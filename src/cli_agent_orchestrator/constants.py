@@ -3,7 +3,8 @@
 from pathlib import Path
 
 # Available providers
-PROVIDERS = ['q_cli']
+PROVIDERS = ['q_cli', 'claude_code']
+DEFAULT_PROVIDER = "q_cli"
 
 # Tmux capture limits
 TMUX_HISTORY_LINES = 200

@@ -4,6 +4,7 @@ import logging
 from typing import Dict, Optional
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.providers.q_cli import QCliProvider
+from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,11 @@ class ProviderRegistry:
                 provider = QCliProvider(terminal_id, session_name, window_name, agent_profile)
                 self._providers[terminal_id] = provider
                 logger.info(f"Created {provider_type} provider for terminal: {terminal_id} with agent: {agent_profile}")
+                return provider
+            elif provider_type == "claude_code":
+                provider = ClaudeCodeProvider(terminal_id, session_name, window_name, agent_profile)
+                self._providers[terminal_id] = provider
+                logger.info(f"Created {provider_type} provider for terminal: {terminal_id}")
                 return provider
             else:
                 raise ValueError(f"Unknown provider type: {provider_type}")

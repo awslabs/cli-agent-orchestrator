@@ -10,11 +10,9 @@ from pydantic import Field
 
 from cli_agent_orchestrator.core.session_manager import session_manager
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
-from cli_agent_orchestrator.mcp_server.utils import get_session_for_terminal
+from cli_agent_orchestrator.mcp_server.utils import get_terminal_record
 from cli_agent_orchestrator.providers.registry import provider_registry
-
-# Constants
-DEFAULT_PROVIDER = "q_cli"
+from cli_agent_orchestrator.constants import DEFAULT_PROVIDER
 
 # Create MCP server
 mcp = FastMCP(
@@ -79,31 +77,38 @@ async def handoff(
     start_time = time.time()
     
     try:
+        # Default to DEFAULT_PROVIDER, will be updated based on current terminal
+        provider = DEFAULT_PROVIDER
+        
         # Get current terminal ID from environment
         current_terminal_id = os.environ.get('CAO_TERMINAL_ID')
         if current_terminal_id:
-            # Get session_id from database
-            session_id = get_session_for_terminal(current_terminal_id)
-            if not session_id:
+            # Get terminal record from database
+            terminal_record = get_terminal_record(current_terminal_id)
+            if not terminal_record:
                 return HandoffResult(
                     success=False,
-                    message=f"Could not find session for terminal {current_terminal_id}",
+                    message=f"Could not find terminal record for {current_terminal_id}",
                     output=None,
                     terminal_id=current_terminal_id
                 )
             
-            # Create new terminal in existing session
+            # Use the same provider as current terminal
+            provider = terminal_record.provider
+            session_id = terminal_record.session_id
+            
+            # Create new terminal in existing session with same provider
             terminal = await session_manager.create_terminal(
                 session_id=session_id,
-                provider=DEFAULT_PROVIDER,
+                provider=provider,
                 agent_profile=agent_profile
             )
         else:
-            # No terminal ID found, create new session with terminal
+            # No terminal ID found, create new session with terminal using default provider
             session_uuid = uuid.uuid4().hex[:4]
             session, terminals = await session_manager.create_session_with_terminals(
                 f"cao-{session_uuid}",
-                [{"provider": DEFAULT_PROVIDER, "agent_profile": agent_profile}]
+                [{"provider": provider, "agent_profile": agent_profile}]
             )
             terminal = terminals[0]
         
@@ -149,7 +154,7 @@ async def handoff(
         
         return HandoffResult(
             success=True,
-            message=f"Successfully handed off to {agent_profile} ({DEFAULT_PROVIDER}) in {execution_time:.2f}s",
+            message=f"Successfully handed off to {agent_profile} ({provider}) in {execution_time:.2f}s",
             output=output,
             terminal_id=terminal.id
         )
