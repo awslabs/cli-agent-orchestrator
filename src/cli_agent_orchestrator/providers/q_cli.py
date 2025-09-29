@@ -64,6 +64,10 @@ class QCliProvider(BaseProvider):
         if self._detect_error(output):
             return TerminalStatus.ERROR
         
+        # Check for waiting user answer (tool permission prompt)
+        if self._is_waiting_for_permission(output):
+            return TerminalStatus.WAITING_USER_ANSWER
+        
         # Check for Q CLI prompt pattern (agent-specific only)
         if re.search(self._q_cli_prompt_pattern, output):
             # Check if there's a response message (completed) vs just ready
@@ -78,6 +82,12 @@ class QCliProvider(BaseProvider):
         
         # No prompt detected = processing
         return TerminalStatus.PROCESSING
+    
+    def _is_waiting_for_permission(self, output: str) -> bool:
+        """Check if Q CLI is waiting for permission by examining if permission prompt ends the output."""
+        # Look for "Allow this action" followed by permission prompt and clean agent prompt at end of string
+        pattern = r'Allow this action\?.*\[.*y.*\/.*n.*\/.*t.*\]:\x1b\[39m\s*' + self._q_cli_prompt_pattern
+        return re.search(pattern, output, re.MULTILINE | re.DOTALL) is not None
     
     def _has_response_message(self, output: str) -> bool:
         """Check if output contains a response message (green arrow pattern followed by prompt)."""
