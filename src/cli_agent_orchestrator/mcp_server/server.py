@@ -14,6 +14,7 @@ from cli_agent_orchestrator.mcp_server.utils import get_terminal_record
 from cli_agent_orchestrator.providers.registry import provider_registry
 from cli_agent_orchestrator.constants import DEFAULT_PROVIDER
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.utils.terminal import wait_until_terminal_status
 
 # Create MCP server
 mcp = FastMCP(
@@ -114,40 +115,20 @@ async def handoff(
             terminal = terminals[0]
         
         # Wait for terminal to be IDLE before sending message
-        wait_start = time.time()
-        while time.time() - wait_start < 30:  # 30 second timeout for IDLE status
-            terminal_status = await session_manager.get_terminal(terminal.id)
-            if terminal_status.status == TerminalStatus.IDLE:
-                break
-            await asyncio.sleep(1)
-        else:
+        if not await wait_until_terminal_status(session_manager, terminal.id, TerminalStatus.IDLE, timeout=30.0):
             return HandoffResult(
                 success=False,
                 message=f"Terminal {terminal.id} did not reach IDLE status within 30 seconds",
                 output=None,
                 terminal_id=terminal.id
             )
+        
         await asyncio.sleep(2) # wait another 2s
         # Send message to terminal
         await session_manager.send_terminal_input(terminal.id, message)
         
         # Monitor until completion with timeout
-        elapsed = 0
-        while elapsed < timeout:
-            terminal_status = await session_manager.get_terminal(terminal.id)
-            if terminal_status.status == TerminalStatus.COMPLETED:
-                break
-            elif terminal_status.status == TerminalStatus.ERROR:
-                return HandoffResult(
-                    success=False,
-                    message=f"Terminal {terminal.id} encountered an error",
-                    output=None,
-                    terminal_id=terminal.id
-                )
-            await asyncio.sleep(0.5)
-            elapsed = time.time() - start_time
-        
-        if elapsed >= timeout:
+        if not await wait_until_terminal_status(session_manager, terminal.id, TerminalStatus.COMPLETED, timeout=timeout, polling_interval=0.5):
             return HandoffResult(
                 success=False,
                 message=f"Handoff timed out after {timeout} seconds",

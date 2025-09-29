@@ -1,12 +1,18 @@
 """Tmux adapter using libtmux."""
 
+import asyncio
 import logging
 import os
+import re
 import subprocess
+import time
 import uuid
 from typing import List, Optional
 
 import libtmux
+
+# Delay between chunks when sending long key strings
+SEND_KEYS_CHUNK_INTERVAL = 0.5
 
 from cli_agent_orchestrator.models.session import Session, SessionStatus
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
@@ -215,8 +221,39 @@ class TmuxAdapter:
             
             pane = window.active_pane
             if pane:
-                # Send keys with Enter
-                pane.send_keys(keys, enter=True)
+                # Split keys into chunks of ~100 characters at whitespace boundaries
+                chunks = []
+                start = 0
+                
+                while start < len(keys):
+                    # Find next whitespace after 100th character from start
+                    target_pos = start + 100
+                    
+                    if target_pos >= len(keys):
+                        # Last chunk
+                        chunks.append(keys[start:])
+                        break
+                    
+                    # Look forward from target position to find next whitespace
+                    match = re.search(r'\s', keys[target_pos:])
+                    
+                    if match:
+                        # Split at the whitespace position
+                        split_pos = target_pos + match.start()
+                        chunks.append(keys[start:split_pos])
+                        start = split_pos  # Don't skip the whitespace
+                    else:
+                        # No whitespace found, take the rest
+                        chunks.append(keys[start:])
+                        break
+                
+                # Send chunks with delay between them
+                for chunk in chunks:
+                    pane.send_keys(chunk, enter=False)
+                    time.sleep(SEND_KEYS_CHUNK_INTERVAL)
+                
+                # Send carriage return as separate command
+                pane.send_keys("C-m")
                 return True
             return False
             

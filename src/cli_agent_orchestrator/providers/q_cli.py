@@ -6,6 +6,7 @@ import subprocess
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.adapters.tmux import TmuxAdapter
+from cli_agent_orchestrator.utils.terminal import wait_until_status
 
 # Custom exception for provider errors
 class ProviderError(Exception):
@@ -43,15 +44,11 @@ class QCliProvider(BaseProvider):
         ], check=True)
         
         # Wait for Q CLI prompt to be ready using status check
-        max_attempts = 60  # 30 seconds total
-        for _ in range(max_attempts):
-            await asyncio.sleep(0.5)
-            status = await self.get_status()
-            if status == TerminalStatus.IDLE:
-                self._initialized = True
-                return True
+        if not await wait_until_status(self, TerminalStatus.IDLE, timeout=30.0):
+            raise TimeoutError("Q CLI initialization timed out after 30 seconds")
         
-        raise TimeoutError(f"Q CLI initialization timed out after {max_attempts * 0.5} seconds")
+        self._initialized = True
+        return True
     
     async def get_status(self) -> TerminalStatus:
         """Get Q CLI status by analyzing terminal output."""

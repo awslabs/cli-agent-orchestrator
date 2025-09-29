@@ -8,6 +8,7 @@ from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.adapters.tmux import TmuxAdapter
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.terminal import wait_until_status
 
 # Custom exception for provider errors
 class ProviderError(Exception):
@@ -17,8 +18,9 @@ class ProviderError(Exception):
 # Regex patterns for Claude Code output analysis
 ANSI_CODE_PATTERN = r'\x1b\[[0-9;]*m'
 RESPONSE_PATTERN = r'⏺(?:\x1b\[[0-9;]*m)*\s+'  # Handle any ANSI codes between marker and text
-PROCESSING_PATTERN = r'[✶✢].*….*\(esc to interrupt\)'
+PROCESSING_PATTERN = r'[✶✢✽✻·✳].*….*\(esc to interrupt.*\)'
 IDLE_PROMPT_PATTERN = r'>[\s\xa0]'  # Handle both regular space and non-breaking space
+WAITING_USER_ANSWER_PATTERN = r'❯.*\d+\.'  # Pattern for Claude showing selection options with arrow cursor
 
 
 class ClaudeCodeProvider(BaseProvider):
@@ -63,15 +65,11 @@ class ClaudeCodeProvider(BaseProvider):
         ], check=True)
         
         # Wait for Claude Code prompt to be ready
-        max_attempts = 60  # 30 seconds total
-        for _ in range(max_attempts):
-            await asyncio.sleep(0.5)
-            status = await self.get_status()
-            if status == TerminalStatus.IDLE:
-                self._initialized = True
-                return True
+        if not await wait_until_status(self, TerminalStatus.IDLE, timeout=30.0, polling_interval=1.0):
+            raise TimeoutError("Claude Code initialization timed out after 30 seconds")
         
-        raise TimeoutError(f"Claude Code initialization timed out after {max_attempts * 0.5} seconds")
+        self._initialized = True
+        return True
     
     async def get_status(self) -> TerminalStatus:
         """Get Claude Code status by analyzing terminal output."""
@@ -86,6 +84,10 @@ class ClaudeCodeProvider(BaseProvider):
         # Check for processing state first
         if re.search(PROCESSING_PATTERN, output):
             return TerminalStatus.PROCESSING
+        
+        # Check for waiting user answer (Claude asking for user selection)
+        if re.search(WAITING_USER_ANSWER_PATTERN, output):
+            return TerminalStatus.WAITING_USER_ANSWER
         
         # Check for completed state (has response + ready prompt)
         if re.search(RESPONSE_PATTERN, output) and re.search(IDLE_PROMPT_PATTERN, output):

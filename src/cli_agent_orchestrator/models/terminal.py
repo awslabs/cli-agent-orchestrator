@@ -10,6 +10,7 @@ class TerminalStatus(str, Enum):
     PROCESSING = "processing"
     COMPLETED = "completed"
     WAITING_PERMISSION = "waiting_permission"
+    WAITING_USER_ANSWER = "waiting_user_answer"
     ERROR = "error"
 
 
