@@ -15,6 +15,7 @@ dependencies = [
     "libtmux>=0.37.0",
     "aiofiles>=24.1.0",
     "click>=8.0.0",
+    "python-frontmatter>=1.1.0",
 ]
 
 [project.scripts]

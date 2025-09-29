@@ -3,9 +3,11 @@
 import asyncio
 import re
 import subprocess
+import shlex
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.adapters.tmux import TmuxAdapter
+from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 
 # Custom exception for provider errors
 class ProviderError(Exception):
@@ -25,13 +27,36 @@ class ClaudeCodeProvider(BaseProvider):
     def __init__(self, terminal_id: str, session_name: str, window_name: str, agent_profile: str = None):
         super().__init__(terminal_id, session_name, window_name)
         self._initialized = False
-        # Claude Code doesn't use agent profiles like Q CLI
+        self._agent_profile = agent_profile
     
-    # TODO: add the ability to launch with --agents <json> and --mcp-config and allowed tools
+    def _build_claude_command(self) -> list:
+        """Build Claude Code command with agent profile if provided."""
+        command_parts = ["claude"]
+        
+        if self._agent_profile:
+            try:
+                profile = load_agent_profile(self._agent_profile)
+                
+                # Add system prompt with proper escaping
+                command_parts.extend(["--append-system-prompt", shlex.quote(profile.system_prompt)])
+                
+                # Add MCP config if present
+                if profile.mcpServers:
+                    mcp_json = profile.model_dump_json(include={"mcpServers"})
+                    command_parts.extend(["--mcp-config", shlex.quote(mcp_json)])
+                    
+            except Exception as e:
+                raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
+        
+        return command_parts
+    
     async def initialize(self) -> bool:
         """Initialize Claude Code provider by starting claude command."""
-        # Send Claude Code start command to tmux
-        command = "claude"
+        # Build command with agent profile support
+        command_parts = self._build_claude_command()
+        command = " ".join(command_parts)
+        
+        # Send Claude Code command to tmux
         subprocess.run([
             "tmux", "send-keys", "-t", f"{self.session_name}:{self.window_name}", 
             command, "C-m"
