@@ -1,11 +1,27 @@
-## My Project
+# CLI Agent Orchestrator
 
-TODO: Fill this README out!
+A lightweight orchestration system for managing multiple AI agent sessions in tmux terminals. Enables Multi-agent collaboration via MCP server.
 
-Be sure to:
+## Installation
 
-* Change the title in this README
-* Edit your repository description on GitHub
+1. Install [uv](https://docs.astral.sh/uv/getting-started/installation/)
+
+2. Install CLI Agent Orchestrator:
+```bash
+uv tool install git+https://github.com/awslabs/cli-agent-orchestrator.git@launch
+```
+
+## Quick Start
+
+Initialize the database:
+```bash
+cao init
+```
+
+Launch a terminal with an agent profile:
+```bash
+cao launch --agents code_sup
+```
 
 ## Security
 

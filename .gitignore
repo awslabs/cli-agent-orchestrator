@@ -25,3 +25,4 @@ dist/
 *.log
 *.db
 .amazonq/
+.obsidian/
