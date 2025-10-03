@@ -2,6 +2,9 @@
 
 from pathlib import Path
 
+# Session configuration
+SESSION_PREFIX = "cao-"
+
 # Available providers
 PROVIDERS = ['q_cli', 'claude_code']
 DEFAULT_PROVIDER = "q_cli"

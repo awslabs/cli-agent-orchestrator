@@ -1,12 +1,9 @@
 """Claude Code provider implementation."""
 
-import asyncio
 import re
-import subprocess
-import shlex
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.adapters.tmux import TmuxAdapter
+from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_until_status
 
@@ -52,31 +49,27 @@ class ClaudeCodeProvider(BaseProvider):
         
         return command_parts
     
-    async def initialize(self) -> bool:
+    def initialize(self) -> bool:
         """Initialize Claude Code provider by starting claude command."""
         # Build command with agent profile support
         command_parts = self._build_claude_command()
         command = " ".join(command_parts)
         
-        # Send Claude Code command to tmux
-        subprocess.run([
-            "tmux", "send-keys", "-t", f"{self.session_name}:{self.window_name}", 
-            command, "C-m"
-        ], check=True)
+        # Send Claude Code command using tmux client
+        tmux_client.send_keys(self.session_name, self.window_name, command)
         
         # Wait for Claude Code prompt to be ready
-        if not await wait_until_status(self, TerminalStatus.IDLE, timeout=30.0, polling_interval=1.0):
+        if not wait_until_status(self, TerminalStatus.IDLE, timeout=30.0, polling_interval=1.0):
             raise TimeoutError("Claude Code initialization timed out after 30 seconds")
         
         self._initialized = True
         return True
     
-    async def get_status(self) -> TerminalStatus:
+    def get_status(self) -> TerminalStatus:
         """Get Claude Code status by analyzing terminal output."""
         
-        # Use tmux adapter to get window history
-        tmux_adapter = TmuxAdapter()
-        output = tmux_adapter.get_window_history(self.session_name, self.window_name)
+        # Use tmux client singleton to get window history
+        output = tmux_client.get_history(self.session_name, self.window_name)
         
         if not output:
             return TerminalStatus.ERROR
@@ -141,6 +134,6 @@ class ClaudeCodeProvider(BaseProvider):
         """Get the command to exit Claude Code."""
         return "/exit"
 
-    async def cleanup(self) -> None:
+    def cleanup(self) -> None:
         """Clean up Claude Code provider."""
         self._initialized = False

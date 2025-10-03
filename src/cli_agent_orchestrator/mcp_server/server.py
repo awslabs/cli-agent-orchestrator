@@ -3,18 +3,17 @@
 import asyncio
 import os
 import time
-import uuid
 
 from fastmcp import FastMCP
 from pydantic import Field
 
-from cli_agent_orchestrator.core.session_manager import session_manager
+from cli_agent_orchestrator.services import terminal_service
+from cli_agent_orchestrator.clients.database import get_terminal_metadata
+from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
-from cli_agent_orchestrator.mcp_server.utils import get_terminal_record
-from cli_agent_orchestrator.providers.registry import provider_registry
 from cli_agent_orchestrator.constants import DEFAULT_PROVIDER
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.utils.terminal import wait_until_terminal_status
+from cli_agent_orchestrator.utils.terminal import generate_session_name, wait_until_terminal_status
 
 # Create MCP server
 mcp = FastMCP(
@@ -79,15 +78,14 @@ async def handoff(
     start_time = time.time()
     
     try:
-        # Default to DEFAULT_PROVIDER, will be updated based on current terminal
         provider = DEFAULT_PROVIDER
         
         # Get current terminal ID from environment
         current_terminal_id = os.environ.get('CAO_TERMINAL_ID')
         if current_terminal_id:
-            # Get terminal record from database
-            terminal_record = get_terminal_record(current_terminal_id)
-            if not terminal_record:
+            # Get terminal metadata from database
+            terminal_metadata = get_terminal_metadata(current_terminal_id)
+            if not terminal_metadata:
                 return HandoffResult(
                     success=False,
                     message=f"Could not find terminal record for {current_terminal_id}",
@@ -95,27 +93,28 @@ async def handoff(
                     terminal_id=current_terminal_id
                 )
             
-            # Use the same provider as current terminal
-            provider = terminal_record.provider
-            session_id = terminal_record.session_id
+            provider = terminal_metadata["provider"]
+            session_name = terminal_metadata["tmux_session"]
             
-            # Create new terminal in existing session with same provider
-            terminal = await session_manager.create_terminal(
-                session_id=session_id,
+            # Create new terminal in existing session
+            terminal = terminal_service.create_terminal(
+                session_name=session_name,
                 provider=provider,
-                agent_profile=agent_profile
+                agent_profile=agent_profile,
+                new_session=False
             )
         else:
-            # No terminal ID found, create new session with terminal using default provider
-            session_uuid = uuid.uuid4().hex[:4]
-            session, terminals = await session_manager.create_session_with_terminals(
-                f"cao-{session_uuid}",
-                [{"provider": provider, "agent_profile": agent_profile}]
+            # Create new session with terminal
+            session_name = generate_session_name()
+            terminal = terminal_service.create_terminal(
+                session_name=session_name,
+                provider=provider,
+                agent_profile=agent_profile,
+                new_session=True
             )
-            terminal = terminals[0]
         
         # Wait for terminal to be IDLE before sending message
-        if not await wait_until_terminal_status(session_manager, terminal.id, TerminalStatus.IDLE, timeout=30.0):
+        if not wait_until_terminal_status(terminal.id, TerminalStatus.IDLE, timeout=30.0):
             return HandoffResult(
                 success=False,
                 message=f"Terminal {terminal.id} did not reach IDLE status within 30 seconds",
@@ -123,12 +122,13 @@ async def handoff(
                 terminal_id=terminal.id
             )
         
-        await asyncio.sleep(2) # wait another 2s
+        await asyncio.sleep(2)  # wait another 2s
+        
         # Send message to terminal
-        await session_manager.send_terminal_input(terminal.id, message)
+        terminal_service.send_input(terminal.id, message)
         
         # Monitor until completion with timeout
-        if not await wait_until_terminal_status(session_manager, terminal.id, TerminalStatus.COMPLETED, timeout=timeout, polling_interval=0.5):
+        if not wait_until_terminal_status(terminal.id, TerminalStatus.COMPLETED, timeout=timeout, polling_interval=0.5):
             return HandoffResult(
                 success=False,
                 message=f"Handoff timed out after {timeout} seconds",
@@ -137,13 +137,13 @@ async def handoff(
             )
         
         # Get the response
-        output = await session_manager.get_terminal_output(terminal.id, "last")
+        output = terminal_service.get_output(terminal.id, terminal_service.OutputMode.LAST)
         
         # Send provider-specific exit command to cleanup terminal
-        provider = provider_registry.get_provider(terminal.id)
-        if provider:
-            exit_command = provider.exit_cli()
-            await session_manager.send_terminal_input(terminal.id, exit_command)
+        provider_instance = provider_manager.get_provider(terminal.id)
+        if provider_instance:
+            exit_command = provider_instance.exit_cli()
+            terminal_service.send_input(terminal.id, exit_command)
         else:
             raise ValueError(f"No provider found for terminal {terminal.id}")
         

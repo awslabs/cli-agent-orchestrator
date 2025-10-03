@@ -20,7 +20,7 @@ class BaseProvider(ABC):
         return self._status
     
     @abstractmethod
-    async def initialize(self) -> bool:
+    def initialize(self) -> bool:
         """Initialize the provider (e.g., start CLI tool, send setup commands).
         
         Returns:
@@ -29,7 +29,7 @@ class BaseProvider(ABC):
         pass
     
     @abstractmethod
-    async def get_status(self) -> TerminalStatus:
+    def get_status(self) -> TerminalStatus:
         """Get current provider status by analyzing terminal output.
         
         Returns:
@@ -59,7 +59,7 @@ class BaseProvider(ABC):
         pass
 
     @abstractmethod
-    async def cleanup(self) -> None:
+    def cleanup(self) -> None:
         """Clean up provider resources."""
         pass
     

@@ -1,12 +1,11 @@
 """Launch command for CLI Agent Orchestrator CLI."""
 
-import asyncio
 import subprocess
 import click
 
-from cli_agent_orchestrator.core.session_manager import session_manager
+from cli_agent_orchestrator.services.terminal_service import create_terminal
 from cli_agent_orchestrator.constants import PROVIDERS
-from cli_agent_orchestrator.utils.session import generate_session_name
+from cli_agent_orchestrator.utils.terminal import generate_session_name
 
 
 @click.command()
@@ -26,17 +25,19 @@ def launch(agents, session_name, headless, provider):
             session_name = generate_session_name()
         
         # Create session with terminal
-        session, terminals = asyncio.run(session_manager.create_session_with_terminals(
-            session_name,
-            [{"provider": provider, "agent_profile": agents}]
-        ))
+        terminal = create_terminal(
+            session_name=session_name,
+            provider=provider,
+            agent_profile=agents,
+            new_session=True
+        )
         
-        click.echo(f"Session created: {session.name}")
-        click.echo(f"Terminal created: {terminals[0].name}")
+        click.echo(f"Session created: {terminal.session_name}")
+        click.echo(f"Terminal created: {terminal.name}")
         
         # Attach to tmux session unless headless
         if not headless:
-            subprocess.run(["tmux", "attach-session", "-t", session.id])
+            subprocess.run(["tmux", "attach-session", "-t", terminal.session_name])
             
     except Exception as e:
         raise click.ClickException(str(e))
