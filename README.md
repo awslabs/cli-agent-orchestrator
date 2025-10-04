@@ -8,7 +8,7 @@ A lightweight orchestration system for managing multiple AI agent sessions in tm
 
 2. Install CLI Agent Orchestrator:
 ```bash
-uv tool install git+https://github.com/awslabs/cli-agent-orchestrator.git@launch
+uv tool install git+https://github.com/awslabs/cli-agent-orchestrator.git@launch --upgrade
 ```
 
 ## Quick Start
