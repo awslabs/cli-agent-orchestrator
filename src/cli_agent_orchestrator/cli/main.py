@@ -4,17 +4,20 @@ import click
 
 from cli_agent_orchestrator.cli.commands.launch import launch
 from cli_agent_orchestrator.cli.commands.init import init
+from cli_agent_orchestrator.cli.commands.flow import flow
+from cli_agent_orchestrator.utils.logging import setup_logging
 
 
 @click.group()
 def cli():
     """CLI Agent Orchestrator."""
-    pass
+    setup_logging()
 
 
 # Register commands
 cli.add_command(launch)
 cli.add_command(init)
+cli.add_command(flow)
 
 
 if __name__ == "__main__":

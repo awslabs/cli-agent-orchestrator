@@ -1,5 +1,6 @@
 """Single FastAPI entry point for all HTTP routes."""
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from typing import List, Dict, Optional
@@ -8,13 +9,34 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from cli_agent_orchestrator.clients.database import init_db
-from cli_agent_orchestrator.services import session_service, terminal_service
+from cli_agent_orchestrator.services import session_service, terminal_service, flow_service
 from cli_agent_orchestrator.services.terminal_service import OutputMode
 from cli_agent_orchestrator.models.terminal import Terminal
 from cli_agent_orchestrator.constants import SERVER_VERSION, CORS_ORIGINS, SERVER_HOST, SERVER_PORT
 from cli_agent_orchestrator.utils.logging import setup_logging
 
 logger = logging.getLogger(__name__)
+
+
+async def flow_daemon():
+    """Background task to check and execute flows."""
+    logger.info("Flow daemon started")
+    while True:
+        try:
+            flows = flow_service.get_flows_to_run()
+            for flow in flows:
+                try:
+                    executed = flow_service.execute_flow(flow.name)
+                    if executed:
+                        logger.info(f"Flow '{flow.name}' executed successfully")
+                    else:
+                        logger.info(f"Flow '{flow.name}' skipped (execute=false)")
+                except Exception as e:
+                    logger.error(f"Flow '{flow.name}' failed: {e}")
+        except Exception as e:
+            logger.error(f"Flow daemon error: {e}")
+        
+        await asyncio.sleep(60)
 
 
 # Request/Response Models
@@ -40,7 +62,19 @@ async def lifespan(app: FastAPI):
     logger.info("Starting CLI Agent Orchestrator server...")
     setup_logging()
     init_db()
+    
+    # Start flow daemon as background task
+    daemon_task = asyncio.create_task(flow_daemon())
+    
     yield
+    
+    # Cancel daemon on shutdown
+    daemon_task.cancel()
+    try:
+        await daemon_task
+    except asyncio.CancelledError:
+        pass
+    
     logger.info("Shutting down CLI Agent Orchestrator server...")
 
 
@@ -186,6 +220,11 @@ async def delete_terminal(terminal_id: str) -> Dict:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to delete terminal: {str(e)}")
 
 
-if __name__ == "__main__":
+def main():
+    """Entry point for cao-server command."""
     import uvicorn
     uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT)
+
+
+if __name__ == "__main__":
+    main()

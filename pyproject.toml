@@ -20,7 +20,7 @@ dependencies = [
 
 [project.scripts]
 "cao" = "cli_agent_orchestrator.cli.main:cli"
-"cao-server" = "cli_agent_orchestrator.api.server:main"
+"cao-server" = "cli_agent_orchestrator.api.main:main"
 "cao-mcp-server" = "cli_agent_orchestrator.mcp_server.server:main"
 
 [build-system]
