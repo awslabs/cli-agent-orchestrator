@@ -22,6 +22,10 @@ CAO_HOME_DIR = Path.home() / ".aws" / "cli-agent-orchestrator"
 DB_DIR = CAO_HOME_DIR / "db"
 LOG_DIR = CAO_HOME_DIR / "logs"
 TERMINAL_LOG_DIR = LOG_DIR / "terminal"
+AGENT_CONTEXT_DIR = CAO_HOME_DIR / "agent-context"
+
+# Q CLI directories
+Q_AGENTS_DIR = Path.home() / ".aws" / "amazonq" / "cli-agents"
 
 # Database configuration
 DATABASE_FILE = DB_DIR / "cli-agent-orchestrator.db"
