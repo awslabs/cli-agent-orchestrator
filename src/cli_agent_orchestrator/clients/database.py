@@ -2,9 +2,10 @@
 
 from datetime import datetime
 from typing import Optional, Dict, List
-from sqlalchemy import Column, String, DateTime, create_engine
+from sqlalchemy import Column, String, DateTime, Boolean, create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR
+from cli_agent_orchestrator.models.flow import Flow
 
 Base = declarative_base()
 
@@ -20,6 +21,21 @@ class TerminalModel(Base):
     provider = Column(String, nullable=False)  # "q_cli", "claude_code"
     agent_profile = Column(String)  # "developer", "reviewer" (optional)
     last_active = Column(DateTime, default=datetime.utcnow)
+
+
+class FlowModel(Base):
+    """SQLAlchemy model for flow metadata."""
+    
+    __tablename__ = "flows"
+    
+    name = Column(String, primary_key=True)
+    file_path = Column(String, nullable=False)
+    schedule = Column(String, nullable=False)
+    agent_profile = Column(String, nullable=False)
+    script = Column(String, nullable=True)
+    last_run = Column(DateTime, nullable=True)
+    next_run = Column(DateTime, nullable=True)
+    enabled = Column(Boolean, default=True)
 
 
 # Module-level singletons
@@ -113,3 +129,125 @@ def delete_terminals_by_session(tmux_session: str) -> int:
         deleted = db.query(TerminalModel).filter(TerminalModel.tmux_session == tmux_session).delete()
         db.commit()
         return deleted
+
+
+# Flow database functions
+
+def create_flow(name: str, file_path: str, schedule: str, agent_profile: str, 
+                script: str, next_run: datetime) -> Flow:
+    """Create flow record."""
+    with SessionLocal() as db:
+        flow = FlowModel(
+            name=name,
+            file_path=file_path,
+            schedule=schedule,
+            agent_profile=agent_profile,
+            script=script,
+            next_run=next_run
+        )
+        db.add(flow)
+        db.commit()
+        db.refresh(flow)
+        return Flow(
+            name=flow.name,
+            file_path=flow.file_path,
+            schedule=flow.schedule,
+            agent_profile=flow.agent_profile,
+            script=flow.script,
+            last_run=flow.last_run,
+            next_run=flow.next_run,
+            enabled=flow.enabled
+        )
+
+
+def get_flow(name: str) -> Optional[Flow]:
+    """Get flow by name."""
+    with SessionLocal() as db:
+        flow = db.query(FlowModel).filter(FlowModel.name == name).first()
+        if not flow:
+            return None
+        return Flow(
+            name=flow.name,
+            file_path=flow.file_path,
+            schedule=flow.schedule,
+            agent_profile=flow.agent_profile,
+            script=flow.script,
+            last_run=flow.last_run,
+            next_run=flow.next_run,
+            enabled=flow.enabled
+        )
+
+
+def list_flows() -> List[Flow]:
+    """List all flows."""
+    with SessionLocal() as db:
+        flows = db.query(FlowModel).order_by(FlowModel.next_run).all()
+        return [
+            Flow(
+                name=f.name,
+                file_path=f.file_path,
+                schedule=f.schedule,
+                agent_profile=f.agent_profile,
+                script=f.script,
+                last_run=f.last_run,
+                next_run=f.next_run,
+                enabled=f.enabled
+            )
+            for f in flows
+        ]
+
+
+def update_flow_run_times(name: str, last_run: datetime, next_run: datetime) -> bool:
+    """Update flow run times after execution."""
+    with SessionLocal() as db:
+        flow = db.query(FlowModel).filter(FlowModel.name == name).first()
+        if flow:
+            flow.last_run = last_run
+            flow.next_run = next_run
+            db.commit()
+            return True
+        return False
+
+
+def update_flow_enabled(name: str, enabled: bool, next_run: Optional[datetime] = None) -> bool:
+    """Update flow enabled status and optionally next_run."""
+    with SessionLocal() as db:
+        flow = db.query(FlowModel).filter(FlowModel.name == name).first()
+        if flow:
+            flow.enabled = enabled
+            if next_run is not None:
+                flow.next_run = next_run
+            db.commit()
+            return True
+        return False
+
+
+def delete_flow(name: str) -> bool:
+    """Delete flow."""
+    with SessionLocal() as db:
+        deleted = db.query(FlowModel).filter(FlowModel.name == name).delete()
+        db.commit()
+        return deleted > 0
+
+
+def get_flows_to_run() -> List[Flow]:
+    """Get enabled flows where next_run <= now."""
+    with SessionLocal() as db:
+        now = datetime.now()
+        flows = db.query(FlowModel).filter(
+            FlowModel.enabled == True,
+            FlowModel.next_run <= now
+        ).all()
+        return [
+            Flow(
+                name=f.name,
+                file_path=f.file_path,
+                schedule=f.schedule,
+                agent_profile=f.agent_profile,
+                script=f.script,
+                last_run=f.last_run,
+                next_run=f.next_run,
+                enabled=f.enabled
+            )
+            for f in flows
+        ]
