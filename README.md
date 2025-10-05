@@ -18,9 +18,16 @@ Initialize the database:
 cao init
 ```
 
+Install agents from agent store to Q CLI:
+```bash
+cao install code_supervisor
+cao install developer
+cao install reviewer
+```
+
 Launch a terminal with an agent profile:
 ```bash
-cao launch --agents code_sup
+cao launch --agents code_supervisor
 ```
 
 ## Security
