@@ -30,6 +30,15 @@ Launch a terminal with an agent profile:
 cao launch --agents code_supervisor
 ```
 
+Shutdown sessions:
+```bash
+# Shutdown all cao sessions
+cao shutdown --all
+
+# Shutdown specific session
+cao shutdown --session cao-my-session
+```
+
 ## Security
 
 See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
