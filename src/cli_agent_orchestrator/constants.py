@@ -26,6 +26,10 @@ TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # Terminal log configuration
 TERMINAL_LOG_TAIL_LINES = 5  # Lines to check for IDLE patterns in inbox service
+AGENT_CONTEXT_DIR = CAO_HOME_DIR / "agent-context"
+
+# Q CLI directories
+Q_AGENTS_DIR = Path.home() / ".aws" / "amazonq" / "cli-agents"
 
 # Database configuration
 DATABASE_FILE = DB_DIR / "cli-agent-orchestrator.db"
