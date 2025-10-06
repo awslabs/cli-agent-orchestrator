@@ -3,16 +3,18 @@
 import asyncio
 import os
 import time
+from typing import Dict, Any
 
 from fastmcp import FastMCP
 from pydantic import Field
 
 from cli_agent_orchestrator.services import terminal_service
-from cli_agent_orchestrator.clients.database import get_terminal_metadata
+from cli_agent_orchestrator.clients.database import get_terminal_metadata, create_inbox_message
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
 from cli_agent_orchestrator.constants import DEFAULT_PROVIDER
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.models.inbox import MessageStatus
 from cli_agent_orchestrator.utils.terminal import generate_session_name, wait_until_terminal_status
 
 # Create MCP server
@@ -163,6 +165,52 @@ async def handoff(
             output=None,
             terminal_id=None
         )
+
+
+@mcp.tool()
+async def send_message(
+    receiver_id: str = Field(description="Target terminal ID to send message to"),
+    message: str = Field(description="Message content to send")
+) -> Dict[str, Any]:
+    """Send a message to another terminal's inbox.
+    
+    The message will be delivered when the destination terminal is IDLE.
+    Messages are delivered in order (oldest first).
+    
+    Args:
+        receiver_id: Terminal ID of the receiver
+        message: Message content to send
+        
+    Returns:
+        Dict with success status and message details
+    """
+    try:
+        # Get sender terminal ID from environment
+        sender_id = os.getenv("CAO_TERMINAL_ID")
+        if not sender_id:
+            raise ValueError("CAO_TERMINAL_ID not set - cannot determine sender")
+        
+        # Validate receiver terminal exists
+        receiver_metadata = get_terminal_metadata(receiver_id)
+        if not receiver_metadata:
+            raise ValueError(f"Receiver terminal '{receiver_id}' not found")
+        
+        # Create inbox message
+        inbox_msg = create_inbox_message(sender_id, receiver_id, message)
+        
+        return {
+            "success": True,
+            "message_id": inbox_msg.id,
+            "sender_id": inbox_msg.sender_id,
+            "receiver_id": inbox_msg.receiver_id,
+            "created_at": inbox_msg.created_at.isoformat()
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 
 def main():

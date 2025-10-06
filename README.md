@@ -23,6 +23,21 @@ Launch a terminal with an agent profile:
 cao launch --agents code_sup
 ```
 
+## MCP Tools
+
+### send_message
+Send asynchronous messages between terminals. Messages are delivered when the receiver terminal is IDLE.
+
+```python
+# From within a CAO terminal
+send_message(
+    receiver_id="abc123",  # Target terminal ID
+    message="Your task here"
+)
+```
+
+Messages are queued and delivered in order (oldest first).
+
 ## Security
 
 See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.

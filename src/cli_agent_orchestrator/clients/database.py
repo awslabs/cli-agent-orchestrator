@@ -2,9 +2,10 @@
 
 from datetime import datetime
 from typing import Optional, Dict, List
-from sqlalchemy import Column, String, DateTime, create_engine
+from sqlalchemy import Column, String, DateTime, Integer, create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR
+from cli_agent_orchestrator.models.inbox import MessageStatus, InboxMessage
 
 Base = declarative_base()
 
@@ -19,7 +20,20 @@ class TerminalModel(Base):
     tmux_window = Column(String, nullable=False)  # "window-name"
     provider = Column(String, nullable=False)  # "q_cli", "claude_code"
     agent_profile = Column(String)  # "developer", "reviewer" (optional)
-    last_active = Column(DateTime, default=datetime.utcnow)
+    last_active = Column(DateTime, default=datetime.now)
+
+
+class InboxModel(Base):
+    """SQLAlchemy model for inbox messages."""
+    
+    __tablename__ = "inbox"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    sender_id = Column(String, nullable=False)
+    receiver_id = Column(String, nullable=False)
+    message = Column(String, nullable=False)
+    status = Column(String, nullable=False)  # MessageStatus enum value
+    created_at = Column(DateTime, default=datetime.now)
 
 
 # Module-level singletons
@@ -93,7 +107,7 @@ def update_last_active(terminal_id: str) -> bool:
     with SessionLocal() as db:
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if terminal:
-            terminal.last_active = datetime.utcnow()
+            terminal.last_active = datetime.now()
             db.commit()
             return True
         return False
@@ -113,3 +127,59 @@ def delete_terminals_by_session(tmux_session: str) -> int:
         deleted = db.query(TerminalModel).filter(TerminalModel.tmux_session == tmux_session).delete()
         db.commit()
         return deleted
+
+
+def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> InboxMessage:
+    """Create inbox message with status=MessageStatus.PENDING."""
+    with SessionLocal() as db:
+        inbox_msg = InboxModel(
+            sender_id=sender_id,
+            receiver_id=receiver_id,
+            message=message,
+            status=MessageStatus.PENDING.value
+        )
+        db.add(inbox_msg)
+        db.commit()
+        db.refresh(inbox_msg)
+        return InboxMessage(
+            id=inbox_msg.id,
+            sender_id=inbox_msg.sender_id,
+            receiver_id=inbox_msg.receiver_id,
+            message=inbox_msg.message,
+            status=MessageStatus(inbox_msg.status),
+            created_at=inbox_msg.created_at
+        )
+
+
+def get_pending_messages(receiver_id: str, limit: int = 1) -> List[InboxMessage]:
+    """Get pending messages ordered by created_at ASC (oldest first)."""
+    with SessionLocal() as db:
+        messages = db.query(InboxModel)\
+            .filter(InboxModel.receiver_id == receiver_id)\
+            .filter(InboxModel.status == MessageStatus.PENDING.value)\
+            .order_by(InboxModel.created_at.asc())\
+            .limit(limit)\
+            .all()
+        return [
+            InboxMessage(
+                id=msg.id,
+                sender_id=msg.sender_id,
+                receiver_id=msg.receiver_id,
+                message=msg.message,
+                status=MessageStatus(msg.status),
+                created_at=msg.created_at
+            )
+            for msg in messages
+        ]
+
+
+def update_message_status(message_id: int, status: MessageStatus) -> bool:
+    """Update message status to MessageStatus.DELIVERED or MessageStatus.FAILED."""
+    with SessionLocal() as db:
+        message = db.query(InboxModel).filter(InboxModel.id == message_id).first()
+        if message:
+            message.status = status.value
+            db.commit()
+            return True
+        return False
+

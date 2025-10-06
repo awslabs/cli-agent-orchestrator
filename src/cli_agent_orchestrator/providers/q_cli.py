@@ -1,6 +1,7 @@
 """Q CLI provider implementation."""
 
 import re
+from typing import List
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.clients.tmux import tmux_client
@@ -13,6 +14,7 @@ ESCAPE_SEQUENCE_PATTERN = r'\[[?0-9;]*[a-zA-Z]'
 CONTROL_CHAR_PATTERN = r'[\x00-\x1f\x7f-\x9f]'
 BELL_CHAR = '\x07'
 GENERIC_PROMPT_PATTERN = r'\x1b\[38;5;13m>\s*\x1b\[39m\s*$'
+IDLE_PATTERNS = ['\x1b[38;5;13m>', '\x1b[38;5;14m[']
 
 # Error indicators
 ERROR_INDICATORS = ["Amazon Q is having trouble responding right now"]
@@ -84,6 +86,10 @@ class QCliProvider(BaseProvider):
         
         # No prompt = processing
         return TerminalStatus.PROCESSING
+    
+    def get_idle_patterns(self) -> List[str]:
+        """Return Q CLI IDLE prompt patterns."""
+        return IDLE_PATTERNS
     
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract agent's final response message using green arrow indicator."""

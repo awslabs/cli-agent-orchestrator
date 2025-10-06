@@ -1,6 +1,7 @@
 """Base provider interface for CLI tool abstraction."""
 
 from abc import ABC, abstractmethod
+from typing import List
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
 
@@ -34,6 +35,18 @@ class BaseProvider(ABC):
         
         Returns:
             TerminalStatus: Current status of the provider
+        """
+        pass
+    
+    @abstractmethod
+    def get_idle_patterns(self) -> List[str]:
+        """Get list of patterns that indicate IDLE state in terminal output.
+        
+        Used for quick detection in file watcher before calling full get_status().
+        Should return patterns that appear in the IDLE prompt.
+        
+        Returns:
+            List[str]: Patterns to search for in last N lines
         """
         pass
     

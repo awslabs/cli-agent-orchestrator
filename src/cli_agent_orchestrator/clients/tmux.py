@@ -181,6 +181,55 @@ class TmuxClient:
             return session is not None
         except Exception:
             return False
+    
+    def pipe_pane(self, session_name: str, window_name: str, file_path: str) -> None:
+        """Start piping pane output to file.
+        
+        Args:
+            session_name: Tmux session name
+            window_name: Tmux window name
+            file_path: Absolute path to log file
+        """
+        try:
+            session = self.server.sessions.get(session_name=session_name)
+            if not session:
+                raise ValueError(f"Session '{session_name}' not found")
+            
+            window = session.windows.get(window_name=window_name)
+            if not window:
+                raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
+            
+            pane = window.active_pane
+            if pane:
+                pane.cmd('pipe-pane', '-o', f'cat >> {file_path}')
+                logger.info(f"Started pipe-pane for {session_name}:{window_name} to {file_path}")
+        except Exception as e:
+            logger.error(f"Failed to start pipe-pane for {session_name}:{window_name}: {e}")
+            raise
+    
+    def stop_pipe_pane(self, session_name: str, window_name: str) -> None:
+        """Stop piping pane output.
+        
+        Args:
+            session_name: Tmux session name
+            window_name: Tmux window name
+        """
+        try:
+            session = self.server.sessions.get(session_name=session_name)
+            if not session:
+                raise ValueError(f"Session '{session_name}' not found")
+            
+            window = session.windows.get(window_name=window_name)
+            if not window:
+                raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
+            
+            pane = window.active_pane
+            if pane:
+                pane.cmd('pipe-pane')
+                logger.info(f"Stopped pipe-pane for {session_name}:{window_name}")
+        except Exception as e:
+            logger.error(f"Failed to stop pipe-pane for {session_name}:{window_name}: {e}")
+            raise
 
 
 # Module-level singleton

@@ -22,6 +22,10 @@ CAO_HOME_DIR = Path.home() / ".aws" / "cli-agent-orchestrator"
 DB_DIR = CAO_HOME_DIR / "db"
 LOG_DIR = CAO_HOME_DIR / "logs"
 TERMINAL_LOG_DIR = LOG_DIR / "terminal"
+TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+# Terminal log configuration
+TERMINAL_LOG_TAIL_LINES = 5  # Lines to check for IDLE patterns in inbox service
 
 # Database configuration
 DATABASE_FILE = DB_DIR / "cli-agent-orchestrator.db"

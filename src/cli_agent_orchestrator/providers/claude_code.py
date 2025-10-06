@@ -1,6 +1,8 @@
 """Claude Code provider implementation."""
 
 import re
+import shlex
+from typing import List
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.clients.tmux import tmux_client
@@ -18,6 +20,7 @@ RESPONSE_PATTERN = r'⏺(?:\x1b\[[0-9;]*m)*\s+'  # Handle any ANSI codes between
 PROCESSING_PATTERN = r'[✶✢✽✻·✳].*….*\(esc to interrupt.*\)'
 IDLE_PROMPT_PATTERN = r'>[\s\xa0]'  # Handle both regular space and non-breaking space
 WAITING_USER_ANSWER_PATTERN = r'❯.*\d+\.'  # Pattern for Claude showing selection options with arrow cursor
+IDLE_PATTERNS = ['>']
 
 
 class ClaudeCodeProvider(BaseProvider):
@@ -92,6 +95,10 @@ class ClaudeCodeProvider(BaseProvider):
         
         # If no recognizable state, return None
         return None
+    
+    def get_idle_patterns(self) -> List[str]:
+        """Return Claude Code IDLE prompt patterns."""
+        return IDLE_PATTERNS
     
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract Claude's final response message using ⏺ indicator."""

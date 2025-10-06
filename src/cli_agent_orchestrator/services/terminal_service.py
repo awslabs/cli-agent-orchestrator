@@ -13,7 +13,8 @@ from cli_agent_orchestrator.clients.database import (
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.utils.terminal import generate_terminal_id, generate_session_name, generate_window_name
 from cli_agent_orchestrator.models.terminal import Terminal
-from cli_agent_orchestrator.constants import SESSION_PREFIX
+from cli_agent_orchestrator.constants import SESSION_PREFIX, TERMINAL_LOG_DIR
+from cli_agent_orchestrator.services.inbox_service import inbox_service
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,13 @@ def create_terminal(session_name: str, provider: str, agent_profile: str,
             provider, terminal_id, session_name, window_name, agent_profile
         )
         provider_instance.initialize()
+        
+        # Start pipe-pane to log file
+        log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
+        tmux_client.pipe_pane(session_name, window_name, str(log_path))
+        
+        # Register with inbox service
+        inbox_service.register_terminal(terminal_id, str(log_path), provider_instance)
         
         terminal = Terminal(
             id=terminal_id,
@@ -158,6 +166,23 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
 def delete_terminal(terminal_id: str) -> bool:
     """Delete terminal."""
     try:
+        # Unregister from inbox service
+        inbox_service.unregister_terminal(terminal_id)
+        
+        # Get metadata before deletion
+        metadata = get_terminal_metadata(terminal_id)
+        
+        # Stop pipe-pane
+        if metadata:
+            try:
+                tmux_client.stop_pipe_pane(
+                    metadata["tmux_session"],
+                    metadata["tmux_window"]
+                )
+            except Exception as e:
+                logger.warning(f"Failed to stop pipe-pane for {terminal_id}: {e}")
+        
+        # Existing cleanup
         provider_manager.cleanup_provider(terminal_id)
         deleted = db_delete_terminal(terminal_id)
         logger.info(f"Deleted terminal: {terminal_id}")
