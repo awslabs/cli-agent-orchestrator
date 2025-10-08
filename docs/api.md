@@ -1,0 +1,194 @@
+# CLI Agent Orchestrator API Documentation
+
+Base URL: `http://localhost:8080` (default)
+
+## Health Check
+
+### GET /health
+Check if the server is running.
+
+**Response:**
+```json
+{
+  "status": "ok",
+  "service": "cli-agent-orchestrator"
+}
+```
+
+---
+
+## Sessions
+
+### POST /sessions
+Create a new session with one terminal.
+
+**Parameters:**
+- `provider` (string, required): Provider type ("q_cli" or "claude_code")
+- `agent_profile` (string, required): Agent profile name
+- `session_name` (string, optional): Custom session name
+
+**Response:** Terminal object (201 Created)
+
+### GET /sessions
+List all sessions.
+
+**Response:** Array of session objects
+
+### GET /sessions/{session_name}
+Get details of a specific session.
+
+**Response:** Session object with terminals list
+
+### DELETE /sessions/{session_name}
+Delete a session and all its terminals.
+
+**Response:**
+```json
+{
+  "success": true
+}
+```
+
+---
+
+## Terminals
+
+### POST /sessions/{session_name}/terminals
+Create an additional terminal in an existing session.
+
+**Parameters:**
+- `provider` (string, required): Provider type
+- `agent_profile` (string, required): Agent profile name
+
+**Response:** Terminal object (201 Created)
+
+### GET /sessions/{session_name}/terminals
+List all terminals in a session.
+
+**Response:** Array of terminal objects
+
+### GET /terminals/{terminal_id}
+Get terminal details.
+
+**Response:** Terminal object
+```json
+{
+  "id": "string",
+  "provider": "string",
+  "agent_profile": "string",
+  "session_name": "string",
+  "tmux_session": "string",
+  "tmux_window": "string",
+  "status": "IDLE|BUSY|COMPLETED|ERROR",
+  "log_path": "string",
+  "created_at": "timestamp"
+}
+```
+
+### POST /terminals/{terminal_id}/input
+Send input to a terminal.
+
+**Parameters:**
+- `message` (string, required): Message to send
+
+**Response:**
+```json
+{
+  "success": true
+}
+```
+
+### GET /terminals/{terminal_id}/output
+Get terminal output.
+
+**Parameters:**
+- `mode` (string, optional): Output mode - "full" (default), "last", or "tail"
+
+**Response:**
+```json
+{
+  "output": "string",
+  "mode": "string"
+}
+```
+
+### POST /terminals/{terminal_id}/exit
+Send provider-specific exit command to terminal.
+
+**Response:**
+```json
+{
+  "success": true
+}
+```
+
+### DELETE /terminals/{terminal_id}
+Delete a terminal.
+
+**Response:**
+```json
+{
+  "success": true
+}
+```
+
+---
+
+## Inbox (Terminal-to-Terminal Messaging)
+
+### POST /terminals/{receiver_id}/inbox/messages
+Send a message to another terminal's inbox.
+
+**Parameters:**
+- `sender_id` (string, required): Sender terminal ID
+- `message` (string, required): Message content
+
+**Response:**
+```json
+{
+  "success": true,
+  "message_id": "string",
+  "sender_id": "string",
+  "receiver_id": "string",
+  "created_at": "timestamp"
+}
+```
+
+**Behavior:**
+- Messages are queued and delivered when the receiver terminal is IDLE
+- Messages are delivered in order (oldest first)
+- Delivery is automatic via watchdog file monitoring
+
+### GET /inbox/status
+Get inbox service status.
+
+**Response:**
+```json
+{
+  "registered_terminals": ["terminal_id1", "terminal_id2"],
+  "active_watchers": 2,
+  "providers": ["terminal_id1", "terminal_id2"]
+}
+```
+
+---
+
+## Error Responses
+
+All endpoints return standard HTTP status codes:
+
+- `200 OK`: Success
+- `201 Created`: Resource created
+- `400 Bad Request`: Invalid parameters
+- `404 Not Found`: Resource not found
+- `500 Internal Server Error`: Server error
+
+Error response format:
+```json
+{
+  "detail": "Error message"
+}
+```
+
+---
+
