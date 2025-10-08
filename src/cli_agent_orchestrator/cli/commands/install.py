@@ -95,7 +95,7 @@ def install(agent_source: str):
         allowed_tools = profile.allowedTools
         if allowed_tools is None:
             # Default: allow all built-in tools and all MCP server tools
-            allowed_tools = ["@builtin"]
+            allowed_tools = ["@builtin", "fs_*", "execute_bash"]
             if profile.mcpServers:
                 for server_name in profile.mcpServers.keys():
                     allowed_tools.append(f"@{server_name}")
