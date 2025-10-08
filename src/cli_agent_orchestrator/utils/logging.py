@@ -1,12 +1,11 @@
 import logging
-import sys
+import os
 from datetime import datetime
-from typing import Optional
 from cli_agent_orchestrator.constants import LOG_DIR
 
-def setup_logging(level: Optional[str] = None) -> None:
+def setup_logging() -> None:
     """Setup logging configuration."""
-    log_level = getattr(logging, (level or "INFO").upper(), logging.INFO)
+    log_level = os.getenv("CAO_LOG_LEVEL", "INFO").upper()
     
     # Ensure log directory exists
     LOG_DIR.mkdir(parents=True, exist_ok=True)

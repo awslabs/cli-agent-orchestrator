@@ -7,13 +7,11 @@ from cli_agent_orchestrator.cli.commands.init import init
 from cli_agent_orchestrator.cli.commands.install import install
 from cli_agent_orchestrator.cli.commands.shutdown import shutdown
 from cli_agent_orchestrator.cli.commands.flow import flow
-from cli_agent_orchestrator.utils.logging import setup_logging
 
 
 @click.group()
 def cli():
     """CLI Agent Orchestrator."""
-    setup_logging()
 
 
 # Register commands

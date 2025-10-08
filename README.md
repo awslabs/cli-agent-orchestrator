@@ -16,15 +16,37 @@ uv tool install git+https://github.com/awslabs/cli-agent-orchestrator.git@main -
 ```
 
 ## Quick Start
-Install agents from agent store to Q CLI:
+
+### Installing Agents
+
+CAO supports installing agents from multiple sources:
+
+**1. Install built-in agents (bundled with CAO):**
 ```bash
 cao install code_supervisor
 cao install developer
 cao install reviewer
 ```
 
-Start the cao server
+**2. Install from a local file:**
+```bash
+cao install ./my-custom-agent.md
+cao install /absolute/path/to/agent.md
 ```
+
+**3. Install from a URL:**
+```bash
+cao install https://example.com/agents/custom-agent.md
+```
+
+When installing from a file or URL, the agent is saved to your local agent store (`~/.aws/cli-agent-orchestrator/agent-store/`) and can be referenced by name in future installations.
+
+For details on creating custom agent profiles, see [docs/agent-profile.md](docs/agent-profile.md).
+
+### Launching Agents
+
+Start the cao server:
+```bash
 cao-server
 ```
 

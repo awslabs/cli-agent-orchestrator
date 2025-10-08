@@ -1,5 +1,6 @@
 """Minimal database client with only terminal metadata."""
 
+import logging
 from datetime import datetime
 from typing import Optional, Dict, List
 from sqlalchemy import Column, String, DateTime, Integer, Boolean, create_engine
@@ -7,6 +8,8 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 from cli_agent_orchestrator.models.inbox import MessageStatus, InboxMessage
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR
 from cli_agent_orchestrator.models.flow import Flow
+
+logger = logging.getLogger(__name__)
 
 Base = declarative_base()
 
@@ -90,7 +93,9 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict]:
     with SessionLocal() as db:
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if not terminal:
+            logger.warning(f"Terminal metadata not found for terminal_id: {terminal_id}")
             return None
+        logger.debug(f"Retrieved terminal metadata for {terminal_id}: provider={terminal.provider}, session={terminal.tmux_session}")
         return {
             "id": terminal.id,
             "tmux_session": terminal.tmux_session,
@@ -195,6 +200,11 @@ def update_message_status(message_id: int, status: MessageStatus) -> bool:
         message = db.query(InboxModel).filter(InboxModel.id == message_id).first()
         if message:
             message.status = status.value
+            db.commit()
+            return True
+        return False
+
+
 # Flow database functions
 
 def create_flow(name: str, file_path: str, schedule: str, agent_profile: str, 

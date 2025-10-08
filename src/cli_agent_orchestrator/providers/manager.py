@@ -5,6 +5,7 @@ from typing import Dict, Optional
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.providers.q_cli import QCliProvider
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+from cli_agent_orchestrator.clients.database import get_terminal_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +38,37 @@ class ProviderManager:
             raise
     
     def get_provider(self, terminal_id: str) -> Optional[BaseProvider]:
-        """Get provider instance directly from map."""
-        return self._providers.get(terminal_id)
+        """Get provider instance, creating on-demand if not found.
+        
+        Args:
+            terminal_id: Terminal ID to get provider for
+            
+        Returns:
+            Provider instance
+            
+        Raises:
+            ValueError: If terminal not found in database or provider creation fails
+        """
+        # Check if already exists
+        provider = self._providers.get(terminal_id)
+        if provider:
+            return provider
+        
+        # Try to create on-demand from database metadata
+        metadata = get_terminal_metadata(terminal_id)
+        if not metadata:
+            raise ValueError(f"Terminal {terminal_id} not found in database")
+        
+        # Create provider on-demand
+        provider = self.create_provider(
+            metadata["provider"],
+            terminal_id,
+            metadata["tmux_session"],
+            metadata["tmux_window"],
+            metadata["agent_profile"]
+        )
+        logger.info(f"Created provider on-demand for terminal {terminal_id}")
+        return provider
     
     def cleanup_provider(self, terminal_id: str) -> None:
         """Cleanup provider and remove from map (used when terminal is deleted)."""

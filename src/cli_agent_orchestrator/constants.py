@@ -25,8 +25,15 @@ TERMINAL_LOG_DIR = LOG_DIR / "terminal"
 TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # Terminal log configuration
-TERMINAL_LOG_TAIL_LINES = 5  # Lines to check for IDLE patterns in inbox service
+INBOX_POLLING_INTERVAL = 2  # Seconds between polling for log file changes
+
+# Cleanup configuration
+RETENTION_DAYS = 14  # Days to keep terminals, messages, and logs
+
 AGENT_CONTEXT_DIR = CAO_HOME_DIR / "agent-context"
+
+# Agent store directories
+LOCAL_AGENT_STORE_DIR = CAO_HOME_DIR / "agent-store"
 
 # Q CLI directories
 Q_AGENTS_DIR = Path.home() / ".aws" / "amazonq" / "cli-agents"

@@ -8,11 +8,15 @@ from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from watchdog.observers.polling import PollingObserver
+
 from cli_agent_orchestrator.clients.database import init_db, create_inbox_message
 from cli_agent_orchestrator.services import session_service, terminal_service, flow_service, inbox_service
+from cli_agent_orchestrator.services.cleanup_service import cleanup_old_data
+from cli_agent_orchestrator.services.inbox_service import LogFileHandler
 from cli_agent_orchestrator.services.terminal_service import OutputMode
 from cli_agent_orchestrator.models.terminal import Terminal
-from cli_agent_orchestrator.constants import SERVER_VERSION, CORS_ORIGINS, SERVER_HOST, SERVER_PORT
+from cli_agent_orchestrator.constants import SERVER_VERSION, CORS_ORIGINS, SERVER_HOST, SERVER_PORT, TERMINAL_LOG_DIR, INBOX_POLLING_INTERVAL
 from cli_agent_orchestrator.utils.logging import setup_logging
 from cli_agent_orchestrator.utils.terminal import generate_session_name
 from cli_agent_orchestrator.providers.manager import provider_manager
@@ -54,13 +58,24 @@ async def lifespan(app: FastAPI):
     setup_logging()
     init_db()
     
+    # Run cleanup in background
+    asyncio.create_task(asyncio.to_thread(cleanup_old_data))
+    
     # Start flow daemon as background task
     daemon_task = asyncio.create_task(flow_daemon())
     
+    # Start inbox watcher
+    inbox_observer = PollingObserver(timeout=INBOX_POLLING_INTERVAL)
+    inbox_observer.schedule(LogFileHandler(), str(TERMINAL_LOG_DIR), recursive=False)
+    inbox_observer.start()
+    logger.info("Inbox watcher started (PollingObserver)")
+    
     yield
     
-    # Shutdown inbox watchers
-    await inbox_service.shutdown_all()
+    # Stop inbox observer
+    inbox_observer.stop()
+    inbox_observer.join()
+    logger.info("Inbox watcher stopped")
     
     # Cancel daemon on shutdown
     daemon_task.cancel()
@@ -213,8 +228,6 @@ async def exit_terminal(terminal_id: str) -> Dict:
     """Send provider-specific exit command to terminal."""
     try:
         provider = provider_manager.get_provider(terminal_id)
-        if not provider:
-            raise ValueError(f"No provider found for terminal {terminal_id}")
         exit_command = provider.exit_cli()
         terminal_service.send_input(terminal_id, exit_command)
         return {"success": True}
@@ -238,10 +251,11 @@ async def delete_terminal(terminal_id: str) -> Dict:
 
 @app.post("/terminals/{receiver_id}/inbox/messages")
 async def create_inbox_message_endpoint(receiver_id: str, sender_id: str, message: str) -> Dict:
-    """Create inbox message and trigger delivery check."""
+    """Create inbox message and attempt immediate delivery."""
     try:
         inbox_msg = create_inbox_message(sender_id, receiver_id, message)
         inbox_service.check_and_send_pending_messages(receiver_id)
+        
         return {
             "success": True,
             "message_id": inbox_msg.id,
@@ -253,16 +267,6 @@ async def create_inbox_message_endpoint(receiver_id: str, sender_id: str, messag
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to create inbox message: {str(e)}")
-
-
-@app.get("/inbox/status")
-async def get_inbox_status() -> Dict:
-    """Get inbox service status."""
-    return {
-        "registered_terminals": list(inbox_service._watch_tasks.keys()),
-        "active_watchers": len(inbox_service._watch_tasks),
-        "providers": list(inbox_service._providers.keys())
-    }
 
 
 def main():

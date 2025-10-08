@@ -2,13 +2,22 @@
 
 import frontmatter
 from importlib import resources
+from pathlib import Path
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
+from cli_agent_orchestrator.constants import LOCAL_AGENT_STORE_DIR
 
 
 def load_agent_profile(agent_name: str) -> AgentProfile:
-    """Load agent profile from agent_store."""
+    """Load agent profile from local or built-in agent store."""
     try:
-        # Use importlib.resources to access agent_store files
+        # Check local store first
+        local_profile = LOCAL_AGENT_STORE_DIR / f"{agent_name}.md"
+        if local_profile.exists():
+            profile_data = frontmatter.loads(local_profile.read_text())
+            profile_data.metadata['system_prompt'] = profile_data.content.strip()
+            return AgentProfile(**profile_data.metadata)
+        
+        # Fall back to built-in store
         agent_store = resources.files("cli_agent_orchestrator.agent_store")
         profile_file = agent_store / f"{agent_name}.md"
         
