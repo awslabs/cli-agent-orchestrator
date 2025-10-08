@@ -39,4 +39,5 @@ DATABASE_URL = f"sqlite:///{DATABASE_FILE}"
 SERVER_HOST = "localhost"
 SERVER_PORT = 8080
 SERVER_VERSION = "0.1.0"
+API_BASE_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
 CORS_ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"]

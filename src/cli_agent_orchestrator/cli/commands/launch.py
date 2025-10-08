@@ -2,10 +2,9 @@
 
 import subprocess
 import click
+import requests
 
-from cli_agent_orchestrator.services.terminal_service import create_terminal
-from cli_agent_orchestrator.constants import PROVIDERS
-from cli_agent_orchestrator.utils.terminal import generate_session_name
+from cli_agent_orchestrator.constants import PROVIDERS, SERVER_HOST, SERVER_PORT
 
 
 @click.command()
@@ -20,24 +19,28 @@ def launch(agents, session_name, headless, provider):
         if provider not in PROVIDERS:
             raise click.ClickException(f"Invalid provider '{provider}'. Available providers: {', '.join(PROVIDERS)}")
         
-        # Generate session name if not provided
-        if not session_name:
-            session_name = generate_session_name()
+        # Call API to create session
+        url = f"http://{SERVER_HOST}:{SERVER_PORT}/sessions"
+        params = {
+            "provider": provider,
+            "agent_profile": agents,
+        }
+        if session_name:
+            params["session_name"] = session_name
         
-        # Create session with terminal
-        terminal = create_terminal(
-            session_name=session_name,
-            provider=provider,
-            agent_profile=agents,
-            new_session=True
-        )
+        response = requests.post(url, params=params)
+        response.raise_for_status()
         
-        click.echo(f"Session created: {terminal.session_name}")
-        click.echo(f"Terminal created: {terminal.name}")
+        terminal = response.json()
+        
+        click.echo(f"Session created: {terminal['session_name']}")
+        click.echo(f"Terminal created: {terminal['name']}")
         
         # Attach to tmux session unless headless
         if not headless:
-            subprocess.run(["tmux", "attach-session", "-t", terminal.session_name])
+            subprocess.run(["tmux", "attach-session", "-t", terminal['session_name']])
             
+    except requests.exceptions.RequestException as e:
+        raise click.ClickException(f"Failed to connect to cao-server: {str(e)}")
     except Exception as e:
         raise click.ClickException(str(e))

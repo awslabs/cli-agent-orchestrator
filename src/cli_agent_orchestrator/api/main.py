@@ -8,12 +8,14 @@ from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from cli_agent_orchestrator.clients.database import init_db
-from cli_agent_orchestrator.services import session_service, terminal_service, flow_service
+from cli_agent_orchestrator.clients.database import init_db, create_inbox_message
+from cli_agent_orchestrator.services import session_service, terminal_service, flow_service, inbox_service
 from cli_agent_orchestrator.services.terminal_service import OutputMode
 from cli_agent_orchestrator.models.terminal import Terminal
 from cli_agent_orchestrator.constants import SERVER_VERSION, CORS_ORIGINS, SERVER_HOST, SERVER_PORT
 from cli_agent_orchestrator.utils.logging import setup_logging
+from cli_agent_orchestrator.utils.terminal import generate_session_name
+from cli_agent_orchestrator.providers.manager import provider_manager
 
 logger = logging.getLogger(__name__)
 
@@ -39,18 +41,7 @@ async def flow_daemon():
         await asyncio.sleep(60)
 
 
-# Request/Response Models
-class CreateSessionRequest(BaseModel):
-    name: str = Field(..., description="Session name (with cao- prefix)", min_length=1)
-    provider: str = Field(..., description="Provider type (q_cli, claude_code)")
-    agent_profile: str = Field(None, description="Agent profile for Q CLI provider")
-    window_name: str = Field("terminal", description="Terminal window name")
-
-
-class TerminalInputRequest(BaseModel):
-    message: str = Field(..., description="Message to send to terminal")
-
-
+# Response Models
 class TerminalOutputResponse(BaseModel):
     output: str
     mode: str
@@ -67,6 +58,9 @@ async def lifespan(app: FastAPI):
     daemon_task = asyncio.create_task(flow_daemon())
     
     yield
+    
+    # Shutdown inbox watchers
+    await inbox_service.shutdown_all()
     
     # Cancel daemon on shutdown
     daemon_task.cancel()
@@ -100,14 +94,17 @@ async def health_check():
 
 
 @app.post("/sessions", response_model=Terminal, status_code=status.HTTP_201_CREATED)
-async def create_session(request: CreateSessionRequest) -> Terminal:
+async def create_session(
+    provider: str,
+    agent_profile: str,
+    session_name: str = None
+) -> Terminal:
     """Create a new session with exactly one terminal."""
     try:
         result = terminal_service.create_terminal(
-            session_name=request.name,
-            provider=request.provider,
-            agent_profile=request.agent_profile,
-            window_name=request.window_name,
+            provider=provider,
+            agent_profile=agent_profile,
+            session_name=session_name,
             new_session=True
         )
         return result
@@ -148,14 +145,17 @@ async def delete_session(session_name: str) -> Dict:
 
 
 @app.post("/sessions/{session_name}/terminals", response_model=Terminal, status_code=status.HTTP_201_CREATED)
-async def create_terminal_in_session(session_name: str, request: CreateSessionRequest) -> Terminal:
+async def create_terminal_in_session(
+    session_name: str,
+    provider: str,
+    agent_profile: str
+) -> Terminal:
     """Create additional terminal in existing session."""
     try:
         result = terminal_service.create_terminal(
+            provider=provider,
+            agent_profile=agent_profile,
             session_name=session_name,
-            provider=request.provider,
-            agent_profile=request.agent_profile,
-            window_name=request.window_name,
             new_session=False
         )
         return result
@@ -187,9 +187,9 @@ async def get_terminal(terminal_id: str) -> Terminal:
 
 
 @app.post("/terminals/{terminal_id}/input")
-async def send_terminal_input(terminal_id: str, request: TerminalInputRequest) -> Dict:
+async def send_terminal_input(terminal_id: str, message: str) -> Dict:
     try:
-        success = terminal_service.send_input(terminal_id, request.message)
+        success = terminal_service.send_input(terminal_id, message)
         return {"success": success}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -208,6 +208,22 @@ async def get_terminal_output(terminal_id: str, mode: OutputMode = OutputMode.FU
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to get output: {str(e)}")
 
 
+@app.post("/terminals/{terminal_id}/exit")
+async def exit_terminal(terminal_id: str) -> Dict:
+    """Send provider-specific exit command to terminal."""
+    try:
+        provider = provider_manager.get_provider(terminal_id)
+        if not provider:
+            raise ValueError(f"No provider found for terminal {terminal_id}")
+        exit_command = provider.exit_cli()
+        terminal_service.send_input(terminal_id, exit_command)
+        return {"success": True}
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to exit terminal: {str(e)}")
+
+
 @app.delete("/terminals/{terminal_id}")
 async def delete_terminal(terminal_id: str) -> Dict:
     """Delete a terminal."""
@@ -218,6 +234,35 @@ async def delete_terminal(terminal_id: str) -> Dict:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to delete terminal: {str(e)}")
+
+
+@app.post("/terminals/{receiver_id}/inbox/messages")
+async def create_inbox_message_endpoint(receiver_id: str, sender_id: str, message: str) -> Dict:
+    """Create inbox message and trigger delivery check."""
+    try:
+        inbox_msg = create_inbox_message(sender_id, receiver_id, message)
+        inbox_service.check_and_send_pending_messages(receiver_id)
+        return {
+            "success": True,
+            "message_id": inbox_msg.id,
+            "sender_id": inbox_msg.sender_id,
+            "receiver_id": inbox_msg.receiver_id,
+            "created_at": inbox_msg.created_at.isoformat()
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to create inbox message: {str(e)}")
+
+
+@app.get("/inbox/status")
+async def get_inbox_status() -> Dict:
+    """Get inbox service status."""
+    return {
+        "registered_terminals": list(inbox_service._watch_tasks.keys()),
+        "active_watchers": len(inbox_service._watch_tasks),
+        "providers": list(inbox_service._providers.keys())
+    }
 
 
 def main():

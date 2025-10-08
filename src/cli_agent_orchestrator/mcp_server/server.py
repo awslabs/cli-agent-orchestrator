@@ -1,20 +1,18 @@
 """CLI Agent Orchestrator MCP Server implementation."""
 
 import asyncio
+import logging
 import os
 import time
 from typing import Dict, Any
+import requests
 
 from fastmcp import FastMCP
 from pydantic import Field
 
-from cli_agent_orchestrator.services import terminal_service
-from cli_agent_orchestrator.clients.database import get_terminal_metadata, create_inbox_message
-from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
-from cli_agent_orchestrator.constants import DEFAULT_PROVIDER
+from cli_agent_orchestrator.constants import DEFAULT_PROVIDER, API_BASE_URL
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.models.inbox import MessageStatus
 from cli_agent_orchestrator.utils.terminal import generate_session_name, wait_until_terminal_status
 
 # Create MCP server
@@ -85,69 +83,72 @@ async def handoff(
         # Get current terminal ID from environment
         current_terminal_id = os.environ.get('CAO_TERMINAL_ID')
         if current_terminal_id:
-            # Get terminal metadata from database
-            terminal_metadata = get_terminal_metadata(current_terminal_id)
-            if not terminal_metadata:
-                return HandoffResult(
-                    success=False,
-                    message=f"Could not find terminal record for {current_terminal_id}",
-                    output=None,
-                    terminal_id=current_terminal_id
-                )
+            # Get terminal metadata via API
+            response = requests.get(f"{API_BASE_URL}/terminals/{current_terminal_id}")
+            response.raise_for_status()
+            terminal_metadata = response.json()
             
             provider = terminal_metadata["provider"]
-            session_name = terminal_metadata["tmux_session"]
+            session_name = terminal_metadata["session_name"]
             
             # Create new terminal in existing session
-            terminal = terminal_service.create_terminal(
-                session_name=session_name,
-                provider=provider,
-                agent_profile=agent_profile,
-                new_session=False
+            response = requests.post(
+                f"{API_BASE_URL}/sessions/{session_name}/terminals",
+                params={"provider": provider, "agent_profile": agent_profile}
             )
+            response.raise_for_status()
+            terminal = response.json()
         else:
             # Create new session with terminal
             session_name = generate_session_name()
-            terminal = terminal_service.create_terminal(
-                session_name=session_name,
-                provider=provider,
-                agent_profile=agent_profile,
-                new_session=True
+            response = requests.post(
+                f"{API_BASE_URL}/sessions",
+                params={"provider": provider, "agent_profile": agent_profile, "session_name": session_name}
             )
+            response.raise_for_status()
+            terminal = response.json()
+        
+        terminal_id = terminal["id"]
         
         # Wait for terminal to be IDLE before sending message
-        if not wait_until_terminal_status(terminal.id, TerminalStatus.IDLE, timeout=30.0):
+        if not wait_until_terminal_status(terminal_id, TerminalStatus.IDLE, timeout=30.0):
             return HandoffResult(
                 success=False,
-                message=f"Terminal {terminal.id} did not reach IDLE status within 30 seconds",
+                message=f"Terminal {terminal_id} did not reach IDLE status within 30 seconds",
                 output=None,
-                terminal_id=terminal.id
+                terminal_id=terminal_id
             )
         
         await asyncio.sleep(2)  # wait another 2s
         
         # Send message to terminal
-        terminal_service.send_input(terminal.id, message)
+        response = requests.post(
+            f"{API_BASE_URL}/terminals/{terminal_id}/input",
+            params={"message": message}
+        )
+        response.raise_for_status()
         
         # Monitor until completion with timeout
-        if not wait_until_terminal_status(terminal.id, TerminalStatus.COMPLETED, timeout=timeout, polling_interval=0.5):
+        if not wait_until_terminal_status(terminal_id, TerminalStatus.COMPLETED, timeout=timeout, polling_interval=1.0):
             return HandoffResult(
                 success=False,
                 message=f"Handoff timed out after {timeout} seconds",
                 output=None,
-                terminal_id=terminal.id
+                terminal_id=terminal_id
             )
         
         # Get the response
-        output = terminal_service.get_output(terminal.id, terminal_service.OutputMode.LAST)
+        response = requests.get(
+            f"{API_BASE_URL}/terminals/{terminal_id}/output",
+            params={"mode": "last"}
+        )
+        response.raise_for_status()
+        output_data = response.json()
+        output = output_data["output"]
         
         # Send provider-specific exit command to cleanup terminal
-        provider_instance = provider_manager.get_provider(terminal.id)
-        if provider_instance:
-            exit_command = provider_instance.exit_cli()
-            terminal_service.send_input(terminal.id, exit_command)
-        else:
-            raise ValueError(f"No provider found for terminal {terminal.id}")
+        response = requests.post(f"{API_BASE_URL}/terminals/{terminal_id}/exit")
+        response.raise_for_status()
         
         execution_time = time.time() - start_time
         
@@ -155,7 +156,7 @@ async def handoff(
             success=True,
             message=f"Successfully handed off to {agent_profile} ({provider}) in {execution_time:.2f}s",
             output=output,
-            terminal_id=terminal.id
+            terminal_id=terminal_id
         )
         
     except Exception as e:
@@ -187,24 +188,17 @@ async def send_message(
     try:
         # Get sender terminal ID from environment
         sender_id = os.getenv("CAO_TERMINAL_ID")
+        
         if not sender_id:
             raise ValueError("CAO_TERMINAL_ID not set - cannot determine sender")
         
-        # Validate receiver terminal exists
-        receiver_metadata = get_terminal_metadata(receiver_id)
-        if not receiver_metadata:
-            raise ValueError(f"Receiver terminal '{receiver_id}' not found")
-        
-        # Create inbox message
-        inbox_msg = create_inbox_message(sender_id, receiver_id, message)
-        
-        return {
-            "success": True,
-            "message_id": inbox_msg.id,
-            "sender_id": inbox_msg.sender_id,
-            "receiver_id": inbox_msg.receiver_id,
-            "created_at": inbox_msg.created_at.isoformat()
-        }
+        # Create inbox message via API
+        response = requests.post(
+            f"{API_BASE_URL}/terminals/{receiver_id}/inbox/messages",
+            params={"sender_id": sender_id, "message": message}
+        )
+        response.raise_for_status()
+        return response.json()
         
     except Exception as e:
         return {

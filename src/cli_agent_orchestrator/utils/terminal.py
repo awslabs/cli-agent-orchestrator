@@ -3,7 +3,8 @@
 import time
 import uuid
 import logging
-from cli_agent_orchestrator.constants import SESSION_PREFIX
+import httpx
+from cli_agent_orchestrator.constants import SESSION_PREFIX, API_BASE_URL
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,7 @@ def wait_until_status(
     
     while time.time() - start_time < timeout:
         status = provider_instance.get_status()
+        logger.info(f"Waiting for {target_status}, current status: {status}")
         if status == target_status:
             return True
         time.sleep(polling_interval)
@@ -69,11 +71,17 @@ def wait_until_terminal_status(
     timeout: float = 30.0,
     polling_interval: float = 1.0
 ) -> bool:
-    """Wait until terminal reaches target status by looking up provider and calling wait_until_status."""
-    from cli_agent_orchestrator.providers.manager import provider_manager
-    
-    provider_instance = provider_manager.get_provider(terminal_id)
-    if not provider_instance:
-        raise ValueError(f"No provider found for terminal {terminal_id}")
-    
-    return wait_until_status(provider_instance, target_status, timeout, polling_interval)
+    """Wait until terminal reaches target status using API endpoint."""
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        try:
+            response = httpx.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=10.0)
+            logger.info(response)
+            if response.status_code == 200:
+                terminal_data = response.json()
+                if terminal_data["status"] == target_status.value:
+                    return True
+        except Exception:
+            pass
+        time.sleep(polling_interval)
+    return False

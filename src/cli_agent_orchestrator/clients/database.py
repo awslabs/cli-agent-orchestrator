@@ -2,7 +2,7 @@
 
 from datetime import datetime
 from typing import Optional, Dict, List
-from sqlalchemy import Column, String, DateTime, Integer, create_engine
+from sqlalchemy import Column, String, DateTime, Integer, Boolean, create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 from cli_agent_orchestrator.models.inbox import MessageStatus, InboxMessage
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR

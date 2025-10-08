@@ -1,11 +1,14 @@
 """Q CLI provider implementation."""
 
 import re
+import logging
 from typing import List
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.utils.terminal import wait_until_status, wait_for_shell
+
+logger = logging.getLogger(__name__)
 
 # Regex patterns for Q CLI output analysis (module-level constants)
 GREEN_ARROW_PATTERN = r'\x1b\[38;5;10m>\s*\x1b\[39m'
@@ -14,7 +17,6 @@ ESCAPE_SEQUENCE_PATTERN = r'\[[?0-9;]*[a-zA-Z]'
 CONTROL_CHAR_PATTERN = r'[\x00-\x1f\x7f-\x9f]'
 BELL_CHAR = '\x07'
 GENERIC_PROMPT_PATTERN = r'\x1b\[38;5;13m>\s*\x1b\[39m\s*$'
-IDLE_PATTERNS = ['\x1b[38;5;13m>', '\x1b[38;5;14m[']
 
 # Error indicators
 ERROR_INDICATORS = ["Amazon Q is having trouble responding right now"]
@@ -29,7 +31,8 @@ class QCliProvider(BaseProvider):
         self._initialized = False
         self._agent_profile = agent_profile
         # Create dynamic prompt pattern based on agent profile
-        self._idle_prompt_pattern = rf'\x1b\[38;5;14m\[{re.escape(self._agent_profile)}\]\s*\x1b\[38;5;13m>\s*\x1b\[39m\s*$'
+        # Matches: [agent] > with optional color reset and optional trailing whitespace/newlines
+        self._idle_prompt_pattern = rf'\x1b\[38;5;14m\[{re.escape(self._agent_profile)}\]\s*\x1b\[38;5;13m>\s*(?:\x1b\[39m)?[\s\n]*$'
         self._permission_prompt_pattern = r'Allow this action\?.*\[.*y.*\/.*n.*\/.*t.*\]:\x1b\[39m\s*' + self._idle_prompt_pattern
     
     def initialize(self) -> bool:
@@ -54,6 +57,12 @@ class QCliProvider(BaseProvider):
         if not output:
             return TerminalStatus.ERROR
         
+        # Check if we have the idle prompt (not processing)
+        has_idle_prompt = re.search(self._idle_prompt_pattern, output)
+        
+        if not has_idle_prompt:
+            return TerminalStatus.PROCESSING
+        
         # Check for error indicators
         clean_output = re.sub(ANSI_CODE_PATTERN, '', output).lower()
         if any(indicator.lower() in clean_output for indicator in ERROR_INDICATORS):
@@ -63,69 +72,43 @@ class QCliProvider(BaseProvider):
         if re.search(self._permission_prompt_pattern, output, re.MULTILINE | re.DOTALL):
             return TerminalStatus.WAITING_USER_ANSWER
         
-        # Check for agent-specific prompt
-        if re.search(self._idle_prompt_pattern, output):
-            # Has response message = completed, no response = idle
-            lines = output.split('\n')
-            last_prompt_idx = -1
-            last_arrow_idx = -1
-            
-            for i, line in enumerate(lines):
-                if re.search(self._idle_prompt_pattern, line):
-                    last_prompt_idx = i
-                if re.search(GREEN_ARROW_PATTERN, line):
-                    last_arrow_idx = i
-            
-            if last_arrow_idx != -1 and last_prompt_idx != -1 and last_arrow_idx < last_prompt_idx:
-                return TerminalStatus.COMPLETED
-            return TerminalStatus.IDLE
+        # Check for completed state (has response + agent prompt)
+        if re.search(GREEN_ARROW_PATTERN, output):
+            return TerminalStatus.COMPLETED
         
-        # Check for generic prompt (invalid agent)
-        if re.search(GENERIC_PROMPT_PATTERN, output):
-            raise ValueError(f"Invalid agent profile '{self._agent_profile}' - Q CLI fell back to generic prompt")
-        
-        # No prompt = processing
-        return TerminalStatus.PROCESSING
-    
-    def get_idle_patterns(self) -> List[str]:
-        """Return Q CLI IDLE prompt patterns."""
-        return IDLE_PATTERNS
+        # Just agent prompt, no response
+        return TerminalStatus.IDLE
     
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract agent's final response message using green arrow indicator."""
-        matches = list(re.finditer(GREEN_ARROW_PATTERN, script_output))
+        # Find last green arrow and idle prompt
+        green_arrows = list(re.finditer(GREEN_ARROW_PATTERN, script_output))
+        idle_prompts = list(re.finditer(self._idle_prompt_pattern, script_output))
         
-        if not matches:
+        if not green_arrows:
             raise ValueError("No Q CLI response found - no green arrow pattern detected")
         
-        # Extract text after last green arrow until final prompt
-        last_match = matches[-1]
-        remaining_text = script_output[last_match.end():]
-        lines = remaining_text.split('\n')
-        final_lines = []
-        found_final_prompt = False
-        
-        for line in lines:
-            if re.search(self._idle_prompt_pattern, line):
-                found_final_prompt = True
-                break
-            
-            clean_line = line.strip()
-            if not clean_line.startswith(BELL_CHAR):
-                final_lines.append(clean_line)
-        
-        if not found_final_prompt:
+        if not idle_prompts:
             raise ValueError("Incomplete Q CLI response - no final prompt detected")
         
-        if not final_lines or not any(line.strip() for line in final_lines):
+        # Extract text between last green arrow and last idle prompt
+        start_pos = green_arrows[-1].end()
+        end_pos = idle_prompts[-1].start()
+        
+        final_answer = script_output[start_pos:end_pos].strip()
+        
+        if not final_answer:
             raise ValueError("Empty Q CLI response - no content found")
         
         # Clean up the message
-        final_answer = '\n'.join(final_lines).strip()
         final_answer = re.sub(ANSI_CODE_PATTERN, '', final_answer)
         final_answer = re.sub(ESCAPE_SEQUENCE_PATTERN, '', final_answer)
         final_answer = re.sub(CONTROL_CHAR_PATTERN, '', final_answer)
         return final_answer.strip()
+    
+    def get_idle_patterns(self) -> List[str]:
+        """Return Q CLI IDLE prompt patterns."""
+        return self._idle_prompt_pattern
     
     # TODO: exit_cli should run the tmux.send_keys directly with /exit or ctrl-c twice
     def exit_cli(self) -> str:
