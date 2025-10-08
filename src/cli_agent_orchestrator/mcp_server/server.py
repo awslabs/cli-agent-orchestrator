@@ -234,13 +234,10 @@ async def delegate(
 ) -> Dict[str, Any]:
     """Delegate a task to another agent without blocking.
     
-    Creates a new terminal with the specified agent profile and sends the message immediately.
-    Returns without waiting for completion, allowing the current (host) agent to continue working.
-    
-    The worker agent should be instructed to send results back via send_message tool.
-    **IMPORTANT**: The terminal id of each agent is available in environment variable $CAO_TERMINAL_ID.
-    You must include your terminal_id in the message to the worker agent to allow callback.
-    Example message: "Analyze the logs. When done, send results to terminal {host_terminal_id} using send_message tool."
+    In the message to the worker agent include instruction to send results back via send_message tool.
+    **IMPORTANT**: The terminal id of each agent is available in environment variable CAO_TERMINAL_ID.
+    When delegating, first find out your own CAO_TERMINAL_ID value, then include the terminal_id value in the message to the worker agent to allow callback.
+    Example message: "Analyze the logs. When done, send results back to terminal ee3f93b3 using send_message tool."
     
     Args:
         agent_profile: Agent profile for the worker terminal

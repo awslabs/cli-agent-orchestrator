@@ -20,7 +20,7 @@ RESPONSE_PATTERN = r'⏺(?:\x1b\[[0-9;]*m)*\s+'  # Handle any ANSI codes between
 PROCESSING_PATTERN = r'[✶✢✽✻·✳].*….*\(esc to interrupt.*\)'
 IDLE_PROMPT_PATTERN = r'>[\s\xa0]'  # Handle both regular space and non-breaking space
 WAITING_USER_ANSWER_PATTERN = r'❯.*\d+\.'  # Pattern for Claude showing selection options with arrow cursor
-IDLE_PATTERNS = ['>']
+IDLE_PROMPT_PATTERN_LOG = r'>[\s\xa0]'  # Same pattern for log files
 
 
 class ClaudeCodeProvider(BaseProvider):
@@ -68,11 +68,11 @@ class ClaudeCodeProvider(BaseProvider):
         self._initialized = True
         return True
     
-    def get_status(self) -> TerminalStatus:
+    def get_status(self, tail_lines: int = None) -> TerminalStatus:
         """Get Claude Code status by analyzing terminal output."""
         
         # Use tmux client singleton to get window history
-        output = tmux_client.get_history(self.session_name, self.window_name)
+        output = tmux_client.get_history(self.session_name, self.window_name, tail_lines=tail_lines)
         
         if not output:
             return TerminalStatus.ERROR
@@ -96,9 +96,9 @@ class ClaudeCodeProvider(BaseProvider):
         # If no recognizable state, return None
         return None
     
-    def get_idle_patterns(self) -> List[str]:
-        """Return Claude Code IDLE prompt patterns."""
-        return IDLE_PATTERNS
+    def get_idle_pattern_for_log(self) -> str:
+        """Return Claude Code IDLE prompt pattern for log files."""
+        return IDLE_PROMPT_PATTERN_LOG
     
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract Claude's final response message using ⏺ indicator."""

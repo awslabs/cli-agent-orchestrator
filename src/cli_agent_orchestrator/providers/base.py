@@ -30,8 +30,11 @@ class BaseProvider(ABC):
         pass
     
     @abstractmethod
-    def get_status(self) -> TerminalStatus:
+    def get_status(self, tail_lines: int = None) -> TerminalStatus:
         """Get current provider status by analyzing terminal output.
+        
+        Args:
+            tail_lines: Number of lines to capture from terminal (default: provider-specific)
         
         Returns:
             TerminalStatus: Current status of the provider
@@ -39,14 +42,14 @@ class BaseProvider(ABC):
         pass
     
     @abstractmethod
-    def get_idle_patterns(self) -> List[str]:
-        """Get list of patterns that indicate IDLE state in terminal output.
+    def get_idle_pattern_for_log(self) -> str:
+        """Get pattern that indicates IDLE state in log file output.
         
         Used for quick detection in file watcher before calling full get_status().
-        Should return patterns that appear in the IDLE prompt.
+        Should return a simple pattern that appears in the IDLE prompt.
         
         Returns:
-            List[str]: Patterns to search for in last N lines
+            str: Pattern to search for in log file tail
         """
         pass
     

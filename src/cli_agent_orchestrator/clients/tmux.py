@@ -3,7 +3,6 @@
 import logging
 import os
 import re
-import subprocess
 import time
 from typing import List, Dict, Optional
 import libtmux
@@ -104,8 +103,14 @@ class TmuxClient:
             logger.error(f"Failed to send keys to {session_name}:{window_name}: {e}")
             raise
 
-    def get_history(self, session_name: str, window_name: str) -> str:
-        """Get window history."""
+    def get_history(self, session_name: str, window_name: str, tail_lines: int = TMUX_HISTORY_LINES) -> str:
+        """Get window history.
+        
+        Args:
+            session_name: Name of tmux session
+            window_name: Name of window in session
+            tail_lines: Number of lines to capture from end (default: TMUX_HISTORY_LINES)
+        """
         try:
             session = self.server.sessions.get(session_name=session_name)
             if not session:
@@ -117,7 +122,7 @@ class TmuxClient:
             
             # Use cmd to run capture-pane with -e (escape sequences) and -p (print) flags
             pane = window.panes[0]
-            result = pane.cmd('capture-pane', '-e', '-p', '-S', f'-{TMUX_HISTORY_LINES}')
+            result = pane.cmd('capture-pane', '-e', '-p', '-S', f'-{tail_lines}')
             # Join all lines with newlines to get complete output
             return '\n'.join(result.stdout) if result.stdout else ""
         except Exception as e:
@@ -184,7 +189,7 @@ class TmuxClient:
             return False
     
     def pipe_pane(self, session_name: str, window_name: str, file_path: str) -> None:
-        """Start piping pane output to file with unbuffered output.
+        """Start piping pane output to file.
         
         Args:
             session_name: Tmux session name
@@ -192,13 +197,18 @@ class TmuxClient:
             file_path: Absolute path to log file
         """
         try:
-            target = f"{session_name}:{window_name}"
-            cmd = ['tmux', 'pipe-pane', '-t', target, '-o', f'stdbuf -oL -eL cat >> {file_path}']
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
-            logger.info(f"Started pipe-pane for {target} to {file_path}")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to start pipe-pane for {session_name}:{window_name}: {e.stderr}")
-            raise
+            session = self.server.sessions.get(session_name=session_name)
+            if not session:
+                raise ValueError(f"Session '{session_name}' not found")
+            
+            window = session.windows.get(window_name=window_name)
+            if not window:
+                raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
+            
+            pane = window.active_pane
+            if pane:
+                pane.cmd('pipe-pane', '-o', f'cat >> {file_path}')
+                logger.info(f"Started pipe-pane for {session_name}:{window_name} to {file_path}")
         except Exception as e:
             logger.error(f"Failed to start pipe-pane for {session_name}:{window_name}: {e}")
             raise
@@ -211,16 +221,22 @@ class TmuxClient:
             window_name: Tmux window name
         """
         try:
-            target = f"{session_name}:{window_name}"
-            cmd = ['tmux', 'pipe-pane', '-t', target]
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
-            logger.info(f"Stopped pipe-pane for {target}")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to stop pipe-pane for {session_name}:{window_name}: {e.stderr}")
-            raise
+            session = self.server.sessions.get(session_name=session_name)
+            if not session:
+                raise ValueError(f"Session '{session_name}' not found")
+            
+            window = session.windows.get(window_name=window_name)
+            if not window:
+                raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
+            
+            pane = window.active_pane
+            if pane:
+                pane.cmd('pipe-pane')
+                logger.info(f"Stopped pipe-pane for {session_name}:{window_name}")
         except Exception as e:
             logger.error(f"Failed to stop pipe-pane for {session_name}:{window_name}: {e}")
             raise
+
 
 # Module-level singleton
 tmux_client = TmuxClient()
