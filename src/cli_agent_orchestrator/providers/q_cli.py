@@ -32,9 +32,11 @@ class QCliProvider(BaseProvider):
         self._initialized = False
         self._agent_profile = agent_profile
         # Create dynamic prompt pattern based on agent profile
-        # Matches: [agent] !> or [agent] > with optional color reset and optional trailing whitespace/newlines
-        self._idle_prompt_pattern = rf'\x1b\[38;5;14m\[{re.escape(self._agent_profile)}\]\s*(?:\x1b\[38;5;9m!\s*)?\x1b\[38;5;13m>\s*(?:\x1b\[39m)?[\s\n]*$'
+        # Matches: [agent] !> or [agent] > or [agent] X% > with optional color reset and optional trailing whitespace/newlines
+        # The percentage has its own ANSI color codes: \x1b[38;5;10m2% 
+        self._idle_prompt_pattern = rf'\x1b\[38;5;14m\[{re.escape(self._agent_profile)}\]\s*(?:\x1b\[38;5;10m\d+%\s*)?(?:\x1b\[38;5;9m!\s*)?\x1b\[38;5;13m>\s*(?:\x1b\[39m)?[\s\n]*$'
         self._permission_prompt_pattern = r'Allow this action\?.*\[.*y.*\/.*n.*\/.*t.*\]:\x1b\[39m\s*' + self._idle_prompt_pattern
+    
     
     def initialize(self) -> bool:
         """Initialize Q CLI provider by starting q chat command."""
