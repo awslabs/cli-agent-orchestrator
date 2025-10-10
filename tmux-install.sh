@@ -11,7 +11,7 @@
 # 4. Optionally installs enhanced tmux configuration
 # 
 # Usage:
-#   bash <(curl -s https://raw.githubusercontent.com/awslabs/cli-agent-orchestrator/install-script/tmux-install.sh)
+#   bash <(curl -s https://raw.githubusercontent.com/awslabs/cli-agent-orchestrator/main/tmux-install.sh)
 #   or
 #   bash tmux-install.sh
 # =============================================================================
@@ -26,7 +26,7 @@ readonly YELLOW='\033[1;33m'
 readonly NC='\033[0m'
 
 # Configuration
-readonly TMUX_CONF_URL="https://raw.githubusercontent.com/awslabs/cli-agent-orchestrator/install-script/.tmux.conf"
+readonly TMUX_CONF_URL="https://raw.githubusercontent.com/awslabs/cli-agent-orchestrator/main/.tmux.conf"
 
 # Logging functions
 log_info() { echo -e "${BLUE}[INFO]${NC} $1" >&2; }
@@ -526,14 +526,6 @@ main() {
     echo "========================================"
     log_success "Installation completed!"
     echo "========================================"
-    echo ""
-    
-    echo "tmux is now ready to use!"
-    echo ""
-    echo "Quick start:"
-    echo "  tmux          # Start a new session"
-    echo "  tmux ls       # List sessions"
-    echo "  tmux attach   # Attach to last session"
     echo ""
 }
 
