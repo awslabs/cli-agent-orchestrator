@@ -6,9 +6,17 @@ For project structure and architecture details, see [CODEBASE.md](CODEBASE.md).
 
 ## Installation
 
-1. Install [tmux](https://github.com/tmux/tmux/wiki/Installing)
+1. Install tmux (version 3.3 or higher required)
 
-2. Install [uv](https://docs.astral.sh/uv/getting-started/installation/)
+```bash
+bash <(curl -s https://raw.githubusercontent.com/awslabs/cli-agent-orchestrator/install-script/tmux-install.sh)
+```
+
+2. Install uv
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
 
 3. Install CLI Agent Orchestrator:
 ```bash
