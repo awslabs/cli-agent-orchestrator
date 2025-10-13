@@ -113,7 +113,7 @@ CAO supports three orchestration patterns:
 - Sends the task message and waits for the agent to finish
 - Returns the agent's output to the caller
 - Automatically exits the agent after completion
-- Use when you need sequential task execution with results
+- Use when you need **synchronous** task execution with results
 
 Example: Sequential code review workflow
 ```
@@ -137,7 +137,7 @@ Supervisor ← receives review ← Reviewer exits
 - Agent continues working in the background
 - Delegated agent sends results back to supervisor via `send_message` when complete
 - Messages are queued for delivery if the supervisor is busy (common in parallel workflows)
-- Use for parallel task execution or fire-and-forget operations
+- Use for **asynchronous** task execution or fire-and-forget operations
 
 Example: Parallel test execution
 ```
@@ -154,7 +154,7 @@ Supervisor ← send_message("Unit tests passed") ← Tester 1
 - Sends a message to a specific terminal's inbox
 - Messages are queued and delivered when the terminal is idle
 - Enables ongoing collaboration between agents
-- Common for swarm operations where multiple agents coordinate dynamically
+- Common for **swarm** operations where multiple agents coordinate dynamically
 - Use for iterative feedback or multi-turn conversations
 
 Example: Multi-role feature development
