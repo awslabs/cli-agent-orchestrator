@@ -9,7 +9,7 @@ For project structure and architecture details, see [CODEBASE.md](CODEBASE.md).
 1. Install tmux (version 3.3 or higher required)
 
 ```bash
-bash <(curl -s https://raw.githubusercontent.com/awslabs/cli-agent-orchestrator/install-script/tmux-install.sh)
+bash <(curl -s https://raw.githubusercontent.com/awslabs/cli-agent-orchestrator/main/tmux-install.sh)
 ```
 
 2. Install uv
@@ -89,6 +89,92 @@ Ctrl+b, then d
 # Delete a session
 cao shutdown --session <session-name>
 ```
+
+## MCP Server Tools and Orchestration Modes
+
+CAO provides a local HTTP server that processes orchestration requests. CLI agents can interact with this server through MCP tools to coordinate multi-agent workflows.
+
+### How It Works
+
+Each agent terminal is assigned a unique `CAO_TERMINAL_ID` environment variable. The server uses this ID to:
+- Route messages between agents
+- Track terminal status (IDLE, BUSY, COMPLETED, ERROR)
+- Manage terminal-to-terminal communication via inbox
+- Coordinate orchestration operations
+
+When an agent calls an MCP tool, the server identifies the caller by their `CAO_TERMINAL_ID` and orchestrates accordingly.
+
+### Orchestration Modes
+
+CAO supports three orchestration patterns:
+
+**1. Handoff** - Transfer control to another agent and wait for completion
+- Creates a new terminal with the specified agent profile
+- Sends the task message and waits for the agent to finish
+- Returns the agent's output to the caller
+- Automatically exits the agent after completion
+- Use when you need sequential task execution with results
+
+Example: Sequential code review workflow
+```
+Supervisor → handoff(developer, "Implement login feature") → waits
+                                                              ↓
+                                                    Developer completes
+                                                              ↓
+Supervisor ← receives code ← Developer exits
+          ↓
+          → handoff(reviewer, "Review login code") → waits
+                                                      ↓
+                                              Reviewer completes
+                                                      ↓
+Supervisor ← receives review ← Reviewer exits
+```
+
+**2. Delegate** - Spawn an agent to work independently (async)
+- Creates a new terminal with the specified agent profile
+- Sends the task message with callback instructions
+- Returns immediately with the terminal ID
+- Agent continues working in the background
+- Delegated agent sends results back to supervisor via `send_message` when complete
+- Messages are queued for delivery if the supervisor is busy (common in parallel workflows)
+- Use for parallel task execution or fire-and-forget operations
+
+Example: Parallel test execution
+```
+Supervisor → delegate(tester, "Run unit tests") → continues immediately
+          → delegate(tester, "Run integration tests") → continues immediately
+          → delegate(tester, "Run e2e tests") → continues immediately
+                                                        ↓
+Supervisor ← send_message("Unit tests passed") ← Tester 1
+          ← send_message("Integration tests passed") ← Tester 2
+          ← send_message("E2E tests passed") ← Tester 3
+```
+
+**3. Send Message** - Communicate with an existing agent
+- Sends a message to a specific terminal's inbox
+- Messages are queued and delivered when the terminal is idle
+- Enables ongoing collaboration between agents
+- Common for swarm operations where multiple agents coordinate dynamically
+- Use for iterative feedback or multi-turn conversations
+
+Example: Multi-role feature development
+```
+PM → send_message(developer_id, "Build payment API per spec")
+Developer → send_message(pm_id, "Clarify refund flow?")
+PM → send_message(developer_id, "Refunds go to original payment method")
+Developer → send_message(reviewer_id, "Ready for review")
+Reviewer → send_message(developer_id, "Add error handling for timeouts")
+Developer → send_message(reviewer_id, "Updated")
+Reviewer → send_message(pm_id, "Payment API approved")
+```
+
+### Custom Orchestration
+
+The `cao-server` runs on `http://localhost:8080` by default and exposes REST APIs for session management, terminal control, and messaging. The CLI commands (`cao launch`, `cao shutdown`) and MCP server tools (`handoff`, `delegate`, `send_message`) are just examples of how these APIs can be packaged together.
+
+You can combine the three orchestration modes above into custom workflows, or create entirely new orchestration patterns using the underlying APIs to fit your specific needs.
+
+For complete API documentation, see [docs/api.md](docs/api.md).
 
 ## Flows - Scheduled Agent Sessions
 
