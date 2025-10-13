@@ -53,6 +53,8 @@ Delete a session and all its terminals.
 
 ## Terminals
 
+**Note:** All `terminal_id` path parameters must be 8-character hexadecimal strings (e.g., "a1b2c3d4").
+
 ### POST /sessions/{session_name}/terminals
 Create an additional terminal in an existing session.
 
@@ -74,14 +76,12 @@ Get terminal details.
 ```json
 {
   "id": "string",
-  "provider": "string",
-  "agent_profile": "string",
+  "name": "string",
+  "provider": "q_cli|claude_code",
   "session_name": "string",
-  "tmux_session": "string",
-  "tmux_window": "string",
-  "status": "IDLE|BUSY|COMPLETED|ERROR",
-  "log_path": "string",
-  "created_at": "timestamp"
+  "agent_profile": "string",
+  "status": "idle|processing|completed|waiting_user_answer|error",
+  "last_active": "timestamp"
 }
 ```
 
@@ -158,18 +158,6 @@ Send a message to another terminal's inbox.
 - Messages are queued and delivered when the receiver terminal is IDLE
 - Messages are delivered in order (oldest first)
 - Delivery is automatic via watchdog file monitoring
-
-### GET /inbox/status
-Get inbox service status.
-
-**Response:**
-```json
-{
-  "registered_terminals": ["terminal_id1", "terminal_id2"],
-  "active_watchers": 2,
-  "providers": ["terminal_id1", "terminal_id2"]
-}
-```
 
 ---
 
