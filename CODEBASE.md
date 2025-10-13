@@ -15,7 +15,7 @@
                       ┌──────▼──────┐
                       │  FastAPI    │
                       │  HTTP API   │
-                      │  (:8080)    │
+                      │  (:9889)    │
                       └──────┬──────┘
                              │
                       ┌──────▼──────┐
@@ -59,7 +59,7 @@ src/cli_agent_orchestrator/
 │   ├── server.py          # Handoff & send_message tools
 │   └── models.py          # HandoffResult model
 ├── api/                   # Entry Point: HTTP API
-│   └── main.py            # FastAPI endpoints (port 8080)
+│   └── main.py            # FastAPI endpoints (port 9889)
 ├── services/              # Service Layer: Business logic
 │   ├── session_service.py # List, get, delete sessions
 │   ├── terminal_service.py# Create, get, send input, get output, delete terminals

@@ -1,6 +1,6 @@
 # CLI Agent Orchestrator API Documentation
 
-Base URL: `http://localhost:8080` (default)
+Base URL: `http://localhost:9889` (default)
 
 ## Health Check
 
