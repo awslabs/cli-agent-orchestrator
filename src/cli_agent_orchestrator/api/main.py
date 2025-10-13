@@ -3,10 +3,9 @@
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from typing import List, Dict, Optional
-from fastapi import FastAPI, HTTPException, status
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from typing import List, Dict, Optional, Annotated
+from fastapi import FastAPI, HTTPException, status, Path
+from pydantic import BaseModel, Field, field_validator
 
 from watchdog.observers.polling import PollingObserver
 
@@ -15,8 +14,8 @@ from cli_agent_orchestrator.services import session_service, terminal_service, f
 from cli_agent_orchestrator.services.cleanup_service import cleanup_old_data
 from cli_agent_orchestrator.services.inbox_service import LogFileHandler
 from cli_agent_orchestrator.services.terminal_service import OutputMode
-from cli_agent_orchestrator.models.terminal import Terminal
-from cli_agent_orchestrator.constants import SERVER_VERSION, CORS_ORIGINS, SERVER_HOST, SERVER_PORT, TERMINAL_LOG_DIR, INBOX_POLLING_INTERVAL
+from cli_agent_orchestrator.models.terminal import Terminal, TerminalId
+from cli_agent_orchestrator.constants import SERVER_VERSION, SERVER_HOST, SERVER_PORT, TERMINAL_LOG_DIR, INBOX_POLLING_INTERVAL
 from cli_agent_orchestrator.utils.logging import setup_logging
 from cli_agent_orchestrator.utils.terminal import generate_session_name
 from cli_agent_orchestrator.providers.manager import provider_manager
@@ -92,14 +91,6 @@ app = FastAPI(
     description="Simplified CLI Agent Orchestrator API",
     version=SERVER_VERSION,
     lifespan=lifespan,
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
 )
 
 
@@ -191,7 +182,7 @@ async def list_terminals_in_session(session_name: str) -> List[Dict]:
 
 
 @app.get("/terminals/{terminal_id}", response_model=Terminal)
-async def get_terminal(terminal_id: str) -> Terminal:
+async def get_terminal(terminal_id: TerminalId) -> Terminal:
     try:
         terminal = terminal_service.get_terminal(terminal_id)
         return Terminal(**terminal)
@@ -202,7 +193,7 @@ async def get_terminal(terminal_id: str) -> Terminal:
 
 
 @app.post("/terminals/{terminal_id}/input")
-async def send_terminal_input(terminal_id: str, message: str) -> Dict:
+async def send_terminal_input(terminal_id: TerminalId, message: str) -> Dict:
     try:
         success = terminal_service.send_input(terminal_id, message)
         return {"success": success}
@@ -213,7 +204,7 @@ async def send_terminal_input(terminal_id: str, message: str) -> Dict:
 
 
 @app.get("/terminals/{terminal_id}/output", response_model=TerminalOutputResponse)
-async def get_terminal_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> TerminalOutputResponse:
+async def get_terminal_output(terminal_id: TerminalId, mode: OutputMode = OutputMode.FULL) -> TerminalOutputResponse:
     try:
         output = terminal_service.get_output(terminal_id, mode)
         return TerminalOutputResponse(output=output, mode=mode)
@@ -224,7 +215,7 @@ async def get_terminal_output(terminal_id: str, mode: OutputMode = OutputMode.FU
 
 
 @app.post("/terminals/{terminal_id}/exit")
-async def exit_terminal(terminal_id: str) -> Dict:
+async def exit_terminal(terminal_id: TerminalId) -> Dict:
     """Send provider-specific exit command to terminal."""
     try:
         provider = provider_manager.get_provider(terminal_id)
@@ -238,7 +229,7 @@ async def exit_terminal(terminal_id: str) -> Dict:
 
 
 @app.delete("/terminals/{terminal_id}")
-async def delete_terminal(terminal_id: str) -> Dict:
+async def delete_terminal(terminal_id: TerminalId) -> Dict:
     """Delete a terminal."""
     try:
         success = terminal_service.delete_terminal(terminal_id)
@@ -250,7 +241,7 @@ async def delete_terminal(terminal_id: str) -> Dict:
 
 
 @app.post("/terminals/{receiver_id}/inbox/messages")
-async def create_inbox_message_endpoint(receiver_id: str, sender_id: str, message: str) -> Dict:
+async def create_inbox_message_endpoint(receiver_id: TerminalId, sender_id: str, message: str) -> Dict:
     """Create inbox message and attempt immediate delivery."""
     try:
         inbox_msg = create_inbox_message(sender_id, receiver_id, message)

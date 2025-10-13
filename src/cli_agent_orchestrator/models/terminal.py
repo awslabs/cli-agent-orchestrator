@@ -1,8 +1,11 @@
 from enum import Enum
-from typing import Optional
+from typing import Optional, Annotated
 from datetime import datetime
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, StringConstraints
 from cli_agent_orchestrator.models.provider import ProviderType
+
+# Terminal ID validation (8 character hex string)
+TerminalId = Annotated[str, StringConstraints(pattern=r'^[a-f0-9]{8}$')]
 
 # TODO: remove WAITING_PERMISSION
 class TerminalStatus(str, Enum):

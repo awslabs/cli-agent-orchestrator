@@ -20,4 +20,6 @@ def setup_logging() -> None:
         ]
     )
     
+    print(f"Server logs: {log_file}")
+    print("For debug logs: export CAO_LOG_LEVEL=DEBUG && cao-server")
     logging.info(f"Logging to: {log_file}")

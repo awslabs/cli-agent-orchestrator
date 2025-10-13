@@ -170,7 +170,7 @@ Reviewer → send_message(pm_id, "Payment API approved")
 
 ### Custom Orchestration
 
-The `cao-server` runs on `http://localhost:8080` by default and exposes REST APIs for session management, terminal control, and messaging. The CLI commands (`cao launch`, `cao shutdown`) and MCP server tools (`handoff`, `delegate`, `send_message`) are just examples of how these APIs can be packaged together.
+The `cao-server` runs on `http://localhost:9889` by default and exposes REST APIs for session management, terminal control, and messaging. The CLI commands (`cao launch`, `cao shutdown`) and MCP server tools (`handoff`, `delegate`, `send_message`) are just examples of how these APIs can be packaged together.
 
 You can combine the three orchestration modes above into custom workflows, or create entirely new orchestration patterns using the underlying APIs to fit your specific needs.
 
