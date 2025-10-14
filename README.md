@@ -9,7 +9,7 @@ For project structure and architecture details, see [CODEBASE.md](CODEBASE.md).
 1. Install tmux (version 3.3 or higher required)
 
 ```bash
-bash <(curl -s https://raw.githubusercontent.com/awslabs/cli-agent-orchestrator/main/tmux-install.sh)
+bash <(curl -s https://raw.githubusercontent.com/awslabs/cli-agent-orchestrator/refs/heads/main/tmux-install.sh)
 ```
 
 2. Install uv
