@@ -1,8 +1,14 @@
 # CLI Agent Orchestrator
 
-A lightweight orchestration system for managing multiple AI agent sessions in tmux terminals. Enables Multi-agent collaboration via MCP server.
+CLI Agent Orchestrator(CAO), prounceced as  is a lightweight orchestration system for managing multiple AI agent sessions in tmux terminals. Enables Multi-agent collaboration via MCP server.
 
-For project structure and architecture details, see [CODEBASE.md](CODEBASE.md).
+## Hierarchical Multi-Agent System
+
+CLI Agent Orchestrator (CAO) implements a hierarchical multi-agent system. This architecture enables complex problem-solving through specialized division of CLI Developer Agent.
+
+![CAO Architecture](./docs/assets/cao_architecture.png)
+
+For detailed project structure and architecture, see [CODEBASE.md](CODEBASE.md).
 
 ## Installation
 
@@ -116,19 +122,8 @@ CAO supports three orchestration patterns:
 - Use when you need **synchronous** task execution with results
 
 Example: Sequential code review workflow
-```
-Supervisor → handoff(developer, "Implement login feature") → waits
-                                                              ↓
-                                                    Developer completes
-                                                              ↓
-Supervisor ← receives code ← Developer exits
-          ↓
-          → handoff(reviewer, "Review login code") → waits
-                                                      ↓
-                                              Reviewer completes
-                                                      ↓
-Supervisor ← receives review ← Reviewer exits
-```
+
+![Handoff Workflow](./docs/assets/handoff-workflow.png)
 
 **2. Delegate** - Spawn an agent to work independently (async)
 - Creates a new terminal with the specified agent profile

@@ -1,0 +1,16 @@
+sequenceDiagram
+    participant S as Supervisor
+    participant D as Developer
+    participant R as Reviewer
+    
+    S->>D: handoff("Implement login feature")
+    Note over S: waits
+    D->>D: Working on implementation
+    D->>S: Code completed
+    Note over D: exits
+    
+    S->>R: handoff("Review login code")
+    Note over S: waits
+    R->>R: Reviewing code
+    R->>S: Review completed
+    Note over R: exits
