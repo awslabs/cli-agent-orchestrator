@@ -4,7 +4,7 @@ CLI Agent Orchestrator(CAO, pronounced as "kay-oh"), is a lightweight orchestrat
 
 ## Hierarchical Multi-Agent System
 
-CLI Agent Orchestrator (CAO) implements a hierarchical multi-agent system. This architecture enables complex problem-solving through specialized division of CLI Developer Agent.
+CLI Agent Orchestrator (CAO) implements a hierarchical multi-agent system. This architecture enables complex problem-solving through specialized division of CLI Developer Agents.
 
 ![CAO Architecture](./docs/assets/cao_architecture.png)
 
