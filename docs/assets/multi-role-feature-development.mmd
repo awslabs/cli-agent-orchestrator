@@ -1,0 +1,12 @@
+sequenceDiagram
+    participant PM as Product Manager
+    participant D as Developer
+    participant R as Reviewer
+    
+    PM->>D: send_message("Build payment API per spec")
+    D->>PM: send_message("Clarify refund flow?")
+    PM->>D: send_message("Refunds go to original payment method")
+    D->>R: send_message("Ready for review")
+    R->>D: send_message("Add error handling for timeouts")
+    D->>R: send_message("Updated")
+    R->>PM: send_message("Payment API approved")

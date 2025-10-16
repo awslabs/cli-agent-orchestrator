@@ -1,0 +1,24 @@
+sequenceDiagram
+    participant S as Supervisor
+    participant T1 as Tester 1
+    participant T2 as Tester 2
+    participant T3 as Tester 3
+    
+    S->>T1: delegate("Run unit tests")
+    Note over S: continues immediately
+    S->>T2: delegate("Run integration tests")
+    Note over S: continues immediately
+    S->>T3: delegate("Run e2e tests")
+    Note over S: continues immediately
+    
+    par Parallel Execution
+        T1->>T1: Running unit tests
+    and
+        T2->>T2: Running integration tests
+    and
+        T3->>T3: Running e2e tests
+    end
+    
+    T1->>S: send_message("Unit tests passed")
+    T2->>S: send_message("Integration tests passed")
+    T3->>S: send_message("E2E tests passed")

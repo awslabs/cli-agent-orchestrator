@@ -135,15 +135,8 @@ Example: Sequential code review workflow
 - Use for **asynchronous** task execution or fire-and-forget operations
 
 Example: Parallel test execution
-```
-Supervisor → delegate(tester, "Run unit tests") → continues immediately
-          → delegate(tester, "Run integration tests") → continues immediately
-          → delegate(tester, "Run e2e tests") → continues immediately
-                                                        ↓
-Supervisor ← send_message("Unit tests passed") ← Tester 1
-          ← send_message("Integration tests passed") ← Tester 2
-          ← send_message("E2E tests passed") ← Tester 3
-```
+
+![Parallel Test Execution](./docs/assets/parallel-test-execution.png)
 
 **3. Send Message** - Communicate with an existing agent
 - Sends a message to a specific terminal's inbox
@@ -153,15 +146,7 @@ Supervisor ← send_message("Unit tests passed") ← Tester 1
 - Use for iterative feedback or multi-turn conversations
 
 Example: Multi-role feature development
-```
-PM → send_message(developer_id, "Build payment API per spec")
-Developer → send_message(pm_id, "Clarify refund flow?")
-PM → send_message(developer_id, "Refunds go to original payment method")
-Developer → send_message(reviewer_id, "Ready for review")
-Reviewer → send_message(developer_id, "Add error handling for timeouts")
-Developer → send_message(reviewer_id, "Updated")
-Reviewer → send_message(pm_id, "Payment API approved")
-```
+![Multi-role Feature Development](./docs/assets/multi-role-feature-development.png)
 
 ### Custom Orchestration
 
