@@ -1,6 +1,6 @@
 # CLI Agent Orchestrator
 
-CLI Agent Orchestrator(CAO), prounceced as  is a lightweight orchestration system for managing multiple AI agent sessions in tmux terminals. Enables Multi-agent collaboration via MCP server.
+CLI Agent Orchestrator(CAO, pronounced as "kay-oh"), is a lightweight orchestration system for managing multiple AI agent sessions in tmux terminals. Enables Multi-agent collaboration via MCP server.
 
 ## Hierarchical Multi-Agent System
 
