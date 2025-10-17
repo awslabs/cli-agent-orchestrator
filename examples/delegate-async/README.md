@@ -18,20 +18,21 @@ A supervisor orchestrates parallel data analysis while also preparing a report t
 
 ```mermaid
 graph TD
-    A[Supervisor] -->|1. delegate async| B[Data Analyst 1]
-    A -->|1. delegate async| C[Data Analyst 2]
-    A -->|1. delegate async| D[Data Analyst 3]
+    A[["🤖 Supervisor<br/>Agent"]] -->|1. delegate async| B[["🤖 Data Analyst 1<br/>Agent"]]
+    A -->|1. delegate async| C[["🤖 Data Analyst 2<br/>Agent"]]
+    A -->|1. delegate async| D[["🤖 Data Analyst 3<br/>Agent"]]
     A -->|2. returns immediately| A
-    A -->|3. handoff waits| E[Report Generator]
+    A -->|3. handoff waits| E[["🤖 Report Generator<br/>Agent"]]
     E -->|3. returns template| A
     B -->|4. send_message| A
     C -->|4. send_message| A
     D -->|4. send_message| A
-    A -->|5. combines & outputs| F[Final Report]
+    A -->|5. combines & outputs| F["📄 Final Report<br/>(Output)"]
     
     style B fill:#e1f5ff
     style C fill:#e1f5ff
     style D fill:#e1f5ff
+    style F fill:#fff4e6
 ```
 
 **Workflow Steps:**
@@ -244,12 +245,12 @@ Presents final comprehensive report to user
 
 ```mermaid
 sequenceDiagram
-    participant User
-    participant Supervisor
-    participant DA1 as Data Analyst 1
-    participant DA2 as Data Analyst 2
-    participant DA3 as Data Analyst 3
-    participant ReportGen as Report Generator
+    participant User as 👤 User
+    participant Supervisor as 🤖 Supervisor Agent
+    participant DA1 as 🤖 Data Analyst 1
+    participant DA2 as 🤖 Data Analyst 2
+    participant DA3 as 🤖 Data Analyst 3
+    participant ReportGen as 🤖 Report Generator
 
     User->>Supervisor: Analyze 3 datasets & create report
     
@@ -274,7 +275,7 @@ sequenceDiagram
     
     Note over Supervisor: Combines template + all results
     
-    Supervisor->>User: Final comprehensive report
+    Supervisor->>User: 📄 Final comprehensive report
 ```
 
 ## Pattern Comparison
