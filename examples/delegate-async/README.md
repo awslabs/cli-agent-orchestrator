@@ -164,14 +164,22 @@ Message will be delivered to terminal abc12345's inbox.
 cao-server
 ```
 
-2. Install the agent profiles:
+2. Add cao-mcp-server to Q CLI global configuration:
+```bash
+q mcp add --name cao-mcp-server --scope global --command uvx \
+  --args '--from' \
+  --args 'git+https://github.com/awslabs/cli-agent-orchestrator.git@main' \
+  --args 'cao-mcp-server'
+```
+
+3. Install the agent profiles:
 ```bash
 cao install examples/delegate-async/analysis_supervisor.md
 cao install examples/delegate-async/data_analyst.md
 cao install examples/delegate-async/report_generator.md
 ```
 
-3. Launch the supervisor:
+4. Launch the supervisor:
 ```bash
 cao launch --agents analysis_supervisor
 ```
@@ -318,3 +326,29 @@ T=33s:  Present final report
 - Use handoff for work that must complete before final assembly
 - Check inbox for incoming results from delegated workers
 - Aggregate all results before presenting final output
+
+## Troubleshooting
+
+### "Failed to validate tool parameters: missing field `operation`"
+
+This error means the MCP tools are not loaded. The cao-mcp-server must be added to Q CLI's **global** MCP configuration, not just the agent profile.
+
+**Solution:**
+```bash
+q mcp add --name cao-mcp-server --scope global --command uvx \
+  --args '--from' \
+  --args 'git+https://github.com/awslabs/cli-agent-orchestrator.git@main' \
+  --args 'cao-mcp-server'
+```
+
+Then restart your Q CLI session:
+```bash
+q restart
+```
+
+Verify the MCP server is loaded:
+```bash
+q mcp list
+```
+
+You should see `cao-mcp-server` listed under the default scope.
