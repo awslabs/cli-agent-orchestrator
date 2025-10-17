@@ -36,6 +36,14 @@ graph TD
     style E fill:#e1f5ff
 ```
 
+**Workflow Steps:**
+1. Supervisor → Data Analyst (**handoff** - blocking initially)
+2. Data Analyst → 3 Statistics Workers (**delegate** - async/parallel) and returns immediately
+3. Supervisor → Report Generator (**handoff** - blocking, waits for completion)
+4. Statistics Workers → Data Analyst (**send_message** - async callback)
+5. Data Analyst → Supervisor (**send_message** - async callback with aggregated results)
+6. Supervisor combines template + analysis into final report
+
 ### Key Characteristics:
 
 - **Data Analyst**: Fire-and-forget agent (returns quickly, workers continue in background)
