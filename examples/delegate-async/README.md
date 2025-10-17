@@ -1,78 +1,157 @@
 # Delegate (Async) Pattern Example
 
-This example demonstrates a complex workflow combining **handoff** (sequential) and **delegate** (async/parallel) patterns.
+This example demonstrates a workflow combining **delegate** (async/parallel) and **handoff** (sequential) patterns.
 
 ## Pattern Overview
 
 This example showcases:
-- **Handoff (Sequential)**: Supervisor waits for agents to complete before proceeding
-- **Delegate (Async)**: Data Analyst spawns parallel workers without blocking
-- **Send Message**: Workers and agents communicate results via inbox
-- **Complex orchestration**: Multi-step workflow with both sequential and parallel execution
+- **Delegate (Async)**: Supervisor spawns multiple Data Analysts in parallel
+- **Handoff (Sequential)**: Supervisor waits for Report Generator to complete
+- **Send Message**: Data Analysts send results back when done
+- **Mixed orchestration**: Both parallel and sequential execution in one workflow
 
-## Example Scenario: Data Analysis with Report Generation
+## Example Scenario: Parallel Data Analysis with Report Generation
 
-A supervisor orchestrates a data analysis workflow that combines parallel data processing with sequential report generation.
+A supervisor orchestrates parallel data analysis while also preparing a report template.
 
 ### Complete Workflow:
 
 ```mermaid
 graph TD
-    A[Supervisor] -->|1. handoff| B[Data Analyst]
-    B -->|2. delegate| C[Statistics Worker 1]
-    B -->|2. delegate| D[Statistics Worker 2]
-    B -->|2. delegate| E[Statistics Worker 3]
-    B -->|2. returns immediately| A
-    A -->|3. handoff waits| F[Report Generator]
-    F -->|3. returns template| A
-    C -->|4. send_message| B
-    D -->|4. send_message| B
-    E -->|4. send_message| B
-    B -->|5. send_message aggregated| A
-    A -->|6. combines & outputs| G[Final Report]
+    A[Supervisor] -->|1. delegate async| B[Data Analyst 1]
+    A -->|1. delegate async| C[Data Analyst 2]
+    A -->|1. delegate async| D[Data Analyst 3]
+    A -->|2. returns immediately| A
+    A -->|3. handoff waits| E[Report Generator]
+    E -->|3. returns template| A
+    B -->|4. send_message| A
+    C -->|4. send_message| A
+    D -->|4. send_message| A
+    A -->|5. combines & outputs| F[Final Report]
     
+    style B fill:#e1f5ff
     style C fill:#e1f5ff
     style D fill:#e1f5ff
-    style E fill:#e1f5ff
 ```
 
 **Workflow Steps:**
-1. Supervisor → Data Analyst (**handoff** - blocking initially)
-2. Data Analyst → 3 Statistics Workers (**delegate** - async/parallel) and returns immediately
+1. Supervisor → 3 Data Analysts (**delegate** - async/parallel, one per dataset)
+2. Supervisor gets immediate return (non-blocking)
 3. Supervisor → Report Generator (**handoff** - blocking, waits for completion)
-4. Statistics Workers → Data Analyst (**send_message** - async callback)
-5. Data Analyst → Supervisor (**send_message** - async callback with aggregated results)
-6. Supervisor combines template + analysis into final report
+4. Data Analysts → Supervisor (**send_message** - async callback with results)
+5. Supervisor aggregates all results and combines with template into final report
 
 ### Key Characteristics:
 
-- **Data Analyst**: Fire-and-forget agent (returns quickly, workers continue in background)
+- **Data Analysts**: Work in parallel, each analyzing one dataset independently
 - **Report Generator**: Sequential agent (Supervisor waits for completion)
-- **Statistics Workers**: Parallel workers (multiple running simultaneously)
-- **Final assembly**: Supervisor combines results when Data Analyst's results arrive
+- **Parallel execution**: 3 Data Analysts run simultaneously
+- **Final assembly**: Supervisor combines results when all Data Analysts complete
 
 ## Agent Profiles
 
+All agents require the **cao-mcp-server** configuration in their frontmatter to access orchestration tools:
+
+```yaml
+---
+name: your_agent_name
+description: Your agent description
+mcpServers:
+  cao-mcp-server:
+    type: stdio
+    command: uvx
+    args:
+      - "--from"
+      - "git+https://github.com/awslabs/cli-agent-orchestrator.git@main"
+      - "cao-mcp-server"
+---
+```
+
+This configuration provides three orchestration tools:
+
+### 1. `handoff` - Sequential/Blocking Pattern
+**When to use:** Need results before continuing
+
+**How it works:**
+- Creates a new terminal with specified agent
+- Sends message and **waits** for completion
+- Returns the agent's output
+- Blocks until agent finishes
+
+**Example usage in agent prompt:**
+```
+Use handoff when you need complete results:
+
+handoff(
+  agent_profile="report_generator",
+  message="Create report template with sections: Summary, Analysis, Conclusions"
+)
+
+This blocks until report_generator completes and returns the template.
+```
+
+### 2. `delegate` - Async/Parallel Pattern
+**When to use:** Fire-and-forget, parallel execution
+
+**How it works:**
+- Creates a new terminal with specified agent
+- Sends message and **returns immediately**
+- Does NOT wait for completion
+- Worker must use `send_message` to return results
+
+**Example usage in agent prompt:**
+```
+Use delegate for parallel tasks:
+
+1. Get your terminal ID: my_id = CAO_TERMINAL_ID
+
+2. Delegate with callback instructions:
+   delegate(
+     agent_profile="data_analyst",
+     message="Analyze dataset [1,2,3,4,5]. 
+              Send results to terminal {my_id} using send_message."
+   )
+
+3. Continue immediately (non-blocking)
+4. Repeat for other datasets
+```
+
+### 3. `send_message` - Async Communication
+**When to use:** Send results back to another agent
+
+**How it works:**
+- Sends message to another terminal's inbox
+- Message queued if receiver is busy
+- Delivered when receiver is IDLE
+
+**Example usage in agent prompt:**
+```
+Use send_message to return results:
+
+send_message(
+  receiver_id="abc12345",
+  message="Dataset A analysis: mean=3.0, median=3.0, std=1.414"
+)
+
+Message will be delivered to terminal abc12345's inbox.
+```
+
+## Agent Profile Details
+
 ### 1. Analysis Supervisor (`analysis_supervisor.md`)
 - Orchestrates the entire workflow
-- Handoffs to Data Analyst (gets immediate return)
-- Handoffs to Report Generator (waits for completion)
-- Receives results from Data Analyst via send_message
+- Delegates to 3 Data Analysts (parallel, async)
+- Handoffs to Report Generator (sequential, waits)
+- Receives results from Data Analysts via send_message
 - Combines everything into final output
 
 ### 2. Data Analyst (`data_analyst.md`)
-- Receives task from Supervisor via handoff
-- Delegates to multiple Statistics Workers (parallel)
-- Returns immediately to Supervisor (doesn't wait for workers)
-- Receives results from workers via send_message
-- Sends aggregated results to Supervisor via send_message
+- Receives task from Supervisor via delegate
+- Performs statistical analysis on one dataset
+- Sends results back to Supervisor via send_message
+- Multiple instances run in parallel
 
-### 3. Statistics Worker (`statistics_worker.md`)
-- Performs statistical calculations
-- Sends results back to Data Analyst via send_message
-- Multiple workers run in parallel
-
-### 4. Report Generator (`report_generator.md`)
+### 3. Report Generator (`report_generator.md`)
 - Creates report templates
 - Supervisor waits for completion (handoff)
 - Returns formatted report structure
@@ -88,7 +167,6 @@ cao-server
 ```bash
 cao install examples/delegate-async/analysis_supervisor.md
 cao install examples/delegate-async/data_analyst.md
-cao install examples/delegate-async/statistics_worker.md
 cao install examples/delegate-async/report_generator.md
 ```
 
@@ -113,80 +191,76 @@ Generate a professional report with the analysis results.
 
 ## Detailed Workflow
 
-### Step 1: Supervisor → Data Analyst (Handoff)
+### Step 1: Supervisor Gets Terminal ID
 ```
-Supervisor calls handoff(agent_profile="data_analyst", message="Analyze datasets...")
-Data Analyst receives task
-```
-
-### Step 2: Data Analyst → Statistics Workers (Delegate)
-```
-Data Analyst gets CAO_TERMINAL_ID (e.g., "analyst123")
-Data Analyst delegates:
-  - Worker 1: Dataset A
-  - Worker 2: Dataset B
-  - Worker 3: Dataset C
-Data Analyst returns immediately (handoff completes)
-Workers continue processing in background
+Supervisor checks CAO_TERMINAL_ID (e.g., "super123")
+Needs this for Data Analysts to send results back
 ```
 
-### Step 3: Supervisor → Report Generator (Handoff)
+### Step 2: Supervisor Delegates to Data Analysts (Parallel)
 ```
-Supervisor receives return from Data Analyst
-Supervisor calls handoff(agent_profile="report_generator", message="Create report template...")
+delegate(agent_profile="data_analyst", 
+         message="Analyze Dataset A: [1,2,3,4,5]. Send to super123.")
+
+delegate(agent_profile="data_analyst",
+         message="Analyze Dataset B: [10,20,30,40,50]. Send to super123.")
+
+delegate(agent_profile="data_analyst",
+         message="Analyze Dataset C: [5,15,25,35,45]. Send to super123.")
+
+All 3 delegates return immediately - Data Analysts work in parallel
+```
+
+### Step 3: Supervisor Handoffs to Report Generator
+```
+handoff(agent_profile="report_generator",
+        message="Create report template...")
+
 Supervisor WAITS for Report Generator to complete
-Report Generator returns template
+Receives template back
 ```
 
-### Step 4: Statistics Workers → Data Analyst (Send Message)
+### Step 4: Data Analysts Send Results Back
 ```
-Worker 1 completes → send_message(receiver_id="analyst123", message="Dataset A results...")
-Worker 2 completes → send_message(receiver_id="analyst123", message="Dataset B results...")
-Worker 3 completes → send_message(receiver_id="analyst123", message="Dataset C results...")
+Data Analyst 1 → send_message(receiver_id="super123", message="Dataset A results...")
+Data Analyst 2 → send_message(receiver_id="super123", message="Dataset B results...")
+Data Analyst 3 → send_message(receiver_id="super123", message="Dataset C results...")
+
+Messages queued in Supervisor's inbox
 ```
 
-### Step 5: Data Analyst → Supervisor (Send Message)
+### Step 5: Supervisor Final Assembly
 ```
-Data Analyst receives all worker results
-Data Analyst aggregates results
-Data Analyst sends to Supervisor: send_message(receiver_id="supervisor456", message="Aggregated analysis...")
-```
-
-### Step 6: Supervisor Final Assembly
-```
-Supervisor receives Data Analyst results (via inbox)
-Supervisor combines:
+Supervisor receives all 3 Data Analyst results (via inbox)
+Combines:
   - Report template (from Report Generator)
-  - Analysis results (from Data Analyst)
-Supervisor presents final comprehensive report to user
+  - Dataset A analysis (from Data Analyst 1)
+  - Dataset B analysis (from Data Analyst 2)
+  - Dataset C analysis (from Data Analyst 3)
+Presents final comprehensive report to user
 ```
 
-## Workflow Diagram
+## Workflow Diagram (Sequence)
 
 ```mermaid
 sequenceDiagram
     participant User
     participant Supervisor
-    participant DataAnalyst as Data Analyst
-    participant Worker1 as Statistics Worker 1
-    participant Worker2 as Statistics Worker 2
-    participant Worker3 as Statistics Worker 3
+    participant DA1 as Data Analyst 1
+    participant DA2 as Data Analyst 2
+    participant DA3 as Data Analyst 3
     participant ReportGen as Report Generator
 
-    User->>Supervisor: Analyze datasets & create report
+    User->>Supervisor: Analyze 3 datasets & create report
     
     Note over Supervisor: Get terminal ID: "super123"
     
-    Supervisor->>DataAnalyst: handoff(analyze datasets)
-    Note over DataAnalyst: Get terminal ID: "analyst123"
+    Supervisor->>DA1: delegate(Dataset A)
+    Supervisor->>DA2: delegate(Dataset B)
+    Supervisor->>DA3: delegate(Dataset C)
     
-    DataAnalyst->>Worker1: delegate(Dataset A)
-    DataAnalyst->>Worker2: delegate(Dataset B)
-    DataAnalyst->>Worker3: delegate(Dataset C)
-    
-    DataAnalyst-->>Supervisor: Returns immediately<br/>"Analysis initiated"
-    
-    Note over Worker1,Worker3: Workers processing in parallel
+    Note over Supervisor: All delegates return immediately
+    Note over DA1,DA3: Analysts working in parallel
     
     Supervisor->>ReportGen: handoff(create template)
     Note over Supervisor: WAITS for completion
@@ -194,15 +268,11 @@ sequenceDiagram
     
     Note over Supervisor: Has template, waiting for data...
     
-    Worker1-->>DataAnalyst: send_message(Dataset A results)
-    Worker2-->>DataAnalyst: send_message(Dataset B results)
-    Worker3-->>DataAnalyst: send_message(Dataset C results)
+    DA1-->>Supervisor: send_message(Dataset A results)
+    DA2-->>Supervisor: send_message(Dataset B results)
+    DA3-->>Supervisor: send_message(Dataset C results)
     
-    Note over DataAnalyst: Aggregates all results
-    
-    DataAnalyst-->>Supervisor: send_message(aggregated analysis)
-    
-    Note over Supervisor: Combines template + analysis
+    Note over Supervisor: Combines template + all results
     
     Supervisor->>User: Final comprehensive report
 ```
@@ -211,24 +281,39 @@ sequenceDiagram
 
 | Pattern | Used By | Behavior | Use Case |
 |---------|---------|----------|----------|
-| **Handoff** | Supervisor → Data Analyst | Blocking initially, but Data Analyst returns quickly | Initiate async work |
-| **Delegate** | Data Analyst → Workers | Non-blocking, parallel execution | Independent parallel tasks |
+| **Delegate** | Supervisor → Data Analysts | Non-blocking, parallel execution | Independent parallel tasks |
 | **Handoff** | Supervisor → Report Generator | Blocking, waits for completion | Sequential task that must complete |
-| **Send Message** | Workers → Data Analyst | Async callback | Return results from parallel work |
-| **Send Message** | Data Analyst → Supervisor | Async callback | Return aggregated results |
+| **Send Message** | Data Analysts → Supervisor | Async callback | Return results from parallel work |
 
 ## Key Insights
 
-1. **Handoff doesn't always mean "wait forever"**: Data Analyst returns quickly even though its workers are still running
-2. **Delegate enables true parallelism**: Multiple workers process simultaneously
-3. **Send message enables callbacks**: Async communication between agents
-4. **Mixed patterns**: Supervisor uses both handoff patterns (quick return + wait for completion)
-5. **Inbox queuing**: Messages wait if receiver is busy, delivered when IDLE
+1. **Delegate enables true parallelism**: 3 Data Analysts process simultaneously
+2. **Handoff for sequential work**: Report Generator must complete before final assembly
+3. **Send message for callbacks**: Async communication from workers to supervisor
+4. **Inbox queuing**: Messages wait if receiver is busy, delivered when IDLE
+5. **Efficient workflow**: Supervisor uses wait time productively (getting report template)
+
+## Timing Example
+
+```
+T=0s:   Delegate Data Analyst 1 (returns immediately)
+T=1s:   Delegate Data Analyst 2 (returns immediately)
+T=2s:   Delegate Data Analyst 3 (returns immediately)
+T=3s:   Handoff to Report Generator (blocks)
+T=33s:  Report Generator completes (30s work)
+T=33s:  Supervisor has template, waiting for data...
+T=20s:  Data Analyst 1 completes (started at T=0s)
+T=21s:  Data Analyst 2 completes (started at T=1s)
+T=22s:  Data Analyst 3 completes (started at T=2s)
+T=33s:  Supervisor receives all results, combines with template
+T=33s:  Present final report
+```
 
 ## Tips
 
-- Data Analyst must get its terminal ID before delegating
-- Data Analyst returns quickly but continues monitoring inbox for worker results
-- Supervisor must get its terminal ID and include it in Data Analyst's task for callback
-- Report Generator is a traditional sequential task (no async complexity)
-- Final assembly happens when all async results arrive
+- Always get your terminal ID before delegating
+- Include callback terminal ID in all delegate messages
+- Delegate all parallel tasks quickly (don't wait between delegates)
+- Use handoff for work that must complete before final assembly
+- Check inbox for incoming results from delegated workers
+- Aggregate all results before presenting final output
