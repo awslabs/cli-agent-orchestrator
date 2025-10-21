@@ -1,0 +1,32 @@
+sequenceDiagram
+    participant S as Supervisor
+    participant A1 as Data Analyst 1
+    participant A2 as Data Analyst 2
+    participant A3 as Data Analyst 3
+    participant R as Report Generator
+    
+    S->>A1: assign("Analyze Dataset A")
+    Note over S: continues immediately
+    S->>A2: assign("Analyze Dataset B")
+    Note over S: continues immediately
+    S->>A3: assign("Analyze Dataset C")
+    Note over S: continues immediately
+    
+    S->>R: handoff("Create report template")
+    Note over S: waits for completion
+    R-->>S: Returns template
+    
+    par Parallel Execution
+        A1->>A1: Analyzing Dataset A
+    and
+        A2->>A2: Analyzing Dataset B
+    and
+        A3->>A3: Analyzing Dataset C
+    end
+    
+    A1->>S: send_message("Dataset A analysis")
+    A2->>S: send_message("Dataset B analysis")
+    A3->>S: send_message("Dataset C analysis")
+    
+    Note over S: Combines template + analysis results
+    S->>S: Generate final report

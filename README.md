@@ -165,11 +165,11 @@ Example: Sequential code review workflow
 - Messages are queued for delivery if the supervisor is busy (common in parallel workflows)
 - Use for **asynchronous** task execution or fire-and-forget operations
 
-Example: Parallel test execution
+Example: A supervisor assigns parallel data analysis tasks to multiple analysts while using handoff to sequentially generate a report template, then combines all results.
 
-![Parallel Test Execution](./docs/assets/parallel-test-execution.png)
+See [examples/assign](examples/assign) for the complete working example.
 
-For a complete working example combining assign with handoff patterns, see [examples/assign](examples/assign) - a supervisor orchestrates parallel data analysis across multiple analysts while sequentially generating a report.
+![Parallel Data Analysis](./docs/assets/parallel-data-analysis.png)
 
 **3. Send Message** - Communicate with an existing agent
 - Sends a message to a specific terminal's inbox
