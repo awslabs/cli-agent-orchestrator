@@ -4,11 +4,11 @@ sequenceDiagram
     participant T2 as Tester 2
     participant T3 as Tester 3
     
-    S->>T1: delegate("Run unit tests")
+    S->>T1: assign("Run unit tests")
     Note over S: continues immediately
-    S->>T2: delegate("Run integration tests")
+    S->>T2: assign("Run integration tests")
     Note over S: continues immediately
-    S->>T3: delegate("Run e2e tests")
+    S->>T3: assign("Run e2e tests")
     Note over S: continues immediately
     
     par Parallel Execution

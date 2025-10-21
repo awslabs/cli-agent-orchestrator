@@ -16,7 +16,7 @@ CLI Agent Orchestrator (CAO) implements a hierarchical multi-agent system that e
 
 * **Intelligent task delegation** – CAO automatically routes tasks to appropriate specialists based on project requirements, expertise matching, and workflow dependencies. The system adapts between individual agent work and coordinated team efforts through three orchestration patterns:
   - **Handoff** - Synchronous task transfer with wait-for-completion
-  - **Delegate** - Asynchronous task spawning for parallel execution  
+  - **Assign** - Asynchronous task spawning for parallel execution  
   - **Send Message** - Direct communication with existing agents
 
 * **Flexible workflow patterns** – CAO supports both sequential coordination for dependent tasks and parallel processing for independent work streams. This allows optimization of both development speed and quality assurance processes.
@@ -146,12 +146,12 @@ Example: Sequential code review workflow
 
 ![Handoff Workflow](./docs/assets/handoff-workflow.png)
 
-**2. Delegate** - Spawn an agent to work independently (async)
+**2. Assign** - Spawn an agent to work independently (async)
 - Creates a new terminal with the specified agent profile
 - Sends the task message with callback instructions
 - Returns immediately with the terminal ID
 - Agent continues working in the background
-- Delegated agent sends results back to supervisor via `send_message` when complete
+- Assigned agent sends results back to supervisor via `send_message` when complete
 - Messages are queued for delivery if the supervisor is busy (common in parallel workflows)
 - Use for **asynchronous** task execution or fire-and-forget operations
 
@@ -171,7 +171,7 @@ Example: Multi-role feature development
 
 ### Custom Orchestration
 
-The `cao-server` runs on `http://localhost:9889` by default and exposes REST APIs for session management, terminal control, and messaging. The CLI commands (`cao launch`, `cao shutdown`) and MCP server tools (`handoff`, `delegate`, `send_message`) are just examples of how these APIs can be packaged together.
+The `cao-server` runs on `http://localhost:9889` by default and exposes REST APIs for session management, terminal control, and messaging. The CLI commands (`cao launch`, `cao shutdown`) and MCP server tools (`handoff`, `assign`, `send_message`) are just examples of how these APIs can be packaged together.
 
 You can combine the three orchestration modes above into custom workflows, or create entirely new orchestration patterns using the underlying APIs to fit your specific needs.
 

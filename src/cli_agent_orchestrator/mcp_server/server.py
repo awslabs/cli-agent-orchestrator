@@ -224,7 +224,7 @@ async def handoff(
 
 
 @mcp.tool()
-async def delegate(
+async def assign(
     agent_profile: str = Field(
         description='The agent profile for the worker agent (e.g., "developer", "analyst")'
     ),
@@ -232,11 +232,11 @@ async def delegate(
         description='The task message to send. Include callback instructions for the worker to send results back.'
     )
 ) -> Dict[str, Any]:
-    """Delegate a task to another agent without blocking.
+    """Assigns a task to another agent without blocking.
     
     In the message to the worker agent include instruction to send results back via send_message tool.
     **IMPORTANT**: The terminal id of each agent is available in environment variable CAO_TERMINAL_ID.
-    When delegating, first find out your own CAO_TERMINAL_ID value, then include the terminal_id value in the message to the worker agent to allow callback.
+    When assigning, first find out your own CAO_TERMINAL_ID value, then include the terminal_id value in the message to the worker agent to allow callback.
     Example message: "Analyze the logs. When done, send results back to terminal ee3f93b3 using send_message tool."
     
     Args:
@@ -256,14 +256,14 @@ async def delegate(
         return {
             "success": True,
             "terminal_id": terminal_id,
-            "message": f"Task delegated to {agent_profile} (terminal: {terminal_id})"
+            "message": f"Task assigned to {agent_profile} (terminal: {terminal_id})"
         }
         
     except Exception as e:
         return {
             "success": False,
             "terminal_id": None,
-            "message": f"Delegation failed: {str(e)}"
+            "message": f"Assignment failed: {str(e)}"
         }
 
 
