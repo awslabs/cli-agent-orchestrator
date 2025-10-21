@@ -92,23 +92,26 @@ Create template:
 
 ## Dataset Analysis
 
-### Dataset A Analysis
-- Mean: [PLACEHOLDER]
-- Median: [PLACEHOLDER]
-- Standard Deviation: [PLACEHOLDER]
-- Observations: [PLACEHOLDER]
+### Dataset 1 Analysis
+**Statistical Metrics:**
+- [PLACEHOLDER for metrics]
 
-### Dataset B Analysis
-- Mean: [PLACEHOLDER]
-- Median: [PLACEHOLDER]
-- Standard Deviation: [PLACEHOLDER]
-- Observations: [PLACEHOLDER]
+**Key Observations:**
+- [PLACEHOLDER for insights]
 
-### Dataset C Analysis
-- Mean: [PLACEHOLDER]
-- Median: [PLACEHOLDER]
-- Standard Deviation: [PLACEHOLDER]
-- Observations: [PLACEHOLDER]
+### Dataset 2 Analysis
+**Statistical Metrics:**
+- [PLACEHOLDER for metrics]
+
+**Key Observations:**
+- [PLACEHOLDER for insights]
+
+### Dataset 3 Analysis
+**Statistical Metrics:**
+- [PLACEHOLDER for metrics]
+
+**Key Observations:**
+- [PLACEHOLDER for insights]
 
 ## Comparative Analysis
 [Cross-dataset comparison and trends]

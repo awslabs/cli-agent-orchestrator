@@ -1,11 +1,11 @@
-# Delegate (Async) Pattern Example
+# Assign (Async) Pattern Example
 
-This example demonstrates a workflow combining **delegate** (async/parallel) and **handoff** (sequential) patterns.
+This example demonstrates a workflow combining **assign** (async/parallel) and **handoff** (sequential) patterns.
 
 ## Pattern Overview
 
 This example showcases:
-- **Delegate (Async)**: Supervisor spawns multiple Data Analysts in parallel
+- **Assign (Async)**: Supervisor spawns multiple Data Analysts in parallel
 - **Handoff (Sequential)**: Supervisor waits for Report Generator to complete
 - **Send Message**: Data Analysts send results back when done
 - **Mixed orchestration**: Both parallel and sequential execution in one workflow
@@ -18,9 +18,9 @@ A supervisor orchestrates parallel data analysis while also preparing a report t
 
 ```mermaid
 graph TD
-    A[["🤖 Supervisor<br/>Agent"]] -->|1. delegate async| B[["🤖 Data Analyst 1<br/>Agent"]]
-    A -->|1. delegate async| C[["🤖 Data Analyst 2<br/>Agent"]]
-    A -->|1. delegate async| D[["🤖 Data Analyst 3<br/>Agent"]]
+    A[["🤖 Supervisor<br/>Agent"]] -->|1. assign async| B[["🤖 Data Analyst 1<br/>Agent"]]
+    A -->|1. assign async| C[["🤖 Data Analyst 2<br/>Agent"]]
+    A -->|1. assign async| D[["🤖 Data Analyst 3<br/>Agent"]]
     A -->|2. returns immediately| A
     A -->|3. handoff waits| E[["🤖 Report Generator<br/>Agent"]]
     E -->|3. returns template| A
@@ -36,7 +36,7 @@ graph TD
 ```
 
 **Workflow Steps:**
-1. Supervisor → 3 Data Analysts (**delegate** - async/parallel, one per dataset)
+1. Supervisor → 3 Data Analysts (**assign** - async/parallel, one per dataset)
 2. Supervisor gets immediate return (non-blocking)
 3. Supervisor → Report Generator (**handoff** - blocking, waits for completion)
 4. Data Analysts → Supervisor (**send_message** - async callback with results)
@@ -91,7 +91,7 @@ handoff(
 This blocks until report_generator completes and returns the template.
 ```
 
-### 2. `delegate` - Async/Parallel Pattern
+### 2. `assign` - Async/Parallel Pattern
 **When to use:** Fire-and-forget, parallel execution
 
 **How it works:**
@@ -102,14 +102,14 @@ This blocks until report_generator completes and returns the template.
 
 **Example usage in agent prompt:**
 ```
-Use delegate for parallel tasks:
+Use assign for parallel tasks:
 
 1. Get your terminal ID: my_id = CAO_TERMINAL_ID
 
-2. Delegate with callback instructions:
-   delegate(
+2. Assign with callback instructions:
+   assign(
      agent_profile="data_analyst",
-     message="Analyze dataset [1,2,3,4,5]. 
+     message="Analyze dataset [values]. 
               Send results to terminal {my_id} using send_message."
    )
 
@@ -141,13 +141,13 @@ Message will be delivered to terminal abc12345's inbox.
 
 ### 1. Analysis Supervisor (`analysis_supervisor.md`)
 - Orchestrates the entire workflow
-- Delegates to 3 Data Analysts (parallel, async)
+- Assigns to 3 Data Analysts (parallel, async)
 - Handoffs to Report Generator (sequential, waits)
 - Receives results from Data Analysts via send_message
 - Combines everything into final output
 
 ### 2. Data Analyst (`data_analyst.md`)
-- Receives task from Supervisor via delegate
+- Receives task from Supervisor via assign
 - Performs statistical analysis on one dataset
 - Sends results back to Supervisor via send_message
 - Multiple instances run in parallel
@@ -174,9 +174,9 @@ q mcp add --name cao-mcp-server --scope global --command uvx \
 
 3. Install the agent profiles:
 ```bash
-cao install examples/delegate-async/analysis_supervisor.md
-cao install examples/delegate-async/data_analyst.md
-cao install examples/delegate-async/report_generator.md
+cao install examples/assign/analysis_supervisor.md
+cao install examples/assign/data_analyst.md
+cao install examples/assign/report_generator.md
 ```
 
 4. Launch the supervisor:
@@ -206,18 +206,18 @@ Supervisor checks CAO_TERMINAL_ID (e.g., "super123")
 Needs this for Data Analysts to send results back
 ```
 
-### Step 2: Supervisor Delegates to Data Analysts (Parallel)
+### Step 2: Supervisor Assigns to Data Analysts (Parallel)
 ```
-delegate(agent_profile="data_analyst", 
-         message="Analyze Dataset A: [1,2,3,4,5]. Send to super123.")
+assign(agent_profile="data_analyst", 
+       message="Analyze Dataset A: [values]. Send to super123.")
 
-delegate(agent_profile="data_analyst",
-         message="Analyze Dataset B: [10,20,30,40,50]. Send to super123.")
+assign(agent_profile="data_analyst",
+       message="Analyze Dataset B: [values]. Send to super123.")
 
-delegate(agent_profile="data_analyst",
-         message="Analyze Dataset C: [5,15,25,35,45]. Send to super123.")
+assign(agent_profile="data_analyst",
+       message="Analyze Dataset C: [values]. Send to super123.")
 
-All 3 delegates return immediately - Data Analysts work in parallel
+All 3 assigns return immediately - Data Analysts work in parallel
 ```
 
 ### Step 3: Supervisor Handoffs to Report Generator
@@ -264,11 +264,11 @@ sequenceDiagram
     
     Note over Supervisor: Get terminal ID: "super123"
     
-    Supervisor->>DA1: delegate(Dataset A)
-    Supervisor->>DA2: delegate(Dataset B)
-    Supervisor->>DA3: delegate(Dataset C)
+    Supervisor->>DA1: assign(Dataset A)
+    Supervisor->>DA2: assign(Dataset B)
+    Supervisor->>DA3: assign(Dataset C)
     
-    Note over Supervisor: All delegates return immediately
+    Note over Supervisor: All assigns return immediately
     Note over DA1,DA3: Analysts working in parallel
     
     Supervisor->>ReportGen: handoff(create template)
@@ -290,13 +290,13 @@ sequenceDiagram
 
 | Pattern | Used By | Behavior | Use Case |
 |---------|---------|----------|----------|
-| **Delegate** | Supervisor → Data Analysts | Non-blocking, parallel execution | Independent parallel tasks |
+| **Assign** | Supervisor → Data Analysts | Non-blocking, parallel execution | Independent parallel tasks |
 | **Handoff** | Supervisor → Report Generator | Blocking, waits for completion | Sequential task that must complete |
 | **Send Message** | Data Analysts → Supervisor | Async callback | Return results from parallel work |
 
 ## Key Insights
 
-1. **Delegate enables true parallelism**: 3 Data Analysts process simultaneously
+1. **Assign enables true parallelism**: 3 Data Analysts process simultaneously
 2. **Handoff for sequential work**: Report Generator must complete before final assembly
 3. **Send message for callbacks**: Async communication from workers to supervisor
 4. **Inbox queuing**: Messages wait if receiver is busy, delivered when IDLE
@@ -305,9 +305,9 @@ sequenceDiagram
 ## Timing Example
 
 ```
-T=0s:   Delegate Data Analyst 1 (returns immediately)
-T=1s:   Delegate Data Analyst 2 (returns immediately)
-T=2s:   Delegate Data Analyst 3 (returns immediately)
+T=0s:   Assign Data Analyst 1 (returns immediately)
+T=1s:   Assign Data Analyst 2 (returns immediately)
+T=2s:   Assign Data Analyst 3 (returns immediately)
 T=3s:   Handoff to Report Generator (blocks)
 T=33s:  Report Generator completes (30s work)
 T=33s:  Supervisor has template, waiting for data...
@@ -320,11 +320,11 @@ T=33s:  Present final report
 
 ## Tips
 
-- Always get your terminal ID before delegating
-- Include callback terminal ID in all delegate messages
-- Delegate all parallel tasks quickly (don't wait between delegates)
+- Always get your terminal ID before assigning
+- Include callback terminal ID in all assign messages
+- Assign all parallel tasks quickly (don't wait between assigns)
 - Use handoff for work that must complete before final assembly
-- Check inbox for incoming results from delegated workers
+- Check inbox for incoming results from assigned workers
 - Aggregate all results before presenting final output
 
 ## Troubleshooting
