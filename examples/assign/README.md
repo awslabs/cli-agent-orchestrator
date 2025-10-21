@@ -164,22 +164,14 @@ Message will be delivered to terminal abc12345's inbox.
 cao-server
 ```
 
-2. Add cao-mcp-server to Q CLI global configuration:
-```bash
-q mcp add --name cao-mcp-server --scope global --command uvx \
-  --args '--from' \
-  --args 'git+https://github.com/awslabs/cli-agent-orchestrator.git@main' \
-  --args 'cao-mcp-server'
-```
-
-3. Install the agent profiles:
+2. Install the agent profiles:
 ```bash
 cao install examples/assign/analysis_supervisor.md
 cao install examples/assign/data_analyst.md
 cao install examples/assign/report_generator.md
 ```
 
-4. Launch the supervisor:
+3. Launch the supervisor:
 ```bash
 cao launch --agents analysis_supervisor
 ```

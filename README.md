@@ -113,9 +113,19 @@ tmux attach -t <session-name>
 # Detach from session (inside tmux)
 Ctrl+b, then d
 
+# Switch between windows (inside tmux)
+Ctrl+b, then n          # Next window
+Ctrl+b, then p          # Previous window
+Ctrl+b, then <number>   # Go to window number (0-9)
+Ctrl+b, then w          # List all windows (interactive selector)
+
 # Delete a session
 cao shutdown --session <session-name>
 ```
+
+**List all windows (Ctrl+b, w):**
+
+![Tmux Window Selector](./docs/assets/tmux_all_windows.png)
 
 ## MCP Server Tools and Orchestration Modes
 
