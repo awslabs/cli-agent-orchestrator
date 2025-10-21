@@ -169,6 +169,8 @@ Example: Parallel test execution
 
 ![Parallel Test Execution](./docs/assets/parallel-test-execution.png)
 
+For a complete working example combining assign with handoff patterns, see [examples/assign](examples/assign) - a supervisor orchestrates parallel data analysis across multiple analysts while sequentially generating a report.
+
 **3. Send Message** - Communicate with an existing agent
 - Sends a message to a specific terminal's inbox
 - Messages are queued and delivered when the terminal is idle
