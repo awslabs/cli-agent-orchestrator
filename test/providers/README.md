@@ -98,15 +98,15 @@ test/providers/
 - tmux 3.2+ must be installed
 
 **Agent Setup:**
-The integration tests automatically create a test agent named `developer` if it doesn't exist. The agent is created at:
-- `~/.aws/amazonq/cli-agents/developer.json`
+The integration tests automatically create a test agent named `agent-q-cli-integration-test` if it doesn't exist. The agent is created at:
+- `~/.aws/amazonq/cli-agents/agent-q-cli-integration-test.json`
 
 If you want to create the agent manually before running tests:
 ```bash
 mkdir -p ~/.aws/amazonq/cli-agents
-cat > ~/.aws/amazonq/cli-agents/developer.json << 'EOF'
+cat > ~/.aws/amazonq/cli-agents/agent-q-cli-integration-test.json << 'EOF'
 {
-  "name": "developer",
+  "name": "agent-q-cli-integration-test",
   "description": "Test agent for integration tests",
   "instructions": "You are a helpful developer assistant for testing purposes.",
   "tools": []
@@ -120,44 +120,44 @@ For more information on custom agents, see: https://docs.aws.amazon.com/amazonq/
 
 ### Run All Unit Tests (Recommended)
 ```bash
-pytest test/providers/test_q_cli_unit.py -v
+uv run pytest test/providers/test_q_cli_unit.py -v
 ```
 
 ### Run Unit Tests with Coverage
 ```bash
-pytest test/providers/test_q_cli_unit.py --cov=src/cli_agent_orchestrator/providers/q_cli.py --cov-report=term-missing -v
+uv run pytest test/providers/test_q_cli_unit.py --cov=src/cli_agent_orchestrator/providers/q_cli.py --cov-report=term-missing -v
 ```
 
 ### Run Integration Tests (Requires Q CLI)
 ```bash
-pytest test/providers/test_q_cli_integration.py -v
+uv run pytest test/providers/test_q_cli_integration.py -v
 ```
 
 ### Run All Tests
 ```bash
-pytest test/providers/ -v
+uv run pytest test/providers/ -v
 ```
 
 ### Run Tests by Marker
 ```bash
 # Run only integration tests
-pytest test/providers/ -m integration -v
+uv run pytest test/providers/ -m integration -v
 
 # Skip integration tests (unit only)
-pytest test/providers/ -m "not integration" -v
+uv run pytest test/providers/ -m "not integration" -v
 
 # Run only slow tests
-pytest test/providers/ -m slow -v
+uv run pytest test/providers/ -m slow -v
 ```
 
 ### Run Specific Test Class
 ```bash
-pytest test/providers/test_q_cli_unit.py::TestQCliProviderStatusDetection -v
+uv run pytest test/providers/test_q_cli_unit.py::TestQCliProviderStatusDetection -v
 ```
 
 ### Run Specific Test
 ```bash
-pytest test/providers/test_q_cli_unit.py::TestQCliProviderStatusDetection::test_get_status_idle -v
+uv run pytest test/providers/test_q_cli_unit.py::TestQCliProviderStatusDetection::test_get_status_idle -v
 ```
 
 ## Test Fixtures
@@ -165,7 +165,7 @@ pytest test/providers/test_q_cli_unit.py::TestQCliProviderStatusDetection::test_
 Test fixtures contain realistic Q CLI terminal output with proper ANSI escape sequences. To regenerate fixtures:
 
 ```bash
-python test/providers/fixtures/generate_fixtures.py
+uv run python test/providers/fixtures/generate_fixtures.py
 ```
 
 ### Fixture Contents
@@ -182,48 +182,14 @@ python test/providers/fixtures/generate_fixtures.py
 
 ## CI/CD Integration
 
-### GitHub Actions Example
+The project includes a GitHub Actions workflow (`.github/workflows/test-q-cli-provider.yml`) that automatically runs tests on pull requests and pushes to main/develop branches.
 
-```yaml
-name: Test Q CLI Provider
+The workflow includes:
+- **Unit tests**: Run on Python 3.10, 3.11, and 3.12 with coverage reporting
+- **Integration tests**: Run only on main branch (requires Q CLI setup)
+- **Code quality**: Checks formatting (black), import sorting (isort), and type checking (mypy)
 
-on: [push, pull_request]
-
-jobs:
-  unit-tests:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v4
-        with:
-          python-version: '3.12'
-      - name: Install dependencies
-        run: |
-          pip install -e .
-          pip install pytest pytest-cov pytest-mock
-      - name: Run unit tests
-        run: pytest test/providers/test_q_cli_unit.py --cov --cov-report=xml
-      - name: Upload coverage
-        uses: codecov/codecov-action@v3
-
-  integration-tests:
-    runs-on: ubuntu-latest
-    # Only run on main branch
-    if: github.ref == 'refs/heads/main'
-    steps:
-      - uses: actions/checkout@v3
-      - name: Install Q CLI
-        run: |
-          # Add Q CLI installation steps
-      - name: Configure Q CLI
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        run: |
-          # Add Q CLI configuration steps
-      - name: Run integration tests
-        run: pytest test/providers/test_q_cli_integration.py -v
-```
+For more details, see the [workflow file](../../.github/workflows/test-q-cli-provider.yml).
 
 ## Writing New Tests
 
@@ -270,14 +236,14 @@ def test_new_integration(self, q_cli_available, test_session_name, cleanup_sessi
 
 ### Unit Tests Fail with Import Error
 ```bash
-# Install package in development mode
-pip install -e .
+# Sync dependencies (installs all required packages including dev dependencies)
+uv sync
 ```
 
 ### Fixture Files Have Wrong Encoding
 ```bash
 # Regenerate fixtures
-python test/providers/fixtures/generate_fixtures.py
+uv run python test/providers/fixtures/generate_fixtures.py
 ```
 
 ### Integration Tests Skip
@@ -288,7 +254,7 @@ python test/providers/fixtures/generate_fixtures.py
 ### Coverage Not 100%
 Run with missing lines report:
 ```bash
-pytest test/providers/test_q_cli_unit.py --cov=src/cli_agent_orchestrator/providers/q_cli.py --cov-report=term-missing
+uv run pytest test/providers/test_q_cli_unit.py --cov=src/cli_agent_orchestrator/providers/q_cli.py --cov-report=term-missing
 ```
 
 ## Maintenance
@@ -296,8 +262,8 @@ pytest test/providers/test_q_cli_unit.py --cov=src/cli_agent_orchestrator/provid
 ### When Q CLI Output Format Changes
 
 1. Update fixture files in `fixtures/generate_fixtures.py`
-2. Regenerate: `python test/providers/fixtures/generate_fixtures.py`
-3. Run tests to verify: `pytest test/providers/test_q_cli_unit.py -v`
+2. Regenerate: `uv run python test/providers/fixtures/generate_fixtures.py`
+3. Run tests to verify: `uv run pytest test/providers/test_q_cli_unit.py -v`
 4. Update integration tests if behavior changes
 
 ### Adding New Q CLI Features
@@ -343,13 +309,13 @@ The Q CLI provider uses index-based extraction for parsing terminal output. This
 
 ```bash
 # Run all handoff unit tests
-pytest test/providers/test_q_cli_unit.py::TestQCliProviderHandoffScenarios -v
+uv run pytest test/providers/test_q_cli_unit.py::TestQCliProviderHandoffScenarios -v
 
 # Run handoff integration tests
-pytest test/providers/test_q_cli_integration.py::TestQCliProviderHandoffIntegration -v
+uv run pytest test/providers/test_q_cli_integration.py::TestQCliProviderHandoffIntegration -v
 
 # Run specific handoff test
-pytest test/providers/test_q_cli_unit.py::TestQCliProviderHandoffScenarios::test_handoff_indices_not_corrupted -v
+uv run pytest test/providers/test_q_cli_unit.py::TestQCliProviderHandoffScenarios::test_handoff_indices_not_corrupted -v
 ```
 
 ### Key Test Validations
