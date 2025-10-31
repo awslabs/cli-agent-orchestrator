@@ -12,7 +12,7 @@ from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_sta
 logger = logging.getLogger(__name__)
 
 # Regex patterns for Q CLI output analysis (module-level constants)
-GREEN_ARROW_PATTERN = r"\x1b\[38;5;10m>\s*\x1b\[39m"
+GREEN_ARROW_PATTERN = r"^>\s*"  # Pattern for ANSI-cleaned output (start of line)
 ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
 ESCAPE_SEQUENCE_PATTERN = r"\[[?0-9;]*[a-zA-Z]"
 CONTROL_CHAR_PATTERN = r"[\x00-\x1f\x7f-\x9f]"
@@ -32,12 +32,13 @@ class QCliProvider(BaseProvider):
         # TODO: remove the ._initialized if it's not referenced anywhere
         self._initialized = False
         self._agent_profile = agent_profile
-        # Create dynamic prompt pattern based on agent profile
-        # Matches: [agent] !> or [agent] > or [agent] X% > with optional color reset and optional trailing whitespace/newlines
-        # Q CLI uses 16-color codes: \x1b[36m (cyan) for [agent], \x1b[35m (magenta) for >
-        self._idle_prompt_pattern = rf"\x1b\[36m\[{re.escape(self._agent_profile)}\]\s*(?:\x1b\[32m\d+%\s*)?\x1b\[35m>\s*(?:\x1b\[39m)?[\s\n]*$"
+        # Create dynamic prompt pattern based on agent profile (ANSI-free)
+        # Matches: [agent] !> or [agent] > or [agent] X% > after ANSI codes are stripped
+        self._idle_prompt_pattern = (
+            rf"\[{re.escape(self._agent_profile)}\]\s*(?:\d+%\s*)?!?>\s*[\s\n]*$"
+        )
         self._permission_prompt_pattern = (
-            r"Allow this action\?.*\[.*y.*\/.*n.*\/.*t.*\]:\x1b\[39m\s*" + self._idle_prompt_pattern
+            r"Allow this action\?.*\[.*y.*\/.*n.*\/.*t.*\]:\s*" + self._idle_prompt_pattern
         )
 
     def initialize(self) -> bool:
@@ -63,23 +64,25 @@ class QCliProvider(BaseProvider):
         if not output:
             return TerminalStatus.ERROR
 
+        # Strip ANSI codes once for all pattern matching
+        clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
+
         # Check if we have the idle prompt (not processing)
-        has_idle_prompt = re.search(self._idle_prompt_pattern, output)
+        has_idle_prompt = re.search(self._idle_prompt_pattern, clean_output)
 
         if not has_idle_prompt:
             return TerminalStatus.PROCESSING
 
         # Check for error indicators
-        clean_output = re.sub(ANSI_CODE_PATTERN, "", output).lower()
-        if any(indicator.lower() in clean_output for indicator in ERROR_INDICATORS):
+        if any(indicator.lower() in clean_output.lower() for indicator in ERROR_INDICATORS):
             return TerminalStatus.ERROR
 
         # Check for permission prompt
-        if re.search(self._permission_prompt_pattern, output, re.MULTILINE | re.DOTALL):
+        if re.search(self._permission_prompt_pattern, clean_output, re.MULTILINE | re.DOTALL):
             return TerminalStatus.WAITING_USER_ANSWER
 
         # Check for completed state (has response + agent prompt)
-        if re.search(GREEN_ARROW_PATTERN, output):
+        if re.search(GREEN_ARROW_PATTERN, clean_output, re.MULTILINE):
             logger.debug(f"get_status: returning COMPLETED")
             return TerminalStatus.COMPLETED
 
@@ -88,9 +91,12 @@ class QCliProvider(BaseProvider):
 
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract agent's final response message using green arrow indicator."""
-        # Find last green arrow and idle prompt
-        green_arrows = list(re.finditer(GREEN_ARROW_PATTERN, script_output))
-        idle_prompts = list(re.finditer(self._idle_prompt_pattern, script_output))
+        # Strip ANSI codes for pattern matching
+        clean_output = re.sub(ANSI_CODE_PATTERN, "", script_output)
+
+        # Find patterns in clean output
+        green_arrows = list(re.finditer(GREEN_ARROW_PATTERN, clean_output, re.MULTILINE))
+        idle_prompts = list(re.finditer(self._idle_prompt_pattern, clean_output))
 
         if not green_arrows:
             raise ValueError("No Q CLI response found - no green arrow pattern detected")
@@ -98,11 +104,11 @@ class QCliProvider(BaseProvider):
         if not idle_prompts:
             raise ValueError("Incomplete Q CLI response - no final prompt detected")
 
-        # Extract text between last green arrow and last idle prompt
+        # Extract directly from clean output
         start_pos = green_arrows[-1].end()
         end_pos = idle_prompts[-1].start()
 
-        final_answer = script_output[start_pos:end_pos].strip()
+        final_answer = clean_output[start_pos:end_pos].strip()
 
         if not final_answer:
             raise ValueError("Empty Q CLI response - no content found")

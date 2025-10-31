@@ -231,22 +231,22 @@ class TestQCliProviderRegexPatterns:
         """Test green arrow pattern detection."""
         from cli_agent_orchestrator.providers.q_cli import GREEN_ARROW_PATTERN
 
-        # Should match
-        assert re.search(GREEN_ARROW_PATTERN, "\x1b[38;5;10m> \x1b[39m")
-        assert re.search(GREEN_ARROW_PATTERN, "\x1b[38;5;10m>\x1b[39m")
+        # Should match (test with ANSI-cleaned input)
+        assert re.search(GREEN_ARROW_PATTERN, "> ")
+        assert re.search(GREEN_ARROW_PATTERN, ">")
 
-        # Should not match
-        assert not re.search(GREEN_ARROW_PATTERN, "> ")
-        assert not re.search(GREEN_ARROW_PATTERN, "\x1b[35m>\x1b[39m")
+        # Should not match (not at start of line)
+        assert not re.search(GREEN_ARROW_PATTERN, "text > ", re.MULTILINE)
+        assert not re.search(GREEN_ARROW_PATTERN, "some>", re.MULTILINE)
 
     def test_idle_prompt_pattern_with_profile(self):
         """Test idle prompt pattern with different profiles."""
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
 
-        # Should match
-        assert re.search(provider._idle_prompt_pattern, "\x1b[36m[developer]\x1b[35m>\x1b[39m")
-        assert re.search(provider._idle_prompt_pattern, "\x1b[36m[developer]\x1b[35m>\x1b[39m ")
-        assert re.search(provider._idle_prompt_pattern, "\x1b[36m[developer]\x1b[35m>\x1b[39m\n")
+        # Should match (test with ANSI-cleaned input)
+        assert re.search(provider._idle_prompt_pattern, "[developer]>")
+        assert re.search(provider._idle_prompt_pattern, "[developer]> ")
+        assert re.search(provider._idle_prompt_pattern, "[developer]>\n")
 
         # Should not match different profile
         assert not re.search(provider._idle_prompt_pattern, "\x1b[36m[reviewer]\x1b[35m>\x1b[39m")
@@ -255,21 +255,21 @@ class TestQCliProviderRegexPatterns:
         """Test idle prompt pattern with usage percentage."""
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
 
-        # Should match with percentage
+        # Should match with percentage (test with ANSI-cleaned input)
         assert re.search(
             provider._idle_prompt_pattern,
-            "\x1b[36m[developer] \x1b[32m45%\x1b[35m>\x1b[39m",
+            "[developer] 45%>",
         )
         assert re.search(
             provider._idle_prompt_pattern,
-            "\x1b[36m[developer] \x1b[32m100%\x1b[35m>\x1b[39m",
+            "[developer] 100%>",
         )
 
     def test_permission_prompt_pattern(self):
         """Test permission prompt pattern detection."""
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
 
-        permission_text = "Allow this action? [y/n/t]:\x1b[39m \x1b[36m[developer]\x1b[35m>\x1b[39m"
+        permission_text = "Allow this action? [y/n/t]: [developer]>"
         assert re.search(provider._permission_prompt_pattern, permission_text)
 
     def test_ansi_code_cleaning(self):
