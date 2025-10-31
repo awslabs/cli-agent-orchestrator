@@ -31,11 +31,10 @@ class QCliProvider(BaseProvider):
         # TODO: remove the ._initialized if it's not referenced anywhere
         self._initialized = False
         self._agent_profile = agent_profile
-        # Create dynamic prompt pattern based on agent profile
-        # Matches: [agent] !> or [agent] > or [agent] X% > with optional color reset and optional trailing whitespace/newlines
-        # Q CLI uses 16-color codes: \x1b[36m (cyan) for [agent], \x1b[35m (magenta) for >
-        self._idle_prompt_pattern = rf'\x1b\[36m\[{re.escape(self._agent_profile)}\]\s*(?:\x1b\[32m\d+%\s*)?\x1b\[35m>\s*(?:\x1b\[39m)?[\s\n]*$'
-        self._permission_prompt_pattern = r'Allow this action\?.*\[.*y.*\/.*n.*\/.*t.*\]:\x1b\[39m\s*' + self._idle_prompt_pattern
+        # Create dynamic prompt pattern based on agent profile (ANSI-free)
+        # Matches: [agent] !> or [agent] > or [agent] X% > after ANSI codes are stripped
+        self._idle_prompt_pattern = rf'\[{re.escape(self._agent_profile)}\]\s*(?:\d+%\s*)?!?>\s*[\s\n]*$'
+        self._permission_prompt_pattern = r'Allow this action\?.*\[.*y.*\/.*n.*\/.*t.*\]:\s*' + self._idle_prompt_pattern
     
     
     def initialize(self) -> bool:
@@ -61,19 +60,25 @@ class QCliProvider(BaseProvider):
         if not output:
             return TerminalStatus.ERROR
         
+        # Debug logging for pattern matching
+        logger.debug(f"Pattern: {self._idle_prompt_pattern}")
+        logger.debug(f"Output (last 200 chars): {repr(output[-200:])}")
+        
+        # Strip ANSI codes once for all pattern matching
+        clean_output = re.sub(ANSI_CODE_PATTERN, '', output)
+        
         # Check if we have the idle prompt (not processing)
-        has_idle_prompt = re.search(self._idle_prompt_pattern, output)
+        has_idle_prompt = re.search(self._idle_prompt_pattern, clean_output)
         
         if not has_idle_prompt:
             return TerminalStatus.PROCESSING
         
         # Check for error indicators
-        clean_output = re.sub(ANSI_CODE_PATTERN, '', output).lower()
-        if any(indicator.lower() in clean_output for indicator in ERROR_INDICATORS):
+        if any(indicator.lower() in clean_output.lower() for indicator in ERROR_INDICATORS):
             return TerminalStatus.ERROR
         
         # Check for permission prompt
-        if re.search(self._permission_prompt_pattern, output, re.MULTILINE | re.DOTALL):
+        if re.search(self._permission_prompt_pattern, clean_output, re.MULTILINE | re.DOTALL):
             return TerminalStatus.WAITING_USER_ANSWER
         
         # Check for completed state (has response + agent prompt)
