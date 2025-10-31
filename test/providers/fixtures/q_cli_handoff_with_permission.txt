@@ -1,0 +1,5 @@
+$ q chat --agent supervisor
+Delegate this task to another agent.
+[38;5;10m> [39mI can delegate this to the developer agent. This will require accessing their workspace.
+
+Allow this action? [y/n/t]:[39m [36m[supervisor][35m>[39m 

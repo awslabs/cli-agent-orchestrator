@@ -1,0 +1,8 @@
+$ q chat --agent supervisor
+Please handle this complex task.
+[38;5;10m> [39mAttempting to delegate to the specialist agent...
+
+Error: Unable to complete handoff - target agent is not available.
+
+Amazon Q is having trouble responding right now. Please try again.
+[36m[supervisor][35m>[39m 

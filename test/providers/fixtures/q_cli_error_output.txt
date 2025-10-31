@@ -1,0 +1,4 @@
+$ q chat --agent developer
+Amazon Q is having trouble responding right now. Please try again later.
+
+[36m[developer][35m>[39m 

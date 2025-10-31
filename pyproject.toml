@@ -62,7 +62,8 @@ warn_unused_configs = true
 markers = [
     "asyncio: marks tests that use asyncio",
     "integration: marks integration tests",
-    "e2e: marks end-to-end tests"
+    "e2e: marks end-to-end tests",
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')"
 ]
 asyncio_mode = "strict"
 testpaths = ["test"]

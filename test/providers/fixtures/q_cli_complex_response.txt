@@ -1,0 +1,35 @@
+$ q chat --agent developer
+[38;5;10m> [39mHere's a detailed response with code examples.
+
+First, let me explain the concept:
+
+## Python Example
+
+```python
+def hello_world():
+    print("Hello, World!")
+    return True
+```
+
+## JavaScript Example
+
+```javascript
+function helloWorld() {
+    console.log("Hello, World!");
+    return true;
+}
+```
+
+Key points to consider:
+1. Function naming conventions
+2. Return values
+3. Side effects
+
+Additional notes with special characters:
+- Emoji support: 🚀 ✅ 🎉
+- Unicode: café, naïve, 日本語
+- Control chars: [K[2J
+
+Let me know if you need more details!
+
+[36m[developer][35m>[39m 

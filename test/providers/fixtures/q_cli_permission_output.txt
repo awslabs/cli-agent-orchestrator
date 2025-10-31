@@ -1,0 +1,4 @@
+$ q chat --agent developer
+[38;5;10m> [39mI'd like to execute a command that requires your permission.
+
+Allow this action? [y/n/t]:[39m [36m[developer][35m>[39m 
