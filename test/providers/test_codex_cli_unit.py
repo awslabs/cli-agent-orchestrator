@@ -2,7 +2,7 @@
 
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import ANY, call, patch
+from unittest.mock import call, patch
 
 import pytest
 
@@ -33,11 +33,8 @@ class TestCodexCliInitialization:
 
         mock_wait_shell.assert_called_once()
         assert mock_tmux.send_keys.call_args_list == [
-            call("session", "window", ANY),
             call("session", "window", "codex"),
         ]
-        export_call = mock_tmux.send_keys.call_args_list[0]
-        assert export_call.args[2].startswith("export CAO_MCP_HOME=")
         mock_wait_status.assert_called_once()
 
     @patch("cli_agent_orchestrator.providers.codex_cli.wait_for_shell")
@@ -80,11 +77,12 @@ class TestCodexCliInitialization:
         mock_subprocess.assert_called_once()
         cmd_args = mock_subprocess.call_args[0][0]
         assert cmd_args[:3] == ["codex", "mcp", "add"]
-        assert "--env" in cmd_args
+        assert cmd_args[3:5] == ["--env", "OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES"]
+        assert cmd_args[5:7] == ["cao-mcp-server", "uvx"]
+        assert "--from" in cmd_args
         assert cmd_args[-1] == "cao-mcp-server"
         # First send_keys exports env, second launches Codex
         assert mock_tmux.send_keys.call_args_list[0].args[2].startswith("export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=")
-        assert mock_tmux.send_keys.call_args_list[1].args[2].startswith("export CAO_MCP_HOME=")
         assert mock_tmux.send_keys.call_args_list[-1] == call("session", "window", "codex")
 
 

@@ -5,7 +5,6 @@ import os
 import re
 import shlex
 import subprocess
-from pathlib import Path
 from typing import Dict, Optional
 
 from cli_agent_orchestrator.providers.base import BaseProvider
@@ -71,9 +70,7 @@ class CodexCliProvider(BaseProvider):
             self._ensure_mcp_servers_registered()
 
         # Export server-specific environment variables so Codex inherits them.
-        env_exports = dict(self._env_exports)
-        env_exports.setdefault("CAO_MCP_HOME", str(Path.home() / ".cache" / "codex-cao"))
-        for key, value in env_exports.items():
+        for key, value in self._env_exports.items():
             quoted = shlex.quote(str(value))
             tmux_client.send_keys(
                 self.session_name,
@@ -96,9 +93,6 @@ class CodexCliProvider(BaseProvider):
         """Register MCP servers with Codex using the CLI's `mcp add` command."""
 
         base_env = os.environ.copy()
-        base_env.update(self._env_exports)
-        base_env.setdefault("CAO_MCP_HOME", str(Path.home() / ".cache" / "codex-cao"))
-        Path(base_env["CAO_MCP_HOME"]).mkdir(parents=True, exist_ok=True)
 
         for name, server in self._mcp_servers.items():
             command = server.get("command")
@@ -112,7 +106,8 @@ class CodexCliProvider(BaseProvider):
             cmd = ["codex", "mcp", "add"]
             for key, value in server_env.items():
                 cmd.extend(["--env", f"{key}={value}"])
-            cmd.extend([command, *args, name])
+            cmd.extend([name, command])
+            cmd.extend(args)
 
             try:
                 result = subprocess.run(
