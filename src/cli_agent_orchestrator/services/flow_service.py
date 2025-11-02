@@ -20,6 +20,7 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.services.terminal_service import create_terminal, send_input
+from cli_agent_orchestrator.constants import PROVIDERS, DEFAULT_PROVIDER
 from cli_agent_orchestrator.utils.template import render_template
 from cli_agent_orchestrator.utils.terminal import generate_session_name
 
@@ -62,6 +63,10 @@ def add_flow(file_path: str) -> Flow:
         name = metadata['name']
         schedule = metadata['schedule']
         agent_profile = metadata['agent_profile']
+        provider = metadata.get('provider', DEFAULT_PROVIDER)
+        if provider not in PROVIDERS:
+            raise ValueError(f"Unsupported provider: {provider}")
+
         script = metadata.get('script', '')  # Optional
         
         # Validate cron expression and calculate next run
@@ -76,6 +81,7 @@ def add_flow(file_path: str) -> Flow:
             file_path=str(path),
             schedule=schedule,
             agent_profile=agent_profile,
+            provider=provider,
             script=script,
             next_run=next_run
         )
@@ -193,7 +199,7 @@ def execute_flow(name: str) -> bool:
         session_name = generate_session_name()
         terminal = create_terminal(
             session_name=session_name,
-            provider='q_cli',
+            provider=flow.provider,
             agent_profile=flow.agent_profile,
             new_session=True
         )

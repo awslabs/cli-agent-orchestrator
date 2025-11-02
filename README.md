@@ -22,7 +22,7 @@ CLI Agent Orchestrator (CAO) implements a hierarchical multi-agent system that e
 * **Flow - Scheduled runs** – Automated execution of workflows at specified intervals using cron-like scheduling, enabling routine tasks and monitoring workflows to run unattended.
 * **Context preservation** – The supervisor agent provides only necessary context to each worker agent, avoiding context pollution while maintaining workflow coherence.
 * **Direct worker interaction and steering** – Users can interact directly with worker agents to provide additional steering, distinguishing from sub-agents features by allowing real-time guidance and course correction.
-* **Advanced CLI integration** – CAO agents have full access to advanced features of the developer CLI, such as the [sub-agents](https://docs.claude.com/en/docs/claude-code/sub-agents) feature of Claude Code, [Custom Agent](https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/command-line-custom-agents.html) of Amazon Q Developer for CLI and so on.
+* **Advanced CLI integration** – CAO agents have full access to advanced features of the developer CLI, such as the [sub-agents](https://docs.claude.com/en/docs/claude-code/sub-agents) feature of Claude Code, [Custom Agent](https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/command-line-custom-agents.html) of Amazon Q Developer for CLI, and the planning/Reason+ modes available in [Codex CLI](https://developers.openai.com/codex/cli).
 
 For detailed project structure and architecture, see [CODEBASE.md](CODEBASE.md).
 
@@ -89,6 +89,12 @@ In another terminal, launch a terminal with an agent profile:
 
 ```bash
 cao launch --agents code_supervisor
+```
+
+To launch the same profile backed by Codex CLI:
+
+```bash
+cao launch --agents code_supervisor --provider codex_cli
 ```
 
 Shutdown sessions:
@@ -232,6 +238,8 @@ tmux attach -t <session-name>
 # 6. Cleanup session when done
 cao shutdown --session <session-name>
 ```
+
+Flow frontmatter accepts an optional `provider` key (default `q_cli`). Set `provider: codex_cli` to schedule Codex-backed sessions when needed.
 
 **IMPORTANT:** The `cao-server` must be running for flows to execute on schedule.
 

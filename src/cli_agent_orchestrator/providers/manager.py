@@ -5,6 +5,7 @@ from typing import Dict, Optional
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.providers.q_cli import QCliProvider
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+from cli_agent_orchestrator.providers.codex_cli import CodexCliProvider
 from cli_agent_orchestrator.clients.database import get_terminal_metadata
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,8 @@ class ProviderManager:
                 provider = QCliProvider(terminal_id, tmux_session, tmux_window, agent_profile)
             elif provider_type == "claude_code":
                 provider = ClaudeCodeProvider(terminal_id, tmux_session, tmux_window, agent_profile)
+            elif provider_type == "codex_cli":
+                provider = CodexCliProvider(terminal_id, tmux_session, tmux_window, agent_profile)
             else:
                 raise ValueError(f"Unknown provider type: {provider_type}")
             

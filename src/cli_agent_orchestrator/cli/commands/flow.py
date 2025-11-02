@@ -23,6 +23,7 @@ def add(file_path):
         click.echo(f"Flow '{flow.name}' added successfully")
         click.echo(f"  Schedule: {flow.schedule}")
         click.echo(f"  Agent: {flow.agent_profile}")
+        click.echo(f"  Provider: {flow.provider}")
         click.echo(f"  Next run: {flow.next_run}")
     except Exception as e:
         raise click.ClickException(str(e))
@@ -37,15 +38,15 @@ def list():
             click.echo("No flows found")
             return
         
-        click.echo(f"{'Name':<20} {'Schedule':<15} {'Agent':<15} {'Last Run':<20} {'Next Run':<20} {'Enabled':<8}")
-        click.echo("-" * 110)
-        
+        click.echo(f"{'Name':<20} {'Schedule':<15} {'Agent':<15} {'Provider':<12} {'Last Run':<20} {'Next Run':<20} {'Enabled':<8}")
+        click.echo("-" * 126)
+
         for f in flows:
             last_run = f.last_run.strftime('%Y-%m-%d %H:%M') if f.last_run else 'Never'
             next_run = f.next_run.strftime('%Y-%m-%d %H:%M') if f.next_run else 'N/A'
             enabled = 'Yes' if f.enabled else 'No'
             
-            click.echo(f"{f.name:<20} {f.schedule:<15} {f.agent_profile:<15} {last_run:<20} {next_run:<20} {enabled:<8}")
+            click.echo(f"{f.name:<20} {f.schedule:<15} {f.agent_profile:<15} {f.provider:<12} {last_run:<20} {next_run:<20} {enabled:<8}")
     except Exception as e:
         raise click.ClickException(str(e))
 

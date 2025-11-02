@@ -11,7 +11,11 @@ from cli_agent_orchestrator.constants import PROVIDERS, SERVER_HOST, SERVER_PORT
 @click.option('--agents', required=True, help='Agent profile to launch')
 @click.option('--session-name', help='Name of the session (default: auto-generated)')
 @click.option('--headless', is_flag=True, help='Launch in detached mode')
-@click.option('--provider', default='q_cli', help='Provider to use (default: q_cli)')
+@click.option(
+    '--provider',
+    default='q_cli',
+    help='Provider to use (default: q_cli). Available: q_cli, claude_code, codex_cli'
+)
 def launch(agents, session_name, headless, provider):
     """Launch cao session with specified agent profile."""
     try:

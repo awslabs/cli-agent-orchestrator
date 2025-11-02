@@ -72,7 +72,8 @@ src/cli_agent_orchestrator/
 │   ├── base.py            # Abstract provider interface
 │   ├── manager.py         # Maps terminal_id → provider
 │   ├── q_cli.py           # Amazon Q CLI provider (q_cli)
-│   └── claude_code.py     # Claude Code provider (claude_code)
+│   ├── claude_code.py     # Claude Code provider (claude_code)
+│   └── codex_cli.py       # Codex CLI provider (codex_cli)
 ├── models/                # Data models
 │   ├── terminal.py        # Terminal, TerminalStatus
 │   ├── session.py         # Session model

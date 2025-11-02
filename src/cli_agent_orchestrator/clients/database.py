@@ -3,7 +3,7 @@
 import logging
 from datetime import datetime
 from typing import Optional, Dict, List
-from sqlalchemy import Column, String, DateTime, Integer, Boolean, create_engine
+from sqlalchemy import Column, String, DateTime, Integer, Boolean, create_engine, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 from cli_agent_orchestrator.models.inbox import MessageStatus, InboxMessage
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR
@@ -49,6 +49,7 @@ class FlowModel(Base):
     file_path = Column(String, nullable=False)
     schedule = Column(String, nullable=False)
     agent_profile = Column(String, nullable=False)
+    provider = Column(String, nullable=False, default="q_cli")
     script = Column(String, nullable=True)
     last_run = Column(DateTime, nullable=True)
     next_run = Column(DateTime, nullable=True)
@@ -64,6 +65,15 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 def init_db():
     """Initialize database tables."""
     Base.metadata.create_all(bind=engine)
+
+    # Lightweight migration: ensure flows table has provider column
+    try:
+        with engine.begin() as connection:
+            columns = connection.execute(text("PRAGMA table_info(flows)")).fetchall()
+            if columns and not any(column[1] == 'provider' for column in columns):
+                connection.execute(text("ALTER TABLE flows ADD COLUMN provider TEXT DEFAULT 'q_cli'"))
+    except Exception as exc:
+        logger.warning("Failed to ensure flows.provider column exists: %s", exc)
 
 
 def create_terminal(terminal_id: str, tmux_session: str, tmux_window: str, 
@@ -207,8 +217,8 @@ def update_message_status(message_id: int, status: MessageStatus) -> bool:
 
 # Flow database functions
 
-def create_flow(name: str, file_path: str, schedule: str, agent_profile: str, 
-                script: str, next_run: datetime) -> Flow:
+def create_flow(name: str, file_path: str, schedule: str, agent_profile: str,
+                provider: str, script: str, next_run: datetime) -> Flow:
     """Create flow record."""
     with SessionLocal() as db:
         flow = FlowModel(
@@ -216,6 +226,7 @@ def create_flow(name: str, file_path: str, schedule: str, agent_profile: str,
             file_path=file_path,
             schedule=schedule,
             agent_profile=agent_profile,
+            provider=provider,
             script=script,
             next_run=next_run
         )
@@ -227,6 +238,7 @@ def create_flow(name: str, file_path: str, schedule: str, agent_profile: str,
             file_path=flow.file_path,
             schedule=flow.schedule,
             agent_profile=flow.agent_profile,
+            provider=flow.provider,
             script=flow.script,
             last_run=flow.last_run,
             next_run=flow.next_run,
@@ -245,6 +257,7 @@ def get_flow(name: str) -> Optional[Flow]:
             file_path=flow.file_path,
             schedule=flow.schedule,
             agent_profile=flow.agent_profile,
+            provider=flow.provider,
             script=flow.script,
             last_run=flow.last_run,
             next_run=flow.next_run,
@@ -262,6 +275,7 @@ def list_flows() -> List[Flow]:
                 file_path=f.file_path,
                 schedule=f.schedule,
                 agent_profile=f.agent_profile,
+                provider=f.provider,
                 script=f.script,
                 last_run=f.last_run,
                 next_run=f.next_run,
@@ -318,6 +332,7 @@ def get_flows_to_run() -> List[Flow]:
                 file_path=f.file_path,
                 schedule=f.schedule,
                 agent_profile=f.agent_profile,
+                provider=f.provider,
                 script=f.script,
                 last_run=f.last_run,
                 next_run=f.next_run,

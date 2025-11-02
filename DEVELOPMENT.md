@@ -51,8 +51,12 @@ Unit tests are fast (< 1 second) and use mocked dependencies:
 # Run all unit tests
 uv run pytest test/providers/test_q_cli_unit.py -v
 
+# Run Codex CLI unit tests
+uv run pytest test/providers/test_codex_cli_unit.py -v
+
 # Run with coverage report
 uv run pytest test/providers/test_q_cli_unit.py --cov=src/cli_agent_orchestrator/providers/q_cli.py --cov-report=term-missing -v
+uv run pytest test/providers/test_codex_cli_unit.py --cov=src/cli_agent_orchestrator/providers/codex_cli.py --cov-report=term-missing -v
 
 # Run specific test class
 uv run pytest test/providers/test_q_cli_unit.py::TestQCliProviderStatusDetection -v
