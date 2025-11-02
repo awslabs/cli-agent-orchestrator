@@ -1,8 +1,10 @@
 """Unit tests for Codex CLI provider."""
 
-import pytest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import ANY, call, patch
+
+import pytest
 
 from cli_agent_orchestrator.providers.codex_cli import CodexCliProvider
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -30,7 +32,12 @@ class TestCodexCliInitialization:
         assert provider.initialize() is True
 
         mock_wait_shell.assert_called_once()
-        mock_tmux.send_keys.assert_called_once_with("session", "window", "codex")
+        assert mock_tmux.send_keys.call_args_list == [
+            call("session", "window", ANY),
+            call("session", "window", "codex"),
+        ]
+        export_call = mock_tmux.send_keys.call_args_list[0]
+        assert export_call.args[2].startswith("export CAO_MCP_HOME=")
         mock_wait_status.assert_called_once()
 
     @patch("cli_agent_orchestrator.providers.codex_cli.wait_for_shell")
@@ -41,6 +48,44 @@ class TestCodexCliInitialization:
 
         with pytest.raises(TimeoutError, match="Shell initialization timed out"):
             provider.initialize()
+
+    @patch("cli_agent_orchestrator.providers.codex_cli.subprocess.run")
+    @patch("cli_agent_orchestrator.providers.codex_cli.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.codex_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.codex_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.codex_cli.tmux_client")
+    def test_initialize_registers_mcp_servers(
+        self,
+        mock_tmux,
+        mock_wait_status,
+        mock_wait_shell,
+        mock_load_profile,
+        mock_subprocess,
+    ):
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        mock_load_profile.return_value = SimpleNamespace(
+            mcpServers={
+                "cao-mcp-server": {
+                    "command": "uvx",
+                    "args": ["--from", "git+https://example", "cao-mcp-server"],
+                    "env": {"OBJC_DISABLE_INITIALIZE_FORK_SAFETY": "YES"},
+                }
+            }
+        )
+
+        provider = CodexCliProvider("abcd1234", "session", "window", agent_profile="product_supervisor")
+        provider.initialize()
+
+        mock_subprocess.assert_called_once()
+        cmd_args = mock_subprocess.call_args[0][0]
+        assert cmd_args[:3] == ["codex", "mcp", "add"]
+        assert "--env" in cmd_args
+        assert cmd_args[-1] == "cao-mcp-server"
+        # First send_keys exports env, second launches Codex
+        assert mock_tmux.send_keys.call_args_list[0].args[2].startswith("export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=")
+        assert mock_tmux.send_keys.call_args_list[1].args[2].startswith("export CAO_MCP_HOME=")
+        assert mock_tmux.send_keys.call_args_list[-1] == call("session", "window", "codex")
 
 
 class TestCodexCliStatusDetection:

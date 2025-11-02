@@ -1,13 +1,18 @@
 """Codex CLI provider implementation."""
 
 import logging
+import os
 import re
-from typing import Optional
+import shlex
+import subprocess
+from pathlib import Path
+from typing import Dict, Optional
 
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
+from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 
 logger = logging.getLogger(__name__)
 
@@ -41,11 +46,40 @@ class CodexCliProvider(BaseProvider):
         super().__init__(terminal_id, session_name, window_name)
         self._initialized = False
         self._agent_profile = agent_profile
+        self._mcp_servers: Dict[str, Dict] = {}
+        self._env_exports: Dict[str, str] = {}
+        self._profile = None
+
+        if self._agent_profile:
+            try:
+                self._profile = load_agent_profile(self._agent_profile)
+                if self._profile.mcpServers:
+                    self._mcp_servers = self._profile.mcpServers
+                    for server in self._mcp_servers.values():
+                        for key, value in (server.get("env") or {}).items():
+                            self._env_exports[key] = value
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Failed to load agent profile '%s': %s", self._agent_profile, exc)
 
     def initialize(self) -> bool:
         """Launch Codex CLI inside the tmux pane and wait until it's idle."""
         if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
+
+        # Ensure MCP configuration is registered ahead of the interactive session.
+        if self._mcp_servers:
+            self._ensure_mcp_servers_registered()
+
+        # Export server-specific environment variables so Codex inherits them.
+        env_exports = dict(self._env_exports)
+        env_exports.setdefault("CAO_MCP_HOME", str(Path.home() / ".cache" / "codex-cao"))
+        for key, value in env_exports.items():
+            quoted = shlex.quote(str(value))
+            tmux_client.send_keys(
+                self.session_name,
+                self.window_name,
+                f"export {key}={quoted}"
+            )
 
         command = "codex"
         # Fire up the interactive Codex TUI inside the tmux pane.
@@ -57,6 +91,43 @@ class CodexCliProvider(BaseProvider):
 
         self._initialized = True
         return True
+
+    def _ensure_mcp_servers_registered(self) -> None:
+        """Register MCP servers with Codex using the CLI's `mcp add` command."""
+
+        base_env = os.environ.copy()
+        base_env.update(self._env_exports)
+        base_env.setdefault("CAO_MCP_HOME", str(Path.home() / ".cache" / "codex-cao"))
+        Path(base_env["CAO_MCP_HOME"]).mkdir(parents=True, exist_ok=True)
+
+        for name, server in self._mcp_servers.items():
+            command = server.get("command")
+            if not command:
+                logger.warning("Skipping MCP server '%s': missing command", name)
+                continue
+
+            args = server.get("args") or []
+            server_env = server.get("env") or {}
+
+            cmd = ["codex", "mcp", "add"]
+            for key, value in server_env.items():
+                cmd.extend(["--env", f"{key}={value}"])
+            cmd.extend([command, *args, name])
+
+            try:
+                result = subprocess.run(
+                    cmd,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=base_env,
+                )
+                if result.returncode != 0 and "already exists" not in (result.stderr or ""):
+                    logger.warning(
+                        "Failed to register MCP server '%s': %s", name, result.stderr.strip()
+                    )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.error("Error registering MCP server '%s': %s", name, exc)
 
     def get_status(self, tail_lines: int = None) -> TerminalStatus:
         """Determine Codex CLI status from tmux history."""

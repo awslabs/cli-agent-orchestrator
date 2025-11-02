@@ -14,6 +14,7 @@ This example adapts the **assign/handoff** orchestration pattern so a Codex supe
    cao install examples/hybrid-use-case/implementation_codex.md
    cao install examples/hybrid-use-case/release_captain_codex.md
    ```
+   > Each profile now exports `OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES` so `uvx` can spawn reliably inside macOS sandboxes. If you previously installed them, rerun the commands above to refresh the stored copies.
 3. Create a workspace for generated artefacts:
    ```bash
    mkdir -p examples/hybrid-use-case/output

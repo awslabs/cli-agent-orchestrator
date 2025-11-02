@@ -10,6 +10,8 @@ mcpServers:
       - "--from"
       - "git+https://github.com/awslabs/cli-agent-orchestrator.git@main"
       - "cao-mcp-server"
+    env:
+      OBJC_DISABLE_INITIALIZE_FORK_SAFETY: "YES"
 ---
 
 # LOG ANALYST (CODEX CLI)
