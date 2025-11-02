@@ -12,6 +12,7 @@ from pydantic import Field
 
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
 from cli_agent_orchestrator.constants import DEFAULT_PROVIDER, API_BASE_URL
+from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.utils.terminal import generate_session_name, wait_until_terminal_status
 
@@ -45,7 +46,19 @@ def _create_terminal(agent_profile: str) -> Tuple[str, str]:
         Exception: If terminal creation fails
     """
     provider = DEFAULT_PROVIDER
-    
+    profile_provider = None
+
+    try:
+        profile = load_agent_profile(agent_profile)
+        profile_provider = getattr(profile, "provider", None)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Agent profile '{agent_profile}' is not installed. Run `cao install` before invoking it."
+        ) from exc
+
+    if profile_provider:
+        provider = profile_provider
+
     # Get current terminal ID from environment
     current_terminal_id = os.environ.get('CAO_TERMINAL_ID')
     if current_terminal_id:
@@ -53,10 +66,12 @@ def _create_terminal(agent_profile: str) -> Tuple[str, str]:
         response = requests.get(f"{API_BASE_URL}/terminals/{current_terminal_id}")
         response.raise_for_status()
         terminal_metadata = response.json()
-        
-        provider = terminal_metadata["provider"]
+
         session_name = terminal_metadata["session_name"]
-        
+
+        if not profile_provider:
+            provider = terminal_metadata["provider"]
+
         # Create new terminal in existing session
         response = requests.post(
             f"{API_BASE_URL}/sessions/{session_name}/terminals",

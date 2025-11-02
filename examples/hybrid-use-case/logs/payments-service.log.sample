@@ -1,0 +1,15 @@
+2024-05-18T07:29:58.412Z INFO  request_id=81f1dc6b-9b2f-4c4c-ab4d-0ddd123fa211 customer_id=98437 event="checkout.start" latency_ms=12
+2024-05-18T07:30:01.904Z WARN  request_id=4b127a6d-3b4d-4579-aafb-02454f9d25c1 customer_id=61102 event="checkout.retry" latency_ms=482 note="retrying charge after transient 5xx"
+2024-05-18T07:30:02.337Z ERROR request_id=2f71f754-cb3c-47d0-968c-32e68fe8f6b6 customer_id=61102 event="payment.charge" error_code=PAY-502 message="upstream processor timed out"
+2024-05-18T07:30:02.339Z INFO  request_id=2f71f754-cb3c-47d0-968c-32e68fe8f6b6 event="retry.schedule" next_attempt_in_sec=30 policy="exponential-backoff"
+2024-05-18T07:30:05.121Z INFO  request_id=81f1dc6b-9b2f-4c4c-ab4d-0ddd123fa211 event="checkout.succeeded" latency_ms=87 charges=1
+2024-05-18T07:30:30.017Z ERROR request_id=9083ecb7-6904-42ba-9393-53c7cdded770 customer_id=11745 event="payment.charge" error_code=PAY-422 message="validation failed: invalid postal code"
+2024-05-18T07:30:31.228Z INFO  request_id=9083ecb7-6904-42ba-9393-53c7cdded770 event="checkout.failed" reason="validation error"
+2024-05-18T07:31:14.993Z ERROR request_id=b7d3f64c-87ea-4329-a176-9ed2e9859d69 customer_id=40211 event="payment.charge" error_code=PAY-502 message="upstream processor timed out"
+2024-05-18T07:31:15.004Z WARN  request_id=b7d3f64c-87ea-4329-a176-9ed2e9859d69 event="retry.schedule" next_attempt_in_sec=60 policy="exponential-backoff"
+2024-05-18T07:31:45.566Z ERROR request_id=a1b26a2b-44f0-49f3-8d38-79fcd6096f3f customer_id=61102 event="payment.charge" error_code=PAY-502 message="upstream processor timed out"
+2024-05-18T07:31:45.874Z WARN  request_id=a1b26a2b-44f0-49f3-8d38-79fcd6096f3f event="retry.schedule" next_attempt_in_sec=60 policy="exponential-backoff"
+2024-05-18T07:31:46.227Z INFO  request_id=523e11d0-7d3c-4c3b-bad0-0e17367be865 customer_id=50999 event="checkout.start" latency_ms=11
+2024-05-18T07:31:47.092Z INFO  request_id=523e11d0-7d3c-4c3b-bad0-0e17367be865 event="checkout.succeeded" latency_ms=94 charges=1
+2024-05-18T07:32:15.093Z ERROR request_id=2f71f754-cb3c-47d0-968c-32e68fe8f6b6 customer_id=61102 event="payment.charge.retry" attempt=2 error_code=PAY-502 message="upstream processor timed out"
+2024-05-18T07:32:45.327Z ERROR request_id=b7d3f64c-87ea-4329-a176-9ed2e9859d69 customer_id=40211 event="payment.charge.retry" attempt=2 error_code=PAY-502 message="upstream processor timed out"

@@ -4,7 +4,13 @@ import subprocess
 import click
 import requests
 
-from cli_agent_orchestrator.constants import PROVIDERS, SERVER_HOST, SERVER_PORT
+from cli_agent_orchestrator.constants import (
+    DEFAULT_PROVIDER,
+    PROVIDERS,
+    SERVER_HOST,
+    SERVER_PORT,
+)
+from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 
 
 @click.command()
@@ -13,20 +19,35 @@ from cli_agent_orchestrator.constants import PROVIDERS, SERVER_HOST, SERVER_PORT
 @click.option('--headless', is_flag=True, help='Launch in detached mode')
 @click.option(
     '--provider',
-    default='q_cli',
-    help='Provider to use (default: q_cli). Available: q_cli, claude_code, codex_cli'
+    default=None,
+    help='Provider to use. Defaults to the agent profile provider or q_cli. Available: q_cli, claude_code, codex_cli'
 )
 def launch(agents, session_name, headless, provider):
     """Launch cao session with specified agent profile."""
     try:
-        # Validate provider
-        if provider not in PROVIDERS:
-            raise click.ClickException(f"Invalid provider '{provider}'. Available providers: {', '.join(PROVIDERS)}")
+        selected_provider = provider
+
+        if not selected_provider:
+            # Detect provider preference from the agent profile so Codex/Claude
+            # sessions work without an explicit flag.
+            try:
+                profile = load_agent_profile(agents)
+                selected_provider = profile.provider or DEFAULT_PROVIDER
+            except Exception:
+                selected_provider = DEFAULT_PROVIDER
+
+            click.echo(f"Using provider '{selected_provider}' (derived from agent profile)")
+
+        # Validate provider after defaults are resolved
+        if selected_provider not in PROVIDERS:
+            raise click.ClickException(
+                f"Invalid provider '{selected_provider}'. Available providers: {', '.join(PROVIDERS)}"
+            )
         
         # Call API to create session
         url = f"http://{SERVER_HOST}:{SERVER_PORT}/sessions"
         params = {
-            "provider": provider,
+            "provider": selected_provider,
             "agent_profile": agents,
         }
         if session_name:
