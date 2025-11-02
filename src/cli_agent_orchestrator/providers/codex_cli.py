@@ -69,8 +69,11 @@ class CodexCliProvider(BaseProvider):
         if self._mcp_servers:
             self._ensure_mcp_servers_registered()
 
-        # Export server-specific environment variables so Codex inherits them.
-        for key, value in self._env_exports.items():
+        # Export environment variables so Codex inherits terminal metadata and MCP settings.
+        runtime_env = {"CAO_TERMINAL_ID": self.terminal_id}
+        runtime_env.update(self._env_exports)
+
+        for key, value in runtime_env.items():
             quoted = shlex.quote(str(value))
             tmux_client.send_keys(
                 self.session_name,

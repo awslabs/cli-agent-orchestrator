@@ -33,6 +33,7 @@ class TestCodexCliInitialization:
 
         mock_wait_shell.assert_called_once()
         assert mock_tmux.send_keys.call_args_list == [
+            call("session", "window", "export CAO_TERMINAL_ID=abcd1234"),
             call("session", "window", "codex"),
         ]
         mock_wait_status.assert_called_once()
@@ -82,7 +83,8 @@ class TestCodexCliInitialization:
         assert "--from" in cmd_args
         assert cmd_args[-1] == "cao-mcp-server"
         # First send_keys exports env, second launches Codex
-        assert mock_tmux.send_keys.call_args_list[0].args[2].startswith("export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=")
+        assert mock_tmux.send_keys.call_args_list[0].args[2] == "export CAO_TERMINAL_ID=abcd1234"
+        assert mock_tmux.send_keys.call_args_list[1].args[2].startswith("export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=")
         assert mock_tmux.send_keys.call_args_list[-1] == call("session", "window", "codex")
 
 

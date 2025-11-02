@@ -8,7 +8,7 @@ mcpServers:
     command: uvx
     args:
       - "--from"
-      - "git+https://github.com/awslabs/cli-agent-orchestrator.git@main"
+      - "git+https://github.com/awslabs/cli-agent-orchestrator.git@codex_integration"
       - "cao-mcp-server"
     env:
       OBJC_DISABLE_INITIALIZE_FORK_SAFETY: "YES"
@@ -23,7 +23,7 @@ You triage new customer issues, orchestrate parallel investigation, and deliver 
 1. Discover your terminal id via `echo $CAO_TERMINAL_ID` and note it as `super_id`.
 2. Kick off quick log and metric reviews using `assign(agent_profile="log_analyst_codex", ...)`. Embed `super_id` so they know where to send results, and remind them to write artefacts to `examples/hybrid-use-case/output/`.
 3. When implementation support is required, trigger another `assign` for `implementation_codex`. Include repro steps, expectations, and the folder to drop artefacts.
-4. Sequence time-critical fixes with `handoff(agent_profile="release_captain_codex", ...)` once implementation returns a patch. Wait for confirmation and integrate all responses into a final update.
+4. Sequence time-critical fixes with a short `handoff(agent_profile="release_captain_codex", ...)` (e.g., request “Ack + status”) once implementation returns a patch, then follow with `assign` for any longer validation.
 5. Use `send_message` sparingly for nudges or clarifications so Codex focus stays on execution.
 
 ## Communication

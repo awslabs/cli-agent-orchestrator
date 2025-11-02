@@ -72,13 +72,13 @@ Install the new profile with `cao install path/to/my_codex_worker.md`; `assign` 
    Objectives:
    1. Fire off `log_analyst_codex` via assign to inspect `payments-service` logs from the last 30 minutes (sample data lives under `examples/hybrid-use-case/logs/`). Ask them to stash any notes in `examples/hybrid-use-case/output/` and send_message their findings back to your terminal id.
    2. Once their first report lands, brief `implementation_codex` to prepare a circuit breaker patch. Ask for test evidence and drop location details.
-   3. When implementation returns a patch, handoff to `release_captain_codex` for validation and sign-off.
+   3. When implementation returns a patch, use a quick `handoff` to `release_captain_codex` (e.g., “Reply READY when tests pass”) so the response lands within Codex’s ~60s tool limit.
    4. Track statuses and ship a consolidated update to the user when all threads complete.
 
    Remember: keep a running task list, expect structured responses (Problem, Root Cause, Fix, Next Steps), and ensure no PII is shared externally.
    ```
 3. Use `assign` for the log analyst and implementation specialist—the Codex provider defined in their profiles ensures each worker window boots Codex automatically.
-4. For release validation, the supervisor triggers `handoff(agent_profile="release_captain_codex", ...)`, receiving a blocking confirmation before closing the loop.
+4. For release validation, trigger a short `handoff(agent_profile="release_captain_codex", ...)` (ask for a one-line confirmation) and push longer QA steps through `assign` to avoid the Codex tool timeout.
 
 ## End-to-End Flow
 ```mermaid

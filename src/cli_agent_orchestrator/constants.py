@@ -1,5 +1,6 @@
 """Constants for CLI Agent Orchestrator application."""
 
+import os
 from pathlib import Path
 
 # Session configuration
@@ -49,3 +50,16 @@ SERVER_PORT = 9889
 SERVER_VERSION = "0.1.0"
 API_BASE_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
 CORS_ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"]
+
+# Payments service protection defaults
+PAYMENTS_BREAKER_FAILURE_THRESHOLD = int(os.getenv("PAYMENTS_BREAKER_FAILURE_THRESHOLD", "3"))
+PAYMENTS_BREAKER_RESET_TIMEOUT_SECONDS = float(
+    os.getenv("PAYMENTS_BREAKER_RESET_TIMEOUT_SECONDS", "30")
+)
+PAYMENTS_BREAKER_HALF_OPEN_MAX_CALLS = int(
+    os.getenv("PAYMENTS_BREAKER_HALF_OPEN_MAX_CALLS", "1")
+)
+PAYMENTS_RETRY_MAX_ATTEMPTS = int(os.getenv("PAYMENTS_RETRY_MAX_ATTEMPTS", "3"))
+PAYMENTS_RETRY_BASE_DELAY_SECONDS = float(os.getenv("PAYMENTS_RETRY_BASE_DELAY_SECONDS", "0.2"))
+PAYMENTS_RETRY_MAX_DELAY_SECONDS = float(os.getenv("PAYMENTS_RETRY_MAX_DELAY_SECONDS", "3.0"))
+PAYMENTS_RETRY_JITTER_RATIO = float(os.getenv("PAYMENTS_RETRY_JITTER_RATIO", "0.25"))
