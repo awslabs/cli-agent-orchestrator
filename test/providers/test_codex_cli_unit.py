@@ -79,13 +79,14 @@ class TestCodexCliInitialization:
         cmd_args = mock_subprocess.call_args[0][0]
         assert cmd_args[:3] == ["codex", "mcp", "add"]
         assert cmd_args[3:5] == ["--env", "OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES"]
-        assert cmd_args[5:7] == ["cao-mcp-server", "uvx"]
+        assert cmd_args[5:7] == ["--env", "CAO_TERMINAL_ID=abcd1234"]
+        assert cmd_args[7:9] == ["cao-mcp-server", "uvx"]
         assert "--from" in cmd_args
         assert cmd_args[-1] == "cao-mcp-server"
         # First send_keys exports env, second launches Codex
         assert mock_tmux.send_keys.call_args_list[0].args[2] == "export CAO_TERMINAL_ID=abcd1234"
         assert mock_tmux.send_keys.call_args_list[1].args[2].startswith("export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=")
-        assert mock_tmux.send_keys.call_args_list[-1] == call("session", "window", "codex")
+        assert mock_tmux.send_keys.call_args_list[2] == call("session", "window", "codex")
 
 
 class TestCodexCliStatusDetection:

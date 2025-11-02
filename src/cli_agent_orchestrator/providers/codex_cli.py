@@ -104,7 +104,9 @@ class CodexCliProvider(BaseProvider):
                 continue
 
             args = server.get("args") or []
-            server_env = server.get("env") or {}
+            server_env = (server.get("env") or {}).copy()
+            # Ensure downstream tools know which terminal initiated the MCP call.
+            server_env.setdefault("CAO_TERMINAL_ID", self.terminal_id)
 
             cmd = ["codex", "mcp", "add"]
             for key, value in server_env.items():
