@@ -16,9 +16,9 @@ Base = declarative_base()
 
 class TerminalModel(Base):
     """SQLAlchemy model for terminal metadata only."""
-    
+
     __tablename__ = "terminals"
-    
+
     id = Column(String, primary_key=True)  # "abc123ef"
     tmux_session = Column(String, nullable=False)  # "cao-session-name"
     tmux_window = Column(String, nullable=False)  # "window-name"
@@ -29,9 +29,9 @@ class TerminalModel(Base):
 
 class InboxModel(Base):
     """SQLAlchemy model for inbox messages."""
-    
+
     __tablename__ = "inbox"
-    
+
     id = Column(Integer, primary_key=True, autoincrement=True)
     sender_id = Column(String, nullable=False)
     receiver_id = Column(String, nullable=False)
@@ -42,9 +42,9 @@ class InboxModel(Base):
 
 class FlowModel(Base):
     """SQLAlchemy model for flow metadata."""
-    
+
     __tablename__ = "flows"
-    
+
     name = Column(String, primary_key=True)
     file_path = Column(String, nullable=False)
     schedule = Column(String, nullable=False)
@@ -66,8 +66,9 @@ def init_db():
     Base.metadata.create_all(bind=engine)
 
 
-def create_terminal(terminal_id: str, tmux_session: str, tmux_window: str, 
-                   provider: str, agent_profile: str = None) -> Dict:
+def create_terminal(
+    terminal_id: str, tmux_session: str, tmux_window: str, provider: str, agent_profile: str = None
+) -> Dict:
     """Create terminal metadata record."""
     with SessionLocal() as db:
         terminal = TerminalModel(
@@ -75,7 +76,7 @@ def create_terminal(terminal_id: str, tmux_session: str, tmux_window: str,
             tmux_session=tmux_session,
             tmux_window=tmux_window,
             provider=provider,
-            agent_profile=agent_profile
+            agent_profile=agent_profile,
         )
         db.add(terminal)
         db.commit()
@@ -84,7 +85,7 @@ def create_terminal(terminal_id: str, tmux_session: str, tmux_window: str,
             "tmux_session": terminal.tmux_session,
             "tmux_window": terminal.tmux_window,
             "provider": terminal.provider,
-            "agent_profile": terminal.agent_profile
+            "agent_profile": terminal.agent_profile,
         }
 
 
@@ -95,14 +96,16 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict]:
         if not terminal:
             logger.warning(f"Terminal metadata not found for terminal_id: {terminal_id}")
             return None
-        logger.debug(f"Retrieved terminal metadata for {terminal_id}: provider={terminal.provider}, session={terminal.tmux_session}")
+        logger.debug(
+            f"Retrieved terminal metadata for {terminal_id}: provider={terminal.provider}, session={terminal.tmux_session}"
+        )
         return {
             "id": terminal.id,
             "tmux_session": terminal.tmux_session,
             "tmux_window": terminal.tmux_window,
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
-            "last_active": terminal.last_active
+            "last_active": terminal.last_active,
         }
 
 
@@ -117,7 +120,7 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict]:
                 "tmux_window": t.tmux_window,
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
-                "last_active": t.last_active
+                "last_active": t.last_active,
             }
             for t in terminals
         ]
@@ -145,7 +148,9 @@ def delete_terminal(terminal_id: str) -> bool:
 def delete_terminals_by_session(tmux_session: str) -> int:
     """Delete all terminals in a session."""
     with SessionLocal() as db:
-        deleted = db.query(TerminalModel).filter(TerminalModel.tmux_session == tmux_session).delete()
+        deleted = (
+            db.query(TerminalModel).filter(TerminalModel.tmux_session == tmux_session).delete()
+        )
         db.commit()
         return deleted
 
@@ -157,7 +162,7 @@ def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> Inbo
             sender_id=sender_id,
             receiver_id=receiver_id,
             message=message,
-            status=MessageStatus.PENDING.value
+            status=MessageStatus.PENDING.value,
         )
         db.add(inbox_msg)
         db.commit()
@@ -168,19 +173,21 @@ def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> Inbo
             receiver_id=inbox_msg.receiver_id,
             message=inbox_msg.message,
             status=MessageStatus(inbox_msg.status),
-            created_at=inbox_msg.created_at
+            created_at=inbox_msg.created_at,
         )
 
 
 def get_pending_messages(receiver_id: str, limit: int = 1) -> List[InboxMessage]:
     """Get pending messages ordered by created_at ASC (oldest first)."""
     with SessionLocal() as db:
-        messages = db.query(InboxModel)\
-            .filter(InboxModel.receiver_id == receiver_id)\
-            .filter(InboxModel.status == MessageStatus.PENDING.value)\
-            .order_by(InboxModel.created_at.asc())\
-            .limit(limit)\
+        messages = (
+            db.query(InboxModel)
+            .filter(InboxModel.receiver_id == receiver_id)
+            .filter(InboxModel.status == MessageStatus.PENDING.value)
+            .order_by(InboxModel.created_at.asc())
+            .limit(limit)
             .all()
+        )
         return [
             InboxMessage(
                 id=msg.id,
@@ -188,7 +195,7 @@ def get_pending_messages(receiver_id: str, limit: int = 1) -> List[InboxMessage]
                 receiver_id=msg.receiver_id,
                 message=msg.message,
                 status=MessageStatus(msg.status),
-                created_at=msg.created_at
+                created_at=msg.created_at,
             )
             for msg in messages
         ]
@@ -207,8 +214,10 @@ def update_message_status(message_id: int, status: MessageStatus) -> bool:
 
 # Flow database functions
 
-def create_flow(name: str, file_path: str, schedule: str, agent_profile: str, 
-                script: str, next_run: datetime) -> Flow:
+
+def create_flow(
+    name: str, file_path: str, schedule: str, agent_profile: str, script: str, next_run: datetime
+) -> Flow:
     """Create flow record."""
     with SessionLocal() as db:
         flow = FlowModel(
@@ -217,7 +226,7 @@ def create_flow(name: str, file_path: str, schedule: str, agent_profile: str,
             schedule=schedule,
             agent_profile=agent_profile,
             script=script,
-            next_run=next_run
+            next_run=next_run,
         )
         db.add(flow)
         db.commit()
@@ -230,7 +239,7 @@ def create_flow(name: str, file_path: str, schedule: str, agent_profile: str,
             script=flow.script,
             last_run=flow.last_run,
             next_run=flow.next_run,
-            enabled=flow.enabled
+            enabled=flow.enabled,
         )
 
 
@@ -248,7 +257,7 @@ def get_flow(name: str) -> Optional[Flow]:
             script=flow.script,
             last_run=flow.last_run,
             next_run=flow.next_run,
-            enabled=flow.enabled
+            enabled=flow.enabled,
         )
 
 
@@ -265,7 +274,7 @@ def list_flows() -> List[Flow]:
                 script=f.script,
                 last_run=f.last_run,
                 next_run=f.next_run,
-                enabled=f.enabled
+                enabled=f.enabled,
             )
             for f in flows
         ]
@@ -308,10 +317,9 @@ def get_flows_to_run() -> List[Flow]:
     """Get enabled flows where next_run <= now."""
     with SessionLocal() as db:
         now = datetime.now()
-        flows = db.query(FlowModel).filter(
-            FlowModel.enabled == True,
-            FlowModel.next_run <= now
-        ).all()
+        flows = (
+            db.query(FlowModel).filter(FlowModel.enabled == True, FlowModel.next_run <= now).all()
+        )
         return [
             Flow(
                 name=f.name,
@@ -321,7 +329,7 @@ def get_flows_to_run() -> List[Flow]:
                 script=f.script,
                 last_run=f.last_run,
                 next_run=f.next_run,
-                enabled=f.enabled
+                enabled=f.enabled,
             )
             for f in flows
         ]

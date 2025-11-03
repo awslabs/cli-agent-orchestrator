@@ -20,8 +20,7 @@ fixtures = {
         "\x1b[36m[developer]\x1b[35m>\x1b[39m "
     ),
     "q_cli_processing_output.txt": (
-        "$ q chat --agent developer\n"
-        "User input received, processing your request..."
+        "$ q chat --agent developer\n" "User input received, processing your request..."
     ),
     "q_cli_permission_output.txt": (
         "$ q chat --agent developer\n"

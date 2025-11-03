@@ -146,9 +146,7 @@ class TestQCliProviderStatusDetection:
         status = provider.get_status(tail_lines=50)
 
         assert status == TerminalStatus.IDLE
-        mock_tmux.get_history.assert_called_once_with(
-            "test-session", "window-0", tail_lines=50
-        )
+        mock_tmux.get_history.assert_called_once_with("test-session", "window-0", tail_lines=50)
 
 
 class TestQCliProviderMessageExtraction:
@@ -246,17 +244,11 @@ class TestQCliProviderRegexPatterns:
 
         # Should match
         assert re.search(provider._idle_prompt_pattern, "\x1b[36m[developer]\x1b[35m>\x1b[39m")
-        assert re.search(
-            provider._idle_prompt_pattern, "\x1b[36m[developer]\x1b[35m>\x1b[39m "
-        )
-        assert re.search(
-            provider._idle_prompt_pattern, "\x1b[36m[developer]\x1b[35m>\x1b[39m\n"
-        )
+        assert re.search(provider._idle_prompt_pattern, "\x1b[36m[developer]\x1b[35m>\x1b[39m ")
+        assert re.search(provider._idle_prompt_pattern, "\x1b[36m[developer]\x1b[35m>\x1b[39m\n")
 
         # Should not match different profile
-        assert not re.search(
-            provider._idle_prompt_pattern, "\x1b[36m[reviewer]\x1b[35m>\x1b[39m"
-        )
+        assert not re.search(provider._idle_prompt_pattern, "\x1b[36m[reviewer]\x1b[35m>\x1b[39m")
 
     def test_idle_prompt_pattern_with_percentage(self):
         """Test idle prompt pattern with usage percentage."""
@@ -276,9 +268,7 @@ class TestQCliProviderRegexPatterns:
         """Test permission prompt pattern detection."""
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
 
-        permission_text = (
-            "Allow this action? [y/n/t]:\x1b[39m \x1b[36m[developer]\x1b[35m>\x1b[39m"
-        )
+        permission_text = "Allow this action? [y/n/t]:\x1b[39m \x1b[36m[developer]\x1b[35m>\x1b[39m"
         assert re.search(provider._permission_prompt_pattern, permission_text)
 
     def test_ansi_code_cleaning(self):
@@ -308,9 +298,7 @@ class TestQCliProviderPromptPatterns:
     @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
     def test_prompt_with_percentage(self, mock_tmux):
         """Test prompt with usage percentage."""
-        mock_tmux.get_history.return_value = (
-            "\x1b[36m[developer] \x1b[32m75%\x1b[35m>\x1b[39m "
-        )
+        mock_tmux.get_history.return_value = "\x1b[36m[developer] \x1b[32m75%\x1b[35m>\x1b[39m "
 
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
         status = provider.get_status()
@@ -320,13 +308,9 @@ class TestQCliProviderPromptPatterns:
     @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
     def test_prompt_with_special_profile_characters(self, mock_tmux):
         """Test prompt with special characters in profile name."""
-        mock_tmux.get_history.return_value = (
-            "\x1b[36m[code-reviewer_v2]\x1b[35m>\x1b[39m "
-        )
+        mock_tmux.get_history.return_value = "\x1b[36m[code-reviewer_v2]\x1b[35m>\x1b[39m "
 
-        provider = QCliProvider(
-            "test1234", "test-session", "window-0", "code-reviewer_v2"
-        )
+        provider = QCliProvider("test1234", "test-session", "window-0", "code-reviewer_v2")
         status = provider.get_status()
 
         assert status == TerminalStatus.IDLE
@@ -378,10 +362,10 @@ class TestQCliProviderHandoffScenarios:
         mock_tmux.get_history.return_value = output
 
         provider = QCliProvider("test1234", "test-session", "window-0", "supervisor")
-        
+
         # Even with error, should be able to extract the message
         message = provider.extract_last_message_from_script(output)
-        
+
         assert len(message) > 0
         assert "\x1b[" not in message
         assert "error" in message.lower() or "unable" in message.lower()
@@ -417,11 +401,11 @@ class TestQCliProviderHandoffScenarios:
         output = load_fixture("q_cli_handoff_successful.txt")
 
         provider = QCliProvider("test1234", "test-session", "window-0", "supervisor")
-        
+
         # This test validates the core concern: indices work correctly
         # even with ANSI codes present in the original string
         message = provider.extract_last_message_from_script(output)
-        
+
         # Message should be complete and well-formed
         assert len(message) > 0
         assert "\x1b[" not in message  # All ANSI codes removed
@@ -461,9 +445,7 @@ class TestQCliProviderEdgeCases:
     def test_long_agent_profile_name(self, mock_tmux):
         """Test with very long agent profile name."""
         long_profile = "very_long_agent_profile_name_that_exceeds_normal_length"
-        mock_tmux.get_history.return_value = (
-            f"\x1b[36m[{long_profile}]\x1b[35m>\x1b[39m "
-        )
+        mock_tmux.get_history.return_value = f"\x1b[36m[{long_profile}]\x1b[35m>\x1b[39m "
 
         provider = QCliProvider("test1234", "test-session", "window-0", long_profile)
         status = provider.get_status()
@@ -484,9 +466,7 @@ class TestQCliProviderEdgeCases:
         assert status == TerminalStatus.COMPLETED
 
         # Test message extraction
-        message = provider.extract_last_message_from_script(
-            mock_tmux.get_history.return_value
-        )
+        message = provider.extract_last_message_from_script(mock_tmux.get_history.return_value)
         assert "日本語" in message
         assert "café" in message
         assert "🚀" in message
@@ -500,9 +480,7 @@ class TestQCliProviderEdgeCases:
         )
 
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
-        message = provider.extract_last_message_from_script(
-            mock_tmux.get_history.return_value
-        )
+        message = provider.extract_last_message_from_script(mock_tmux.get_history.return_value)
 
         # Control characters should be cleaned
         assert "\x07" not in message  # Bell

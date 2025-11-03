@@ -15,7 +15,7 @@ def flow():
 
 
 @flow.command()
-@click.argument('file_path', type=click.Path(exists=True))
+@click.argument("file_path", type=click.Path(exists=True))
 def add(file_path):
     """Add a flow from file."""
     try:
@@ -36,22 +36,26 @@ def list():
         if not flows:
             click.echo("No flows found")
             return
-        
-        click.echo(f"{'Name':<20} {'Schedule':<15} {'Agent':<15} {'Last Run':<20} {'Next Run':<20} {'Enabled':<8}")
+
+        click.echo(
+            f"{'Name':<20} {'Schedule':<15} {'Agent':<15} {'Last Run':<20} {'Next Run':<20} {'Enabled':<8}"
+        )
         click.echo("-" * 110)
-        
+
         for f in flows:
-            last_run = f.last_run.strftime('%Y-%m-%d %H:%M') if f.last_run else 'Never'
-            next_run = f.next_run.strftime('%Y-%m-%d %H:%M') if f.next_run else 'N/A'
-            enabled = 'Yes' if f.enabled else 'No'
-            
-            click.echo(f"{f.name:<20} {f.schedule:<15} {f.agent_profile:<15} {last_run:<20} {next_run:<20} {enabled:<8}")
+            last_run = f.last_run.strftime("%Y-%m-%d %H:%M") if f.last_run else "Never"
+            next_run = f.next_run.strftime("%Y-%m-%d %H:%M") if f.next_run else "N/A"
+            enabled = "Yes" if f.enabled else "No"
+
+            click.echo(
+                f"{f.name:<20} {f.schedule:<15} {f.agent_profile:<15} {last_run:<20} {next_run:<20} {enabled:<8}"
+            )
     except Exception as e:
         raise click.ClickException(str(e))
 
 
 @flow.command()
-@click.argument('name')
+@click.argument("name")
 def remove(name):
     """Remove a flow."""
     try:
@@ -62,7 +66,7 @@ def remove(name):
 
 
 @flow.command()
-@click.argument('name')
+@click.argument("name")
 def disable(name):
     """Disable a flow."""
     try:
@@ -73,7 +77,7 @@ def disable(name):
 
 
 @flow.command()
-@click.argument('name')
+@click.argument("name")
 def enable(name):
     """Enable a flow."""
     try:
@@ -84,7 +88,7 @@ def enable(name):
 
 
 @flow.command()
-@click.argument('name')
+@click.argument("name")
 def run(name):
     """Manually run a flow."""
     try:

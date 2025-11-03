@@ -21,10 +21,7 @@ def _get_log_tail(terminal_id: str, lines: int = 5) -> str:
     log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
     try:
         result = subprocess.run(
-            ['tail', '-n', str(lines), str(log_path)],
-            capture_output=True,
-            text=True,
-            timeout=1
+            ["tail", "-n", str(lines), str(log_path)], capture_output=True, text=True, timeout=1
         )
         return result.stdout
     except Exception:
@@ -36,7 +33,7 @@ def _has_idle_pattern(terminal_id: str) -> bool:
     tail = _get_log_tail(terminal_id)
     if not tail:
         return False
-    
+
     try:
         provider = provider_manager.get_provider(terminal_id)
         idle_pattern = provider.get_idle_pattern_for_log()
@@ -47,13 +44,13 @@ def _has_idle_pattern(terminal_id: str) -> bool:
 
 def check_and_send_pending_messages(terminal_id: str) -> bool:
     """Check for pending messages and send if terminal is ready.
-    
+
     Args:
         terminal_id: Terminal ID to check messages for
-        
+
     Returns:
         bool: True if a message was sent, False otherwise
-        
+
     Raises:
         ValueError: If provider not found for terminal
     """
@@ -61,17 +58,17 @@ def check_and_send_pending_messages(terminal_id: str) -> bool:
     messages = get_pending_messages(terminal_id, limit=1)
     if not messages:
         return False
-    
+
     message = messages[0]
-    
+
     # Get provider and check status
     provider = provider_manager.get_provider(terminal_id)
     status = provider.get_status(tail_lines=INBOX_SERVICE_TAIL_LINES)
-    
+
     if status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
         logger.debug(f"Terminal {terminal_id} not ready (status={status})")
         return False
-    
+
     # Send message
     try:
         terminal_service.send_input(terminal_id, message.message)
@@ -86,15 +83,15 @@ def check_and_send_pending_messages(terminal_id: str) -> bool:
 
 class LogFileHandler(FileSystemEventHandler):
     """Handler for terminal log file changes."""
-    
+
     def on_modified(self, event):
         """Handle file modification events."""
-        if isinstance(event, FileModifiedEvent) and event.src_path.endswith('.log'):
+        if isinstance(event, FileModifiedEvent) and event.src_path.endswith(".log"):
             log_path = Path(event.src_path)
             terminal_id = log_path.stem
             logger.debug(f"Log file modified: {terminal_id}.log")
             self._handle_log_change(terminal_id)
-    
+
     def _handle_log_change(self, terminal_id: str):
         """Handle log file change and attempt message delivery."""
         try:
@@ -103,14 +100,16 @@ class LogFileHandler(FileSystemEventHandler):
             if not messages:
                 logger.debug(f"No pending messages for {terminal_id}, skipping")
                 return
-            
+
             # Fast check: does log tail have idle pattern?
             if not _has_idle_pattern(terminal_id):
-                logger.debug(f"Terminal {terminal_id} not idle (no idle pattern in log tail), skipping")
+                logger.debug(
+                    f"Terminal {terminal_id} not idle (no idle pattern in log tail), skipping"
+                )
                 return
-            
+
             # Attempt delivery
             check_and_send_pending_messages(terminal_id)
-                
+
         except Exception as e:
             logger.error(f"Error handling log change for {terminal_id}: {e}")
