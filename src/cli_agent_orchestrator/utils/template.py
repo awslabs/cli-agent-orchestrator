@@ -1,9 +1,10 @@
 """Template variable replacement utility."""
 
 import re
+from typing import Any, Dict
 
 
-def render_template(template: str, variables: dict) -> str:
+def render_template(template: str, variables: Dict[str, Any]) -> str:
     """Replace [[key]] with values from variables dict.
 
     Args:
@@ -23,7 +24,7 @@ def render_template(template: str, variables: dict) -> str:
     if missing_vars:
         raise ValueError(f"Missing template variables: {', '.join(sorted(missing_vars))}")
 
-    def replace(match):
+    def replace(match: re.Match[str]) -> str:
         return str(variables[match.group(1)])
 
     return re.sub(pattern, replace, template)

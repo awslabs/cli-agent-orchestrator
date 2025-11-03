@@ -5,10 +5,10 @@ import logging
 import subprocess
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, cast
 
-import frontmatter
-from apscheduler.triggers.cron import CronTrigger
+import frontmatter  # type: ignore
+from apscheduler.triggers.cron import CronTrigger  # type: ignore
 
 from cli_agent_orchestrator.clients.database import create_flow as db_create_flow
 from cli_agent_orchestrator.clients.database import delete_flow as db_delete_flow
@@ -30,7 +30,10 @@ logger = logging.getLogger(__name__)
 def _get_next_run_time(cron_expression: str) -> datetime:
     """Calculate next run time from cron expression."""
     trigger = CronTrigger.from_crontab(cron_expression)
-    return trigger.get_next_fire_time(None, datetime.now())
+    next_time = trigger.get_next_fire_time(None, datetime.now())
+    if next_time is None:
+        raise ValueError(f"Could not calculate next run time for cron expression: {cron_expression}")
+    return cast(datetime, next_time)
 
 
 def _parse_flow_file(file_path: Path) -> Tuple[Dict, str]:
@@ -185,7 +188,10 @@ def execute_flow(name: str) -> bool:
             return False
 
         # Render prompt template
-        rendered_prompt = render_template(prompt_template, output["output"])
+        if not isinstance(output["output"], dict):
+            raise ValueError("Script output 'output' field must be a dictionary")
+        output_dict: Dict[str, Any] = output["output"]  # type: ignore[assignment]
+        rendered_prompt = render_template(prompt_template, output_dict)
 
         # Launch session
         session_name = generate_session_name()

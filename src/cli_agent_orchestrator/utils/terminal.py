@@ -3,11 +3,16 @@
 import logging
 import time
 import uuid
+from typing import TYPE_CHECKING
 
 import httpx
 
 from cli_agent_orchestrator.constants import API_BASE_URL, SESSION_PREFIX
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+
+if TYPE_CHECKING:
+    from cli_agent_orchestrator.clients.tmux import TmuxClient
+    from cli_agent_orchestrator.providers.base import BaseProvider
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +34,7 @@ def generate_window_name(agent_profile: str) -> str:
 
 
 def wait_for_shell(
-    tmux_client,
+    tmux_client: "TmuxClient",
     session_name: str,
     window_name: str,
     timeout: float = 10.0,
@@ -55,7 +60,7 @@ def wait_for_shell(
 
 
 def wait_until_status(
-    provider_instance,
+    provider_instance: "BaseProvider",
     target_status: TerminalStatus,
     timeout: float = 30.0,
     polling_interval: float = 1.0,

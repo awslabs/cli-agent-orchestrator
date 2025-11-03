@@ -2,10 +2,10 @@
 
 import logging
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy import Boolean, Column, DateTime, Integer, String, create_engine
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.orm import declarative_base, sessionmaker, DeclarativeBase
 
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR
 from cli_agent_orchestrator.models.flow import Flow
@@ -13,7 +13,7 @@ from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 
 logger = logging.getLogger(__name__)
 
-Base = declarative_base()
+Base: Any = declarative_base()
 
 
 class TerminalModel(Base):
@@ -63,14 +63,14 @@ engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
-def init_db():
+def init_db() -> None:
     """Initialize database tables."""
     Base.metadata.create_all(bind=engine)
 
 
 def create_terminal(
-    terminal_id: str, tmux_session: str, tmux_window: str, provider: str, agent_profile: str = None
-) -> Dict:
+    terminal_id: str, tmux_session: str, tmux_window: str, provider: str, agent_profile: Optional[str] = None
+) -> Dict[str, Any]:
     """Create terminal metadata record."""
     with SessionLocal() as db:
         terminal = TerminalModel(
@@ -91,7 +91,7 @@ def create_terminal(
         }
 
 
-def get_terminal_metadata(terminal_id: str) -> Optional[Dict]:
+def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
     """Get terminal metadata by ID."""
     with SessionLocal() as db:
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
@@ -111,7 +111,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict]:
         }
 
 
-def list_terminals_by_session(tmux_session: str) -> List[Dict]:
+def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
     """List all terminals in a tmux session."""
     with SessionLocal() as db:
         terminals = db.query(TerminalModel).filter(TerminalModel.tmux_session == tmux_session).all()

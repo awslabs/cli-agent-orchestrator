@@ -111,7 +111,7 @@ async def health_check():
 
 
 @app.post("/sessions", response_model=Terminal, status_code=status.HTTP_201_CREATED)
-async def create_session(provider: str, agent_profile: str, session_name: str = None) -> Terminal:
+async def create_session(provider: str, agent_profile: str, session_name: Optional[str] = None) -> Terminal:
     """Create a new session with exactly one terminal."""
     try:
         result = terminal_service.create_terminal(
@@ -258,6 +258,8 @@ async def exit_terminal(terminal_id: TerminalId) -> Dict:
     """Send provider-specific exit command to terminal."""
     try:
         provider = provider_manager.get_provider(terminal_id)
+        if provider is None:
+            raise ValueError(f"Provider not found for terminal {terminal_id}")
         exit_command = provider.exit_cli()
         terminal_service.send_input(terminal_id, exit_command)
         return {"success": True}

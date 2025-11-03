@@ -2,7 +2,7 @@
 
 import logging
 import re
-from typing import List
+from typing import List, Optional
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -55,7 +55,7 @@ class QCliProvider(BaseProvider):
         self._initialized = True
         return True
 
-    def get_status(self, tail_lines: int = None) -> TerminalStatus:
+    def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
         """Get Q CLI status by analyzing terminal output."""
         logger.debug(f"get_status: tail_lines={tail_lines}")
         output = tmux_client.get_history(self.session_name, self.window_name, tail_lines=tail_lines)

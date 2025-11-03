@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 class ProviderManager:
     """Simplified provider manager with direct mapping."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._providers: Dict[str, BaseProvider] = {}
 
     def create_provider(
@@ -23,10 +23,11 @@ class ProviderManager:
         terminal_id: str,
         tmux_session: str,
         tmux_window: str,
-        agent_profile: str = None,
+        agent_profile: Optional[str] = None,
     ) -> BaseProvider:
         """Create and store provider instance."""
         try:
+            provider: BaseProvider
             if provider_type == "q_cli":
                 if not agent_profile:
                     raise ValueError("Q CLI provider requires agent_profile parameter")

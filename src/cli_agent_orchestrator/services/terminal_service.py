@@ -1,8 +1,9 @@
 """Terminal service with workflow functions."""
 
 import logging
+from datetime import datetime
 from enum import Enum
-from typing import Dict
+from typing import Dict, Optional
 
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
@@ -12,7 +13,8 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.constants import SESSION_PREFIX, TERMINAL_LOG_DIR
-from cli_agent_orchestrator.models.terminal import Terminal
+from cli_agent_orchestrator.models.provider import ProviderType
+from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
@@ -31,7 +33,7 @@ class OutputMode(str, Enum):
 
 
 def create_terminal(
-    provider: str, agent_profile: str, session_name: str = None, new_session: bool = False
+    provider: str, agent_profile: str, session_name: Optional[str] = None, new_session: bool = False
 ) -> Terminal:
     """Create terminal, optionally creating new session with it."""
     try:
@@ -77,9 +79,11 @@ def create_terminal(
         terminal = Terminal(
             id=terminal_id,
             name=window_name,
-            provider=provider,
+            provider=ProviderType(provider),
             session_name=session_name,
             agent_profile=agent_profile,
+            status=TerminalStatus.IDLE,
+            last_active=datetime.now(),
         )
 
         logger.info(
@@ -89,7 +93,7 @@ def create_terminal(
 
     except Exception as e:
         logger.error(f"Failed to create terminal: {e}")
-        if new_session:
+        if new_session and session_name:
             try:
                 tmux_client.kill_session(session_name)
             except:
@@ -106,6 +110,8 @@ def get_terminal(terminal_id: str) -> Dict:
 
         # Get status from provider
         provider = provider_manager.get_provider(terminal_id)
+        if provider is None:
+            raise ValueError(f"Provider not found for terminal {terminal_id}")
         status = provider.get_status().value
 
         return {
@@ -154,6 +160,8 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
             return full_output
         elif mode == OutputMode.LAST:
             provider = provider_manager.get_provider(terminal_id)
+            if provider is None:
+                raise ValueError(f"Provider not found for terminal {terminal_id}")
             return provider.extract_last_message_from_script(full_output)
 
     except Exception as e:

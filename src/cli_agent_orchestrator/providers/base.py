@@ -1,7 +1,7 @@
 """Base provider interface for CLI tool abstraction."""
 
 from abc import ABC, abstractmethod
-from typing import List
+from typing import List, Optional
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
@@ -31,7 +31,7 @@ class BaseProvider(ABC):
         pass
 
     @abstractmethod
-    def get_status(self, tail_lines: int = None) -> TerminalStatus:
+    def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
         """Get current provider status by analyzing terminal output.
 
         Args:

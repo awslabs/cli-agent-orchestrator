@@ -2,7 +2,7 @@
 
 import re
 import shlex
-from typing import List
+from typing import List, Optional
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -33,22 +33,23 @@ class ClaudeCodeProvider(BaseProvider):
     """Provider for Claude Code CLI tool integration."""
 
     def __init__(
-        self, terminal_id: str, session_name: str, window_name: str, agent_profile: str = None
+        self, terminal_id: str, session_name: str, window_name: str, agent_profile: Optional[str] = None
     ):
         super().__init__(terminal_id, session_name, window_name)
         self._initialized = False
         self._agent_profile = agent_profile
 
-    def _build_claude_command(self) -> list:
+    def _build_claude_command(self) -> List[str]:
         """Build Claude Code command with agent profile if provided."""
         command_parts = ["claude"]
 
-        if self._agent_profile:
+        if self._agent_profile is not None:
             try:
                 profile = load_agent_profile(self._agent_profile)
 
                 # Add system prompt with proper escaping
-                command_parts.extend(["--append-system-prompt", shlex.quote(profile.system_prompt)])
+                system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
+                command_parts.extend(["--append-system-prompt", shlex.quote(system_prompt)])
 
                 # Add MCP config if present
                 if profile.mcpServers:
@@ -76,7 +77,7 @@ class ClaudeCodeProvider(BaseProvider):
         self._initialized = True
         return True
 
-    def get_status(self, tail_lines: int = None) -> TerminalStatus:
+    def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
         """Get Claude Code status by analyzing terminal output."""
 
         # Use tmux client singleton to get window history
@@ -101,8 +102,8 @@ class ClaudeCodeProvider(BaseProvider):
         if re.search(IDLE_PROMPT_PATTERN, output):
             return TerminalStatus.IDLE
 
-        # If no recognizable state, return None
-        return None
+        # If no recognizable state, return ERROR
+        return TerminalStatus.ERROR
 
     def get_idle_pattern_for_log(self) -> str:
         """Return Claude Code IDLE prompt pattern for log files."""

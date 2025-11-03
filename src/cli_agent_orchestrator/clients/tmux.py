@@ -19,7 +19,7 @@ SEND_KEYS_CHUNK_INTERVAL = 0.5
 class TmuxClient:
     """Simplified tmux client for basic operations."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.server = libtmux.Server()
 
     def create_session(self, session_name: str, window_name: str, terminal_id: str) -> str:
@@ -35,7 +35,10 @@ class TmuxClient:
                 environment=environment,
             )
             logger.info(f"Created tmux session: {session_name} with window: {window_name}")
-            return session.windows[0].name
+            window_name_result = session.windows[0].name
+            if window_name_result is None:
+                raise ValueError(f"Window name is None for session {session_name}")
+            return window_name_result
         except Exception as e:
             logger.error(f"Failed to create session {session_name}: {e}")
             raise
@@ -52,12 +55,15 @@ class TmuxClient:
             )
 
             logger.info(f"Created window '{window.name}' in session '{session_name}'")
-            return window.name
+            window_name_result = window.name
+            if window_name_result is None:
+                raise ValueError(f"Window name is None for session {session_name}")
+            return window_name_result
         except Exception as e:
             logger.error(f"Failed to create window in session {session_name}: {e}")
             raise
 
-    def send_keys(self, session_name: str, window_name: str, keys: str):
+    def send_keys(self, session_name: str, window_name: str, keys: str) -> None:
         """Send keys to window with chunking for long messages."""
         try:
             logger.info(f"send_keys: {session_name}:{window_name} - keys: {keys}")
@@ -107,7 +113,7 @@ class TmuxClient:
             raise
 
     def get_history(
-        self, session_name: str, window_name: str, tail_lines: int = TMUX_HISTORY_LINES
+        self, session_name: str, window_name: str, tail_lines: Optional[int] = None
     ) -> str:
         """Get window history.
 
@@ -127,25 +133,27 @@ class TmuxClient:
 
             # Use cmd to run capture-pane with -e (escape sequences) and -p (print) flags
             pane = window.panes[0]
-            result = pane.cmd("capture-pane", "-e", "-p", "-S", f"-{tail_lines}")
+            lines = tail_lines if tail_lines is not None else TMUX_HISTORY_LINES
+            result = pane.cmd("capture-pane", "-e", "-p", "-S", f"-{lines}")
             # Join all lines with newlines to get complete output
             return "\n".join(result.stdout) if result.stdout else ""
         except Exception as e:
             logger.error(f"Failed to get history from {session_name}:{window_name}: {e}")
             raise
 
-    def list_sessions(self) -> List[Dict]:
+    def list_sessions(self) -> List[Dict[str, str]]:
         """List all tmux sessions."""
         try:
-            sessions = []
+            sessions: List[Dict[str, str]] = []
             for session in self.server.sessions:
                 # Check if session has attached clients
                 is_attached = len(getattr(session, "attached_sessions", [])) > 0
-
+                
+                session_name = session.name if session.name is not None else ""
                 sessions.append(
                     {
-                        "id": session.name,
-                        "name": session.name,
+                        "id": session_name,
+                        "name": session_name,
                         "status": "active" if is_attached else "detached",
                     }
                 )
@@ -155,16 +163,17 @@ class TmuxClient:
             logger.error(f"Failed to list sessions: {e}")
             return []
 
-    def get_session_windows(self, session_name: str) -> List[Dict]:
+    def get_session_windows(self, session_name: str) -> List[Dict[str, str]]:
         """Get all windows in a session."""
         try:
             session = self.server.sessions.get(session_name=session_name)
             if not session:
                 return []
 
-            windows = []
+            windows: List[Dict[str, str]] = []
             for window in session.windows:
-                windows.append({"name": window.name, "index": window.index})
+                window_name = window.name if window.name is not None else ""
+                windows.append({"name": window_name, "index": str(window.index)})
 
             return windows
         except Exception as e:

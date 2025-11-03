@@ -37,6 +37,8 @@ def _has_idle_pattern(terminal_id: str) -> bool:
 
     try:
         provider = provider_manager.get_provider(terminal_id)
+        if provider is None:
+            return False
         idle_pattern = provider.get_idle_pattern_for_log()
         return bool(re.search(idle_pattern, tail))
     except Exception:
@@ -64,6 +66,8 @@ def check_and_send_pending_messages(terminal_id: str) -> bool:
 
     # Get provider and check status
     provider = provider_manager.get_provider(terminal_id)
+    if provider is None:
+        raise ValueError(f"Provider not found for terminal {terminal_id}")
     status = provider.get_status(tail_lines=INBOX_SERVICE_TAIL_LINES)
 
     if status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
