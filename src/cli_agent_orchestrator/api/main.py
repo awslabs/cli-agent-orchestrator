@@ -111,7 +111,9 @@ async def health_check():
 
 
 @app.post("/sessions", response_model=Terminal, status_code=status.HTTP_201_CREATED)
-async def create_session(provider: str, agent_profile: str, session_name: Optional[str] = None) -> Terminal:
+async def create_session(
+    provider: str, agent_profile: str, session_name: Optional[str] = None
+) -> Terminal:
     """Create a new session with exactly one terminal."""
     try:
         result = terminal_service.create_terminal(

@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import Boolean, Column, DateTime, Integer, String, create_engine
-from sqlalchemy.orm import declarative_base, sessionmaker, DeclarativeBase
+from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
 
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR
 from cli_agent_orchestrator.models.flow import Flow
@@ -69,7 +69,11 @@ def init_db() -> None:
 
 
 def create_terminal(
-    terminal_id: str, tmux_session: str, tmux_window: str, provider: str, agent_profile: Optional[str] = None
+    terminal_id: str,
+    tmux_session: str,
+    tmux_window: str,
+    provider: str,
+    agent_profile: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record."""
     with SessionLocal() as db:

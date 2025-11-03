@@ -148,7 +148,7 @@ class TmuxClient:
             for session in self.server.sessions:
                 # Check if session has attached clients
                 is_attached = len(getattr(session, "attached_sessions", [])) > 0
-                
+
                 session_name = session.name if session.name is not None else ""
                 sessions.append(
                     {

@@ -32,7 +32,9 @@ def _get_next_run_time(cron_expression: str) -> datetime:
     trigger = CronTrigger.from_crontab(cron_expression)
     next_time = trigger.get_next_fire_time(None, datetime.now())
     if next_time is None:
-        raise ValueError(f"Could not calculate next run time for cron expression: {cron_expression}")
+        raise ValueError(
+            f"Could not calculate next run time for cron expression: {cron_expression}"
+        )
     return cast(datetime, next_time)
 
 

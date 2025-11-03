@@ -33,7 +33,11 @@ class ClaudeCodeProvider(BaseProvider):
     """Provider for Claude Code CLI tool integration."""
 
     def __init__(
-        self, terminal_id: str, session_name: str, window_name: str, agent_profile: Optional[str] = None
+        self,
+        terminal_id: str,
+        session_name: str,
+        window_name: str,
+        agent_profile: Optional[str] = None,
     ):
         super().__init__(terminal_id, session_name, window_name)
         self._initialized = False
