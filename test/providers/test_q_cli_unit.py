@@ -1,12 +1,13 @@
 """Unit tests for Q CLI provider."""
 
 import re
-import pytest
 from pathlib import Path
-from unittest.mock import Mock, patch, MagicMock
-from cli_agent_orchestrator.providers.q_cli import QCliProvider
-from cli_agent_orchestrator.models.terminal import TerminalStatus
+from unittest.mock import MagicMock, Mock, patch
 
+import pytest
+
+from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.providers.q_cli import QCliProvider
 
 # Test fixtures directory
 FIXTURES_DIR = Path(__file__).parent / "fixtures"

@@ -1,10 +1,12 @@
 """Session utilities for CLI Agent Orchestrator."""
 
+import logging
 import time
 import uuid
-import logging
+
 import httpx
-from cli_agent_orchestrator.constants import SESSION_PREFIX, API_BASE_URL
+
+from cli_agent_orchestrator.constants import API_BASE_URL, SESSION_PREFIX
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
 logger = logging.getLogger(__name__)

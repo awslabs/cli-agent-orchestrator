@@ -2,10 +2,11 @@
 
 import logging
 from typing import Dict, Optional
-from cli_agent_orchestrator.providers.base import BaseProvider
-from cli_agent_orchestrator.providers.q_cli import QCliProvider
-from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+
 from cli_agent_orchestrator.clients.database import get_terminal_metadata
+from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+from cli_agent_orchestrator.providers.q_cli import QCliProvider
 
 logger = logging.getLogger(__name__)
 

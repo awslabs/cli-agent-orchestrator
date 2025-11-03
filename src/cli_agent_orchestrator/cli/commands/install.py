@@ -1,13 +1,14 @@
 """Install command for CLI Agent Orchestrator."""
 
+from importlib import resources
+from pathlib import Path
+
 import click
 import requests
-from pathlib import Path
-from importlib import resources
 
-from cli_agent_orchestrator.constants import AGENT_CONTEXT_DIR, Q_AGENTS_DIR, LOCAL_AGENT_STORE_DIR
-from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.constants import AGENT_CONTEXT_DIR, LOCAL_AGENT_STORE_DIR, Q_AGENTS_DIR
 from cli_agent_orchestrator.models.q_agent import QAgentConfig
+from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 
 
 def _download_agent(source: str) -> str:

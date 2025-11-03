@@ -4,14 +4,15 @@ import logging
 import re
 import subprocess
 from pathlib import Path
-from watchdog.events import FileSystemEventHandler, FileModifiedEvent
+
+from watchdog.events import FileModifiedEvent, FileSystemEventHandler
 
 from cli_agent_orchestrator.clients.database import get_pending_messages, update_message_status
+from cli_agent_orchestrator.constants import INBOX_SERVICE_TAIL_LINES, TERMINAL_LOG_DIR
 from cli_agent_orchestrator.models.inbox import MessageStatus
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services import terminal_service
-from cli_agent_orchestrator.constants import TERMINAL_LOG_DIR, INBOX_SERVICE_TAIL_LINES
 
 logger = logging.getLogger(__name__)
 

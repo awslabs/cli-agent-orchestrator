@@ -2,13 +2,14 @@
 
 import logging
 from typing import Dict, List
-from cli_agent_orchestrator.clients.tmux import tmux_client
+
 from cli_agent_orchestrator.clients.database import (
-    list_terminals_by_session,
     delete_terminals_by_session,
+    list_terminals_by_session,
 )
-from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.constants import SESSION_PREFIX
+from cli_agent_orchestrator.providers.manager import provider_manager
 
 logger = logging.getLogger(__name__)
 

@@ -4,8 +4,10 @@ import logging
 import os
 import re
 import time
-from typing import List, Dict, Optional
+from typing import Dict, List, Optional
+
 import libtmux
+
 from cli_agent_orchestrator.constants import TMUX_HISTORY_LINES
 
 logger = logging.getLogger(__name__)

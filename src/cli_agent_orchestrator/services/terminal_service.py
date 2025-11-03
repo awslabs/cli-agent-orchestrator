@@ -3,21 +3,22 @@
 import logging
 from enum import Enum
 from typing import Dict
-from cli_agent_orchestrator.clients.tmux import tmux_client
+
+from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
+from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (
-    create_terminal as db_create_terminal,
     get_terminal_metadata,
     update_last_active,
-    delete_terminal as db_delete_terminal,
 )
+from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.constants import SESSION_PREFIX, TERMINAL_LOG_DIR
+from cli_agent_orchestrator.models.terminal import Terminal
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.utils.terminal import (
-    generate_terminal_id,
     generate_session_name,
+    generate_terminal_id,
     generate_window_name,
 )
-from cli_agent_orchestrator.models.terminal import Terminal
-from cli_agent_orchestrator.constants import SESSION_PREFIX, TERMINAL_LOG_DIR
 
 logger = logging.getLogger(__name__)
 

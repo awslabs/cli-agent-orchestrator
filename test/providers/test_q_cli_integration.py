@@ -1,15 +1,16 @@
 """Integration tests for Q CLI provider with real Q CLI."""
 
-import pytest
-import shutil
-import time
 import json
+import shutil
 import subprocess
+import time
 from pathlib import Path
-from cli_agent_orchestrator.providers.q_cli import QCliProvider
-from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.clients.tmux import tmux_client
 
+import pytest
+
+from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.providers.q_cli import QCliProvider
 
 # Mark all tests in this module as integration and slow
 pytestmark = [pytest.mark.integration, pytest.mark.slow]

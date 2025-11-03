@@ -1,12 +1,13 @@
 """Q CLI provider implementation."""
 
-import re
 import logging
+import re
 from typing import List
-from cli_agent_orchestrator.providers.base import BaseProvider
-from cli_agent_orchestrator.models.terminal import TerminalStatus
+
 from cli_agent_orchestrator.clients.tmux import tmux_client
-from cli_agent_orchestrator.utils.terminal import wait_until_status, wait_for_shell
+from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 
 logger = logging.getLogger(__name__)
 

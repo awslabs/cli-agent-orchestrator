@@ -4,8 +4,8 @@ import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from cli_agent_orchestrator.constants import RETENTION_DAYS, LOG_DIR, TERMINAL_LOG_DIR
-from cli_agent_orchestrator.clients.database import SessionLocal, TerminalModel, InboxModel
+from cli_agent_orchestrator.clients.database import InboxModel, SessionLocal, TerminalModel
+from cli_agent_orchestrator.constants import LOG_DIR, RETENTION_DAYS, TERMINAL_LOG_DIR
 
 logger = logging.getLogger(__name__)
 

@@ -3,33 +3,33 @@
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from typing import List, Dict, Optional, Annotated
-from fastapi import FastAPI, HTTPException, status, Path
-from pydantic import BaseModel, Field, field_validator
+from typing import Annotated, Dict, List, Optional
 
+from fastapi import FastAPI, HTTPException, Path, status
+from pydantic import BaseModel, Field, field_validator
 from watchdog.observers.polling import PollingObserver
 
-from cli_agent_orchestrator.clients.database import init_db, create_inbox_message
+from cli_agent_orchestrator.clients.database import create_inbox_message, init_db
+from cli_agent_orchestrator.constants import (
+    INBOX_POLLING_INTERVAL,
+    SERVER_HOST,
+    SERVER_PORT,
+    SERVER_VERSION,
+    TERMINAL_LOG_DIR,
+)
+from cli_agent_orchestrator.models.terminal import Terminal, TerminalId
+from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services import (
-    session_service,
-    terminal_service,
     flow_service,
     inbox_service,
+    session_service,
+    terminal_service,
 )
 from cli_agent_orchestrator.services.cleanup_service import cleanup_old_data
 from cli_agent_orchestrator.services.inbox_service import LogFileHandler
 from cli_agent_orchestrator.services.terminal_service import OutputMode
-from cli_agent_orchestrator.models.terminal import Terminal, TerminalId
-from cli_agent_orchestrator.constants import (
-    SERVER_VERSION,
-    SERVER_HOST,
-    SERVER_PORT,
-    TERMINAL_LOG_DIR,
-    INBOX_POLLING_INTERVAL,
-)
 from cli_agent_orchestrator.utils.logging import setup_logging
 from cli_agent_orchestrator.utils.terminal import generate_session_name
-from cli_agent_orchestrator.providers.manager import provider_manager
 
 logger = logging.getLogger(__name__)
 

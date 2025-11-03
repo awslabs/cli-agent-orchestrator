@@ -1,7 +1,9 @@
-from enum import Enum
-from typing import Optional, Annotated
 from datetime import datetime
-from pydantic import BaseModel, Field, ConfigDict, StringConstraints
+from enum import Enum
+from typing import Annotated, Optional
+
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+
 from cli_agent_orchestrator.models.provider import ProviderType
 
 # Terminal ID validation (8 character hex string)

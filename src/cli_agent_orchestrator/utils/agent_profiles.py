@@ -1,10 +1,12 @@
 """Agent profile utilities."""
 
-import frontmatter
 from importlib import resources
 from pathlib import Path
-from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+import frontmatter
+
 from cli_agent_orchestrator.constants import LOCAL_AGENT_STORE_DIR
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
 
 
 def load_agent_profile(agent_name: str) -> AgentProfile:

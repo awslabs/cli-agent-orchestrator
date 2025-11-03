@@ -3,9 +3,10 @@
 import re
 import shlex
 from typing import List
-from cli_agent_orchestrator.providers.base import BaseProvider
-from cli_agent_orchestrator.models.terminal import TerminalStatus
+
 from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_until_status
 
