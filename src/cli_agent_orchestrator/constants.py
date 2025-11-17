@@ -2,12 +2,14 @@
 
 from pathlib import Path
 
+from cli_agent_orchestrator.models.provider import ProviderType
+
 # Session configuration
 SESSION_PREFIX = "cao-"
 
-# Available providers
-PROVIDERS = ["q_cli", "claude_code"]
-DEFAULT_PROVIDER = "q_cli"
+# Available providers (derived from enum)
+PROVIDERS = [p.value for p in ProviderType]
+DEFAULT_PROVIDER = ProviderType.Q_CLI.value
 
 # Tmux capture limits
 TMUX_HISTORY_LINES = 200
@@ -38,6 +40,9 @@ LOCAL_AGENT_STORE_DIR = CAO_HOME_DIR / "agent-store"
 
 # Q CLI directories
 Q_AGENTS_DIR = Path.home() / ".aws" / "amazonq" / "cli-agents"
+
+# Kiro CLI directories
+KIRO_AGENTS_DIR = Path.home() / ".kiro" / "agents"
 
 # Database configuration
 DATABASE_FILE = DB_DIR / "cli-agent-orchestrator.db"

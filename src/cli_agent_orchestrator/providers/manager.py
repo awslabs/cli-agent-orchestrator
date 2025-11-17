@@ -4,8 +4,10 @@ import logging
 from typing import Dict, Optional
 
 from cli_agent_orchestrator.clients.database import get_terminal_metadata
+from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
 from cli_agent_orchestrator.providers.q_cli import QCliProvider
 
 logger = logging.getLogger(__name__)
@@ -28,11 +30,15 @@ class ProviderManager:
         """Create and store provider instance."""
         try:
             provider: BaseProvider
-            if provider_type == "q_cli":
+            if provider_type == ProviderType.Q_CLI.value:
                 if not agent_profile:
                     raise ValueError("Q CLI provider requires agent_profile parameter")
                 provider = QCliProvider(terminal_id, tmux_session, tmux_window, agent_profile)
-            elif provider_type == "claude_code":
+            elif provider_type == ProviderType.KIRO_CLI.value:
+                if not agent_profile:
+                    raise ValueError("Kiro CLI provider requires agent_profile parameter")
+                provider = KiroCliProvider(terminal_id, tmux_session, tmux_window, agent_profile)
+            elif provider_type == ProviderType.CLAUDE_CODE.value:
                 provider = ClaudeCodeProvider(terminal_id, tmux_session, tmux_window, agent_profile)
             else:
                 raise ValueError(f"Unknown provider type: {provider_type}")

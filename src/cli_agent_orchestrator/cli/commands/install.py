@@ -6,7 +6,16 @@ from pathlib import Path
 import click
 import requests
 
-from cli_agent_orchestrator.constants import AGENT_CONTEXT_DIR, LOCAL_AGENT_STORE_DIR, Q_AGENTS_DIR
+from cli_agent_orchestrator.constants import (
+    AGENT_CONTEXT_DIR,
+    DEFAULT_PROVIDER,
+    KIRO_AGENTS_DIR,
+    LOCAL_AGENT_STORE_DIR,
+    PROVIDERS,
+    Q_AGENTS_DIR,
+)
+from cli_agent_orchestrator.models.kiro_agent import KiroAgentConfig
+from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.q_agent import QAgentConfig
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 
@@ -49,7 +58,8 @@ def _download_agent(source: str) -> str:
 
 @click.command()
 @click.argument("agent_source")
-def install(agent_source: str):
+@click.option("--provider", type=click.Choice(PROVIDERS), default=DEFAULT_PROVIDER, help=f"Provider to use (default: {DEFAULT_PROVIDER})")
+def install(agent_source: str, provider: str):
     """
     Install an agent from local store, built-in store, URL, or file path.
 
@@ -77,7 +87,6 @@ def install(agent_source: str):
 
         # Ensure directories exist
         AGENT_CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
-        Q_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
 
         # Determine source for context file
         local_profile = LOCAL_AGENT_STORE_DIR / f"{agent_name}.md"
@@ -101,32 +110,52 @@ def install(agent_source: str):
                 for server_name in profile.mcpServers.keys():
                     allowed_tools.append(f"@{server_name}")
 
-        # Create Q CLI agent config using Pydantic model
-        q_agent_config = QAgentConfig(
-            name=profile.name,
-            description=profile.description,
-            tools=profile.tools if profile.tools is not None else ["*"],
-            allowedTools=allowed_tools,
-            resources=[f"file://{dest_file.absolute()}"],
-            prompt=profile.prompt,
-            mcpServers=profile.mcpServers,
-            toolAliases=profile.toolAliases,
-            toolsSettings=profile.toolsSettings,
-            hooks=profile.hooks,
-            model=profile.model,
-        )
-
-        # Create path-safe filename (replace / with __)
-        safe_filename = profile.name.replace("/", "__")
-
-        # Write Q CLI agent JSON using Pydantic's model_dump
-        q_agent_file = Q_AGENTS_DIR / f"{safe_filename}.json"
-        with open(q_agent_file, "w") as f:
-            f.write(q_agent_config.model_dump_json(indent=2, exclude_none=True))
+        # Create agent config based on provider
+        agent_file = None
+        if provider == ProviderType.Q_CLI.value:
+            Q_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+            agent_config = QAgentConfig(
+                name=profile.name,
+                description=profile.description,
+                tools=profile.tools if profile.tools is not None else ["*"],
+                allowedTools=allowed_tools,
+                resources=[f"file://{dest_file.absolute()}"],
+                prompt=profile.prompt,
+                mcpServers=profile.mcpServers,
+                toolAliases=profile.toolAliases,
+                toolsSettings=profile.toolsSettings,
+                hooks=profile.hooks,
+                model=profile.model,
+            )
+            safe_filename = profile.name.replace("/", "__")
+            agent_file = Q_AGENTS_DIR / f"{safe_filename}.json"
+            with open(agent_file, "w") as f:
+                f.write(agent_config.model_dump_json(indent=2, exclude_none=True))
+            
+        elif provider == ProviderType.KIRO_CLI.value:
+            KIRO_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+            agent_config = KiroAgentConfig(
+                name=profile.name,
+                description=profile.description,
+                tools=profile.tools if profile.tools is not None else ["*"],
+                allowedTools=allowed_tools,
+                resources=[f"file://{dest_file.absolute()}"],
+                prompt=profile.prompt,
+                mcpServers=profile.mcpServers,
+                toolAliases=profile.toolAliases,
+                toolsSettings=profile.toolsSettings,
+                hooks=profile.hooks,
+                model=profile.model,
+            )
+            safe_filename = profile.name.replace("/", "__")
+            agent_file = KIRO_AGENTS_DIR / f"{safe_filename}.json"
+            with open(agent_file, "w") as f:
+                f.write(agent_config.model_dump_json(indent=2, exclude_none=True))
 
         click.echo(f"✓ Agent '{profile.name}' installed successfully")
         click.echo(f"✓ Context file: {dest_file}")
-        click.echo(f"✓ Q CLI agent: {q_agent_file}")
+        if agent_file:
+            click.echo(f"✓ {provider} agent: {agent_file}")
 
     except FileNotFoundError as e:
         click.echo(f"Error: {e}", err=True)

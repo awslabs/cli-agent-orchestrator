@@ -1,20 +1,27 @@
-# Q CLI Provider Tests
+# Provider Tests
 
-This directory contains comprehensive test suites for the Q CLI provider implementation.
+This directory contains comprehensive test suites for provider implementations.
+
+## Providers
+
+### Q CLI Provider
+Tests for Amazon Q CLI integration (`q_cli`)
+
+### Kiro CLI Provider
+Tests for Kiro CLI integration (`kiro_cli`)
+
+Since Kiro CLI has identical output format to Q CLI, the test fixtures are reused with renamed files.
 
 ## Test Structure
 
 ```
 test/providers/
-├── test_q_cli_unit.py          # Unit tests (fast, mocked)
-├── test_q_cli_integration.py   # Integration tests (slow, real Q CLI)
+├── test_q_cli_unit.py          # Q CLI unit tests (fast, mocked)
+├── test_kiro_cli_unit.py       # Kiro CLI unit tests (fast, mocked)
+├── test_q_cli_integration.py   # Q CLI integration tests (slow, real Q CLI)
 ├── fixtures/                    # Test fixture files
-│   ├── q_cli_idle_output.txt
-│   ├── q_cli_completed_output.txt
-│   ├── q_cli_processing_output.txt
-│   ├── q_cli_permission_output.txt
-│   ├── q_cli_error_output.txt
-│   ├── q_cli_complex_response.txt
+│   ├── q_cli_*.txt             # Q CLI fixtures
+│   ├── kiro_cli_*.txt          # Kiro CLI fixtures (identical format to Q CLI)
 │   └── generate_fixtures.py    # Script to regenerate fixtures
 └── README.md
 ```
@@ -317,6 +324,23 @@ uv run pytest test/providers/test_q_cli_integration.py::TestQCliProviderHandoffI
 # Run specific handoff test
 uv run pytest test/providers/test_q_cli_unit.py::TestQCliProviderHandoffScenarios::test_handoff_indices_not_corrupted -v
 ```
+
+## Kiro CLI Provider Tests
+
+### Running Kiro CLI Tests
+
+```bash
+# Run all Kiro CLI unit tests
+uv run pytest test/providers/test_kiro_cli_unit.py -v
+
+# Run with coverage
+uv run pytest test/providers/test_kiro_cli_unit.py --cov=src/cli_agent_orchestrator/providers/kiro_cli.py --cov-report=term-missing -v
+
+# Run specific test class
+uv run pytest test/providers/test_kiro_cli_unit.py::TestKiroCliProviderStatusDetection -v
+```
+
+Note: Kiro CLI has identical output format to Q CLI, so the test structure and fixtures mirror the Q CLI tests.
 
 ### Key Test Validations
 

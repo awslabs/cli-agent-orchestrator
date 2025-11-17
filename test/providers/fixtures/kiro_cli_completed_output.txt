@@ -1,0 +1,12 @@
+$ q chat --agent developer
+[38;5;10m> [39mHere is a comprehensive response to your query.
+
+This response includes multiple paragraphs and demonstrates
+how Q CLI formats its output with proper spacing and structure.
+
+The response can include:
+- Bullet points
+- Code examples
+- Multiple sections
+
+[36m[developer][35m>[39m 

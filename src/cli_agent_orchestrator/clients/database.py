@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy import Boolean, Column, DateTime, Integer, String, create_engine
 from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
 
-from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR
+from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 
@@ -51,6 +51,7 @@ class FlowModel(Base):
     file_path = Column(String, nullable=False)
     schedule = Column(String, nullable=False)
     agent_profile = Column(String, nullable=False)
+    provider = Column(String, nullable=False, default=DEFAULT_PROVIDER)
     script = Column(String, nullable=True)
     last_run = Column(DateTime, nullable=True)
     next_run = Column(DateTime, nullable=True)
@@ -222,7 +223,13 @@ def update_message_status(message_id: int, status: MessageStatus) -> bool:
 
 
 def create_flow(
-    name: str, file_path: str, schedule: str, agent_profile: str, script: str, next_run: datetime
+    name: str,
+    file_path: str,
+    schedule: str,
+    agent_profile: str,
+    provider: str,
+    script: str,
+    next_run: datetime,
 ) -> Flow:
     """Create flow record."""
     with SessionLocal() as db:
@@ -231,6 +238,7 @@ def create_flow(
             file_path=file_path,
             schedule=schedule,
             agent_profile=agent_profile,
+            provider=provider,
             script=script,
             next_run=next_run,
         )
@@ -242,6 +250,7 @@ def create_flow(
             file_path=flow.file_path,
             schedule=flow.schedule,
             agent_profile=flow.agent_profile,
+            provider=flow.provider,
             script=flow.script,
             last_run=flow.last_run,
             next_run=flow.next_run,
@@ -260,6 +269,7 @@ def get_flow(name: str) -> Optional[Flow]:
             file_path=flow.file_path,
             schedule=flow.schedule,
             agent_profile=flow.agent_profile,
+            provider=flow.provider,
             script=flow.script,
             last_run=flow.last_run,
             next_run=flow.next_run,
@@ -277,6 +287,7 @@ def list_flows() -> List[Flow]:
                 file_path=f.file_path,
                 schedule=f.schedule,
                 agent_profile=f.agent_profile,
+                provider=f.provider,
                 script=f.script,
                 last_run=f.last_run,
                 next_run=f.next_run,
@@ -332,6 +343,7 @@ def get_flows_to_run() -> List[Flow]:
                 file_path=f.file_path,
                 schedule=f.schedule,
                 agent_profile=f.agent_profile,
+                provider=f.provider,
                 script=f.script,
                 last_run=f.last_run,
                 next_run=f.next_run,

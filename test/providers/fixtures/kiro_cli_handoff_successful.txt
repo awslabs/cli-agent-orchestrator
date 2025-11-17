@@ -1,0 +1,8 @@
+$ q chat --agent supervisor
+What task would you like to delegate?
+[38;5;10m> [39mI'll delegate this task to the developer agent for implementation.
+
+Initiating handoff to developer agent...
+
+[38;5;10m> [39mHandoff completed successfully. The developer agent will handle the implementation.
+[36m[supervisor][35m>[39m 

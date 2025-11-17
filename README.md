@@ -75,6 +75,20 @@ cao install https://example.com/agents/custom-agent.md
 
 When installing from a file or URL, the agent is saved to your local agent store (`~/.aws/cli-agent-orchestrator/agent-store/`) and can be referenced by name in future installations.
 
+**Provider Selection:**
+
+By default, agents are installed for the `q_cli` provider (Amazon Q CLI). You can specify a different provider:
+
+```bash
+# Install for Kiro CLI
+cao install developer --provider kiro_cli
+
+# Install for Amazon Q CLI (default)
+cao install developer --provider q_cli
+```
+
+Note: The `claude_code` provider does not require agent installation.
+
 For details on creating custom agent profiles, see [docs/agent-profile.md](docs/agent-profile.md).
 
 ### Launching Agents
@@ -89,6 +103,9 @@ In another terminal, launch a terminal with an agent profile:
 
 ```bash
 cao launch --agents code_supervisor
+
+# Or specify a provider
+cao launch --agents code_supervisor --provider kiro_cli
 ```
 
 Shutdown sessions:
@@ -246,6 +263,7 @@ A flow that runs at regular intervals with a static prompt (no script needed):
 name: daily-standup
 schedule: "0 9 * * 1-5"  # 9am weekdays
 agent_profile: developer
+provider: q_cli  # Optional, defaults to q_cli
 ---
 
 Review yesterday's commits and create a standup summary.

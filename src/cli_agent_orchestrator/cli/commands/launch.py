@@ -5,14 +5,14 @@ import subprocess
 import click
 import requests
 
-from cli_agent_orchestrator.constants import PROVIDERS, SERVER_HOST, SERVER_PORT
+from cli_agent_orchestrator.constants import DEFAULT_PROVIDER, PROVIDERS, SERVER_HOST, SERVER_PORT
 
 
 @click.command()
 @click.option("--agents", required=True, help="Agent profile to launch")
 @click.option("--session-name", help="Name of the session (default: auto-generated)")
 @click.option("--headless", is_flag=True, help="Launch in detached mode")
-@click.option("--provider", default="q_cli", help="Provider to use (default: q_cli)")
+@click.option("--provider", default=DEFAULT_PROVIDER, help=f"Provider to use (default: {DEFAULT_PROVIDER})")
 def launch(agents, session_name, headless, provider):
     """Launch cao session with specified agent profile."""
     try:

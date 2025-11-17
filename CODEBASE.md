@@ -34,15 +34,17 @@
            │ Clients │               │Providers │
            ├─────────┤               ├──────────┤
            │ • tmux  │               │ • q_cli  │
-           │ • db    │               │ • claude │
-           └────┬────┘               │   _code  │
-                │                    └────┬─────┘
-         ┌──────┴──────┐                  │
-         │             │                  │
-    ┌────▼────┐  ┌─────▼─────┐     ┌─────▼──────┐
-    │  Tmux   │  │  SQLite   │     │ CLI Tools  │
-    │ Sessions│  │  Database │     │• Amazon Q  │
-    └─────────┘  └───────────┘     │  CLI       │
+           │ • db    │               │ • kiro   │
+           └────┬────┘               │   _cli   │
+                │                    │ • claude │
+         ┌──────┴──────┐             │   _code  │
+         │             │             └────┬─────┘
+    ┌────▼────┐  ┌─────▼─────┐          │
+    │  Tmux   │  │  SQLite   │     ┌─────▼──────┐
+    │ Sessions│  │  Database │     │ CLI Tools  │
+    └─────────┘  └───────────┘     │• Amazon Q  │
+                                   │  CLI       │
+                                   │• Kiro CLI  │
                                    │• Claude    │
                                    │  Code      │
                                    └────────────┘
@@ -72,6 +74,7 @@ src/cli_agent_orchestrator/
 │   ├── base.py            # Abstract provider interface
 │   ├── manager.py         # Maps terminal_id → provider
 │   ├── q_cli.py           # Amazon Q CLI provider (q_cli)
+│   ├── kiro_cli.py        # Kiro CLI provider (kiro_cli)
 │   └── claude_code.py     # Claude Code provider (claude_code)
 ├── models/                # Data models
 │   ├── terminal.py        # Terminal, TerminalStatus
