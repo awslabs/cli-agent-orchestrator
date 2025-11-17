@@ -1,0 +1,94 @@
+name: Test Kiro CLI Provider
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'src/cli_agent_orchestrator/providers/kiro_cli.py'
+      - 'test/providers/test_kiro_cli_unit.py'
+      - 'test/providers/fixtures/kiro_cli_*.txt'
+      - 'pyproject.toml'
+      - '.github/workflows/test-kiro-cli-provider.yml'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'src/cli_agent_orchestrator/providers/kiro_cli.py'
+      - 'test/providers/test_kiro_cli_unit.py'
+      - 'test/providers/fixtures/kiro_cli_*.txt'
+      - 'pyproject.toml'
+      - '.github/workflows/test-kiro-cli-provider.yml'
+
+jobs:
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      - name: Run unit tests with coverage
+        run: |
+          uv run pytest test/providers/test_kiro_cli_unit.py \
+            --cov=src/cli_agent_orchestrator/providers/kiro_cli.py \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            -v
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  lint:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      - name: Check code formatting with black
+        run: uv run black --check src/ test/
+
+      - name: Check import sorting with isort
+        run: uv run isort --check-only src/ test/
+
+      - name: Run type checker with mypy
+        run: uv run mypy src/
+        continue-on-error: true

@@ -58,7 +58,12 @@ def _download_agent(source: str) -> str:
 
 @click.command()
 @click.argument("agent_source")
-@click.option("--provider", type=click.Choice(PROVIDERS), default=DEFAULT_PROVIDER, help=f"Provider to use (default: {DEFAULT_PROVIDER})")
+@click.option(
+    "--provider",
+    type=click.Choice(PROVIDERS),
+    default=DEFAULT_PROVIDER,
+    help=f"Provider to use (default: {DEFAULT_PROVIDER})",
+)
 def install(agent_source: str, provider: str):
     """
     Install an agent from local store, built-in store, URL, or file path.
@@ -131,7 +136,7 @@ def install(agent_source: str, provider: str):
             agent_file = Q_AGENTS_DIR / f"{safe_filename}.json"
             with open(agent_file, "w") as f:
                 f.write(agent_config.model_dump_json(indent=2, exclude_none=True))
-            
+
         elif provider == ProviderType.KIRO_CLI.value:
             KIRO_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
             agent_config = KiroAgentConfig(
