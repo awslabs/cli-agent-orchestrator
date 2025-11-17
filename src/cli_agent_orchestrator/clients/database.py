@@ -51,7 +51,7 @@ class FlowModel(Base):
     file_path = Column(String, nullable=False)
     schedule = Column(String, nullable=False)
     agent_profile = Column(String, nullable=False)
-    provider = Column(String, nullable=False, default=DEFAULT_PROVIDER)
+    provider = Column(String, nullable=False)
     script = Column(String, nullable=True)
     last_run = Column(DateTime, nullable=True)
     next_run = Column(DateTime, nullable=True)
