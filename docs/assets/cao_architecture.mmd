@@ -1,0 +1,18 @@
+graph TD
+    A[Supervisor Agent]
+    
+    A -->|coordinate tasks<br/>manage workflows| B[Worker Agent 1]
+    A -->|coordinate tasks<br/>manage workflows| C[Worker Agent 2]
+    A -->|coordinate tasks<br/>manage workflows| D[Worker Agent 3]
+    
+    B --> E[CLI Tool<br/>Kiro CLI/Amazon Q CLI,<br/>Claude Code, and others]
+    C --> F[CLI Tool<br/>Kiro CLI/Amazon Q CLI,<br/>Claude Code, and others]
+    D --> G[CLI Tool<br/>Kiro CLI/Amazon Q CLI,<br/>Claude Code, and others]
+    
+    style A fill:#d4e4f7,stroke:#6b8db8,stroke-width:2px
+    style B fill:#e8d9f5,stroke:#9b7bb5,stroke-width:2px
+    style C fill:#e8d9f5,stroke:#9b7bb5,stroke-width:2px
+    style D fill:#e8d9f5,stroke:#9b7bb5,stroke-width:2px
+    style E fill:#e8ecf7,stroke:#7b8db8,stroke-width:2px
+    style F fill:#e8ecf7,stroke:#7b8db8,stroke-width:2px
+    style G fill:#e8ecf7,stroke:#7b8db8,stroke-width:2px
