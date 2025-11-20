@@ -190,10 +190,10 @@ install_tmux_from_source() {
         log_error "  brew install libevent ncurses automake pkg-config"
         log_error ""
         log_error "On Ubuntu/Debian:"
-        log_error "  sudo apt-get install libevent-dev libncurses-dev build-essential autoconf automake pkg-config bison"
+        log_error "  sudo apt-get install git libevent-dev libncurses-dev build-essential autoconf automake pkg-config bison"
         log_error ""
         log_error "On RHEL/CentOS/Amazon Linux:"
-        log_error "  sudo yum install libevent-devel ncurses-devel gcc make bison pkg-config autoconf automake"
+        log_error "  sudo yum install git libevent-devel ncurses-devel gcc make bison pkg-config autoconf automake"
         echo ""
         exit 1
     fi
