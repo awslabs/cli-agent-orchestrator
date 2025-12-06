@@ -12,7 +12,7 @@ dependencies = [
     "sqlalchemy>=2.0.0",
     "uvicorn[standard]>=0.24.0",
     "websockets>=12.0",
-    "libtmux>=0.37.0",
+    "libtmux==0.51.0",
     "aiofiles>=24.1.0",
     "click>=8.0.0",
     "python-frontmatter>=1.1.0",
