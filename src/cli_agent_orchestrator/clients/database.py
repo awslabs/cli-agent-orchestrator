@@ -186,15 +186,30 @@ def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> Inbo
 
 def get_pending_messages(receiver_id: str, limit: int = 1) -> List[InboxMessage]:
     """Get pending messages ordered by created_at ASC (oldest first)."""
+    return get_inbox_messages(receiver_id, limit=limit, status=MessageStatus.PENDING)
+
+
+def get_inbox_messages(
+    receiver_id: str, limit: int = 10, status: Optional[MessageStatus] = None
+) -> List[InboxMessage]:
+    """Get inbox messages with optional status filter ordered by created_at ASC (oldest first).
+
+    Args:
+        receiver_id: Terminal ID to get messages for
+        limit: Maximum number of messages to return (default: 10)
+        status: Optional filter by message status (None = all statuses)
+
+    Returns:
+        List of inbox messages ordered by creation time (oldest first)
+    """
     with SessionLocal() as db:
-        messages = (
-            db.query(InboxModel)
-            .filter(InboxModel.receiver_id == receiver_id)
-            .filter(InboxModel.status == MessageStatus.PENDING.value)
-            .order_by(InboxModel.created_at.asc())
-            .limit(limit)
-            .all()
-        )
+        query = db.query(InboxModel).filter(InboxModel.receiver_id == receiver_id)
+
+        if status is not None:
+            query = query.filter(InboxModel.status == status.value)
+
+        messages = query.order_by(InboxModel.created_at.asc()).limit(limit).all()
+
         return [
             InboxMessage(
                 id=msg.id,

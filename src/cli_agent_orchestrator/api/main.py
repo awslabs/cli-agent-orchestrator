@@ -5,11 +5,11 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Annotated, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Path, status
+from fastapi import FastAPI, HTTPException, Path, Query, status
 from pydantic import BaseModel, Field, field_validator
 from watchdog.observers.polling import PollingObserver
 
-from cli_agent_orchestrator.clients.database import create_inbox_message, init_db
+from cli_agent_orchestrator.clients.database import create_inbox_message, get_inbox_messages, init_db
 from cli_agent_orchestrator.constants import (
     INBOX_POLLING_INTERVAL,
     SERVER_HOST,
@@ -17,6 +17,7 @@ from cli_agent_orchestrator.constants import (
     SERVER_VERSION,
     TERMINAL_LOG_DIR,
 )
+from cli_agent_orchestrator.models.inbox import MessageStatus
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalId
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services import (
@@ -311,6 +312,63 @@ async def create_inbox_message_endpoint(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create inbox message: {str(e)}",
+        )
+
+
+@app.get("/terminals/{terminal_id}/inbox/messages")
+async def get_inbox_messages_endpoint(
+    terminal_id: TerminalId,
+    limit: int = Query(default=10, le=100, description="Maximum number of messages to retrieve"),
+    status: Optional[str] = Query(default=None, description="Filter by message status"),
+) -> List[Dict]:
+    """Get inbox messages for a terminal.
+
+    Args:
+        terminal_id: Terminal ID to get messages for
+        limit: Maximum number of messages to return (default: 10, max: 100)
+        status: Optional filter by message status ('pending', 'delivered', 'failed')
+
+    Returns:
+        List of inbox messages with sender_id, message, created_at, status
+    """
+    try:
+        # Convert status filter if provided
+        status_filter = None
+        if status:
+            try:
+                status_filter = MessageStatus(status)
+            except ValueError:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid status: {status}. Valid values: pending, delivered, failed"
+                )
+
+        # Get messages using existing database function
+        messages = get_inbox_messages(terminal_id, limit=limit, status=status_filter)
+
+        # Convert to response format
+        result = []
+        for msg in messages:
+            result.append({
+                "id": msg.id,
+                "sender_id": msg.sender_id,
+                "receiver_id": msg.receiver_id,
+                "message": msg.message,
+                "status": msg.status.value,
+                "created_at": msg.created_at.isoformat() if msg.created_at else None,
+            })
+
+        return result
+
+    except HTTPException:
+        # Re-raise HTTPException (validation errors)
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve inbox messages: {str(e)}"
         )
 
 
