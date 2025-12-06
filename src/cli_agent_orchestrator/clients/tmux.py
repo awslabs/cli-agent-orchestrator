@@ -185,7 +185,7 @@ class TmuxClient:
         try:
             session = self.server.sessions.get(session_name=session_name)
             if session:
-                session.kill_session()
+                session.kill()
                 logger.info(f"Killed tmux session: {session_name}")
                 return True
             return False
