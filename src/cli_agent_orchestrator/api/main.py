@@ -112,7 +112,10 @@ async def health_check():
 
 @app.post("/sessions", response_model=Terminal, status_code=status.HTTP_201_CREATED)
 async def create_session(
-    provider: str, agent_profile: str, session_name: Optional[str] = None
+    provider: str,
+    agent_profile: str,
+    session_name: Optional[str] = None,
+    parent_id: Optional[str] = None,
 ) -> Terminal:
     """Create a new session with exactly one terminal."""
     try:
@@ -121,6 +124,7 @@ async def create_session(
             agent_profile=agent_profile,
             session_name=session_name,
             new_session=True,
+            parent_id=parent_id,
         )
         return result
 
@@ -177,7 +181,10 @@ async def delete_session(session_name: str) -> Dict:
     status_code=status.HTTP_201_CREATED,
 )
 async def create_terminal_in_session(
-    session_name: str, provider: str, agent_profile: str
+    session_name: str,
+    provider: str,
+    agent_profile: str,
+    parent_id: Optional[str] = None,
 ) -> Terminal:
     """Create additional terminal in existing session."""
     try:
@@ -186,6 +193,7 @@ async def create_terminal_in_session(
             agent_profile=agent_profile,
             session_name=session_name,
             new_session=False,
+            parent_id=parent_id,
         )
         return result
     except ValueError as e:

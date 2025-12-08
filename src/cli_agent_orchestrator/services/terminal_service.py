@@ -3,7 +3,7 @@
 import logging
 from datetime import datetime
 from enum import Enum
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
@@ -33,7 +33,12 @@ class OutputMode(str, Enum):
 
 
 def create_terminal(
-    provider: str, agent_profile: str, session_name: Optional[str] = None, new_session: bool = False
+    provider: str,
+    agent_profile: str,
+    session_name: Optional[str] = None,
+    new_session: bool = False,
+    parent_id: Optional[str] = None,
+    extra_env: Optional[Dict[str, Any]] = None,
 ) -> Terminal:
     """Create terminal, optionally creating new session with it."""
     try:
@@ -55,15 +60,17 @@ def create_terminal(
                 raise ValueError(f"Session '{session_name}' already exists")
 
             # Create new tmux session with this terminal as the initial window
-            tmux_client.create_session(session_name, window_name, terminal_id)
+            tmux_client.create_session(session_name, window_name, terminal_id, parent_id, extra_env)
         else:
             # Add window to existing session
             if not tmux_client.session_exists(session_name):
                 raise ValueError(f"Session '{session_name}' not found")
-            window_name = tmux_client.create_window(session_name, window_name, terminal_id)
+            window_name = tmux_client.create_window(
+                session_name, window_name, terminal_id, parent_id, extra_env
+            )
 
         # Save terminal metadata to database
-        db_create_terminal(terminal_id, session_name, window_name, provider, agent_profile)
+        db_create_terminal(terminal_id, session_name, window_name, provider, agent_profile, parent_id)
 
         # Initialize provider
         provider_instance = provider_manager.create_provider(
@@ -120,6 +127,7 @@ def get_terminal(terminal_id: str) -> Dict:
             "provider": metadata["provider"],
             "session_name": metadata["tmux_session"],
             "agent_profile": metadata["agent_profile"],
+            "parent_id": metadata.get("parent_id"),
             "status": status,
             "last_active": metadata["last_active"],
         }

@@ -4,7 +4,7 @@ import logging
 import os
 import re
 import time
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import libtmux
 
@@ -22,11 +22,22 @@ class TmuxClient:
     def __init__(self) -> None:
         self.server = libtmux.Server()
 
-    def create_session(self, session_name: str, window_name: str, terminal_id: str) -> str:
+    def create_session(
+        self,
+        session_name: str,
+        window_name: str,
+        terminal_id: str,
+        parent_id: Optional[str] = None,
+        extra_env: Optional[Dict[str, str]] = None,
+    ) -> str:
         """Create detached tmux session with initial window and return window name."""
         try:
             environment = os.environ.copy()
             environment["CAO_TERMINAL_ID"] = terminal_id
+            if parent_id:
+                environment["CAO_PARENT_TERMINAL_ID"] = parent_id
+            if extra_env:
+                environment.update(extra_env)
 
             session = self.server.new_session(
                 session_name=session_name,
@@ -43,16 +54,27 @@ class TmuxClient:
             logger.error(f"Failed to create session {session_name}: {e}")
             raise
 
-    def create_window(self, session_name: str, window_name: str, terminal_id: str) -> str:
+    def create_window(
+        self,
+        session_name: str,
+        window_name: str,
+        terminal_id: str,
+        parent_id: Optional[str] = None,
+        extra_env: Optional[Dict[str, str]] = None,
+    ) -> str:
         """Create window in session and return window name."""
         try:
             session = self.server.sessions.get(session_name=session_name)
             if not session:
                 raise ValueError(f"Session '{session_name}' not found")
 
-            window = session.new_window(
-                window_name=window_name, environment={"CAO_TERMINAL_ID": terminal_id}
-            )
+            env: Dict[str, str] = {"CAO_TERMINAL_ID": terminal_id}
+            if parent_id:
+                env["CAO_PARENT_TERMINAL_ID"] = parent_id
+            if extra_env:
+                env.update(extra_env)
+
+            window = session.new_window(window_name=window_name, environment=env)
 
             logger.info(f"Created window '{window.name}' in session '{session_name}'")
             window_name_result = window.name

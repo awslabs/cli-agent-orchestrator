@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 import time
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import requests
 from fastmcp import FastMCP
@@ -32,11 +32,15 @@ mcp = FastMCP(
 )
 
 
-def _create_terminal(agent_profile: str) -> Tuple[str, str]:
+def _create_terminal(
+    agent_profile: str,
+    provider_override: Optional[str] = None,
+) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
     Args:
         agent_profile: Agent profile for the terminal
+        provider_override: Optional provider override (uses caller's provider if not set)
 
     Returns:
         Tuple of (terminal_id, provider)
@@ -44,9 +48,9 @@ def _create_terminal(agent_profile: str) -> Tuple[str, str]:
     Raises:
         Exception: If terminal creation fails
     """
-    provider = DEFAULT_PROVIDER
+    provider = provider_override or DEFAULT_PROVIDER
 
-    # Get current terminal ID from environment
+    # Get current terminal ID from environment - this becomes parent_id for the new terminal
     current_terminal_id = os.environ.get("CAO_TERMINAL_ID")
     if current_terminal_id:
         # Get terminal metadata via API
@@ -54,18 +58,24 @@ def _create_terminal(agent_profile: str) -> Tuple[str, str]:
         response.raise_for_status()
         terminal_metadata = response.json()
 
-        provider = terminal_metadata["provider"]
+        # Use override provider or inherit from parent
+        if not provider_override:
+            provider = terminal_metadata["provider"]
         session_name = terminal_metadata["session_name"]
 
-        # Create new terminal in existing session
+        # Create new terminal in existing session with parent_id set
         response = requests.post(
             f"{API_BASE_URL}/sessions/{session_name}/terminals",
-            params={"provider": provider, "agent_profile": agent_profile},
+            params={
+                "provider": provider,
+                "agent_profile": agent_profile,
+                "parent_id": current_terminal_id,
+            },
         )
         response.raise_for_status()
         terminal = response.json()
     else:
-        # Create new session with terminal
+        # Create new session with terminal (no parent)
         session_name = generate_session_name()
         response = requests.post(
             f"{API_BASE_URL}/sessions",
@@ -135,6 +145,10 @@ async def handoff(
         ge=1,
         le=3600,
     ),
+    provider: Optional[str] = Field(
+        default=None,
+        description="Override the CLI provider (e.g., 'claude_code', 'q_cli'). Defaults to caller's provider.",
+    ),
 ) -> HandoffResult:
     """Hand off a task to another agent via CAO terminal and wait for completion.
 
@@ -160,6 +174,7 @@ async def handoff(
         agent_profile: The agent profile for the new terminal
         message: The task/message to send
         timeout: Maximum wait time in seconds
+        provider: Optional provider override
 
     Returns:
         HandoffResult with success status, message, and agent output
@@ -167,8 +182,8 @@ async def handoff(
     start_time = time.time()
 
     try:
-        # Create terminal
-        terminal_id, provider = _create_terminal(agent_profile)
+        # Create terminal with optional provider override
+        terminal_id, used_provider = _create_terminal(agent_profile, provider)
 
         # Wait for terminal to be IDLE before sending message
         if not wait_until_terminal_status(terminal_id, TerminalStatus.IDLE, timeout=30.0):
@@ -211,7 +226,7 @@ async def handoff(
 
         return HandoffResult(
             success=True,
-            message=f"Successfully handed off to {agent_profile} ({provider}) in {execution_time:.2f}s",
+            message=f"Successfully handed off to {agent_profile} ({used_provider}) in {execution_time:.2f}s",
             output=output,
             terminal_id=terminal_id,
         )
@@ -228,26 +243,29 @@ async def assign(
         description='The agent profile for the worker agent (e.g., "developer", "analyst")'
     ),
     message: str = Field(
-        description="The task message to send. Include callback instructions for the worker to send results back."
+        description="The task message to send. The worker can use reply() tool to send results back automatically."
+    ),
+    provider: Optional[str] = Field(
+        default=None,
+        description="Override the CLI provider (e.g., 'claude_code', 'q_cli'). Defaults to caller's provider.",
     ),
 ) -> Dict[str, Any]:
     """Assigns a task to another agent without blocking.
 
-    In the message to the worker agent include instruction to send results back via send_message tool.
-    **IMPORTANT**: The terminal id of each agent is available in environment variable CAO_TERMINAL_ID.
-    When assigning, first find out your own CAO_TERMINAL_ID value, then include the terminal_id value in the message to the worker agent to allow callback.
-    Example message: "Analyze the logs. When done, send results back to terminal ee3f93b3 using send_message tool."
+    The worker agent automatically has CAO_PARENT_TERMINAL_ID set, so it can use
+    the reply() tool to send results back without needing to know the parent's terminal ID.
 
     Args:
         agent_profile: Agent profile for the worker terminal
-        message: Task message (include callback instructions)
+        message: Task message to send
+        provider: Optional provider override
 
     Returns:
         Dict with success status, worker terminal_id, and message
     """
     try:
-        # Create terminal
-        terminal_id, _ = _create_terminal(agent_profile)
+        # Create terminal with optional provider override
+        terminal_id, used_provider = _create_terminal(agent_profile, provider)
 
         # Send message immediately
         _send_direct_input(terminal_id, message)
@@ -255,6 +273,7 @@ async def assign(
         return {
             "success": True,
             "terminal_id": terminal_id,
+            "provider": used_provider,
             "message": f"Task assigned to {agent_profile} (terminal: {terminal_id})",
         }
 
@@ -281,6 +300,34 @@ async def send_message(
     """
     try:
         return _send_to_inbox(receiver_id, message)
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def reply(
+    message: str = Field(description="Message content to send to parent terminal"),
+) -> Dict[str, Any]:
+    """Reply to the parent terminal that spawned this agent.
+
+    Automatically uses CAO_PARENT_TERMINAL_ID environment variable.
+    Only works for agents spawned via assign() or handoff().
+
+    Args:
+        message: Message content to send
+
+    Returns:
+        Dict with success status and message details
+    """
+    parent_id = os.environ.get("CAO_PARENT_TERMINAL_ID")
+    if not parent_id:
+        return {
+            "success": False,
+            "error": "No parent terminal - this agent was not spawned via assign() or handoff(). "
+            "CAO_PARENT_TERMINAL_ID environment variable is not set.",
+        }
+    try:
+        return _send_to_inbox(parent_id, message)
     except Exception as e:
         return {"success": False, "error": str(e)}
 
