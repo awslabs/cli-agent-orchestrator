@@ -1,7 +1,7 @@
 """Tests for parent terminal tracking and reply functionality."""
 
 import os
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -257,7 +257,7 @@ class TestMcpAssignWithProvider:
                     provider="q_cli",
                 )
 
-                mock_create.assert_called_once_with("developer", "q_cli")
+                mock_create.assert_called_once_with("developer", "q_cli", ANY)
                 assert result["success"] is True
                 assert result["provider"] == "q_cli"
 
@@ -282,7 +282,7 @@ class TestMcpAssignWithProvider:
                     provider=None,  # Explicitly pass None to test default behavior
                 )
 
-                mock_create.assert_called_once_with("developer", None)
+                mock_create.assert_called_once_with("developer", None, ANY)
                 assert result["success"] is True
 
     @pytest.mark.asyncio
@@ -369,7 +369,7 @@ class TestMcpHandoffWithProvider:
                                 provider="q_cli",
                             )
 
-                            mock_create.assert_called_once_with("developer", "q_cli")
+                            mock_create.assert_called_once_with("developer", "q_cli", ANY)
                             assert result.success is True
                             assert "q_cli" in result.message
 

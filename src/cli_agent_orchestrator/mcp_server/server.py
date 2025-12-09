@@ -35,12 +35,14 @@ mcp = FastMCP(
 def _create_terminal(
     agent_profile: str,
     provider_override: Optional[str] = None,
+    provider_args: Optional[str] = None,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
     Args:
         agent_profile: Agent profile for the terminal
         provider_override: Optional provider override (uses caller's provider if not set)
+        provider_args: Optional extra CLI arguments to pass to the provider
 
     Returns:
         Tuple of (terminal_id, provider)
@@ -64,26 +66,32 @@ def _create_terminal(
         session_name = terminal_metadata["session_name"]
 
         # Create new terminal in existing session with parent_id set
+        params: Dict[str, Any] = {
+            "provider": provider,
+            "agent_profile": agent_profile,
+            "parent_id": current_terminal_id,
+        }
+        if provider_args:
+            params["provider_args"] = provider_args
         response = requests.post(
             f"{API_BASE_URL}/sessions/{session_name}/terminals",
-            params={
-                "provider": provider,
-                "agent_profile": agent_profile,
-                "parent_id": current_terminal_id,
-            },
+            params=params,
         )
         response.raise_for_status()
         terminal = response.json()
     else:
         # Create new session with terminal (no parent)
         session_name = generate_session_name()
+        params = {
+            "provider": provider,
+            "agent_profile": agent_profile,
+            "session_name": session_name,
+        }
+        if provider_args:
+            params["provider_args"] = provider_args
         response = requests.post(
             f"{API_BASE_URL}/sessions",
-            params={
-                "provider": provider,
-                "agent_profile": agent_profile,
-                "session_name": session_name,
-            },
+            params=params,
         )
         response.raise_for_status()
         terminal = response.json()
@@ -149,6 +157,10 @@ async def handoff(
         default=None,
         description="Override the CLI provider (e.g., 'claude_code', 'q_cli'). Defaults to caller's provider.",
     ),
+    provider_args: Optional[str] = Field(
+        default=None,
+        description="Extra CLI arguments to pass to the provider (e.g., '--dangerously-skip-permissions --verbose')",
+    ),
 ) -> HandoffResult:
     """Hand off a task to another agent via CAO terminal and wait for completion.
 
@@ -182,8 +194,8 @@ async def handoff(
     start_time = time.time()
 
     try:
-        # Create terminal with optional provider override
-        terminal_id, used_provider = _create_terminal(agent_profile, provider)
+        # Create terminal with optional provider override and args
+        terminal_id, used_provider = _create_terminal(agent_profile, provider, provider_args)
 
         # Wait for terminal to be IDLE before sending message
         if not wait_until_terminal_status(terminal_id, TerminalStatus.IDLE, timeout=30.0):
@@ -249,6 +261,10 @@ async def assign(
         default=None,
         description="Override the CLI provider (e.g., 'claude_code', 'q_cli'). Defaults to caller's provider.",
     ),
+    provider_args: Optional[str] = Field(
+        default=None,
+        description="Extra CLI arguments to pass to the provider (e.g., '--dangerously-skip-permissions --verbose')",
+    ),
 ) -> Dict[str, Any]:
     """Assigns a task to another agent without blocking.
 
@@ -259,13 +275,14 @@ async def assign(
         agent_profile: Agent profile for the worker terminal
         message: Task message to send
         provider: Optional provider override
+        provider_args: Optional extra CLI arguments for the provider
 
     Returns:
         Dict with success status, worker terminal_id, and message
     """
     try:
-        # Create terminal with optional provider override
-        terminal_id, used_provider = _create_terminal(agent_profile, provider)
+        # Create terminal with optional provider override and args
+        terminal_id, used_provider = _create_terminal(agent_profile, provider, provider_args)
 
         # Send message immediately
         _send_direct_input(terminal_id, message)

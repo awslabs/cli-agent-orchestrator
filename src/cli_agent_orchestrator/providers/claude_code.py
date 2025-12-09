@@ -1,5 +1,6 @@
 """Claude Code provider implementation."""
 
+import os
 import re
 import shlex
 from typing import List, Optional
@@ -46,6 +47,11 @@ class ClaudeCodeProvider(BaseProvider):
     def _build_claude_command(self) -> List[str]:
         """Build Claude Code command with agent profile if provided."""
         command_parts = ["claude"]
+
+        # Add extra provider args from environment (e.g., --dangerously-skip-permissions)
+        provider_args = os.environ.get("CAO_PROVIDER_ARGS")
+        if provider_args:
+            command_parts.extend(provider_args.split())
 
         if self._agent_profile is not None:
             try:
