@@ -8,17 +8,14 @@ import requests
 from cli_agent_orchestrator.constants import DEFAULT_PROVIDER, PROVIDERS, SERVER_HOST, SERVER_PORT
 
 
-@click.command()
+@click.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 @click.option("--agents", required=True, help="Agent profile to launch")
 @click.option("--session-name", help="Name of the session (default: auto-generated)")
 @click.option("--headless", is_flag=True, help="Launch in detached mode")
 @click.option(
     "--provider", default=DEFAULT_PROVIDER, help=f"Provider to use (default: {DEFAULT_PROVIDER})"
 )
-@click.option(
-    "--provider-args",
-    help="Extra CLI arguments to pass to the provider (e.g., '--dangerously-skip-permissions')",
-)
+@click.argument("provider_args", nargs=-1, type=click.UNPROCESSED)
 def launch(agents, session_name, headless, provider, provider_args):
     """Launch cao session with specified agent profile."""
     try:
@@ -37,7 +34,7 @@ def launch(agents, session_name, headless, provider, provider_args):
         if session_name:
             params["session_name"] = session_name
         if provider_args:
-            params["provider_args"] = provider_args
+            params["provider_args"] = " ".join(provider_args)
 
         response = requests.post(url, params=params)
         response.raise_for_status()
