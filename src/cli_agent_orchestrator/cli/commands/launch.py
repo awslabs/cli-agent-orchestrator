@@ -15,7 +15,11 @@ from cli_agent_orchestrator.constants import DEFAULT_PROVIDER, PROVIDERS, SERVER
 @click.option(
     "--provider", default=DEFAULT_PROVIDER, help=f"Provider to use (default: {DEFAULT_PROVIDER})"
 )
-def launch(agents, session_name, headless, provider):
+@click.option(
+    "--provider-args",
+    help="Extra CLI arguments to pass to the provider (e.g., '--dangerously-skip-permissions')",
+)
+def launch(agents, session_name, headless, provider, provider_args):
     """Launch cao session with specified agent profile."""
     try:
         # Validate provider
@@ -32,6 +36,8 @@ def launch(agents, session_name, headless, provider):
         }
         if session_name:
             params["session_name"] = session_name
+        if provider_args:
+            params["provider_args"] = provider_args
 
         response = requests.post(url, params=params)
         response.raise_for_status()
