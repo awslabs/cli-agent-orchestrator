@@ -85,7 +85,7 @@ def create_terminal(
 
         # Initialize provider
         provider_instance = provider_manager.create_provider(
-            provider, terminal_id, session_name, window_name, agent_profile
+            provider, terminal_id, session_name, window_name, agent_profile, provider_args
         )
         provider_instance.initialize()
 

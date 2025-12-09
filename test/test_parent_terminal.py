@@ -659,21 +659,21 @@ class TestProviderBuildCommand:
     """Test provider command building with provider_args."""
 
     def test_claude_code_build_command_with_provider_args(self):
-        """Test ClaudeCodeProvider builds command with provider_args from env."""
+        """Test ClaudeCodeProvider builds command with provider_args."""
         from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
 
-        with patch.dict(os.environ, {"CAO_PROVIDER_ARGS": "--dangerously-skip-permissions --verbose"}):
-            provider = ClaudeCodeProvider(
-                terminal_id="test123",
-                session_name="test-session",
-                window_name="test-window",
-                agent_profile="developer",
-            )
-            command = provider._build_claude_command()
+        provider = ClaudeCodeProvider(
+            terminal_id="test123",
+            session_name="test-session",
+            window_name="test-window",
+            agent_profile="developer",
+            provider_args="--dangerously-skip-permissions --verbose",
+        )
+        command = provider._build_claude_command()
 
-            # Verify provider args are included
-            assert "--dangerously-skip-permissions" in command
-            assert "--verbose" in command
+        # Verify provider args are included
+        assert "--dangerously-skip-permissions" in command
+        assert "--verbose" in command
 
     def test_claude_code_build_command_with_no_profile(self):
         """Test ClaudeCodeProvider skips profile when CAO_NO_PROFILE=1."""

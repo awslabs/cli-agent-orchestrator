@@ -26,6 +26,7 @@ class ProviderManager:
         tmux_session: str,
         tmux_window: str,
         agent_profile: Optional[str] = None,
+        provider_args: Optional[str] = None,
     ) -> BaseProvider:
         """Create and store provider instance."""
         try:
@@ -39,7 +40,9 @@ class ProviderManager:
                     raise ValueError("Kiro CLI provider requires agent_profile parameter")
                 provider = KiroCliProvider(terminal_id, tmux_session, tmux_window, agent_profile)
             elif provider_type == ProviderType.CLAUDE_CODE.value:
-                provider = ClaudeCodeProvider(terminal_id, tmux_session, tmux_window, agent_profile)
+                provider = ClaudeCodeProvider(
+                    terminal_id, tmux_session, tmux_window, agent_profile, provider_args
+                )
             else:
                 raise ValueError(f"Unknown provider type: {provider_type}")
 

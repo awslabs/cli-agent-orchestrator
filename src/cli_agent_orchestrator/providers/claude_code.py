@@ -50,8 +50,9 @@ class ClaudeCodeProvider(BaseProvider):
         session_name: str,
         window_name: str,
         agent_profile: Optional[str] = None,
+        provider_args: Optional[str] = None,
     ):
-        super().__init__(terminal_id, session_name, window_name)
+        super().__init__(terminal_id, session_name, window_name, provider_args)
         self._initialized = False
         self._agent_profile = agent_profile
 
@@ -59,11 +60,10 @@ class ClaudeCodeProvider(BaseProvider):
         """Build Claude Code command with agent profile if provided."""
         command_parts = ["claude"]
 
-        # Add extra provider args from environment (e.g., --dangerously-skip-permissions)
+        # Add extra provider args (e.g., --dangerously-skip-permissions)
         # Validate against allowlist to prevent command injection
-        provider_args = os.environ.get("CAO_PROVIDER_ARGS", "")
-        if provider_args:
-            for arg in provider_args.split():
+        if self.provider_args:
+            for arg in self.provider_args.split():
                 if arg in ALLOWED_PROVIDER_ARGS:
                     command_parts.append(arg)
                 else:
