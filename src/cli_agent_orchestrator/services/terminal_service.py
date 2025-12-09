@@ -40,16 +40,20 @@ def create_terminal(
     parent_id: Optional[str] = None,
     extra_env: Optional[Dict[str, Any]] = None,
     provider_args: Optional[str] = None,
+    no_profile: bool = False,
 ) -> Terminal:
     """Create terminal, optionally creating new session with it."""
     try:
         terminal_id = generate_terminal_id()
 
-        # Add provider_args to environment if specified
-        if provider_args:
+        # Add provider_args and no_profile to environment if specified
+        if provider_args or no_profile:
             if extra_env is None:
                 extra_env = {}
-            extra_env["CAO_PROVIDER_ARGS"] = provider_args
+            if provider_args:
+                extra_env["CAO_PROVIDER_ARGS"] = provider_args
+            if no_profile:
+                extra_env["CAO_NO_PROFILE"] = "1"
 
         # Generate session name if not provided
         if not session_name:

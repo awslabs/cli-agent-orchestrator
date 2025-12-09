@@ -117,6 +117,7 @@ async def create_session(
     session_name: Optional[str] = None,
     parent_id: Optional[str] = None,
     provider_args: Optional[str] = None,
+    no_profile: Optional[str] = None,
 ) -> Terminal:
     """Create a new session with exactly one terminal."""
     try:
@@ -127,6 +128,7 @@ async def create_session(
             new_session=True,
             parent_id=parent_id,
             provider_args=provider_args,
+            no_profile=no_profile == "true",
         )
         return result
 

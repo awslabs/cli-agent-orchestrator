@@ -49,11 +49,16 @@ class ClaudeCodeProvider(BaseProvider):
         command_parts = ["claude"]
 
         # Add extra provider args from environment (e.g., --dangerously-skip-permissions)
-        provider_args = os.environ.get("CAO_PROVIDER_ARGS")
-        if provider_args:
-            command_parts.extend(provider_args.split())
+        provider_args = os.environ.get("CAO_PROVIDER_ARGS", "")
+        provider_args_list = provider_args.split() if provider_args else []
 
-        if self._agent_profile is not None:
+        if provider_args_list:
+            command_parts.extend(provider_args_list)
+
+        # Skip profile injection if CAO_NO_PROFILE is set
+        no_profile = os.environ.get("CAO_NO_PROFILE") == "1"
+
+        if self._agent_profile is not None and not no_profile:
             try:
                 profile = load_agent_profile(self._agent_profile)
 

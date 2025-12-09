@@ -15,8 +15,11 @@ from cli_agent_orchestrator.constants import DEFAULT_PROVIDER, PROVIDERS, SERVER
 @click.option(
     "--provider", default=DEFAULT_PROVIDER, help=f"Provider to use (default: {DEFAULT_PROVIDER})"
 )
+@click.option(
+    "--no-profile", is_flag=True, help="Skip injecting agent profile (system prompt, MCP config)"
+)
 @click.argument("provider_args", nargs=-1, type=click.UNPROCESSED)
-def launch(agents, session_name, headless, provider, provider_args):
+def launch(agents, session_name, headless, provider, no_profile, provider_args):
     """Launch cao session with specified agent profile."""
     try:
         # Validate provider
@@ -35,6 +38,8 @@ def launch(agents, session_name, headless, provider, provider_args):
             params["session_name"] = session_name
         if provider_args:
             params["provider_args"] = " ".join(provider_args)
+        if no_profile:
+            params["no_profile"] = "true"
 
         response = requests.post(url, params=params)
         response.raise_for_status()
