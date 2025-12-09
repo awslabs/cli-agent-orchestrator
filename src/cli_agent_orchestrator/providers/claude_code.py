@@ -9,7 +9,7 @@ from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
-from cli_agent_orchestrator.utils.terminal import wait_until_status
+from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 
 
 # Custom exception for provider errors
@@ -19,9 +19,20 @@ class ProviderError(Exception):
     pass
 
 
+# Allowlist of safe provider arguments for CAO_PROVIDER_ARGS
+# These are arguments that can be safely passed to claude command
+ALLOWED_PROVIDER_ARGS = frozenset([
+    "--dangerously-skip-permissions",
+    "--verbose",
+    "--debug",
+    "--no-color",
+])
+
+
 # Regex patterns for Claude Code output analysis
 ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
-RESPONSE_PATTERN = r"⏺(?:\x1b\[[0-9;]*m)*\s+"  # Handle any ANSI codes between marker and text
+# Response marker can be ⏺ (record symbol) or ● (filled circle) depending on Claude version
+RESPONSE_PATTERN = r"[⏺●](?:\x1b\[[0-9;]*m)*\s+"  # Handle any ANSI codes between marker and text
 PROCESSING_PATTERN = r"[✶✢✽✻·✳].*….*\(esc to interrupt.*\)"
 IDLE_PROMPT_PATTERN = r">[\s\xa0]"  # Handle both regular space and non-breaking space
 WAITING_USER_ANSWER_PATTERN = (
@@ -49,11 +60,17 @@ class ClaudeCodeProvider(BaseProvider):
         command_parts = ["claude"]
 
         # Add extra provider args from environment (e.g., --dangerously-skip-permissions)
+        # Validate against allowlist to prevent command injection
         provider_args = os.environ.get("CAO_PROVIDER_ARGS", "")
-        provider_args_list = provider_args.split() if provider_args else []
-
-        if provider_args_list:
-            command_parts.extend(provider_args_list)
+        if provider_args:
+            for arg in provider_args.split():
+                if arg in ALLOWED_PROVIDER_ARGS:
+                    command_parts.append(arg)
+                else:
+                    raise ProviderError(
+                        f"Invalid provider argument: {arg}. "
+                        f"Allowed arguments: {', '.join(sorted(ALLOWED_PROVIDER_ARGS))}"
+                    )
 
         # Skip profile injection if CAO_NO_PROFILE is set
         no_profile = os.environ.get("CAO_NO_PROFILE") == "1"
@@ -76,8 +93,29 @@ class ClaudeCodeProvider(BaseProvider):
 
         return command_parts
 
-    def initialize(self) -> bool:
-        """Initialize Claude Code provider by starting claude command."""
+    def initialize(self, init_timeout: float = 90.0) -> bool:
+        """Initialize Claude Code provider by starting claude command.
+
+        Args:
+            init_timeout: Timeout in seconds to wait for Claude Code to initialize.
+                         Defaults to 90 seconds. Can be overridden via CAO_INIT_TIMEOUT env var.
+        """
+        # Allow env var to override timeout with validation
+        timeout_str = os.environ.get("CAO_INIT_TIMEOUT")
+        if timeout_str is not None:
+            try:
+                timeout = float(timeout_str)
+                if timeout <= 0:
+                    timeout = init_timeout  # Use default for invalid values
+            except ValueError:
+                timeout = init_timeout  # Use default for non-numeric values
+        else:
+            timeout = init_timeout
+
+        # Wait for shell to be ready first
+        if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
+            raise TimeoutError("Shell initialization timed out after 10 seconds")
+
         # Build command with agent profile support
         command_parts = self._build_claude_command()
         command = " ".join(command_parts)
@@ -86,8 +124,8 @@ class ClaudeCodeProvider(BaseProvider):
         tmux_client.send_keys(self.session_name, self.window_name, command)
 
         # Wait for Claude Code prompt to be ready
-        if not wait_until_status(self, TerminalStatus.IDLE, timeout=30.0, polling_interval=1.0):
-            raise TimeoutError("Claude Code initialization timed out after 30 seconds")
+        if not wait_until_status(self, TerminalStatus.IDLE, timeout=timeout, polling_interval=1.0):
+            raise TimeoutError(f"Claude Code initialization timed out after {timeout} seconds")
 
         self._initialized = True
         return True

@@ -1,6 +1,7 @@
 """Q CLI provider implementation."""
 
 import logging
+import os
 import re
 from typing import List, Optional
 
@@ -41,13 +42,25 @@ class QCliProvider(BaseProvider):
             r"Allow this action\?.*\[.*y.*\/.*n.*\/.*t.*\]:\s*" + self._idle_prompt_pattern
         )
 
+    def _build_q_command(self) -> str:
+        """Build Q CLI command with provider args if provided."""
+        command_parts = ["q", "chat"]
+
+        # Add extra provider args from environment
+        provider_args = os.environ.get("CAO_PROVIDER_ARGS", "")
+        if provider_args:
+            command_parts.extend(provider_args.split())
+
+        command_parts.extend(["--agent", self._agent_profile])
+        return " ".join(command_parts)
+
     def initialize(self) -> bool:
         """Initialize Q CLI provider by starting q chat command."""
         # Wait for shell to be ready first
         if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
-        command = f"q chat --agent {self._agent_profile}"
+        command = self._build_q_command()
         tmux_client.send_keys(self.session_name, self.window_name, command)
 
         if not wait_until_status(self, TerminalStatus.IDLE, timeout=30.0):

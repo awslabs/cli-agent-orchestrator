@@ -154,6 +154,24 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
         ]
 
 
+def get_all_terminals() -> List[Dict[str, Any]]:
+    """Get all terminals from the database."""
+    with SessionLocal() as db:
+        terminals = db.query(TerminalModel).all()
+        return [
+            {
+                "id": t.id,
+                "tmux_session": t.tmux_session,
+                "tmux_window": t.tmux_window,
+                "provider": t.provider,
+                "agent_profile": t.agent_profile,
+                "parent_id": t.parent_id,
+                "last_active": t.last_active,
+            }
+            for t in terminals
+        ]
+
+
 def update_last_active(terminal_id: str) -> bool:
     """Update last active timestamp."""
     with SessionLocal() as db:

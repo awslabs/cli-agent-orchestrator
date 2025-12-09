@@ -6,6 +6,7 @@ from cli_agent_orchestrator.cli.commands.flow import flow
 from cli_agent_orchestrator.cli.commands.init import init
 from cli_agent_orchestrator.cli.commands.install import install
 from cli_agent_orchestrator.cli.commands.launch import launch
+from cli_agent_orchestrator.cli.commands.resume import resume
 from cli_agent_orchestrator.cli.commands.shutdown import shutdown
 
 
@@ -16,6 +17,7 @@ def cli():
 
 # Register commands
 cli.add_command(launch)
+cli.add_command(resume)
 cli.add_command(init)
 cli.add_command(install)
 cli.add_command(shutdown)

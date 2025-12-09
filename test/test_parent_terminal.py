@@ -257,7 +257,7 @@ class TestMcpAssignWithProvider:
                     provider="q_cli",
                 )
 
-                mock_create.assert_called_once_with("developer", "q_cli", ANY)
+                mock_create.assert_called_once_with("developer", "q_cli", ANY, ANY)
                 assert result["success"] is True
                 assert result["provider"] == "q_cli"
 
@@ -282,7 +282,7 @@ class TestMcpAssignWithProvider:
                     provider=None,  # Explicitly pass None to test default behavior
                 )
 
-                mock_create.assert_called_once_with("developer", None, ANY)
+                mock_create.assert_called_once_with("developer", None, ANY, ANY)
                 assert result["success"] is True
 
     @pytest.mark.asyncio
@@ -369,7 +369,7 @@ class TestMcpHandoffWithProvider:
                                 provider="q_cli",
                             )
 
-                            mock_create.assert_called_once_with("developer", "q_cli", ANY)
+                            mock_create.assert_called_once_with("developer", "q_cli", ANY, ANY)
                             assert result.success is True
                             assert "q_cli" in result.message
 
@@ -521,3 +521,215 @@ class TestCreateTerminalWithParentId:
                 assert provider == "q_cli"
                 call_kwargs = mock_requests.post.call_args.kwargs
                 assert call_kwargs["params"]["provider"] == "q_cli"
+
+
+class TestProviderArgsPassthrough:
+    """Test provider_args and no_profile passthrough."""
+
+    def test_create_terminal_with_provider_args(self):
+        """Test _create_terminal passes provider_args to API."""
+        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "parent12"}):
+            with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+                mock_get_response = MagicMock()
+                mock_get_response.json.return_value = {
+                    "provider": "claude_code",
+                    "session_name": "test-session",
+                }
+                mock_get_response.raise_for_status.return_value = None
+
+                mock_post_response = MagicMock()
+                mock_post_response.json.return_value = {"id": "child123"}
+                mock_post_response.raise_for_status.return_value = None
+
+                mock_requests.get.return_value = mock_get_response
+                mock_requests.post.return_value = mock_post_response
+
+                _create_terminal(
+                    "developer",
+                    provider_args="--dangerously-skip-permissions --verbose",
+                )
+
+                call_kwargs = mock_requests.post.call_args.kwargs
+                assert call_kwargs["params"]["provider_args"] == "--dangerously-skip-permissions --verbose"
+
+    def test_create_terminal_with_no_profile(self):
+        """Test _create_terminal passes no_profile to API."""
+        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "parent12"}):
+            with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+                mock_get_response = MagicMock()
+                mock_get_response.json.return_value = {
+                    "provider": "claude_code",
+                    "session_name": "test-session",
+                }
+                mock_get_response.raise_for_status.return_value = None
+
+                mock_post_response = MagicMock()
+                mock_post_response.json.return_value = {"id": "child123"}
+                mock_post_response.raise_for_status.return_value = None
+
+                mock_requests.get.return_value = mock_get_response
+                mock_requests.post.return_value = mock_post_response
+
+                _create_terminal("developer", no_profile=True)
+
+                call_kwargs = mock_requests.post.call_args.kwargs
+                assert call_kwargs["params"]["no_profile"] == "true"
+
+    def test_create_terminal_without_no_profile(self):
+        """Test _create_terminal doesn't pass no_profile when False."""
+        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "parent12"}):
+            with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+                mock_get_response = MagicMock()
+                mock_get_response.json.return_value = {
+                    "provider": "claude_code",
+                    "session_name": "test-session",
+                }
+                mock_get_response.raise_for_status.return_value = None
+
+                mock_post_response = MagicMock()
+                mock_post_response.json.return_value = {"id": "child123"}
+                mock_post_response.raise_for_status.return_value = None
+
+                mock_requests.get.return_value = mock_get_response
+                mock_requests.post.return_value = mock_post_response
+
+                _create_terminal("developer", no_profile=False)
+
+                call_kwargs = mock_requests.post.call_args.kwargs
+                assert "no_profile" not in call_kwargs["params"]
+
+    @pytest.mark.asyncio
+    async def test_assign_with_provider_args(self):
+        """Test assign() passes provider_args to _create_terminal."""
+        from cli_agent_orchestrator.mcp_server.server import assign
+
+        assign_fn = assign.fn
+
+        with patch(
+            "cli_agent_orchestrator.mcp_server.server._create_terminal"
+        ) as mock_create:
+            with patch(
+                "cli_agent_orchestrator.mcp_server.server._send_direct_input"
+            ) as mock_send:
+                mock_create.return_value = ("child123", "claude_code")
+
+                await assign_fn(
+                    agent_profile="developer",
+                    message="Test task",
+                    provider_args="--dangerously-skip-permissions",
+                )
+
+                # Verify provider_args was passed
+                call_args = mock_create.call_args
+                assert call_args[0][2] == "--dangerously-skip-permissions"
+
+    @pytest.mark.asyncio
+    async def test_assign_with_no_profile(self):
+        """Test assign() passes no_profile to _create_terminal."""
+        from cli_agent_orchestrator.mcp_server.server import assign
+
+        assign_fn = assign.fn
+
+        with patch(
+            "cli_agent_orchestrator.mcp_server.server._create_terminal"
+        ) as mock_create:
+            with patch(
+                "cli_agent_orchestrator.mcp_server.server._send_direct_input"
+            ) as mock_send:
+                mock_create.return_value = ("child123", "claude_code")
+
+                await assign_fn(
+                    agent_profile="developer",
+                    message="Test task",
+                    no_profile=True,
+                )
+
+                # Verify no_profile was passed as True
+                call_args = mock_create.call_args
+                assert call_args[0][3] is True
+
+
+class TestProviderBuildCommand:
+    """Test provider command building with provider_args."""
+
+    def test_claude_code_build_command_with_provider_args(self):
+        """Test ClaudeCodeProvider builds command with provider_args from env."""
+        from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+
+        with patch.dict(os.environ, {"CAO_PROVIDER_ARGS": "--dangerously-skip-permissions --verbose"}):
+            provider = ClaudeCodeProvider(
+                terminal_id="test123",
+                session_name="test-session",
+                window_name="test-window",
+                agent_profile="developer",
+            )
+            command = provider._build_claude_command()
+
+            # Verify provider args are included
+            assert "--dangerously-skip-permissions" in command
+            assert "--verbose" in command
+
+    def test_claude_code_build_command_with_no_profile(self):
+        """Test ClaudeCodeProvider skips profile when CAO_NO_PROFILE=1."""
+        from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+
+        with patch.dict(os.environ, {"CAO_NO_PROFILE": "1"}):
+            with patch(
+                "cli_agent_orchestrator.providers.claude_code.load_agent_profile"
+            ) as mock_load:
+                provider = ClaudeCodeProvider(
+                    terminal_id="test123",
+                    session_name="test-session",
+                    window_name="test-window",
+                    agent_profile="developer",
+                )
+                command = provider._build_claude_command()
+
+                # Verify profile was NOT loaded
+                mock_load.assert_not_called()
+                # Command should just be ["claude"]
+                assert command == ["claude"]
+
+    def test_q_cli_build_command_with_provider_args(self):
+        """Test QCliProvider builds command with provider_args from env."""
+        from cli_agent_orchestrator.providers.q_cli import QCliProvider
+
+        with patch.dict(os.environ, {"CAO_PROVIDER_ARGS": "--verbose --debug"}):
+            provider = QCliProvider(
+                terminal_id="test123",
+                session_name="test-session",
+                window_name="test-window",
+                agent_profile="developer",
+            )
+            command = provider._build_q_command()
+
+            # Verify provider args are included before --agent
+            assert "--verbose" in command
+            assert "--debug" in command
+            # --agent should be at the end
+            assert command.endswith("--agent developer")
+
+    def test_kiro_cli_build_command_with_provider_args(self):
+        """Test KiroCliProvider builds command with provider_args from env."""
+        from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
+
+        with patch.dict(os.environ, {"CAO_PROVIDER_ARGS": "--verbose --debug"}):
+            provider = KiroCliProvider(
+                terminal_id="test123",
+                session_name="test-session",
+                window_name="test-window",
+                agent_profile="developer",
+            )
+            command = provider._build_kiro_command()
+
+            # Verify provider args are included before --agent
+            assert "--verbose" in command
+            assert "--debug" in command
+            # --agent should be at the end
+            assert command.endswith("--agent developer")

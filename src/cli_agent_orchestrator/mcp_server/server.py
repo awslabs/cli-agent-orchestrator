@@ -36,6 +36,7 @@ def _create_terminal(
     agent_profile: str,
     provider_override: Optional[str] = None,
     provider_args: Optional[str] = None,
+    no_profile: bool = False,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
@@ -43,6 +44,7 @@ def _create_terminal(
         agent_profile: Agent profile for the terminal
         provider_override: Optional provider override (uses caller's provider if not set)
         provider_args: Optional extra CLI arguments to pass to the provider
+        no_profile: Skip injecting agent profile (system prompt, MCP config)
 
     Returns:
         Tuple of (terminal_id, provider)
@@ -73,6 +75,8 @@ def _create_terminal(
         }
         if provider_args:
             params["provider_args"] = provider_args
+        if no_profile:
+            params["no_profile"] = "true"
         response = requests.post(
             f"{API_BASE_URL}/sessions/{session_name}/terminals",
             params=params,
@@ -89,6 +93,8 @@ def _create_terminal(
         }
         if provider_args:
             params["provider_args"] = provider_args
+        if no_profile:
+            params["no_profile"] = "true"
         response = requests.post(
             f"{API_BASE_URL}/sessions",
             params=params,
@@ -161,6 +167,10 @@ async def handoff(
         default=None,
         description="Extra CLI arguments to pass to the provider (e.g., '--dangerously-skip-permissions --verbose')",
     ),
+    no_profile: bool = Field(
+        default=False,
+        description="Skip injecting agent profile (system prompt, MCP config). Useful when resuming sessions.",
+    ),
 ) -> HandoffResult:
     """Hand off a task to another agent via CAO terminal and wait for completion.
 
@@ -195,7 +205,9 @@ async def handoff(
 
     try:
         # Create terminal with optional provider override and args
-        terminal_id, used_provider = _create_terminal(agent_profile, provider, provider_args)
+        terminal_id, used_provider = _create_terminal(
+            agent_profile, provider, provider_args, no_profile
+        )
 
         # Wait for terminal to be IDLE before sending message
         if not wait_until_terminal_status(terminal_id, TerminalStatus.IDLE, timeout=30.0):
@@ -265,6 +277,10 @@ async def assign(
         default=None,
         description="Extra CLI arguments to pass to the provider (e.g., '--dangerously-skip-permissions --verbose')",
     ),
+    no_profile: bool = Field(
+        default=False,
+        description="Skip injecting agent profile (system prompt, MCP config). Useful when resuming sessions.",
+    ),
 ) -> Dict[str, Any]:
     """Assigns a task to another agent without blocking.
 
@@ -276,13 +292,16 @@ async def assign(
         message: Task message to send
         provider: Optional provider override
         provider_args: Optional extra CLI arguments for the provider
+        no_profile: Skip injecting agent profile
 
     Returns:
         Dict with success status, worker terminal_id, and message
     """
     try:
         # Create terminal with optional provider override and args
-        terminal_id, used_provider = _create_terminal(agent_profile, provider, provider_args)
+        terminal_id, used_provider = _create_terminal(
+            agent_profile, provider, provider_args, no_profile
+        )
 
         # Send message immediately
         _send_direct_input(terminal_id, message)

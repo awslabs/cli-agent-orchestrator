@@ -247,8 +247,8 @@ class TestQCliProviderIntegration:
         tmux_client.create_session(test_session_name, window_name, terminal_id)
 
         try:
-            # Try with a different profile (may not exist, that's okay)
-            provider = QCliProvider(terminal_id, test_session_name, window_name, "test-agent")
+            # Try with the test agent from the fixture
+            provider = QCliProvider(terminal_id, test_session_name, window_name, ensure_test_agent)
 
             # Initialize - may fail if profile doesn't exist
             try:

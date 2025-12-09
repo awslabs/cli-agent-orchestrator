@@ -3,6 +3,7 @@
 import logging
 import os
 import re
+import shlex
 import time
 from typing import Any, Dict, List, Optional
 
@@ -223,6 +224,17 @@ class TmuxClient:
         except Exception:
             return False
 
+    def window_exists(self, session_name: str, window_name: str) -> bool:
+        """Check if a window exists in a session."""
+        try:
+            session = self.server.sessions.get(session_name=session_name)
+            if not session:
+                return False
+            window = session.windows.get(window_name=window_name)
+            return window is not None
+        except Exception:
+            return False
+
     def pipe_pane(self, session_name: str, window_name: str, file_path: str) -> None:
         """Start piping pane output to file.
 
@@ -230,7 +242,14 @@ class TmuxClient:
             session_name: Tmux session name
             window_name: Tmux window name
             file_path: Absolute path to log file
+
+        Raises:
+            ValueError: If file_path is not absolute or contains invalid characters
         """
+        # Validate file_path to prevent command injection
+        if not os.path.isabs(file_path):
+            raise ValueError(f"file_path must be an absolute path, got: {file_path}")
+
         try:
             session = self.server.sessions.get(session_name=session_name)
             if not session:
@@ -242,7 +261,9 @@ class TmuxClient:
 
             pane = window.active_pane
             if pane:
-                pane.cmd("pipe-pane", "-o", f"cat >> {file_path}")
+                # Use shlex.quote to safely escape the file path
+                safe_path = shlex.quote(file_path)
+                pane.cmd("pipe-pane", "-o", f"cat >> {safe_path}")
                 logger.info(f"Started pipe-pane for {session_name}:{window_name} to {file_path}")
         except Exception as e:
             logger.error(f"Failed to start pipe-pane for {session_name}:{window_name}: {e}")

@@ -117,7 +117,7 @@ async def create_session(
     session_name: Optional[str] = None,
     parent_id: Optional[str] = None,
     provider_args: Optional[str] = None,
-    no_profile: Optional[str] = None,
+    no_profile: bool = False,
 ) -> Terminal:
     """Create a new session with exactly one terminal."""
     try:
@@ -128,7 +128,7 @@ async def create_session(
             new_session=True,
             parent_id=parent_id,
             provider_args=provider_args,
-            no_profile=no_profile == "true",
+            no_profile=no_profile,
         )
         return result
 
@@ -190,6 +190,7 @@ async def create_terminal_in_session(
     agent_profile: str,
     parent_id: Optional[str] = None,
     provider_args: Optional[str] = None,
+    no_profile: bool = False,
 ) -> Terminal:
     """Create additional terminal in existing session."""
     try:
@@ -200,6 +201,7 @@ async def create_terminal_in_session(
             new_session=False,
             parent_id=parent_id,
             provider_args=provider_args,
+            no_profile=no_profile,
         )
         return result
     except ValueError as e:
