@@ -733,3 +733,44 @@ class TestProviderBuildCommand:
             assert "--debug" in command
             # --agent should be at the end
             assert command.endswith("--agent developer")
+
+
+class TestProviderManagerPassthrough:
+    """Test provider_manager passes provider_args correctly."""
+
+    def test_provider_manager_passes_provider_args_to_claude_code(self):
+        """Test provider_manager.create_provider passes provider_args to ClaudeCodeProvider."""
+        from cli_agent_orchestrator.providers.manager import ProviderManager
+        from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+
+        manager = ProviderManager()
+        provider = manager.create_provider(
+            provider_type="claude_code",
+            terminal_id="test123",
+            tmux_session="test-session",
+            tmux_window="test-window",
+            agent_profile="developer",
+            provider_args="--dangerously-skip-permissions",
+        )
+
+        # Verify it's a ClaudeCodeProvider with provider_args set
+        assert isinstance(provider, ClaudeCodeProvider)
+        assert provider.provider_args == "--dangerously-skip-permissions"
+
+    def test_provider_manager_handles_none_provider_args(self):
+        """Test provider_manager handles None provider_args gracefully."""
+        from cli_agent_orchestrator.providers.manager import ProviderManager
+        from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+
+        manager = ProviderManager()
+        provider = manager.create_provider(
+            provider_type="claude_code",
+            terminal_id="test456",
+            tmux_session="test-session",
+            tmux_window="test-window",
+            agent_profile="developer",
+            provider_args=None,
+        )
+
+        assert isinstance(provider, ClaudeCodeProvider)
+        assert provider.provider_args is None
