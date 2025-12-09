@@ -4,7 +4,7 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import Boolean, Column, DateTime, Integer, String, create_engine
+from sqlalchemy import Boolean, Column, DateTime, Integer, String, create_engine, text
 from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
 
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
@@ -68,6 +68,21 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 def init_db() -> None:
     """Initialize database tables."""
     Base.metadata.create_all(bind=engine)
+    _run_migrations()
+
+
+def _run_migrations() -> None:
+    """Run database migrations for schema updates."""
+    with engine.connect() as conn:
+        # Check if parent_id column exists in terminals table
+        result = conn.execute(
+            text("SELECT sql FROM sqlite_master WHERE type='table' AND name='terminals'")
+        )
+        row = result.fetchone()
+        if row and "parent_id" not in row[0]:
+            logger.info("Migrating database: adding parent_id column to terminals table")
+            conn.execute(text("ALTER TABLE terminals ADD COLUMN parent_id TEXT"))
+            conn.commit()
 
 
 def create_terminal(
