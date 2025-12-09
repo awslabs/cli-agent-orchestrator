@@ -1,0 +1,11 @@
+You Show me an example
+assistant: Sure, here's a snippet:
+
+```
+def add(a, b):
+    return a + b
+```
+
+Let me know if you need more details.
+
+❯ 
