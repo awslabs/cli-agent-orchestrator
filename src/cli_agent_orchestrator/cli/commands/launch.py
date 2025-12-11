@@ -6,6 +6,7 @@ import click
 import requests
 
 from cli_agent_orchestrator.constants import DEFAULT_PROVIDER, PROVIDERS, SERVER_HOST, SERVER_PORT
+from cli_agent_orchestrator.utils.context_files import get_context_provider
 
 
 @click.command()
@@ -13,21 +14,24 @@ from cli_agent_orchestrator.constants import DEFAULT_PROVIDER, PROVIDERS, SERVER
 @click.option("--session-name", help="Name of the session (default: auto-generated)")
 @click.option("--headless", is_flag=True, help="Launch in detached mode")
 @click.option(
-    "--provider", default=DEFAULT_PROVIDER, help=f"Provider to use (default: {DEFAULT_PROVIDER})"
+    "--provider",
+    help="Provider to use (default: provider in agent context or q_cli)",
 )
 def launch(agents, session_name, headless, provider):
     """Launch cao session with specified agent profile."""
     try:
+        selected_provider = provider or get_context_provider(agents) or DEFAULT_PROVIDER
+
         # Validate provider
-        if provider not in PROVIDERS:
+        if selected_provider not in PROVIDERS:
             raise click.ClickException(
-                f"Invalid provider '{provider}'. Available providers: {', '.join(PROVIDERS)}"
+                f"Invalid provider '{selected_provider}'. Available providers: {', '.join(PROVIDERS)}"
             )
 
         # Call API to create session
         url = f"http://{SERVER_HOST}:{SERVER_PORT}/sessions"
         params = {
-            "provider": provider,
+            "provider": selected_provider,
             "agent_profile": agents,
         }
         if session_name:

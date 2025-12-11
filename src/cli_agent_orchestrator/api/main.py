@@ -11,7 +11,9 @@ from watchdog.observers.polling import PollingObserver
 
 from cli_agent_orchestrator.clients.database import create_inbox_message, get_inbox_messages, init_db
 from cli_agent_orchestrator.constants import (
+    DEFAULT_PROVIDER,
     INBOX_POLLING_INTERVAL,
+    PROVIDERS,
     SERVER_HOST,
     SERVER_PORT,
     SERVER_VERSION,
@@ -29,6 +31,7 @@ from cli_agent_orchestrator.services import (
 from cli_agent_orchestrator.services.cleanup_service import cleanup_old_data
 from cli_agent_orchestrator.services.inbox_service import LogFileHandler
 from cli_agent_orchestrator.services.terminal_service import OutputMode
+from cli_agent_orchestrator.utils.context_files import get_context_provider
 from cli_agent_orchestrator.utils.logging import setup_logging
 from cli_agent_orchestrator.utils.terminal import generate_session_name
 
@@ -113,12 +116,18 @@ async def health_check():
 
 @app.post("/sessions", response_model=Terminal, status_code=status.HTTP_201_CREATED)
 async def create_session(
-    provider: str, agent_profile: str, session_name: Optional[str] = None
+    provider: Optional[str] = None, agent_profile: str = Query(...), session_name: Optional[str] = None
 ) -> Terminal:
     """Create a new session with exactly one terminal."""
     try:
+        selected_provider = provider or get_context_provider(agent_profile) or DEFAULT_PROVIDER
+        if selected_provider not in PROVIDERS:
+            raise ValueError(
+                f"Invalid provider '{selected_provider}'. Available providers: {', '.join(PROVIDERS)}"
+            )
+
         result = terminal_service.create_terminal(
-            provider=provider,
+            provider=selected_provider,
             agent_profile=agent_profile,
             session_name=session_name,
             new_session=True,
@@ -178,12 +187,18 @@ async def delete_session(session_name: str) -> Dict:
     status_code=status.HTTP_201_CREATED,
 )
 async def create_terminal_in_session(
-    session_name: str, provider: str, agent_profile: str
+    session_name: str, provider: Optional[str] = None, agent_profile: str = Query(...)
 ) -> Terminal:
     """Create additional terminal in existing session."""
     try:
+        selected_provider = provider or get_context_provider(agent_profile) or DEFAULT_PROVIDER
+        if selected_provider not in PROVIDERS:
+            raise ValueError(
+                f"Invalid provider '{selected_provider}'. Available providers: {', '.join(PROVIDERS)}"
+            )
+
         result = terminal_service.create_terminal(
-            provider=provider,
+            provider=selected_provider,
             agent_profile=agent_profile,
             session_name=session_name,
             new_session=False,
