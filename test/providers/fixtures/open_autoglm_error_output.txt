@@ -1,0 +1,7 @@
+OpenAutoGLM> connect to device
+checking adb connection...
+error: adb: no devices/emulators found
+failed to establish connection to Android device
+Make sure USB debugging is enabled and device is connected
+
+OpenAutoGLM>
