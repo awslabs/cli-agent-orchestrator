@@ -22,6 +22,10 @@ class AgentProfile(BaseModel):
     description: str
     system_prompt: Optional[str] = None  # The markdown content
 
+    # Workspace configuration for agent isolation
+    workspaceDirectory: Optional[str] = None  # Agent-specific working directory
+    workspaceInit: Optional[List[str]] = None  # Initialization commands for workspace
+
     # Q CLI agent fields (all optional, will be passed through to JSON)
     prompt: Optional[str] = None
     mcpServers: Optional[Dict[str, Any]] = None

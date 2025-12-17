@@ -1,6 +1,12 @@
 ---
 name: developer
 description: Developer Agent in a multi-agent system
+workspaceDirectory: ~/.cao/agents/developer
+workspaceInit:
+  - "echo '🚀 Developer workspace initialized'"
+  - "pwd && ls -la"
+  - "mkdir -p work tests docs"
+  - "echo '📁 Created standard directories: work/, tests/, docs/'"
 mcpServers:
   cao-mcp-server:
     type: stdio

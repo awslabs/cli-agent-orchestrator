@@ -38,6 +38,9 @@ AGENT_CONTEXT_DIR = CAO_HOME_DIR / "agent-context"
 # Agent store directories
 LOCAL_AGENT_STORE_DIR = CAO_HOME_DIR / "agent-store"
 
+# Agent workspace directories
+AGENTS_BASE_DIR = Path.home() / ".cao" / "agents"
+
 # Q CLI directories
 Q_AGENTS_DIR = Path.home() / ".aws" / "amazonq" / "cli-agents"
 

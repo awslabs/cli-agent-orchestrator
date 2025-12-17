@@ -1,6 +1,13 @@
 ---
 name: reviewer
 description: Code Reviewer Agent in a multi-agent system
+workspaceDirectory: ~/.cao/agents/reviewer
+workspaceInit:
+  - "echo '🔍 Code Reviewer workspace initialized'"
+  - "pwd && ls -la"
+  - "mkdir -p reviews reports analysis"
+  - "echo '📋 Created review directories: reviews/, reports/, analysis/'"
+  - "echo '📝 Ready to analyze code quality and provide feedback'"
 mcpServers:
   cao-mcp-server:
     type: stdio

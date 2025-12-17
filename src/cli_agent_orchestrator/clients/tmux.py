@@ -3,12 +3,14 @@
 import logging
 import os
 import re
+import shlex
 import time
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import libtmux
 
-from cli_agent_orchestrator.constants import TMUX_HISTORY_LINES
+from cli_agent_orchestrator.constants import AGENTS_BASE_DIR, TMUX_HISTORY_LINES
 
 logger = logging.getLogger(__name__)
 
@@ -22,42 +24,114 @@ class TmuxClient:
     def __init__(self) -> None:
         self.server = libtmux.Server()
 
-    def create_session(self, session_name: str, window_name: str, terminal_id: str) -> str:
+    def _get_agent_workspace(self, agent_profile: str) -> str:
+        """Create and return agent-specific workspace directory."""
+        workspace_dir = Path(AGENTS_BASE_DIR) / agent_profile
+        workspace_dir.mkdir(parents=True, exist_ok=True)
+        return str(workspace_dir)
+
+    def _execute_workspace_init(self, session_name: str, window_name: str,
+                               init_commands: List[str]) -> None:
+        """Execute workspace initialization commands."""
+        try:
+            session = self.server.sessions.get(session_name=session_name)
+            if not session:
+                return
+
+            window = session.windows.get(window_name=window_name)
+            if not window:
+                return
+
+            pane = window.active_pane
+            if pane:
+                # Wait a moment for shell to be ready
+                time.sleep(2)
+
+                for cmd in init_commands:
+                    expanded_cmd = os.path.expandvars(cmd)
+                    pane.send_keys(expanded_cmd, enter=False)
+                    pane.send_keys("C-m", enter=False)
+                    time.sleep(0.5)
+
+                logger.info(f"Executed {len(init_commands)} workspace init commands")
+        except Exception as e:
+            logger.warning(f"Failed to execute workspace init commands: {e}")
+
+    def create_session(self, session_name: str, window_name: str, terminal_id: str,
+                       agent_profile: Optional[str] = None, workspace_dir: Optional[str] = None,
+                       workspace_init: Optional[List[str]] = None) -> str:
         """Create detached tmux session with initial window and return window name."""
         try:
             environment = os.environ.copy()
             environment["CAO_TERMINAL_ID"] = terminal_id
+
+            # Set workspace directory
+            if workspace_dir:
+                workspace_path = Path(workspace_dir)
+                workspace_path.mkdir(parents=True, exist_ok=True)
+                environment["PWD"] = str(workspace_path)
+            elif agent_profile:
+                # Use default agent workspace
+                default_workspace = self._get_agent_workspace(agent_profile)
+                environment["PWD"] = default_workspace
 
             session = self.server.new_session(
                 session_name=session_name,
                 window_name=window_name,
                 detach=True,
                 environment=environment,
+                start_directory=workspace_dir or (self._get_agent_workspace(agent_profile) if agent_profile else None)
             )
             logger.info(f"Created tmux session: {session_name} with window: {window_name}")
             window_name_result = session.windows[0].name
             if window_name_result is None:
                 raise ValueError(f"Window name is None for session {session_name}")
+
+            # Execute workspace initialization commands
+            if workspace_init:
+                self._execute_workspace_init(session_name, window_name_result, workspace_init)
+
             return window_name_result
         except Exception as e:
             logger.error(f"Failed to create session {session_name}: {e}")
             raise
 
-    def create_window(self, session_name: str, window_name: str, terminal_id: str) -> str:
+    def create_window(self, session_name: str, window_name: str, terminal_id: str,
+                      agent_profile: Optional[str] = None, workspace_dir: Optional[str] = None,
+                      workspace_init: Optional[List[str]] = None) -> str:
         """Create window in session and return window name."""
         try:
             session = self.server.sessions.get(session_name=session_name)
             if not session:
                 raise ValueError(f"Session '{session_name}' not found")
 
+            # Prepare environment and workspace directory
+            environment = {"CAO_TERMINAL_ID": terminal_id}
+            start_dir = workspace_dir
+
+            if workspace_dir:
+                workspace_path = Path(workspace_dir)
+                workspace_path.mkdir(parents=True, exist_ok=True)
+                environment["PWD"] = str(workspace_path)
+            elif agent_profile:
+                # Use default agent workspace
+                default_workspace = self._get_agent_workspace(agent_profile)
+                environment["PWD"] = default_workspace
+                start_dir = default_workspace
+
             window = session.new_window(
-                window_name=window_name, environment={"CAO_TERMINAL_ID": terminal_id}
+                window_name=window_name, environment=environment, start_directory=start_dir
             )
 
             logger.info(f"Created window '{window.name}' in session '{session_name}'")
             window_name_result = window.name
             if window_name_result is None:
                 raise ValueError(f"Window name is None for session {session_name}")
+
+            # Execute workspace initialization commands
+            if workspace_init:
+                self._execute_workspace_init(session_name, window_name_result, workspace_init)
+
             return window_name_result
         except Exception as e:
             logger.error(f"Failed to create window in session {session_name}: {e}")

@@ -21,6 +21,7 @@ from cli_agent_orchestrator.utils.terminal import (
     generate_terminal_id,
     generate_window_name,
 )
+from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,18 @@ def create_terminal(
 
         window_name = generate_window_name(agent_profile)
 
+        # Load agent profile to get workspace configuration
+        workspace_dir = None
+        workspace_init = None
+        if agent_profile:
+            try:
+                profile = load_agent_profile(agent_profile)
+                workspace_dir = profile.workspace_directory
+                workspace_init = profile.workspace_init
+                logger.info(f"Loaded workspace config for {agent_profile}: dir={workspace_dir}, init_commands={len(workspace_init) if workspace_init else 0}")
+            except Exception as e:
+                logger.warning(f"Failed to load agent profile {agent_profile}: {e}")
+
         if new_session:
             # Apply SESSION_PREFIX if not already present
             if not session_name.startswith(SESSION_PREFIX):
@@ -55,12 +68,14 @@ def create_terminal(
                 raise ValueError(f"Session '{session_name}' already exists")
 
             # Create new tmux session with this terminal as the initial window
-            tmux_client.create_session(session_name, window_name, terminal_id)
+            tmux_client.create_session(session_name, window_name, terminal_id,
+                                      agent_profile, workspace_dir, workspace_init)
         else:
             # Add window to existing session
             if not tmux_client.session_exists(session_name):
                 raise ValueError(f"Session '{session_name}' not found")
-            window_name = tmux_client.create_window(session_name, window_name, terminal_id)
+            window_name = tmux_client.create_window(session_name, window_name, terminal_id,
+                                                    agent_profile, workspace_dir, workspace_init)
 
         # Save terminal metadata to database
         db_create_terminal(terminal_id, session_name, window_name, provider, agent_profile)
