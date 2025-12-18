@@ -9,7 +9,11 @@ from fastapi import FastAPI, HTTPException, Path, Query, status
 from pydantic import BaseModel, Field, field_validator
 from watchdog.observers.polling import PollingObserver
 
-from cli_agent_orchestrator.clients.database import create_inbox_message, get_inbox_messages, init_db
+from cli_agent_orchestrator.clients.database import (
+    create_inbox_message,
+    get_inbox_messages,
+    init_db,
+)
 from cli_agent_orchestrator.constants import (
     INBOX_POLLING_INTERVAL,
     SERVER_HOST,
@@ -340,7 +344,7 @@ async def get_inbox_messages_endpoint(
             except ValueError:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Invalid status: {status}. Valid values: pending, delivered, failed"
+                    detail=f"Invalid status: {status}. Valid values: pending, delivered, failed",
                 )
 
         # Get messages using existing database function
@@ -349,14 +353,16 @@ async def get_inbox_messages_endpoint(
         # Convert to response format
         result = []
         for msg in messages:
-            result.append({
-                "id": msg.id,
-                "sender_id": msg.sender_id,
-                "receiver_id": msg.receiver_id,
-                "message": msg.message,
-                "status": msg.status.value,
-                "created_at": msg.created_at.isoformat() if msg.created_at else None,
-            })
+            result.append(
+                {
+                    "id": msg.id,
+                    "sender_id": msg.sender_id,
+                    "receiver_id": msg.receiver_id,
+                    "message": msg.message,
+                    "status": msg.status.value,
+                    "created_at": msg.created_at.isoformat() if msg.created_at else None,
+                }
+            )
 
         return result
 
@@ -368,7 +374,7 @@ async def get_inbox_messages_endpoint(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to retrieve inbox messages: {str(e)}"
+            detail=f"Failed to retrieve inbox messages: {str(e)}",
         )
 
 
