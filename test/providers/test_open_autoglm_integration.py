@@ -16,11 +16,7 @@ class TestOpenAutoGLMProviderManagerIntegration:
     def test_create_openautoglm_provider(self, mock_get_metadata):
         """Test creating OpenAutoGLM provider through manager."""
         provider = provider_manager.create_provider(
-            ProviderType.OPEN_AUTOGLM.value,
-            "test1234",
-            "test-session",
-            "window-0",
-            "mobile_agent"
+            ProviderType.OPEN_AUTOGLM.value, "test1234", "test-session", "window-0", "mobile_agent"
         )
 
         assert isinstance(provider, OpenAutoGLMProvider)
@@ -41,7 +37,7 @@ class TestOpenAutoGLMProviderManagerIntegration:
             "provider": ProviderType.OPEN_AUTOGLM.value,
             "tmux_session": "test-session",
             "tmux_window": "window-0",
-            "agent_profile": "mobile_agent"
+            "agent_profile": "mobile_agent",
         }
 
         provider = provider_manager.get_provider("test1234")
@@ -67,14 +63,11 @@ class TestOpenAutoGLMProviderManagerIntegration:
         """Test cleaning up OpenAutoGLM provider."""
         # First create a provider
         provider = provider_manager.create_provider(
-            ProviderType.OPEN_AUTOGLM.value,
-            "test1234",
-            "test-session",
-            "window-0"
+            ProviderType.OPEN_AUTOGLM.value, "test1234", "test-session", "window-0"
         )
 
         # Mock the cleanup method
-        with patch.object(provider, 'cleanup') as mock_cleanup:
+        with patch.object(provider, "cleanup") as mock_cleanup:
             provider_manager.cleanup_provider("test1234")
 
             # Verify cleanup was called and provider removed
@@ -90,16 +83,10 @@ class TestOpenAutoGLMProviderManagerIntegration:
         """Test that listing providers includes OpenAutoGLM provider."""
         # Create multiple providers including OpenAutoGLM
         provider_manager.create_provider(
-            ProviderType.OPEN_AUTOGLM.value,
-            "auto1234",
-            "session1",
-            "window1"
+            ProviderType.OPEN_AUTOGLM.value, "auto1234", "session1", "window1"
         )
         provider_manager.create_provider(
-            ProviderType.CLAUDE_CODE.value,
-            "claude1234",
-            "session2",
-            "window2"
+            ProviderType.CLAUDE_CODE.value, "claude1234", "session2", "window2"
         )
 
         providers = provider_manager.list_providers()
@@ -116,7 +103,7 @@ class TestOpenAutoGLMProviderManagerIntegration:
             "provider": "unknown_provider",
             "tmux_session": "test-session",
             "tmux_window": "window-0",
-            "agent_profile": None
+            "agent_profile": None,
         }
 
         with pytest.raises(ValueError, match="Unknown provider type: unknown_provider"):
@@ -129,11 +116,13 @@ class TestOpenAutoGLMProviderManagerIntegration:
             "provider": ProviderType.OPEN_AUTOGLM.value,
             "tmux_session": "test-session",
             "tmux_window": "window-0",
-            "agent_profile": None
+            "agent_profile": None,
         }
 
         # Mock OpenAutoGLMProvider to raise an exception
-        with patch("cli_agent_orchestrator.providers.manager.OpenAutoGLMProvider") as mock_provider_class:
+        with patch(
+            "cli_agent_orchestrator.providers.manager.OpenAutoGLMProvider"
+        ) as mock_provider_class:
             mock_provider_class.side_effect = Exception("Failed to initialize")
 
             with pytest.raises(Exception, match="Failed to initialize"):

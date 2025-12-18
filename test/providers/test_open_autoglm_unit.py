@@ -69,7 +69,7 @@ class TestOpenAutoGLMProviderInitialization:
         mock_profile.open_autoglm_config = {
             "api_endpoint": "http://localhost:8080/api",
             "model_name": "autoglm-v2",
-            "device_id": "emulator-5554"
+            "device_id": "emulator-5554",
         }
         mock_load_profile.return_value = mock_profile
 
@@ -246,10 +246,11 @@ class TestOpenAutoGLMProviderRegexPatterns:
 
     def test_adb_device_pattern(self):
         """Test ADB device pattern detection."""
-        from cli_agent_orchestrator.providers.open_autoglm import ADB_DEVICE_PATTERN
-
         # Test case insensitive matching by converting pattern to case insensitive
         import re
+
+        from cli_agent_orchestrator.providers.open_autoglm import ADB_DEVICE_PATTERN
+
         pattern = re.compile(ADB_DEVICE_PATTERN, re.IGNORECASE)
 
         assert pattern.search("adb device found: emulator-5554")
@@ -294,10 +295,11 @@ class TestOpenAutoGLMProviderRegexPatterns:
 
     def test_error_pattern(self):
         """Test error pattern detection."""
-        from cli_agent_orchestrator.providers.open_autoglm import ERROR_PATTERN
-
         # Test case insensitive matching by converting pattern to case insensitive
         import re
+
+        from cli_agent_orchestrator.providers.open_autoglm import ERROR_PATTERN
+
         pattern = re.compile(ERROR_PATTERN, re.IGNORECASE)
 
         assert pattern.search("error: something went wrong")
@@ -415,7 +417,7 @@ class TestOpenAutoGLMProviderEdgeCases:
             "PROCESSING command...",
             "Task COMPLETED successfully",
             "ERROR: adb not found",
-            "OpenAutoGLM> "
+            "OpenAutoGLM> ",
         ]
 
         expected_statuses = [
@@ -423,7 +425,7 @@ class TestOpenAutoGLMProviderEdgeCases:
             TerminalStatus.PROCESSING,
             TerminalStatus.COMPLETED,
             TerminalStatus.ERROR,
-            TerminalStatus.IDLE
+            TerminalStatus.IDLE,
         ]
 
         provider = OpenAutoGLMProvider("test1234", "test-session", "window-0")
@@ -435,11 +437,7 @@ class TestOpenAutoGLMProviderEdgeCases:
 
     def test_extract_message_with_unicode(self):
         """Test message extraction with unicode characters."""
-        output = (
-            "executing action...\n"
-            "result: 操作成功完成 - 日本語\n"
-            "OpenAutoGLM> "
-        )
+        output = "executing action...\n" "result: 操作成功完成 - 日本語\n" "OpenAutoGLM> "
 
         provider = OpenAutoGLMProvider("test1234", "test-session", "window-0")
         message = provider.extract_last_message_from_script(output)

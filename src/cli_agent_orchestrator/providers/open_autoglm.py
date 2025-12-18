@@ -57,18 +57,18 @@ class OpenAutoGLMProvider(BaseProvider):
                 profile = load_agent_profile(self._agent_profile)
 
                 # Extract OpenAutoGLM specific configuration from profile
-                if hasattr(profile, 'open_autoglm_config'):
+                if hasattr(profile, "open_autoglm_config"):
                     config = profile.open_autoglm_config
 
-                    if config.get('api_endpoint'):
-                        command_parts.extend(["--api-endpoint", config['api_endpoint']])
+                    if config.get("api_endpoint"):
+                        command_parts.extend(["--api-endpoint", config["api_endpoint"]])
 
-                    if config.get('model_name'):
-                        command_parts.extend(["--model", config['model_name']])
+                    if config.get("model_name"):
+                        command_parts.extend(["--model", config["model_name"]])
 
-                    if config.get('device_id'):
-                        command_parts.extend(["--device", config['device_id']])
-                        self._device_id = config['device_id']
+                    if config.get("device_id"):
+                        command_parts.extend(["--device", config["device_id"]])
+                        self._device_id = config["device_id"]
 
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
@@ -119,7 +119,9 @@ class OpenAutoGLMProvider(BaseProvider):
             return TerminalStatus.PROCESSING
 
         # Check for completion state
-        if re.search(COMPLETION_PATTERN, output_lower) and re.search(IDLE_PROMPT_PATTERN, output_lower):
+        if re.search(COMPLETION_PATTERN, output_lower) and re.search(
+            IDLE_PROMPT_PATTERN, output_lower
+        ):
             return TerminalStatus.COMPLETED
 
         # Check for error patterns
@@ -161,7 +163,11 @@ class OpenAutoGLMProvider(BaseProvider):
                     break
 
                 # Skip empty lines and common debug messages
-                if line.strip() and not line.startswith("[DEBUG]") and not line.startswith("[INFO]"):
+                if (
+                    line.strip()
+                    and not line.startswith("[DEBUG]")
+                    and not line.startswith("[INFO]")
+                ):
                     response_lines.append(line.strip())
 
         # If no completion pattern found, try to extract last meaningful output
@@ -169,15 +175,19 @@ class OpenAutoGLMProvider(BaseProvider):
             # Look backwards for the last substantial output
             for line in reversed(lines):
                 line_stripped = line.strip()
-                if (line_stripped and
-                    not re.search(IDLE_PROMPT_PATTERN, line) and
-                    not line.startswith("[") and
-                    not re.match(r"^(thinking|processing|executing)", line_lower)):
+                if (
+                    line_stripped
+                    and not re.search(IDLE_PROMPT_PATTERN, line)
+                    and not line.startswith("[")
+                    and not re.match(r"^(thinking|processing|executing)", line_lower)
+                ):
                     response_lines.insert(0, line_stripped)
                     break
 
         if not response_lines:
-            raise ValueError("No OpenAutoGLM response found - no recognizable output pattern detected")
+            raise ValueError(
+                "No OpenAutoGLM response found - no recognizable output pattern detected"
+            )
 
         # Join lines and clean up
         final_answer = "\n".join(response_lines).strip()
@@ -214,6 +224,7 @@ class OpenAutoGLMProvider(BaseProvider):
 
             # Wait a moment for output
             import time
+
             time.sleep(2)
 
             # Check output for connected device

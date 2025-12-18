@@ -42,7 +42,9 @@ class ProviderManager:
             elif provider_type == ProviderType.CLAUDE_CODE.value:
                 provider = ClaudeCodeProvider(terminal_id, tmux_session, tmux_window, agent_profile)
             elif provider_type == ProviderType.OPEN_AUTOGLM.value:
-                provider = OpenAutoGLMProvider(terminal_id, tmux_session, tmux_window, agent_profile)
+                provider = OpenAutoGLMProvider(
+                    terminal_id, tmux_session, tmux_window, agent_profile
+                )
             else:
                 raise ValueError(f"Unknown provider type: {provider_type}")
 

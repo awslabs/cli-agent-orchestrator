@@ -30,8 +30,9 @@ class TmuxClient:
         workspace_dir.mkdir(parents=True, exist_ok=True)
         return str(workspace_dir)
 
-    def _execute_workspace_init(self, session_name: str, window_name: str,
-                               init_commands: List[str]) -> None:
+    def _execute_workspace_init(
+        self, session_name: str, window_name: str, init_commands: List[str]
+    ) -> None:
         """Execute workspace initialization commands."""
         try:
             session = self.server.sessions.get(session_name=session_name)
@@ -57,9 +58,15 @@ class TmuxClient:
         except Exception as e:
             logger.warning(f"Failed to execute workspace init commands: {e}")
 
-    def create_session(self, session_name: str, window_name: str, terminal_id: str,
-                       agent_profile: Optional[str] = None, workspace_dir: Optional[str] = None,
-                       workspace_init: Optional[List[str]] = None) -> str:
+    def create_session(
+        self,
+        session_name: str,
+        window_name: str,
+        terminal_id: str,
+        agent_profile: Optional[str] = None,
+        workspace_dir: Optional[str] = None,
+        workspace_init: Optional[List[str]] = None,
+    ) -> str:
         """Create detached tmux session with initial window and return window name."""
         try:
             environment = os.environ.copy()
@@ -80,7 +87,8 @@ class TmuxClient:
                 window_name=window_name,
                 detach=True,
                 environment=environment,
-                start_directory=workspace_dir or (self._get_agent_workspace(agent_profile) if agent_profile else None)
+                start_directory=workspace_dir
+                or (self._get_agent_workspace(agent_profile) if agent_profile else None),
             )
             logger.info(f"Created tmux session: {session_name} with window: {window_name}")
             window_name_result = session.windows[0].name
@@ -96,9 +104,15 @@ class TmuxClient:
             logger.error(f"Failed to create session {session_name}: {e}")
             raise
 
-    def create_window(self, session_name: str, window_name: str, terminal_id: str,
-                      agent_profile: Optional[str] = None, workspace_dir: Optional[str] = None,
-                      workspace_init: Optional[List[str]] = None) -> str:
+    def create_window(
+        self,
+        session_name: str,
+        window_name: str,
+        terminal_id: str,
+        agent_profile: Optional[str] = None,
+        workspace_dir: Optional[str] = None,
+        workspace_init: Optional[List[str]] = None,
+    ) -> str:
         """Create window in session and return window name."""
         try:
             session = self.server.sessions.get(session_name=session_name)
