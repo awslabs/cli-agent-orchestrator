@@ -73,7 +73,9 @@ class TestGetInboxMessagesEndpoint:
 
     def test_get_messages_with_status_filter(self, client, sample_inbox_messages):
         """Test getting messages with status filter."""
-        pending_messages = [msg for msg in sample_inbox_messages if msg.status == MessageStatus.PENDING]
+        pending_messages = [
+            msg for msg in sample_inbox_messages if msg.status == MessageStatus.PENDING
+        ]
 
         with patch("cli_agent_orchestrator.api.main.get_inbox_messages") as mock_get:
             mock_get.return_value = pending_messages
@@ -182,21 +184,22 @@ class TestGetInboxMessagesEndpoint:
             created_at = data[0]["created_at"]
             assert isinstance(created_at, str)
             # Should be able to parse as ISO datetime
-            parsed_datetime = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+            parsed_datetime = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
             assert isinstance(parsed_datetime, datetime)
 
     def test_all_status_values(self, client, sample_inbox_messages):
         """Test filtering by each possible status value."""
         for status_value in ["pending", "delivered", "failed"]:
             filtered_messages = [
-                msg for msg in sample_inbox_messages
-                if msg.status.value == status_value
+                msg for msg in sample_inbox_messages if msg.status.value == status_value
             ]
 
             with patch("cli_agent_orchestrator.api.main.get_inbox_messages") as mock_get:
                 mock_get.return_value = filtered_messages
 
-                response = client.get(f"/terminals/terminal123/inbox/messages?status={status_value}")
+                response = client.get(
+                    f"/terminals/terminal123/inbox/messages?status={status_value}"
+                )
 
                 assert response.status_code == 200
                 data = response.json()
@@ -212,11 +215,12 @@ class TestDatabaseFunctionCompatibility:
     def test_get_inbox_messages_function_exists(self):
         """Test that the new get_inbox_messages function is properly imported."""
         from cli_agent_orchestrator.clients.database import get_inbox_messages
+
         assert callable(get_inbox_messages)
 
     def test_get_pending_messages_backward_compatibility(self):
         """Test that get_pending_messages still works as before."""
-        from cli_agent_orchestrator.clients.database import get_pending_messages, get_inbox_messages
+        from cli_agent_orchestrator.clients.database import get_inbox_messages, get_pending_messages
 
         # Both functions should be callable
         assert callable(get_pending_messages)
