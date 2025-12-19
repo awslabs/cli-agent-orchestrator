@@ -1,0 +1,8 @@
+OpenAutoGLM> open the Settings app
+thinking...
+executing action: tap_app_icon("Settings")
+running command: adb shell am start -a android.settings.SETTINGS
+task completed successfully
+result: Settings app opened successfully
+
+OpenAutoGLM>
