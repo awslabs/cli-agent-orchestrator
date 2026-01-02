@@ -32,9 +32,10 @@ class KiroCliProvider(BaseProvider):
         self._initialized = False
         self._agent_profile = agent_profile
         # Create dynamic prompt pattern based on agent profile (ANSI-free)
-        # Matches: [agent] !> or [agent] > or [agent] X% > after ANSI codes are stripped
+        # Matches: [agent] !> or [agent] > or [agent] X% > or [agent] λ > or [agent] X% λ >
+        # after ANSI codes are stripped
         self._idle_prompt_pattern = (
-            rf"\[{re.escape(self._agent_profile)}\]\s*(?:\d+%\s*)?!?>\s*[\s\n]*$"
+            rf"\[{re.escape(self._agent_profile)}\]\s*(?:\d+%\s*)?(?:\u03bb\s*)?!?>\s*[\s\n]*$"
         )
         self._permission_prompt_pattern = (
             r"Allow this action\?.*\[.*y.*\/.*n.*\/.*t.*\]:\s*" + self._idle_prompt_pattern

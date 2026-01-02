@@ -264,6 +264,10 @@ class TestQCliProviderRegexPatterns:
             provider._idle_prompt_pattern,
             "[developer] 100%>",
         )
+        # Should match when an optional U+03BB lambda character appears before >
+        assert re.search(provider._idle_prompt_pattern, "[developer] 45%\u03bb>")
+        assert re.search(provider._idle_prompt_pattern, "[developer] 45%\u03bb >")
+        assert re.search(provider._idle_prompt_pattern, "[developer] 100%\u03bb>")
 
     def test_permission_prompt_pattern(self):
         """Test permission prompt pattern detection."""

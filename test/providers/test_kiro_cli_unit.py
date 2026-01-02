@@ -251,7 +251,7 @@ class TestKiroCliProviderRegexPatterns:
         # Should not match different profile
         assert not re.search(provider._idle_prompt_pattern, "\x1b[36m[reviewer]\x1b[35m>\x1b[39m")
 
-    def test_idle_prompt_pattern_with_percentage(self):
+    def test_idle_prompt_pattern_with_customization(self):
         """Test idle prompt pattern with usage percentage."""
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
 
@@ -264,6 +264,10 @@ class TestKiroCliProviderRegexPatterns:
             provider._idle_prompt_pattern,
             "[developer] 100%>",
         )
+        # Should match when an optional U+03BB lambda character appears before >
+        assert re.search(provider._idle_prompt_pattern, "[developer] 45%\u03bb>")
+        assert re.search(provider._idle_prompt_pattern, "[developer] 45%\u03bb >")
+        assert re.search(provider._idle_prompt_pattern, "[developer] 100%\u03bb>")
 
     def test_permission_prompt_pattern(self):
         """Test permission prompt pattern detection."""
