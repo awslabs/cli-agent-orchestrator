@@ -25,16 +25,17 @@ codex auth login
 Create a terminal using the Codex provider:
 
 ```bash
-# Create a Codex CLI session
-cao create codex developer
+# Start the CAO server in one terminal
+cao-server
 
-# Or using HTTP API
-curl -X POST "http://localhost:9889/sessions" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "provider": "codex",
-    "agent_profile": "developer"
-  }'
+# In another terminal, launch a Codex-backed CAO session
+cao launch --agents codex_developer --provider codex
+```
+
+You can also create a session via HTTP API (query parameters):
+
+```bash
+curl -X POST "http://localhost:9889/sessions?provider=codex&agent_profile=codex_developer"
 ```
 
 ## Features
@@ -55,110 +56,57 @@ The provider automatically extracts the last assistant response from terminal ou
 
 ## Configuration
 
-### Agent Profile
+CAO's Codex provider currently launches `codex` and relies on your existing Codex CLI configuration/authentication.
 
-Create a custom agent profile for Codex:
-
-```yaml
-# agent_profile.yaml
-name: codex-developer
-profile: developer
-skills: [python, javascript, typescript, testing, documentation]
-workspace: codex-workspace
-
-# Codex CLI specific settings
-codex:
-  model: "gpt-4"
-  timeout: 300
-  auto_approve: false
-```
-
-### Provider Options
-
-Configure Codex provider behavior:
-
-```javascript
-{
-  "provider": "codex",
-  "options": {
-    "model": "gpt-4",
-    "timeout": 300,
-    "auto_approve": false,
-    "confirmation_prompt": "Approve this action? (y/n)"
-  }
-}
-```
+- `--provider codex` selects the provider.
+- `--agents <name>` is stored as terminal metadata and used for tmux window naming; it does not change Codex behavior.
+- Model/timeout/approval settings are configured in Codex CLI itself (outside of CAO).
 
 ## Workflows
 
-### 1. Single Agent Tasks
+### 1. Interactive single-agent task
 
 ```bash
-# Create a Codex session for code review
-cao create codex code-reviewer
-
-# Send code review task
-cao send <terminal-id> "Please review this Python code for security issues"
-
-# Wait for completion and get response
-cao get-output <terminal-id>
+cao launch --agents codex_developer --provider codex
 ```
 
-### 2. Supervisor-Worker Pattern
+In the tmux window, type your prompt at the Codex prompt.
 
-Create a supervisor agent that coordinates multiple Codex workers:
-
-```python
-# supervisor.py
-def coordinate_refactoring_task():
-    # Create supervisor agent
-    supervisor = cao.create("codex", "supervisor")
-
-    # Create worker agents
-    frontend_worker = cao.create("codex", "frontend-developer")
-    backend_worker = cao.create("codex", "backend-developer")
-    tester_worker = cao.create("codex", "qa-tester")
-
-    # Coordinate work
-    supervisor.send("Plan refactoring of user authentication system")
-
-    # Delegate tasks to workers
-    frontend_worker.send("Update frontend auth components")
-    backend_worker.send("Refactor backend auth services")
-    tester_worker.send("Create tests for auth flow")
-
-    # Collect results
-    results = []
-    for worker in [frontend_worker, backend_worker, tester_worker]:
-        results.append(worker.get_output())
-
-    # Final review
-    final_review = supervisor.send(f"Review refactoring results: {results}")
-    return final_review
-```
-
-### 3. Code Review Workflow
+To get the CAO terminal id (useful for API automation / MCP), run:
 
 ```bash
-# Step 1: Create reviewer agent
-reviewer_id=$(cao create codex code-reviewer)
+echo "$CAO_TERMINAL_ID"
+```
 
-# Step 2: Send code for review
-cao send $reviewer_id "Review this pull request for security and performance issues"
+### 2. Automate send/get-output via HTTP API
 
-# Step 3: Get detailed review
-review_output=$(cao get-output $reviewer_id)
+```bash
+python3 - <<'PY'
+import time
 
-# Step 4: Create fixer agent
-fixer_id=$(cao create codex developer)
+import requests
 
-# Step 5: Send review to fixer
-cao send $fixer_id "Fix the issues identified in this review: $review_output"
+terminal_id = "<terminal-id>"
 
-# Step 6: Get fixes
-fixes=$(cao get-output $fixer_id)
+requests.post(
+    f"http://localhost:9889/terminals/{terminal_id}/input",
+    params={"message": "Please review this Python code for security issues"},
+).raise_for_status()
 
-echo "Review completed and fixes applied"
+# Poll status until completion
+while True:
+    status = requests.get(f"http://localhost:9889/terminals/{terminal_id}").json()["status"]
+    if status in {"completed", "error", "waiting_user_answer"}:
+        break
+    time.sleep(1)
+
+resp = requests.get(
+    f"http://localhost:9889/terminals/{terminal_id}/output",
+    params={"mode": "last"},
+)
+resp.raise_for_status()
+print(resp.json()["output"])
+PY
 ```
 
 ## Authentication
@@ -214,53 +162,21 @@ EOF
    codex auth login
    ```
 
-2. **Timeout Issues**:
-   - Increase timeout in provider configuration
-   - Check network connectivity
-   - Verify ChatGPT subscription status
+2. **Timeout / Hanging Tasks**:
+   - Confirm `codex` works in a regular shell (`codex`, then exit)
+   - Attach to the tmux session and check whether Codex is waiting for input/approval
+   - Verify your ChatGPT subscription status and network connectivity
 
 3. **Status Detection Problems**:
    - Check terminal history for unexpected prompts
    - Verify Codex CLI version compatibility
    - Review custom prompt patterns
 
-### Debug Mode
+## Implementation Notes
 
-Enable debug logging for troubleshooting:
-
-```python
-import logging
-logging.basicConfig(level=logging.DEBUG)
-
-# Create Codex provider with debug
-provider = CodexProvider(
-    terminal_id="debug-session",
-    debug=True
-)
-```
-
-## API Reference
-
-### Provider Methods
-
-```python
-# Create Codex provider
-provider = CodexProvider(
-    terminal_id="session-id",
-    debug=False
-)
-
-# Get terminal status
-status = provider.get_status()
-# Returns: TerminalStatus enum
-
-# Get last message
-message = provider.get_last_message()
-# Returns: str (assistant response)
-
-# Send input
-provider.send_input("Your prompt here")
-```
+- Status detection is implemented in `CodexProvider.get_status()` (terminal output parsing).
+- Output mode `last` uses `CodexProvider.extract_last_message_from_script()`.
+- Exiting a Codex terminal uses `/exit` (`POST /terminals/{terminal_id}/exit`).
 
 ### Status Values
 
@@ -293,34 +209,7 @@ Break complex tasks into smaller, focused prompts:
 "Write tests for the authentication flow"
 ```
 
-### 3. Error Handling
 
-Always check for errors and handle them appropriately:
-```python
-try:
-    status = provider.get_status()
-    if status == TerminalStatus.ERROR:
-        error_output = provider.get_output()
-        logger.error(f"Codex task failed: {error_output}")
-        return False
-except Exception as e:
-    logger.error(f"Provider error: {e}")
-    return False
-```
-
-### 4. Resource Management
-
-Clean up terminals after tasks complete:
-```python
-# Clean up completed sessions
-def cleanup_session(terminal_id):
-    provider = CodexProvider(terminal_id)
-    try:
-        provider.send_input("/exit")
-        provider.delete_terminal()
-    except Exception as e:
-        logger.warning(f"Failed to cleanup session {terminal_id}: {e}")
-```
 
 ## Examples
 

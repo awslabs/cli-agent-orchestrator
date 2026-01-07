@@ -6,8 +6,8 @@ from typing import Dict, Optional
 from cli_agent_orchestrator.clients.database import get_terminal_metadata
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.providers.base import BaseProvider
-from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
 from cli_agent_orchestrator.providers.q_cli import QCliProvider
 

@@ -34,20 +34,38 @@ This example demonstrates how to use the **Codex CLI provider** for basic AI age
 cao-server
 
 # In another terminal, create a Codex session
-cao launch --agents codex-developer --provider codex
+cao launch --agents codex_developer --provider codex
 ```
 
 ### 2. Send Your First Task
 
 ```bash
-# Find the terminal ID
-tmux list-sessions
+# In the tmux window, paste your prompt at the Codex prompt.
 
-# Send a coding task
-cao send <terminal-id> "Write a Python function to validate email addresses using regex"
+# Optional: print the CAO terminal id (useful for API automation / MCP)
+echo "$CAO_TERMINAL_ID"
+```
 
-# Wait for completion and get response
-cao get-output <terminal-id>
+Optional automation from another terminal (send input + get extracted last message):
+
+```bash
+python3 - <<'PY'
+import requests
+
+terminal_id = "<terminal-id>"
+
+requests.post(
+    f"http://localhost:9889/terminals/{terminal_id}/input",
+    params={"message": "Write a Python function to validate email addresses using regex"},
+).raise_for_status()
+
+resp = requests.get(
+    f"http://localhost:9889/terminals/{terminal_id}/output",
+    params={"mode": "last"},
+)
+resp.raise_for_status()
+print(resp.json()["output"])
+PY
 ```
 
 ## Agent Profiles
@@ -71,23 +89,7 @@ The example includes pre-configured agent profiles for different Codex-based tas
 
 ## Setup
 
-### 1. Install the Agent Profiles
-
-```bash
-# Install all Codex agent profiles
-cao install examples/codex-basic/codex_developer.md
-cao install examples/codex-basic/codex_reviewer.md
-cao install examples/codex-basic/codex_documenter.md
-```
-
-### 2. Verify Installation
-
-```bash
-# List installed agents
-cao list
-
-# Should show codex_developer, codex_reviewer, codex_documenter
-```
+No CAO-side agent installation is required for the `codex` provider. The `--agents` value is used for naming/metadata only.
 
 ## Usage Examples
 
@@ -117,17 +119,18 @@ Include proper error handling and docstring."
 ```bash
 # Launch a Codex reviewer
 cao launch --agents codex_reviewer --provider codex
-
-# Provide code for review:
-"Please review this Python code for security issues:
-
-```python
-import subprocess
-
-def execute_command(user_input):
-    command = f'ls {user_input}'
-    return subprocess.run(command, shell=True, capture_output=True)
 ```
+
+Paste this prompt into the Codex CLI:
+
+```text
+Please review this Python code for security issues:
+
+    import subprocess
+
+    def execute_command(user_input):
+        command = f"ls {user_input}"
+        return subprocess.run(command, shell=True, capture_output=True)
 
 Focus on:
 1. Security vulnerabilities
@@ -190,7 +193,7 @@ def validate_email(email):
     pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
     return re.match(pattern, email) is not None
 
-# This is the response returned by get_last_message()
+# This is the response returned by GET /terminals/{terminal_id}/output?mode=last
 ```
 
 ## Advanced Examples
@@ -214,20 +217,21 @@ Proceed step by step and show me each part."
 ```bash
 # Launch reviewer then developer
 cao launch --agents codex_reviewer --provider codex
-
-# Review and refactor request:
-"Review this legacy code and suggest refactoring improvements:
-
-```python
-def process_data(data):
-    result = []
-    for i in range(len(data)):
-        if data[i] > 0:
-            result.append(data[i] * 2)
-        else:
-            result.append(0)
-    return result
 ```
+
+Paste this prompt into the Codex CLI:
+
+```text
+Review this legacy code and suggest refactoring improvements:
+
+    def process_data(data):
+        result = []
+        for i in range(len(data)):
+            if data[i] > 0:
+                result.append(data[i] * 2)
+            else:
+                result.append(0)
+        return result
 
 Identify:
 1. Code smells and anti-patterns
@@ -235,7 +239,7 @@ Identify:
 3. Pythonic alternatives
 4. Better naming and structure
 
-Then provide a refactored version with explanations."
+Then provide a refactored version with explanations.
 ```
 
 ## Troubleshooting
@@ -257,16 +261,6 @@ Then provide a refactored version with explanations."
    - Agent might be in unexpected state
    - Check terminal output manually: `tmux attach -t <session-name>`
    - Verify Codex CLI version compatibility
-
-### Debug Mode
-
-Enable debugging for detailed status information:
-
-```python
-# In agent profile, add debug settings:
-debug: true
-verbose_output: true
-```
 
 ## Performance Tips
 
