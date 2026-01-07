@@ -91,6 +91,32 @@ Note: The `claude_code` provider does not require agent installation.
 
 For details on creating custom agent profiles, see [docs/agent-profile.md](docs/agent-profile.md).
 
+## Codex CLI Provider
+
+The **Codex CLI provider** enables CAO to work with **ChatGPT/Codex CLI** through your ChatGPT subscription, allowing you to orchestrate multiple Codex-based agents without migrating to API-based agents.
+
+### Key Benefits
+
+- **ChatGPT Integration**: Use your existing ChatGPT subscription for agent orchestration
+- **No Migration Required**: Continue using Codex CLI without switching to API-based agents
+- **Multi-Agent Coordination**: Orchestrate multiple Codex agents in supervisor-worker patterns
+- **Status Detection**: Automatic detection of processing, waiting, completed, and error states
+
+### Quick Start
+
+```bash
+# Create a Codex CLI session
+cao create codex developer
+
+# Send a task to the agent
+cao send <terminal-id> "Review this Python code for security issues"
+
+# Get the response
+cao get-output <terminal-id>
+```
+
+For detailed documentation and examples, see [docs/codex-cli.md](docs/codex-cli.md).
+
 ### Launching Agents
 
 Start the cao server:

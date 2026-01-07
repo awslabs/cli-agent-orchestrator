@@ -5,7 +5,7 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Annotated, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Path, Query, status
+from fastapi import FastAPI, HTTPException, Path, Query, Request, status
 from pydantic import BaseModel, Field, field_validator
 from watchdog.observers.polling import PollingObserver
 
@@ -322,8 +322,9 @@ async def create_inbox_message_endpoint(
 @app.get("/terminals/{terminal_id}/inbox/messages")
 async def get_inbox_messages_endpoint(
     terminal_id: TerminalId,
+    request: Request,
     limit: int = Query(default=10, le=100, description="Maximum number of messages to retrieve"),
-    status: Optional[str] = Query(default=None, description="Filter by message status"),
+    message_status: Optional[str] = Query(default=None, description="Filter by message status"),
 ) -> List[Dict]:
     """Get inbox messages for a terminal.
 
@@ -338,13 +339,14 @@ async def get_inbox_messages_endpoint(
     try:
         # Convert status filter if provided
         status_filter = None
-        if status:
+        status_value = message_status or request.query_params.get("status")
+        if status_value:
             try:
-                status_filter = MessageStatus(status)
+                status_filter = MessageStatus(status_value)
             except ValueError:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Invalid status: {status}. Valid values: pending, delivered, failed",
+                    detail=f"Invalid status: {status_value}. Valid values: pending, delivered, failed",
                 )
 
         # Get messages using existing database function
