@@ -10,14 +10,12 @@ from cli_agent_orchestrator.models.provider import ProviderType
 TerminalId = Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{8}$")]
 
 
-# TODO: remove WAITING_PERMISSION
 class TerminalStatus(str, Enum):
     """Terminal status enumeration with provider-aware states."""
 
     IDLE = "idle"
     PROCESSING = "processing"
     COMPLETED = "completed"
-    WAITING_PERMISSION = "waiting_permission"
     WAITING_USER_ANSWER = "waiting_user_answer"
     ERROR = "error"
 
