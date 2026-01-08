@@ -323,14 +323,16 @@ async def create_inbox_message_endpoint(
 async def get_inbox_messages_endpoint(
     terminal_id: TerminalId,
     limit: int = Query(default=10, le=100, description="Maximum number of messages to retrieve"),
-    status: Optional[str] = Query(default=None, description="Filter by message status"),
+    status_param: Optional[str] = Query(
+        default=None, alias="status", description="Filter by message status"
+    ),
 ) -> List[Dict]:
     """Get inbox messages for a terminal.
 
     Args:
         terminal_id: Terminal ID to get messages for
         limit: Maximum number of messages to return (default: 10, max: 100)
-        status: Optional filter by message status ('pending', 'delivered', 'failed')
+        status_param: Optional filter by message status ('pending', 'delivered', 'failed')
 
     Returns:
         List of inbox messages with sender_id, message, created_at, status
@@ -338,13 +340,13 @@ async def get_inbox_messages_endpoint(
     try:
         # Convert status filter if provided
         status_filter = None
-        if status:
+        if status_param:
             try:
-                status_filter = MessageStatus(status)
+                status_filter = MessageStatus(status_param)
             except ValueError:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Invalid status: {status}. Valid values: pending, delivered, failed",
+                    detail=f"Invalid status: {status_param}. Valid values: pending, delivered, failed",
                 )
 
         # Get messages using existing database function

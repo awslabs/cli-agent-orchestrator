@@ -24,7 +24,7 @@ def sample_inbox_messages():
         InboxMessage(
             id=1,
             sender_id="sender1",
-            receiver_id="terminal123",
+            receiver_id="abcdef12",
             message="Hello world",
             status=MessageStatus.PENDING,
             created_at=datetime(2025, 12, 6, 12, 0, 0),
@@ -32,7 +32,7 @@ def sample_inbox_messages():
         InboxMessage(
             id=2,
             sender_id="sender2",
-            receiver_id="terminal123",
+            receiver_id="abcdef12",
             message="Another message",
             status=MessageStatus.DELIVERED,
             created_at=datetime(2025, 12, 6, 12, 5, 0),
@@ -40,7 +40,7 @@ def sample_inbox_messages():
         InboxMessage(
             id=3,
             sender_id="sender3",
-            receiver_id="terminal123",
+            receiver_id="abcdef12",
             message="Failed message",
             status=MessageStatus.FAILED,
             created_at=datetime(2025, 12, 6, 12, 10, 0),
@@ -56,7 +56,7 @@ class TestGetInboxMessagesEndpoint:
         with patch("cli_agent_orchestrator.api.main.get_inbox_messages") as mock_get:
             mock_get.return_value = sample_inbox_messages
 
-            response = client.get("/terminals/terminal123/inbox/messages")
+            response = client.get("/terminals/abcdef12/inbox/messages")
 
             assert response.status_code == 200
             data = response.json()
@@ -80,7 +80,7 @@ class TestGetInboxMessagesEndpoint:
         with patch("cli_agent_orchestrator.api.main.get_inbox_messages") as mock_get:
             mock_get.return_value = pending_messages
 
-            response = client.get("/terminals/terminal123/inbox/messages?status=pending")
+            response = client.get("/terminals/abcdef12/inbox/messages?status=pending")
 
             assert response.status_code == 200
             data = response.json()
@@ -93,28 +93,28 @@ class TestGetInboxMessagesEndpoint:
         with patch("cli_agent_orchestrator.api.main.get_inbox_messages") as mock_get:
             mock_get.return_value = sample_inbox_messages[:2]
 
-            response = client.get("/terminals/terminal123/inbox/messages?limit=2")
+            response = client.get("/terminals/abcdef12/inbox/messages?limit=2")
 
             assert response.status_code == 200
             data = response.json()
             assert len(data) == 2
-            mock_get.assert_called_once_with("terminal123", limit=2, status=None)
+            mock_get.assert_called_once_with("abcdef12", limit=2, status=None)
 
     def test_get_messages_with_status_and_limit(self, client, sample_inbox_messages):
         """Test getting messages with both status and limit parameters."""
         with patch("cli_agent_orchestrator.api.main.get_inbox_messages") as mock_get:
             mock_get.return_value = sample_inbox_messages[:1]
 
-            response = client.get("/terminals/terminal123/inbox/messages?status=pending&limit=5")
+            response = client.get("/terminals/abcdef12/inbox/messages?status=pending&limit=5")
 
             assert response.status_code == 200
             data = response.json()
             assert len(data) == 1
-            mock_get.assert_called_once_with("terminal123", limit=5, status=MessageStatus.PENDING)
+            mock_get.assert_called_once_with("abcdef12", limit=5, status=MessageStatus.PENDING)
 
     def test_invalid_status_parameter(self, client):
         """Test error handling for invalid status parameter."""
-        response = client.get("/terminals/terminal123/inbox/messages?status=invalid_status")
+        response = client.get("/terminals/abcdef12/inbox/messages?status=invalid_status")
 
         assert response.status_code == 400
         data = response.json()
@@ -128,7 +128,7 @@ class TestGetInboxMessagesEndpoint:
         with patch("cli_agent_orchestrator.api.main.get_inbox_messages") as mock_get:
             mock_get.return_value = []
 
-            response = client.get("/terminals/terminal123/inbox/messages?limit=150")
+            response = client.get("/terminals/abcdef12/inbox/messages?limit=150")
 
             # FastAPI should return 422 for query parameter validation error
             assert response.status_code == 422
@@ -138,7 +138,7 @@ class TestGetInboxMessagesEndpoint:
         with patch("cli_agent_orchestrator.api.main.get_inbox_messages") as mock_get:
             mock_get.side_effect = Exception("Database connection failed")
 
-            response = client.get("/terminals/terminal123/inbox/messages")
+            response = client.get("/terminals/abcdef12/inbox/messages")
 
             assert response.status_code == 500
             data = response.json()
@@ -150,7 +150,7 @@ class TestGetInboxMessagesEndpoint:
         with patch("cli_agent_orchestrator.api.main.get_inbox_messages") as mock_get:
             mock_get.side_effect = ValueError("Terminal not found")
 
-            response = client.get("/terminals/nonexistent/inbox/messages")
+            response = client.get("/terminals/deadbeef/inbox/messages")
 
             assert response.status_code == 404
             data = response.json()
@@ -162,7 +162,7 @@ class TestGetInboxMessagesEndpoint:
         with patch("cli_agent_orchestrator.api.main.get_inbox_messages") as mock_get:
             mock_get.return_value = []
 
-            response = client.get("/terminals/terminal123/inbox/messages")
+            response = client.get("/terminals/abcdef12/inbox/messages")
 
             assert response.status_code == 200
             data = response.json()
@@ -174,7 +174,7 @@ class TestGetInboxMessagesEndpoint:
         with patch("cli_agent_orchestrator.api.main.get_inbox_messages") as mock_get:
             mock_get.return_value = sample_inbox_messages[:1]
 
-            response = client.get("/terminals/terminal123/inbox/messages")
+            response = client.get("/terminals/abcdef12/inbox/messages")
 
             assert response.status_code == 200
             data = response.json()
@@ -197,9 +197,7 @@ class TestGetInboxMessagesEndpoint:
             with patch("cli_agent_orchestrator.api.main.get_inbox_messages") as mock_get:
                 mock_get.return_value = filtered_messages
 
-                response = client.get(
-                    f"/terminals/terminal123/inbox/messages?status={status_value}"
-                )
+                response = client.get(f"/terminals/abcdef12/inbox/messages?status={status_value}")
 
                 assert response.status_code == 200
                 data = response.json()
