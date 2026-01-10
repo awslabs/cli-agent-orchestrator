@@ -1,0 +1,4 @@
+OpenAutoGLM v1.0.0 - Mobile Device Automation
+Type 'help' for commands or 'exit' to quit
+
+OpenAutoGLM>
