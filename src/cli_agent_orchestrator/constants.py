@@ -14,11 +14,6 @@ DEFAULT_PROVIDER = ProviderType.Q_CLI.value
 # Tmux capture limits
 TMUX_HISTORY_LINES = 200
 
-# TODO: remove the terminal history lines and status check lines if they aren't used anywhere
-# Terminal output capture limits
-TERMINAL_HISTORY_LINES = 200
-STATUS_CHECK_LINES = 100
-
 # Application directories
 CAO_HOME_DIR = Path.home() / ".aws" / "cli-agent-orchestrator"
 DB_DIR = CAO_HOME_DIR / "db"
