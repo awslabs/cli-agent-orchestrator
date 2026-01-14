@@ -16,6 +16,11 @@ This document records **all review feedback** found on PR #39 and how each item 
 - Removed non-Codex changes from PR #39 by restoring the following files to match `upstream/main`:
   - `src/cli_agent_orchestrator/api/main.py`
   - `test/api/test_inbox_messages.py`
+- Also restored unrelated changes in existing providers/tests (not required for Codex support):
+  - `src/cli_agent_orchestrator/providers/q_cli.py`
+  - `src/cli_agent_orchestrator/providers/kiro_cli.py`
+  - `test/providers/test_q_cli_unit.py`
+  - `test/providers/test_kiro_cli_unit.py`
 - Formatting-only fixes were handled separately (per the thread) and are not included in this PR.
 
 ### 2) `status` vs `message_status` parameter naming
