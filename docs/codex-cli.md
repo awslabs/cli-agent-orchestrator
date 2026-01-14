@@ -213,10 +213,8 @@ Break complex tasks into smaller, focused prompts:
 
 ## Examples
 
-See the `examples/` directory for complete workflow examples:
-- `examples/codex-basic/` - Basic Codex usage
-- `examples/codex-supervisor/` - Supervisor-worker pattern
-- `examples/codex-code-review/` - Automated code review workflow
+See the `examples/` directory for a step-by-step walkthrough:
+- `examples/codex-basic/` - Basic Codex usage (includes three agent profiles)
 
 ## Contributing
 

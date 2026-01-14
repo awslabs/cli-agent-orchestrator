@@ -105,14 +105,31 @@ The **Codex CLI provider** enables CAO to work with **ChatGPT/Codex CLI** throug
 ### Quick Start
 
 ```bash
-# Create a Codex CLI session
-cao create codex developer
+# Start the CAO server (in one terminal)
+cao-server
 
-# Send a task to the agent
-cao send <terminal-id> "Review this Python code for security issues"
+# Install an example Codex agent profile
+cao install examples/codex-basic/codex_developer.md --provider codex
 
-# Get the response
-cao get-output <terminal-id>
+# Launch a Codex-backed agent (opens a tmux window)
+cao launch --agents codex_developer --provider codex
+
+# In the tmux window, paste your prompt at the Codex prompt.
+
+# Optional: print the CAO terminal id (useful for API automation / MCP)
+echo "$CAO_TERMINAL_ID"
+```
+
+Optional automation (send input + fetch extracted last message) from another terminal:
+
+```bash
+TERMINAL_ID="<terminal-id>"
+
+curl -X POST "http://localhost:9889/terminals/${TERMINAL_ID}/input" \
+  --get \
+  --data-urlencode 'message=Review this Python code for security issues'
+
+curl "http://localhost:9889/terminals/${TERMINAL_ID}/output?mode=last"
 ```
 
 For detailed documentation and examples, see [docs/codex-cli.md](docs/codex-cli.md).
