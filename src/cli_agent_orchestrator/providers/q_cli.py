@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 # Regex patterns for Q CLI output analysis (module-level constants)
 GREEN_ARROW_PATTERN = r"^>\s*"  # Pattern for ANSI-cleaned output (start of line)
 ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
+CSI_CODE_PATTERN = r"\x1b\[[0-9;?]*[A-Za-z]"
 ESCAPE_SEQUENCE_PATTERN = r"\[[?0-9;]*[a-zA-Z]"
 CONTROL_CHAR_PATTERN = r"[\x00-\x1f\x7f-\x9f]"
 BELL_CHAR = "\x07"
@@ -65,8 +66,8 @@ class QCliProvider(BaseProvider):
         if not output:
             return TerminalStatus.ERROR
 
-        # Strip ANSI codes once for all pattern matching
-        clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
+        clean_output = re.sub(CSI_CODE_PATTERN, "", output)
+        clean_output = re.sub(ANSI_CODE_PATTERN, "", clean_output)
 
         # Check if we have the idle prompt (not processing)
         has_idle_prompt = re.search(self._idle_prompt_pattern, clean_output)
@@ -92,8 +93,8 @@ class QCliProvider(BaseProvider):
 
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract agent's final response message using green arrow indicator."""
-        # Strip ANSI codes for pattern matching
-        clean_output = re.sub(ANSI_CODE_PATTERN, "", script_output)
+        clean_output = re.sub(CSI_CODE_PATTERN, "", script_output)
+        clean_output = re.sub(ANSI_CODE_PATTERN, "", clean_output)
 
         # Find patterns in clean output
         green_arrows = list(re.finditer(GREEN_ARROW_PATTERN, clean_output, re.MULTILINE))
@@ -116,6 +117,7 @@ class QCliProvider(BaseProvider):
 
         # Clean up the message
         final_answer = re.sub(ANSI_CODE_PATTERN, "", final_answer)
+        final_answer = re.sub(CSI_CODE_PATTERN, "", final_answer)
         final_answer = re.sub(ESCAPE_SEQUENCE_PATTERN, "", final_answer)
         final_answer = re.sub(CONTROL_CHAR_PATTERN, "", final_answer)
         return final_answer.strip()

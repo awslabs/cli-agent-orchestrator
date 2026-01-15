@@ -19,8 +19,26 @@ pytestmark = [pytest.mark.integration, pytest.mark.slow]
 @pytest.fixture(scope="session")
 def q_cli_available():
     """Check if Q CLI is available and configured."""
-    if not shutil.which("q"):
+    q_path = shutil.which("q")
+    if not q_path:
         pytest.skip("Q CLI not installed")
+
+    try:
+        result = subprocess.run(
+            [q_path, "doctor"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except Exception:
+        pytest.skip("Q CLI not configured")
+
+    combined_output = f"{result.stdout}\n{result.stderr}".lower()
+    if "unrecognized subcommand" in combined_output:
+        pytest.skip("Q CLI not configured")
+
+    if "not authenticated" in combined_output or "kiro-cli login" in combined_output:
+        pytest.skip("Q CLI not authenticated")
     return True
 
 
