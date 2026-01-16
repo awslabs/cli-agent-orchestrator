@@ -22,19 +22,53 @@ class TmuxClient:
     def __init__(self) -> None:
         self.server = libtmux.Server()
 
-    def create_session(self, session_name: str, window_name: str, terminal_id: str) -> str:
+    def _resolve_and_validate_working_directory(self, working_directory: Optional[str]) -> str:
+        """Resolve and validate working directory.
+
+        Args:
+            working_directory: Optional directory path, defaults to current directory
+
+        Returns:
+            Canonicalized absolute path
+
+        Raises:
+            ValueError: If directory does not exist
+        """
+        if working_directory is None:
+            working_directory = os.getcwd()
+
+        # Canonicalize path (resolve symlinks and normalize)
+        real_path = os.path.realpath(working_directory)
+
+        if not os.path.isdir(real_path):
+            raise ValueError(f"Working directory does not exist: {working_directory}")
+
+        return real_path
+
+    def create_session(
+        self,
+        session_name: str,
+        window_name: str,
+        terminal_id: str,
+        working_directory: Optional[str] = None,
+    ) -> str:
         """Create detached tmux session with initial window and return window name."""
         try:
+            working_directory = self._resolve_and_validate_working_directory(working_directory)
+
             environment = os.environ.copy()
             environment["CAO_TERMINAL_ID"] = terminal_id
 
             session = self.server.new_session(
                 session_name=session_name,
                 window_name=window_name,
+                start_directory=working_directory,
                 detach=True,
                 environment=environment,
             )
-            logger.info(f"Created tmux session: {session_name} with window: {window_name}")
+            logger.info(
+                f"Created tmux session: {session_name} with window: {window_name} in directory: {working_directory}"
+            )
             window_name_result = session.windows[0].name
             if window_name_result is None:
                 raise ValueError(f"Window name is None for session {session_name}")
@@ -43,18 +77,30 @@ class TmuxClient:
             logger.error(f"Failed to create session {session_name}: {e}")
             raise
 
-    def create_window(self, session_name: str, window_name: str, terminal_id: str) -> str:
+    def create_window(
+        self,
+        session_name: str,
+        window_name: str,
+        terminal_id: str,
+        working_directory: Optional[str] = None,
+    ) -> str:
         """Create window in session and return window name."""
         try:
+            working_directory = self._resolve_and_validate_working_directory(working_directory)
+
             session = self.server.sessions.get(session_name=session_name)
             if not session:
                 raise ValueError(f"Session '{session_name}' not found")
 
             window = session.new_window(
-                window_name=window_name, environment={"CAO_TERMINAL_ID": terminal_id}
+                window_name=window_name,
+                start_directory=working_directory,
+                environment={"CAO_TERMINAL_ID": terminal_id},
             )
 
-            logger.info(f"Created window '{window.name}' in session '{session_name}'")
+            logger.info(
+                f"Created window '{window.name}' in session '{session_name}' in directory: {working_directory}"
+            )
             window_name_result = window.name
             if window_name_result is None:
                 raise ValueError(f"Window name is None for session {session_name}")
@@ -200,6 +246,28 @@ class TmuxClient:
             return session is not None
         except Exception:
             return False
+
+    def get_pane_working_directory(self, session_name: str, window_name: str) -> Optional[str]:
+        """Get the current working directory of a pane."""
+        try:
+            session = self.server.sessions.get(session_name=session_name)
+            if not session:
+                return None
+
+            window = session.windows.get(window_name=window_name)
+            if not window:
+                return None
+
+            pane = window.active_pane
+            if pane:
+                # Get pane_current_path from tmux
+                result = pane.cmd("display-message", "-p", "#{pane_current_path}")
+                if result.stdout:
+                    return result.stdout[0].strip()
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get working directory for {session_name}:{window_name}: {e}")
+            return None
 
     def pipe_pane(self, session_name: str, window_name: str, file_path: str) -> None:
         """Start piping pane output to file.
