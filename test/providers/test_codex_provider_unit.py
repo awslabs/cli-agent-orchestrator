@@ -206,3 +206,25 @@ class TestCodexProviderMessageExtraction:
 
         with pytest.raises(ValueError, match="Empty Codex response"):
             provider.extract_last_message_from_script(output)
+
+
+class TestCodexProviderMisc:
+    def test_get_idle_pattern_for_log(self):
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        assert provider.get_idle_pattern_for_log() == "❯"
+
+    def test_exit_cli(self):
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        assert provider.exit_cli() == "/exit"
+
+    def test_cleanup(self):
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        provider._initialized = True
+        provider.cleanup()
+        assert provider._initialized is False
+
+    def test_extract_last_message_without_trailing_prompt(self):
+        output = "You do thing\nassistant: Hello\nSecond line\n"
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+        assert message == "Hello\nSecond line"
