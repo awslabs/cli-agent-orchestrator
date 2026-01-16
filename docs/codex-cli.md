@@ -230,4 +230,4 @@ To contribute to the Codex provider:
 
 For issues and questions:
 - GitHub Issues: [cli-agent-orchestrator](https://github.com/awslabs/cli-agent-orchestrator/issues)
-- Documentation: [Codex CLI Provider Docs](https://github.com/awslabs/cli-agent-orchestrator/docs/codex-cli.md)
+- Documentation: [Codex CLI Provider Docs](https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/codex-cli.md)

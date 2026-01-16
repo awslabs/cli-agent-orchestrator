@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 # Regex patterns for Codex output analysis
 ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
-IDLE_PROMPT_PATTERN = r"(?:❯|›|>|codex>|You>?)"
+IDLE_PROMPT_PATTERN = r"(?:❯|›|codex>)"
 # Match the prompt only if it appears at the end of the captured output.
 IDLE_PROMPT_AT_END_PATTERN = rf"(?:^\s*{IDLE_PROMPT_PATTERN}\s*$)\s*\Z"
 IDLE_PROMPT_PATTERN_LOG = r"❯"
@@ -62,23 +62,47 @@ class CodexProvider(BaseProvider):
         clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
         tail_output = "\n".join(clean_output.splitlines()[-25:])
 
-        if re.search(ERROR_PATTERN, tail_output, re.IGNORECASE | re.MULTILINE):
-            return TerminalStatus.ERROR
+        last_user = None
+        for match in re.finditer(USER_PREFIX_PATTERN, clean_output, re.IGNORECASE | re.MULTILINE):
+            last_user = match
 
-        if re.search(WAITING_PROMPT_PATTERN, tail_output, re.IGNORECASE | re.MULTILINE):
-            return TerminalStatus.WAITING_USER_ANSWER
+        output_after_last_user = clean_output[last_user.start() :] if last_user else clean_output
+        assistant_after_last_user = bool(
+            last_user
+            and re.search(
+                ASSISTANT_PREFIX_PATTERN,
+                output_after_last_user,
+                re.IGNORECASE | re.MULTILINE,
+            )
+        )
 
         has_idle_prompt_at_end = bool(
             re.search(IDLE_PROMPT_AT_END_PATTERN, clean_output, re.IGNORECASE | re.MULTILINE)
         )
+
+        # Only treat ERROR/WAITING prompts as actionable if they appear after the last user message
+        # and are not part of an assistant response.
+        if last_user is not None:
+            if not assistant_after_last_user:
+                if re.search(
+                    WAITING_PROMPT_PATTERN,
+                    output_after_last_user,
+                    re.IGNORECASE | re.MULTILINE,
+                ):
+                    return TerminalStatus.WAITING_USER_ANSWER
+                if re.search(
+                    ERROR_PATTERN,
+                    output_after_last_user,
+                    re.IGNORECASE | re.MULTILINE,
+                ):
+                    return TerminalStatus.ERROR
+        else:
+            if re.search(WAITING_PROMPT_PATTERN, tail_output, re.IGNORECASE | re.MULTILINE):
+                return TerminalStatus.WAITING_USER_ANSWER
+            if re.search(ERROR_PATTERN, tail_output, re.IGNORECASE | re.MULTILINE):
+                return TerminalStatus.ERROR
         if has_idle_prompt_at_end:
             # Consider COMPLETED only if we see an assistant marker after the last user message.
-            last_user = None
-            for match in re.finditer(
-                USER_PREFIX_PATTERN, clean_output, re.IGNORECASE | re.MULTILINE
-            ):
-                last_user = match
-
             if last_user is not None:
                 if re.search(
                     ASSISTANT_PREFIX_PATTERN,

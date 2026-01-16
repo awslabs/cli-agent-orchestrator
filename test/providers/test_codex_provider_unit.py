@@ -171,6 +171,63 @@ class TestCodexProviderStatusDetection:
 
         assert status == TerminalStatus.PROCESSING
 
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_get_status_not_error_when_assistant_mentions_error_text(self, mock_tmux):
+        mock_tmux.get_history.return_value = (
+            "You Explain the failure\n"
+            "assistant: Here's an example error:\n"
+            "Error: example only\n"
+            "\n"
+            "❯ \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_get_status_not_waiting_when_assistant_mentions_approval_text(self, mock_tmux):
+        mock_tmux.get_history.return_value = (
+            "You Explain approvals\n"
+            "assistant: You might see this prompt:\n"
+            "Approve this command? [y/n]\n"
+            "\n"
+            "❯ \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_get_status_error_when_error_after_user_and_prompt(self, mock_tmux):
+        mock_tmux.get_history.return_value = "You Run thing\nError: failed\n\n❯ \n"
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.ERROR
+
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_get_status_waiting_user_answer_when_no_user_prefix(self, mock_tmux):
+        mock_tmux.get_history.return_value = "Approve this command? [y/n]\n"
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_get_status_error_when_no_user_prefix(self, mock_tmux):
+        mock_tmux.get_history.return_value = "Error: something failed\n"
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.ERROR
+
 
 class TestCodexProviderMessageExtraction:
     def test_extract_last_message_success(self):

@@ -50,6 +50,8 @@ Optional automation from another terminal (send input + get extracted last messa
 
 ```bash
 python3 - <<'PY'
+import time
+
 import requests
 
 terminal_id = "<terminal-id>"
@@ -58,6 +60,13 @@ requests.post(
     f"http://localhost:9889/terminals/{terminal_id}/input",
     params={"message": "Write a Python function to validate email addresses using regex"},
 ).raise_for_status()
+
+# Poll status until completion
+while True:
+    status = requests.get(f"http://localhost:9889/terminals/{terminal_id}").json()["status"]
+    if status in {"completed", "error", "waiting_user_answer"}:
+        break
+    time.sleep(1)
 
 resp = requests.get(
     f"http://localhost:9889/terminals/{terminal_id}/output",
@@ -273,7 +282,7 @@ Then provide a refactored version with explanations.
 
 After mastering the basics, explore:
 
-- **Multi-Agent Patterns**: See `examples/codex-supervisor/`
+- **Multi-Agent Patterns**: See `examples/assign/` for step-by-step patterns you can adapt to Codex
 - **Workflow Integration**: Combine with other providers
 - **Custom Agent Profiles**: Create specialized Codex agents
 - **MCP Integration**: Use Codex agents in MCP workflows
@@ -282,7 +291,7 @@ After mastering the basics, explore:
 
 For issues:
 - Check [troubleshooting section](#troubleshooting)
-- Review [main documentation](../../../docs/codex-cli.md)
+- Review [main documentation](../../docs/codex-cli.md)
 - Report issues on [GitHub](https://github.com/awslabs/cli-agent-orchestrator/issues)
 
 ## Contributing
