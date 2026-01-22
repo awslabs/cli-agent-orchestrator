@@ -64,6 +64,15 @@ export function AgentPanel() {
     refresh()
   }
 
+  const triggerLearning = async (id: string) => {
+    try {
+      const proposal = await api.learn.trigger(id)
+      alert(`Learning proposal created!\n\n${proposal.changes}`)
+    } catch (e) {
+      alert('Failed to trigger learning')
+    }
+  }
+
   const handleStatusChange = (sessionId: string, status: string) => {
     setSessionStatuses(prev => ({ ...prev, [sessionId]: status }))
   }
@@ -211,6 +220,13 @@ export function AgentPanel() {
                       className={`ml-auto px-1 text-xs rounded ${autoModeSessions.has(session.id) ? 'bg-green-600' : 'bg-gray-600'}`}
                     >
                       Auto
+                    </button>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); triggerLearning(session.id) }}
+                      className="px-1 text-xs bg-purple-600 hover:bg-purple-500 rounded"
+                      title="Extract learnings from this session"
+                    >
+                      Learn
                     </button>
                     <button
                       onClick={(e) => { e.stopPropagation(); deleteSession(session.id) }}

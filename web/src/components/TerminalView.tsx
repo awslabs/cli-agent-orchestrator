@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Terminal } from 'xterm'
 import { FitAddon } from 'xterm-addon-fit'
 import 'xterm/css/xterm.css'
-import { createTerminalStream, api } from '../api'
+import { api } from '../api'
 
 interface Props {
   sessionId: string
@@ -13,7 +13,7 @@ export function TerminalView({ sessionId, onStatusChange }: Props) {
   const termRef = useRef<HTMLDivElement>(null)
   const terminalRef = useRef<Terminal | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
-  const [input, setInput] = useState('')
+  const lastOutputRef = useRef<string>('')
   const [connected, setConnected] = useState(false)
 
   useEffect(() => {
@@ -25,7 +25,8 @@ export function TerminalView({ sessionId, onStatusChange }: Props) {
       fontFamily: 'monospace',
       cursorBlink: true,
       convertEol: true,
-      scrollback: 5000
+      scrollback: 5000,
+      allowProposedApi: true
     })
     const fitAddon = new FitAddon()
     terminal.loadAddon(fitAddon)
@@ -33,37 +34,65 @@ export function TerminalView({ sessionId, onStatusChange }: Props) {
     fitAddon.fit()
     terminalRef.current = terminal
 
-    // Handle direct keyboard input to terminal
+    // Handle keyboard input - send raw keystrokes to tmux
     terminal.onData((data) => {
-      // Send each keystroke in raw mode (no Enter added)
       api.sessions.input(sessionId, data, true).catch(console.error)
     })
 
-    // Load initial output
+    // Handle paste from clipboard
+    terminal.attachCustomKeyEventHandler((e) => {
+      // Allow Ctrl+Shift+C for copy (browser default)
+      if (e.ctrlKey && e.shiftKey && e.key === 'C') {
+        return false // Let browser handle copy
+      }
+      // Handle Ctrl+Shift+V or Ctrl+V for paste
+      if ((e.ctrlKey && e.shiftKey && e.key === 'V') || (e.ctrlKey && e.key === 'v')) {
+        if (e.type === 'keydown') {
+          navigator.clipboard.readText().then(text => {
+            if (text) api.sessions.input(sessionId, text, true).catch(console.error)
+          }).catch(() => {})
+        }
+        return false
+      }
+      return true // Let xterm handle other keys
+    })
+
+    // Load initial output then connect WebSocket
     api.sessions.output(sessionId).then(r => {
-      terminal.write(r.output || '')
+      const output = r.output || ''
+      terminal.write(output)
+      lastOutputRef.current = output
       onStatusChange?.(r.status)
     }).catch(() => {})
 
-    // Connect WebSocket for live updates
+    // WebSocket for live streaming
     const connectWs = () => {
-      wsRef.current = createTerminalStream(sessionId, (data) => {
-        if (data.type === 'output') {
-          terminal.write(data.data)
-          onStatusChange?.(data.status)
-        }
-      })
-      wsRef.current.onopen = () => setConnected(true)
-      wsRef.current.onclose = () => {
-        setConnected(false)
-        // Reconnect after 2s
-        setTimeout(connectWs, 2000)
+      const ws = new WebSocket(`ws://${location.host}/api/v2/sessions/${sessionId}/stream`)
+      wsRef.current = ws
+      
+      ws.onopen = () => setConnected(true)
+      ws.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data)
+          if (msg.type === 'output' && msg.data) {
+            terminal.write(msg.data)
+            onStatusChange?.(msg.status)
+          }
+        } catch {}
       }
+      ws.onclose = () => {
+        setConnected(false)
+        setTimeout(connectWs, 1000)
+      }
+      ws.onerror = () => setConnected(false)
     }
     connectWs()
 
     const handleResize = () => fitAddon.fit()
     window.addEventListener('resize', handleResize)
+
+    // Focus terminal on mount
+    setTimeout(() => terminal.focus(), 100)
 
     return () => {
       wsRef.current?.close()
@@ -72,48 +101,18 @@ export function TerminalView({ sessionId, onStatusChange }: Props) {
     }
   }, [sessionId])
 
-  const sendInput = () => {
-    if (!input) return
-    // Backend already sends Enter key after the message
-    api.sessions.input(sessionId, input).catch(console.error)
-    setInput('')
-  }
-
-  const focusTerminal = () => {
-    terminalRef.current?.focus()
-  }
-
   return (
     <div className="flex flex-col h-full">
       <div className="flex items-center gap-2 px-2 py-1 bg-gray-900 border-b border-gray-700 text-xs">
-        <span className={connected ? 'text-green-400' : 'text-red-400'}>●</span>
+        <span className={`w-2 h-2 rounded-full ${connected ? 'bg-green-500' : 'bg-red-500'}`} />
         <span className="text-gray-400">{sessionId.slice(-8)}</span>
-        <button onClick={focusTerminal} className="ml-auto px-2 py-0.5 bg-gray-700 rounded hover:bg-gray-600">
-          Focus Terminal
-        </button>
+        <span className="text-gray-500 ml-auto">Ctrl+Shift+V to paste</span>
       </div>
       <div 
         ref={termRef} 
-        className="flex-1 min-h-0 cursor-text" 
-        onClick={focusTerminal}
+        className="flex-1 min-h-0" 
+        onClick={() => terminalRef.current?.focus()}
       />
-      <div className="flex gap-2 p-2 bg-gray-900 border-t border-gray-700">
-        <input
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') {
-              e.preventDefault()
-              sendInput()
-            }
-          }}
-          placeholder="Type command and press Enter..."
-          className="flex-1 px-3 py-1 bg-gray-800 border border-gray-600 rounded text-sm font-mono"
-        />
-        <button onClick={sendInput} className="px-3 py-1 bg-blue-600 rounded text-sm">
-          Send
-        </button>
-      </div>
     </div>
   )
 }

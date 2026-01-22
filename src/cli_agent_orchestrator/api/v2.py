@@ -273,6 +273,28 @@ async def delete_session(session_id: str):
         raise HTTPException(404, str(e))
 
 
+@router.delete("/sessions")
+async def delete_sessions(session_ids: List[str] = None, all: bool = False):
+    """Mass delete sessions. Pass session_ids list or all=true."""
+    deleted = []
+    errors = []
+    
+    if all:
+        sessions = session_service.list_sessions()
+        session_ids = [s["id"] for s in sessions]
+    
+    if not session_ids:
+        raise HTTPException(400, "Provide session_ids or all=true")
+    
+    for sid in session_ids:
+        try:
+            session_service.delete_session(sid)
+            deleted.append(sid)
+        except Exception as e:
+            errors.append({"id": sid, "error": str(e)})
+    
+    return {"deleted": deleted, "errors": errors}
+
 @router.post("/sessions/{session_id}/input")
 async def send_input(session_id: str, message: str, raw: bool = False):
     """Send input to session. Set raw=true for direct keystrokes without Enter."""
@@ -296,6 +318,8 @@ async def get_output(session_id: str, lines: int = 200):
             raise HTTPException(404, "No terminal in session")
         term_id = data["terminals"][0]["id"]
         output = terminal_service.get_output(term_id)
+        # Strip trailing empty lines but keep the prompt line
+        output = output.rstrip('\n') + '\n' if output else ''
         return {"output": output, "status": detect_session_status(output)}
     except ValueError as e:
         raise HTTPException(404, str(e))
@@ -304,36 +328,57 @@ async def get_output(session_id: str, lines: int = 200):
 # --- WebSocket Streaming ---
 @router.websocket("/sessions/{session_id}/stream")
 async def stream_terminal(ws: WebSocket, session_id: str):
-    """WebSocket for live terminal output."""
+    """WebSocket for live terminal output using tmux pipe-pane."""
     await ws.accept()
-    if session_id not in terminal_streams:
-        terminal_streams[session_id] = set()
-    terminal_streams[session_id].add(ws)
     
     try:
-        # Get initial output
         data = session_service.get_session(session_id)
-        if data.get("terminals"):
-            term_id = data["terminals"][0]["id"]
-            last_len = 0
-            while True:
-                try:
-                    output = terminal_service.get_output(term_id)
-                    if len(output) > last_len:
-                        new_content = output[last_len:]
+        if not data.get("terminals"):
+            await ws.close()
+            return
+            
+        term = data["terminals"][0]
+        tmux_session = term["tmux_session"]
+        tmux_window = term["tmux_window"]
+        target = f"{tmux_session}:{tmux_window}"
+        
+        # Use asyncio subprocess to run tmux capture-pane in a loop
+        import subprocess
+        last_output = ""
+        
+        while True:
+            try:
+                # Capture current pane content
+                result = subprocess.run(
+                    ["/usr/local/bin/tmux", "capture-pane", "-t", target, "-p", "-S", "-500"],
+                    capture_output=True, text=True, timeout=1
+                )
+                output = result.stdout.rstrip('\n') + '\n' if result.stdout else ''
+                
+                if output != last_output:
+                    # Send only new content if possible
+                    if last_output and output.startswith(last_output):
+                        new_content = output[len(last_output):]
+                    else:
+                        new_content = output
+                        
+                    if new_content.strip():
                         await ws.send_json({
-                            "type": "output",
+                            "type": "output", 
                             "data": new_content,
                             "status": detect_session_status(output)
                         })
-                        last_len = len(output)
-                    await asyncio.sleep(0.5)
-                except:
-                    break
+                    last_output = output
+                    
+                await asyncio.sleep(0.1)  # 100ms polling
+            except Exception as e:
+                logger.error(f"Stream error: {e}")
+                await asyncio.sleep(0.5)
+                
     except WebSocketDisconnect:
         pass
-    finally:
-        terminal_streams.get(session_id, set()).discard(ws)
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
 
 
 # --- Activity Feed ---
@@ -457,8 +502,80 @@ def analyze_session_output(output: str) -> Dict:
     return learnings
 
 
-@router.post("/learn/{session_id}")
-async def trigger_learning(session_id: str):
+# Import the new learning system
+from cli_agent_orchestrator.services.learning_service import learning_system
+
+
+# --- Learning System Routes (specific routes BEFORE parameterized) ---
+
+@router.get("/learn/stats")
+async def get_learning_stats():
+    """Get learning system statistics."""
+    return learning_system.stats()
+
+
+@router.get("/learn/context")
+async def get_active_context():
+    """Get all approved context bullets."""
+    return {"bullets": learning_system.get_active_context()}
+
+
+@router.get("/learn/memories")
+async def list_memories(limit: int = 50):
+    """List all memories in the bank."""
+    return learning_system.memories[:limit]
+
+
+@router.get("/learn/memories/search")
+async def search_memories(query: str, limit: int = 5):
+    """Search memories relevant to a query."""
+    return learning_system.get_relevant_memories(query, limit)
+
+
+@router.post("/learn/memories")
+async def add_memory(title: str, content: str, outcome: str = "success"):
+    """Add a human-provided memory (highest priority)."""
+    return learning_system.add_human_memory(title, content, outcome)
+
+
+@router.get("/learn/proposals")
+async def list_proposals(status: Optional[str] = None):
+    """List context update proposals (deltas)."""
+    deltas = learning_system.deltas
+    if status:
+        return [d for d in deltas if d["status"] == status]
+    return deltas
+
+
+@router.post("/learn/proposals/{delta_id}/approve")
+async def approve_proposal(delta_id: str, feedback: str = None):
+    """Approve context delta."""
+    result = learning_system.approve_delta(delta_id, feedback)
+    if not result:
+        raise HTTPException(404, "Delta not found")
+    return result
+
+
+@router.post("/learn/proposals/{delta_id}/reject")
+async def reject_proposal(delta_id: str, feedback: str = None):
+    """Reject context delta."""
+    result = learning_system.reject_delta(delta_id, feedback)
+    if not result:
+        raise HTTPException(404, "Delta not found")
+    return result
+
+
+@router.put("/learn/proposals/{delta_id}")
+async def edit_proposal(delta_id: str, bullets: list[str]):
+    """Edit a delta's bullets (human refinement)."""
+    result = learning_system.edit_delta(delta_id, bullets)
+    if not result:
+        raise HTTPException(404, "Delta not found")
+    return result
+
+
+@router.post("/learn/sessions/{session_id}")
+async def trigger_learning(session_id: str, outcome: str = "neutral"):
     """Trigger context learning for completed session."""
     try:
         data = session_service.get_session(session_id)
@@ -467,61 +584,15 @@ async def trigger_learning(session_id: str):
         
         term_id = data["terminals"][0]["id"]
         output = terminal_service.get_output(term_id)
+        agent_name = data["terminals"][0].get("agent_profile", "unknown")
         
-        # Analyze output for learnings
-        learnings = analyze_session_output(output)
+        # Use new learning system
+        proposal = learning_system.create_proposal(session_id, output, outcome)
+        proposal["agent_name"] = agent_name
         
-        # Generate meaningful changes based on analysis
-        changes = []
-        if learnings["errors"]:
-            changes.append(f"Add error handling for: {', '.join(learnings['errors'][:3])}")
-        if learnings["patterns"]:
-            changes.extend(learnings["patterns"])
-        if learnings["tools_used"]:
-            changes.append(f"Frequently used tools: {', '.join(learnings['tools_used'][:5])}")
-        
-        proposal = {
-            "id": f"prop-{len(context_proposals)}",
-            "session_id": session_id,
-            "agent_name": data["terminals"][0].get("agent_profile", "unknown"),
-            "changes": "\n".join(changes) if changes else "No significant learnings extracted",
-            "reason": f"Analyzed {len(output)} chars, found {len(learnings['tools_used'])} tools, {len(learnings['errors'])} errors",
-            "learnings": learnings,
-            "status": "pending",
-            "created_at": datetime.now().isoformat()
-        }
-        context_proposals.append(proposal)
         return proposal
     except ValueError as e:
         raise HTTPException(404, str(e))
-
-
-@router.get("/learn/proposals")
-async def list_proposals(status: Optional[str] = None):
-    """List context update proposals."""
-    if status:
-        return [p for p in context_proposals if p["status"] == status]
-    return context_proposals
-
-
-@router.post("/learn/proposals/{proposal_id}/approve")
-async def approve_proposal(proposal_id: str):
-    """Approve context update."""
-    for p in context_proposals:
-        if p["id"] == proposal_id:
-            p["status"] = "approved"
-            return p
-    raise HTTPException(404, "Proposal not found")
-
-
-@router.post("/learn/proposals/{proposal_id}/reject")
-async def reject_proposal(proposal_id: str):
-    """Reject context update."""
-    for p in context_proposals:
-        if p["id"] == proposal_id:
-            p["status"] = "rejected"
-            return p
-    raise HTTPException(404, "Proposal not found")
 
 
 # --- Chat Bar / Task Decomposition ---

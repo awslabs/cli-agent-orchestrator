@@ -50,10 +50,14 @@ export const api = {
 
   // Context Learning
   learn: {
-    trigger: (sessionId: string) => fetch(`${API}/v2/learn/${sessionId}`, { method: 'POST' }).then(r => r.json()),
+    trigger: (sessionId: string) => fetch(`${API}/v2/learn/sessions/${sessionId}`, { method: 'POST' }).then(r => r.json()),
     proposals: () => fetch(`${API}/v2/learn/proposals`).then(r => r.json()),
     approve: (id: string) => fetch(`${API}/v2/learn/proposals/${id}/approve`, { method: 'POST' }).then(r => r.json()),
-    reject: (id: string) => fetch(`${API}/v2/learn/proposals/${id}/reject`, { method: 'POST' }).then(r => r.json())
+    reject: (id: string) => fetch(`${API}/v2/learn/proposals/${id}/reject`, { method: 'POST' }).then(r => r.json()),
+    memories: () => fetch(`${API}/v2/learn/memories`).then(r => r.json()),
+    addMemory: (title: string, content: string) => fetch(`${API}/v2/learn/memories?title=${encodeURIComponent(title)}&content=${encodeURIComponent(content)}`, { method: 'POST' }).then(r => r.json()),
+    stats: () => fetch(`${API}/v2/learn/stats`).then(r => r.json()),
+    context: () => fetch(`${API}/v2/learn/context`).then(r => r.json())
   },
 
   // Ralph
