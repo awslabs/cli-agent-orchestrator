@@ -109,6 +109,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Include web dashboard routes
+from cli_agent_orchestrator.api.web import router as web_router
+app.include_router(web_router, prefix="/api")
+
 
 @app.get("/health")
 async def health_check():
