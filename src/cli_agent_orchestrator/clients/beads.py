@@ -101,7 +101,7 @@ class BeadsClient:
         now = datetime.utcnow().isoformat()
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
-                "UPDATE tasks SET status = 'closed', closed_at = ?, updated_at = ? WHERE id = ?",
+                "UPDATE tasks SET status = 'closed', assignee = NULL, closed_at = ?, updated_at = ? WHERE id = ?",
                 (now, now, task_id)
             )
         return self.get(task_id)

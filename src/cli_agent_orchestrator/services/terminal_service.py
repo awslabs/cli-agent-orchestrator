@@ -129,14 +129,14 @@ def get_terminal(terminal_id: str) -> Dict:
         raise
 
 
-def send_input(terminal_id: str, message: str) -> bool:
-    """Send input to terminal."""
+def send_input(terminal_id: str, message: str, add_enter: bool = True) -> bool:
+    """Send input to terminal. Set add_enter=False for raw keystrokes."""
     try:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        tmux_client.send_keys(metadata["tmux_session"], metadata["tmux_window"], message)
+        tmux_client.send_keys(metadata["tmux_session"], metadata["tmux_window"], message, add_enter=add_enter)
 
         update_last_active(terminal_id)
         logger.info(f"Sent input to terminal: {terminal_id}")

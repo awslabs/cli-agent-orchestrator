@@ -61,10 +61,10 @@ class TmuxClient:
             logger.error(f"Failed to create window in session {session_name}: {e}")
             raise
 
-    def send_keys(self, session_name: str, window_name: str, keys: str) -> None:
-        """Send keys to window with chunking for long messages."""
+    def send_keys(self, session_name: str, window_name: str, keys: str, add_enter: bool = True) -> None:
+        """Send keys to window. Set add_enter=False for raw keystrokes."""
         try:
-            logger.info(f"send_keys: {session_name}:{window_name} - keys: {keys}")
+            logger.info(f"send_keys: {session_name}:{window_name} - keys: {keys[:50]}...")
 
             session = self.server.sessions.get(session_name=session_name)
             if not session:
@@ -76,6 +76,11 @@ class TmuxClient:
 
             pane = window.active_pane
             if pane:
+                # For raw mode (single keystrokes), send directly
+                if not add_enter and len(keys) <= 10:
+                    pane.send_keys(keys, enter=False)
+                    return
+
                 # Split keys into chunks of ~100 characters at whitespace boundaries
                 chunks = []
                 start = 0
@@ -87,9 +92,7 @@ class TmuxClient:
                         chunks.append(keys[start:])
                         break
 
-                    # Look forward from target position to find next whitespace
                     match = re.search(r"\s", keys[target_pos:])
-
                     if match:
                         split_pos = target_pos + match.start()
                         chunks.append(keys[start:split_pos])
@@ -103,8 +106,9 @@ class TmuxClient:
                     pane.send_keys(chunk, enter=False)
                     time.sleep(SEND_KEYS_CHUNK_INTERVAL)
 
-                # Send carriage return as separate command
-                pane.send_keys("C-m", enter=False)
+                # Send carriage return only if add_enter is True
+                if add_enter:
+                    pane.send_keys("C-m", enter=False)
                 logger.debug(f"Sent keys to {session_name}:{window_name}")
         except Exception as e:
             logger.error(f"Failed to send keys to {session_name}:{window_name}: {e}")

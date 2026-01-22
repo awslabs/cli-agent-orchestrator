@@ -11,7 +11,7 @@ const STATUS_STYLE: Record<string, string> = {
 }
 
 export function AgentPanel() {
-  const { agents, setAgents, sessions, setSessions, activeSession, setActiveSession, autoModeSessions, toggleAutoMode } = useStore()
+  const { agents, setAgents, sessions, setSessions, activeSession, setActiveSession, autoModeSessions, toggleAutoMode, tasks } = useStore()
   const [showCreate, setShowCreate] = useState(false)
   const [newAgent, setNewAgent] = useState({ name: '', description: '' })
   const [spawning, setSpawning] = useState<string | null>(null)
@@ -30,15 +30,18 @@ export function AgentPanel() {
   useEffect(() => { refresh() }, [])
 
   const spawnSession = async (agentName: string) => {
+    if (spawning) return // Prevent double-click
     setSpawning(agentName)
     try {
       const session = await api.sessions.create({ agent_name: agentName })
       await refresh()
       setActiveSession(session.id)
     } catch (e) {
-      console.error(e)
+      console.error('Failed to spawn session:', e)
+      alert(`Failed to spawn ${agentName}: ${e instanceof Error ? e.message : 'Unknown error'}`)
+    } finally {
+      setSpawning(null)
     }
-    setSpawning(null)
   }
 
   const createAgent = async () => {
@@ -189,30 +192,38 @@ export function AgentPanel() {
           <div className="space-y-1 max-h-48 overflow-y-auto">
             {sessions.map(session => {
               const status = sessionStatuses[session.id] || session.status
+              const assignedBead = tasks.find(t => t.assignee === session.id && t.status === 'wip')
               return (
                 <div
                   key={session.id}
-                  className={`flex items-center gap-2 p-2 rounded text-sm cursor-pointer ${
+                  className={`p-2 rounded text-sm cursor-pointer ${
                     activeSession === session.id ? 'bg-blue-900' : 'bg-gray-700 hover:bg-gray-600'
                   }`}
                   onClick={() => setActiveSession(activeSession === session.id ? null : session.id)}
                 >
-                  <span className={STATUS_STYLE[status] || STATUS_STYLE.IDLE}>●</span>
-                  <span className="font-mono">{session.id.slice(-8)}</span>
-                  <span className="text-xs text-gray-400 truncate">{session.terminals?.[0]?.agent_profile}</span>
-                  <span className="text-xs text-gray-500">{status}</span>
-                  <button
-                    onClick={(e) => { e.stopPropagation(); toggleAutoMode(session.id) }}
-                    className={`ml-auto px-1 text-xs rounded ${autoModeSessions.has(session.id) ? 'bg-green-600' : 'bg-gray-600'}`}
-                  >
-                    Auto
-                  </button>
-                  <button
-                    onClick={(e) => { e.stopPropagation(); deleteSession(session.id) }}
-                    className="px-1 text-xs bg-red-600 rounded"
-                  >
-                    ×
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <span className={STATUS_STYLE[status] || STATUS_STYLE.IDLE}>●</span>
+                    <span className="font-mono">{session.id.slice(-8)}</span>
+                    <span className="text-xs text-gray-400 truncate">{session.terminals?.[0]?.agent_profile}</span>
+                    <span className="text-xs text-gray-500">{status}</span>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); toggleAutoMode(session.id) }}
+                      className={`ml-auto px-1 text-xs rounded ${autoModeSessions.has(session.id) ? 'bg-green-600' : 'bg-gray-600'}`}
+                    >
+                      Auto
+                    </button>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); deleteSession(session.id) }}
+                      className="px-1 text-xs bg-red-600 rounded"
+                    >
+                      ×
+                    </button>
+                  </div>
+                  {assignedBead && (
+                    <div className="mt-1 ml-4 text-xs text-yellow-400">
+                      📋 Working on: "{assignedBead.title}" (P{assignedBead.priority})
+                    </div>
+                  )}
                 </div>
               )
             })}

@@ -13,6 +13,12 @@ export function BeadsPanel() {
   const [priority, setPriority] = useState(2)
   const [error, setError] = useState<string | null>(null)
 
+  // Check if a bead is orphaned (wip but assignee session doesn't exist)
+  const isOrphaned = (task: { status: string; assignee?: string }) => {
+    if (task.status !== 'wip' || !task.assignee) return false
+    return !sessions.some(s => s.id === task.assignee)
+  }
+
   const refresh = async () => {
     try {
       const list = await api.tasks.list()
@@ -146,32 +152,34 @@ export function BeadsPanel() {
             grouped[status as keyof typeof grouped].length > 0 && (
               <div key={status}>
                 <div className="text-xs text-gray-500 uppercase mt-2 mb-1">{status} ({grouped[status as keyof typeof grouped].length})</div>
-                {grouped[status as keyof typeof grouped].map(task => (
-                  <div key={task.id} className="flex items-center gap-2 p-2 bg-gray-700 rounded text-sm group hover:bg-gray-650">
-                    <span className={`w-6 h-6 rounded text-xs flex items-center justify-center font-bold ${P[task.priority]}`}>
-                      P{task.priority}
-                    </span>
-                    <span className="text-gray-400 w-4">{S[task.status]}</span>
-                    <div className="flex-1 min-w-0">
-                      <div className="truncate">{task.title}</div>
-                      {task.assignee && <div className="text-xs text-gray-400">→ {task.assignee}</div>}
-                    </div>
+                {grouped[status as keyof typeof grouped].map(task => {
+                  const orphaned = isOrphaned(task)
+                  return (
+                  <div key={task.id} className={`p-2 rounded text-sm group ${orphaned ? 'bg-orange-900 border border-orange-600' : 'bg-gray-700 hover:bg-gray-650'}`}>
+                    <div className="flex items-center gap-2">
+                      <span className={`w-6 h-6 rounded text-xs flex items-center justify-center font-bold ${P[task.priority]}`}>
+                        P{task.priority}
+                      </span>
+                      <span className="text-gray-400 w-4">{orphaned ? '⚠' : S[task.status]}</span>
+                      <div className="flex-1 min-w-0">
+                        <div className="truncate">{task.title}</div>
+                      </div>
                     
-                    <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                      {task.status === 'open' && sessions.length > 0 && (
-                        <select
-                          onChange={(e) => e.target.value && assignTask(task.id, e.target.value)}
-                          className="px-1 py-0.5 text-xs bg-blue-600 rounded cursor-pointer"
-                          defaultValue=""
-                        >
-                          <option value="" disabled>Assign→</option>
-                          {sessions.map(s => (
-                            <option key={s.id} value={s.id}>{s.id.slice(-8)}</option>
-                          ))}
-                        </select>
-                      )}
+                      <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                        {(task.status === 'open' || orphaned) && sessions.length > 0 && (
+                          <select
+                            onChange={(e) => e.target.value && assignTask(task.id, e.target.value)}
+                            className="px-1 py-0.5 text-xs bg-blue-600 rounded cursor-pointer"
+                            defaultValue=""
+                          >
+                            <option value="" disabled>{orphaned ? 'Reassign→' : 'Assign→'}</option>
+                            {sessions.map(s => (
+                              <option key={s.id} value={s.id}>{s.id.slice(-8)}</option>
+                            ))}
+                          </select>
+                        )}
                       
-                      {task.status === 'open' && (
+                        {task.status === 'open' && (
                         <button
                           onClick={() => markWip(task.id)}
                           className="px-2 py-0.5 text-xs bg-yellow-600 hover:bg-yellow-500 rounded"
@@ -195,7 +203,13 @@ export function BeadsPanel() {
                       </button>
                     </div>
                   </div>
-                ))}
+                  {task.assignee && (
+                    <div className={`mt-1 ml-10 text-xs ${orphaned ? 'text-orange-400' : 'text-gray-400'}`}>
+                      {orphaned ? '⚠ Agent disconnected - reassign?' : `→ 🤖 ${task.assignee.slice(-8)}`}
+                    </div>
+                  )}
+                </div>
+                )})}
               </div>
             )
           )

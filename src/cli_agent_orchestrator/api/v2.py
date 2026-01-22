@@ -274,14 +274,14 @@ async def delete_session(session_id: str):
 
 
 @router.post("/sessions/{session_id}/input")
-async def send_input(session_id: str, message: str):
-    """Send input to session."""
+async def send_input(session_id: str, message: str, raw: bool = False):
+    """Send input to session. Set raw=true for direct keystrokes without Enter."""
     try:
         data = session_service.get_session(session_id)
         if not data.get("terminals"):
             raise HTTPException(404, "No terminal in session")
         term_id = data["terminals"][0]["id"]
-        terminal_service.send_input(term_id, message)
+        terminal_service.send_input(term_id, message, add_enter=not raw)
         return {"success": True}
     except ValueError as e:
         raise HTTPException(404, str(e))

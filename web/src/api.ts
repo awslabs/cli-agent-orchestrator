@@ -19,8 +19,8 @@ export const api = {
     create: (data: { agent_name: string; provider?: string }) =>
       fetch(`${API}/v2/sessions`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(r => r.json()),
     delete: (id: string) => fetch(`${API}/v2/sessions/${id}`, { method: 'DELETE' }),
-    input: (id: string, message: string) =>
-      fetch(`${API}/v2/sessions/${id}/input?message=${encodeURIComponent(message)}`, { method: 'POST' }),
+    input: (id: string, message: string, raw: boolean = false) =>
+      fetch(`${API}/v2/sessions/${id}/input?message=${encodeURIComponent(message)}&raw=${raw}`, { method: 'POST' }),
     output: (id: string) => fetch(`${API}/v2/sessions/${id}/output`).then(r => r.json()),
     autoMode: (id: string, enabled: boolean) =>
       fetch(`${API}/v2/sessions/${id}/auto-mode`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }) }).then(r => r.json())

@@ -35,8 +35,8 @@ export function TerminalView({ sessionId, onStatusChange }: Props) {
 
     // Handle direct keyboard input to terminal
     terminal.onData((data) => {
-      // Send each keystroke to the session
-      api.sessions.input(sessionId, data).catch(console.error)
+      // Send each keystroke in raw mode (no Enter added)
+      api.sessions.input(sessionId, data, true).catch(console.error)
     })
 
     // Load initial output
