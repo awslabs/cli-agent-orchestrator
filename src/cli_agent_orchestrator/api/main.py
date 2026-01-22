@@ -3,9 +3,12 @@
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path as FilePath
 from typing import Annotated, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Path, Query, status
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
 from watchdog.observers.polling import PollingObserver
 
@@ -382,6 +385,18 @@ async def get_inbox_messages_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to retrieve inbox messages: {str(e)}",
         )
+
+
+# Serve React static files (must be after API routes)
+WEB_DIST = FilePath(__file__).parent.parent.parent.parent / "web" / "dist"
+if WEB_DIST.exists():
+    app.mount("/assets", StaticFiles(directory=WEB_DIST / "assets"), name="assets")
+    @app.get("/{path:path}")
+    async def serve_spa(path: str):
+        file = WEB_DIST / path
+        if file.exists() and file.is_file():
+            return FileResponse(file)
+        return FileResponse(WEB_DIST / "index.html")
 
 
 def main():

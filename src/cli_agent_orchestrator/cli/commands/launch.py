@@ -6,6 +6,7 @@ import click
 import requests
 
 from cli_agent_orchestrator.constants import DEFAULT_PROVIDER, PROVIDERS, SERVER_HOST, SERVER_PORT
+from cli_agent_orchestrator.clients.beads import BeadsClient
 
 
 @click.command()
@@ -15,7 +16,10 @@ from cli_agent_orchestrator.constants import DEFAULT_PROVIDER, PROVIDERS, SERVER
 @click.option(
     "--provider", default=DEFAULT_PROVIDER, help=f"Provider to use (default: {DEFAULT_PROVIDER})"
 )
-def launch(agents, session_name, headless, provider):
+@click.option("--from-queue", is_flag=True, help="Auto-assign next task from Beads queue")
+@click.option("--task", "task_id", help="Launch for specific Beads task ID")
+@click.option("--priority", type=int, help="Priority filter for --from-queue (1/2/3)")
+def launch(agents, session_name, headless, provider, from_queue, task_id, priority):
     """Launch cao session with specified agent profile."""
     try:
         # Validate provider
@@ -23,6 +27,22 @@ def launch(agents, session_name, headless, provider):
             raise click.ClickException(
                 f"Invalid provider '{provider}'. Available providers: {', '.join(PROVIDERS)}"
             )
+
+        # Handle Beads task assignment
+        task = None
+        if from_queue or task_id:
+            beads = BeadsClient()
+            if task_id:
+                task = beads.get(task_id)
+                if not task:
+                    raise click.ClickException(f"Task {task_id} not found")
+            elif from_queue:
+                task = beads.next(priority=priority)
+                if not task:
+                    raise click.ClickException("No open tasks in queue")
+            if task:
+                beads.wip(task.id, assignee=agents)
+                click.echo(f"Assigned task [{task.id}] {task.title}")
 
         # Call API to create session
         url = f"http://{SERVER_HOST}:{SERVER_PORT}/sessions"
