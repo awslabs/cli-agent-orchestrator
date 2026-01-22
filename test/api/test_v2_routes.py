@@ -26,7 +26,8 @@ class TestAgentsAPI:
         """Test listing agents with agent files."""
         with tempfile.TemporaryDirectory() as tmpdir:
             agents_dir = Path(tmpdir)
-            (agents_dir / "test-agent.md").write_text("# Test Agent\nDescription here")
+            # discover_agents() looks for .json files
+            (agents_dir / "test-agent.json").write_text('{"name": "test-agent", "description": "Test Agent"}')
             
             with patch('cli_agent_orchestrator.api.v2.KIRO_AGENTS_DIR', agents_dir):
                 response = client.get("/api/v2/agents")
@@ -67,13 +68,14 @@ class TestAgentsAPI:
         """Test getting agent details."""
         with tempfile.TemporaryDirectory() as tmpdir:
             agents_dir = Path(tmpdir)
-            (agents_dir / "my-agent.md").write_text("# My Agent\nContent here")
+            (agents_dir / "my-agent.json").write_text('{"name": "my-agent", "description": "Content here"}')
             
             with patch('cli_agent_orchestrator.api.v2.KIRO_AGENTS_DIR', agents_dir):
                 response = client.get("/api/v2/agents/my-agent")
                 assert response.status_code == 200
                 assert response.json()["name"] == "my-agent"
-                assert "Content here" in response.json()["content"]
+                # get_agent returns config, not content
+                assert response.json()["config"]["description"] == "Content here"
 
     def test_get_agent_not_found(self):
         """Test getting non-existent agent."""
