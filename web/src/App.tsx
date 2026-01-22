@@ -12,7 +12,7 @@ export default function App() {
   useEffect(() => {
     api.tasks.list().then(setTasks).catch(() => {})
     api.ralph.status().then(r => setRalph(r.active ? r : null)).catch(() => {})
-    api.agents.list().then(setAgents).catch(() => {})
+    fetch('/sessions').then(r => r.json()).then(setAgents).catch(() => {})
 
     const ws = new WebSocket(`ws://${location.host}/api/ws/updates`)
     ws.onmessage = (e) => {

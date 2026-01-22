@@ -9,6 +9,7 @@ from typing import Annotated, Dict, List, Optional
 from fastapi import FastAPI, HTTPException, Path, Query, status
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 from watchdog.observers.polling import PollingObserver
 
@@ -110,6 +111,15 @@ app = FastAPI(
     description="Simplified CLI Agent Orchestrator API",
     version=SERVER_VERSION,
     lifespan=lifespan,
+)
+
+# Enable CORS for browser access
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Include web dashboard routes
