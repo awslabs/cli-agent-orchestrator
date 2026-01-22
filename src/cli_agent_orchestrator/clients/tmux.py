@@ -20,19 +20,19 @@ class TmuxClient:
     """Simplified tmux client for basic operations."""
 
     def __init__(self) -> None:
+        # Prefer newer tmux from /usr/local/bin if available
+        if os.path.exists("/usr/local/bin/tmux"):
+            os.environ["PATH"] = "/usr/local/bin:" + os.environ.get("PATH", "")
         self.server = libtmux.Server()
 
     def create_session(self, session_name: str, window_name: str, terminal_id: str) -> str:
         """Create detached tmux session with initial window and return window name."""
         try:
-            environment = os.environ.copy()
-            environment["CAO_TERMINAL_ID"] = terminal_id
-
+            # Note: environment param requires tmux 3.2+, skip for older versions
             session = self.server.new_session(
                 session_name=session_name,
                 window_name=window_name,
                 detach=True,
-                environment=environment,
             )
             logger.info(f"Created tmux session: {session_name} with window: {window_name}")
             window_name_result = session.windows[0].name
@@ -50,9 +50,7 @@ class TmuxClient:
             if not session:
                 raise ValueError(f"Session '{session_name}' not found")
 
-            window = session.new_window(
-                window_name=window_name, environment={"CAO_TERMINAL_ID": terminal_id}
-            )
+            window = session.new_window(window_name=window_name)
 
             logger.info(f"Created window '{window.name}' in session '{session_name}'")
             window_name_result = window.name
@@ -131,10 +129,11 @@ class TmuxClient:
             if not window:
                 raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
 
-            # Use cmd to run capture-pane with -e (escape sequences) and -p (print) flags
+            # Use cmd to run capture-pane with -p (print) flag
+            # Note: -e (escape sequences) requires tmux 2.6+, skip for older versions
             pane = window.panes[0]
             lines = tail_lines if tail_lines is not None else TMUX_HISTORY_LINES
-            result = pane.cmd("capture-pane", "-e", "-p", "-S", f"-{lines}")
+            result = pane.cmd("capture-pane", "-p", "-S", f"-{lines}")
             # Join all lines with newlines to get complete output
             return "\n".join(result.stdout) if result.stdout else ""
         except Exception as e:

@@ -1,5 +1,5 @@
-import { useState } from 'react'
-import { useStore, Task, Session } from '../store'
+import { useState, useEffect } from 'react'
+import { useStore } from '../store'
 import { api } from '../api'
 
 const P: Record<number, string> = { 1: 'bg-red-600', 2: 'bg-yellow-600', 3: 'bg-blue-600' }
@@ -9,22 +9,70 @@ export function BeadsPanel() {
   const { tasks, setTasks, sessions } = useStore()
   const [showAdd, setShowAdd] = useState(false)
   const [title, setTitle] = useState('')
+  const [description, setDescription] = useState('')
   const [priority, setPriority] = useState(2)
-  const [assignTo, setAssignTo] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
 
-  const refresh = () => api.tasks.list().then(setTasks)
+  const refresh = async () => {
+    try {
+      const list = await api.tasks.list()
+      setTasks(list)
+      setError(null)
+    } catch (e) {
+      setError('Failed to load tasks')
+    }
+  }
+
+  useEffect(() => { refresh() }, [])
 
   const addTask = async () => {
     if (!title.trim()) return
-    await api.tasks.create({ title, priority })
-    setTitle('')
-    setShowAdd(false)
-    refresh()
+    try {
+      await api.tasks.create({ title, description, priority })
+      setTitle('')
+      setDescription('')
+      setShowAdd(false)
+      refresh()
+    } catch (e) {
+      setError('Failed to create task')
+    }
   }
 
-  const assign = async (taskId: string, sessionId: string) => {
-    await api.tasks.assign(taskId, sessionId)
-    refresh()
+  const deleteTask = async (id: string) => {
+    if (!confirm('Delete this task?')) return
+    try {
+      await api.tasks.delete(id)
+      refresh()
+    } catch (e) {
+      setError('Failed to delete task')
+    }
+  }
+
+  const markWip = async (id: string) => {
+    try {
+      await api.tasks.wip(id)
+      refresh()
+    } catch (e) {
+      setError('Failed to update task')
+    }
+  }
+
+  const markClose = async (id: string) => {
+    try {
+      await api.tasks.close(id)
+      refresh()
+    } catch (e) {
+      setError('Failed to close task')
+    }
+  }
+
+  const assignTask = async (taskId: string, sessionId: string) => {
+    try {
+      await api.tasks.assign(taskId, sessionId)
+      refresh()
+    } catch (e) {
+      setError('Failed to assign task')
+    }
   }
 
   const grouped = {
@@ -37,86 +85,125 @@ export function BeadsPanel() {
     <div className="bg-gray-800 rounded p-4">
       <div className="flex justify-between mb-3">
         <h2 className="font-bold">📋 BEADS QUEUE</h2>
-        <button onClick={() => setShowAdd(!showAdd)} className="px-2 text-sm bg-gray-700 rounded">
-          {showAdd ? '×' : '+ Add'}
-        </button>
+        <div className="flex gap-1">
+          <button onClick={refresh} className="px-2 text-sm bg-gray-700 rounded hover:bg-gray-600">↻</button>
+          <button onClick={() => setShowAdd(!showAdd)} className="px-2 text-sm bg-gray-700 rounded hover:bg-gray-600">
+            {showAdd ? '×' : '+ Add'}
+          </button>
+        </div>
       </div>
 
+      {error && (
+        <div className="mb-2 p-2 bg-red-900 border border-red-600 rounded text-sm text-red-200">
+          {error}
+          <button onClick={() => setError(null)} className="ml-2 text-red-400">×</button>
+        </div>
+      )}
+
       {showAdd && (
-        <div className="mb-3 p-2 bg-gray-700 rounded space-y-2">
+        <div className="mb-3 p-3 bg-gray-700 rounded space-y-2">
           <input
             value={title}
             onChange={(e) => setTitle(e.target.value)}
             placeholder="Task title..."
-            className="w-full px-2 py-1 bg-gray-800 rounded text-sm"
+            className="w-full px-2 py-1 bg-gray-800 rounded text-sm border border-gray-600 focus:border-blue-500 outline-none"
+            autoFocus
           />
-          <div className="flex gap-2">
+          <textarea
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            placeholder="Description (optional)..."
+            className="w-full px-2 py-1 bg-gray-800 rounded text-sm border border-gray-600 focus:border-blue-500 outline-none resize-none"
+            rows={2}
+          />
+          <div className="flex gap-2 items-center">
+            <span className="text-xs text-gray-400">Priority:</span>
             {[1, 2, 3].map(p => (
               <button
                 key={p}
                 onClick={() => setPriority(p)}
-                className={`px-2 py-1 rounded text-xs ${priority === p ? P[p] : 'bg-gray-600'}`}
+                className={`px-3 py-1 rounded text-xs font-bold ${priority === p ? P[p] : 'bg-gray-600 hover:bg-gray-500'}`}
               >
                 P{p}
               </button>
             ))}
-            <button onClick={addTask} className="ml-auto px-2 py-1 bg-green-600 rounded text-xs">Add</button>
+            <button 
+              onClick={addTask} 
+              disabled={!title.trim()}
+              className="ml-auto px-3 py-1 bg-green-600 hover:bg-green-500 disabled:opacity-50 disabled:cursor-not-allowed rounded text-xs font-bold"
+            >
+              Create Task
+            </button>
           </div>
         </div>
       )}
 
-      <div className="space-y-1 max-h-64 overflow-y-auto">
-        {['open', 'wip', 'closed'].map(status => (
-          grouped[status as keyof typeof grouped].map(task => (
-            <div key={task.id} className="flex items-center gap-2 p-2 bg-gray-700 rounded text-sm group">
-              <span className={`w-5 h-5 rounded text-xs flex items-center justify-center ${P[task.priority]}`}>
-                P{task.priority}
-              </span>
-              <span className="text-gray-400">{S[task.status]}</span>
-              <span className="flex-1 truncate">{task.title}</span>
-              {task.assignee && <span className="text-xs text-gray-400">→ {task.assignee}</span>}
-              
-              {task.status === 'open' && sessions.length > 0 && (
-                <div className="hidden group-hover:flex gap-1">
-                  {sessions.slice(0, 3).map(s => (
-                    <button
-                      key={s.id}
-                      onClick={() => assign(task.id, s.id)}
-                      className="px-1 text-xs bg-blue-600 rounded"
-                      title={`Assign to ${s.id}`}
-                    >
-                      →{s.id.slice(-4)}
-                    </button>
-                  ))}
-                </div>
-              )}
-              
-              {task.status === 'open' && (
-                <button
-                  onClick={() => api.tasks.wip(task.id).then(refresh)}
-                  className="hidden group-hover:block px-1 text-xs bg-yellow-600 rounded"
-                >
-                  WIP
-                </button>
-              )}
-              {task.status === 'wip' && (
-                <button
-                  onClick={() => api.tasks.close(task.id).then(refresh)}
-                  className="hidden group-hover:block px-1 text-xs bg-green-600 rounded"
-                >
-                  Done
-                </button>
-              )}
-              <button
-                onClick={() => api.tasks.delete(task.id).then(refresh)}
-                className="hidden group-hover:block px-1 text-xs bg-red-600 rounded"
-              >
-                ×
-              </button>
-            </div>
-          ))
-        ))}
-        {tasks.length === 0 && <div className="text-gray-500 text-sm">No tasks</div>}
+      <div className="space-y-1 max-h-72 overflow-y-auto">
+        {tasks.length === 0 ? (
+          <div className="text-gray-500 text-sm text-center py-4">No tasks - click "+ Add" to create one</div>
+        ) : (
+          ['open', 'wip', 'closed'].map(status => 
+            grouped[status as keyof typeof grouped].length > 0 && (
+              <div key={status}>
+                <div className="text-xs text-gray-500 uppercase mt-2 mb-1">{status} ({grouped[status as keyof typeof grouped].length})</div>
+                {grouped[status as keyof typeof grouped].map(task => (
+                  <div key={task.id} className="flex items-center gap-2 p-2 bg-gray-700 rounded text-sm group hover:bg-gray-650">
+                    <span className={`w-6 h-6 rounded text-xs flex items-center justify-center font-bold ${P[task.priority]}`}>
+                      P{task.priority}
+                    </span>
+                    <span className="text-gray-400 w-4">{S[task.status]}</span>
+                    <div className="flex-1 min-w-0">
+                      <div className="truncate">{task.title}</div>
+                      {task.assignee && <div className="text-xs text-gray-400">→ {task.assignee}</div>}
+                    </div>
+                    
+                    <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                      {task.status === 'open' && sessions.length > 0 && (
+                        <select
+                          onChange={(e) => e.target.value && assignTask(task.id, e.target.value)}
+                          className="px-1 py-0.5 text-xs bg-blue-600 rounded cursor-pointer"
+                          defaultValue=""
+                        >
+                          <option value="" disabled>Assign→</option>
+                          {sessions.map(s => (
+                            <option key={s.id} value={s.id}>{s.id.slice(-8)}</option>
+                          ))}
+                        </select>
+                      )}
+                      
+                      {task.status === 'open' && (
+                        <button
+                          onClick={() => markWip(task.id)}
+                          className="px-2 py-0.5 text-xs bg-yellow-600 hover:bg-yellow-500 rounded"
+                        >
+                          WIP
+                        </button>
+                      )}
+                      {task.status === 'wip' && (
+                        <button
+                          onClick={() => markClose(task.id)}
+                          className="px-2 py-0.5 text-xs bg-green-600 hover:bg-green-500 rounded"
+                        >
+                          Done
+                        </button>
+                      )}
+                      <button
+                        onClick={() => deleteTask(task.id)}
+                        className="px-2 py-0.5 text-xs bg-red-600 hover:bg-red-500 rounded"
+                      >
+                        ×
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )
+          )
+        )}
+      </div>
+
+      <div className="mt-2 text-xs text-gray-500">
+        {tasks.filter(t => t.status === 'open').length} open · {tasks.filter(t => t.status === 'wip').length} in progress · {tasks.filter(t => t.status === 'closed').length} closed
       </div>
     </div>
   )

@@ -6,7 +6,8 @@ export interface Task {
 }
 
 export interface Agent { 
-  name: string; description: string; path: string; last_modified?: string 
+  name: string; description: string; path: string; last_modified?: string
+  steering?: string; config?: Record<string, unknown>
 }
 
 export interface Session { 

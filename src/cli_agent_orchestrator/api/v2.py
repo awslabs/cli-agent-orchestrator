@@ -35,7 +35,7 @@ class AgentCreate(BaseModel):
 
 class SessionCreate(BaseModel):
     agent_name: str
-    provider: str = "kiro-cli"
+    provider: str = "kiro_cli"
 
 
 class BeadAssign(BaseModel):
@@ -62,16 +62,17 @@ def discover_agents() -> List[Dict]:
     agents = []
     if KIRO_AGENTS_DIR.exists():
         for f in KIRO_AGENTS_DIR.iterdir():
-            if f.suffix == ".md":
-                name = f.stem
-                content = f.read_text()
-                desc = content.split("\n")[0][:100] if content else ""
-                agents.append({
-                    "name": name,
-                    "description": desc,
-                    "path": str(f),
-                    "last_modified": datetime.fromtimestamp(f.stat().st_mtime).isoformat()
-                })
+            if f.suffix == ".json" and not f.name.endswith(".bak"):
+                try:
+                    data = json.loads(f.read_text())
+                    agents.append({
+                        "name": data.get("name", f.stem),
+                        "description": data.get("description", ""),
+                        "path": str(f),
+                        "last_modified": datetime.fromtimestamp(f.stat().st_mtime).isoformat()
+                    })
+                except:
+                    pass
     return agents
 
 
@@ -137,14 +138,34 @@ async def create_agent(req: AgentCreate):
 @router.get("/agents/{name}")
 async def get_agent(name: str):
     """Get agent details."""
-    path = KIRO_AGENTS_DIR / f"{name}.md"
-    if not path.exists():
+    # Try .json first (standard format), then .md
+    json_path = KIRO_AGENTS_DIR / f"{name}.json"
+    md_path = KIRO_AGENTS_DIR / f"{name}.md"
+    
+    if json_path.exists():
+        try:
+            data = json.loads(json_path.read_text())
+            # Also try to load steering file
+            steering_path = Path.home() / ".kiro" / "steering" / f"{name}.md"
+            steering = steering_path.read_text() if steering_path.exists() else None
+            return {
+                "name": data.get("name", name),
+                "description": data.get("description", ""),
+                "path": str(json_path),
+                "config": data,
+                "steering": steering
+            }
+        except Exception as e:
+            raise HTTPException(500, f"Failed to read agent: {e}")
+    elif md_path.exists():
+        return {
+            "name": name,
+            "description": "",
+            "path": str(md_path),
+            "steering": md_path.read_text()
+        }
+    else:
         raise HTTPException(404, "Agent not found")
-    return {
-        "name": name,
-        "content": path.read_text(),
-        "path": str(path)
-    }
 
 
 @router.put("/agents/{name}")
@@ -161,11 +182,17 @@ async def update_agent(name: str, req: AgentCreate):
 @router.delete("/agents/{name}")
 async def delete_agent(name: str):
     """Delete agent profile."""
-    path = KIRO_AGENTS_DIR / f"{name}.md"
-    if not path.exists():
+    json_path = KIRO_AGENTS_DIR / f"{name}.json"
+    md_path = KIRO_AGENTS_DIR / f"{name}.md"
+    
+    if json_path.exists():
+        json_path.unlink()
+        return {"success": True}
+    elif md_path.exists():
+        md_path.unlink()
+        return {"success": True}
+    else:
         raise HTTPException(404, "Agent not found")
-    path.unlink()
-    return {"success": True}
 
 
 # --- Sessions API ---
