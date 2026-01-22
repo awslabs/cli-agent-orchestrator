@@ -6,9 +6,9 @@ export function RalphPanel() {
   const refresh = () => api.ralph.status().then(r => setRalph(r.active ? r : null))
   const start = async () => {
     const prompt = window.prompt('Ralph prompt:')
-    if (prompt) { await api.ralph.start({ prompt }); refresh(); addActivity('Ralph loop started') }
+    if (prompt) { await api.ralph.start({ prompt }); refresh(); addActivity({ type: 'ralph_started', timestamp: new Date().toISOString() }) }
   }
-  const stop = async () => { await api.ralph.stop(); refresh(); addActivity('Ralph loop stopped') }
+  const stop = async () => { await api.ralph.stop(); refresh(); addActivity({ type: 'ralph_stopped', timestamp: new Date().toISOString() }) }
 
   const pct = ralph ? (ralph.iteration / ralph.maxIterations) * 100 : 0
 

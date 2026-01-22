@@ -124,7 +124,9 @@ app.add_middleware(
 
 # Include web dashboard routes
 from cli_agent_orchestrator.api.web import router as web_router
+from cli_agent_orchestrator.api.v2 import router as v2_router
 app.include_router(web_router, prefix="/api")
+app.include_router(v2_router, prefix="/api")
 
 
 @app.get("/health")

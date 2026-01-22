@@ -1,0 +1,515 @@
+"""V2 API routes for CAO Web UI - Sessions, Agents, Activity, Learning."""
+import asyncio
+import json
+import os
+import re
+from pathlib import Path
+from typing import Dict, List, Optional, Set
+from datetime import datetime
+
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
+
+from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.clients.beads import BeadsClient
+from cli_agent_orchestrator.constants import KIRO_AGENTS_DIR, SESSION_PREFIX
+from cli_agent_orchestrator.services import terminal_service, session_service
+from cli_agent_orchestrator.providers.manager import provider_manager
+
+router = APIRouter(prefix="/v2")
+beads = BeadsClient()
+
+# WebSocket connections for terminal streaming
+terminal_streams: Dict[str, Set[WebSocket]] = {}
+activity_streams: Set[WebSocket] = set()
+
+# Activity log (in-memory, recent 500 entries)
+activity_log: List[Dict] = []
+
+
+class AgentCreate(BaseModel):
+    name: str
+    description: str = ""
+    steering: str = ""
+
+
+class SessionCreate(BaseModel):
+    agent_name: str
+    provider: str = "kiro-cli"
+
+
+class BeadAssign(BaseModel):
+    session_id: str
+
+
+class AutoModeToggle(BaseModel):
+    enabled: bool
+
+
+class ContextProposal(BaseModel):
+    agent_name: str
+    changes: str
+    reason: str
+
+
+class ChatDecompose(BaseModel):
+    text: str
+
+
+# --- Agent Discovery ---
+def discover_agents() -> List[Dict]:
+    """Discover agents from ~/.kiro/agents/"""
+    agents = []
+    if KIRO_AGENTS_DIR.exists():
+        for f in KIRO_AGENTS_DIR.iterdir():
+            if f.suffix == ".md":
+                name = f.stem
+                content = f.read_text()
+                desc = content.split("\n")[0][:100] if content else ""
+                agents.append({
+                    "name": name,
+                    "description": desc,
+                    "path": str(f),
+                    "last_modified": datetime.fromtimestamp(f.stat().st_mtime).isoformat()
+                })
+    return agents
+
+
+def detect_session_status(output: str) -> str:
+    """Detect session status from terminal output."""
+    lines = output.strip().split("\n")[-50:]
+    text = "\n".join(lines).lower()
+    
+    # Check for waiting input patterns
+    if re.search(r"(waiting for|enter your|type your|what would you|how can i help)", text):
+        return "WAITING_INPUT"
+    if re.search(r"(error|exception|failed|traceback)", text):
+        return "ERROR"
+    if re.search(r"(processing|working|analyzing|reading|writing)", text):
+        return "PROCESSING"
+    return "IDLE"
+
+
+def extract_activity(output: str, session_id: str) -> List[Dict]:
+    """Extract activity entries from terminal output."""
+    entries = []
+    lines = output.split("\n")
+    
+    for line in lines[-100:]:
+        if "<invoke" in line:
+            match = re.search(r'name="([^"]+)"', line)
+            if match:
+                entries.append({
+                    "type": "tool_call",
+                    "tool": match.group(1),
+                    "session_id": session_id,
+                    "timestamp": datetime.now().isoformat()
+                })
+        elif re.search(r"(fs_write|fs_read|execute_bash)", line):
+            entries.append({
+                "type": "file_op",
+                "detail": line[:100],
+                "session_id": session_id,
+                "timestamp": datetime.now().isoformat()
+            })
+    return entries
+
+
+# --- Agents API ---
+@router.get("/agents")
+async def list_agents():
+    """List available agents from ~/.kiro/agents/"""
+    return discover_agents()
+
+
+@router.post("/agents", status_code=201)
+async def create_agent(req: AgentCreate):
+    """Create new agent profile."""
+    KIRO_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+    path = KIRO_AGENTS_DIR / f"{req.name}.md"
+    if path.exists():
+        raise HTTPException(400, "Agent already exists")
+    content = f"# {req.name}\n\n{req.description}\n\n{req.steering}"
+    path.write_text(content)
+    return {"name": req.name, "path": str(path)}
+
+
+@router.get("/agents/{name}")
+async def get_agent(name: str):
+    """Get agent details."""
+    path = KIRO_AGENTS_DIR / f"{name}.md"
+    if not path.exists():
+        raise HTTPException(404, "Agent not found")
+    return {
+        "name": name,
+        "content": path.read_text(),
+        "path": str(path)
+    }
+
+
+@router.put("/agents/{name}")
+async def update_agent(name: str, req: AgentCreate):
+    """Update agent profile."""
+    path = KIRO_AGENTS_DIR / f"{name}.md"
+    if not path.exists():
+        raise HTTPException(404, "Agent not found")
+    content = f"# {req.name}\n\n{req.description}\n\n{req.steering}"
+    path.write_text(content)
+    return {"name": name, "path": str(path)}
+
+
+@router.delete("/agents/{name}")
+async def delete_agent(name: str):
+    """Delete agent profile."""
+    path = KIRO_AGENTS_DIR / f"{name}.md"
+    if not path.exists():
+        raise HTTPException(404, "Agent not found")
+    path.unlink()
+    return {"success": True}
+
+
+# --- Sessions API ---
+@router.get("/sessions")
+async def list_sessions():
+    """List active sessions with status."""
+    sessions = session_service.list_sessions()
+    result = []
+    for s in sessions:
+        try:
+            data = session_service.get_session(s["id"])
+            status = "IDLE"
+            if data.get("terminals"):
+                term = data["terminals"][0]
+                try:
+                    output = terminal_service.get_output(term["id"])
+                    status = detect_session_status(output)
+                except:
+                    pass
+            result.append({**s, "status": status, "terminals": data.get("terminals", [])})
+        except:
+            result.append({**s, "status": "ERROR", "terminals": []})
+    return result
+
+
+@router.post("/sessions", status_code=201)
+async def create_session(req: SessionCreate):
+    """Spawn new agent session."""
+    terminal = terminal_service.create_terminal(
+        provider=req.provider,
+        agent_profile=req.agent_name,
+        new_session=True
+    )
+    await broadcast_activity({
+        "type": "session_started",
+        "session_id": terminal.session_name,
+        "agent": req.agent_name,
+        "timestamp": datetime.now().isoformat()
+    })
+    return {
+        "id": terminal.session_name,
+        "terminal_id": terminal.id,
+        "agent": req.agent_name,
+        "status": "IDLE"
+    }
+
+
+@router.get("/sessions/{session_id}")
+async def get_session(session_id: str):
+    """Get session details with status."""
+    try:
+        data = session_service.get_session(session_id)
+        status = "IDLE"
+        if data.get("terminals"):
+            term = data["terminals"][0]
+            try:
+                output = terminal_service.get_output(term["id"])
+                status = detect_session_status(output)
+            except:
+                pass
+        return {**data, "status": status}
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@router.delete("/sessions/{session_id}")
+async def delete_session(session_id: str):
+    """Terminate session."""
+    try:
+        session_service.delete_session(session_id)
+        await broadcast_activity({
+            "type": "session_ended",
+            "session_id": session_id,
+            "timestamp": datetime.now().isoformat()
+        })
+        return {"success": True}
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@router.post("/sessions/{session_id}/input")
+async def send_input(session_id: str, message: str):
+    """Send input to session."""
+    try:
+        data = session_service.get_session(session_id)
+        if not data.get("terminals"):
+            raise HTTPException(404, "No terminal in session")
+        term_id = data["terminals"][0]["id"]
+        terminal_service.send_input(term_id, message)
+        return {"success": True}
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@router.get("/sessions/{session_id}/output")
+async def get_output(session_id: str, lines: int = 200):
+    """Get terminal output."""
+    try:
+        data = session_service.get_session(session_id)
+        if not data.get("terminals"):
+            raise HTTPException(404, "No terminal in session")
+        term_id = data["terminals"][0]["id"]
+        output = terminal_service.get_output(term_id)
+        return {"output": output, "status": detect_session_status(output)}
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+# --- WebSocket Streaming ---
+@router.websocket("/sessions/{session_id}/stream")
+async def stream_terminal(ws: WebSocket, session_id: str):
+    """WebSocket for live terminal output."""
+    await ws.accept()
+    if session_id not in terminal_streams:
+        terminal_streams[session_id] = set()
+    terminal_streams[session_id].add(ws)
+    
+    try:
+        # Get initial output
+        data = session_service.get_session(session_id)
+        if data.get("terminals"):
+            term_id = data["terminals"][0]["id"]
+            last_len = 0
+            while True:
+                try:
+                    output = terminal_service.get_output(term_id)
+                    if len(output) > last_len:
+                        new_content = output[last_len:]
+                        await ws.send_json({
+                            "type": "output",
+                            "data": new_content,
+                            "status": detect_session_status(output)
+                        })
+                        last_len = len(output)
+                    await asyncio.sleep(0.5)
+                except:
+                    break
+    except WebSocketDisconnect:
+        pass
+    finally:
+        terminal_streams.get(session_id, set()).discard(ws)
+
+
+# --- Activity Feed ---
+async def broadcast_activity(entry: Dict):
+    """Broadcast activity to all connected clients."""
+    activity_log.insert(0, entry)
+    if len(activity_log) > 500:
+        activity_log.pop()
+    
+    msg = json.dumps(entry)
+    for ws in list(activity_streams):
+        try:
+            await ws.send_text(msg)
+        except:
+            activity_streams.discard(ws)
+
+
+@router.get("/activity")
+async def get_activity(session_id: Optional[str] = None, limit: int = 50):
+    """Get activity feed."""
+    entries = activity_log
+    if session_id:
+        entries = [e for e in entries if e.get("session_id") == session_id]
+    return entries[:limit]
+
+
+@router.websocket("/activity/stream")
+async def stream_activity(ws: WebSocket):
+    """WebSocket for live activity feed."""
+    await ws.accept()
+    activity_streams.add(ws)
+    try:
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        activity_streams.discard(ws)
+
+
+# --- Beads with Assignment ---
+@router.post("/beads/{bead_id}/assign")
+async def assign_bead(bead_id: str, req: BeadAssign):
+    """Assign bead to session."""
+    task = beads.get(bead_id)
+    if not task:
+        raise HTTPException(404, "Bead not found")
+    
+    # Update assignee
+    task = beads.wip(bead_id, req.session_id)
+    
+    # Send task to session
+    try:
+        data = session_service.get_session(req.session_id)
+        if data.get("terminals"):
+            term_id = data["terminals"][0]["id"]
+            prompt = f"Work on this task: {task.title}\n\n{task.description}"
+            terminal_service.send_input(term_id, prompt)
+    except:
+        pass
+    
+    await broadcast_activity({
+        "type": "bead_assigned",
+        "bead_id": bead_id,
+        "session_id": req.session_id,
+        "timestamp": datetime.now().isoformat()
+    })
+    return task.__dict__
+
+
+# --- Auto-mode (stored per-session in memory) ---
+auto_mode_sessions: Set[str] = set()
+
+
+@router.post("/sessions/{session_id}/auto-mode")
+async def toggle_auto_mode(session_id: str, req: AutoModeToggle):
+    """Toggle auto-mode for session."""
+    if req.enabled:
+        auto_mode_sessions.add(session_id)
+    else:
+        auto_mode_sessions.discard(session_id)
+    return {"session_id": session_id, "auto_mode": req.enabled}
+
+
+@router.get("/sessions/{session_id}/auto-mode")
+async def get_auto_mode(session_id: str):
+    """Get auto-mode status."""
+    return {"session_id": session_id, "auto_mode": session_id in auto_mode_sessions}
+
+
+# --- Context Learning ---
+context_proposals: List[Dict] = []
+
+
+def analyze_session_output(output: str) -> Dict:
+    """Analyze session output to extract learnings."""
+    learnings = {"tools_used": [], "errors": [], "patterns": [], "files_modified": []}
+    
+    # Extract tool calls
+    for match in re.finditer(r'<invoke name="([^"]+)"', output):
+        tool = match.group(1)
+        if tool not in learnings["tools_used"]:
+            learnings["tools_used"].append(tool)
+    
+    # Extract errors
+    for match in re.finditer(r'(error|exception|failed|traceback)[:\s]+([^\n]+)', output, re.I):
+        learnings["errors"].append(match.group(2)[:100])
+    
+    # Extract file paths
+    for match in re.finditer(r'(?:fs_write|fs_read|modified|created)[:\s]+([^\s\n]+\.\w+)', output, re.I):
+        path = match.group(1)
+        if path not in learnings["files_modified"]:
+            learnings["files_modified"].append(path)
+    
+    # Detect patterns
+    if "retry" in output.lower() or "again" in output.lower():
+        learnings["patterns"].append("Required retries - consider adding error handling guidance")
+    if len(learnings["tools_used"]) > 5:
+        learnings["patterns"].append("Heavy tool usage - agent is thorough")
+    if learnings["errors"]:
+        learnings["patterns"].append("Encountered errors - may need better error recovery")
+    
+    return learnings
+
+
+@router.post("/learn/{session_id}")
+async def trigger_learning(session_id: str):
+    """Trigger context learning for completed session."""
+    try:
+        data = session_service.get_session(session_id)
+        if not data.get("terminals"):
+            raise HTTPException(404, "No terminal in session")
+        
+        term_id = data["terminals"][0]["id"]
+        output = terminal_service.get_output(term_id)
+        
+        # Analyze output for learnings
+        learnings = analyze_session_output(output)
+        
+        # Generate meaningful changes based on analysis
+        changes = []
+        if learnings["errors"]:
+            changes.append(f"Add error handling for: {', '.join(learnings['errors'][:3])}")
+        if learnings["patterns"]:
+            changes.extend(learnings["patterns"])
+        if learnings["tools_used"]:
+            changes.append(f"Frequently used tools: {', '.join(learnings['tools_used'][:5])}")
+        
+        proposal = {
+            "id": f"prop-{len(context_proposals)}",
+            "session_id": session_id,
+            "agent_name": data["terminals"][0].get("agent_profile", "unknown"),
+            "changes": "\n".join(changes) if changes else "No significant learnings extracted",
+            "reason": f"Analyzed {len(output)} chars, found {len(learnings['tools_used'])} tools, {len(learnings['errors'])} errors",
+            "learnings": learnings,
+            "status": "pending",
+            "created_at": datetime.now().isoformat()
+        }
+        context_proposals.append(proposal)
+        return proposal
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@router.get("/learn/proposals")
+async def list_proposals(status: Optional[str] = None):
+    """List context update proposals."""
+    if status:
+        return [p for p in context_proposals if p["status"] == status]
+    return context_proposals
+
+
+@router.post("/learn/proposals/{proposal_id}/approve")
+async def approve_proposal(proposal_id: str):
+    """Approve context update."""
+    for p in context_proposals:
+        if p["id"] == proposal_id:
+            p["status"] = "approved"
+            return p
+    raise HTTPException(404, "Proposal not found")
+
+
+@router.post("/learn/proposals/{proposal_id}/reject")
+async def reject_proposal(proposal_id: str):
+    """Reject context update."""
+    for p in context_proposals:
+        if p["id"] == proposal_id:
+            p["status"] = "rejected"
+            return p
+    raise HTTPException(404, "Proposal not found")
+
+
+# --- Chat Bar / Task Decomposition ---
+@router.post("/beads/decompose")
+async def decompose_tasks(req: ChatDecompose):
+    """Decompose text into multiple beads (simplified)."""
+    # Simple decomposition - split by newlines or numbered items
+    lines = [l.strip() for l in req.text.split("\n") if l.strip()]
+    tasks = []
+    
+    for line in lines:
+        # Remove numbering
+        clean = re.sub(r"^\d+[\.\)]\s*", "", line)
+        if clean and len(clean) > 3:
+            task = beads.add(clean, "", 2)
+            tasks.append(task.__dict__)
+    
+    return {"tasks": tasks, "count": len(tasks)}

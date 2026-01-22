@@ -1,4 +1,4 @@
-import { useStore, Task } from '../store'
+import { useStore, Task, Activity } from '../store'
 import { api } from '../api'
 
 const P = { 1: 'bg-red-600', 2: 'bg-yellow-600', 3: 'bg-blue-600' } as const
@@ -9,10 +9,10 @@ export function TaskPanel() {
   const refresh = () => api.tasks.list().then(setTasks)
   const add = async () => {
     const title = prompt('Task title:')
-    if (title) { await api.tasks.create({ title }); refresh(); addActivity(`Task added: ${title}`) }
+    if (title) { await api.tasks.create({ title }); refresh(); addActivity({ type: 'task_created', timestamp: new Date().toISOString(), detail: title }) }
   }
-  const wip = async (t: Task) => { await api.tasks.wip(t.id); refresh(); addActivity(`Task WIP: ${t.title}`) }
-  const close = async (t: Task) => { await api.tasks.close(t.id); refresh(); addActivity(`Task closed: ${t.title}`) }
+  const wip = async (t: Task) => { await api.tasks.wip(t.id); refresh(); addActivity({ type: 'task_wip', timestamp: new Date().toISOString(), detail: t.title }) }
+  const close = async (t: Task) => { await api.tasks.close(t.id); refresh(); addActivity({ type: 'task_closed', timestamp: new Date().toISOString(), detail: t.title }) }
 
   return (
     <div className="bg-gray-800 rounded p-4">

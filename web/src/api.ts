@@ -1,17 +1,79 @@
 const API = '/api'
 
 export const api = {
+  // V2 Agents
+  agents: {
+    list: () => fetch(`${API}/v2/agents`).then(r => r.json()),
+    get: (name: string) => fetch(`${API}/v2/agents/${name}`).then(r => r.json()),
+    create: (data: { name: string; description?: string; steering?: string }) => 
+      fetch(`${API}/v2/agents`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(r => r.json()),
+    update: (name: string, data: { name: string; description?: string; steering?: string }) =>
+      fetch(`${API}/v2/agents/${name}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(r => r.json()),
+    delete: (name: string) => fetch(`${API}/v2/agents/${name}`, { method: 'DELETE' })
+  },
+
+  // V2 Sessions
+  sessions: {
+    list: () => fetch(`${API}/v2/sessions`).then(r => r.json()),
+    get: (id: string) => fetch(`${API}/v2/sessions/${id}`).then(r => r.json()),
+    create: (data: { agent_name: string; provider?: string }) =>
+      fetch(`${API}/v2/sessions`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(r => r.json()),
+    delete: (id: string) => fetch(`${API}/v2/sessions/${id}`, { method: 'DELETE' }),
+    input: (id: string, message: string) =>
+      fetch(`${API}/v2/sessions/${id}/input?message=${encodeURIComponent(message)}`, { method: 'POST' }),
+    output: (id: string) => fetch(`${API}/v2/sessions/${id}/output`).then(r => r.json()),
+    autoMode: (id: string, enabled: boolean) =>
+      fetch(`${API}/v2/sessions/${id}/auto-mode`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }) }).then(r => r.json())
+  },
+
+  // V2 Activity
+  activity: {
+    list: (sessionId?: string) => fetch(`${API}/v2/activity${sessionId ? `?session_id=${sessionId}` : ''}`).then(r => r.json())
+  },
+
+  // Beads (Tasks)
   tasks: {
     list: () => fetch(`${API}/tasks`).then(r => r.json()),
-    create: (data: { title: string; priority?: number }) => fetch(`${API}/tasks`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(r => r.json()),
+    get: (id: string) => fetch(`${API}/tasks/${id}`).then(r => r.json()),
+    create: (data: { title: string; description?: string; priority?: number }) => 
+      fetch(`${API}/tasks`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(r => r.json()),
+    update: (id: string, data: Partial<{ title: string; description: string; priority: number; status: string }>) =>
+      fetch(`${API}/tasks/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(r => r.json()),
     wip: (id: string) => fetch(`${API}/tasks/${id}/wip`, { method: 'POST' }).then(r => r.json()),
     close: (id: string) => fetch(`${API}/tasks/${id}/close`, { method: 'POST' }).then(r => r.json()),
-    delete: (id: string) => fetch(`${API}/tasks/${id}`, { method: 'DELETE' })
+    delete: (id: string) => fetch(`${API}/tasks/${id}`, { method: 'DELETE' }),
+    assign: (id: string, sessionId: string) =>
+      fetch(`${API}/v2/beads/${id}/assign`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session_id: sessionId }) }).then(r => r.json()),
+    decompose: (text: string) =>
+      fetch(`${API}/v2/beads/decompose`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) }).then(r => r.json())
   },
+
+  // Context Learning
+  learn: {
+    trigger: (sessionId: string) => fetch(`${API}/v2/learn/${sessionId}`, { method: 'POST' }).then(r => r.json()),
+    proposals: () => fetch(`${API}/v2/learn/proposals`).then(r => r.json()),
+    approve: (id: string) => fetch(`${API}/v2/learn/proposals/${id}/approve`, { method: 'POST' }).then(r => r.json()),
+    reject: (id: string) => fetch(`${API}/v2/learn/proposals/${id}/reject`, { method: 'POST' }).then(r => r.json())
+  },
+
+  // Ralph
   ralph: {
     status: () => fetch(`${API}/ralph`).then(r => r.json()),
-    start: (data: { prompt: string; min_iterations?: number; max_iterations?: number }) => fetch(`${API}/ralph`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(r => r.json()),
+    start: (data: { prompt: string; min_iterations?: number; max_iterations?: number }) => 
+      fetch(`${API}/ralph`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(r => r.json()),
     stop: () => fetch(`${API}/ralph/stop`, { method: 'POST' })
-  },
-  agents: { list: () => fetch('/sessions').then(r => r.json()) }
+  }
+}
+
+// WebSocket helpers
+export function createTerminalStream(sessionId: string, onData: (data: { type: string; data: string; status: string }) => void) {
+  const ws = new WebSocket(`ws://${location.host}/api/v2/sessions/${sessionId}/stream`)
+  ws.onmessage = (e) => onData(JSON.parse(e.data))
+  return ws
+}
+
+export function createActivityStream(onData: (data: unknown) => void) {
+  const ws = new WebSocket(`ws://${location.host}/api/v2/activity/stream`)
+  ws.onmessage = (e) => onData(JSON.parse(e.data))
+  return ws
 }
