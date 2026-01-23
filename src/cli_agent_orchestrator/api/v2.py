@@ -1,6 +1,7 @@
 """V2 API routes for CAO Web UI - Sessions, Agents, Activity, Learning."""
 import asyncio
 import json
+import logging
 import os
 import re
 from pathlib import Path
@@ -8,12 +9,14 @@ from typing import Dict, List, Optional, Set
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+
+logger = logging.getLogger(__name__)
 from pydantic import BaseModel
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.clients.beads import BeadsClient
 from cli_agent_orchestrator.constants import KIRO_AGENTS_DIR, SESSION_PREFIX
-from cli_agent_orchestrator.services import terminal_service, session_service
+from cli_agent_orchestrator.services import terminal_service, session_service, flow_service
 from cli_agent_orchestrator.providers.manager import provider_manager
 
 router = APIRouter(prefix="/v2")
@@ -78,16 +81,25 @@ def discover_agents() -> List[Dict]:
 
 def detect_session_status(output: str) -> str:
     """Detect session status from terminal output."""
-    lines = output.strip().split("\n")[-50:]
-    text = "\n".join(lines).lower()
+    if not output or not output.strip():
+        return "IDLE"
     
-    # Check for waiting input patterns
-    if re.search(r"(waiting for|enter your|type your|what would you|how can i help)", text):
+    lines = output.strip().split("\n")[-20:]  # Only check last 20 lines
+    text = "\n".join(lines)
+    
+    # Check for kiro/agent waiting for input (prompt visible)
+    if re.search(r"(>\s*$|❯\s*$|\$\s*$|waiting for your|enter your response|type your message|how can i help you)", text, re.IGNORECASE):
         return "WAITING_INPUT"
-    if re.search(r"(error|exception|failed|traceback)", text):
-        return "ERROR"
-    if re.search(r"(processing|working|analyzing|reading|writing)", text):
+    
+    # Check for active processing indicators
+    if re.search(r"(thinking\.\.\.|processing\.\.\.|working on|analyzing|reading file|writing to|executing|running)", text, re.IGNORECASE):
         return "PROCESSING"
+    
+    # Only show ERROR for actual Python tracebacks or explicit errors at end of output
+    last_lines = "\n".join(lines[-5:])
+    if re.search(r"(Traceback \(most recent|raise \w+Error|^\s*\w+Error:)", last_lines):
+        return "ERROR"
+    
     return "IDLE"
 
 
@@ -138,22 +150,29 @@ async def create_agent(req: AgentCreate):
 @router.get("/agents/{name}")
 async def get_agent(name: str):
     """Get agent details."""
-    # Try .json first (standard format), then .md
     json_path = KIRO_AGENTS_DIR / f"{name}.json"
     md_path = KIRO_AGENTS_DIR / f"{name}.md"
     
     if json_path.exists():
         try:
             data = json.loads(json_path.read_text())
-            # Also try to load steering file
-            steering_path = Path.home() / ".kiro" / "steering" / f"{name}.md"
-            steering = steering_path.read_text() if steering_path.exists() else None
+            # Load context file from resources
+            context = ""
+            context_path = None
+            resources = data.get("resources", [])
+            for res in resources:
+                if res.startswith("file://") and res.endswith(".md"):
+                    context_path = res.replace("file://", "")
+                    if Path(context_path).exists():
+                        context = Path(context_path).read_text()
+                    break
             return {
                 "name": data.get("name", name),
                 "description": data.get("description", ""),
                 "path": str(json_path),
                 "config": data,
-                "steering": steering
+                "context": context,
+                "context_path": context_path
             }
         except Exception as e:
             raise HTTPException(500, f"Failed to read agent: {e}")
@@ -162,7 +181,8 @@ async def get_agent(name: str):
             "name": name,
             "description": "",
             "path": str(md_path),
-            "steering": md_path.read_text()
+            "context": md_path.read_text(),
+            "context_path": str(md_path)
         }
     else:
         raise HTTPException(404, "Agent not found")
@@ -170,13 +190,26 @@ async def get_agent(name: str):
 
 @router.put("/agents/{name}")
 async def update_agent(name: str, req: AgentCreate):
-    """Update agent profile."""
-    path = KIRO_AGENTS_DIR / f"{name}.md"
-    if not path.exists():
-        raise HTTPException(404, "Agent not found")
-    content = f"# {req.name}\n\n{req.description}\n\n{req.steering}"
-    path.write_text(content)
-    return {"name": name, "path": str(path)}
+    """Update agent context file."""
+    json_path = KIRO_AGENTS_DIR / f"{name}.json"
+    
+    if json_path.exists():
+        data = json.loads(json_path.read_text())
+        resources = data.get("resources", [])
+        for res in resources:
+            if res.startswith("file://") and res.endswith(".md"):
+                context_path = Path(res.replace("file://", ""))
+                context_path.parent.mkdir(parents=True, exist_ok=True)
+                context_path.write_text(req.steering)
+                return {"name": name, "context_path": str(context_path)}
+    
+    # Fallback to md file
+    md_path = KIRO_AGENTS_DIR / f"{name}.md"
+    if md_path.exists():
+        md_path.write_text(req.steering)
+        return {"name": name, "context_path": str(md_path)}
+    
+    raise HTTPException(404, "Agent not found")
 
 
 @router.delete("/agents/{name}")
@@ -205,16 +238,18 @@ async def list_sessions():
         try:
             data = session_service.get_session(s["id"])
             status = "IDLE"
+            agent_name = "unknown"
             if data.get("terminals"):
                 term = data["terminals"][0]
+                agent_name = term.get("agent_profile", "unknown")
                 try:
                     output = terminal_service.get_output(term["id"])
                     status = detect_session_status(output)
                 except:
                     pass
-            result.append({**s, "status": status, "terminals": data.get("terminals", [])})
+            result.append({**s, "status": status, "agent_name": agent_name, "terminals": data.get("terminals", [])})
         except:
-            result.append({**s, "status": "ERROR", "terminals": []})
+            result.append({**s, "status": "ERROR", "agent_name": "unknown", "terminals": []})
     return result
 
 
@@ -263,6 +298,8 @@ async def delete_session(session_id: str):
     """Terminate session."""
     try:
         session_service.delete_session(session_id)
+        # Clear assignee from any beads assigned to this session
+        beads.clear_assignee_by_session(session_id)
         await broadcast_activity({
             "type": "session_ended",
             "session_id": session_id,
@@ -624,6 +661,11 @@ session_positions: Dict[str, Dict[str, float]] = {}
 bead_positions: Dict[str, Dict[str, float]] = {}
 
 
+def clear_bead_position(bead_id: str):
+    """Clear bead position when bead is deleted."""
+    bead_positions.pop(bead_id, None)
+
+
 @router.put("/sessions/{session_id}/position")
 async def update_session_position(session_id: str, pos: PositionUpdate):
     """Save agent/session position on map."""
@@ -709,3 +751,156 @@ async def delete_ralph_loop(loop_id: str):
         "timestamp": datetime.now().isoformat()
     })
     return {"success": True}
+
+
+# --- Flows API ---
+class FlowCreate(BaseModel):
+    name: str
+    schedule: str
+    agent_profile: str
+    prompt: str
+class FlowCreate(BaseModel):
+    name: str
+    schedule: str
+    agent_profile: str
+    prompt: str
+    provider: str = "kiro_cli"
+    script: Optional[str] = None
+
+
+@router.get("/flows")
+async def list_flows():
+    """List all flows."""
+    flows = flow_service.list_flows()
+    return [
+        {
+            "name": f.name,
+            "schedule": f.schedule,
+            "agent_profile": f.agent_profile,
+            "provider": f.provider,
+            "enabled": f.enabled,
+            "next_run": f.next_run.isoformat() if f.next_run else None,
+            "last_run": f.last_run.isoformat() if f.last_run else None,
+        }
+        for f in flows
+    ]
+
+
+@router.post("/flows")
+async def create_flow(req: FlowCreate):
+    """Create a new flow by generating a flow file."""
+    try:
+        # Create flow file in ~/.aws/cli-agent-orchestrator/flows/
+        flows_dir = Path.home() / ".aws" / "cli-agent-orchestrator" / "flows"
+        flows_dir.mkdir(parents=True, exist_ok=True)
+        
+        file_path = flows_dir / f"{req.name}.md"
+        if file_path.exists():
+            raise HTTPException(400, f"Flow '{req.name}' already exists")
+        
+        # Generate flow file content
+        content = f"""---
+name: {req.name}
+schedule: "{req.schedule}"
+agent_profile: {req.agent_profile}
+provider: {req.provider}
+"""
+        if req.script:
+            content += f"script: {req.script}\n"
+        content += f"""---
+
+{req.prompt}
+"""
+        file_path.write_text(content)
+        
+        # Add flow using existing service
+        flow = flow_service.add_flow(str(file_path))
+        
+        await broadcast_activity({
+            "type": "flow_created",
+            "flow_name": req.name,
+            "timestamp": datetime.now().isoformat()
+        })
+        
+        return {
+            "name": flow.name,
+            "schedule": flow.schedule,
+            "agent_profile": flow.agent_profile,
+            "provider": flow.provider,
+            "enabled": flow.enabled,
+            "next_run": flow.next_run.isoformat() if flow.next_run else None,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+
+@router.get("/flows/{name}")
+async def get_flow(name: str):
+    """Get flow details."""
+    try:
+        f = flow_service.get_flow(name)
+        return {
+            "name": f.name,
+            "schedule": f.schedule,
+            "agent_profile": f.agent_profile,
+            "provider": f.provider,
+            "enabled": f.enabled,
+            "next_run": f.next_run.isoformat() if f.next_run else None,
+            "last_run": f.last_run.isoformat() if f.last_run else None,
+            "file_path": f.file_path,
+            "script": f.script,
+        }
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@router.post("/flows/{name}/run")
+async def run_flow(name: str):
+    """Manually trigger a flow."""
+    try:
+        result = flow_service.execute_flow(name)
+        await broadcast_activity({
+            "type": "flow_executed",
+            "flow_name": name,
+            "timestamp": datetime.now().isoformat()
+        })
+        return {"success": True, "executed": result}
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@router.post("/flows/{name}/enable")
+async def enable_flow(name: str):
+    """Enable a flow."""
+    try:
+        flow_service.enable_flow(name)
+        return {"success": True}
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@router.post("/flows/{name}/disable")
+async def disable_flow(name: str):
+    """Disable a flow."""
+    try:
+        flow_service.disable_flow(name)
+        return {"success": True}
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@router.delete("/flows/{name}")
+async def delete_flow(name: str):
+    """Delete a flow."""
+    try:
+        flow_service.remove_flow(name)
+        await broadcast_activity({
+            "type": "flow_deleted",
+            "flow_name": name,
+            "timestamp": datetime.now().isoformat()
+        })
+        return {"success": True}
+    except ValueError as e:
+        raise HTTPException(404, str(e))

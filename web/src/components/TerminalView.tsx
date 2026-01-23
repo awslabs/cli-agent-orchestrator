@@ -6,7 +6,7 @@ import { api } from '../api'
 
 interface Props {
   sessionId: string
-  onStatusChange?: (status: string) => void
+  onStatusChange?: (status: string, contextChars?: number) => void
 }
 
 export function TerminalView({ sessionId, onStatusChange }: Props) {
@@ -14,6 +14,7 @@ export function TerminalView({ sessionId, onStatusChange }: Props) {
   const terminalRef = useRef<Terminal | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
   const lastOutputRef = useRef<string>('')
+  const totalCharsRef = useRef<number>(0)
   const [connected, setConnected] = useState(false)
 
   useEffect(() => {
@@ -62,8 +63,9 @@ export function TerminalView({ sessionId, onStatusChange }: Props) {
       const output = r.output || ''
       terminal.write(output)
       lastOutputRef.current = output
-      onStatusChange?.(r.status)
-    }).catch(() => {})
+      totalCharsRef.current = output.length
+      onStatusChange?.(r.status || 'IDLE', totalCharsRef.current)
+    }).catch(() => onStatusChange?.('IDLE', 0))
 
     // WebSocket for live streaming
     const connectWs = () => {
@@ -76,7 +78,22 @@ export function TerminalView({ sessionId, onStatusChange }: Props) {
           const msg = JSON.parse(e.data)
           if (msg.type === 'output' && msg.data) {
             terminal.write(msg.data)
-            onStatusChange?.(msg.status)
+            totalCharsRef.current += msg.data.length
+            // Detect status from output patterns
+            const data = msg.data as string
+            let detectedStatus = msg.status
+            if (!detectedStatus) {
+              if (data.includes('Thinking') || data.includes('⠋') || data.includes('⠙') || data.includes('⠹') || data.includes('⠸') || data.includes('⠼') || data.includes('⠴') || data.includes('⠦') || data.includes('⠧') || data.includes('⠇') || data.includes('⠏')) {
+                detectedStatus = 'PROCESSING'
+              } else if (data.includes('?') || data.includes('input') || data.includes('Enter')) {
+                detectedStatus = 'WAITING_INPUT'
+              }
+            }
+            if (detectedStatus) {
+              onStatusChange?.(detectedStatus, totalCharsRef.current)
+            } else {
+              onStatusChange?.(undefined as any, totalCharsRef.current)
+            }
           }
         } catch {}
       }
@@ -84,7 +101,10 @@ export function TerminalView({ sessionId, onStatusChange }: Props) {
         setConnected(false)
         setTimeout(connectWs, 1000)
       }
-      ws.onerror = () => setConnected(false)
+      ws.onerror = () => {
+        setConnected(false)
+        onStatusChange?.('ERROR', totalCharsRef.current)
+      }
     }
     connectWs()
 

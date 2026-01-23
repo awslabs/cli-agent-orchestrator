@@ -7,6 +7,7 @@ from pydantic import BaseModel
 
 from cli_agent_orchestrator.clients.beads import BeadsClient, Task
 from cli_agent_orchestrator.clients.ralph import RalphRunner
+from cli_agent_orchestrator.api.v2 import clear_bead_position
 
 router = APIRouter()
 beads = BeadsClient()
@@ -109,8 +110,21 @@ async def close_task(task_id: str):
 async def delete_task(task_id: str):
     if not beads.delete(task_id):
         raise HTTPException(404, "Task not found")
+    clear_bead_position(task_id)
     await broadcast("task_deleted", {"id": task_id})
     return {"success": True}
+
+@router.post("/tasks/unassign-session/{session_id}")
+async def unassign_session_beads(session_id: str):
+    """Unassign all beads from a session (keeps status unchanged)."""
+    tasks_list = beads.list()
+    unassigned = []
+    for task in tasks_list:
+        if task.assignee == session_id:
+            beads.update(task.id, assignee=None)
+            unassigned.append(task.id)
+    await broadcast("tasks_unassigned", {"session_id": session_id, "task_ids": unassigned})
+    return {"unassigned": unassigned}
 
 # Ralph endpoints
 @router.get("/ralph")

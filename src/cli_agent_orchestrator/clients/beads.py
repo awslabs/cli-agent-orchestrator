@@ -121,3 +121,13 @@ class BeadsClient:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(f"UPDATE tasks SET {set_clause} WHERE id = ?", (*updates.values(), task_id))
         return self.get(task_id)
+
+    def clear_assignee_by_session(self, session_id: str) -> int:
+        """Clear assignee from all tasks assigned to a session."""
+        now = datetime.utcnow().isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "UPDATE tasks SET assignee = NULL, status = 'open', updated_at = ? WHERE assignee = ?",
+                (now, session_id)
+            )
+            return cursor.rowcount

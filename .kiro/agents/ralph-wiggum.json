@@ -1,0 +1,14 @@
+{
+  "name": "ralph-wiggum",
+  "description": "Ralph Wiggum iterative loop agent - works on tasks through continuous iteration until completion",
+  "tools": [
+    "*"
+  ],
+  "allowedTools": [
+    "*"
+  ],
+  "resources": [
+    "file://../ralph-loop.local.json"
+  ],
+  "prompt": "file://../steering/ralph-context.md"
+}

@@ -46,6 +46,8 @@ export const api = {
     delete: (id: string) => fetch(`${API}/tasks/${id}`, { method: 'DELETE' }),
     assign: (id: string, sessionId: string) =>
       fetch(`${API}/v2/beads/${id}/assign`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session_id: sessionId }) }).then(r => r.json()),
+    unassignSession: (sessionId: string) =>
+      fetch(`${API}/tasks/unassign-session/${sessionId}`, { method: 'POST' }).then(r => r.json()),
     decompose: (text: string) =>
       fetch(`${API}/v2/beads/decompose`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) }).then(r => r.json()),
     updatePosition: (id: string, x: number, y: number) =>
@@ -80,6 +82,18 @@ export const api = {
   // Map state
   map: {
     getState: () => fetch(`${API}/v2/map/state`).then(r => r.json())
+  },
+
+  // Flows
+  flows: {
+    list: () => fetch(`${API}/v2/flows`).then(r => r.json()),
+    get: (name: string) => fetch(`${API}/v2/flows/${name}`).then(r => r.json()),
+    create: (data: { name: string; schedule: string; agent_profile: string; prompt: string; provider?: string }) =>
+      fetch(`${API}/v2/flows`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(r => r.json()),
+    run: (name: string) => fetch(`${API}/v2/flows/${name}/run`, { method: 'POST' }).then(r => r.json()),
+    enable: (name: string) => fetch(`${API}/v2/flows/${name}/enable`, { method: 'POST' }).then(r => r.json()),
+    disable: (name: string) => fetch(`${API}/v2/flows/${name}/disable`, { method: 'POST' }).then(r => r.json()),
+    delete: (name: string) => fetch(`${API}/v2/flows/${name}`, { method: 'DELETE' })
   }
 }
 
