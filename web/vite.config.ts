@@ -7,8 +7,14 @@ export default defineConfig({
     proxy: { 
       '/api': { 
         target: 'http://localhost:8000', 
-        ws: true  // Enable WebSocket proxying for all /api routes
+        ws: true
       }
     } 
+  },
+  test: {
+    globals: true,
+    environment: 'happy-dom',
+    setupFiles: './src/test/setup.ts',
+    include: ['src/**/*.test.{ts,tsx}']
   }
 })

@@ -611,3 +611,101 @@ async def decompose_tasks(req: ChatDecompose):
             tasks.append(task.__dict__)
     
     return {"tasks": tasks, "count": len(tasks)}
+
+
+# --- Position Persistence ---
+class PositionUpdate(BaseModel):
+    x: float
+    y: float
+
+
+# In-memory position storage (would be DB in production)
+session_positions: Dict[str, Dict[str, float]] = {}
+bead_positions: Dict[str, Dict[str, float]] = {}
+
+
+@router.put("/sessions/{session_id}/position")
+async def update_session_position(session_id: str, pos: PositionUpdate):
+    """Save agent/session position on map."""
+    session_positions[session_id] = {"x": pos.x, "y": pos.y}
+    return {"session_id": session_id, "x": pos.x, "y": pos.y}
+
+
+@router.put("/beads/{bead_id}/position")
+async def update_bead_position(bead_id: str, pos: PositionUpdate):
+    """Save bead position on map."""
+    bead_positions[bead_id] = {"x": pos.x, "y": pos.y}
+    return {"bead_id": bead_id, "x": pos.x, "y": pos.y}
+
+
+@router.get("/map/state")
+async def get_map_state():
+    """Get all positions for initial map load."""
+    return {
+        "sessions": session_positions,
+        "beads": bead_positions
+    }
+
+
+# --- Ralph Loop CRUD ---
+class RalphCreate(BaseModel):
+    prompt: str
+    min_iterations: int = 3
+    max_iterations: int = 10
+    agent_count: int = 1
+
+
+ralph_loops: Dict[str, Dict] = {}
+
+
+@router.get("/ralph")
+async def list_ralph_loops():
+    """List all Ralph loops."""
+    return list(ralph_loops.values())
+
+
+@router.post("/ralph", status_code=201)
+async def create_ralph_loop(req: RalphCreate):
+    """Create a new Ralph loop."""
+    import uuid
+    loop_id = str(uuid.uuid4())[:8]
+    loop = {
+        "id": loop_id,
+        "prompt": req.prompt,
+        "min_iterations": req.min_iterations,
+        "max_iterations": req.max_iterations,
+        "current_iteration": 0,
+        "status": "running",
+        "agent_count": req.agent_count,
+        "created_at": datetime.now().isoformat()
+    }
+    ralph_loops[loop_id] = loop
+    await broadcast_activity({
+        "type": "ralph_created",
+        "loop_id": loop_id,
+        "prompt": req.prompt,
+        "timestamp": datetime.now().isoformat()
+    })
+    return loop
+
+
+@router.get("/ralph/{loop_id}")
+async def get_ralph_loop(loop_id: str):
+    """Get Ralph loop details."""
+    if loop_id not in ralph_loops:
+        raise HTTPException(404, "Ralph loop not found")
+    return ralph_loops[loop_id]
+
+
+@router.delete("/ralph/{loop_id}")
+async def delete_ralph_loop(loop_id: str):
+    """Stop and delete a Ralph loop."""
+    if loop_id not in ralph_loops:
+        raise HTTPException(404, "Ralph loop not found")
+    del ralph_loops[loop_id]
+    await broadcast_activity({
+        "type": "ralph_deleted",
+        "loop_id": loop_id,
+        "timestamp": datetime.now().isoformat()
+    })
+    return {"success": True}

@@ -23,7 +23,9 @@ export const api = {
       fetch(`${API}/v2/sessions/${id}/input?message=${encodeURIComponent(message)}&raw=${raw}`, { method: 'POST' }),
     output: (id: string) => fetch(`${API}/v2/sessions/${id}/output`).then(r => r.json()),
     autoMode: (id: string, enabled: boolean) =>
-      fetch(`${API}/v2/sessions/${id}/auto-mode`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }) }).then(r => r.json())
+      fetch(`${API}/v2/sessions/${id}/auto-mode`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }) }).then(r => r.json()),
+    updatePosition: (id: string, x: number, y: number) =>
+      fetch(`${API}/v2/sessions/${id}/position`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ x, y }) }).then(r => r.json())
   },
 
   // V2 Activity
@@ -45,7 +47,9 @@ export const api = {
     assign: (id: string, sessionId: string) =>
       fetch(`${API}/v2/beads/${id}/assign`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session_id: sessionId }) }).then(r => r.json()),
     decompose: (text: string) =>
-      fetch(`${API}/v2/beads/decompose`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) }).then(r => r.json())
+      fetch(`${API}/v2/beads/decompose`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) }).then(r => r.json()),
+    updatePosition: (id: string, x: number, y: number) =>
+      fetch(`${API}/v2/beads/${id}/position`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ x, y }) }).then(r => r.json())
   },
 
   // Context Learning
@@ -62,10 +66,20 @@ export const api = {
 
   // Ralph
   ralph: {
+    list: () => fetch(`${API}/v2/ralph`).then(r => r.json()),
+    get: (id: string) => fetch(`${API}/v2/ralph/${id}`).then(r => r.json()),
+    create: (data: { prompt: string; min_iterations?: number; max_iterations?: number; agent_count?: number }) => 
+      fetch(`${API}/v2/ralph`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(r => r.json()),
+    delete: (id: string) => fetch(`${API}/v2/ralph/${id}`, { method: 'DELETE' }),
     status: () => fetch(`${API}/ralph`).then(r => r.json()),
     start: (data: { prompt: string; min_iterations?: number; max_iterations?: number }) => 
       fetch(`${API}/ralph`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(r => r.json()),
     stop: () => fetch(`${API}/ralph/stop`, { method: 'POST' })
+  },
+
+  // Map state
+  map: {
+    getState: () => fetch(`${API}/v2/map/state`).then(r => r.json())
   }
 }
 
