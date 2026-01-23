@@ -298,7 +298,7 @@ class TestContextLearningTrigger:
         """Test triggering learning for non-existent session."""
         with patch('cli_agent_orchestrator.api.v2.session_service') as mock_svc:
             mock_svc.get_session.side_effect = ValueError("Session not found")
-            response = client.post("/api/v2/learn/fake-session")
+            response = client.post("/api/v2/learn/sessions/fake-session")
             assert response.status_code == 404
 
 
@@ -505,10 +505,12 @@ class TestContextLearningIntegration:
             }
             mock_term.get_output.return_value = 'Some output with <invoke name="fs_read"> tool calls'
             
-            response = client.post("/api/v2/learn/learn-test")
+            response = client.post("/api/v2/learn/sessions/learn-test")
             assert response.status_code == 200
             result = response.json()
-            assert "learnings" in result
+            # API returns a proposal object with id, agent_name, etc.
+            assert "id" in result
+            assert "agent_name" in result
 
 
 class TestActivityFeedIntegration:
