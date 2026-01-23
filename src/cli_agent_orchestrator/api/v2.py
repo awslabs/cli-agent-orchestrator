@@ -635,19 +635,55 @@ async def trigger_learning(session_id: str, outcome: str = "neutral"):
 # --- Chat Bar / Task Decomposition ---
 @router.post("/beads/decompose")
 async def decompose_tasks(req: ChatDecompose):
-    """Decompose text into multiple beads (simplified)."""
-    # Simple decomposition - split by newlines or numbered items
+    """Decompose text into multiple beads using AI."""
+    import subprocess
+    import tempfile
+    
+    # Try AI decomposition via kiro-cli
+    prompt = f"""Parse this text into tasks. Output JSON array only, no markdown:
+[{{"title": "short title", "description": "details", "priority": 1-3}}]
+
+Text:
+{req.text}"""
+    
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            f.write(prompt)
+            f.flush()
+            result = subprocess.run(
+                ['kiro-cli', 'chat', '-m', prompt, '--no-interactive'],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode == 0 and result.stdout:
+                # Try to parse JSON from output
+                import json as json_mod
+                output = result.stdout.strip()
+                # Find JSON array in output
+                start = output.find('[')
+                end = output.rfind(']') + 1
+                if start >= 0 and end > start:
+                    parsed = json_mod.loads(output[start:end])
+                    beads_list = []
+                    for item in parsed:
+                        task = beads.add(
+                            item.get('title', 'Task'),
+                            item.get('description', ''),
+                            item.get('priority', 2)
+                        )
+                        beads_list.append(task.__dict__)
+                    return {"beads": beads_list, "count": len(beads_list)}
+    except Exception:
+        pass
+    
+    # Fallback: simple line-based decomposition
     lines = [l.strip() for l in req.text.split("\n") if l.strip()]
     tasks = []
-    
     for line in lines:
-        # Remove numbering
-        clean = re.sub(r"^\d+[\.\)]\s*", "", line)
+        clean = re.sub(r"^[-*•]\s*", "", re.sub(r"^\d+[\.\)]\s*", "", line))
         if clean and len(clean) > 3:
             task = beads.add(clean, "", 2)
             tasks.append(task.__dict__)
-    
-    return {"tasks": tasks, "count": len(tasks)}
+    return {"beads": tasks, "count": len(tasks)}
 
 
 # --- Position Persistence ---

@@ -20,7 +20,7 @@ export interface Terminal {
 }
 
 export interface Activity { 
-  type: string; session_id?: string; timestamp: string; detail?: string; tool?: string 
+  type: string; session_id?: string; timestamp: string; detail?: string; tool?: string; message?: string 
 }
 
 export interface RalphState { 

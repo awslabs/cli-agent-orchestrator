@@ -16,7 +16,7 @@ const AGENT_ICONS: Record<string, React.ReactNode> = {
   'amzn-builder': <Package size={20} />
 }
 
-const STATUS_CONFIG = {
+const STATUS_CONFIG: Record<string, { color: string; text: string; label: string; animate?: string }> = {
   IDLE: { color: 'bg-emerald-500', text: 'text-emerald-400', label: 'Ready' },
   PROCESSING: { color: 'bg-amber-500', text: 'text-amber-400', label: 'Working', animate: 'animate-pulse' },
   WAITING_INPUT: { color: 'bg-amber-500', text: 'text-amber-400', label: 'Waiting', animate: 'animate-pulse' },
@@ -57,7 +57,7 @@ export function AgentPanel() {
   const saveAgentContext = async () => {
     if (!editingAgent) return
     try {
-      await api.agents.update(editingAgent.name, { steering: editingAgent.context })
+      await api.agents.update(editingAgent.name, { name: editingAgent.name, steering: editingAgent.context })
       setEditingAgent(null)
       refresh()
     } catch (e) {
