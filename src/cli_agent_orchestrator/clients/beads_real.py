@@ -123,9 +123,10 @@ class BeadsClient:
     def get(self, task_id: str) -> Optional[Task]:
         """Get a single task by ID."""
         try:
-            issue = self._run_bd_json("show", task_id)
-            if isinstance(issue, dict):
-                return self._issue_to_task(issue)
+            result = self._run_bd_json("show", task_id)
+            # bd show returns a list with single issue
+            if isinstance(result, list) and result:
+                return self._issue_to_task(result[0])
         except Exception:
             pass
         return None
@@ -143,7 +144,7 @@ class BeadsClient:
     
     def wip(self, task_id: str, assignee: Optional[str] = None) -> Optional[Task]:
         """Mark task as work-in-progress."""
-        self._run_bd("update", task_id, "--state", "in_progress")
+        self._run_bd("update", task_id, "--status", "in_progress")
         if assignee:
             self._run_bd("update", task_id, "--assignee", assignee)
         return self.get(task_id)
@@ -156,7 +157,7 @@ class BeadsClient:
     def delete(self, task_id: str) -> bool:
         """Delete a task."""
         try:
-            self._run_bd("delete", task_id, "-y")
+            self._run_bd("delete", task_id, "--force")
             return True
         except Exception:
             return False
@@ -172,8 +173,8 @@ class BeadsClient:
             bd_priority = {1: 1, 2: 2, 3: 3}.get(kwargs["priority"], 2)
             args.extend(["-p", str(bd_priority)])
         if "status" in kwargs:
-            state_map = {"open": "open", "wip": "in_progress", "closed": "closed"}
-            args.extend(["--state", state_map.get(kwargs["status"], kwargs["status"])])
+            status_map = {"open": "open", "wip": "in_progress", "closed": "closed"}
+            args.extend(["--status", status_map.get(kwargs["status"], kwargs["status"])])
         if "assignee" in kwargs:
             args.extend(["--assignee", kwargs["assignee"]])
         if len(args) > 2:
