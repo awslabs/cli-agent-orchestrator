@@ -526,6 +526,37 @@ async def assign_bead(bead_id: str, req: BeadAssign):
     return task.__dict__
 
 
+class ChildBeadCreate(BaseModel):
+    title: str
+    description: str = ""
+    priority: int = 2
+
+
+@router.post("/beads/{bead_id}/children")
+async def create_child_bead(bead_id: str, req: ChildBeadCreate):
+    """Create a child bead under a parent."""
+    parent = beads.get(bead_id)
+    if not parent:
+        raise HTTPException(404, "Parent bead not found")
+    
+    task = beads.create_child(bead_id, req.title, req.description, req.priority)
+    
+    await broadcast_activity({
+        "type": "bead_created",
+        "bead_id": task.id,
+        "parent_id": bead_id,
+        "timestamp": datetime.now().isoformat()
+    })
+    return task.__dict__
+
+
+@router.get("/beads/{bead_id}/children")
+async def get_child_beads(bead_id: str):
+    """Get child beads of a parent."""
+    children = beads.get_children(bead_id)
+    return [t.__dict__ for t in children]
+
+
 @router.get("/agents")
 async def list_agents():
     """List available agent profiles."""

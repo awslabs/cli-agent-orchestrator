@@ -40,6 +40,9 @@ export const api = {
     get: (id: string) => fetch(`${API}/tasks/${id}`).then(r => r.json()),
     create: (data: { title: string; description?: string; priority?: number }) => 
       fetch(`${API}/tasks`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(r => r.json()),
+    createChild: (parentId: string, data: { title: string; description?: string; priority?: number }) =>
+      fetch(`${API}/v2/beads/${parentId}/children`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(r => r.json()),
+    getChildren: (parentId: string) => fetch(`${API}/v2/beads/${parentId}/children`).then(r => r.json()),
     update: (id: string, data: Partial<{ title: string; description: string; priority: number; status: string }>) =>
       fetch(`${API}/tasks/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(r => r.json()),
     wip: (id: string) => fetch(`${API}/tasks/${id}/wip`, { method: 'POST' }).then(r => r.json()),

@@ -34,6 +34,8 @@ interface Bead {
   priority?: number
   status: string
   assignee?: string
+  parent_id?: string
+  blocked_by?: string[]
 }
 
 export function BeadsPanel() {
@@ -158,8 +160,17 @@ export function BeadsPanel() {
     refresh()
   }
 
-  const filtered = tasks.filter(t => filter === 'all' || t.status === filter)
+  // Build hierarchy: separate parents and children
+  const filteredTasks = tasks.filter(t => filter === 'all' || t.status === filter)
+  const parentBeads = filteredTasks.filter(t => !t.parent_id)
     .sort((a, b) => (a.priority || 3) - (b.priority || 3))
+  const childrenByParent = filteredTasks.filter(t => t.parent_id)
+    .reduce((acc, t) => {
+      const pid = t.parent_id!
+      if (!acc[pid]) acc[pid] = []
+      acc[pid].push(t)
+      return acc
+    }, {} as Record<string, typeof tasks>)
 
   const counts = {
     all: tasks.length,
@@ -490,7 +501,7 @@ export function BeadsPanel() {
 
       {/* Bead List */}
       <div className="space-y-3">
-        {filtered.length === 0 ? (
+        {filteredTasks.length === 0 ? (
           <div className="text-center py-12 text-gray-500">
             <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-gray-800 flex items-center justify-center text-gray-600">
               <Inbox size={32} />
@@ -498,111 +509,162 @@ export function BeadsPanel() {
             <p>No beads found</p>
           </div>
         ) : (
-          filtered.map(bead => {
+          parentBeads.map(bead => {
             const priority = PRIORITY_STYLES[(bead.priority || 3) as 1 | 2 | 3]
             const status = STATUS_STYLES[bead.status as keyof typeof STATUS_STYLES] || STATUS_STYLES.open
             const isExpanded = expandedBead === bead.id
+            const children = childrenByParent[bead.id] || []
+            const hasChildren = children.length > 0
             
             return (
-              <div
-                key={bead.id}
-                className={`group rounded-xl border transition-all hover:shadow-lg ${priority.bg} ${priority.border}`}
-              >
-                {/* Main row */}
-                <div className="p-4 flex items-start gap-3">
-                  {/* Priority indicator */}
-                  <div className={`w-1.5 self-stretch rounded-full ${priority.badge}`}></div>
-                  
-                  {/* Content */}
-                  <div 
-                    className="flex-1 min-w-0 cursor-pointer"
-                    onClick={() => setExpandedBead(isExpanded ? null : bead.id)}
-                  >
-                    <div className="flex items-center gap-2 mb-1">
-                      <span className={`px-2.5 py-1 text-xs rounded-full font-medium ${status.bg} ${status.text}`}>
-                        {status.label}
-                      </span>
-                      {/* Assigned/Unassigned indicator */}
-                      {bead.assignee ? (
-                        <span className="px-2.5 py-1 text-xs rounded-full font-medium bg-purple-500/10 text-purple-400">
-                          Assigned
+              <div key={bead.id} data-testid="bead-card">
+                <div
+                  className={`group rounded-xl border transition-all hover:shadow-lg ${priority.bg} ${priority.border}`}
+                >
+                  {/* Main row */}
+                  <div className="p-4 flex items-start gap-3">
+                    {/* Priority indicator */}
+                    <div className={`w-1.5 self-stretch rounded-full ${priority.badge}`}></div>
+                    
+                    {/* Content */}
+                    <div 
+                      className="flex-1 min-w-0 cursor-pointer"
+                      onClick={() => setExpandedBead(isExpanded ? null : bead.id)}
+                    >
+                      <div className="flex items-center gap-2 mb-1">
+                        <span className={`px-2.5 py-1 text-xs rounded-full font-medium ${status.bg} ${status.text}`}>
+                          {status.label}
                         </span>
-                      ) : (
-                        <span className="px-2.5 py-1 text-xs rounded-full font-medium bg-gray-500/10 text-gray-400">
-                          Unassigned
-                        </span>
+                        {/* Assigned/Unassigned indicator */}
+                        {bead.assignee ? (
+                          <span className="px-2.5 py-1 text-xs rounded-full font-medium bg-purple-500/10 text-purple-400">
+                            Assigned
+                          </span>
+                        ) : (
+                          <span className="px-2.5 py-1 text-xs rounded-full font-medium bg-gray-500/10 text-gray-400">
+                            Unassigned
+                          </span>
+                        )}
+                        <span className={`text-xs font-medium ${priority.text}`}>P{bead.priority || 3}</span>
+                        {hasChildren && (
+                          <span className="px-2 py-0.5 text-xs rounded bg-cyan-500/10 text-cyan-400">
+                            {children.length} sub-bead{children.length > 1 ? 's' : ''}
+                          </span>
+                        )}
+                        {bead.blocked_by && bead.blocked_by.length > 0 && (
+                          <span className="px-2 py-0.5 text-xs rounded bg-orange-500/10 text-orange-400">
+                            Blocked
+                          </span>
+                        )}
+                        {bead.description && (
+                          <button className="text-xs text-gray-500 flex items-center gap-1">
+                            {isExpanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />} context
+                          </button>
+                        )}
+                      </div>
+                      <h3 className="font-medium text-white text-base">{bead.title}</h3>
+                      {!isExpanded && bead.description && (
+                        <p className="text-sm text-gray-400 mt-1 line-clamp-1">{bead.description}</p>
                       )}
-                      <span className={`text-xs font-medium ${priority.text}`}>P{bead.priority || 3}</span>
-                      {bead.description && (
-                        <button className="text-xs text-gray-500 flex items-center gap-1">
-                          {isExpanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />} context
+                      {bead.assignee && (
+                        <div className="mt-2 flex items-center gap-1.5 text-xs text-purple-400 font-medium">
+                          {(() => {
+                            const session = sessions.find(s => s.id === bead.assignee)
+                            const icon = session ? (AGENT_ICONS[session.agent_name] || <User size={12} />) : <User size={12} />
+                            return (
+                              <>
+                                {icon}
+                                <span>{session?.agent_name || 'Unknown'}</span>
+                                <span className="text-gray-500 font-mono">({bead.assignee})</span>
+                              </>
+                            )
+                          })()}
+                        </div>
+                      )}
+                      {bead.blocked_by && bead.blocked_by.length > 0 && (
+                        <div className="mt-2 text-xs text-orange-400">
+                          Blocked by: {bead.blocked_by.join(', ')}
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Actions */}
+                    <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                      {(bead.status === 'open' || (bead.status === 'wip' && !bead.assignee)) && (
+                        <button
+                          onClick={() => setAssignModal(bead)}
+                          className="px-3 py-2 text-sm bg-purple-600 hover:bg-purple-500 rounded-lg text-white font-medium"
+                        >
+                          Assign
                         </button>
                       )}
+                      <button
+                        onClick={() => setEditingBead(bead)}
+                        className="px-3 py-2 rounded-lg hover:bg-blue-500/20 text-blue-400 text-sm font-medium flex items-center gap-1"
+                        title="Edit"
+                      >
+                        <Edit2 size={14} /> Edit
+                      </button>
+                      {bead.status !== 'closed' && (
+                        <button
+                          onClick={() => closeBead(bead.id)}
+                          className="px-3 py-2 rounded-lg hover:bg-emerald-500/20 text-emerald-400 text-sm font-medium flex items-center gap-1"
+                          title="Mark complete"
+                        >
+                          <Check size={14} /> Done
+                        </button>
+                      )}
+                      <button
+                        onClick={() => deleteBead(bead.id)}
+                        className="px-3 py-2 rounded-lg hover:bg-red-500/20 text-red-400 text-sm font-medium"
+                        title="Delete"
+                      >
+                        <Trash2 size={14} />
+                      </button>
                     </div>
-                    <h3 className="font-medium text-white text-base">{bead.title}</h3>
-                    {!isExpanded && bead.description && (
-                      <p className="text-sm text-gray-400 mt-1 line-clamp-1">{bead.description}</p>
-                    )}
-                    {bead.assignee && (
-                      <div className="mt-2 flex items-center gap-1.5 text-xs text-purple-400 font-medium">
-                        {(() => {
-                          const session = sessions.find(s => s.id === bead.assignee)
-                          const icon = session ? (AGENT_ICONS[session.agent_name] || <User size={12} />) : <User size={12} />
-                          return (
-                            <>
-                              {icon}
-                              <span>{session?.agent_name || 'Unknown'}</span>
-                              <span className="text-gray-500 font-mono">({bead.assignee})</span>
-                            </>
-                          )
-                        })()}
-                      </div>
-                    )}
                   </div>
 
-                  {/* Actions */}
-                  <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                    {(bead.status === 'open' || (bead.status === 'wip' && !bead.assignee)) && (
-                      <button
-                        onClick={() => setAssignModal(bead)}
-                        className="px-3 py-2 text-sm bg-purple-600 hover:bg-purple-500 rounded-lg text-white font-medium"
-                      >
-                        Assign
-                      </button>
-                    )}
-                    <button
-                      onClick={() => setEditingBead(bead)}
-                      className="px-3 py-2 rounded-lg hover:bg-blue-500/20 text-blue-400 text-sm font-medium flex items-center gap-1"
-                      title="Edit"
-                    >
-                      <Edit2 size={14} /> Edit
-                    </button>
-                    {bead.status !== 'closed' && (
-                      <button
-                        onClick={() => closeBead(bead.id)}
-                        className="px-3 py-2 rounded-lg hover:bg-emerald-500/20 text-emerald-400 text-sm font-medium flex items-center gap-1"
-                        title="Mark complete"
-                      >
-                        <Check size={14} /> Done
-                      </button>
-                    )}
-                    <button
-                      onClick={() => deleteBead(bead.id)}
-                      className="px-3 py-2 rounded-lg hover:bg-red-500/20 text-red-400 text-sm font-medium"
-                      title="Delete"
-                    >
-                      <Trash2 size={14} />
-                    </button>
-                  </div>
+                  {/* Expanded context */}
+                  {isExpanded && bead.description && (
+                    <div className="px-4 pb-4 pt-0 border-t border-gray-800/50 mt-2">
+                      <div className="text-xs text-gray-500 uppercase tracking-wide mb-2">Full Context</div>
+                      <div className="text-sm text-gray-300 whitespace-pre-wrap bg-gray-900/50 rounded-lg p-3 max-h-64 overflow-y-auto">
+                        {bead.description}
+                      </div>
+                    </div>
+                  )}
                 </div>
 
-                {/* Expanded context */}
-                {isExpanded && bead.description && (
-                  <div className="px-4 pb-4 pt-0 border-t border-gray-800/50 mt-2">
-                    <div className="text-xs text-gray-500 uppercase tracking-wide mb-2">Full Context</div>
-                    <div className="text-sm text-gray-300 whitespace-pre-wrap bg-gray-900/50 rounded-lg p-3 max-h-64 overflow-y-auto">
-                      {bead.description}
-                    </div>
+                {/* Child beads */}
+                {hasChildren && (
+                  <div className="ml-6 mt-2 space-y-2 border-l-2 border-gray-700 pl-4">
+                    {children.map(child => {
+                      const childPriority = PRIORITY_STYLES[(child.priority || 3) as 1 | 2 | 3]
+                      const childStatus = STATUS_STYLES[child.status as keyof typeof STATUS_STYLES] || STATUS_STYLES.open
+                      return (
+                        <div
+                          key={child.id}
+                          data-testid="bead-card"
+                          className={`group rounded-lg border p-3 ${childPriority.bg} ${childPriority.border}`}
+                        >
+                          <div className="flex items-center gap-2 mb-1">
+                            <span className={`px-2 py-0.5 text-xs rounded-full font-medium ${childStatus.bg} ${childStatus.text}`}>
+                              {childStatus.label}
+                            </span>
+                            <span className={`text-xs font-medium ${childPriority.text}`}>P{child.priority || 3}</span>
+                          </div>
+                          <h4 className="font-medium text-white text-sm">{child.title}</h4>
+                          {child.assignee && (
+                            <div className="mt-1 flex items-center gap-1 text-xs text-purple-400">
+                              {(() => {
+                                const session = sessions.find(s => s.id === child.assignee)
+                                return <span>{session?.agent_name || 'Unknown'}</span>
+                              })()}
+                            </div>
+                          )}
+                        </div>
+                      )
+                    })}
                   </div>
                 )}
               </div>

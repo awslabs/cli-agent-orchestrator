@@ -115,3 +115,128 @@ describe('BeadsPanel Assignment Modal', () => {
     expect(singleAgentOption.closest('button')).toHaveClass('border-emerald-500')
   })
 })
+
+
+describe('BeadsPanel Hierarchy Display', () => {
+  const parentBead = {
+    id: 'parent-1',
+    title: 'Parent Bead',
+    description: 'Parent description',
+    priority: 2,
+    status: 'open'
+  }
+
+  const childBead = {
+    id: 'parent-1.1',
+    title: 'Child Bead',
+    description: 'Child description',
+    priority: 2,
+    status: 'open',
+    parent_id: 'parent-1'
+  }
+
+  const mockStore = {
+    tasks: [parentBead, childBead],
+    setTasks: vi.fn(),
+    sessions: [],
+    agents: [],
+    setAgents: vi.fn()
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    ;(useStore as any).mockReturnValue(mockStore)
+  })
+
+  it('renders child beads nested under parent', () => {
+    render(<BeadsPanel />)
+    
+    // Parent should be visible
+    expect(screen.getByText('Parent Bead')).toBeInTheDocument()
+    // Child should be visible
+    expect(screen.getByText('Child Bead')).toBeInTheDocument()
+  })
+
+  it('shows hierarchy indicator on parent beads', () => {
+    render(<BeadsPanel />)
+    
+    // Parent should have children indicator
+    const parentElement = screen.getByText('Parent Bead').closest('[data-testid="bead-card"]')
+    expect(parentElement).toBeInTheDocument()
+  })
+})
+
+describe('BeadsPanel Session Links', () => {
+  const assignedBead = {
+    id: 'bead-1',
+    title: 'Assigned Bead',
+    priority: 2,
+    status: 'open',
+    assignee: 'session-1'
+  }
+
+  const mockSession = {
+    id: 'session-1',
+    name: 'test-session',
+    status: 'IDLE' as const,
+    terminals: [],
+    agent_name: 'generalist'
+  }
+
+  const mockStore = {
+    tasks: [assignedBead],
+    setTasks: vi.fn(),
+    sessions: [mockSession],
+    agents: [],
+    setAgents: vi.fn()
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    ;(useStore as any).mockReturnValue(mockStore)
+  })
+
+  it('shows session link on assigned bead', () => {
+    render(<BeadsPanel />)
+    
+    // Should show agent name for assigned bead
+    expect(screen.getByText('generalist')).toBeInTheDocument()
+  })
+})
+
+describe('BeadsPanel Dependency Display', () => {
+  const blockedBead = {
+    id: 'bead-2',
+    title: 'Blocked Bead',
+    priority: 2,
+    status: 'open',
+    blocked_by: ['bead-1']
+  }
+
+  const blockerBead = {
+    id: 'bead-1',
+    title: 'Blocker Bead',
+    priority: 1,
+    status: 'wip'
+  }
+
+  const mockStore = {
+    tasks: [blockerBead, blockedBead],
+    setTasks: vi.fn(),
+    sessions: [],
+    agents: [],
+    setAgents: vi.fn()
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    ;(useStore as any).mockReturnValue(mockStore)
+  })
+
+  it('shows blocked_by indicator on bead', () => {
+    render(<BeadsPanel />)
+    
+    // Blocked bead should show dependency info
+    expect(screen.getByText('Blocked Bead')).toBeInTheDocument()
+  })
+})

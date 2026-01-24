@@ -484,3 +484,70 @@ class TestClearAssigneeBySession:
             assert "--assignee" in args
             assignee_idx = args.index("--assignee")
             assert args[assignee_idx + 1] == ""
+
+
+class TestCreateChild:
+    """Tests for create_child() method."""
+
+    def test_create_child_uses_parent_flag(self, client):
+        """create_child() calls bd create with --parent flag."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="✓ Created issue: parent-1.1\n",
+                stderr="",
+            )
+            client.create_child("parent-1", "Child task")
+            # First call should be create with --parent
+            create_call = mock_run.call_args_list[0]
+            args = create_call[0][0]
+            assert "--parent" in args
+            assert "parent-1" in args
+
+    def test_create_child_returns_task(self, client):
+        """create_child() returns Task with parent_id set."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="✓ Created issue: parent-1.1\n", stderr=""),
+                MagicMock(
+                    returncode=0,
+                    stdout=json.dumps([{"id": "parent-1.1", "title": "Child", "priority": 2, "status": "open", "parent_id": "parent-1"}]),
+                    stderr="",
+                ),
+            ]
+            task = client.create_child("parent-1", "Child task")
+            assert task.id == "parent-1.1"
+            assert task.parent_id == "parent-1"
+
+
+class TestGetChildren:
+    """Tests for get_children() method."""
+
+    def test_get_children_filters_by_parent(self, client):
+        """get_children() returns only tasks with matching parent_id."""
+        tasks = [
+            {"id": "parent-1.1", "title": "Child 1", "priority": 2, "status": "open", "parent_id": "parent-1"},
+            {"id": "parent-1.2", "title": "Child 2", "priority": 2, "status": "open", "parent_id": "parent-1"},
+            {"id": "other-1", "title": "Other", "priority": 2, "status": "open"},
+        ]
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(tasks), stderr="")
+            children = client.get_children("parent-1")
+            assert len(children) == 2
+            assert all(c.parent_id == "parent-1" for c in children)
+
+
+class TestListWithHierarchy:
+    """Tests for list() returning parent_id."""
+
+    def test_list_includes_parent_id(self, client):
+        """list() returns tasks with parent_id populated."""
+        tasks = [
+            {"id": "parent-1", "title": "Parent", "priority": 2, "status": "open"},
+            {"id": "parent-1.1", "title": "Child", "priority": 2, "status": "open", "parent_id": "parent-1"},
+        ]
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(tasks), stderr="")
+            result = client.list()
+            child = next(t for t in result if t.id == "parent-1.1")
+            assert child.parent_id == "parent-1"

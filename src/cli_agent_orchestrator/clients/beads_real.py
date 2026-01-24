@@ -3,8 +3,8 @@
 import json
 import re
 import subprocess
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Optional, List
 
 
 @dataclass
@@ -22,6 +22,8 @@ class Task:
     closed_at: Optional[str] = None
     tags: str = "[]"
     metadata: str = "{}"
+    parent_id: Optional[str] = None
+    blocked_by: Optional[List[str]] = None
 
 
 class BeadsClient:
@@ -86,6 +88,11 @@ class BeadsClient:
 
     def _issue_to_task(self, issue: dict) -> Task:
         """Convert Beads Issue dict to CAO Task."""
+        # Extract blocked_by from dependencies
+        blocked_by = None
+        deps = issue.get("dependencies", [])
+        if deps:
+            blocked_by = [d.get("id") for d in deps if d.get("dependency_type") == "blocks"]
         return Task(
             id=issue.get("id", ""),
             title=issue.get("title", ""),
@@ -96,6 +103,8 @@ class BeadsClient:
             created_at=issue.get("created_at"),
             updated_at=issue.get("updated_at"),
             closed_at=issue.get("closed_at"),
+            parent_id=issue.get("parent_id"),
+            blocked_by=blocked_by if blocked_by else None,
         )
 
     def list(self, status: Optional[str] = None, priority: Optional[int] = None) -> list[Task]:
@@ -187,3 +196,18 @@ class BeadsClient:
                 self._run_bd("update", task.id, "--status", "open", "--assignee", "")
                 count += 1
         return count
+
+    def create_child(self, parent_id: str, title: str, description: str = "", priority: int = 2) -> Task:
+        """Create a child task under a parent."""
+        bd_priority = self._cao_to_beads_priority(priority)
+        args = ["create", title, "-p", str(bd_priority), "--parent", parent_id]
+        if description:
+            args.extend(["-d", description])
+        output = self._run_bd(*args)
+        task_id = self._parse_create_output(output)
+        return self.get(task_id) or Task(id=task_id, title=title, priority=priority, parent_id=parent_id)
+
+    def get_children(self, parent_id: str) -> List[Task]:
+        """Get child tasks of a parent."""
+        all_tasks = self.list()
+        return [t for t in all_tasks if t.parent_id == parent_id]

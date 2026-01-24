@@ -2,7 +2,8 @@ import { create } from 'zustand'
 
 export interface Task { 
   id: string; title: string; description: string; priority: number; 
-  status: string; assignee?: string; created_at?: string 
+  status: string; assignee?: string; created_at?: string
+  parent_id?: string; blocked_by?: string[]
 }
 
 export interface Agent { 
