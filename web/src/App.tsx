@@ -8,9 +8,10 @@ import { RalphPanel } from './components/RalphPanel'
 import { ContextProposals } from './components/ContextProposals'
 import { FlowsPanel } from './components/FlowsPanel'
 import { MessagesPanel } from './components/MessagesPanel'
+import { OrchestrationPanel } from './components/OrchestrationPanel'
 import { StarCraftView } from './components/starcraft'
 import { TerminalTest } from './components/TerminalTest'
-import { Bot, Zap, ClipboardList, RefreshCw, Activity, Brain, Terminal, Gamepad2, Clock, ArrowLeft, Mail } from 'lucide-react'
+import { Bot, Zap, ClipboardList, RefreshCw, Activity, Brain, Terminal, Gamepad2, Clock, ArrowLeft, Mail, GitBranch } from 'lucide-react'
 
 // Modern stat card component
 function StatCard({ icon, label, value, color }: { icon: React.ReactNode; label: string; value: number | string; color: string }) {
@@ -52,7 +53,7 @@ function TabButton({ active, onClick, children, badge }: { active: boolean; onCl
 
 export default function App() {
   const [view, setView] = useState<'dashboard' | 'starcraft' | 'terminal-test'>('dashboard')
-  const [activeTab, setActiveTab] = useState<'agents' | 'beads' | 'activity' | 'learn' | 'ralph' | 'flows' | 'messages'>('agents')
+  const [activeTab, setActiveTab] = useState<'agents' | 'beads' | 'activity' | 'learn' | 'ralph' | 'flows' | 'messages' | 'orchestrations'>('agents')
   const { tasks, agents, sessions, ralph, flows, messages, setTasks, setAgents, setSessions, setRalph, setFlows, setMessages, addActivity } = useStore()
 
   // Check URL for terminal test mode
@@ -170,6 +171,9 @@ export default function App() {
           <TabButton active={activeTab === 'messages'} onClick={() => setActiveTab('messages')} badge={messages.filter(m => m.status === 'pending').length}>
             <Mail size={16} /> Messages
           </TabButton>
+          <TabButton active={activeTab === 'orchestrations'} onClick={() => setActiveTab('orchestrations')} badge={sessions.filter(s => sessions.some(c => c.parent_session === s.id)).length}>
+            <GitBranch size={16} /> Orchestrations
+          </TabButton>
         </div>
       </div>
 
@@ -183,6 +187,7 @@ export default function App() {
           {activeTab === 'ralph' && <RalphPanel />}
           {activeTab === 'flows' && <FlowsPanel />}
           {activeTab === 'messages' && <MessagesPanel />}
+          {activeTab === 'orchestrations' && <OrchestrationPanel />}
         </div>
       </main>
 
