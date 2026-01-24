@@ -1,4 +1,5 @@
 """BeadsClient - Wrapper around bd CLI for CAO integration."""
+
 import json
 import re
 import subprocess
@@ -9,6 +10,7 @@ from typing import Optional
 @dataclass
 class Task:
     """CAO-compatible task wrapper around Beads Issue."""
+
     id: str
     title: str
     description: str = ""
@@ -24,10 +26,10 @@ class Task:
 
 class BeadsClient:
     """CAO-compatible client wrapping bd CLI."""
-    
+
     def __init__(self, working_dir: Optional[str] = None):
         self.working_dir = working_dir
-    
+
     def _run_bd(self, *args) -> str:
         """Run bd command and return output."""
         cmd = ["bd", "--no-daemon"] + list(args)
@@ -96,7 +98,7 @@ class BeadsClient:
             updated_at=issue.get("updated_at"),
             closed_at=issue.get("closed_at"),
         )
-    
+
     def list(self, status: Optional[str] = None, priority: Optional[int] = None) -> list[Task]:
         """List tasks, optionally filtered by status/priority."""
         args = ["list"]
@@ -109,7 +111,7 @@ class BeadsClient:
         if priority:
             tasks = [t for t in tasks if t.priority == priority]
         return sorted(tasks, key=lambda t: (t.priority, t.created_at or ""))
-    
+
     def next(self, priority: Optional[int] = None) -> Optional[Task]:
         """Get next ready task (no blockers)."""
         issues = self._run_bd_json("ready")
@@ -119,7 +121,7 @@ class BeadsClient:
         if priority:
             tasks = [t for t in tasks if t.priority == priority]
         return tasks[0] if tasks else None
-    
+
     def get(self, task_id: str) -> Optional[Task]:
         """Get a single task by ID."""
         try:
@@ -130,7 +132,7 @@ class BeadsClient:
         except Exception:
             pass
         return None
-    
+
     def add(self, title: str, description: str = "", priority: int = 2, tags: str = "[]") -> Task:
         """Create a new task."""
         # Map CAO priority (1-3) to beads priority (0-4)
@@ -141,19 +143,19 @@ class BeadsClient:
         output = self._run_bd(*args)
         task_id = self._parse_create_output(output)
         return self.get(task_id) or Task(id=task_id, title=title, priority=priority)
-    
+
     def wip(self, task_id: str, assignee: Optional[str] = None) -> Optional[Task]:
         """Mark task as work-in-progress."""
         self._run_bd("update", task_id, "--status", "in_progress")
         if assignee:
             self._run_bd("update", task_id, "--assignee", assignee)
         return self.get(task_id)
-    
+
     def close(self, task_id: str) -> Optional[Task]:
         """Close a task."""
         self._run_bd("close", task_id)
         return self.get(task_id)
-    
+
     def delete(self, task_id: str) -> bool:
         """Delete a task."""
         try:
@@ -161,7 +163,7 @@ class BeadsClient:
             return True
         except Exception:
             return False
-    
+
     def update(self, task_id: str, **kwargs) -> Optional[Task]:
         """Update task fields."""
         args = ["update", task_id]
@@ -180,13 +182,13 @@ class BeadsClient:
         if len(args) > 2:
             self._run_bd(*args)
         return self.get(task_id)
-    
+
     def clear_assignee_by_session(self, session_id: str) -> int:
         """Clear assignee from tasks assigned to session."""
         tasks = self.list(status="wip")
         count = 0
         for task in tasks:
             if task.assignee == session_id:
-                self._run_bd("update", task.id, "--status", "open")
+                self._run_bd("update", task.id, "--status", "open", "--assignee", "")
                 count += 1
         return count
