@@ -54,24 +54,43 @@ class BeadsClient:
         """Run bd command with JSON output."""
         output = self._run_bd(*args, "--json")
         return self._parse_json(output)
-    
+
+    def _cao_to_beads_priority(self, priority: int) -> int:
+        """Convert CAO priority (1-3) to Beads priority (0-4)."""
+        if priority in (1, 2, 3):
+            return priority
+        return 2
+
+    def _beads_to_cao_priority(self, priority: int) -> int:
+        """Convert Beads priority (0-4) to CAO priority (1-3)."""
+        if priority <= 1:
+            return 1
+        if priority == 2:
+            return 2
+        if priority in (3, 4):
+            return 3
+        return 2
+
+    def _cao_to_beads_status(self, status: str) -> str:
+        """Convert CAO status to Beads status."""
+        mapping = {"open": "open", "wip": "in_progress", "closed": "closed"}
+        return mapping.get(status, "open")
+
+    def _beads_to_cao_status(self, status: str) -> str:
+        """Convert Beads status to CAO status."""
+        mapping = {"open": "open", "in_progress": "wip", "closed": "closed"}
+        return mapping.get(status, "open")
+
     def _issue_to_task(self, issue: dict) -> Task:
         """Convert Beads Issue dict to CAO Task."""
-        # Map beads priority (0-4) to CAO priority (1-3)
         bd_priority = issue.get("priority", 2)
-        priority = 1 if bd_priority <= 1 else (3 if bd_priority >= 3 else 2)
-        
-        # Map beads state to CAO status
-        state = issue.get("state", "open")
-        status_map = {"open": "open", "in_progress": "wip", "closed": "closed"}
-        status = status_map.get(state, "open")
-        
+        state = issue.get("status", "open")
         return Task(
             id=issue.get("id", ""),
             title=issue.get("title", ""),
             description=issue.get("description", "") or "",
-            priority=priority,
-            status=status,
+            priority=self._beads_to_cao_priority(bd_priority),
+            status=self._beads_to_cao_status(state),
             assignee=issue.get("assignee"),
             created_at=issue.get("created_at"),
             updated_at=issue.get("updated_at"),
@@ -82,8 +101,7 @@ class BeadsClient:
         """List tasks, optionally filtered by status/priority."""
         args = ["list"]
         if status:
-            state_map = {"open": "open", "wip": "in_progress", "closed": "closed"}
-            args.extend(["--state", state_map.get(status, status)])
+            args.extend(["--status", self._cao_to_beads_status(status)])
         issues = self._run_bd_json(*args)
         if not isinstance(issues, list):
             issues = []
