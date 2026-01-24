@@ -5,7 +5,7 @@ from typing import List, Optional, Set
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
-from cli_agent_orchestrator.clients.beads import BeadsClient, Task
+from cli_agent_orchestrator.clients.beads_real import BeadsClient, Task
 from cli_agent_orchestrator.clients.ralph import RalphRunner
 from cli_agent_orchestrator.api.v2 import clear_bead_position
 
