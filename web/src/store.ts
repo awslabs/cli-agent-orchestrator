@@ -36,10 +36,17 @@ export interface Flow {
   enabled: boolean; next_run?: string; last_run?: string
 }
 
+export interface InboxMessage {
+  id: number; sender_id: string; receiver_id: string
+  message: string; status: 'pending' | 'delivered' | 'failed'
+  created_at: string
+}
+
 interface Store {
   // Data
   tasks: Task[]; agents: Agent[]; sessions: Session[]
   activity: Activity[]; ralph: RalphState | null; flows: Flow[]
+  messages: InboxMessage[]
   activeSession: string | null; autoModeSessions: Set<string>
   
   // Actions
@@ -48,6 +55,7 @@ interface Store {
   setSessions: (s: Session[]) => void
   setRalph: (r: RalphState | null) => void
   setFlows: (f: Flow[]) => void
+  setMessages: (m: InboxMessage[]) => void
   setActiveSession: (id: string | null) => void
   addActivity: (a: Activity) => void
   toggleAutoMode: (sessionId: string) => void
@@ -55,6 +63,7 @@ interface Store {
 
 export const useStore = create<Store>((set) => ({
   tasks: [], agents: [], sessions: [], activity: [], ralph: null, flows: [],
+  messages: [],
   activeSession: null, autoModeSessions: new Set(),
   
   setTasks: (tasks) => set({ tasks }),
@@ -62,6 +71,7 @@ export const useStore = create<Store>((set) => ({
   setSessions: (sessions) => set({ sessions }),
   setRalph: (ralph) => set({ ralph }),
   setFlows: (flows) => set({ flows }),
+  setMessages: (messages) => set({ messages }),
   setActiveSession: (activeSession) => set({ activeSession }),
   addActivity: (a) => set((s) => ({ activity: [a, ...s.activity].slice(0, 100) })),
   toggleAutoMode: (sessionId) => set((s) => {

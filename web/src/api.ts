@@ -100,6 +100,17 @@ export const api = {
     enable: (name: string) => fetch(`${API}/v2/flows/${name}/enable`, { method: 'POST' }).then(r => r.json()),
     disable: (name: string) => fetch(`${API}/v2/flows/${name}/disable`, { method: 'POST' }).then(r => r.json()),
     delete: (name: string) => fetch(`${API}/v2/flows/${name}`, { method: 'DELETE' })
+  },
+
+  // Messages
+  messages: {
+    list: (terminalId: string, status?: string, limit?: number) => {
+      const params = new URLSearchParams()
+      if (status) params.set('status', status)
+      if (limit) params.set('limit', limit.toString())
+      const query = params.toString()
+      return fetch(`${API}/terminals/${terminalId}/inbox/messages${query ? `?${query}` : ''}`).then(r => r.json())
+    }
   }
 }
 
