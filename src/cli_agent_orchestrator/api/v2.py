@@ -20,7 +20,7 @@ from cli_agent_orchestrator.services import terminal_service, session_service, f
 from cli_agent_orchestrator.providers.manager import provider_manager
 
 router = APIRouter(prefix="/v2")
-beads = BeadsClient()
+beads = BeadsClient(working_dir=str(Path.home() / ".beads-planning"))
 
 # WebSocket connections for terminal streaming
 terminal_streams: Dict[str, Set[WebSocket]] = {}
@@ -43,6 +43,11 @@ class SessionCreate(BaseModel):
 
 class BeadAssign(BaseModel):
     session_id: str
+
+
+class BeadAssignAgent(BaseModel):
+    agent_name: str
+    provider: str = "kiro-cli"
 
 
 class AutoModeToggle(BaseModel):
@@ -84,23 +89,25 @@ def detect_session_status(output: str) -> str:
     if not output or not output.strip():
         return "IDLE"
     
-    lines = output.strip().split("\n")[-20:]  # Only check last 20 lines
+    lines = output.strip().split("\n")[-30:]  # Check last 30 lines
     text = "\n".join(lines)
-    
-    # Check for kiro/agent waiting for input (prompt visible)
-    if re.search(r"(>\s*$|❯\s*$|\$\s*$|waiting for your|enter your response|type your message|how can i help you)", text, re.IGNORECASE):
-        return "WAITING_INPUT"
-    
-    # Check for active processing indicators
-    if re.search(r"(thinking\.\.\.|processing\.\.\.|working on|analyzing|reading file|writing to|executing|running)", text, re.IGNORECASE):
-        return "PROCESSING"
-    
-    # Only show ERROR for actual Python tracebacks or explicit errors at end of output
     last_lines = "\n".join(lines[-5:])
+    
+    # Check for error indicators first
     if re.search(r"(Traceback \(most recent|raise \w+Error|^\s*\w+Error:)", last_lines):
         return "ERROR"
     
-    return "IDLE"
+    # Check for kiro/q idle prompt at end (green arrow or prompt)
+    # If we see the prompt, agent is idle/ready
+    if re.search(r"(>\s*$|❯\s*$|kiro.*>\s*$|q.*>\s*$)", last_lines, re.IGNORECASE | re.MULTILINE):
+        return "IDLE"
+    
+    # Check for permission/approval prompts
+    if re.search(r"(allow|deny|yes.*no|approve|confirm|\[y/n\])", last_lines, re.IGNORECASE):
+        return "WAITING_INPUT"
+    
+    # No idle prompt visible = agent is processing/generating
+    return "PROCESSING"
 
 
 def extract_activity(output: str, session_id: str) -> List[Dict]:
@@ -362,10 +369,47 @@ async def get_output(session_id: str, lines: int = 200):
         raise HTTPException(404, str(e))
 
 
+@router.get("/sessions/{session_id}/context")
+async def get_context_usage(session_id: str):
+    """Get context window usage by sending /context command."""
+    import re
+    import time
+    try:
+        data = session_service.get_session(session_id)
+        if not data.get("terminals"):
+            raise HTTPException(404, "No terminal in session")
+        term_id = data["terminals"][0]["id"]
+        
+        # Send /context command
+        terminal_service.send_input(term_id, "/context")
+        time.sleep(2)  # Wait for response
+        
+        # Get output and parse
+        output = terminal_service.get_output(term_id)
+        
+        # Parse context usage from output
+        # Pattern: "Context window: 31.1% used (estimated)"
+        total_match = re.search(r'Context window:\s*([\d.]+)%', output)
+        tools_match = re.search(r'Tools\s*\S*\s*([\d.]+)%', output)
+        files_match = re.search(r'Context files\s*\S*\s*([\d.]+)%', output)
+        responses_match = re.search(r'responses\s*\S*\s*([\d.]+)%', output)
+        prompts_match = re.search(r'prompts\s*\S*\s*([\d.]+)%', output)
+        
+        return {
+            "total_percent": float(total_match.group(1)) if total_match else 0,
+            "tools_percent": float(tools_match.group(1)) if tools_match else 0,
+            "files_percent": float(files_match.group(1)) if files_match else 0,
+            "responses_percent": float(responses_match.group(1)) if responses_match else 0,
+            "prompts_percent": float(prompts_match.group(1)) if prompts_match else 0,
+        }
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
 # --- WebSocket Streaming ---
 @router.websocket("/sessions/{session_id}/stream")
 async def stream_terminal(ws: WebSocket, session_id: str):
-    """WebSocket for live terminal output using tmux pipe-pane."""
+    """WebSocket for live terminal output using tmux capture-pane."""
     await ws.accept()
     
     try:
@@ -379,27 +423,25 @@ async def stream_terminal(ws: WebSocket, session_id: str):
         tmux_window = term["tmux_window"]
         target = f"{tmux_session}:{tmux_window}"
         
-        # Use asyncio subprocess to run tmux capture-pane in a loop
         import subprocess
         last_output = ""
         
         while True:
             try:
-                # Capture current pane content
                 result = subprocess.run(
                     ["/usr/local/bin/tmux", "capture-pane", "-t", target, "-p", "-S", "-500"],
                     capture_output=True, text=True, timeout=1
                 )
-                output = result.stdout.rstrip('\n') + '\n' if result.stdout else ''
+                output = result.stdout or ''
                 
                 if output != last_output:
-                    # Send only new content if possible
+                    # Send only new content
                     if last_output and output.startswith(last_output):
                         new_content = output[len(last_output):]
                     else:
                         new_content = output
                         
-                    if new_content.strip():
+                    if new_content:
                         await ws.send_json({
                             "type": "output", 
                             "data": new_content,
@@ -407,10 +449,10 @@ async def stream_terminal(ws: WebSocket, session_id: str):
                         })
                     last_output = output
                     
-                await asyncio.sleep(0.1)  # 100ms polling
+                await asyncio.sleep(0.05)  # 50ms for responsive updates
             except Exception as e:
                 logger.error(f"Stream error: {e}")
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.2)
                 
     except WebSocketDisconnect:
         pass
@@ -482,6 +524,49 @@ async def assign_bead(bead_id: str, req: BeadAssign):
         "timestamp": datetime.now().isoformat()
     })
     return task.__dict__
+
+
+@router.get("/agents")
+async def list_agents():
+    """List available agent profiles."""
+    agents = []
+    agents_dir = Path.home() / ".kiro" / "agents"
+    if agents_dir.exists():
+        for f in agents_dir.glob("*.json"):
+            agents.append({"name": f.stem, "source": "kiro"})
+    return agents
+
+
+@router.post("/beads/{bead_id}/assign-agent")
+async def assign_bead_to_agent(bead_id: str, req: BeadAssignAgent):
+    """Assign bead to agent profile - spawns new session and starts working."""
+    task = beads.get(bead_id)
+    if not task:
+        raise HTTPException(404, "Bead not found")
+    
+    # Spawn new session with agent
+    terminal = terminal_service.create_terminal(
+        provider=req.provider,
+        agent_profile=req.agent_name,
+        new_session=True
+    )
+    session_id = terminal.session_name
+    
+    # Update bead assignee
+    task = beads.wip(bead_id, session_id)
+    
+    # Send task to agent
+    prompt = f"Work on this task: {task.title}\n\n{task.description}" if task.description else f"Work on this task: {task.title}"
+    terminal_service.send_input(terminal.id, prompt)
+    
+    await broadcast_activity({
+        "type": "bead_assigned",
+        "bead_id": bead_id,
+        "session_id": session_id,
+        "agent": req.agent_name,
+        "timestamp": datetime.now().isoformat()
+    })
+    return {"task": task.__dict__, "session_id": session_id, "terminal_id": terminal.id}
 
 
 # --- Auto-mode (stored per-session in memory) ---

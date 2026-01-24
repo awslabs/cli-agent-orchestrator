@@ -134,6 +134,19 @@ async def health_check():
     return {"status": "ok", "service": "cli-agent-orchestrator"}
 
 
+@app.get("/terminals/{terminal_id}/tokens")
+async def get_terminal_tokens(terminal_id: TerminalId) -> Dict:
+    """Get token usage for a terminal session."""
+    return get_usage(terminal_id).to_dict()
+
+
+@app.post("/terminals/{terminal_id}/tokens/reset")
+async def reset_terminal_tokens(terminal_id: TerminalId) -> Dict:
+    """Reset token usage for a terminal session."""
+    reset_usage(terminal_id)
+    return {"success": True}
+
+
 @app.post("/sessions", response_model=Terminal, status_code=status.HTTP_201_CREATED)
 async def create_session(
     provider: str, agent_profile: str, session_name: Optional[str] = None
@@ -249,11 +262,14 @@ async def get_terminal(terminal_id: TerminalId) -> Terminal:
         )
 
 
+from cli_agent_orchestrator.utils.token_tracker import track_input, track_output, get_usage, reset_usage, count_tokens
+
 @app.post("/terminals/{terminal_id}/input")
 async def send_terminal_input(terminal_id: TerminalId, message: str) -> Dict:
     try:
         success = terminal_service.send_input(terminal_id, message)
-        return {"success": success}
+        tokens = track_input(terminal_id, message)
+        return {"success": success, "input_tokens": tokens}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:

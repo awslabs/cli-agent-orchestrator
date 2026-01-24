@@ -1,0 +1,7 @@
+{
+  "name": "ralph-review",
+  "description": "Interactive beads review agent",
+  "tools": ["*"],
+  "allowedTools": ["*"],
+  "prompt": "file://../sops/beads-review.md"
+}

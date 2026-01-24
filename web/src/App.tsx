@@ -8,6 +8,7 @@ import { RalphPanel } from './components/RalphPanel'
 import { ContextProposals } from './components/ContextProposals'
 import { FlowsPanel } from './components/FlowsPanel'
 import { StarCraftView } from './components/starcraft'
+import { TerminalTest } from './components/TerminalTest'
 import { Bot, Zap, ClipboardList, RefreshCw, Activity, Brain, Terminal, Gamepad2, Clock, ArrowLeft } from 'lucide-react'
 
 // Modern stat card component
@@ -49,9 +50,14 @@ function TabButton({ active, onClick, children, badge }: { active: boolean; onCl
 }
 
 export default function App() {
-  const [view, setView] = useState<'dashboard' | 'starcraft'>('dashboard')
+  const [view, setView] = useState<'dashboard' | 'starcraft' | 'terminal-test'>('dashboard')
   const [activeTab, setActiveTab] = useState<'agents' | 'beads' | 'activity' | 'learn' | 'ralph' | 'flows'>('agents')
   const { tasks, agents, sessions, ralph, flows, setTasks, setAgents, setSessions, setRalph, setFlows, addActivity } = useStore()
+
+  // Check URL for terminal test mode
+  useEffect(() => {
+    if (location.search.includes('terminal-test')) setView('terminal-test')
+  }, [])
 
   useEffect(() => {
     api.tasks.list().then(setTasks).catch(() => {})
@@ -75,6 +81,10 @@ export default function App() {
   const openBeads = tasks.filter(t => t.status === 'open').length
   const wipBeads = tasks.filter(t => t.status === 'wip').length
   const activeSessions = sessions.length
+
+  if (view === 'terminal-test') {
+    return <TerminalTest />
+  }
 
   if (view === 'starcraft') {
     return (

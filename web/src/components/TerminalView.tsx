@@ -3,6 +3,7 @@ import { Terminal } from 'xterm'
 import { FitAddon } from 'xterm-addon-fit'
 import 'xterm/css/xterm.css'
 import { api } from '../api'
+import { Maximize2, Minimize2 } from 'lucide-react'
 
 interface Props {
   sessionId: string
@@ -12,10 +13,12 @@ interface Props {
 export function TerminalView({ sessionId, onStatusChange }: Props) {
   const termRef = useRef<HTMLDivElement>(null)
   const terminalRef = useRef<Terminal | null>(null)
+  const fitAddonRef = useRef<FitAddon | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
-  const lastOutputRef = useRef<string>('')
   const totalCharsRef = useRef<number>(0)
+  const inputBufferRef = useRef<string>('')
   const [connected, setConnected] = useState(false)
+  const [fullscreen, setFullscreen] = useState(false)
 
   useEffect(() => {
     if (!termRef.current) return
@@ -30,23 +33,43 @@ export function TerminalView({ sessionId, onStatusChange }: Props) {
       allowProposedApi: true
     })
     const fitAddon = new FitAddon()
+    fitAddonRef.current = fitAddon
     terminal.loadAddon(fitAddon)
     terminal.open(termRef.current)
     fitAddon.fit()
     terminalRef.current = terminal
 
-    // Handle keyboard input - send raw keystrokes to tmux
+    // Buffer input, show locally, send all on Enter
     terminal.onData((data) => {
-      api.sessions.input(sessionId, data, true).catch(console.error)
+      if (data === '\r') {
+        // Enter: send buffered text + Enter key to tmux
+        const toSend = inputBufferRef.current + '\r'
+        console.log('Sending to tmux:', JSON.stringify(toSend), 'sessionId:', sessionId)
+        inputBufferRef.current = ''
+        terminal.write('\r\n')
+        api.sessions.input(sessionId, toSend, true)
+          .then(() => console.log('Send success'))
+          .catch((e) => console.error('Send failed:', e))
+      } else if (data === '\x7f' || data === '\b') {
+        // Backspace: remove from buffer, erase from display
+        if (inputBufferRef.current.length > 0) {
+          inputBufferRef.current = inputBufferRef.current.slice(0, -1)
+          terminal.write('\b \b')
+        }
+      } else if (data === '\x03') {
+        // Ctrl+C: send immediately to interrupt
+        inputBufferRef.current = ''
+        api.sessions.input(sessionId, '\x03', true).catch(console.error)
+      } else if (data >= ' ' || data === '\t') {
+        // Printable: buffer and echo locally
+        inputBufferRef.current += data
+        terminal.write(data)
+      }
     })
 
-    // Handle paste from clipboard
+    // Handle paste
     terminal.attachCustomKeyEventHandler((e) => {
-      // Allow Ctrl+Shift+C for copy (browser default)
-      if (e.ctrlKey && e.shiftKey && e.key === 'C') {
-        return false // Let browser handle copy
-      }
-      // Handle Ctrl+Shift+V or Ctrl+V for paste
+      if (e.ctrlKey && e.shiftKey && e.key === 'C') return false
       if ((e.ctrlKey && e.shiftKey && e.key === 'V') || (e.ctrlKey && e.key === 'v')) {
         if (e.type === 'keydown') {
           navigator.clipboard.readText().then(text => {
@@ -55,19 +78,18 @@ export function TerminalView({ sessionId, onStatusChange }: Props) {
         }
         return false
       }
-      return true // Let xterm handle other keys
+      return true
     })
 
-    // Load initial output then connect WebSocket
+    // Load initial output
     api.sessions.output(sessionId).then(r => {
       const output = r.output || ''
       terminal.write(output)
-      lastOutputRef.current = output
       totalCharsRef.current = output.length
       onStatusChange?.(r.status || 'IDLE', totalCharsRef.current)
     }).catch(() => onStatusChange?.('IDLE', 0))
 
-    // WebSocket for live streaming
+    // WebSocket for live streaming output only
     const connectWs = () => {
       const ws = new WebSocket(`ws://${location.host}/api/v2/sessions/${sessionId}/stream`)
       wsRef.current = ws
@@ -79,39 +101,17 @@ export function TerminalView({ sessionId, onStatusChange }: Props) {
           if (msg.type === 'output' && msg.data) {
             terminal.write(msg.data)
             totalCharsRef.current += msg.data.length
-            // Detect status from output patterns
-            const data = msg.data as string
-            let detectedStatus = msg.status
-            if (!detectedStatus) {
-              if (data.includes('Thinking') || data.includes('⠋') || data.includes('⠙') || data.includes('⠹') || data.includes('⠸') || data.includes('⠼') || data.includes('⠴') || data.includes('⠦') || data.includes('⠧') || data.includes('⠇') || data.includes('⠏')) {
-                detectedStatus = 'PROCESSING'
-              } else if (data.includes('?') || data.includes('input') || data.includes('Enter')) {
-                detectedStatus = 'WAITING_INPUT'
-              }
-            }
-            if (detectedStatus) {
-              onStatusChange?.(detectedStatus, totalCharsRef.current)
-            } else {
-              onStatusChange?.(undefined as any, totalCharsRef.current)
-            }
+            if (msg.status) onStatusChange?.(msg.status, totalCharsRef.current)
           }
         } catch {}
       }
-      ws.onclose = () => {
-        setConnected(false)
-        setTimeout(connectWs, 1000)
-      }
-      ws.onerror = () => {
-        setConnected(false)
-        onStatusChange?.('ERROR', totalCharsRef.current)
-      }
+      ws.onclose = () => { setConnected(false); setTimeout(connectWs, 1000) }
+      ws.onerror = () => { setConnected(false); onStatusChange?.('ERROR', totalCharsRef.current) }
     }
     connectWs()
 
     const handleResize = () => fitAddon.fit()
     window.addEventListener('resize', handleResize)
-
-    // Focus terminal on mount
     setTimeout(() => terminal.focus(), 100)
 
     return () => {
@@ -121,12 +121,22 @@ export function TerminalView({ sessionId, onStatusChange }: Props) {
     }
   }, [sessionId])
 
+  useEffect(() => {
+    setTimeout(() => fitAddonRef.current?.fit(), 50)
+  }, [fullscreen])
+
   return (
-    <div className="flex flex-col h-full">
+    <div className={`flex flex-col ${fullscreen ? 'fixed inset-0 z-50 bg-gray-950' : 'h-full'}`}>
       <div className="flex items-center gap-2 px-2 py-1 bg-gray-900 border-b border-gray-700 text-xs">
+        <button
+          onClick={() => setFullscreen(!fullscreen)}
+          className="p-1 hover:bg-gray-700 rounded text-gray-400 hover:text-white"
+        >
+          {fullscreen ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+        </button>
         <span className={`w-2 h-2 rounded-full ${connected ? 'bg-green-500' : 'bg-red-500'}`} />
         <span className="text-gray-400">{sessionId.slice(-8)}</span>
-        <span className="text-gray-500 ml-auto">Ctrl+Shift+V to paste</span>
+        <span className="text-gray-500 ml-auto">Type directly • Ctrl+Shift+V to paste</span>
       </div>
       <div 
         ref={termRef} 

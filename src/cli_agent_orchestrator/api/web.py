@@ -1,16 +1,17 @@
 """Web dashboard API routes for Beads, Ralph, and real-time updates."""
+from pathlib import Path
 import asyncio
 import json
 from typing import List, Optional, Set
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
-from cli_agent_orchestrator.clients.beads_real import BeadsClient, Task
+from cli_agent_orchestrator.clients.beads import BeadsClient, Task
 from cli_agent_orchestrator.clients.ralph import RalphRunner
 from cli_agent_orchestrator.api.v2 import clear_bead_position
 
 router = APIRouter()
-beads = BeadsClient()
+beads = BeadsClient(working_dir=str(Path.home() / ".beads-planning"))
 ralph = RalphRunner()
 
 # WebSocket connections
@@ -168,6 +169,31 @@ async def ralph_complete():
         raise HTTPException(404, "No active Ralph loop")
     await broadcast("ralph_completed", state.__dict__)
     return state.__dict__
+
+# Token usage tracking
+from cli_agent_orchestrator.utils.token_tracker import get_usage, track_input, track_output, reset_usage
+
+@router.get("/tokens/{session_id}")
+async def get_token_usage(session_id: str):
+    """Get estimated token usage for a session."""
+    return get_usage(session_id).to_dict()
+
+@router.post("/tokens/{session_id}/track")
+async def track_tokens(session_id: str, data: dict):
+    """Track input/output text for token estimation."""
+    if "input" in data:
+        track_input(session_id, data["input"])
+    if "output" in data:
+        track_output(session_id, data["output"])
+    usage = get_usage(session_id)
+    await broadcast("token_update", {"session_id": session_id, **usage.to_dict()})
+    return usage.to_dict()
+
+@router.post("/tokens/{session_id}/reset")
+async def reset_token_usage(session_id: str):
+    """Reset token usage for a session."""
+    reset_usage(session_id)
+    return {"success": True}
 
 # WebSocket for real-time updates
 @router.websocket("/ws/updates")

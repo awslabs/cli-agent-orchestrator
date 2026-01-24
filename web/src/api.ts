@@ -22,6 +22,7 @@ export const api = {
     input: (id: string, message: string, raw: boolean = false) =>
       fetch(`${API}/v2/sessions/${id}/input?message=${encodeURIComponent(message)}&raw=${raw}`, { method: 'POST' }),
     output: (id: string) => fetch(`${API}/v2/sessions/${id}/output`).then(r => r.json()),
+    context: (id: string) => fetch(`${API}/v2/sessions/${id}/context`).then(r => r.json()),
     autoMode: (id: string, enabled: boolean) =>
       fetch(`${API}/v2/sessions/${id}/auto-mode`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }) }).then(r => r.json()),
     updatePosition: (id: string, x: number, y: number) =>
@@ -46,6 +47,8 @@ export const api = {
     delete: (id: string) => fetch(`${API}/tasks/${id}`, { method: 'DELETE' }),
     assign: (id: string, sessionId: string) =>
       fetch(`${API}/v2/beads/${id}/assign`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session_id: sessionId }) }).then(r => r.json()),
+    assignAgent: (id: string, agentName: string, provider: string = 'kiro_cli') =>
+      fetch(`${API}/v2/beads/${id}/assign-agent`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ agent_name: agentName, provider }) }).then(r => r.json()),
     unassignSession: (sessionId: string) =>
       fetch(`${API}/tasks/unassign-session/${sessionId}`, { method: 'POST' }).then(r => r.json()),
     decompose: (text: string) =>

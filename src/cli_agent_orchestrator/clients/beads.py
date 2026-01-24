@@ -1,15 +1,16 @@
-"""BeadsClient - SQLite-backed task queue for CAO."""
-import sqlite3
-import uuid
-from datetime import datetime
-from pathlib import Path
-from typing import Optional
-from dataclasses import dataclass, asdict
+"""BeadsClient - Wrapper around bd CLI for CAO integration."""
 
-DEFAULT_DB_PATH = Path.home() / ".beads-planning" / "beads.db"
+import json
+import re
+import subprocess
+from dataclasses import dataclass
+from typing import Optional
+
 
 @dataclass
 class Task:
+    """CAO-compatible task wrapper around Beads Issue."""
+
     id: str
     title: str
     description: str = ""
@@ -22,112 +23,172 @@ class Task:
     tags: str = "[]"
     metadata: str = "{}"
 
+
 class BeadsClient:
-    def __init__(self, db_path: Path = DEFAULT_DB_PATH):
-        self.db_path = db_path
-        self._ensure_db()
+    """CAO-compatible client wrapping bd CLI."""
 
-    def _ensure_db(self):
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS tasks (
-                    id TEXT PRIMARY KEY,
-                    title TEXT NOT NULL,
-                    description TEXT DEFAULT '',
-                    priority INTEGER DEFAULT 2,
-                    status TEXT DEFAULT 'open',
-                    assignee TEXT,
-                    created_at TEXT,
-                    updated_at TEXT,
-                    closed_at TEXT,
-                    tags TEXT DEFAULT '[]',
-                    metadata TEXT DEFAULT '{}'
-                )
-            """)
+    def __init__(self, working_dir: Optional[str] = None):
+        self.working_dir = working_dir
 
-    def _row_to_task(self, row) -> Task:
-        return Task(*row)
+    def _run_bd(self, *args) -> str:
+        """Run bd command and return output."""
+        cmd = ["bd", "--no-daemon"] + list(args)
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=self.working_dir)
+        if result.returncode != 0 and result.stderr:
+            raise RuntimeError(f"bd error: {result.stderr}")
+        return result.stdout.strip()
+
+    def _parse_create_output(self, output: str) -> str:
+        """Extract task ID from bd create output."""
+        match = re.search(r"Created issue:\s*(\S+)", output)
+        return match.group(1) if match else ""
+
+    def _parse_json(self, output: str) -> list | dict:
+        """Parse JSON output from bd commands."""
+        if not output:
+            return []
+        try:
+            return json.loads(output)
+        except json.JSONDecodeError:
+            return []
+
+    def _run_bd_json(self, *args) -> list | dict:
+        """Run bd command with JSON output."""
+        output = self._run_bd(*args, "--json")
+        return self._parse_json(output)
+
+    def _cao_to_beads_priority(self, priority: int) -> int:
+        """Convert CAO priority (1-3) to Beads priority (0-4)."""
+        if priority in (1, 2, 3):
+            return priority
+        return 2
+
+    def _beads_to_cao_priority(self, priority: int) -> int:
+        """Convert Beads priority (0-4) to CAO priority (1-3)."""
+        if priority <= 1:
+            return 1
+        if priority == 2:
+            return 2
+        if priority in (3, 4):
+            return 3
+        return 2
+
+    def _cao_to_beads_status(self, status: str) -> str:
+        """Convert CAO status to Beads status."""
+        mapping = {"open": "open", "wip": "in_progress", "closed": "closed"}
+        return mapping.get(status, "open")
+
+    def _beads_to_cao_status(self, status: str) -> str:
+        """Convert Beads status to CAO status."""
+        mapping = {"open": "open", "in_progress": "wip", "closed": "closed"}
+        return mapping.get(status, "open")
+
+    def _issue_to_task(self, issue: dict) -> Task:
+        """Convert Beads Issue dict to CAO Task."""
+        bd_priority = issue.get("priority", 2)
+        state = issue.get("status", "open")
+        return Task(
+            id=issue.get("id", ""),
+            title=issue.get("title", ""),
+            description=issue.get("description", "") or "",
+            priority=self._beads_to_cao_priority(bd_priority),
+            status=self._beads_to_cao_status(state),
+            assignee=issue.get("assignee"),
+            created_at=issue.get("created_at"),
+            updated_at=issue.get("updated_at"),
+            closed_at=issue.get("closed_at"),
+        )
 
     def list(self, status: Optional[str] = None, priority: Optional[int] = None) -> list[Task]:
-        query = "SELECT * FROM tasks WHERE 1=1"
-        params = []
+        """List tasks, optionally filtered by status/priority."""
+        args = ["list"]
         if status:
-            query += " AND status = ?"
-            params.append(status)
+            args.extend(["--status", self._cao_to_beads_status(status)])
+        issues = self._run_bd_json(*args)
+        if not isinstance(issues, list):
+            issues = []
+        tasks = [self._issue_to_task(i) for i in issues]
         if priority:
-            query += " AND priority = ?"
-            params.append(priority)
-        query += " ORDER BY priority ASC, created_at ASC"
-        with sqlite3.connect(self.db_path) as conn:
-            return [self._row_to_task(r) for r in conn.execute(query, params).fetchall()]
+            tasks = [t for t in tasks if t.priority == priority]
+        return sorted(tasks, key=lambda t: (t.priority, t.created_at or ""))
 
     def next(self, priority: Optional[int] = None) -> Optional[Task]:
-        query = "SELECT * FROM tasks WHERE status = 'open'"
-        params = []
+        """Get next ready task (no blockers)."""
+        issues = self._run_bd_json("ready")
+        if not isinstance(issues, list) or not issues:
+            return None
+        tasks = [self._issue_to_task(i) for i in issues]
         if priority:
-            query += " AND priority = ?"
-            params.append(priority)
-        query += " ORDER BY priority ASC, created_at ASC LIMIT 1"
-        with sqlite3.connect(self.db_path) as conn:
-            row = conn.execute(query, params).fetchone()
-            return self._row_to_task(row) if row else None
+            tasks = [t for t in tasks if t.priority == priority]
+        return tasks[0] if tasks else None
 
     def get(self, task_id: str) -> Optional[Task]:
-        with sqlite3.connect(self.db_path) as conn:
-            row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
-            return self._row_to_task(row) if row else None
+        """Get a single task by ID."""
+        try:
+            result = self._run_bd_json("show", task_id)
+            # bd show returns a list with single issue
+            if isinstance(result, list) and result:
+                return self._issue_to_task(result[0])
+        except Exception:
+            pass
+        return None
 
     def add(self, title: str, description: str = "", priority: int = 2, tags: str = "[]") -> Task:
-        task_id = str(uuid.uuid4())[:8]
-        now = datetime.utcnow().isoformat()
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
-                "INSERT INTO tasks (id, title, description, priority, status, created_at, updated_at, tags) VALUES (?, ?, ?, ?, 'open', ?, ?, ?)",
-                (task_id, title, description, priority, now, now, tags)
-            )
-        return self.get(task_id)
+        """Create a new task."""
+        # Map CAO priority (1-3) to beads priority (0-4)
+        bd_priority = {1: 1, 2: 2, 3: 3}.get(priority, 2)
+        args = ["create", title, "-p", str(bd_priority)]
+        if description:
+            args.extend(["-d", description])
+        output = self._run_bd(*args)
+        task_id = self._parse_create_output(output)
+        return self.get(task_id) or Task(id=task_id, title=title, priority=priority)
 
     def wip(self, task_id: str, assignee: Optional[str] = None) -> Optional[Task]:
-        now = datetime.utcnow().isoformat()
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
-                "UPDATE tasks SET status = 'wip', assignee = ?, updated_at = ? WHERE id = ?",
-                (assignee, now, task_id)
-            )
+        """Mark task as work-in-progress."""
+        self._run_bd("update", task_id, "--status", "in_progress")
+        if assignee:
+            self._run_bd("update", task_id, "--assignee", assignee)
         return self.get(task_id)
 
     def close(self, task_id: str) -> Optional[Task]:
-        now = datetime.utcnow().isoformat()
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
-                "UPDATE tasks SET status = 'closed', assignee = NULL, closed_at = ?, updated_at = ? WHERE id = ?",
-                (now, now, task_id)
-            )
+        """Close a task."""
+        self._run_bd("close", task_id)
         return self.get(task_id)
 
     def delete(self, task_id: str) -> bool:
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-            return cursor.rowcount > 0
+        """Delete a task."""
+        try:
+            self._run_bd("delete", task_id, "--force")
+            return True
+        except Exception:
+            return False
 
     def update(self, task_id: str, **kwargs) -> Optional[Task]:
-        allowed = {"title", "description", "priority", "status", "assignee", "tags", "metadata"}
-        updates = {k: v for k, v in kwargs.items() if k in allowed}
-        if not updates:
-            return self.get(task_id)
-        updates["updated_at"] = datetime.utcnow().isoformat()
-        set_clause = ", ".join(f"{k} = ?" for k in updates)
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute(f"UPDATE tasks SET {set_clause} WHERE id = ?", (*updates.values(), task_id))
+        """Update task fields."""
+        args = ["update", task_id]
+        if "title" in kwargs:
+            args.extend(["--title", kwargs["title"]])
+        if "description" in kwargs:
+            args.extend(["--description", kwargs["description"]])
+        if "priority" in kwargs:
+            bd_priority = {1: 1, 2: 2, 3: 3}.get(kwargs["priority"], 2)
+            args.extend(["-p", str(bd_priority)])
+        if "status" in kwargs:
+            status_map = {"open": "open", "wip": "in_progress", "closed": "closed"}
+            args.extend(["--status", status_map.get(kwargs["status"], kwargs["status"])])
+        if "assignee" in kwargs:
+            args.extend(["--assignee", kwargs["assignee"]])
+        if len(args) > 2:
+            self._run_bd(*args)
         return self.get(task_id)
 
     def clear_assignee_by_session(self, session_id: str) -> int:
-        """Clear assignee from all tasks assigned to a session."""
-        now = datetime.utcnow().isoformat()
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.execute(
-                "UPDATE tasks SET assignee = NULL, status = 'open', updated_at = ? WHERE assignee = ?",
-                (now, session_id)
-            )
-            return cursor.rowcount
+        """Clear assignee from tasks assigned to session."""
+        tasks = self.list(status="wip")
+        count = 0
+        for task in tasks:
+            if task.assignee == session_id:
+                self._run_bd("update", task.id, "--status", "open", "--assignee", "")
+                count += 1
+        return count

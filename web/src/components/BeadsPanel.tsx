@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useStore } from '../store'
 import { api } from '../api'
-import { Plus, Edit2, Check, Trash2, ChevronDown, ChevronRight, Inbox, Bot, Wrench, Search, Shield, Swords, Mail, Map, RefreshCw, Package, User, Sparkles, Loader2 } from 'lucide-react'
+import { Plus, Edit2, Check, Trash2, ChevronDown, ChevronRight, Inbox, Bot, Wrench, Search, Shield, Swords, Mail, Map, RefreshCw, Package, User, Sparkles, Loader2, X, Terminal } from 'lucide-react'
 
 const PRIORITY_STYLES = {
   1: { bg: 'bg-red-500/10', border: 'border-red-500/30', text: 'text-red-400', badge: 'bg-red-500', label: 'P1 Critical' },
@@ -37,7 +37,7 @@ interface Bead {
 }
 
 export function BeadsPanel() {
-  const { tasks, setTasks, sessions } = useStore()
+  const { tasks, setTasks, sessions, agents, setAgents } = useStore()
   const [showCreate, setShowCreate] = useState(false)
   const [editingBead, setEditingBead] = useState<Bead | null>(null)
   const [expandedBead, setExpandedBead] = useState<string | null>(null)
@@ -45,8 +45,16 @@ export function BeadsPanel() {
   const [newBead, setNewBead] = useState({ title: '', description: '', priority: 2 })
   const [aiText, setAiText] = useState('')
   const [aiGenerating, setAiGenerating] = useState(false)
+  const [assignModal, setAssignModal] = useState<Bead | null>(null)
+  const [assigning, setAssigning] = useState(false)
+  const [spawnProgress, setSpawnProgress] = useState<{ agent: string; bead: Bead; logs: string[] } | null>(null)
 
   const refresh = () => api.tasks.list().then(setTasks).catch(() => {})
+  
+  useEffect(() => {
+    refresh()
+    api.agents.list().then(setAgents).catch(() => {})
+  }, [])
   
   const generateBeads = async () => {
     if (!aiText.trim() || aiGenerating) return
@@ -92,8 +100,55 @@ export function BeadsPanel() {
 
   const assignBead = async (beadId: string, sessionId: string) => {
     if (sessionId) {
-      await api.tasks.assign(beadId, sessionId)
+      setAssigning(true)
+      try {
+        await api.tasks.assign(beadId, sessionId)
+        // Send the task to the agent
+        const bead = tasks.find(t => t.id === beadId)
+        if (bead) {
+          const prompt = `Please work on this task:\n\nTitle: ${bead.title}\n\n${bead.description || 'No additional details.'}`
+          await api.sessions.input(sessionId, prompt + '\n', true)
+        }
+        refresh()
+        setAssignModal(null)
+      } finally {
+        setAssigning(false)
+      }
+    }
+  }
+
+  const assignToNewAgent = async (agentName: string) => {
+    if (!assignModal) return
+    const bead = assignModal
+    setAssignModal(null)
+    setSpawnProgress({ agent: agentName, bead, logs: [`Initializing ${agentName}...`] })
+    
+    try {
+      await new Promise(r => setTimeout(r, 400))
+      setSpawnProgress(p => p ? { ...p, logs: [...p.logs, 'Creating tmux session...'] } : null)
+      await new Promise(r => setTimeout(r, 400))
+      
+      setSpawnProgress(p => p ? { ...p, logs: [...p.logs, 'Loading agent profile...'] } : null)
+      await new Promise(r => setTimeout(r, 400))
+      
+      setSpawnProgress(p => p ? { ...p, logs: [...p.logs, 'Spawning kiro-cli agent...'] } : null)
+      const result = await api.tasks.assignAgent(bead.id, agentName)
+      
+      setSpawnProgress(p => p ? { ...p, logs: [...p.logs, `Session created: ${result.session_id || 'ok'}`, 'Assigning bead to agent...'] } : null)
+      await new Promise(r => setTimeout(r, 400))
+      
+      setSpawnProgress(p => p ? { ...p, logs: [...p.logs, `Bead assigned: ${bead.title}`, 'Sending task to agent...'] } : null)
+      await new Promise(r => setTimeout(r, 500))
+      
+      setSpawnProgress(p => p ? { ...p, logs: [...p.logs, '✓ Done'] } : null)
+      await new Promise(r => setTimeout(r, 800))
+      
       refresh()
+      setSpawnProgress(null)
+    } catch (e) {
+      setSpawnProgress(p => p ? { ...p, logs: [...p.logs, `Error: ${e}`] } : null)
+      await new Promise(r => setTimeout(r, 2000))
+      setSpawnProgress(null)
     }
   }
 
@@ -244,6 +299,121 @@ export function BeadsPanel() {
       {showCreate && <BeadModal isEdit={false} />}
       {editingBead && <BeadModal isEdit={true} />}
 
+      {/* Assignment Modal */}
+      {assignModal && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50" onClick={() => !assigning && setAssignModal(null)}>
+          <div className="bg-gray-900 rounded-xl p-5 w-full max-w-md border border-gray-700" onClick={e => e.stopPropagation()}>
+            <div className="flex justify-between items-center mb-4">
+              <h3 className="font-semibold text-white text-lg">Assign Bead</h3>
+              <button onClick={() => !assigning && setAssignModal(null)} className="text-gray-400 hover:text-white">
+                <X size={18} />
+              </button>
+            </div>
+            
+            <div className="mb-4 p-3 bg-gray-800 rounded-lg">
+              <div className="text-sm text-gray-400">Bead</div>
+              <div className="text-white font-medium">{assignModal.title}</div>
+              {assignModal.description && (
+                <div className="text-sm text-gray-500 mt-1 line-clamp-2">{assignModal.description}</div>
+              )}
+            </div>
+
+            {/* Existing Sessions */}
+            {sessions.length > 0 && (
+              <div className="mb-4">
+                <div className="text-xs text-gray-400 mb-2 flex items-center gap-1 uppercase tracking-wide">
+                  <Terminal size={12} /> Existing Sessions
+                </div>
+                <div className="space-y-1 max-h-32 overflow-y-auto">
+                  {sessions.map(s => {
+                    const hasAssigned = tasks.some(t => t.assignee === s.id)
+                    const icon = AGENT_ICONS[s.agent_name] || <User size={14} />
+                    return (
+                      <button
+                        key={s.id}
+                        onClick={() => assignBead(assignModal.id, s.id)}
+                        disabled={assigning}
+                        className="w-full text-left p-3 bg-gray-800 hover:bg-gray-700 rounded-lg text-sm flex items-center gap-2 disabled:opacity-50"
+                      >
+                        <span className="text-emerald-400">{icon}</span>
+                        <span className="flex-1 truncate font-medium">{s.agent_name || 'unknown'}</span>
+                        <span className={`text-xs px-2 py-0.5 rounded ${hasAssigned ? 'bg-amber-500/20 text-amber-400' : 'bg-emerald-500/20 text-emerald-400'}`}>
+                          {hasAssigned ? 'busy' : 'idle'}
+                        </span>
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Spawn New Agent */}
+            <div>
+              <div className="text-xs text-gray-400 mb-2 flex items-center gap-1 uppercase tracking-wide">
+                <Plus size={12} /> Spawn New Agent
+              </div>
+              <div className="space-y-1 max-h-48 overflow-y-auto">
+                {agents.map(a => {
+                  const icon = AGENT_ICONS[a.name] || <Bot size={14} />
+                  return (
+                    <button
+                      key={a.name}
+                      onClick={() => assignToNewAgent(a.name)}
+                      disabled={assigning}
+                      className="w-full text-left p-3 bg-gray-800 hover:bg-purple-900/30 rounded-lg text-sm flex items-center gap-2 disabled:opacity-50"
+                    >
+                      <span className="text-purple-400">{icon}</span>
+                      <span className="flex-1 font-medium">{a.name}</span>
+                      <span className="text-xs text-gray-500">+ new</span>
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+
+            {assigning && (
+              <div className="mt-4 text-center text-sm text-amber-400 flex items-center justify-center gap-2">
+                <Loader2 size={14} className="animate-spin" />
+                Assigning to session...
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Spawn Progress Modal */}
+      {spawnProgress && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50">
+          <div className="bg-gray-900 rounded-2xl p-6 w-full max-w-md border border-gray-700 shadow-2xl">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="w-10 h-10 rounded-lg bg-purple-500/20 flex items-center justify-center text-purple-400 animate-pulse">
+                {AGENT_ICONS[spawnProgress.agent] || <Bot size={20} />}
+              </div>
+              <div>
+                <h3 className="font-semibold text-white">Spawning {spawnProgress.agent}</h3>
+                <p className="text-xs text-gray-500">Assigning: {spawnProgress.bead.title}</p>
+              </div>
+            </div>
+            <div className="bg-black/50 rounded-lg p-3 font-mono text-xs space-y-1 max-h-48 overflow-y-auto">
+              {spawnProgress.logs.map((log, i) => (
+                <div key={i} className={`flex items-center gap-2 ${
+                  log.includes('Error') ? 'text-red-400' : 
+                  log.includes('✓') ? 'text-emerald-400' : 'text-gray-400'
+                }`}>
+                  <Terminal size={12} className="text-gray-600" />
+                  {log}
+                </div>
+              ))}
+              {!spawnProgress.logs.some(l => l.includes('✓') || l.includes('Error')) && (
+                <div className="flex items-center gap-2 text-purple-400">
+                  <Loader2 size={12} className="animate-spin" />
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Bead List */}
       <div className="space-y-3">
         {filtered.length === 0 ? (
@@ -318,22 +488,13 @@ export function BeadsPanel() {
 
                   {/* Actions */}
                   <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                    {bead.status === 'open' && sessions.length > 0 && (
-                      <select
-                        onChange={e => e.target.value && assignBead(bead.id, e.target.value)}
-                        className="px-3 py-2 text-sm bg-gray-800 border border-gray-700 rounded-lg text-white cursor-pointer"
-                        defaultValue=""
+                    {(bead.status === 'open' || (bead.status === 'wip' && !bead.assignee)) && (
+                      <button
+                        onClick={() => setAssignModal(bead)}
+                        className="px-3 py-2 text-sm bg-purple-600 hover:bg-purple-500 rounded-lg text-white font-medium"
                       >
-                        <option value="">Assign to...</option>
-                        {sessions.map(s => {
-                          const hasAssigned = tasks.some(t => t.assignee === s.id)
-                          return (
-                            <option key={s.id} value={s.id}>
-                              {s.agent_name} {hasAssigned ? '(busy)' : '(idle)'}
-                            </option>
-                          )
-                        })}
-                      </select>
+                        Assign
+                      </button>
                     )}
                     <button
                       onClick={() => setEditingBead(bead)}

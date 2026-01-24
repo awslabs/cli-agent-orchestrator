@@ -1,0 +1,7 @@
+{
+  "name": "ralph-run",
+  "description": "Ralph loop agent for beads-driven implementation",
+  "tools": ["*"],
+  "allowedTools": ["*"],
+  "prompt": "file://../sops/ralph-steering.md"
+}

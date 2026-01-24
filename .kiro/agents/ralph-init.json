@@ -1,0 +1,7 @@
+{
+  "name": "ralph-init",
+  "description": "Beads initialization from implementation plan",
+  "tools": ["*"],
+  "allowedTools": ["*"],
+  "prompt": "file://../sops/beads-init.md"
+}

@@ -19,7 +19,7 @@ const AGENT_ICONS: Record<string, React.ReactNode> = {
 const STATUS_CONFIG: Record<string, { color: string; text: string; label: string; animate?: string }> = {
   IDLE: { color: 'bg-emerald-500', text: 'text-emerald-400', label: 'Ready' },
   PROCESSING: { color: 'bg-amber-500', text: 'text-amber-400', label: 'Working', animate: 'animate-pulse' },
-  WAITING_INPUT: { color: 'bg-amber-500', text: 'text-amber-400', label: 'Waiting', animate: 'animate-pulse' },
+  WAITING_INPUT: { color: 'bg-emerald-500', text: 'text-emerald-400', label: 'Waiting' },
   ERROR: { color: 'bg-red-500', text: 'text-red-400', label: 'Error' }
 }
 
@@ -27,10 +27,18 @@ export function AgentPanel() {
   const { agents, setAgents, sessions, setSessions, activeSession, setActiveSession, tasks, setTasks, autoModeSessions, toggleAutoMode } = useStore()
   const [spawning, setSpawning] = useState<{ agent: string; logs: string[] } | null>(null)
   const [sessionStatuses, setSessionStatuses] = useState<Record<string, string>>({})
-  const [sessionContext, setSessionContext] = useState<Record<string, number>>({})
+  const [sessionContext, setSessionContext] = useState<Record<string, { total: number; tools: number; files: number; responses: number; prompts: number }>>({})
   const [view, setView] = useState<'agents' | 'sessions'>('sessions')
   const [editingAgent, setEditingAgent] = useState<{ name: string; context: string; contextPath?: string } | null>(null)
   const [closingSession, setClosingSession] = useState<{ id: string; logs: string[] } | null>(null)
+  const [focusedSession, setFocusedSession] = useState<string | null>(null)
+
+  const fetchContextUsage = async (sessionId: string) => {
+    try {
+      const ctx = await api.sessions.context(sessionId)
+      setSessionContext(prev => ({ ...prev, [sessionId]: { total: ctx.total_percent, tools: ctx.tools_percent, files: ctx.files_percent, responses: ctx.responses_percent, prompts: ctx.prompts_percent } }))
+    } catch {}
+  }
 
   const refresh = async () => {
     const [agentList, sessionList, taskList] = await Promise.all([
@@ -160,11 +168,8 @@ export function AgentPanel() {
     setClosingSession(null)
   }
 
-  const handleStatusChange = (sessionId: string, status: string, contextChars?: number) => {
+  const handleStatusChange = (sessionId: string, status: string) => {
     setSessionStatuses(prev => ({ ...prev, [sessionId]: status }))
-    if (contextChars !== undefined) {
-      setSessionContext(prev => ({ ...prev, [sessionId]: contextChars }))
-    }
   }
 
   const getAgentType = (name: string) => {
@@ -297,6 +302,33 @@ export function AgentPanel() {
         </button>
       </div>
 
+      {/* Focused Single Terminal View */}
+      {focusedSession && (
+        <div className="fixed inset-0 bg-gray-950 z-50 flex flex-col">
+          <div className="flex items-center justify-between px-4 py-2 bg-gray-900 border-b border-gray-800">
+            <div className="flex items-center gap-3">
+              <button
+                onClick={() => setFocusedSession(null)}
+                className="p-2 rounded-lg hover:bg-gray-800 text-gray-400 hover:text-white"
+              >
+                ← Back
+              </button>
+              <span className="text-white font-medium">
+                {sessions.find(s => s.id === focusedSession)?.agent_name || 'Terminal'}
+              </span>
+              <span className={`px-2 py-0.5 text-xs rounded-full ${
+                (sessionStatuses[focusedSession] || 'IDLE') === 'PROCESSING' ? 'bg-amber-500/20 text-amber-400' : 'bg-emerald-500/20 text-emerald-400'
+              }`}>
+                {sessionStatuses[focusedSession] || 'IDLE'}
+              </span>
+            </div>
+          </div>
+          <div className="flex-1">
+            <TerminalView sessionId={focusedSession} onStatusChange={(s) => handleStatusChange(focusedSession, s)} />
+          </div>
+        </div>
+      )}
+
       {/* Sessions View */}
       {view === 'sessions' && (
         <div className="space-y-4">
@@ -323,8 +355,8 @@ export function AgentPanel() {
                 const isActive = activeSession === session.id
                 const assignedBead = getAssignedBead(session.id)
                 const isAutoMode = autoModeSessions.has(session.id)
-                const contextChars = sessionContext[session.id] || 0
-                const contextK = contextChars > 0 ? `${Math.round(contextChars / 1000)}k` : '0k'
+                const ctx = sessionContext[session.id]
+                const contextPct = ctx?.total ?? 0
 
                 return (
                   <div
@@ -355,12 +387,7 @@ export function AgentPanel() {
                             <span className={`px-2 py-0.5 text-xs rounded-full bg-gray-800 ${config.text}`}>
                               {config.label}
                             </span>
-                            <span className="px-2 py-0.5 text-xs rounded-full bg-blue-500/20 text-blue-400">
-                              {contextK} ctx
-                            </span>
-                            <span className="px-2 py-0.5 text-xs rounded-full bg-purple-500/20 text-purple-400">
-                              {(session as any).model || 'claude-sonnet-4'}
-                            </span>
+
                           </div>
                           <p className="text-xs text-gray-500 font-mono mt-0.5">{session.id}</p>
                           {assignedBead && (
@@ -395,6 +422,13 @@ export function AgentPanel() {
                             {isAutoMode ? 'Auto ON' : 'Auto'}
                           </button>
                           <button
+                            onClick={(e) => { e.stopPropagation(); setFocusedSession(session.id) }}
+                            className="p-2 rounded-lg hover:bg-blue-500/20 text-gray-400 hover:text-blue-400 transition-all"
+                            title="Focus Terminal"
+                          >
+                            <Terminal size={16} />
+                          </button>
+                          <button
                             onClick={(e) => { e.stopPropagation(); deleteSession(session.id) }}
                             className="p-2 rounded-lg hover:bg-red-500/20 text-gray-400 hover:text-red-400 transition-all"
                           >
@@ -406,11 +440,8 @@ export function AgentPanel() {
                     </div>
 
                     {isActive && (
-                      <div className="border-t border-gray-800">
-                        <TerminalView
-                          sessionId={session.id}
-                          onStatusChange={(s, ctx) => handleStatusChange(session.id, s, ctx)}
-                        />
+                      <div className="border-t border-gray-800 h-80">
+                        <TerminalView sessionId={session.id} onStatusChange={(s) => handleStatusChange(session.id, s)} />
                       </div>
                     )}
                   </div>
