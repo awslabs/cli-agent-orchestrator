@@ -297,3 +297,92 @@ class TestClose:
             args = close_call[0][0]
             assert "close" in args
             assert "abc" in args
+
+
+class TestNext:
+    """Tests for next() method."""
+
+    def test_next_returns_first_ready_task(self, client):
+        """next() returns first task from bd ready --json."""
+        issues = [
+            {"id": "a", "title": "First", "priority": 2, "status": "open"},
+            {"id": "b", "title": "Second", "priority": 2, "status": "open"},
+        ]
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(issues), stderr="")
+            task = client.next()
+            assert task is not None
+            assert task.id == "a"
+
+    def test_next_returns_none_when_empty(self, client):
+        """next() returns None when no ready tasks."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="[]", stderr="")
+            task = client.next()
+            assert task is None
+
+    def test_next_filters_by_priority(self, client):
+        """next() filters tasks by priority."""
+        issues = [
+            {"id": "a", "title": "High", "priority": 1, "status": "open"},
+            {"id": "b", "title": "Medium", "priority": 2, "status": "open"},
+        ]
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(issues), stderr="")
+            task = client.next(priority=2)
+            assert task is not None
+            assert task.id == "b"
+
+
+class TestWip:
+    """Tests for wip() method."""
+
+    def test_wip_sets_status_in_progress(self, client):
+        """wip() uses --status in_progress flag."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps([{"id": "abc", "title": "Test", "priority": 2, "status": "in_progress"}]), stderr="")
+            client.wip("abc")
+            update_call = [c for c in mock_run.call_args_list if "update" in c[0][0]][0]
+            args = update_call[0][0]
+            assert "--status" in args
+            assert "in_progress" in args
+
+    def test_wip_sets_assignee(self, client):
+        """wip() sets assignee when provided."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps([{"id": "abc", "title": "Test", "priority": 2, "status": "in_progress", "assignee": "session-123"}]), stderr="")
+            client.wip("abc", assignee="session-123")
+            assignee_call = [c for c in mock_run.call_args_list if "--assignee" in c[0][0]]
+            assert len(assignee_call) == 1
+            args = assignee_call[0][0][0]
+            assert "session-123" in args
+
+
+class TestClearAssigneeBySession:
+    """Tests for clear_assignee_by_session() method."""
+
+    def test_clears_matching_tasks_uses_status_flag(self, client):
+        """clear_assignee_by_session() uses --status flag (not --state)."""
+        tasks = [
+            {"id": "a", "title": "Task A", "priority": 2, "status": "in_progress", "assignee": "session-123"},
+        ]
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(tasks), stderr="")
+            client.clear_assignee_by_session("session-123")
+            update_calls = [c for c in mock_run.call_args_list if "update" in c[0][0]]
+            assert len(update_calls) >= 1
+            args = update_calls[0][0][0]
+            assert "--status" in args
+            assert "--state" not in args
+
+    def test_returns_count_of_cleared(self, client):
+        """clear_assignee_by_session() returns count of cleared tasks."""
+        tasks = [
+            {"id": "a", "title": "Task A", "priority": 2, "status": "in_progress", "assignee": "session-123"},
+            {"id": "b", "title": "Task B", "priority": 2, "status": "in_progress", "assignee": "session-123"},
+            {"id": "c", "title": "Task C", "priority": 2, "status": "in_progress", "assignee": "other"},
+        ]
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(tasks), stderr="")
+            count = client.clear_assignee_by_session("session-123")
+            assert count == 2

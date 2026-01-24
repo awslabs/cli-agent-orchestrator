@@ -187,6 +187,6 @@ class BeadsClient:
         count = 0
         for task in tasks:
             if task.assignee == session_id:
-                self._run_bd("update", task.id, "--state", "open")
+                self._run_bd("update", task.id, "--status", "open")
                 count += 1
         return count
