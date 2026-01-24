@@ -48,6 +48,7 @@ export function BeadsPanel() {
   const [assignModal, setAssignModal] = useState<Bead | null>(null)
   const [assigning, setAssigning] = useState(false)
   const [spawnProgress, setSpawnProgress] = useState<{ agent: string; bead: Bead; logs: string[] } | null>(null)
+  const [assignMode, setAssignMode] = useState<'single' | 'orchestrator' | null>(null)
 
   const refresh = () => api.tasks.list().then(setTasks).catch(() => {})
   
@@ -301,11 +302,11 @@ export function BeadsPanel() {
 
       {/* Assignment Modal */}
       {assignModal && (
-        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50" onClick={() => !assigning && setAssignModal(null)}>
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50" onClick={() => { if (!assigning) { setAssignModal(null); setAssignMode(null) } }}>
           <div className="bg-gray-900 rounded-xl p-5 w-full max-w-md border border-gray-700" onClick={e => e.stopPropagation()}>
             <div className="flex justify-between items-center mb-4">
               <h3 className="font-semibold text-white text-lg">Assign Bead</h3>
-              <button onClick={() => !assigning && setAssignModal(null)} className="text-gray-400 hover:text-white">
+              <button onClick={() => { if (!assigning) { setAssignModal(null); setAssignMode(null) } }} className="text-gray-400 hover:text-white">
                 <X size={18} />
               </button>
             </div>
@@ -318,58 +319,131 @@ export function BeadsPanel() {
               )}
             </div>
 
-            {/* Existing Sessions */}
-            {sessions.length > 0 && (
-              <div className="mb-4">
-                <div className="text-xs text-gray-400 mb-2 flex items-center gap-1 uppercase tracking-wide">
-                  <Terminal size={12} /> Existing Sessions
+            {/* Mode Toggle */}
+            <div className="mb-4">
+              <div className="text-xs text-gray-400 mb-2 uppercase tracking-wide">How should this be worked on?</div>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  onClick={() => setAssignMode('single')}
+                  className={`p-3 rounded-lg border text-left transition-all ${
+                    assignMode === 'single' 
+                      ? 'border-emerald-500 bg-emerald-500/10' 
+                      : 'border-gray-700 hover:border-gray-600'
+                  }`}
+                >
+                  <div className="flex items-center gap-2 mb-1">
+                    <Bot size={16} className={assignMode === 'single' ? 'text-emerald-400' : 'text-gray-400'} />
+                    <span className={`font-medium ${assignMode === 'single' ? 'text-emerald-400' : 'text-white'}`}>Single Agent</span>
+                  </div>
+                  <p className="text-xs text-gray-500">Assign to one agent who works independently</p>
+                </button>
+                <button
+                  onClick={() => setAssignMode('orchestrator')}
+                  className={`p-3 rounded-lg border text-left transition-all ${
+                    assignMode === 'orchestrator' 
+                      ? 'border-purple-500 bg-purple-500/10' 
+                      : 'border-gray-700 hover:border-gray-600'
+                  }`}
+                >
+                  <div className="flex items-center gap-2 mb-1">
+                    <User size={16} className={assignMode === 'orchestrator' ? 'text-purple-400' : 'text-gray-400'} />
+                    <span className={`font-medium ${assignMode === 'orchestrator' ? 'text-purple-400' : 'text-white'}`}>Orchestrator</span>
+                  </div>
+                  <p className="text-xs text-gray-500">Supervisor coordinates multiple workers</p>
+                </button>
+              </div>
+            </div>
+
+            {/* Single Agent Mode Content */}
+            {assignMode === 'single' && (
+              <>
+                {/* Existing Sessions */}
+                {sessions.length > 0 && (
+                  <div className="mb-4">
+                    <div className="text-xs text-gray-400 mb-2 flex items-center gap-1 uppercase tracking-wide">
+                      <Terminal size={12} /> Existing Sessions
+                    </div>
+                    <div className="space-y-1 max-h-32 overflow-y-auto">
+                      {sessions.map(s => {
+                        const hasAssigned = tasks.some(t => t.assignee === s.id)
+                        const icon = AGENT_ICONS[s.agent_name] || <User size={14} />
+                        return (
+                          <button
+                            key={s.id}
+                            onClick={() => assignBead(assignModal.id, s.id)}
+                            disabled={assigning}
+                            className="w-full text-left p-3 bg-gray-800 hover:bg-gray-700 rounded-lg text-sm flex items-center gap-2 disabled:opacity-50"
+                          >
+                            <span className="text-emerald-400">{icon}</span>
+                            <span className="flex-1 truncate font-medium">{s.agent_name || 'unknown'}</span>
+                            <span className={`text-xs px-2 py-0.5 rounded ${hasAssigned ? 'bg-amber-500/20 text-amber-400' : 'bg-emerald-500/20 text-emerald-400'}`}>
+                              {hasAssigned ? 'busy' : 'idle'}
+                            </span>
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {/* Spawn New Agent */}
+                <div>
+                  <div className="text-xs text-gray-400 mb-2 flex items-center gap-1 uppercase tracking-wide">
+                    <Plus size={12} /> Spawn New Agent
+                  </div>
+                  <div className="space-y-1 max-h-48 overflow-y-auto">
+                    {agents.map(a => {
+                      const icon = AGENT_ICONS[a.name] || <Bot size={14} />
+                      return (
+                        <button
+                          key={a.name}
+                          onClick={() => assignToNewAgent(a.name)}
+                          disabled={assigning}
+                          className="w-full text-left p-3 bg-gray-800 hover:bg-purple-900/30 rounded-lg text-sm flex items-center gap-2 disabled:opacity-50"
+                        >
+                          <span className="text-purple-400">{icon}</span>
+                          <span className="flex-1 font-medium">{a.name}</span>
+                          <span className="text-xs text-gray-500">+ new</span>
+                        </button>
+                      )
+                    })}
+                  </div>
                 </div>
-                <div className="space-y-1 max-h-32 overflow-y-auto">
-                  {sessions.map(s => {
-                    const hasAssigned = tasks.some(t => t.assignee === s.id)
-                    const icon = AGENT_ICONS[s.agent_name] || <User size={14} />
-                    return (
-                      <button
-                        key={s.id}
-                        onClick={() => assignBead(assignModal.id, s.id)}
-                        disabled={assigning}
-                        className="w-full text-left p-3 bg-gray-800 hover:bg-gray-700 rounded-lg text-sm flex items-center gap-2 disabled:opacity-50"
-                      >
-                        <span className="text-emerald-400">{icon}</span>
-                        <span className="flex-1 truncate font-medium">{s.agent_name || 'unknown'}</span>
-                        <span className={`text-xs px-2 py-0.5 rounded ${hasAssigned ? 'bg-amber-500/20 text-amber-400' : 'bg-emerald-500/20 text-emerald-400'}`}>
-                          {hasAssigned ? 'busy' : 'idle'}
-                        </span>
-                      </button>
-                    )
-                  })}
+              </>
+            )}
+
+            {/* Orchestrator Mode Content */}
+            {assignMode === 'orchestrator' && (
+              <div>
+                <div className="text-xs text-gray-400 mb-2 flex items-center gap-1 uppercase tracking-wide">
+                  <User size={12} /> Select Supervisor
+                </div>
+                <p className="text-sm text-gray-500 mb-3">The supervisor will analyze the task and spawn worker agents as needed.</p>
+                <div className="space-y-1 max-h-48 overflow-y-auto">
+                  {agents.filter(a => a.name.includes('supervisor') || a.name.includes('orchestrator')).length > 0 ? (
+                    agents.filter(a => a.name.includes('supervisor') || a.name.includes('orchestrator')).map(a => {
+                      const icon = AGENT_ICONS[a.name] || <User size={14} />
+                      return (
+                        <button
+                          key={a.name}
+                          onClick={() => assignToNewAgent(a.name)}
+                          disabled={assigning}
+                          className="w-full text-left p-3 bg-gray-800 hover:bg-purple-900/30 rounded-lg text-sm flex items-center gap-2 disabled:opacity-50"
+                        >
+                          <span className="text-purple-400">{icon}</span>
+                          <span className="flex-1 font-medium">{a.name}</span>
+                          <span className="text-xs text-gray-500">supervisor</span>
+                        </button>
+                      )
+                    })
+                  ) : (
+                    <div className="text-center py-4 text-gray-500 text-sm">
+                      No supervisor agents available. Create an agent with "supervisor" in the name.
+                    </div>
+                  )}
                 </div>
               </div>
             )}
-
-            {/* Spawn New Agent */}
-            <div>
-              <div className="text-xs text-gray-400 mb-2 flex items-center gap-1 uppercase tracking-wide">
-                <Plus size={12} /> Spawn New Agent
-              </div>
-              <div className="space-y-1 max-h-48 overflow-y-auto">
-                {agents.map(a => {
-                  const icon = AGENT_ICONS[a.name] || <Bot size={14} />
-                  return (
-                    <button
-                      key={a.name}
-                      onClick={() => assignToNewAgent(a.name)}
-                      disabled={assigning}
-                      className="w-full text-left p-3 bg-gray-800 hover:bg-purple-900/30 rounded-lg text-sm flex items-center gap-2 disabled:opacity-50"
-                    >
-                      <span className="text-purple-400">{icon}</span>
-                      <span className="flex-1 font-medium">{a.name}</span>
-                      <span className="text-xs text-gray-500">+ new</span>
-                    </button>
-                  )
-                })}
-              </div>
-            </div>
 
             {assigning && (
               <div className="mt-4 text-center text-sm text-amber-400 flex items-center justify-center gap-2">

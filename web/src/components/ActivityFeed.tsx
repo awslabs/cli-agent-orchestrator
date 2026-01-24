@@ -1,5 +1,5 @@
 import { useStore } from '../store'
-import { ClipboardList, CheckCircle, Link, Rocket, Trash2, RefreshCw, PartyPopper, MessageSquare, AlertTriangle, Activity } from 'lucide-react'
+import { ClipboardList, CheckCircle, Link, Rocket, Trash2, RefreshCw, PartyPopper, MessageSquare, AlertTriangle, Activity, Users, UserPlus, ArrowRightLeft, Send } from 'lucide-react'
 
 const EVENT_CONFIG: Record<string, { icon: React.ReactNode; color: string }> = {
   task_created: { icon: <ClipboardList size={16} />, color: 'text-blue-400' },
@@ -10,7 +10,12 @@ const EVENT_CONFIG: Record<string, { icon: React.ReactNode; color: string }> = {
   ralph_started: { icon: <RefreshCw size={16} />, color: 'text-amber-400' },
   ralph_completed: { icon: <PartyPopper size={16} />, color: 'text-emerald-400' },
   agent_output: { icon: <MessageSquare size={16} />, color: 'text-gray-400' },
-  error: { icon: <AlertTriangle size={16} />, color: 'text-red-400' }
+  error: { icon: <AlertTriangle size={16} />, color: 'text-red-400' },
+  // Orchestration events
+  orchestration_started: { icon: <Users size={16} />, color: 'text-cyan-400' },
+  worker_spawned: { icon: <UserPlus size={16} />, color: 'text-purple-400' },
+  handoff_initiated: { icon: <ArrowRightLeft size={16} />, color: 'text-amber-400' },
+  message_sent: { icon: <Send size={16} />, color: 'text-blue-400' }
 }
 
 function formatTime(timestamp: string) {

@@ -13,6 +13,7 @@ export interface Agent {
 export interface Session { 
   id: string; name: string; status: 'IDLE' | 'PROCESSING' | 'WAITING_INPUT' | 'ERROR'
   terminals: Terminal[]; agent?: string; agent_name: string
+  parent_session?: string
 }
 
 export interface Terminal { 

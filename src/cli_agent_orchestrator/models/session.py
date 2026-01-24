@@ -1,4 +1,5 @@
 from enum import Enum
+from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -19,3 +20,4 @@ class Session(BaseModel):
     id: str = Field(..., description="Unique session identifier")
     name: str = Field(..., description="Human-readable session name")
     status: SessionStatus = Field(..., description="Current session status")
+    parent_session: Optional[str] = Field(None, description="Parent supervisor session ID for worker sessions")

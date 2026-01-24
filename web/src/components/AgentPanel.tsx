@@ -347,106 +347,138 @@ export function AgentPanel() {
             </div>
           ) : (
             <div className="grid gap-4">
-              {sessions.map(session => {
-                const agentName = session.agent_name || 'unknown'
-                const status = sessionStatuses[session.id] || 'IDLE'
-                const config = STATUS_CONFIG[status as keyof typeof STATUS_CONFIG] || STATUS_CONFIG.IDLE
-                const icon = AGENT_ICONS[agentName] || <User size={20} />
-                const isActive = activeSession === session.id
-                const assignedBead = getAssignedBead(session.id)
-                const isAutoMode = autoModeSessions.has(session.id)
-                const ctx = sessionContext[session.id]
-                const contextPct = ctx?.total ?? 0
+              {/* Group sessions by hierarchy: supervisors first, then standalone */}
+              {(() => {
+                const supervisors = sessions.filter(s => !s.parent_session && sessions.some(w => w.parent_session === s.id))
+                const workers = sessions.filter(s => s.parent_session)
+                const standalone = sessions.filter(s => !s.parent_session && !sessions.some(w => w.parent_session === s.id))
+                const workerCount = (supervisorId: string) => workers.filter(w => w.parent_session === supervisorId).length
+                
+                const renderSession = (session: typeof sessions[0], isWorker: boolean = false) => {
+                  const agentName = session.agent_name || 'unknown'
+                  const status = sessionStatuses[session.id] || 'IDLE'
+                  const config = STATUS_CONFIG[status as keyof typeof STATUS_CONFIG] || STATUS_CONFIG.IDLE
+                  const icon = AGENT_ICONS[agentName] || <User size={20} />
+                  const isActive = activeSession === session.id
+                  const assignedBead = getAssignedBead(session.id)
+                  const isAutoMode = autoModeSessions.has(session.id)
+                  const ctx = sessionContext[session.id]
+                  const contextPct = ctx?.total ?? 0
+                  const wCount = workerCount(session.id)
 
-                return (
-                  <div
-                    key={session.id}
-                    className={`rounded-xl border transition-all ${
-                      isActive 
-                        ? 'border-emerald-500/50 bg-emerald-500/5' 
-                        : 'border-gray-800 bg-gray-900/50 hover:border-gray-700'
-                    }`}
-                  >
-                    <div 
-                      className="p-4 cursor-pointer"
-                      onClick={() => setActiveSession(isActive ? null : session.id)}
+                  return (
+                    <div
+                      key={session.id}
+                      data-worker={isWorker ? 'true' : undefined}
+                      className={`rounded-xl border transition-all ${
+                        isActive 
+                          ? 'border-emerald-500/50 bg-emerald-500/5' 
+                          : 'border-gray-800 bg-gray-900/50 hover:border-gray-700'
+                      } ${isWorker ? 'ml-8 border-l-2 border-l-purple-500/30' : ''}`}
                     >
-                      <div className="flex items-center gap-4">
-                        <div className="relative">
-                          <div className="w-12 h-12 rounded-xl bg-gray-800 flex items-center justify-center text-gray-300">
-                            {icon}
+                      <div 
+                        className="p-4 cursor-pointer"
+                        onClick={() => setActiveSession(isActive ? null : session.id)}
+                      >
+                        <div className="flex items-center gap-4">
+                          <div className="relative">
+                            <div className="w-12 h-12 rounded-xl bg-gray-800 flex items-center justify-center text-gray-300">
+                              {icon}
+                            </div>
+                            <div className={`absolute -bottom-1 -right-1 w-4 h-4 rounded-full border-2 border-gray-900 ${config.color} ${config.animate || ''}`}></div>
                           </div>
-                          <div className={`absolute -bottom-1 -right-1 w-4 h-4 rounded-full border-2 border-gray-900 ${config.color} ${config.animate || ''}`}></div>
-                        </div>
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-center gap-2 flex-wrap">
-                            <h3 className="font-medium text-white">{agentName}</h3>
-                            <span className="px-2 py-0.5 text-xs rounded-full bg-gray-700 text-gray-300">
-                              {getAgentType(agentName)}
-                            </span>
-                            <span className={`px-2 py-0.5 text-xs rounded-full bg-gray-800 ${config.text}`}>
-                              {config.label}
-                            </span>
-
-                          </div>
-                          <p className="text-xs text-gray-500 font-mono mt-0.5">{session.id}</p>
-                          {assignedBead && (
-                            <div className="mt-2 p-2 rounded-lg bg-amber-500/10 border border-amber-500/20">
-                              <div className="flex items-center gap-2">
-                                <Zap size={14} className="text-amber-400" />
-                                <span className="text-sm text-amber-300 font-medium truncate">{assignedBead.title}</span>
-                                <span className="text-xs px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400">P{assignedBead.priority || 3}</span>
-                              </div>
-                              {assignedBead.description && (
-                                <p className="text-xs text-gray-400 mt-1 line-clamp-2">{assignedBead.description}</p>
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <h3 className="font-medium text-white">{agentName}</h3>
+                              <span className="px-2 py-0.5 text-xs rounded-full bg-gray-700 text-gray-300">
+                                {getAgentType(agentName)}
+                              </span>
+                              <span className={`px-2 py-0.5 text-xs rounded-full bg-gray-800 ${config.text}`}>
+                                {config.label}
+                              </span>
+                              {wCount > 0 && (
+                                <span className="px-2 py-0.5 text-xs rounded-full bg-purple-500/20 text-purple-400">
+                                  {wCount} worker{wCount > 1 ? 's' : ''}
+                                </span>
+                              )}
+                              {isWorker && (
+                                <span className="px-2 py-0.5 text-xs rounded-full bg-purple-500/10 text-purple-300">
+                                  worker
+                                </span>
                               )}
                             </div>
-                          )}
-                        </div>
-                        <div className="flex items-center gap-2">
-                          <button
-                            onClick={(e) => { 
-                              e.stopPropagation()
-                              const wasAutoMode = isAutoMode
-                              toggleAutoMode(session.id)
-                              // Immediately try to assign bead when turning Auto ON
-                              if (!wasAutoMode) tryAssignBead(session.id)
-                            }}
-                            className={`px-3 py-1.5 text-xs rounded-lg transition-all font-medium flex items-center gap-1.5 ${
-                              isAutoMode 
-                                ? 'bg-purple-500/20 text-purple-400 border border-purple-500/30' 
-                                : 'bg-gray-800 text-gray-400 hover:text-white border border-gray-700'
-                            }`}
-                          >
-                            {isAutoMode ? <Pause size={12} /> : <Play size={12} />}
-                            {isAutoMode ? 'Auto ON' : 'Auto'}
-                          </button>
-                          <button
-                            onClick={(e) => { e.stopPropagation(); setFocusedSession(session.id) }}
-                            className="p-2 rounded-lg hover:bg-blue-500/20 text-gray-400 hover:text-blue-400 transition-all"
-                            title="Focus Terminal"
-                          >
-                            <Terminal size={16} />
-                          </button>
-                          <button
-                            onClick={(e) => { e.stopPropagation(); deleteSession(session.id) }}
-                            className="p-2 rounded-lg hover:bg-red-500/20 text-gray-400 hover:text-red-400 transition-all"
-                          >
-                            <X size={16} />
-                          </button>
-                          <ChevronDown size={16} className={`text-gray-400 transition-transform ${isActive ? 'rotate-180' : ''}`} />
+                            <p className="text-xs text-gray-500 font-mono mt-0.5">{session.id}</p>
+                            {assignedBead && (
+                              <div className="mt-2 p-2 rounded-lg bg-amber-500/10 border border-amber-500/20">
+                                <div className="flex items-center gap-2">
+                                  <Zap size={14} className="text-amber-400" />
+                                  <span className="text-sm text-amber-300 font-medium truncate">{assignedBead.title}</span>
+                                  <span className="text-xs px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400">P{assignedBead.priority || 3}</span>
+                                </div>
+                                {assignedBead.description && (
+                                  <p className="text-xs text-gray-400 mt-1 line-clamp-2">{assignedBead.description}</p>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <button
+                              onClick={(e) => { 
+                                e.stopPropagation()
+                                const wasAutoMode = isAutoMode
+                                toggleAutoMode(session.id)
+                                if (!wasAutoMode) tryAssignBead(session.id)
+                              }}
+                              className={`px-3 py-1.5 text-xs rounded-lg transition-all font-medium flex items-center gap-1.5 ${
+                                isAutoMode 
+                                  ? 'bg-purple-500/20 text-purple-400 border border-purple-500/30' 
+                                  : 'bg-gray-800 text-gray-400 hover:text-white border border-gray-700'
+                              }`}
+                            >
+                              {isAutoMode ? <Pause size={12} /> : <Play size={12} />}
+                              {isAutoMode ? 'Auto ON' : 'Auto'}
+                            </button>
+                            <button
+                              onClick={(e) => { e.stopPropagation(); setFocusedSession(session.id) }}
+                              className="p-2 rounded-lg hover:bg-blue-500/20 text-gray-400 hover:text-blue-400 transition-all"
+                              title="Focus Terminal"
+                            >
+                              <Terminal size={16} />
+                            </button>
+                            <button
+                              onClick={(e) => { e.stopPropagation(); deleteSession(session.id) }}
+                              className="p-2 rounded-lg hover:bg-red-500/20 text-gray-400 hover:text-red-400 transition-all"
+                            >
+                              <X size={16} />
+                            </button>
+                            <ChevronDown size={16} className={`text-gray-400 transition-transform ${isActive ? 'rotate-180' : ''}`} />
+                          </div>
                         </div>
                       </div>
-                    </div>
 
-                    {isActive && (
-                      <div className="border-t border-gray-800 h-80">
-                        <TerminalView sessionId={session.id} onStatusChange={(s) => handleStatusChange(session.id, s)} />
+                      {isActive && (
+                        <div className="border-t border-gray-800 h-80">
+                          <TerminalView sessionId={session.id} onStatusChange={(s) => handleStatusChange(session.id, s)} />
+                        </div>
+                      )}
+                    </div>
+                  )
+                }
+
+                return (
+                  <>
+                    {/* Supervisors with their workers */}
+                    {supervisors.map(supervisor => (
+                      <div key={supervisor.id} className="space-y-2">
+                        {renderSession(supervisor)}
+                        {workers.filter(w => w.parent_session === supervisor.id).map(worker => renderSession(worker, true))}
                       </div>
-                    )}
-                  </div>
+                    ))}
+                    {/* Standalone sessions */}
+                    {standalone.map(session => renderSession(session))}
+                  </>
                 )
-              })}
+              })()}
             </div>
           )}
         </div>
