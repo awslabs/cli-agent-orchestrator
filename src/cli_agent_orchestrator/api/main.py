@@ -66,6 +66,14 @@ class TerminalOutputResponse(BaseModel):
     mode: str
 
 
+class WorkingDirectoryResponse(BaseModel):
+    """Response model for terminal working directory."""
+
+    working_directory: Optional[str] = Field(
+        description="Current working directory of the terminal, or None if unavailable"
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
@@ -117,7 +125,10 @@ async def health_check():
 
 @app.post("/sessions", response_model=Terminal, status_code=status.HTTP_201_CREATED)
 async def create_session(
-    provider: str, agent_profile: str, session_name: Optional[str] = None
+    provider: str,
+    agent_profile: str,
+    session_name: Optional[str] = None,
+    working_directory: Optional[str] = None,
 ) -> Terminal:
     """Create a new session with exactly one terminal."""
     try:
@@ -126,6 +137,7 @@ async def create_session(
             agent_profile=agent_profile,
             session_name=session_name,
             new_session=True,
+            working_directory=working_directory,
         )
         return result
 
@@ -182,7 +194,10 @@ async def delete_session(session_name: str) -> Dict:
     status_code=status.HTTP_201_CREATED,
 )
 async def create_terminal_in_session(
-    session_name: str, provider: str, agent_profile: str
+    session_name: str,
+    provider: str,
+    agent_profile: str,
+    working_directory: Optional[str] = None,
 ) -> Terminal:
     """Create additional terminal in existing session."""
     try:
@@ -191,6 +206,7 @@ async def create_terminal_in_session(
             agent_profile=agent_profile,
             session_name=session_name,
             new_session=False,
+            working_directory=working_directory,
         )
         return result
     except ValueError as e:
@@ -227,6 +243,21 @@ async def get_terminal(terminal_id: TerminalId) -> Terminal:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get terminal: {str(e)}",
+        )
+
+
+@app.get("/terminals/{terminal_id}/working-directory", response_model=WorkingDirectoryResponse)
+async def get_terminal_working_directory(terminal_id: TerminalId) -> WorkingDirectoryResponse:
+    """Get the current working directory of a terminal's pane."""
+    try:
+        working_directory = terminal_service.get_working_directory(terminal_id)
+        return WorkingDirectoryResponse(working_directory=working_directory)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get working directory: {str(e)}",
         )
 
 
