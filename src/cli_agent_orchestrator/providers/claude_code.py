@@ -2,7 +2,7 @@
 
 import re
 import shlex
-from typing import List, Optional
+from typing import Optional
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -43,33 +43,42 @@ class ClaudeCodeProvider(BaseProvider):
         self._initialized = False
         self._agent_profile = agent_profile
 
-    def _build_claude_command(self) -> List[str]:
-        """Build Claude Code command with agent profile if provided."""
+    def _build_claude_command(self) -> str:
+        """Build Claude Code command with agent profile if provided.
+
+        Returns properly escaped shell command string that can be safely sent via tmux.
+        Uses shlex.join() to handle multiline strings and special characters correctly.
+        """
         command_parts = ["claude"]
 
         if self._agent_profile is not None:
             try:
                 profile = load_agent_profile(self._agent_profile)
 
-                # Add system prompt with proper escaping
+                # Add system prompt - escape newlines to prevent tmux chunking issues
                 system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
-                command_parts.extend(["--append-system-prompt", shlex.quote(system_prompt)])
+                if system_prompt:
+                    # Replace actual newlines with \n escape sequences
+                    # This prevents tmux send_keys chunking from breaking the command
+                    escaped_prompt = system_prompt.replace("\\", "\\\\").replace("\n", "\\n")
+                    command_parts.extend(["--append-system-prompt", escaped_prompt])
 
                 # Add MCP config if present
                 if profile.mcpServers:
                     mcp_json = profile.model_dump_json(include={"mcpServers"})
-                    command_parts.extend(["--mcp-config", shlex.quote(mcp_json)])
+                    command_parts.extend(["--mcp-config", mcp_json])
 
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
-        return command_parts
+        # Use shlex.join() for proper shell escaping of all arguments
+        # This correctly handles multiline strings, quotes, and special characters
+        return shlex.join(command_parts)
 
     def initialize(self) -> bool:
         """Initialize Claude Code provider by starting claude command."""
-        # Build command with agent profile support
-        command_parts = self._build_claude_command()
-        command = " ".join(command_parts)
+        # Build properly escaped command string
+        command = self._build_claude_command()
 
         # Send Claude Code command using tmux client
         tmux_client.send_keys(self.session_name, self.window_name, command)
