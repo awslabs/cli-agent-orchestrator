@@ -1,4 +1,23 @@
-"""Session service for session-level operations."""
+"""Session service for session-level operations.
+
+This module provides session management functionality for CAO, where a "session"
+corresponds to a tmux session that may contain multiple terminal windows (agents).
+
+Session Hierarchy:
+- Session: A tmux session (e.g., "cao-my-project")
+  - Terminal: A tmux window within the session (e.g., "developer-abc123")
+    - Provider: The CLI agent running in the terminal (e.g., KiroCliProvider)
+
+Key Operations:
+- list_sessions(): Get all CAO-managed sessions (filtered by SESSION_PREFIX)
+- get_session(): Get session details including all terminal metadata
+- delete_session(): Clean up session, providers, database records, and tmux session
+
+Session Lifecycle:
+1. create_terminal() with new_session=True creates a new tmux session
+2. Additional terminals are added via create_terminal() with new_session=False
+3. delete_session() removes the entire session and all contained terminals
+"""
 
 import logging
 from typing import Dict, List

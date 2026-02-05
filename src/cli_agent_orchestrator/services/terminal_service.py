@@ -1,4 +1,21 @@
-"""Terminal service with workflow functions."""
+"""Terminal service with workflow functions.
+
+This module provides high-level terminal management operations that orchestrate
+multiple components (database, tmux, providers) to create a unified terminal
+abstraction for CLI agents.
+
+Key Responsibilities:
+- Terminal lifecycle management (create, get, delete)
+- Provider initialization and cleanup
+- Tmux session/window management
+- Terminal output capture and message extraction
+
+Terminal Workflow:
+1. create_terminal() → Creates tmux window, initializes provider, starts logging
+2. send_input() → Sends user message to the agent via tmux
+3. get_output() → Retrieves agent response from terminal history
+4. delete_terminal() → Cleans up provider, database record, and logging
+"""
 
 import logging
 from datetime import datetime
@@ -26,7 +43,11 @@ logger = logging.getLogger(__name__)
 
 
 class OutputMode(str, Enum):
-    """Output mode for terminal history."""
+    """Output mode for terminal history retrieval.
+
+    FULL: Returns complete terminal output (scrollback buffer)
+    LAST: Returns only the last agent response (extracted by provider)
+    """
 
     FULL = "full"
     LAST = "last"
@@ -39,26 +60,49 @@ def create_terminal(
     new_session: bool = False,
     working_directory: Optional[str] = None,
 ) -> Terminal:
-    """Create terminal, optionally creating new session with it."""
+    """Create a new terminal with an initialized CLI agent.
+
+    This function orchestrates the complete terminal creation workflow:
+    1. Generate unique terminal ID and window name
+    2. Create tmux session/window (new or existing)
+    3. Save terminal metadata to database
+    4. Initialize the CLI provider (starts the agent)
+    5. Set up terminal logging via tmux pipe-pane
+
+    Args:
+        provider: Provider type string (e.g., "kiro_cli", "claude_code")
+        agent_profile: Name of the agent profile to use
+        session_name: Optional custom session name. If not provided, auto-generated.
+        new_session: If True, creates a new tmux session. If False, adds to existing.
+        working_directory: Optional working directory for the terminal shell.
+
+    Returns:
+        Terminal object with all metadata populated
+
+    Raises:
+        ValueError: If session already exists (new_session=True) or not found (new_session=False)
+        TimeoutError: If provider initialization times out
+    """
     try:
+        # Step 1: Generate unique identifiers
         terminal_id = generate_terminal_id()
 
-        # Generate session name if not provided
         if not session_name:
             session_name = generate_session_name()
 
         window_name = generate_window_name(agent_profile)
 
+        # Step 2: Create tmux session or window
         if new_session:
-            # Apply SESSION_PREFIX if not already present
+            # Ensure session name has the CAO prefix for identification
             if not session_name.startswith(SESSION_PREFIX):
                 session_name = f"{SESSION_PREFIX}{session_name}"
 
-            # Check if session already exists
+            # Prevent duplicate sessions
             if tmux_client.session_exists(session_name):
                 raise ValueError(f"Session '{session_name}' already exists")
 
-            # Create new tmux session with this terminal as the initial window
+            # Create new tmux session with initial window
             tmux_client.create_session(session_name, window_name, terminal_id, working_directory)
         else:
             # Add window to existing session
@@ -68,20 +112,23 @@ def create_terminal(
                 session_name, window_name, terminal_id, working_directory
             )
 
-        # Save terminal metadata to database
+        # Step 3: Persist terminal metadata to database
         db_create_terminal(terminal_id, session_name, window_name, provider, agent_profile)
 
-        # Initialize provider
+        # Step 4: Create and initialize the CLI provider
+        # This starts the agent (e.g., runs "kiro-cli chat --agent developer")
         provider_instance = provider_manager.create_provider(
             provider, terminal_id, session_name, window_name, agent_profile
         )
         provider_instance.initialize()
 
-        # Create log file and start pipe-pane
+        # Step 5: Set up terminal logging via tmux pipe-pane
+        # This captures all terminal output to a log file for inbox monitoring
         log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
         log_path.touch()  # Ensure file exists before watching
         tmux_client.pipe_pane(session_name, window_name, str(log_path))
 
+        # Build and return the Terminal object
         terminal = Terminal(
             id=terminal_id,
             name=window_name,
@@ -98,12 +145,13 @@ def create_terminal(
         return terminal
 
     except Exception as e:
+        # Cleanup on failure: kill the session if we created one
         logger.error(f"Failed to create terminal: {e}")
         if new_session and session_name:
             try:
                 tmux_client.kill_session(session_name)
             except:
-                pass
+                pass  # Ignore cleanup errors
         raise
 
 

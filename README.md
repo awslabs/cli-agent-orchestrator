@@ -77,64 +77,24 @@ When installing from a file or URL, the agent is saved to your local agent store
 
 **Provider Selection:**
 
-By default, agents are installed for the `q_cli` provider (Amazon Q CLI). You can specify a different provider:
+By default, agents are installed for the `kiro_cli` provider (Kiro CLI). You can specify a different provider:
 
 ```bash
-# Install for Kiro CLI
+# Install for Kiro CLI (default)
 cao install developer --provider kiro_cli
 
-# Install for Amazon Q CLI (default)
-cao install developer --provider q_cli
+# Install for other providers
+cao install developer --provider claude_code
+cao install developer --provider codex
 ```
 
-Note: The `claude_code` provider does not require agent installation.
+**Notes:**
+- The `claude_code` provider does not require agent installation.
+- For using the **Codex CLI provider** with your ChatGPT subscription, see [docs/codex-cli.md](docs/codex-cli.md).
 
 For details on creating custom agent profiles, see [docs/agent-profile.md](docs/agent-profile.md).
 
-## Codex CLI Provider
-
-The **Codex CLI provider** enables CAO to work with **ChatGPT/Codex CLI** through your ChatGPT subscription, allowing you to orchestrate multiple Codex-based agents without migrating to API-based agents.
-
-### Key Benefits
-
-- **ChatGPT Integration**: Use your existing ChatGPT subscription for agent orchestration
-- **No Migration Required**: Continue using Codex CLI without switching to API-based agents
-- **Multi-Agent Coordination**: Orchestrate multiple Codex agents in supervisor-worker patterns
-- **Status Detection**: Automatic detection of processing, waiting, completed, and error states
-
-### Quick Start
-
-```bash
-# Start the CAO server (in one terminal)
-cao-server
-
-# Install an example Codex agent profile
-cao install examples/codex-basic/codex_developer.md --provider codex
-
-# Launch a Codex-backed agent (opens a tmux window)
-cao launch --agents codex_developer --provider codex
-
-# In the tmux window, paste your prompt at the Codex prompt.
-
-# Optional: print the CAO terminal id (useful for API automation / MCP)
-echo "$CAO_TERMINAL_ID"
-```
-
-Optional automation (send input + fetch extracted last message) from another terminal:
-
-```bash
-TERMINAL_ID="<terminal-id>"
-
-curl -X POST "http://localhost:9889/terminals/${TERMINAL_ID}/input" \
-  --get \
-  --data-urlencode 'message=Review this Python code for security issues'
-
-curl "http://localhost:9889/terminals/${TERMINAL_ID}/output?mode=last"
-```
-
-For detailed documentation and examples, see [docs/codex-cli.md](docs/codex-cli.md).
-
-### Launching Agents
+## Launching Agents
 
 Start the cao server:
 
@@ -308,7 +268,7 @@ A flow that runs at regular intervals with a static prompt (no script needed):
 name: daily-standup
 schedule: "0 9 * * 1-5"  # 9am weekdays
 agent_profile: developer
-provider: q_cli  # Optional, defaults to q_cli
+provider: kiro_cli  # Optional, defaults to kiro_cli
 ---
 
 Review yesterday's commits and create a standup summary.
@@ -412,7 +372,7 @@ result = await assign(
 
 ### Why Disabled by Default?
 
-Q CLI includes current working directory in context, causing agents to hallucinate/infer directories when the parameter is available. Disabling by default prevents this hallucination for users who don't need explicit directory control.
+When the `working_directory` parameter is visible to agents, they may hallucinate or incorrectly infer directory paths instead of using the default (current working directory). Disabling by default prevents this behavior for users who don't need explicit directory control. If your workflow requires delegating tasks to specific directories, enable this feature and provide explicit paths in your agent instructions.
 
 ## Security
 
