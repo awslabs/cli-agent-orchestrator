@@ -33,20 +33,21 @@
            ┌────▼────┐               ┌────▼─────┐
            │ Clients │               │Providers │
            ├─────────┤               ├──────────┤
-           │ • tmux  │               │ • q_cli  │
-           │ • db    │               │ • kiro   │
-           └────┬────┘               │   _cli   │
+           │ • tmux  │               │ • kiro   │
+           │ • db    │               │   _cli   │
+           └────┬────┘               │ • q_cli  │
                 │                    │ • claude │
          ┌──────┴──────┐             │   _code  │
-         │             │             └────┬─────┘
-    ┌────▼────┐  ┌─────▼─────┐          │
-    │  Tmux   │  │  SQLite   │     ┌─────▼──────┐
-    │ Sessions│  │  Database │     │ CLI Tools  │
-    └─────────┘  └───────────┘     │• Amazon Q  │
-                                   │  CLI       │
+         │             │             │ • codex  │
+    ┌────▼────┐  ┌─────▼─────┐      └────┬─────┘
+    │  Tmux   │  │  SQLite   │          │
+    │ Sessions│  │  Database │     ┌─────▼──────┐
+    └─────────┘  └───────────┘     │ CLI Tools  │
                                    │• Kiro CLI  │
+                                   │  (default) │
                                    │• Claude    │
                                    │  Code      │
+                                   │• Codex CLI │
                                    └────────────┘
 ```
 
@@ -73,9 +74,10 @@ src/cli_agent_orchestrator/
 ├── providers/             # Provider Layer: CLI tool integration
 │   ├── base.py            # Abstract provider interface
 │   ├── manager.py         # Maps terminal_id → provider
+│   ├── kiro_cli.py        # Kiro CLI provider (kiro_cli) - default
 │   ├── q_cli.py           # Amazon Q CLI provider (q_cli)
-│   ├── kiro_cli.py        # Kiro CLI provider (kiro_cli)
-│   └── claude_code.py     # Claude Code provider (claude_code)
+│   ├── claude_code.py     # Claude Code provider (claude_code)
+│   └── codex.py           # Codex/ChatGPT CLI provider (codex)
 ├── models/                # Data models
 │   ├── terminal.py        # Terminal, TerminalStatus
 │   ├── session.py         # Session model

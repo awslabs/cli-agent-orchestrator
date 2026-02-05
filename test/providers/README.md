@@ -4,11 +4,11 @@ This directory contains comprehensive test suites for provider implementations.
 
 ## Providers
 
+### Kiro CLI Provider (Default)
+Tests for Kiro CLI integration (`kiro_cli`) - the default provider.
+
 ### Q CLI Provider
 Tests for Amazon Q CLI integration (`q_cli`)
-
-### Kiro CLI Provider
-Tests for Kiro CLI integration (`kiro_cli`)
 
 Since Kiro CLI has identical output format to Q CLI, the test fixtures are reused with renamed files.
 
@@ -16,12 +16,12 @@ Since Kiro CLI has identical output format to Q CLI, the test fixtures are reuse
 
 ```
 test/providers/
+├── test_kiro_cli_unit.py       # Kiro CLI unit tests (fast, mocked) - default provider
 ├── test_q_cli_unit.py          # Q CLI unit tests (fast, mocked)
-├── test_kiro_cli_unit.py       # Kiro CLI unit tests (fast, mocked)
 ├── test_q_cli_integration.py   # Q CLI integration tests (slow, real Q CLI)
 ├── fixtures/                    # Test fixture files
+│   ├── kiro_cli_*.txt          # Kiro CLI fixtures (default provider)
 │   ├── q_cli_*.txt             # Q CLI fixtures
-│   ├── kiro_cli_*.txt          # Kiro CLI fixtures (identical format to Q CLI)
 │   └── generate_fixtures.py    # Script to regenerate fixtures
 └── README.md
 ```
