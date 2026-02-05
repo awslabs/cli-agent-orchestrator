@@ -2,7 +2,7 @@
 
 from typing import Optional
 
-from cli_agent_orchestrator.adapters.database import SessionLocal, TerminalModel
+from cli_agent_orchestrator.clients.database import SessionLocal, TerminalModel
 
 
 def get_terminal_record(terminal_id: str) -> Optional[TerminalModel]:

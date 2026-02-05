@@ -1,4 +1,25 @@
-"""Inbox service with watchdog for automatic message delivery."""
+"""Inbox service with watchdog for automatic message delivery.
+
+This module provides the inbox functionality for agent-to-agent communication,
+using file system monitoring to detect when agents become idle and can receive messages.
+
+Architecture:
+- Messages are queued in the database (inbox table) via send_message MCP tool
+- LogFileHandler monitors terminal log files for changes using watchdog
+- When a terminal becomes idle (detected via log patterns), pending messages are delivered
+- Messages are sent via terminal_service.send_input() which types into the tmux pane
+
+Message Flow:
+1. Agent A calls send_message(terminal_id, message) → message queued in DB
+2. Agent B's terminal log file updates (via tmux pipe-pane)
+3. LogFileHandler.on_modified() triggered → checks for pending messages
+4. If terminal is IDLE and has pending messages → deliver via send_input()
+5. Message status updated to DELIVERED or FAILED
+
+Performance Optimization:
+- Uses fast log tail check before expensive tmux status queries
+- Only queries full provider status when idle pattern detected in log
+"""
 
 import logging
 import re
