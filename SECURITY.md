@@ -54,7 +54,6 @@ We use [Trivy](https://github.com/aquasecurity/trivy) to scan for:
 Security scans run:
 - On every push to the `main` branch
 - On every pull request targeting `main`
-- Weekly on Monday at 00:00 UTC (scheduled)
 
 ### Dependency Review
 
