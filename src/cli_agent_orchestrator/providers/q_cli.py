@@ -82,11 +82,20 @@ class QCliProvider(BaseProvider):
         if re.search(self._permission_prompt_pattern, clean_output, re.MULTILINE | re.DOTALL):
             return TerminalStatus.WAITING_USER_ANSWER
 
-        # Check for completed state (has response + agent prompt)
-        # Note: The extraction logic will verify the prompt is after the response
-        if re.search(GREEN_ARROW_PATTERN, clean_output, re.MULTILINE):
-            logger.debug(f"get_status: returning COMPLETED")
-            return TerminalStatus.COMPLETED
+        # Check for completed state (has response + agent prompt AFTER the response)
+        green_arrows = list(re.finditer(GREEN_ARROW_PATTERN, clean_output, re.MULTILINE))
+        if green_arrows:
+            # Find if there's an idle prompt after the last green arrow
+            last_arrow_pos = green_arrows[-1].end()
+            idle_prompts = list(re.finditer(self._idle_prompt_pattern, clean_output))
+
+            for prompt in idle_prompts:
+                if prompt.start() > last_arrow_pos:
+                    logger.debug(f"get_status: returning COMPLETED")
+                    return TerminalStatus.COMPLETED
+
+            # Has green arrow but no prompt after it - still processing
+            return TerminalStatus.PROCESSING
 
         # Just agent prompt, no response
         return TerminalStatus.IDLE
