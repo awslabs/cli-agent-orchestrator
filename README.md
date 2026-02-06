@@ -28,52 +28,99 @@ For detailed project structure and architecture, see [CODEBASE.md](CODEBASE.md).
 
 ## Installation
 
-1. Install tmux (version 3.3 or higher required)
+### Requirements
+
+- **Python 3.10 or higher** — CAO requires Python >=3.10 (see [pyproject.toml](pyproject.toml))
+- **tmux 3.3+** — Used for agent session isolation
+- **[uv](https://docs.astral.sh/uv/)** — Fast Python package installer and virtual environment manager
+
+### 1. Install Python 3.10+
+
+If you don't have Python 3.10+ installed, use your platform's package manager:
+
+```bash
+# macOS (Homebrew)
+brew install python@3.12
+
+# Ubuntu/Debian
+sudo apt update && sudo apt install python3.12 python3.12-venv
+
+# Amazon Linux 2023 / Fedora
+sudo dnf install python3.12
+```
+
+Verify your Python version:
+
+```bash
+python3 --version   # Should be 3.10 or higher
+```
+
+> **Note:** We recommend using [uv](https://docs.astral.sh/uv/) to manage Python environments instead of system-wide installations like Anaconda. `uv` automatically handles virtual environments and Python version resolution per-project.
+
+### 2. Install tmux (version 3.3 or higher required)
 
 ```bash
 bash <(curl -s https://raw.githubusercontent.com/awslabs/cli-agent-orchestrator/refs/heads/main/tmux-install.sh)
 ```
 
-2. Install uv
+### 3. Install uv
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-3. Install CLI Agent Orchestrator:
+### 4. Install CLI Agent Orchestrator
 
 ```bash
 uv tool install git+https://github.com/awslabs/cli-agent-orchestrator.git@main --upgrade
 ```
 
+### Development Setup
+
+For local development, clone the repo and use `uv sync` to create an isolated virtual environment:
+
+```bash
+git clone https://github.com/awslabs/cli-agent-orchestrator.git
+cd cli-agent-orchestrator/
+uv sync          # Creates .venv/ and installs all dependencies
+uv run cao --help  # Verify installation
+```
+
+All `cao` and `cao-server` commands should be run via `uv run` during development to ensure the project's virtual environment is used:
+
+```bash
+uv run cao-server          # Start the server
+uv run cao launch --agents code_supervisor  # Launch an agent
+```
+
+For more details, see [DEVELOPMENT.md](DEVELOPMENT.md).
+
+## Prerequisites
+
+Before using CAO, install at least one supported CLI agent tool:
+
+| Provider | Documentation |
+|----------|---------------|
+| **Kiro CLI** (default) | [Kiro CLI Installation](https://kiro.dev/docs/kiro-cli) |
+| **Claude Code** | [Claude Code Installation](https://docs.anthropic.com/en/docs/claude-code/getting-started) |
+| **Codex CLI** | [Codex CLI Setup](docs/codex-cli.md) |
+
 ## Quick Start
 
-### Installing Agents
+### 1. Install Agent Profiles
 
-CAO supports installing agents from multiple sources:
-
-**1. Install built-in agents (bundled with CAO):**
+Install the supervisor agent (the orchestrator that delegates to other agents):
 
 ```bash
 cao install code_supervisor
+```
+
+Optionally install additional worker agents:
+
+```bash
 cao install developer
 cao install reviewer
 ```
-
-**2. Install from a local file:**
-
-```bash
-cao install ./my-custom-agent.md
-cao install /absolute/path/to/agent.md
-```
-
-**3. Install from a URL:**
-
-```bash
-cao install https://example.com/agents/custom-agent.md
-```
-
-When installing from a file or URL, the agent is saved to your local agent store (`~/.aws/cli-agent-orchestrator/agent-store/`) and can be referenced by name in future installations.
 
 **Provider Selection:**
 
@@ -81,28 +128,35 @@ By default, agents are installed for the `kiro_cli` provider (Kiro CLI). You can
 
 ```bash
 # Install for Kiro CLI (default)
-cao install developer --provider kiro_cli
-
-# Install for other providers
-cao install developer --provider claude_code
-cao install developer --provider codex
+cao install code_supervisor
+# Install for other providers (or specific providers)
+cao install code_supervisor --provider claude_code
+cao install code_supervisor --provider codex
+cao install code_supervisor --provider kiro_cli
 ```
 
 **Notes:**
-- The `claude_code` provider does not require agent installation.
+- The `claude_code` provider can optionally work without agent profiles (it uses project's `CLAUDE.md` for context instead). However, to use CAO's supervisor/worker patterns, install the agent profiles.
 - For using the **Codex CLI provider** with your ChatGPT subscription, see [docs/codex-cli.md](docs/codex-cli.md).
+
+You can also install agents from local files or URLs:
+
+```bash
+cao install ./my-custom-agent.md
+cao install https://example.com/agents/custom-agent.md
+```
 
 For details on creating custom agent profiles, see [docs/agent-profile.md](docs/agent-profile.md).
 
-## Launching Agents
-
-Start the cao server:
+### 2. Start the Server
 
 ```bash
 cao-server
 ```
 
-In another terminal, launch a terminal with an agent profile:
+### 3. Launch the Supervisor
+
+In another terminal, launch the supervisor agent:
 
 ```bash
 cao launch --agents code_supervisor
@@ -111,7 +165,9 @@ cao launch --agents code_supervisor
 cao launch --agents code_supervisor --provider kiro_cli
 ```
 
-Shutdown sessions:
+The supervisor will coordinate and delegate tasks to worker agents (developer, reviewer, etc.) as needed using the orchestration patterns.
+
+### 4. Shutdown
 
 ```bash
 # Shutdown all cao sessions
