@@ -1,5 +1,6 @@
 """Launch command for CLI Agent Orchestrator CLI."""
 
+import os
 import subprocess
 
 import click
@@ -30,6 +31,7 @@ def launch(agents, session_name, headless, provider, port):
         params = {
             "provider": provider,
             "agent_profile": agents,
+            "working_directory": os.path.realpath(os.getcwd()),  # Pass normalized current directory
         }
         if session_name:
             params["session_name"] = session_name

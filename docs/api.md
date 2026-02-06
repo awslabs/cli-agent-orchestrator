@@ -26,6 +26,7 @@ Create a new session with one terminal.
 - `provider` (string, required): Provider type ("q_cli" or "claude_code")
 - `agent_profile` (string, required): Agent profile name
 - `session_name` (string, optional): Custom session name
+- `working_directory` (string, optional): Working directory for the agent session
 
 **Response:** Terminal object (201 Created)
 
@@ -61,6 +62,7 @@ Create an additional terminal in an existing session.
 **Parameters:**
 - `provider` (string, required): Provider type
 - `agent_profile` (string, required): Agent profile name
+- `working_directory` (string, optional): Working directory for the terminal
 
 **Response:** Terminal object (201 Created)
 
@@ -111,6 +113,18 @@ Get terminal output.
   "mode": "string"
 }
 ```
+
+### GET /terminals/{terminal_id}/working-directory
+Get the current working directory of a terminal's pane.
+
+**Response:**
+```json
+{
+  "working_directory": "/home/user/project"
+}
+```
+
+**Note:** Returns `null` if working directory is unavailable.
 
 ### POST /terminals/{terminal_id}/exit
 Send provider-specific exit command to terminal.

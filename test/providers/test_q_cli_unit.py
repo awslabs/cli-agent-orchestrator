@@ -205,7 +205,9 @@ class TestQCliProviderMessageExtraction:
 
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
 
-        with pytest.raises(ValueError, match="Empty Q CLI response"):
+        with pytest.raises(
+            ValueError, match="Incomplete Q CLI response - no final prompt detected after response"
+        ):
             provider.extract_last_message_from_script(output)
 
     def test_extract_message_multiple_responses(self):
@@ -222,6 +224,25 @@ class TestQCliProviderMessageExtraction:
 
         assert "Second response" in message
         assert "First response" not in message
+
+    def test_extract_message_with_trailing_text(self):
+        """Test extraction works when prompt has trailing text."""
+        output = (
+            "[developer] 4% λ > User message here\n"
+            "\n"
+            "> Response text here\n"
+            "More response content\n"
+            "\n"
+            "[developer] 5% λ > How can I help?"
+        )
+
+        provider = QCliProvider("test1234", "test-session", "window-0", "developer")
+        message = provider.extract_last_message_from_script(output)
+
+        assert "Response text here" in message
+        assert "More response content" in message
+        assert "How can I help?" not in message
+        assert "User message" not in message
 
 
 class TestQCliProviderRegexPatterns:
@@ -268,6 +289,18 @@ class TestQCliProviderRegexPatterns:
         assert re.search(provider._idle_prompt_pattern, "[developer] 45%\u03bb>")
         assert re.search(provider._idle_prompt_pattern, "[developer] 45%\u03bb >")
         assert re.search(provider._idle_prompt_pattern, "[developer] 100%\u03bb>")
+
+    def test_idle_prompt_pattern_with_trailing_text(self):
+        """Test idle prompt pattern matches with trailing text."""
+        provider = QCliProvider("test1234", "test-session", "window-0", "developer")
+
+        # Should match with various trailing text
+        assert re.search(provider._idle_prompt_pattern, "[developer]> How can I help?")
+        assert re.search(provider._idle_prompt_pattern, "[developer] 16% λ > How can I help?")
+        assert re.search(
+            provider._idle_prompt_pattern, "[developer]> What would you like to do next?"
+        )
+        assert re.search(provider._idle_prompt_pattern, "[developer] 5% > Ready for next task")
 
     def test_permission_prompt_pattern(self):
         """Test permission prompt pattern detection."""

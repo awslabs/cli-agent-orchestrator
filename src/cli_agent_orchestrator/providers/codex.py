@@ -15,7 +15,8 @@ logger = logging.getLogger(__name__)
 ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
 IDLE_PROMPT_PATTERN = r"(?:❯|›|codex>)"
 # Match the prompt only if it appears at the end of the captured output.
-IDLE_PROMPT_AT_END_PATTERN = rf"(?:^\s*{IDLE_PROMPT_PATTERN}\s*$)\s*\Z"
+# Allows trailing text on the same line (e.g., "What would you like to do next?")
+IDLE_PROMPT_AT_END_PATTERN = rf"(?:^\s*{IDLE_PROMPT_PATTERN}\s*)\s*\Z"
 IDLE_PROMPT_PATTERN_LOG = r"❯"
 ASSISTANT_PREFIX_PATTERN = r"^(?:assistant|codex|agent)\s*:"
 USER_PREFIX_PATTERN = r"^You\b"

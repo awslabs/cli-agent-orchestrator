@@ -415,6 +415,62 @@ class TestQCliProviderHandoffIntegration:
             tmux_client.kill_session(test_session_name)
 
 
+class TestQCliProviderWorkingDirectory:
+    """Integration tests for working directory functionality."""
+
+    def test_session_starts_in_custom_directory(self, test_session_name, cleanup_session, tmp_path):
+        """Test that terminal starts in specified working directory."""
+        # Create session with custom working directory
+        window_name = tmux_client.create_session(
+            test_session_name, "test-window", "test-term-id", working_directory=str(tmp_path)
+        )
+
+        # Query the working directory
+        actual_dir = tmux_client.get_pane_working_directory(test_session_name, window_name)
+
+        assert actual_dir == str(tmp_path.resolve())
+
+    def test_working_directory_changes_are_detected(
+        self, test_session_name, cleanup_session, tmp_path
+    ):
+        """Test that directory changes in terminal are detected."""
+        # Create session
+        window_name = tmux_client.create_session(
+            test_session_name, "test-window", "test-term-id", working_directory=str(tmp_path)
+        )
+
+        # Create subdirectory
+        subdir = tmp_path / "subdir"
+        subdir.mkdir()
+
+        # Change directory in tmux pane
+        tmux_client.send_keys(test_session_name, window_name, f"cd {subdir}")
+        time.sleep(0.5)  # Wait for command to execute
+
+        # Query working directory
+        actual_dir = tmux_client.get_pane_working_directory(test_session_name, window_name)
+
+        assert actual_dir == str(subdir.resolve())
+
+    def test_symlink_resolution(self, test_session_name, cleanup_session, tmp_path):
+        """Test that symlinks are resolved to real paths."""
+        # Create real directory and symlink
+        real_dir = tmp_path / "real"
+        real_dir.mkdir()
+        link_dir = tmp_path / "link"
+        link_dir.symlink_to(real_dir)
+
+        # Create session with symlink path
+        window_name = tmux_client.create_session(
+            test_session_name, "test-window", "test-term-id", working_directory=str(link_dir)
+        )
+
+        # Should resolve to real path
+        actual_dir = tmux_client.get_pane_working_directory(test_session_name, window_name)
+
+        assert actual_dir == str(real_dir.resolve())
+
+
 class TestQCliProviderIntegrationErrorHandling:
     """Integration tests for error scenarios."""
 

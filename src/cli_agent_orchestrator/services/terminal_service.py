@@ -33,7 +33,11 @@ class OutputMode(str, Enum):
 
 
 def create_terminal(
-    provider: str, agent_profile: str, session_name: Optional[str] = None, new_session: bool = False
+    provider: str,
+    agent_profile: str,
+    session_name: Optional[str] = None,
+    new_session: bool = False,
+    working_directory: Optional[str] = None,
 ) -> Terminal:
     """Create terminal, optionally creating new session with it."""
     try:
@@ -55,12 +59,14 @@ def create_terminal(
                 raise ValueError(f"Session '{session_name}' already exists")
 
             # Create new tmux session with this terminal as the initial window
-            tmux_client.create_session(session_name, window_name, terminal_id)
+            tmux_client.create_session(session_name, window_name, terminal_id, working_directory)
         else:
             # Add window to existing session
             if not tmux_client.session_exists(session_name):
                 raise ValueError(f"Session '{session_name}' not found")
-            window_name = tmux_client.create_window(session_name, window_name, terminal_id)
+            window_name = tmux_client.create_window(
+                session_name, window_name, terminal_id, working_directory
+            )
 
         # Save terminal metadata to database
         db_create_terminal(terminal_id, session_name, window_name, provider, agent_profile)
@@ -126,6 +132,34 @@ def get_terminal(terminal_id: str) -> Dict:
 
     except Exception as e:
         logger.error(f"Failed to get terminal {terminal_id}: {e}")
+        raise
+
+
+def get_working_directory(terminal_id: str) -> Optional[str]:
+    """Get the current working directory of a terminal's pane.
+
+    Args:
+        terminal_id: The terminal identifier
+
+    Returns:
+        Working directory path, or None if pane has no directory
+
+    Raises:
+        ValueError: If terminal not found
+        Exception: If unable to query working directory
+    """
+    try:
+        metadata = get_terminal_metadata(terminal_id)
+        if not metadata:
+            raise ValueError(f"Terminal '{terminal_id}' not found")
+
+        working_dir = tmux_client.get_pane_working_directory(
+            metadata["tmux_session"], metadata["tmux_window"]
+        )
+        return working_dir
+
+    except Exception as e:
+        logger.error(f"Failed to get working directory for terminal {terminal_id}: {e}")
         raise
 
 
