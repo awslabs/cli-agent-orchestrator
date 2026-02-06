@@ -90,7 +90,8 @@ test/
 │       ├── test_launch.py
 │       └── test_shutdown.py
 ├── clients/               # Client tests
-│   └── test_database.py
+│   ├── test_database.py
+│   └── test_tmux_send_keys.py
 ├── mcp_server/            # MCP server tests
 │   └── test_models.py
 ├── models/                # Model tests
@@ -116,7 +117,7 @@ test/
 
 The project aims for >90% test coverage for core modules.
 
-### Current Coverage Status (348 tests passing)
+### Current Coverage Status (428 tests passing)
 
 **Modules at 100% Coverage:**
 - `cli/commands/` - All CLI commands (flow, init, install, launch, shutdown)
@@ -139,7 +140,7 @@ Some files have limited test coverage due to their nature:
 | Module | Coverage | Justification |
 |--------|----------|---------------|
 | **mcp_server/server.py** | 0% | Requires MCP protocol runtime environment. The MCP server runs as a separate process and communicates via the MCP protocol. Testing requires mocking the entire MCP communication layer, which is better handled by integration tests with actual MCP clients. |
-| **clients/tmux.py** | 35% | Requires real tmux sessions to test. The tmux client manages actual terminal multiplexer sessions, including creating windows, sending keys, and capturing output. Mocking these operations doesn't provide meaningful coverage. Integration tests run actual tmux commands. |
+| **clients/tmux.py** | ~30% | Requires real tmux sessions for full coverage. Core `send_keys` behavior (literal mode, chunking) is unit-tested via `test_tmux_send_keys.py`. Operations like session creation and history capture are better covered by integration tests. |
 | **api/main.py** | 44% | FastAPI endpoints require async testing setup with TestClient and running event loops. Endpoints interact with the database, tmux sessions, and providers simultaneously. Better tested via end-to-end integration tests. |
 | **services/cleanup_service.py** | 20% | Background cleanup service that runs in a separate thread, monitoring and cleaning up stale sessions. Requires running processes and real session state to test cleanup logic. |
 | **services/flow_service.py** | 25% | Flow orchestration service that manages complex multi-step agent interactions. Requires complex runtime state including active sessions, message queues, and provider instances. |
