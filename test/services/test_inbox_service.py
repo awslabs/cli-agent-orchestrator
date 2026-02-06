@@ -180,9 +180,7 @@ class TestLogFileHandler:
     @patch("cli_agent_orchestrator.services.inbox_service.check_and_send_pending_messages")
     @patch("cli_agent_orchestrator.services.inbox_service._has_idle_pattern")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
-    def test_on_modified_triggers_delivery(
-        self, mock_get_messages, mock_has_idle, mock_check_send
-    ):
+    def test_on_modified_triggers_delivery(self, mock_get_messages, mock_has_idle, mock_check_send):
         """Test on_modified triggers message delivery."""
         from watchdog.events import FileModifiedEvent
 

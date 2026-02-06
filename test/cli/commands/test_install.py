@@ -109,7 +109,13 @@ class TestInstallCommand:
     @patch("cli_agent_orchestrator.cli.commands.install.KIRO_AGENTS_DIR")
     @patch("cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR")
     def test_install_builtin_agent_kiro_cli(
-        self, mock_local_store, mock_kiro_dir, mock_context_dir, mock_load, runner, mock_agent_profile
+        self,
+        mock_local_store,
+        mock_kiro_dir,
+        mock_context_dir,
+        mock_load,
+        runner,
+        mock_agent_profile,
     ):
         """Test installing built-in agent for kiro_cli provider."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -124,7 +130,9 @@ class TestInstallCommand:
             mock_load.return_value = mock_agent_profile
 
             # Create mock for resources.files
-            with patch("cli_agent_orchestrator.cli.commands.install.resources.files") as mock_resources:
+            with patch(
+                "cli_agent_orchestrator.cli.commands.install.resources.files"
+            ) as mock_resources:
                 mock_agent_store = MagicMock()
                 mock_agent_store.__truediv__ = lambda self, x: tmppath / "builtin" / x
                 mock_resources.return_value = mock_agent_store
@@ -154,7 +162,9 @@ class TestInstallCommand:
     @patch("cli_agent_orchestrator.cli.commands.install.Path")
     @patch("cli_agent_orchestrator.cli.commands.install._download_agent")
     @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
-    def test_install_from_file_path(self, mock_load, mock_download, mock_path, runner, mock_agent_profile):
+    def test_install_from_file_path(
+        self, mock_load, mock_download, mock_path, runner, mock_agent_profile
+    ):
         """Test installing agent from file path."""
         mock_path_instance = MagicMock()
         mock_path_instance.exists.return_value = True
