@@ -147,8 +147,10 @@ class TmuxClient:
                         break
 
                 # Send chunks with delay between them
+                # Use literal=True to prevent tmux from interpreting quotes
+                # and special characters in the command text as key names
                 for chunk in chunks:
-                    pane.send_keys(chunk, enter=False)
+                    pane.send_keys(chunk, enter=False, literal=True)
                     time.sleep(SEND_KEYS_CHUNK_INTERVAL)
 
                 # Send carriage return as separate command

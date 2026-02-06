@@ -1,14 +1,18 @@
 """Claude Code provider implementation."""
 
+import logging
 import re
 import shlex
+import time
 from typing import Optional
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
-from cli_agent_orchestrator.utils.terminal import wait_until_status
+from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
+
+logger = logging.getLogger(__name__)
 
 
 # Custom exception for provider errors
@@ -22,11 +26,12 @@ class ProviderError(Exception):
 ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
 RESPONSE_PATTERN = r"⏺(?:\x1b\[[0-9;]*m)*\s+"  # Handle any ANSI codes between marker and text
 PROCESSING_PATTERN = r"[✶✢✽✻·✳].*….*\(esc to interrupt.*\)"
-IDLE_PROMPT_PATTERN = r">[\s\xa0]"  # Handle both regular space and non-breaking space
+IDLE_PROMPT_PATTERN = r"[>❯][\s\xa0]"  # Handle both old ">" and new "❯" prompt styles
 WAITING_USER_ANSWER_PATTERN = (
     r"❯.*\d+\."  # Pattern for Claude showing selection options with arrow cursor
 )
-IDLE_PROMPT_PATTERN_LOG = r">[\s\xa0]"  # Same pattern for log files
+TRUST_PROMPT_PATTERN = r"Yes, I trust this folder"  # Workspace trust dialog
+IDLE_PROMPT_PATTERN_LOG = r"[>❯][\s\xa0]"  # Same pattern for log files
 
 
 class ClaudeCodeProvider(BaseProvider):
@@ -75,13 +80,56 @@ class ClaudeCodeProvider(BaseProvider):
         # This correctly handles multiline strings, quotes, and special characters
         return shlex.join(command_parts)
 
+    def _handle_trust_prompt(self, timeout: float = 20.0) -> None:
+        """Auto-accept the workspace trust prompt if it appears.
+
+        Claude Code shows a trust dialog when opening an untrusted directory.
+        This sends Enter to accept 'Yes, I trust this folder'.
+        CAO assumes the user trusts the working directory since they initiated
+        the launch command.
+        """
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            output = tmux_client.get_history(self.session_name, self.window_name)
+            if not output:
+                time.sleep(1.0)
+                continue
+
+            # Clean ANSI codes for reliable text matching
+            clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
+
+            if re.search(TRUST_PROMPT_PATTERN, clean_output):
+                logger.info("Workspace trust prompt detected, auto-accepting")
+                session = tmux_client.server.sessions.get(session_name=self.session_name)
+                window = session.windows.get(window_name=self.window_name)
+                pane = window.active_pane
+                if pane:
+                    pane.send_keys("", enter=True)
+                return
+
+            # Check if Claude Code has fully started (welcome banner visible)
+            # Use a specific pattern that only appears in the welcome screen
+            if re.search(r"Welcome to|Claude Code v\d+", clean_output):
+                logger.info("Claude Code started without trust prompt")
+                return
+
+            time.sleep(1.0)
+        logger.warning("Trust prompt handler timed out")
+
     def initialize(self) -> bool:
         """Initialize Claude Code provider by starting claude command."""
+        # Wait for shell prompt to appear in the tmux window
+        if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
+            raise TimeoutError("Shell initialization timed out after 10 seconds")
+
         # Build properly escaped command string
         command = self._build_claude_command()
 
         # Send Claude Code command using tmux client
         tmux_client.send_keys(self.session_name, self.window_name, command)
+
+        # Handle workspace trust prompt if it appears (new/untrusted directories)
+        self._handle_trust_prompt(timeout=20.0)
 
         # Wait for Claude Code prompt to be ready
         if not wait_until_status(self, TerminalStatus.IDLE, timeout=30.0, polling_interval=1.0):
@@ -104,7 +152,10 @@ class ClaudeCodeProvider(BaseProvider):
             return TerminalStatus.PROCESSING
 
         # Check for waiting user answer (Claude asking for user selection)
-        if re.search(WAITING_USER_ANSWER_PATTERN, output):
+        # Exclude the workspace trust prompt which also matches the pattern
+        if re.search(WAITING_USER_ANSWER_PATTERN, output) and not re.search(
+            TRUST_PROMPT_PATTERN, output
+        ):
             return TerminalStatus.WAITING_USER_ANSWER
 
         # Check for completed state (has response + ready prompt)

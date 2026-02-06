@@ -45,20 +45,26 @@ uv run pytest test/providers/test_q_cli_unit.py -v -k "test_initialization"
 
 ### Unit Tests
 
-Unit tests are fast (< 1 second) and use mocked dependencies:
+Unit tests are fast (< 5 seconds) and use mocked dependencies:
 
 ```bash
 # Run all unit tests
+uv run pytest test/ -v --ignore=test/providers/test_q_cli_integration.py
+
+# Run provider-specific tests
+uv run pytest test/providers/test_claude_code_unit.py -v
+uv run pytest test/providers/test_kiro_cli_unit.py -v
 uv run pytest test/providers/test_q_cli_unit.py -v
+uv run pytest test/providers/test_codex_provider_unit.py -v
+
+# Run tmux client tests
+uv run pytest test/clients/test_tmux_send_keys.py -v
 
 # Run with coverage report
-uv run pytest test/providers/test_q_cli_unit.py --cov=src/cli_agent_orchestrator/providers/q_cli.py --cov-report=term-missing -v
+uv run pytest test/ --cov=src --cov-report=term-missing -v --ignore=test/providers/test_q_cli_integration.py
 
 # Run specific test class
-uv run pytest test/providers/test_q_cli_unit.py::TestQCliProviderStatusDetection -v
-
-# Run specific test
-uv run pytest test/providers/test_q_cli_unit.py::TestQCliProviderStatusDetection::test_get_status_idle -v
+uv run pytest test/providers/test_claude_code_unit.py::TestClaudeCodeProviderStatusDetection -v
 ```
 
 ### Integration Tests
