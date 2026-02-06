@@ -64,7 +64,9 @@ def test_launch_with_session_name():
         }
         mock_post.return_value.raise_for_status.return_value = None
 
-        result = runner.invoke(launch, ["--agents", "test-agent", "--session-name", "custom-session"])
+        result = runner.invoke(
+            launch, ["--agents", "test-agent", "--session-name", "custom-session"]
+        )
 
         assert result.exit_code == 0
 
