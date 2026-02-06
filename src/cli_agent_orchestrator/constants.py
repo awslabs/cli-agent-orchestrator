@@ -44,8 +44,9 @@ DATABASE_FILE = DB_DIR / "cli-agent-orchestrator.db"
 DATABASE_URL = f"sqlite:///{DATABASE_FILE}"
 
 # Server configuration
+import os
 SERVER_HOST = "localhost"
-SERVER_PORT = 9889
+SERVER_PORT = int(os.getenv("CAO_PORT", "9889"))
 SERVER_VERSION = "0.1.0"
 API_BASE_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
 CORS_ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"]
