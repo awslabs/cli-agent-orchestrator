@@ -18,10 +18,15 @@ Since Kiro CLI has identical output format to Q CLI, the test fixtures are reuse
 test/providers/
 ├── test_kiro_cli_unit.py       # Kiro CLI unit tests (fast, mocked) - default provider
 ├── test_q_cli_unit.py          # Q CLI unit tests (fast, mocked)
+├── test_claude_code_unit.py    # Claude Code unit tests (fast, mocked)
+├── test_codex_provider_unit.py # Codex CLI unit tests (fast, mocked)
+├── test_base_provider.py       # Base provider abstract interface tests
+├── test_tmux_working_directory.py # TmuxClient working directory tests
 ├── test_q_cli_integration.py   # Q CLI integration tests (slow, real Q CLI)
 ├── fixtures/                    # Test fixture files
 │   ├── kiro_cli_*.txt          # Kiro CLI fixtures (default provider)
 │   ├── q_cli_*.txt             # Q CLI fixtures
+│   ├── codex_*.txt             # Codex CLI fixtures
 │   └── generate_fixtures.py    # Script to regenerate fixtures
 └── README.md
 ```
@@ -325,6 +330,77 @@ uv run pytest test/providers/test_q_cli_integration.py::TestQCliProviderHandoffI
 uv run pytest test/providers/test_q_cli_unit.py::TestQCliProviderHandoffScenarios::test_handoff_indices_not_corrupted -v
 ```
 
+## Claude Code Provider Tests
+
+### Test Coverage (`test_claude_code_unit.py`)
+
+**33 tests covering:**
+
+1. **Initialization (7 tests)**
+   - Successful initialization (with `wait_for_shell` assertion)
+   - Shell timeout handling
+   - Claude Code timeout handling
+   - Initialization with agent profile
+   - Invalid agent profile error handling
+   - MCP server configuration
+   - Command verification (`claude` sent to tmux)
+
+2. **Status Detection (10 tests)**
+   - IDLE status with old `>` prompt
+   - IDLE status with new `❯` prompt
+   - IDLE status with ANSI-coded terminal output
+   - COMPLETED status (both prompt styles)
+   - PROCESSING status
+   - WAITING_USER_ANSWER status
+   - ERROR status (empty output, unrecognized output)
+   - Status detection with `tail_lines` parameter
+
+3. **Message Extraction (5 tests)**
+   - Successful extraction
+   - No response pattern error
+   - Empty response error
+   - Multiple responses (uses last)
+   - Separator handling
+
+4. **Miscellaneous (5 tests)**
+   - Exit command, idle pattern for log, cleanup
+   - Building claude command (no profile, with system prompt)
+
+5. **Trust Prompt Handling (6 tests)**
+   - Trust prompt detected and auto-accepted via Enter key
+   - Early return when Claude starts without trust prompt (Welcome banner)
+   - Timeout handling when neither prompt nor banner appears
+   - Empty output followed by trust prompt detection
+   - Trust prompt NOT misdetected as `WAITING_USER_ANSWER` in `get_status()`
+   - `initialize()` integration with trust prompt acceptance flow
+
+**Coverage:** 100% of claude_code.py
+
+### Running Claude Code Tests
+
+```bash
+# Run all Claude Code unit tests
+uv run pytest test/providers/test_claude_code_unit.py -v
+
+# Run with coverage
+uv run pytest test/providers/test_claude_code_unit.py --cov=src/cli_agent_orchestrator/providers/claude_code.py --cov-report=term-missing -v
+
+# Run specific test class
+uv run pytest test/providers/test_claude_code_unit.py::TestClaudeCodeProviderInitialization -v
+```
+
+## Codex CLI Provider Tests
+
+### Test Coverage (`test_codex_provider_unit.py`)
+
+Tests cover initialization (with `wait_for_shell`), status detection, message extraction, and edge cases. See the test file for full details.
+
+### Running Codex Tests
+
+```bash
+uv run pytest test/providers/test_codex_provider_unit.py -v
+```
+
 ## Kiro CLI Provider Tests
 
 ### Running Kiro CLI Tests
@@ -350,10 +426,71 @@ Note: Kiro CLI has identical output format to Q CLI, so the test structure and f
 4. **Error Handling**: Tests failed handoff scenarios
 5. **Permission Prompts**: Tests handoffs requiring user approval
 
+## TmuxClient send_keys Tests
+
+Unit tests for the `TmuxClient.send_keys` method are in `test/clients/test_tmux_send_keys.py`.
+
+**8 tests covering:**
+
+1. **Literal mode (3 tests)**
+   - Text chunks use `literal=True` (prevents tmux key interpretation)
+   - Final `C-m` (Enter) is NOT sent as literal
+   - Commands with single quotes use literal mode (the original bug)
+
+2. **Chunking (2 tests)**
+   - Long commands are split into multiple chunks
+   - Short commands remain as a single chunk
+
+3. **Correctness (1 test)**
+   - All chunks reconstruct the original command
+
+4. **Error handling (2 tests)**
+   - Session not found
+   - Window not found
+
+### Running TmuxClient Tests
+
+```bash
+uv run pytest test/clients/test_tmux_send_keys.py -v
+```
+
+## Launch Command Tests
+
+Unit tests for the `launch` CLI command are in `test/cli/commands/test_launch.py`.
+
+**10 tests covering:**
+
+1. **Core functionality (4 tests)**
+   - Working directory included in API params
+   - Custom session name
+   - Headless mode (no tmux attach)
+   - Invalid provider error
+
+2. **Error handling (2 tests)**
+   - RequestException (server unreachable)
+   - Generic exception
+
+3. **Workspace access confirmation (4 tests)**
+   - Confirmation shown and accepted for `claude_code` provider
+   - Confirmation declined cancels launch
+   - `--yes` flag skips confirmation
+   - Default provider (`kiro_cli`) also shows confirmation
+
+**Coverage:** 100% of launch.py
+
+### Running Launch Tests
+
+```bash
+uv run pytest test/cli/commands/test_launch.py -v
+```
+
 ## Test Quality Metrics
 
-- **Unit Test Count:** 42
+- **Provider Unit Test Count:** ~130 (across all providers)
+- **CLI Command Test Count:** ~10
+- **Client Unit Test Count:** ~20
 - **Integration Test Count:** 9
-- **Coverage:** 100% of q_cli.py
-- **Execution Time:** <1s (unit), <90s (integration)
-- **Test Categories:** 7 (initialization, status, extraction, patterns, prompts, handoff, edge cases)
+- **Total Test Count:** 438
+- **Coverage:** 100% of all provider modules and launch.py
+- **Execution Time:** <5s (unit), <90s (integration)
+- **Test Categories:** 9 (initialization, status, extraction, patterns, prompts, handoff, edge cases, tmux send_keys, workspace confirmation)
