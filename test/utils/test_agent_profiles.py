@@ -18,7 +18,9 @@ class TestLoadAgentProfile:
         # Setup mock local directory
         mock_local_path = MagicMock(spec=Path)
         mock_local_path.exists.return_value = True
-        mock_local_path.read_text.return_value = "---\nname: test-agent\ndescription: Test agent\n---\nSystem prompt content"
+        mock_local_path.read_text.return_value = (
+            "---\nname: test-agent\ndescription: Test agent\n---\nSystem prompt content"
+        )
         mock_local_dir.__truediv__.return_value = mock_local_path
 
         # Setup frontmatter mock
@@ -39,7 +41,9 @@ class TestLoadAgentProfile:
     @patch("cli_agent_orchestrator.utils.agent_profiles.resources")
     @patch("cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR")
     @patch("cli_agent_orchestrator.utils.agent_profiles.frontmatter")
-    def test_load_agent_profile_from_builtin_store(self, mock_frontmatter, mock_local_dir, mock_resources):
+    def test_load_agent_profile_from_builtin_store(
+        self, mock_frontmatter, mock_local_dir, mock_resources
+    ):
         """Test loading agent profile from built-in store when local not found."""
         # Setup mock local directory (not found)
         mock_local_path = MagicMock(spec=Path)
@@ -50,7 +54,9 @@ class TestLoadAgentProfile:
         mock_agent_store = MagicMock()
         mock_profile_file = MagicMock()
         mock_profile_file.is_file.return_value = True
-        mock_profile_file.read_text.return_value = "---\nname: builtin-agent\ndescription: Builtin agent\n---\nBuiltin prompt"
+        mock_profile_file.read_text.return_value = (
+            "---\nname: builtin-agent\ndescription: Builtin agent\n---\nBuiltin prompt"
+        )
         mock_agent_store.__truediv__.return_value = mock_profile_file
         mock_resources.files.return_value = mock_agent_store
 

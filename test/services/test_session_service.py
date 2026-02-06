@@ -67,12 +67,8 @@ class TestGetSession:
     def test_get_session_success(self, mock_tmux, mock_list_terminals):
         """Test getting session successfully."""
         mock_tmux.session_exists.return_value = True
-        mock_tmux.list_sessions.return_value = [
-            {"id": "cao-test", "name": "Test Session"}
-        ]
-        mock_list_terminals.return_value = [
-            {"id": "terminal1", "session": "cao-test"}
-        ]
+        mock_tmux.list_sessions.return_value = [{"id": "cao-test", "name": "Test Session"}]
+        mock_list_terminals.return_value = [{"id": "terminal1", "session": "cao-test"}]
 
         result = get_session("cao-test")
 
