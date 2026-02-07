@@ -15,9 +15,7 @@ class TestHandoffMessageContext:
     @patch("cli_agent_orchestrator.mcp_server.server._send_direct_input")
     @patch("cli_agent_orchestrator.mcp_server.server.wait_until_terminal_status")
     @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
-    def test_codex_provider_prepends_handoff_context(
-        self, mock_create, mock_wait, mock_send
-    ):
+    def test_codex_provider_prepends_handoff_context(self, mock_create, mock_wait, mock_send):
         """Codex provider should prepend [CAO Handoff] with supervisor ID."""
         mock_create.return_value = ("dev-terminal-1", "codex")
         # First call: wait for IDLE (True), second call: wait for COMPLETED (True)
@@ -47,9 +45,7 @@ class TestHandoffMessageContext:
     @patch("cli_agent_orchestrator.mcp_server.server._send_direct_input")
     @patch("cli_agent_orchestrator.mcp_server.server.wait_until_terminal_status")
     @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
-    def test_claude_code_provider_no_handoff_context(
-        self, mock_create, mock_wait, mock_send
-    ):
+    def test_claude_code_provider_no_handoff_context(self, mock_create, mock_wait, mock_send):
         """Claude Code provider should NOT prepend any handoff context."""
         mock_create.return_value = ("dev-terminal-2", "claude_code")
         mock_wait.side_effect = [True, True]
@@ -74,9 +70,7 @@ class TestHandoffMessageContext:
     @patch("cli_agent_orchestrator.mcp_server.server._send_direct_input")
     @patch("cli_agent_orchestrator.mcp_server.server.wait_until_terminal_status")
     @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
-    def test_kiro_cli_provider_no_handoff_context(
-        self, mock_create, mock_wait, mock_send
-    ):
+    def test_kiro_cli_provider_no_handoff_context(self, mock_create, mock_wait, mock_send):
         """Kiro CLI provider should NOT prepend any handoff context."""
         mock_create.return_value = ("dev-terminal-3", "kiro_cli")
         mock_wait.side_effect = [True, True]
@@ -127,9 +121,7 @@ class TestHandoffMessageContext:
     @patch("cli_agent_orchestrator.mcp_server.server._send_direct_input")
     @patch("cli_agent_orchestrator.mcp_server.server.wait_until_terminal_status")
     @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
-    def test_codex_handoff_context_fallback_when_no_env(
-        self, mock_create, mock_wait, mock_send
-    ):
+    def test_codex_handoff_context_fallback_when_no_env(self, mock_create, mock_wait, mock_send):
         """When CAO_TERMINAL_ID is not set, supervisor ID should be 'unknown'."""
         mock_create.return_value = ("dev-terminal-5", "codex")
         mock_wait.side_effect = [True, True]
@@ -143,9 +135,7 @@ class TestHandoffMessageContext:
                 mock_requests.get.return_value = mock_response
                 mock_requests.post.return_value = mock_response
 
-                asyncio.get_event_loop().run_until_complete(
-                    _handoff_impl("developer", "Do task")
-                )
+                asyncio.get_event_loop().run_until_complete(_handoff_impl("developer", "Do task"))
 
         sent_message = mock_send.call_args[0][1]
         assert "unknown" in sent_message
@@ -155,9 +145,7 @@ class TestHandoffMessageContext:
     @patch("cli_agent_orchestrator.mcp_server.server._send_direct_input")
     @patch("cli_agent_orchestrator.mcp_server.server.wait_until_terminal_status")
     @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
-    def test_codex_handoff_original_message_preserved(
-        self, mock_create, mock_wait, mock_send
-    ):
+    def test_codex_handoff_original_message_preserved(self, mock_create, mock_wait, mock_send):
         """Original message should appear in full after the handoff prefix."""
         mock_create.return_value = ("dev-terminal-6", "codex")
         mock_wait.side_effect = [True, True]
@@ -172,9 +160,7 @@ class TestHandoffMessageContext:
                 mock_requests.get.return_value = mock_response
                 mock_requests.post.return_value = mock_response
 
-                asyncio.get_event_loop().run_until_complete(
-                    _handoff_impl("developer", original)
-                )
+                asyncio.get_event_loop().run_until_complete(_handoff_impl("developer", original))
 
         sent_message = mock_send.call_args[0][1]
         assert sent_message.endswith(original)
