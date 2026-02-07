@@ -65,9 +65,9 @@ class TestTmuxClientSendKeys:
             c for c in self.mock_pane.send_keys.call_args_list if c != call("C-m", enter=False)
         ]
         for c in chunk_calls:
-            assert c.kwargs.get("literal", False) is True, (
-                f"Chunk with quotes must use literal=True to prevent tmux mangling: {c}"
-            )
+            assert (
+                c.kwargs.get("literal", False) is True
+            ), f"Chunk with quotes must use literal=True to prevent tmux mangling: {c}"
 
     def test_send_keys_long_command_chunked(self):
         """Test that long commands are split into chunks."""
