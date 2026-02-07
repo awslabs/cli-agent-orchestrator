@@ -51,10 +51,10 @@ class TestGenerateFunctions:
         assert len(name) == 14  # developer- (10) + uuid (4)
 
     def test_generate_window_name_unique(self):
-        """Test window names are unique."""
-        names = [generate_window_name("test") for _ in range(100)]
+        """Test window names are mostly unique (4 hex chars = 65536 values, collisions possible)."""
+        names = [generate_window_name("test") for _ in range(10)]
 
-        assert len(set(names)) == 100
+        assert len(set(names)) == 10
 
 
 class TestWaitForShell:
