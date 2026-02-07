@@ -116,23 +116,6 @@ cao install developer
 cao install reviewer
 ```
 
-**Provider Selection:**
-
-By default, agents are installed for the `kiro_cli` provider (Kiro CLI). You can specify a different provider:
-
-```bash
-# Install for Kiro CLI (default)
-cao install code_supervisor
-# Install for other providers (or specific providers)
-cao install code_supervisor --provider claude_code
-cao install code_supervisor --provider codex
-cao install code_supervisor --provider kiro_cli
-```
-
-**Notes:**
-- The `claude_code` provider can optionally work without agent profiles (it uses project's `CLAUDE.md` for context instead). However, to use CAO's supervisor/worker patterns, install the agent profiles.
-- For using the **Codex CLI provider** with your OpenAI API key, see [docs/codex-cli.md](docs/codex-cli.md).
-
 You can also install agents from local files or URLs:
 
 ```bash
@@ -157,6 +140,8 @@ cao launch --agents code_supervisor
 
 # Or specify a provider
 cao launch --agents code_supervisor --provider kiro_cli
+cao launch --agents code_supervisor --provider claude_code
+cao launch --agents code_supervisor --provider codex
 
 # Skip workspace trust confirmation
 cao launch --agents code_supervisor --yolo
