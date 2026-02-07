@@ -19,8 +19,8 @@ PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {"claude_code", "codex", "kiro_cli"}
 @click.option(
     "--provider", default=DEFAULT_PROVIDER, help=f"Provider to use (default: {DEFAULT_PROVIDER})"
 )
-@click.option("--yes", "-y", is_flag=True, help="Skip workspace access confirmation")
-def launch(agents, session_name, headless, provider, yes):
+@click.option("--yolo", is_flag=True, help="Skip workspace trust confirmation")
+def launch(agents, session_name, headless, provider, yolo):
     """Launch cao session with specified agent profile."""
     try:
         # Validate provider
@@ -28,19 +28,20 @@ def launch(agents, session_name, headless, provider, yes):
             raise click.ClickException(
                 f"Invalid provider '{provider}'. Available providers: {', '.join(PROVIDERS)}"
             )
-
         working_directory = os.path.realpath(os.getcwd())
 
-        # Ask for workspace access confirmation for providers that need it.
+        # Ask for workspace trust confirmation for providers that need it.
         # Note: CAO itself does not access the workspace — it is the underlying
-        # provider (e.g. claude_code, codex) that reads and writes files there.
-        if provider in PROVIDERS_REQUIRING_WORKSPACE_ACCESS and not yes:
+        # provider (e.g. claude_code, codex) that reads, writes, and executes
+        # commands in the workspace directory.
+        if provider in PROVIDERS_REQUIRING_WORKSPACE_ACCESS and not yolo:
             click.echo(
-                f"Note: CAO does not access your workspace directly. "
-                f"The underlying provider ({provider}) will read and operate in:\n"
-                f"  {working_directory}\n"
+                f"The underlying provider ({provider}) will be trusted to perform all actions "
+                f"(read, write, and execute) in:\n"
+                f"  {working_directory}\n\n"
+                f"To skip this confirmation, use: cao launch --yolo\n"
             )
-            if not click.confirm("Allow provider workspace access?", default=True):
+            if not click.confirm("Do you trust all the actions in this folder?", default=True):
                 raise click.ClickException("Launch cancelled by user")
 
         # Call API to create session
