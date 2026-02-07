@@ -117,7 +117,7 @@ test/
 
 The project aims for >90% test coverage for core modules.
 
-### Current Coverage Status (428 tests passing)
+### Current Coverage Status (467 tests passing)
 
 **Modules at 100% Coverage:**
 - `cli/commands/` - All CLI commands (flow, init, install, launch, shutdown)
