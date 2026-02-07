@@ -95,6 +95,26 @@ uv run cao launch --agents code_supervisor  # Launch an agent
 
 For more details, see [DEVELOPMENT.md](DEVELOPMENT.md).
 
+### Testing
+
+```bash
+# Run all unit tests (476 tests, excludes E2E)
+uv run pytest test/ --ignore=test/e2e --ignore=test/providers/test_q_cli_integration.py -v
+
+# Run with coverage
+uv run pytest test/ --ignore=test/e2e --ignore=test/providers/test_q_cli_integration.py \
+  --cov=src/cli_agent_orchestrator --cov-report=term-missing -v
+
+# Run E2E tests (requires running cao-server + authenticated CLI tools)
+uv run cao-server &
+uv run pytest -m e2e test/e2e/ -v                    # All providers
+uv run pytest -m e2e test/e2e/ -v -k codex            # Codex only
+uv run pytest -m e2e test/e2e/ -v -k claude_code      # Claude Code only
+uv run pytest -m e2e test/e2e/ -v -k kiro_cli          # Kiro CLI only
+```
+
+For detailed test documentation, coverage targets, and CI workflow details, see [test/README.md](test/README.md).
+
 ## Prerequisites
 
 Before using CAO, install at least one supported CLI agent tool:
