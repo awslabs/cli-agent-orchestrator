@@ -124,7 +124,9 @@ class TestClaudeCodeProviderInitialization:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         provider.initialize()
 
-        mock_tmux.send_keys.assert_called_once_with("test-session", "window-0", "claude")
+        mock_tmux.send_keys.assert_called_once_with(
+            "test-session", "window-0", "claude --dangerously-skip-permissions"
+        )
 
 
 class TestClaudeCodeProviderStatusDetection:
@@ -323,7 +325,7 @@ class TestClaudeCodeProviderMisc:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         command = provider._build_claude_command()
 
-        assert command == "claude"
+        assert command == "claude --dangerously-skip-permissions"
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     def test_build_claude_command_with_system_prompt(self, mock_load):
