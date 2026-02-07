@@ -2,22 +2,24 @@
 
 ## Overview
 
-The Codex CLI provider enables CLI Agent Orchestrator (CAO) to work with **ChatGPT/Codex CLI** through your ChatGPT subscription, allowing you to orchestrate multiple Codex-based agents without migrating everything to API-based agents.
+The Codex CLI provider enables CLI Agent Orchestrator (CAO) to work with **Codex CLI** (OpenAI's coding agent) through your OpenAI API key, allowing you to orchestrate multiple Codex-based agents.
 
 ## Quick Start
 
 ### Prerequisites
 
-1. **ChatGPT Subscription**: You need an active ChatGPT subscription
-2. **Codex CLI**: Install and configure Codex CLI tool
-3. **Authentication**: Authenticate Codex CLI with your ChatGPT account
+1. **OpenAI API Key** or **ChatGPT Subscription**: Authentication for Codex CLI
+2. **Codex CLI**: Install the CLI tool via npm
+3. **tmux**: Required for terminal management
 
 ```bash
 # Install Codex CLI
-pip install codex-cli
+npm install -g @openai/codex
 
-# Authenticate with ChatGPT
-codex auth login
+# Authenticate (set API key)
+export OPENAI_API_KEY=your-key-here
+# Or use interactive login
+codex login
 ```
 
 ### Using Codex Provider with CAO
@@ -148,45 +150,26 @@ PY
 
 ## Authentication
 
-### ChatGPT Subscription Setup
+### OpenAI API Key Setup
 
 1. **Install Codex CLI**:
    ```bash
-   pip install codex-cli
+   npm install -g @openai/codex
    ```
 
-2. **Authenticate**:
+2. **Authenticate** (choose one):
    ```bash
-   codex auth login
-   # Follow browser authentication flow
+   # Option 1: Set environment variable
+   export OPENAI_API_KEY=your-key-here
+
+   # Option 2: Interactive login
+   codex login
    ```
 
-3. **Verify Authentication**:
+3. **Verify Installation**:
    ```bash
-   codex auth status
+   codex --version
    ```
-
-### Workspace Setup
-
-Configure your workspace for Codex development:
-
-```bash
-# Create workspace directory
-mkdir codex-workspace
-cd codex-workspace
-
-# Initialize project structure
-mkdir -p src tests docs
-
-# Create .codex config file
-cat > .codexrc << EOF
-{
-  "model": "gpt-4",
-  "timeout": 300,
-  "workspace": "./src"
-}
-EOF
-```
 
 ## Troubleshooting
 
@@ -195,14 +178,16 @@ EOF
 1. **Authentication Failed**:
    ```bash
    # Re-authenticate
-   codex auth logout
-   codex auth login
+   codex logout
+   codex login
+   # Or set API key directly
+   export OPENAI_API_KEY=your-key-here
    ```
 
 2. **Timeout / Hanging Tasks**:
    - Confirm `codex` works in a regular shell (`codex`, then exit)
    - Attach to the tmux session and check whether Codex is waiting for input/approval
-   - Verify your ChatGPT subscription status and network connectivity
+   - Verify your OpenAI API key or ChatGPT subscription and network connectivity
 
 3. **Status Detection Problems**:
    - Check terminal history for unexpected prompts

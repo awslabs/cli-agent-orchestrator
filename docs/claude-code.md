@@ -65,7 +65,7 @@ CAO launches Claude Code with `--dangerously-skip-permissions` to bypass:
 - **Workspace trust dialog**: The "Yes, I trust this folder" prompt that appears for new directories
 - **Tool permission prompts**: Approval dialogs for file edits, command execution, etc.
 
-This is safe because CAO already confirms workspace access during `cao launch` (or via `--yes/-y` flag). Without this flag, worker agents spawned via handoff/assign would block on the trust dialog with no way to accept it interactively.
+This is safe because CAO already confirms workspace trust during `cao launch` ("Do you trust all the actions in this folder?") or via `--yolo` flag. Without this flag, worker agents spawned via handoff/assign would block on the trust dialog with no way to accept it interactively.
 
 A fallback `_handle_trust_prompt()` method also monitors for the trust dialog and sends Enter to accept it, in case the flag doesn't cover all scenarios.
 
