@@ -71,4 +71,4 @@ testpaths = ["test"]
 python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
-addopts = "--cov=src --cov-report=term-missing"
+addopts = "--cov=src --cov-report=term-missing -m 'not e2e'"

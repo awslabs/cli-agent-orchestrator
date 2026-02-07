@@ -25,7 +25,11 @@ class ProviderError(Exception):
 # Regex patterns for Claude Code output analysis
 ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
 RESPONSE_PATTERN = r"⏺(?:\x1b\[[0-9;]*m)*\s+"  # Handle any ANSI codes between marker and text
-PROCESSING_PATTERN = r"[✶✢✽✻·✳].*….*\(esc to interrupt.*\)"
+# Match Claude Code processing spinners:
+# - Old format: "✽ Cooking… (esc to interrupt)" / "✶ Thinking… (esc to interrupt)"
+# - New format: "✽ Cooking… (6s · ↓ 174 tokens · thinking)"
+# Common: spinner char + text + ellipsis + parenthesized status
+PROCESSING_PATTERN = r"[✶✢✽✻·✳].*….*\(.*\)"
 IDLE_PROMPT_PATTERN = r"[>❯][\s\xa0]"  # Handle both old ">" and new "❯" prompt styles
 WAITING_USER_ANSWER_PATTERN = (
     r"❯.*\d+\."  # Pattern for Claude showing selection options with arrow cursor
@@ -54,7 +58,11 @@ class ClaudeCodeProvider(BaseProvider):
         Returns properly escaped shell command string that can be safely sent via tmux.
         Uses shlex.join() to handle multiline strings and special characters correctly.
         """
-        command_parts = ["claude"]
+        # --dangerously-skip-permissions: bypass the workspace trust dialog and
+        # tool permission prompts. CAO already confirms workspace access during
+        # `cao launch` (or `--yes/-y`), so re-prompting each spawned agent
+        # (supervisor and worker) is redundant and blocks handoff/assign flows.
+        command_parts = ["claude", "--dangerously-skip-permissions"]
 
         if self._agent_profile is not None:
             try:
