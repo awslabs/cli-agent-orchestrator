@@ -295,7 +295,7 @@ cli-agent-orchestrator/
 │       ├── clients/                # Database and tmux clients
 │       ├── mcp_server/             # MCP server implementation
 │       ├── models/                 # Data models
-│       ├── providers/              # Agent providers (Q CLI, Claude Code)
+│       ├── providers/              # Agent providers (Kiro CLI, Q CLI, Claude Code, Codex)
 │       ├── services/               # Business logic services
 │       └── utils/                  # Utility functions
 ├── test/                           # Test suite

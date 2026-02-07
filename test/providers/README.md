@@ -194,14 +194,26 @@ uv run python test/providers/fixtures/generate_fixtures.py
 
 ## CI/CD Integration
 
-The project includes a GitHub Actions workflow (`.github/workflows/test-q-cli-provider.yml`) that automatically runs tests on pull requests and pushes to main/develop branches.
+The project includes multiple GitHub Actions workflows that run on pull requests and pushes:
 
-The workflow includes:
-- **Unit tests**: Run on Python 3.10, 3.11, and 3.12 with coverage reporting
-- **Integration tests**: Run only on main branch (requires Q CLI setup)
-- **Code quality**: Checks formatting (black), import sorting (isort), and type checking (mypy)
+### Comprehensive Workflow (`ci.yml`)
+Runs **all tests** in `test/` (excluding Q CLI integration), plus security scanning:
+- **Unit tests**: Python 3.10, 3.11, 3.12 matrix with coverage
+- **Code quality**: black, isort, mypy
+- **Security scan**: Trivy vulnerability scanner (CRITICAL/HIGH)
+- **Dependency review**: License and vulnerability checks on PRs
 
-For more details, see the [workflow file](../../.github/workflows/test-q-cli-provider.yml).
+### Provider-Specific Workflows (path-triggered)
+Each provider has a dedicated workflow that runs only when its files change:
+
+| Workflow | Tests | Trigger Paths |
+|---|---|---|
+| `test-codex-provider.yml` | `test_codex_provider_unit.py` | `providers/codex.py`, `test/providers/**` |
+| `test-claude-code-provider.yml` | `test_claude_code_unit.py` | `providers/claude_code.py`, `test/providers/**` |
+| `test-kiro-cli-provider.yml` | `test_kiro_cli_unit.py` | `providers/kiro_cli.py`, `test/providers/**` |
+| `test-q-cli-provider.yml` | `test_q_cli_unit.py` | `providers/q_cli.py`, `test/providers/**` |
+
+Each includes unit tests (Python 3.10/3.11/3.12) and code quality checks (black, isort, mypy).
 
 ## Writing New Tests
 
@@ -393,12 +405,75 @@ uv run pytest test/providers/test_claude_code_unit.py::TestClaudeCodeProviderIni
 
 ### Test Coverage (`test_codex_provider_unit.py`)
 
-Tests cover initialization (with `wait_for_shell`), status detection, message extraction, and edge cases. See the test file for full details.
+**56 tests covering:**
+
+1. **Initialization (3 tests)**
+   - Successful initialization (warm-up `echo ready` + codex with `--no-alt-screen --disable shell_snapshot`)
+   - Shell timeout handling
+   - Codex timeout handling
+
+2. **Command Building (10 tests)**
+   - Base command without agent profile
+   - Command with agent profile (developer_instructions injection)
+   - Double quote escaping in system prompts
+   - Newline escaping for TOML/tmux compatibility
+   - MCP server config injection via `-c mcp_servers.<name>.<field>`
+   - MCP server with environment variables
+   - Empty system prompt handling
+   - None system prompt handling
+   - Agent profile load failure (ProviderError)
+   - Initialize with agent profile end-to-end
+
+3. **Status Detection — Label Format (14 tests)**
+   - IDLE, COMPLETED, PROCESSING, WAITING_USER_ANSWER, ERROR states
+   - Empty output handling
+   - tail_lines parameter
+   - Old prompt in scrollback (bottom-N-lines approach)
+   - Assistant mentioning error/approval text (not false positives)
+   - TUI output with status bar (idle + completed)
+   - Trust prompt detection
+
+4. **Status Detection — Bullet Format (7 tests)**
+   - COMPLETED with `•` response after `›` user input
+   - PROCESSING with partial `•` output (no idle prompt)
+   - IDLE when no `•` response after user message
+   - Code blocks within `•` response
+   - Error detection not masked by bullet pattern
+   - Multi-turn `•` conversations
+   - TUI status bar with `•` bullet format
+
+5. **Message Extraction — Label Format (4 tests)**
+   - Successful extraction, complex messages, missing marker, empty response
+
+6. **Message Extraction — Bullet Format (5 tests)**
+   - Single-line `•` response
+   - Multi-line `•` response (all bullets preserved)
+   - Code blocks within `•` response
+   - Multi-turn extraction (only last response)
+   - Extraction without trailing idle prompt
+
+7. **Miscellaneous (5 tests)**
+   - Exit command, idle pattern for log, cleanup, extraction without trailing prompt
+
+8. **Trust Prompt Handling (4 tests)**
+   - Trust prompt detected and auto-accepted
+   - Trust prompt not needed (welcome banner)
+   - Trust prompt as WAITING_USER_ANSWER status
+   - Initialize with trust prompt flow
+
+**Coverage:** 96% of codex.py
 
 ### Running Codex Tests
 
 ```bash
+# Run all Codex CLI unit tests
 uv run pytest test/providers/test_codex_provider_unit.py -v
+
+# Run with coverage
+uv run pytest test/providers/test_codex_provider_unit.py --cov=src/cli_agent_orchestrator/providers/codex.py --cov-report=term-missing -v
+
+# Run specific test class
+uv run pytest test/providers/test_codex_provider_unit.py::TestCodexBuildCommand -v
 ```
 
 ## Kiro CLI Provider Tests
@@ -486,11 +561,11 @@ uv run pytest test/cli/commands/test_launch.py -v
 
 ## Test Quality Metrics
 
-- **Provider Unit Test Count:** ~130 (across all providers)
+- **Provider Unit Test Count:** ~152 (across all providers)
 - **CLI Command Test Count:** ~10
 - **Client Unit Test Count:** ~20
 - **Integration Test Count:** 9
-- **Total Test Count:** 438
-- **Coverage:** 100% of all provider modules and launch.py
+- **Total Test Count:** 467
+- **Coverage:** 83% overall; 96-100% of all provider modules and launch.py
 - **Execution Time:** <5s (unit), <90s (integration)
-- **Test Categories:** 9 (initialization, status, extraction, patterns, prompts, handoff, edge cases, tmux send_keys, workspace confirmation)
+- **Test Categories:** 12 (initialization, status label-format, status bullet-format, extraction label-format, extraction bullet-format, command building, patterns, prompts, handoff, edge cases, tmux send_keys, workspace confirmation)
