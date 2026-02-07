@@ -173,7 +173,12 @@ cao install examples/assign/report_generator.md
 
 3. Launch the supervisor:
 ```bash
+# Using default provider (kiro_cli)
 cao launch --agents analysis_supervisor
+
+# Or specify a different provider
+cao launch --agents analysis_supervisor --provider claude_code
+cao launch --agents analysis_supervisor --provider codex
 ```
 
 ## Usage

@@ -56,7 +56,7 @@
 ```
 src/cli_agent_orchestrator/
 ├── cli/commands/          # Entry Point: CLI commands
-│   ├── launch.py          # Creates terminals with agent profiles (workspace access confirmation, --yes flag)
+│   ├── launch.py          # Creates terminals with agent profiles (workspace trust confirmation, --yolo flag)
 │   └── init.py            # Initializes database
 ├── mcp_server/            # Entry Point: MCP server
 │   ├── server.py          # Handoff & send_message tools
@@ -128,7 +128,7 @@ database.create_inbox_message()  # Status: PENDING
 inbox_service.check_and_send_pending_messages()
   ↓
 If receiver IDLE → send immediately
-If receiver BUSY → watchdog monitors log file
+If receiver PROCESSING → watchdog monitors log file
   ↓
 On log change → detect IDLE pattern → send message
   ↓
