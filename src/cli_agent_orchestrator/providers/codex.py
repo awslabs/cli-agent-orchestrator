@@ -224,8 +224,7 @@ class CodexProvider(BaseProvider):
         # to avoid over-excluding in short outputs or test fixtures.
         all_lines = clean_output.splitlines()
         tui_footer_detected = any(
-            re.search(TUI_FOOTER_PATTERN, line)
-            for line in all_lines[-IDLE_PROMPT_TAIL_LINES:]
+            re.search(TUI_FOOTER_PATTERN, line) for line in all_lines[-IDLE_PROMPT_TAIL_LINES:]
         )
         if tui_footer_detected and len(all_lines) > IDLE_PROMPT_TAIL_LINES:
             cutoff_pos = len("\n".join(all_lines[:-IDLE_PROMPT_TAIL_LINES]))
@@ -328,8 +327,7 @@ class CodexProvider(BaseProvider):
         # Exclude the Codex TUI footer from user-message matching when detected.
         all_lines = clean_output.splitlines()
         tui_footer_detected = any(
-            re.search(TUI_FOOTER_PATTERN, line)
-            for line in all_lines[-IDLE_PROMPT_TAIL_LINES:]
+            re.search(TUI_FOOTER_PATTERN, line) for line in all_lines[-IDLE_PROMPT_TAIL_LINES:]
         )
         if tui_footer_detected and len(all_lines) > IDLE_PROMPT_TAIL_LINES:
             cutoff_pos = len("\n".join(all_lines[:-IDLE_PROMPT_TAIL_LINES]))

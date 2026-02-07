@@ -16,17 +16,17 @@ Run:
 
 import time
 import uuid
-
-import pytest
-import requests
-
-from cli_agent_orchestrator.constants import API_BASE_URL
 from test.e2e.conftest import (
     cleanup_terminal,
     create_terminal,
     get_terminal_status,
     wait_for_status,
 )
+
+import pytest
+import requests
+
+from cli_agent_orchestrator.constants import API_BASE_URL
 
 
 def _create_terminal_in_session(session_name: str, provider: str, agent_profile: str):
@@ -41,9 +41,10 @@ def _create_terminal_in_session(session_name: str, provider: str, agent_profile:
             "agent_profile": agent_profile,
         },
     )
-    assert resp.status_code in (200, 201), (
-        f"Terminal creation in session failed: {resp.status_code} {resp.text}"
-    )
+    assert resp.status_code in (
+        200,
+        201,
+    ), f"Terminal creation in session failed: {resp.status_code} {resp.text}"
     data = resp.json()
     return data["id"]
 
@@ -54,9 +55,7 @@ def _send_inbox_message(sender_id: str, receiver_id: str, message: str):
         f"{API_BASE_URL}/terminals/{receiver_id}/inbox/messages",
         params={"sender_id": sender_id, "message": message},
     )
-    assert resp.status_code == 200, (
-        f"Inbox message send failed: {resp.status_code} {resp.text}"
-    )
+    assert resp.status_code == 200, f"Inbox message send failed: {resp.status_code} {resp.text}"
     return resp.json()
 
 
@@ -69,9 +68,7 @@ def _get_inbox_messages(terminal_id: str, status_filter: str = None):
         f"{API_BASE_URL}/terminals/{terminal_id}/inbox/messages",
         params=params,
     )
-    assert resp.status_code == 200, (
-        f"Get inbox messages failed: {resp.status_code} {resp.text}"
-    )
+    assert resp.status_code == 200, f"Get inbox messages failed: {resp.status_code} {resp.text}"
     return resp.json()
 
 
@@ -95,18 +92,18 @@ def _run_send_message_test(provider: str, agent_profile: str):
         assert sender_id, "Sender terminal ID should not be empty"
 
         # Step 2: Wait for sender to reach IDLE
-        assert wait_for_status(sender_id, "idle", timeout=90.0), (
-            f"Sender terminal did not reach IDLE within 90s (provider={provider})"
-        )
+        assert wait_for_status(
+            sender_id, "idle", timeout=90.0
+        ), f"Sender terminal did not reach IDLE within 90s (provider={provider})"
 
         # Step 3: Create second terminal in the same session (acts as receiver)
         receiver_id = _create_terminal_in_session(actual_session, provider, agent_profile)
         assert receiver_id, "Receiver terminal ID should not be empty"
 
         # Step 4: Wait for receiver to reach IDLE
-        assert wait_for_status(receiver_id, "idle", timeout=90.0), (
-            f"Receiver terminal did not reach IDLE within 90s (provider={provider})"
-        )
+        assert wait_for_status(
+            receiver_id, "idle", timeout=90.0
+        ), f"Receiver terminal did not reach IDLE within 90s (provider={provider})"
 
         # Step 5: Send message from sender to receiver's inbox
         test_message = f"E2E test message from {sender_id} at {time.time()}"
@@ -139,9 +136,11 @@ def _run_send_message_test(provider: str, agent_profile: str):
         # waiting_user_answer (provider showing approval prompt for the message).
         time.sleep(5)
         receiver_status = get_terminal_status(receiver_id)
-        assert receiver_status in ("processing", "completed", "waiting_user_answer"), (
-            f"Receiver should have transitioned from IDLE after inbox delivery, got: {receiver_status}"
-        )
+        assert receiver_status in (
+            "processing",
+            "completed",
+            "waiting_user_answer",
+        ), f"Receiver should have transitioned from IDLE after inbox delivery, got: {receiver_status}"
 
     finally:
         if sender_id and actual_session:
@@ -158,6 +157,7 @@ def _run_send_message_test(provider: str, agent_profile: str):
 # Codex provider
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.e2e
 class TestCodexSendMessage:
     """E2E send_message tests for the Codex provider."""
@@ -171,6 +171,7 @@ class TestCodexSendMessage:
 # Claude Code provider
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.e2e
 class TestClaudeCodeSendMessage:
     """E2E send_message tests for the Claude Code provider."""
@@ -183,6 +184,7 @@ class TestClaudeCodeSendMessage:
 # ---------------------------------------------------------------------------
 # Kiro CLI provider
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.e2e
 class TestKiroCliSendMessage:
