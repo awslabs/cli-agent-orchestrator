@@ -20,6 +20,7 @@ test/providers/
 ├── test_q_cli_unit.py          # Q CLI unit tests (fast, mocked)
 ├── test_claude_code_unit.py    # Claude Code unit tests (fast, mocked)
 ├── test_codex_provider_unit.py # Codex CLI unit tests (fast, mocked)
+├── test_kimi_cli_unit.py       # Kimi CLI unit tests (fast, mocked)
 ├── test_base_provider.py       # Base provider abstract interface tests
 ├── test_tmux_working_directory.py # TmuxClient working directory tests
 ├── test_q_cli_integration.py   # Q CLI integration tests (slow, real Q CLI)
@@ -27,6 +28,7 @@ test/providers/
 │   ├── kiro_cli_*.txt          # Kiro CLI fixtures (default provider)
 │   ├── q_cli_*.txt             # Q CLI fixtures
 │   ├── codex_*.txt             # Codex CLI fixtures
+│   ├── kimi_cli_*.txt          # Kimi CLI fixtures
 │   └── generate_fixtures.py    # Script to regenerate fixtures
 └── README.md
 ```
@@ -212,6 +214,7 @@ Each provider has a dedicated workflow that runs only when its files change:
 | `test-claude-code-provider.yml` | `test_claude_code_unit.py` | `providers/claude_code.py`, `test/providers/**` |
 | `test-kiro-cli-provider.yml` | `test_kiro_cli_unit.py` | `providers/kiro_cli.py`, `test/providers/**` |
 | `test-q-cli-provider.yml` | `test_q_cli_unit.py` | `providers/q_cli.py`, `test/providers/**` |
+| `test-kimi-cli-provider.yml` | `test_kimi_cli_unit.py` | `providers/kimi_cli.py`, `test/providers/**` |
 
 Each includes unit tests (Python 3.10/3.11/3.12) and code quality checks (black, isort, mypy).
 
@@ -476,6 +479,104 @@ uv run pytest test/providers/test_codex_provider_unit.py --cov=src/cli_agent_orc
 uv run pytest test/providers/test_codex_provider_unit.py::TestCodexBuildCommand -v
 ```
 
+## Kimi CLI Provider Tests
+
+### Test Coverage (`test_kimi_cli_unit.py`)
+
+**57 tests across 6 test classes covering:**
+
+1. **Initialization (5 tests)**
+   - Successful initialization (wait_for_shell + kimi --yolo + wait_until_status IDLE)
+   - Shell timeout handling
+   - Kimi CLI timeout handling
+   - Initialization with agent profile
+   - Initialization state tracking
+
+2. **Status Detection (11 tests)**
+   - IDLE status (💫 thinking prompt)
+   - IDLE status (✨ normal prompt)
+   - COMPLETED status (prompt + user input box + response bullets)
+   - PROCESSING status (no prompt at bottom)
+   - ERROR status (error pattern detection)
+   - ERROR status (empty output)
+   - tail_lines parameter pass-through
+   - User input without response (still IDLE)
+   - Status bar not confused with content
+   - ANSI-coded output handling
+   - IDLE detection in tall terminals (46-row with 32 padding lines)
+
+3. **Message Extraction (10 tests)**
+   - Successful extraction (response bullets after user input box)
+   - Thinking bullet filtering (gray ANSI color 38;5;244 excluded)
+   - No user input box error
+   - Empty response error
+   - Status bar line filtering
+   - Complex multi-line response with code blocks
+   - Multiple user inputs (extracts last)
+   - Extraction from fixture file
+   - Fallback when all lines are thinking (returns all content)
+   - Thinking bullets with mixed content
+
+4. **Command Building (13 tests)**
+   - Base command without agent profile (`kimi --yolo`)
+   - Command with agent profile (temp YAML + system.md)
+   - Temp file creation and content verification
+   - Agent YAML extends default agent
+   - MCP server config injection via `--mcp-config` JSON
+   - MCP server with dict config
+   - MCP server with model config (Pydantic)
+   - MCP server CAO_TERMINAL_ID auto-injection
+   - MCP preserves existing env vars
+   - MCP does not override existing CAO_TERMINAL_ID
+   - Empty system prompt (no agent file created)
+   - None system prompt (no agent file created)
+   - Agent profile load failure (ProviderError)
+
+5. **Pattern Tests (10 tests)**
+   - IDLE_PROMPT_PATTERN matches 💫 and ✨
+   - IDLE_PROMPT_PATTERN with various usernames and dirnames
+   - ANSI_CODE_PATTERN stripping
+   - USER_INPUT_BOX patterns (╭─ start, ╰─ end)
+   - RESPONSE_BULLET_PATTERN (• prefix)
+   - THINKING_BULLET_RAW_PATTERN (gray ANSI + bullet)
+   - STATUS_BAR_PATTERN (HH:MM agent/shell format)
+   - ERROR_PATTERN (Error:, APIError:, etc.)
+   - IDLE_PROMPT_TAIL_LINES bounds validation (>= 40, <= 100)
+   - WELCOME_BANNER_PATTERN
+
+6. **Lifecycle (8 tests)**
+   - Cleanup removes temp directory
+   - Cleanup with no temp directory (no-op)
+   - Cleanup resets initialized state
+   - Exit command returns `/exit`
+   - Idle pattern for log returns emoji pattern
+   - Terminal attributes (terminal_id, session_name, window_name)
+   - Provider attributes after construction
+   - Double cleanup is safe
+
+**Coverage:** 100% of kimi_cli.py (134 statements)
+
+### Test Fixtures
+
+- **kimi_cli_idle_output.txt** — TUI with idle prompt (💫) and welcome banner
+- **kimi_cli_completed_output.txt** — Complete response with user input box and • bullets
+- **kimi_cli_processing_output.txt** — Streaming output without idle prompt
+- **kimi_cli_error_output.txt** — Error message output (ConnectionError)
+- **kimi_cli_complex_response.txt** — Multi-line response with thinking bullets and code blocks
+
+### Running Kimi CLI Tests
+
+```bash
+# Run all Kimi CLI unit tests
+uv run pytest test/providers/test_kimi_cli_unit.py -v
+
+# Run with coverage
+uv run pytest test/providers/test_kimi_cli_unit.py --cov=src/cli_agent_orchestrator/providers/kimi_cli.py --cov-report=term-missing -v
+
+# Run specific test class
+uv run pytest test/providers/test_kimi_cli_unit.py::TestKimiCliStatusDetection -v
+```
+
 ## Kiro CLI Provider Tests
 
 ### Running Kiro CLI Tests
@@ -561,11 +662,11 @@ uv run pytest test/cli/commands/test_launch.py -v
 
 ## Test Quality Metrics
 
-- **Provider Unit Test Count:** ~152 (across all providers)
+- **Provider Unit Test Count:** ~209 (across all providers)
 - **CLI Command Test Count:** ~10
 - **Client Unit Test Count:** ~20
 - **Integration Test Count:** 9
-- **Total Test Count:** 467
+- **Total Test Count:** 533
 - **Coverage:** 83% overall; 96-100% of all provider modules and launch.py
 - **Execution Time:** <5s (unit), <90s (integration)
 - **Test Categories:** 12 (initialization, status label-format, status bullet-format, extraction label-format, extraction bullet-format, command building, patterns, prompts, handoff, edge cases, tmux send_keys, workspace confirmation)

@@ -87,6 +87,10 @@ MCP servers from agent profiles are passed via `--mcp-config` as a JSON string:
 kimi --yolo --mcp-config '{"server-name": {"command": "npx", "args": ["-y", "cao-mcp-server"]}}'
 ```
 
+### CAO_TERMINAL_ID Forwarding
+
+Kimi CLI does not automatically forward parent shell environment variables to MCP subprocesses. The provider explicitly injects `CAO_TERMINAL_ID` into the `env` field of each MCP server config so that tools like `handoff` and `assign` can create new agent windows in the same tmux session (instead of creating separate sessions). Existing `env` entries are preserved, and an existing `CAO_TERMINAL_ID` value is never overwritten.
+
 ## Command Flags
 
 | Flag | Purpose |
@@ -102,7 +106,7 @@ kimi --yolo --mcp-config '{"server-name": {"command": "npx", "args": ["-y", "cao
 ### Provider Lifecycle
 
 1. **Initialize**: Wait for shell → send `kimi --yolo` → wait for IDLE (up to 60s)
-2. **Status Detection**: Check bottom 10 lines for idle prompt pattern (end-of-line anchored)
+2. **Status Detection**: Check bottom 50 lines for idle prompt pattern (end-of-line anchored)
 3. **Message Extraction**: Line-based approach mapping raw and clean output for thinking filtering
 4. **Exit**: Send `/exit` command
 5. **Cleanup**: Remove temp agent files, reset state
@@ -169,4 +173,4 @@ If Kimi CLI takes too long to start, check:
 
 ### Status bar not detected
 
-The provider checks the bottom 10 lines for the idle prompt. If Kimi's TUI layout changes, the `IDLE_PROMPT_TAIL_LINES` constant may need adjustment.
+The provider checks the bottom 50 lines for the idle prompt (`IDLE_PROMPT_TAIL_LINES = 50`). This accounts for Kimi's TUI padding lines between the prompt and the status bar, which varies with terminal height (e.g., a 46-row terminal has ~32 empty padding lines). If Kimi's TUI layout changes significantly, this constant may need adjustment.
