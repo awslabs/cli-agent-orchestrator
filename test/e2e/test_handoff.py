@@ -19,9 +19,6 @@ Run:
 
 import time
 import uuid
-
-import pytest
-
 from test.e2e.conftest import (
     cleanup_terminal,
     create_terminal,
@@ -30,6 +27,7 @@ from test.e2e.conftest import (
     wait_for_status,
 )
 
+import pytest
 
 # Timeout for waiting for agent completion (seconds).
 # Agents may take varying amounts of time depending on model and task complexity.
@@ -56,9 +54,9 @@ def _run_handoff_test(provider: str, agent_profile: str, task_message: str, cont
         assert terminal_id, "Terminal ID should not be empty"
 
         # Step 2: Wait for IDLE
-        assert wait_for_status(terminal_id, "idle", timeout=90.0), (
-            f"Terminal did not reach IDLE within 90s (provider={provider})"
-        )
+        assert wait_for_status(
+            terminal_id, "idle", timeout=90.0
+        ), f"Terminal did not reach IDLE within 90s (provider={provider})"
 
         # Settle time before sending message
         time.sleep(2)
@@ -67,9 +65,9 @@ def _run_handoff_test(provider: str, agent_profile: str, task_message: str, cont
         send_handoff_message(terminal_id, task_message, provider)
 
         # Step 4: Poll for COMPLETED
-        assert wait_for_status(terminal_id, "completed", timeout=COMPLETION_TIMEOUT), (
-            f"Terminal did not reach COMPLETED within {COMPLETION_TIMEOUT}s (provider={provider})"
-        )
+        assert wait_for_status(
+            terminal_id, "completed", timeout=COMPLETION_TIMEOUT
+        ), f"Terminal did not reach COMPLETED within {COMPLETION_TIMEOUT}s (provider={provider})"
 
         # Step 5: Extract output
         output = extract_output(terminal_id)
@@ -88,9 +86,9 @@ def _run_handoff_test(provider: str, agent_profile: str, task_message: str, cont
         # At least one content keyword should be present
         output_lower = output.lower()
         matched = [kw for kw in content_keywords if kw.lower() in output_lower]
-        assert matched, (
-            f"Expected at least one of {content_keywords} in output, got: {output[:200]}"
-        )
+        assert (
+            matched
+        ), f"Expected at least one of {content_keywords} in output, got: {output[:200]}"
 
     finally:
         if terminal_id and actual_session:

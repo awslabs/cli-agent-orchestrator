@@ -572,7 +572,6 @@ class TestCodexBulletFormatStatusDetection:
 
         assert status == TerminalStatus.COMPLETED
 
-
     @patch("cli_agent_orchestrator.providers.codex.tmux_client")
     def test_get_status_processing_tui_spinner(self, mock_tmux):
         """PROCESSING when TUI shows • Working spinner, not false COMPLETED."""
