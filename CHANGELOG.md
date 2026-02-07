@@ -27,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fix Codex extraction of multi-line user messages: find first `•` assistant marker after user message instead of skipping one line, correctly handling wrapped `[CAO Handoff]` prefix text
 - Fix Claude Code worker agents blocking on workspace trust prompt during handoff/assign: add `--dangerously-skip-permissions` flag to bypass trust dialog since CAO already confirms workspace trust during `cao launch`
 - Fix Claude Code `PROCESSING_PATTERN` not matching newer Claude Code 2.x spinner format: broaden pattern to match both `(esc to interrupt)` and `(Ns · ↓ tokens · thinking)` formats
+- Fix Kimi CLI worker agents created as separate sessions instead of windows: forward `CAO_TERMINAL_ID` to MCP server subprocess via `env` field in `--mcp-config` JSON, matching Codex provider's `env_vars` approach
+- Fix Kimi CLI initialization timeout on tall terminals (46+ rows): increase `IDLE_PROMPT_TAIL_LINES` from 10 to 50 to account for TUI padding lines between idle prompt and status bar
 
 ### Added
 
