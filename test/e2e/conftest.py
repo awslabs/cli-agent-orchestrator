@@ -74,7 +74,10 @@ def create_terminal(provider: str, agent_profile: str, session_name: str):
             "session_name": session_name,
         },
     )
-    assert resp.status_code in (200, 201), f"Session creation failed: {resp.status_code} {resp.text}"
+    assert resp.status_code in (
+        200,
+        201,
+    ), f"Session creation failed: {resp.status_code} {resp.text}"
     data = resp.json()
     return data["id"], data["session_name"]
 
@@ -87,7 +90,9 @@ def get_terminal_status(terminal_id: str) -> str:
     return resp.json().get("status", "unknown")
 
 
-def wait_for_status(terminal_id: str, target: str, timeout: float = 90.0, poll: float = 3.0) -> bool:
+def wait_for_status(
+    terminal_id: str, target: str, timeout: float = 90.0, poll: float = 3.0
+) -> bool:
     """Poll terminal status until target is reached or timeout."""
     start = time.time()
     while time.time() - start < timeout:

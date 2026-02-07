@@ -26,11 +26,6 @@ Run:
 
 import time
 import uuid
-
-import pytest
-import requests
-
-from cli_agent_orchestrator.constants import API_BASE_URL
 from test.e2e.conftest import (
     cleanup_terminal,
     create_terminal,
@@ -38,6 +33,11 @@ from test.e2e.conftest import (
     get_terminal_status,
     wait_for_status,
 )
+
+import pytest
+import requests
+
+from cli_agent_orchestrator.constants import API_BASE_URL
 
 COMPLETION_TIMEOUT = 180
 
@@ -80,9 +80,9 @@ def _run_assign_test(provider: str, agent_profile: str, task_message: str, conte
         assert terminal_id, "Terminal ID should not be empty"
 
         # Step 2: Wait for IDLE
-        assert wait_for_status(terminal_id, "idle", timeout=90.0), (
-            f"Worker terminal did not reach IDLE within 90s (provider={provider})"
-        )
+        assert wait_for_status(
+            terminal_id, "idle", timeout=90.0
+        ), f"Worker terminal did not reach IDLE within 90s (provider={provider})"
         time.sleep(2)
 
         # Step 3: Send task to worker
@@ -93,9 +93,9 @@ def _run_assign_test(provider: str, agent_profile: str, task_message: str, conte
         assert resp.status_code == 200, f"Send message failed: {resp.status_code}"
 
         # Step 4: Poll for COMPLETED
-        assert wait_for_status(terminal_id, "completed", timeout=COMPLETION_TIMEOUT), (
-            f"Worker did not reach COMPLETED within {COMPLETION_TIMEOUT}s (provider={provider})"
-        )
+        assert wait_for_status(
+            terminal_id, "completed", timeout=COMPLETION_TIMEOUT
+        ), f"Worker did not reach COMPLETED within {COMPLETION_TIMEOUT}s (provider={provider})"
 
         # Step 5: Validate output
         output = extract_output(terminal_id)
@@ -107,9 +107,9 @@ def _run_assign_test(provider: str, agent_profile: str, task_message: str, conte
 
         output_lower = output.lower()
         matched = [kw for kw in content_keywords if kw.lower() in output_lower]
-        assert matched, (
-            f"Expected at least one of {content_keywords} in output, got: {output[:300]}"
-        )
+        assert (
+            matched
+        ), f"Expected at least one of {content_keywords} in output, got: {output[:300]}"
 
     finally:
         if terminal_id and actual_session:
@@ -119,6 +119,7 @@ def _run_assign_test(provider: str, agent_profile: str, task_message: str, conte
 # ---------------------------------------------------------------------------
 # Codex provider
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.e2e
 class TestCodexAssign:
@@ -147,6 +148,7 @@ class TestCodexAssign:
 # Claude Code provider
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.e2e
 class TestClaudeCodeAssign:
     """E2E assign tests for the Claude Code provider using examples/assign/ profiles."""
@@ -173,6 +175,7 @@ class TestClaudeCodeAssign:
 # ---------------------------------------------------------------------------
 # Kiro CLI provider
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.e2e
 class TestKiroCliAssign:
