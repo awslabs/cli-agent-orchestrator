@@ -243,6 +243,28 @@ class TestKimiCliProviderStatusDetection:
         mock_tmux.get_history.assert_called_once_with("session-1", "window-1", tail_lines=20)
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.tmux_client")
+    def test_get_status_idle_tall_terminal(self, mock_tmux):
+        """Test IDLE detection in tall terminals (46+ rows) where prompt is far from bottom.
+
+        In a 46-row terminal, the welcome banner takes ~12 lines, the prompt is at
+        line ~14, and there are ~32 empty padding lines before the status bar. The
+        IDLE_PROMPT_TAIL_LINES must be large enough to reach the prompt.
+        """
+        # Simulate a 46-row terminal: welcome banner + prompt + 32 empty lines + status bar
+        output = (
+            "╭───────────────────────────────────╮\n"
+            "│ Welcome to Kimi Code CLI!          │\n"
+            "│ Send /help for help information.   │\n"
+            "╰───────────────────────────────────╯\n"
+            "user@project💫\n"
+            + "\n" * 32  # 32 empty padding lines (typical for 46-row terminal)
+            + "00:05  yolo  agent (kimi-for-coding, thinking)  ctrl-x: toggle mode  context: 0.0%\n"
+        )
+        mock_tmux.get_history.return_value = output
+        provider = KimiCliProvider("term-1", "session-1", "window-1")
+        assert provider.get_status() == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.kimi_cli.tmux_client")
     def test_get_status_processing_streaming(self, mock_tmux):
         """Test PROCESSING when response is mid-stream (no prompt, no error)."""
         output = (
@@ -728,5 +750,5 @@ class TestKimiCliProviderPatterns:
 
     def test_idle_prompt_tail_lines(self):
         """Test tail lines constant is reasonable for Kimi's TUI layout."""
-        assert IDLE_PROMPT_TAIL_LINES >= 5  # Enough for prompt + padding + status bar
-        assert IDLE_PROMPT_TAIL_LINES <= 20  # Not too many
+        assert IDLE_PROMPT_TAIL_LINES >= 40  # Must cover tall terminals (46+ rows)
+        assert IDLE_PROMPT_TAIL_LINES <= 100  # Not unreasonably large

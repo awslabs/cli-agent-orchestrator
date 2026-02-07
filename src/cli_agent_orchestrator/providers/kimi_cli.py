@@ -66,9 +66,11 @@ ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
 IDLE_PROMPT_PATTERN = r"\w+@[\w.-]+[✨💫]"
 
 # Number of lines from bottom to scan for the idle prompt.
-# Kimi's TUI renders empty padding lines between the prompt and the status bar,
-# so we need to check a wider range than just the last 2-3 lines.
-IDLE_PROMPT_TAIL_LINES = 10
+# Kimi's TUI renders empty padding lines between the prompt and the status bar.
+# The padding depends on terminal height: a 46-row terminal has ~32 empty lines
+# between the prompt (line ~14 after the welcome banner) and the status bar.
+# Must be large enough to cover the tallest expected terminal.
+IDLE_PROMPT_TAIL_LINES = 50
 
 # Simplified idle pattern for log file monitoring.
 # Just looks for either emoji marker, which is sufficient for quick detection.
