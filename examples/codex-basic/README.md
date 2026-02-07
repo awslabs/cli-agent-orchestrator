@@ -98,7 +98,11 @@ The example includes pre-configured agent profiles for different Codex-based tas
 
 ## Setup
 
-No CAO-side agent installation is required for the `codex` provider. The `--agents` value is used for naming/metadata only.
+When using the `codex` provider with `--agents`, CAO loads the specified agent profile and injects its system prompt into Codex as `developer_instructions`. This means Codex will adopt the role defined in the agent profile (e.g., supervisor, developer, reviewer).
+
+Agent profiles are loaded from:
+1. Local store: `~/.aws/cli-agent-orchestrator/agent_store/<name>.md`
+2. Built-in store: `src/cli_agent_orchestrator/agent_store/<name>.md`
 
 ## Usage Examples
 

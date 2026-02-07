@@ -77,7 +77,7 @@ src/cli_agent_orchestrator/
 │   ├── kiro_cli.py        # Kiro CLI provider (kiro_cli) - default
 │   ├── q_cli.py           # Amazon Q CLI provider (q_cli)
 │   ├── claude_code.py     # Claude Code provider (claude_code, ❯ prompt, trust prompt handling)
-│   └── codex.py           # Codex/ChatGPT CLI provider (codex)
+│   └── codex.py           # Codex/ChatGPT CLI provider (codex, developer_instructions, › prompt + • bullet detection, trust prompt handling)
 ├── models/                # Data models
 │   ├── terminal.py        # Terminal, TerminalStatus
 │   ├── session.py         # Session model
