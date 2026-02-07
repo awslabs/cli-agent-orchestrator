@@ -25,8 +25,8 @@ def test_launch_includes_working_directory():
         }
         mock_post.return_value.raise_for_status.return_value = None
 
-        # Run the command (--yes to skip workspace confirmation)
-        result = runner.invoke(launch, ["--agents", "test-agent", "--yes"])
+        # Run the command (--yolo to skip workspace confirmation)
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
 
         # Verify the command succeeded
         assert result.exit_code == 0
@@ -65,7 +65,7 @@ def test_launch_with_session_name():
         mock_post.return_value.raise_for_status.return_value = None
 
         result = runner.invoke(
-            launch, ["--agents", "test-agent", "--session-name", "custom-session", "--yes"]
+            launch, ["--agents", "test-agent", "--session-name", "custom-session", "--yolo"]
         )
 
         assert result.exit_code == 0
@@ -84,7 +84,7 @@ def test_launch_request_exception():
 
         mock_post.side_effect = requests.exceptions.RequestException("Connection refused")
 
-        result = runner.invoke(launch, ["--agents", "test-agent", "--yes"])
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
 
         assert result.exit_code != 0
         assert "Failed to connect to cao-server" in result.output
@@ -97,7 +97,7 @@ def test_launch_generic_exception():
     with patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post:
         mock_post.side_effect = Exception("Unexpected error")
 
-        result = runner.invoke(launch, ["--agents", "test-agent", "--yes"])
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
 
         assert result.exit_code != 0
         assert "Unexpected error" in result.output
@@ -117,7 +117,7 @@ def test_launch_headless_mode():
         }
         mock_post.return_value.raise_for_status.return_value = None
 
-        result = runner.invoke(launch, ["--agents", "test-agent", "--headless", "--yes"])
+        result = runner.invoke(launch, ["--agents", "test-agent", "--headless", "--yolo"])
 
         assert result.exit_code == 0
         # In headless mode, subprocess.run should not be called
@@ -146,8 +146,9 @@ def test_launch_workspace_confirmation_accepted():
         )
 
         assert result.exit_code == 0
-        assert "provider (claude_code) will read and operate in" in result.output
-        assert "Allow provider workspace access?" in result.output
+        assert "provider (claude_code) will be trusted to perform all actions" in result.output
+        assert "cao launch --yolo" in result.output
+        assert "Do you trust all the actions in this folder?" in result.output
         mock_post.assert_called_once()
 
 
@@ -164,8 +165,8 @@ def test_launch_workspace_confirmation_declined():
     assert "Launch cancelled by user" in result.output
 
 
-def test_launch_workspace_confirmation_skipped_with_yes_flag():
-    """Test --yes flag skips workspace confirmation."""
+def test_launch_workspace_confirmation_skipped_with_yolo_flag():
+    """Test --yolo flag skips workspace confirmation."""
     runner = CliRunner()
 
     with (
@@ -179,12 +180,12 @@ def test_launch_workspace_confirmation_skipped_with_yes_flag():
         mock_post.return_value.raise_for_status.return_value = None
 
         result = runner.invoke(
-            launch, ["--agents", "test-agent", "--provider", "claude_code", "--headless", "--yes"]
+            launch, ["--agents", "test-agent", "--provider", "claude_code", "--headless", "--yolo"]
         )
 
         assert result.exit_code == 0
         # No confirmation prompt should appear
-        assert "Allow provider workspace access?" not in result.output
+        assert "Do you trust all the actions in this folder?" not in result.output
         mock_post.assert_called_once()
 
 
@@ -206,5 +207,5 @@ def test_launch_workspace_confirmation_for_default_provider():
         result = runner.invoke(launch, ["--agents", "test-agent", "--headless"], input="y\n")
 
         assert result.exit_code == 0
-        assert "provider (kiro_cli) will read and operate in" in result.output
-        assert "Allow provider workspace access?" in result.output
+        assert "provider (kiro_cli) will be trusted to perform all actions" in result.output
+        assert "Do you trust all the actions in this folder?" in result.output

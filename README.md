@@ -77,7 +77,7 @@ uv tool install git+https://github.com/awslabs/cli-agent-orchestrator.git@main -
 
 ### Development Setup
 
-For local development, clone the repo and use `uv sync` to create an isolated virtual environment:
+For local development, clone the repo and install with `uv sync`:
 
 ```bash
 git clone https://github.com/awslabs/cli-agent-orchestrator.git
@@ -86,44 +86,18 @@ uv sync          # Creates .venv/ and installs all dependencies
 uv run cao --help  # Verify installation
 ```
 
-All `cao` and `cao-server` commands should be run via `uv run` during development to ensure the project's virtual environment is used:
-
-```bash
-uv run cao-server          # Start the server
-uv run cao launch --agents code_supervisor  # Launch an agent
-```
-
-For more details, see [DEVELOPMENT.md](DEVELOPMENT.md).
-
-### Testing
-
-```bash
-# Run all unit tests (476 tests, excludes E2E)
-uv run pytest test/ --ignore=test/e2e --ignore=test/providers/test_q_cli_integration.py -v
-
-# Run with coverage
-uv run pytest test/ --ignore=test/e2e --ignore=test/providers/test_q_cli_integration.py \
-  --cov=src/cli_agent_orchestrator --cov-report=term-missing -v
-
-# Run E2E tests (requires running cao-server + authenticated CLI tools)
-uv run cao-server &
-uv run pytest -m e2e test/e2e/ -v                    # All providers
-uv run pytest -m e2e test/e2e/ -v -k codex            # Codex only
-uv run pytest -m e2e test/e2e/ -v -k claude_code      # Claude Code only
-uv run pytest -m e2e test/e2e/ -v -k kiro_cli          # Kiro CLI only
-```
-
-For detailed test documentation, coverage targets, and CI workflow details, see [test/README.md](test/README.md).
+For development workflow, testing, code quality checks, and project structure, see [DEVELOPMENT.md](DEVELOPMENT.md).
 
 ## Prerequisites
 
 Before using CAO, install at least one supported CLI agent tool:
 
-| Provider | Documentation |
-|----------|---------------|
-| **Kiro CLI** (default) | [Kiro CLI Installation](https://kiro.dev/docs/kiro-cli) |
-| **Claude Code** | [Claude Code Installation](https://docs.anthropic.com/en/docs/claude-code/getting-started) |
-| **Codex CLI** | [Codex CLI Setup](docs/codex-cli.md) |
+| Provider | Documentation | Authentication |
+|----------|---------------|----------------|
+| **Kiro CLI** (default) | [Provider docs](docs/kiro-cli.md) · [Installation](https://kiro.dev/docs/kiro-cli) | AWS credentials |
+| **Claude Code** | [Provider docs](docs/claude-code.md) · [Installation](https://docs.anthropic.com/en/docs/claude-code/getting-started) | Anthropic API key |
+| **Codex CLI** | [Provider docs](docs/codex-cli.md) · [Installation](https://github.com/openai/codex) | OpenAI API key |
+| **Q CLI** | [Installation](https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/command-line.html) | AWS credentials |
 
 ## Quick Start
 
@@ -157,7 +131,7 @@ cao install code_supervisor --provider kiro_cli
 
 **Notes:**
 - The `claude_code` provider can optionally work without agent profiles (it uses project's `CLAUDE.md` for context instead). However, to use CAO's supervisor/worker patterns, install the agent profiles.
-- For using the **Codex CLI provider** with your ChatGPT subscription, see [docs/codex-cli.md](docs/codex-cli.md).
+- For using the **Codex CLI provider** with your OpenAI API key, see [docs/codex-cli.md](docs/codex-cli.md).
 
 You can also install agents from local files or URLs:
 
@@ -183,6 +157,9 @@ cao launch --agents code_supervisor
 
 # Or specify a provider
 cao launch --agents code_supervisor --provider kiro_cli
+
+# Skip workspace trust confirmation
+cao launch --agents code_supervisor --yolo
 ```
 
 The supervisor will coordinate and delegate tasks to worker agents (developer, reviewer, etc.) as needed using the orchestration patterns.
@@ -234,7 +211,7 @@ CAO provides a local HTTP server that processes orchestration requests. CLI agen
 Each agent terminal is assigned a unique `CAO_TERMINAL_ID` environment variable. The server uses this ID to:
 
 - Route messages between agents
-- Track terminal status (IDLE, BUSY, COMPLETED, ERROR)
+- Track terminal status (IDLE, PROCESSING, COMPLETED, ERROR)
 - Manage terminal-to-terminal communication via inbox
 - Coordinate orchestration operations
 
@@ -410,49 +387,17 @@ cao flow remove daily-standup
 
 ## Working Directory Support
 
-CAO supports specifying working directories for agent handoff/delegation operations.
+CAO supports specifying working directories for agent handoff/delegation operations. By default this is disabled to prevent agents from hallucinating directory paths.
 
-### Configuration
-
-Enable working directory parameter in MCP tools:
-
-```bash
-export CAO_ENABLE_WORKING_DIRECTORY=true
-```
-
-### Behavior
-
-- **When disabled (default)**: Working directory parameter is hidden from tools, agents start in supervisor's current directory
-- **When enabled**: Tools expose `working_directory` parameter, allowing explicit directory specification
-- **Default directory**: Current working directory (`cwd`) of the supervisor agent
-
-### Usage Example
-
-With `CAO_ENABLE_WORKING_DIRECTORY=true`:
-
-```python
-# Handoff to agent in specific package directory
-result = await handoff(
-    agent_profile="developer",
-    message="Fix the bug in UserService.java",
-    working_directory="/workspace/src/MyPackage"
-)
-
-# Assign task with specific working directory
-result = await assign(
-    agent_profile="reviewer",
-    message="Review the changes in the authentication module",
-    working_directory="/workspace/src/AuthModule"
-)
-```
-
-### Why Disabled by Default?
-
-When the `working_directory` parameter is visible to agents, they may hallucinate or incorrectly infer directory paths instead of using the default (current working directory). Disabling by default prevents this behavior for users who don't need explicit directory control. If your workflow requires delegating tasks to specific directories, enable this feature and provide explicit paths in your agent instructions.
+For configuration and usage details, see [docs/working-directory.md](docs/working-directory.md).
 
 ## Security
 
-See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
+See [SECURITY.md](SECURITY.md) for vulnerability reporting, security scanning, and best practices.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on contributing to this project.
 
 ## License
 

@@ -107,7 +107,7 @@ test/providers/
 **Requirements:** 
 - Q CLI must be installed (`q` command available)
 - Q CLI must be authenticated (AWS credentials configured)
-- tmux 3.2+ must be installed
+- tmux 3.3+ must be installed
 
 **Agent Setup:**
 The integration tests automatically create a test agent named `agent-q-cli-integration-test` if it doesn't exist. The agent is created at:
@@ -548,7 +548,7 @@ Unit tests for the `launch` CLI command are in `test/cli/commands/test_launch.py
 3. **Workspace access confirmation (4 tests)**
    - Confirmation shown and accepted for `claude_code` provider
    - Confirmation declined cancels launch
-   - `--yes` flag skips confirmation
+   - `--yolo` flag skips confirmation
    - Default provider (`kiro_cli`) also shows confirmation
 
 **Coverage:** 100% of launch.py

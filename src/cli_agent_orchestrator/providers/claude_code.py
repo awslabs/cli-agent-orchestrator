@@ -60,7 +60,7 @@ class ClaudeCodeProvider(BaseProvider):
         """
         # --dangerously-skip-permissions: bypass the workspace trust dialog and
         # tool permission prompts. CAO already confirms workspace access during
-        # `cao launch` (or `--yes/-y`), so re-prompting each spawned agent
+        # `cao launch` (or `--yolo`), so re-prompting each spawned agent
         # (supervisor and worker) is redundant and blocks handoff/assign flows.
         command_parts = ["claude", "--dangerously-skip-permissions"]
 
