@@ -198,3 +198,31 @@ class TestKiroCliAssign:
             task_message=REPORT_GENERATOR_TASK,
             content_keywords=REPORT_GENERATOR_KEYWORDS,
         )
+
+
+# ---------------------------------------------------------------------------
+# Kimi CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestKimiCliAssign:
+    """E2E assign tests for the Kimi CLI provider using examples/assign/ profiles."""
+
+    def test_assign_data_analyst(self, require_kimi):
+        """Kimi CLI data_analyst receives dataset, performs statistical analysis."""
+        _run_assign_test(
+            provider="kimi_cli",
+            agent_profile="data_analyst",
+            task_message=DATA_ANALYST_TASK,
+            content_keywords=DATA_ANALYST_KEYWORDS,
+        )
+
+    def test_assign_report_generator(self, require_kimi):
+        """Kimi CLI report_generator creates a report template."""
+        _run_assign_test(
+            provider="kimi_cli",
+            agent_profile="report_generator",
+            task_message=REPORT_GENERATOR_TASK,
+            content_keywords=REPORT_GENERATOR_KEYWORDS,
+        )

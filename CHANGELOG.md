@@ -50,6 +50,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Provider documentation: `docs/claude-code.md` and `docs/kiro-cli.md` covering status detection, message extraction, configuration, implementation notes, E2E testing, and troubleshooting
 - CI workflow `test-codex-provider.yml` for Codex provider-specific unit tests (path-triggered)
 - CI workflow `test-claude-code-provider.yml` for Claude Code provider-specific unit tests (path-triggered)
+- Kimi CLI provider (`providers/kimi_cli.py`): full integration with Kimi Code CLI (https://kimi.com/code) including idle/processing/completed/error status detection via TUI prompt patterns (✨/💫), response extraction with thinking-bullet filtering, agent profile support via temp YAML files, MCP server config injection, and temp file cleanup
+- Kimi CLI unit tests (`test/providers/test_kimi_cli_unit.py`): 54 tests across 6 test classes covering initialization, status detection, message extraction, command building, patterns, and lifecycle (100% code coverage)
+- Kimi CLI test fixtures: 5 fixture files (`kimi_cli_idle_output.txt`, `kimi_cli_completed_output.txt`, `kimi_cli_processing_output.txt`, `kimi_cli_error_output.txt`, `kimi_cli_complex_response.txt`) capturing real terminal output patterns
+- Kimi CLI E2E tests: handoff (2 tests), assign (2 tests), and send_message (1 test) in `test/e2e/` gated behind `require_kimi` fixture
+- CI workflow `test-kimi-cli-provider.yml` for Kimi CLI provider-specific unit tests (path-triggered)
+- Provider documentation: `docs/kimi-cli.md` covering prerequisites, status detection, message extraction, agent profiles, MCP config, and troubleshooting
 
 ## [1.0.2] - 2026-01-30
 

@@ -39,15 +39,18 @@
                 │                    │ • claude │
          ┌──────┴──────┐             │   _code  │
          │             │             │ • codex  │
-    ┌────▼────┐  ┌─────▼─────┐      └────┬─────┘
-    │  Tmux   │  │  SQLite   │          │
-    │ Sessions│  │  Database │     ┌─────▼──────┐
-    └─────────┘  └───────────┘     │ CLI Tools  │
+         │             │             │ • kimi   │
+    ┌────▼────┐  ┌─────▼─────┐      │   _cli   │
+    │  Tmux   │  │  SQLite   │      └────┬─────┘
+    │ Sessions│  │  Database │           │
+    └─────────┘  └───────────┘     ┌─────▼──────┐
+                                   │ CLI Tools  │
                                    │• Kiro CLI  │
                                    │  (default) │
                                    │• Claude    │
                                    │  Code      │
                                    │• Codex CLI │
+                                   │• Kimi CLI  │
                                    └────────────┘
 ```
 
@@ -77,7 +80,8 @@ src/cli_agent_orchestrator/
 │   ├── kiro_cli.py        # Kiro CLI provider (kiro_cli) - default
 │   ├── q_cli.py           # Amazon Q CLI provider (q_cli)
 │   ├── claude_code.py     # Claude Code provider (claude_code, ❯ prompt, trust prompt handling)
-│   └── codex.py           # Codex/ChatGPT CLI provider (codex, developer_instructions, › prompt + • bullet detection, trust prompt handling)
+│   ├── codex.py           # Codex/ChatGPT CLI provider (codex, developer_instructions, › prompt + • bullet detection, trust prompt handling)
+│   └── kimi_cli.py        # Kimi CLI provider (kimi_cli, ✨/💫 prompt, • bullet response, thinking filter)
 ├── models/                # Data models
 │   ├── terminal.py        # Terminal, TerminalStatus
 │   ├── session.py         # Session model

@@ -193,3 +193,17 @@ class TestKiroCliSendMessage:
     def test_send_message_to_inbox(self, require_kiro):
         """Send a message to another Kiro CLI terminal's inbox and verify delivery."""
         _run_send_message_test(provider="kiro_cli", agent_profile="developer")
+
+
+# ---------------------------------------------------------------------------
+# Kimi CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestKimiCliSendMessage:
+    """E2E send_message tests for the Kimi CLI provider."""
+
+    def test_send_message_to_inbox(self, require_kimi):
+        """Send a message to another Kimi CLI terminal's inbox and verify delivery."""
+        _run_send_message_test(provider="kimi_cli", agent_profile="developer")

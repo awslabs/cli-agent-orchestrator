@@ -61,6 +61,13 @@ def require_kiro():
         pytest.skip("kiro-cli CLI not installed")
 
 
+@pytest.fixture()
+def require_kimi():
+    """Skip test if kimi CLI is not available."""
+    if not _cli_available("kimi"):
+        pytest.skip("kimi CLI not installed")
+
+
 def create_terminal(provider: str, agent_profile: str, session_name: str):
     """Create a CAO session + terminal via the API.
 
