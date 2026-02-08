@@ -141,6 +141,62 @@ class TmuxClient:
                 check=False,
             )
 
+    def send_keys_via_paste(self, session_name: str, window_name: str, text: str) -> None:
+        """Send text to window via tmux paste buffer with bracketed paste mode.
+
+        Uses tmux set-buffer + paste-buffer -p to send text as a bracketed paste,
+        which bypasses TUI hotkey handling. Essential for Ink-based CLIs (Gemini CLI)
+        and other TUI apps where individual keystrokes may trigger hotkeys
+        (e.g., '!' toggles Gemini's shell mode).
+
+        After pasting, sends C-m (Enter) to submit the input.
+
+        Args:
+            session_name: Name of tmux session
+            window_name: Name of window in session
+            text: Text to paste into the pane
+        """
+        try:
+            logger.info(
+                f"send_keys_via_paste: {session_name}:{window_name} - text length: {len(text)}"
+            )
+
+            session = self.server.sessions.get(session_name=session_name)
+            if not session:
+                raise ValueError(f"Session '{session_name}' not found")
+
+            window = session.windows.get(window_name=window_name)
+            if not window:
+                raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
+
+            pane = window.active_pane
+            if pane:
+                buf_name = "cao_paste"
+
+                # Load text into tmux buffer
+                self.server.cmd("set-buffer", "-b", buf_name, text)
+
+                # Paste with bracketed paste mode (-p flag).
+                # This wraps the text in \x1b[200~ ... \x1b[201~ escape sequences,
+                # telling the TUI "this is pasted text" so it bypasses hotkey handling.
+                pane.cmd("paste-buffer", "-p", "-b", buf_name)
+
+                time.sleep(0.3)
+
+                # Send Enter to submit the pasted text
+                pane.send_keys("C-m", enter=False)
+
+                # Clean up the paste buffer
+                try:
+                    self.server.cmd("delete-buffer", "-b", buf_name)
+                except Exception:
+                    pass
+
+                logger.debug(f"Sent text via paste to {session_name}:{window_name}")
+        except Exception as e:
+            logger.error(f"Failed to send text via paste to {session_name}:{window_name}: {e}")
+            raise
+
     def send_special_key(self, session_name: str, window_name: str, key: str) -> None:
         """Send a tmux special key sequence (e.g., C-d, C-c) to a window.
 

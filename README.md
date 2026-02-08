@@ -380,6 +380,27 @@ CAO supports specifying working directories for agent handoff/delegation operati
 
 For configuration and usage details, see [docs/working-directory.md](docs/working-directory.md).
 
+## Skills for AI Coding Agents
+
+CAO includes reusable [skills](skills/) that provide specialized knowledge and workflows for AI coding agents. Skills encode lessons learned, verification checklists, and implementation guides.
+
+| Skill | Description |
+|-------|-------------|
+| `build-cao-provider` | Full lifecycle guide for building a new CLI agent provider |
+| `skill-creator` | Guide for creating new skills |
+
+Skills live in `skills/` as the single source of truth. Copy them to your tool's directory before use:
+
+```bash
+# Install skills for all tools
+for tool in .claude .agents .gemini .kimi .kiro; do
+  mkdir -p "$tool/skills"
+  cp -r skills/* "$tool/skills/"
+done
+```
+
+See [skills/README.md](skills/README.md) for per-tool instructions and Ralph setup.
+
 ## Security
 
 See [SECURITY.md](SECURITY.md) for vulnerability reporting, security scanning, and best practices.

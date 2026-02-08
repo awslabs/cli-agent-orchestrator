@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fix Claude Code `PROCESSING_PATTERN` not matching newer Claude Code 2.x spinner format: broaden pattern to match both `(esc to interrupt)` and `(Ns · ↓ tokens · thinking)` formats
 - Fix Kimi CLI worker agents created as separate sessions instead of windows: forward `CAO_TERMINAL_ID` to MCP server subprocess via `env` field in `--mcp-config` JSON, matching Codex provider's `env_vars` approach
 - Fix Kimi CLI initialization timeout on tall terminals (46+ rows): increase `IDLE_PROMPT_TAIL_LINES` from 10 to 50 to account for TUI padding lines between idle prompt and status bar
+- Fix Gemini CLI `_build_gemini_command()` using `--` separator and `export` for MCP server registration: replace with `-e` flag for `CAO_TERMINAL_ID` forwarding and positional command argument without `--`
+- Fix all providers' `send_input()` using `tmux send_keys(literal=True)` which sends characters individually, allowing TUI hotkeys (e.g., Gemini CLI's `!` shell mode toggle) to intercept user messages; replace with `send_keys_via_paste()` using `tmux set-buffer` + `paste-buffer -p` (bracketed paste mode) to bypass per-character hotkey handling
 
 ### Added
 
@@ -62,13 +64,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Kimi CLI E2E tests: handoff (2 tests), assign (2 tests), and send_message (1 test) in `test/e2e/` gated behind `require_kimi` fixture
 - CI workflow `test-kimi-cli-provider.yml` for Kimi CLI provider-specific unit tests (path-triggered)
 - Provider documentation: `docs/kimi-cli.md` covering prerequisites, status detection, message extraction, agent profiles, MCP config, and troubleshooting
-- Gemini CLI provider (`providers/gemini_cli.py`): full integration with Gemini CLI (https://github.com/google-gemini/gemini-cli) including idle/processing/completed/error status detection via Ink TUI patterns (`*   Type your message` idle prompt, `✦` response prefix, `>` query prefix), response extraction with TUI chrome filtering, MCP server registration via `gemini mcp add`, and `CAO_TERMINAL_ID` forwarding via shell export
+- Gemini CLI provider (`providers/gemini_cli.py`): full integration with Gemini CLI (https://github.com/google-gemini/gemini-cli) including idle/processing/completed/error status detection via Ink TUI patterns (`*   Type your message` idle prompt, `✦` response prefix, `>` query prefix), response extraction with TUI chrome filtering, MCP server registration via `gemini mcp add`, and `CAO_TERMINAL_ID` forwarding via `-e` flag
 - Gemini CLI unit tests (`test/providers/test_gemini_cli_unit.py`): 57 tests across 6 test classes covering initialization, status detection, message extraction, command building, patterns, and miscellaneous (100% code coverage)
 - Gemini CLI test fixtures: 5 fixture files (`gemini_cli_idle_output.txt`, `gemini_cli_completed_output.txt`, `gemini_cli_processing_output.txt`, `gemini_cli_error_output.txt`, `gemini_cli_complex_response.txt`) capturing real terminal output patterns
 - Gemini CLI E2E tests: handoff (2 tests), assign (2 tests), and send_message (1 test) in `test/e2e/` gated behind `require_gemini` fixture
 - CI workflow `test-gemini-cli-provider.yml` for Gemini CLI provider-specific unit tests (path-triggered)
 - Provider documentation: `docs/gemini-cli.md` covering prerequisites, status detection, message extraction, MCP config, and troubleshooting
+- `TmuxClient.send_keys_via_paste()` method for sending text via bracketed paste mode (`tmux set-buffer` + `paste-buffer -p`), bypassing TUI hotkey interception in Ink-based and prompt_toolkit-based CLIs
 - `TmuxClient.send_special_key()` method for sending tmux key sequences (e.g., `C-d`, `C-c`) non-literally, distinct from `send_keys()` which sends text literally
+- Centralized `skills/` directory as single source of truth for AI coding agent skills (`build-cao-provider`, `skill-creator`), with install instructions for Claude Code (`.claude/skills/`), Codex (`.agents/skills/`), Gemini (`.gemini/skills/`), Kimi (`.kimi/skills/`), and Kiro (`.kiro/skills/`)
 - `terminal_service.send_special_key()` wrapper function for the new tmux client method
 - Exit terminal endpoint key sequence routing: `POST /terminals/{terminal_id}/exit` now detects `C-`/`M-` prefixed exit commands and sends them as tmux key sequences instead of literal text
 

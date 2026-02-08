@@ -211,7 +211,7 @@ class TestSendInput:
         result = send_input("test1234", "test message")
 
         assert result is True
-        mock_tmux.send_keys.assert_called_once()
+        mock_tmux.send_keys_via_paste.assert_called_once()
         mock_update.assert_called_once_with("test1234")
 
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
