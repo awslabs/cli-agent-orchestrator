@@ -28,6 +28,7 @@ dist/
 .obsidian/
 .ralph/
 .ralphrc
+work/
 
 # Memory
 context/
