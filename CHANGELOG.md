@@ -34,6 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fix Kimi CLI worker agents created as separate sessions instead of windows: forward `CAO_TERMINAL_ID` to MCP server subprocess via `env` field in `--mcp-config` JSON, matching Codex provider's `env_vars` approach
 - Fix Kimi CLI initialization timeout on tall terminals (46+ rows): increase `IDLE_PROMPT_TAIL_LINES` from 10 to 50 to account for TUI padding lines between idle prompt and status bar
 - Fix Gemini CLI `_build_gemini_command()` using `--` separator and `export` for MCP server registration: replace with `-e` flag for `CAO_TERMINAL_ID` forwarding and positional command argument without `--`
+- Fix Gemini CLI initialization timeout when working directory is the home directory: `gemini mcp add` refuses project-level settings in `~/` ("Please use --scope user"); add `--scope user` to both `gemini mcp add` and `gemini mcp remove` commands
+- Fix Gemini CLI failing to launch in fresh tmux sessions: add warm-up `echo CAO_SHELL_READY` command with marker-based polling (15s timeout) before sending the `gemini` command, ensuring the shell environment (PATH, nvm, homebrew) is fully loaded
 - Fix all providers' `send_input()` using `tmux send_keys(literal=True)` which sends characters individually, allowing TUI hotkeys (e.g., Gemini CLI's `!` shell mode toggle) to intercept user messages; replace with `send_keys_via_paste()` using `tmux set-buffer` + `paste-buffer -p` (bracketed paste mode) to bypass per-character hotkey handling
 
 ### Added

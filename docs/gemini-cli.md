@@ -8,7 +8,6 @@ The Gemini CLI provider enables CAO to work with [Gemini CLI](https://github.com
 
 - **Gemini CLI**: Install via `npm install -g @google/gemini-cli` or `npx @google/gemini-cli`
 - **Authentication**: Run `gemini` and follow the OAuth flow, or set `GEMINI_API_KEY`
-- **Git repository**: Gemini CLI requires a git-initialized directory
 - **tmux 3.3+**
 
 Verify installation:
@@ -81,12 +80,14 @@ If an agent profile provides MCP servers, those are registered via `gemini mcp a
 
 ## MCP Server Configuration
 
-MCP servers from agent profiles are registered using `gemini mcp add` commands chained before the main `gemini` command:
+MCP servers from agent profiles are registered using `gemini mcp add --scope user` commands chained before the main `gemini` command:
 
 ```bash
-gemini mcp add cao-mcp-server -e CAO_TERMINAL_ID=abc12345 npx -y cao-mcp-server && \
+gemini mcp add cao-mcp-server --scope user -e CAO_TERMINAL_ID=abc12345 npx -y cao-mcp-server && \
 gemini --yolo --sandbox false
 ```
+
+The `--scope user` flag writes MCP config to user-level settings instead of project-level settings. This is required because `gemini mcp add` refuses to write project-level settings in the home directory (returns "Please use --scope user to edit settings in the home directory").
 
 ### CAO_TERMINAL_ID Forwarding
 
@@ -94,7 +95,7 @@ Gemini CLI forwards `CAO_TERMINAL_ID` to MCP subprocesses via the `-e` flag on `
 
 ### MCP Server Cleanup
 
-When the provider's `cleanup()` method is called, it sends `gemini mcp remove <name>` for each MCP server that was added during initialization.
+When the provider's `cleanup()` method is called, it sends `gemini mcp remove --scope user <name>` for each MCP server that was added during initialization.
 
 ## Command Flags
 
@@ -107,7 +108,7 @@ When the provider's `cleanup()` method is called, it sends `gemini mcp remove <n
 
 ### Provider Lifecycle
 
-1. **Initialize**: Wait for shell → send command → wait for IDLE (up to 60s)
+1. **Initialize**: Wait for shell → warm-up echo (verify shell ready) → send command → wait for IDLE (up to 60s)
 2. **Status Detection**: Check bottom 50 lines for idle prompt pattern (`IDLE_PROMPT_TAIL_LINES = 50`)
 3. **Message Extraction**: Line-based approach filtering TUI chrome
 4. **Exit**: Send `C-d` (Ctrl+D)
@@ -138,12 +139,12 @@ Set to 50. Gemini's Ink-based TUI can add padding lines between the input box an
 
 ```bash
 # Run all Gemini CLI E2E tests
-uv run pytest -m e2e test/e2e/ -v -k gemini_cli
+uv run pytest test/e2e/ -v -k Gemini -o "addopts="
 
 # Run specific test type
-uv run pytest -m e2e test/e2e/test_handoff.py -v -k gemini_cli
-uv run pytest -m e2e test/e2e/test_assign.py -v -k gemini_cli
-uv run pytest -m e2e test/e2e/test_send_message.py -v -k gemini_cli
+uv run pytest test/e2e/test_handoff.py -v -k Gemini -o "addopts="
+uv run pytest test/e2e/test_assign.py -v -k Gemini -o "addopts="
+uv run pytest test/e2e/test_send_message.py -v -k Gemini -o "addopts="
 ```
 
 Prerequisites for E2E tests:
@@ -161,20 +162,13 @@ which gemini
 gemini --version
 ```
 
-### Not in a git repository
-
-Gemini CLI requires a git-initialized directory. If you get errors about missing git repo:
-
-```bash
-cd /path/to/your/project
-git init  # if needed
-```
-
 ### Initialization timeout
 
 If Gemini CLI takes too long to start, check:
 - Network connectivity (Gemini requires API access)
 - Authentication status (re-run `gemini` to authenticate)
+- MCP server registration: `gemini mcp add` needs `--scope user` when the working directory is the home directory; without it the command fails silently and `gemini` never launches
+- Shell environment: the provider sends a warm-up `echo` command and waits for the marker before launching `gemini`, ensuring PATH/nvm/homebrew are loaded
 - The provider waits up to 60 seconds for initialization
 
 ### Status detection not working on tall terminals

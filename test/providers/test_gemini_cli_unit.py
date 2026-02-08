@@ -46,17 +46,23 @@ def _read_fixture(name: str) -> str:
 class TestGeminiCliProviderInitialization:
     """Tests for GeminiCliProvider initialization flow."""
 
+    @patch("cli_agent_orchestrator.providers.gemini_cli.time")
     @patch("cli_agent_orchestrator.providers.gemini_cli.wait_until_status", return_value=True)
     @patch("cli_agent_orchestrator.providers.gemini_cli.wait_for_shell", return_value=True)
     @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
-    def test_initialize_success(self, mock_tmux, mock_wait_shell, mock_wait_status):
-        """Test successful initialization sends gemini command and reaches IDLE."""
+    def test_initialize_success(self, mock_tmux, mock_wait_shell, mock_wait_status, mock_time):
+        """Test successful initialization sends warm-up + gemini command and reaches IDLE."""
+        # Configure time mock for warm-up loop arithmetic
+        mock_time.time.return_value = 0
+        # Simulate warm-up marker appearing in shell output
+        mock_tmux.get_history.return_value = "CAO_SHELL_READY"
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
         result = provider.initialize()
 
         assert result is True
         assert provider._initialized is True
-        mock_tmux.send_keys.assert_called_once()
+        assert mock_tmux.send_keys.call_count == 2  # warm-up echo + gemini command
+        mock_tmux.send_keys.assert_any_call("session-1", "window-1", "echo CAO_SHELL_READY")
         mock_wait_shell.assert_called_once()
         mock_wait_status.assert_called_once()
 
@@ -68,23 +74,31 @@ class TestGeminiCliProviderInitialization:
         with pytest.raises(TimeoutError, match="Shell initialization"):
             provider.initialize()
 
+    @patch("cli_agent_orchestrator.providers.gemini_cli.time")
     @patch("cli_agent_orchestrator.providers.gemini_cli.wait_until_status", return_value=False)
     @patch("cli_agent_orchestrator.providers.gemini_cli.wait_for_shell", return_value=True)
     @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
-    def test_initialize_gemini_timeout(self, mock_tmux, mock_wait_shell, mock_wait_status):
+    def test_initialize_gemini_timeout(
+        self, mock_tmux, mock_wait_shell, mock_wait_status, mock_time
+    ):
         """Test Gemini CLI init timeout raises TimeoutError."""
+        mock_time.time.return_value = 0
+        mock_tmux.get_history.return_value = "CAO_SHELL_READY"
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
         with pytest.raises(TimeoutError, match="Gemini CLI initialization"):
             provider.initialize()
 
+    @patch("cli_agent_orchestrator.providers.gemini_cli.time")
     @patch("cli_agent_orchestrator.providers.gemini_cli.wait_until_status", return_value=True)
     @patch("cli_agent_orchestrator.providers.gemini_cli.wait_for_shell", return_value=True)
     @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
     def test_initialize_with_mcp_servers(
-        self, mock_load, mock_tmux, mock_wait_shell, mock_wait_status
+        self, mock_load, mock_tmux, mock_wait_shell, mock_wait_status, mock_time
     ):
         """Test initialization with MCP servers in profile adds gemini mcp add commands."""
+        mock_time.time.return_value = 0
+        mock_tmux.get_history.return_value = "CAO_SHELL_READY"
         mock_profile = MagicMock()
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {
@@ -99,23 +113,31 @@ class TestGeminiCliProviderInitialization:
         result = provider.initialize()
         assert result is True
 
-        call_args = mock_tmux.send_keys.call_args
+        # Second send_keys call is the gemini command (first is warm-up echo)
+        call_args = mock_tmux.send_keys.call_args_list[1]
         command = call_args[0][2]
         assert "gemini mcp add" in command
         assert "cao-mcp-server" in command
         assert "CAO_TERMINAL_ID" in command
+        assert "--scope user" in command
 
+    @patch("cli_agent_orchestrator.providers.gemini_cli.time")
     @patch("cli_agent_orchestrator.providers.gemini_cli.wait_until_status", return_value=True)
     @patch("cli_agent_orchestrator.providers.gemini_cli.wait_for_shell", return_value=True)
     @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
-    def test_initialize_sends_gemini_command(self, mock_tmux, mock_wait_shell, mock_wait_status):
-        """Test that initialize sends the correct gemini --yolo command."""
+    def test_initialize_sends_gemini_command(
+        self, mock_tmux, mock_wait_shell, mock_wait_status, mock_time
+    ):
+        """Test that initialize sends warm-up echo then the correct gemini --yolo command."""
+        mock_time.time.return_value = 0
+        mock_tmux.get_history.return_value = "CAO_SHELL_READY"
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
         provider.initialize()
 
-        call_args = mock_tmux.send_keys.call_args
-        command = call_args[0][2]
-        assert command == "gemini --yolo --sandbox false"
+        # First call: warm-up echo
+        assert mock_tmux.send_keys.call_args_list[0][0][2] == "echo CAO_SHELL_READY"
+        # Second call: gemini command
+        assert mock_tmux.send_keys.call_args_list[1][0][2] == "gemini --yolo --sandbox false"
 
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
     def test_initialize_with_invalid_profile(self, mock_load):
@@ -472,7 +494,10 @@ class TestGeminiCliProviderBuildCommand:
         provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
         command = provider._build_gemini_command()
 
-        assert "gemini mcp add test-server -e CAO_TERMINAL_ID=term-1 npx test-pkg" in command
+        assert (
+            "gemini mcp add test-server --scope user -e CAO_TERMINAL_ID=term-1 npx test-pkg"
+            in command
+        )
         assert "CAO_TERMINAL_ID" in command
         assert "gemini --yolo --sandbox false" in command
         # MCP server should be tracked for cleanup
@@ -492,7 +517,10 @@ class TestGeminiCliProviderBuildCommand:
         provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
         command = provider._build_gemini_command()
 
-        assert "gemini mcp add my-server -e CAO_TERMINAL_ID=term-1 node server.js" in command
+        assert (
+            "gemini mcp add my-server --scope user -e CAO_TERMINAL_ID=term-1 node server.js"
+            in command
+        )
         assert "CAO_TERMINAL_ID" in command
 
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
@@ -578,8 +606,8 @@ class TestGeminiCliProviderMisc:
         assert mock_tmux.send_keys.call_count == 2
         # Verify the remove commands were sent
         calls = mock_tmux.send_keys.call_args_list
-        assert "gemini mcp remove server-a" in calls[0][0][2]
-        assert "gemini mcp remove server-b" in calls[1][0][2]
+        assert "gemini mcp remove --scope user server-a" in calls[0][0][2]
+        assert "gemini mcp remove --scope user server-b" in calls[1][0][2]
 
     @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
     def test_cleanup_handles_mcp_removal_error(self, mock_tmux):

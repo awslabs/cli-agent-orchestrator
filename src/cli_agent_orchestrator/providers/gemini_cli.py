@@ -30,6 +30,7 @@ Status Detection Strategy:
 import logging
 import re
 import shlex
+import time
 from typing import Optional
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
@@ -118,9 +119,6 @@ class GeminiCliProvider(BaseProvider):
     including initialization, status detection, response extraction,
     and cleanup. Gemini CLI does not support inline agent profiles —
     if provided, the system prompt is passed via --prompt-interactive flag.
-
-    Note: Gemini CLI requires a **git repository** in the working directory.
-    It exits immediately (code 0) in non-git directories.
     """
 
     def __init__(
@@ -180,15 +178,20 @@ class GeminiCliProvider(BaseProvider):
                         command = cfg.get("command", "")
                         args = cfg.get("args", [])
 
-                        # Build `gemini mcp add <name> [-e KEY=VALUE] <command> [args...]`
+                        # Build `gemini mcp add <name> --scope user [-e KEY=VALUE] <command> [args...]`
                         # Note: Do NOT use `--` separator — yargs in gemini-cli treats
                         # it as end-of-options and fails with "not enough positional args".
                         # Use -e flag for env vars (native gemini mcp add support).
+                        # Use --scope user to avoid "Please use --scope user to edit
+                        # settings in the home directory" error when working_directory
+                        # is the user's home directory.
                         mcp_parts = [
                             "gemini",
                             "mcp",
                             "add",
                             server_name,
+                            "--scope",
+                            "user",
                             "-e",
                             f"CAO_TERMINAL_ID={self.terminal_id}",
                             command,
@@ -214,9 +217,6 @@ class GeminiCliProvider(BaseProvider):
         2. Build and send the gemini command (may include MCP setup)
         3. Wait for Gemini to reach IDLE state (welcome banner + input box)
 
-        Note: Gemini CLI requires a git repository in the working directory.
-        If the directory is not a git repo, Gemini exits silently (code 0).
-
         Returns:
             True if initialization completed successfully
 
@@ -226,6 +226,25 @@ class GeminiCliProvider(BaseProvider):
         # Wait for shell prompt to appear in the tmux window
         if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
+
+        # Send a warm-up command before launching Gemini.
+        # Gemini's Ink TUI exits silently in freshly-created tmux sessions where
+        # the shell environment (PATH, node, nvm, homebrew) is not fully loaded.
+        # wait_for_shell() returns when the prompt text stabilizes, but slow
+        # shell init scripts (.zshrc, brew shellenv) may still be running.
+        # An echo round-trip with output verification ensures the shell has
+        # fully processed its init before we launch gemini.
+        warmup_marker = "CAO_SHELL_READY"
+        tmux_client.send_keys(self.session_name, self.window_name, f"echo {warmup_marker}")
+        warmup_start = time.time()
+        warmup_timeout = 15.0
+        while time.time() - warmup_start < warmup_timeout:
+            output = tmux_client.get_history(self.session_name, self.window_name)
+            if output and warmup_marker in output:
+                break
+            time.sleep(0.5)
+        else:
+            logger.warning("Shell warm-up marker not detected within timeout, proceeding anyway")
 
         # Build properly escaped command string
         command = self._build_gemini_command()
@@ -392,7 +411,7 @@ class GeminiCliProvider(BaseProvider):
                 tmux_client.send_keys(
                     self.session_name,
                     self.window_name,
-                    f"gemini mcp remove {shlex.quote(server_name)}",
+                    f"gemini mcp remove --scope user {shlex.quote(server_name)}",
                 )
             except Exception as e:
                 logger.warning(f"Failed to remove MCP server '{server_name}': {e}")
