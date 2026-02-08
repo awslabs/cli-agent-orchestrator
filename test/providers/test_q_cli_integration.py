@@ -11,6 +11,7 @@ import pytest
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.q_cli import QCliProvider
+from cli_agent_orchestrator.utils.terminal import wait_for_shell
 
 # Mark all tests in this module as integration and slow
 pytestmark = [pytest.mark.integration, pytest.mark.slow]
@@ -444,6 +445,9 @@ class TestQCliProviderWorkingDirectory:
         subdir.mkdir()
 
         # Change directory in tmux pane
+        # wait_for_shell ensures shell is initialized before sending commands
+        # (paste-buffer delivery is instant, so shell must be ready first)
+        wait_for_shell(tmux_client, test_session_name, window_name, timeout=10.0)
         tmux_client.send_keys(test_session_name, window_name, f"cd {subdir}")
         time.sleep(0.5)  # Wait for command to execute
 
