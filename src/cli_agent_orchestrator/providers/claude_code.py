@@ -1,5 +1,6 @@
 """Claude Code provider implementation."""
 
+import json
 import logging
 import re
 import shlex
@@ -76,9 +77,25 @@ class ClaudeCodeProvider(BaseProvider):
                     escaped_prompt = system_prompt.replace("\\", "\\\\").replace("\n", "\\n")
                     command_parts.extend(["--append-system-prompt", escaped_prompt])
 
-                # Add MCP config if present
+                # Add MCP config if present.
+                # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
+                # can identify the current terminal for handoff/assign operations.
+                # Claude Code does not automatically forward parent shell env vars
+                # to MCP subprocesses, so we inject it explicitly via the env field.
                 if profile.mcpServers:
-                    mcp_json = profile.model_dump_json(include={"mcpServers"})
+                    mcp_config = {}
+                    for server_name, server_config in profile.mcpServers.items():
+                        if isinstance(server_config, dict):
+                            mcp_config[server_name] = dict(server_config)
+                        else:
+                            mcp_config[server_name] = server_config.model_dump(exclude_none=True)
+
+                        env = mcp_config[server_name].get("env", {})
+                        if "CAO_TERMINAL_ID" not in env:
+                            env["CAO_TERMINAL_ID"] = self.terminal_id
+                            mcp_config[server_name]["env"] = env
+
+                    mcp_json = json.dumps({"mcpServers": mcp_config})
                     command_parts.extend(["--mcp-config", mcp_json])
 
             except Exception as e:

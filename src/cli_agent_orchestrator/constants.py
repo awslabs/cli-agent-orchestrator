@@ -4,7 +4,8 @@ This module defines all configuration constants used throughout the CAO applicat
 including directory paths, server settings, and provider configurations.
 
 The CAO application orchestrates multiple CLI-based AI agents (Kiro CLI, Claude Code,
-Codex, Q CLI) through tmux sessions, providing a unified interface for agent management.
+Codex, Kimi CLI, Gemini CLI, Q CLI) through tmux sessions, providing a unified interface
+for agent management.
 """
 
 from pathlib import Path

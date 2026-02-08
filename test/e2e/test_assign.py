@@ -14,7 +14,7 @@ Tests the assign flow that _assign_impl() executes:
 
 Requires:
 - Running CAO server
-- Authenticated CLI tools (codex, claude, kiro-cli)
+- Authenticated CLI tools (codex, claude, kiro-cli, kimi, gemini)
 - tmux
 - Agent profiles installed: data_analyst, report_generator
   (install with: cao install examples/assign/data_analyst.md)
@@ -22,6 +22,10 @@ Requires:
 Run:
     uv run pytest -m e2e test/e2e/test_assign.py -v
     uv run pytest -m e2e test/e2e/test_assign.py -v -k codex
+    uv run pytest -m e2e test/e2e/test_assign.py -v -k claude_code
+    uv run pytest -m e2e test/e2e/test_assign.py -v -k kiro_cli
+    uv run pytest -m e2e test/e2e/test_assign.py -v -k kimi_cli
+    uv run pytest -m e2e test/e2e/test_assign.py -v -k gemini_cli
 """
 
 import time
@@ -222,6 +226,34 @@ class TestKimiCliAssign:
         """Kimi CLI report_generator creates a report template."""
         _run_assign_test(
             provider="kimi_cli",
+            agent_profile="report_generator",
+            task_message=REPORT_GENERATOR_TASK,
+            content_keywords=REPORT_GENERATOR_KEYWORDS,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Gemini CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestGeminiCliAssign:
+    """E2E assign tests for the Gemini CLI provider using examples/assign/ profiles."""
+
+    def test_assign_data_analyst(self, require_gemini):
+        """Gemini CLI data_analyst receives dataset, performs statistical analysis."""
+        _run_assign_test(
+            provider="gemini_cli",
+            agent_profile="data_analyst",
+            task_message=DATA_ANALYST_TASK,
+            content_keywords=DATA_ANALYST_KEYWORDS,
+        )
+
+    def test_assign_report_generator(self, require_gemini):
+        """Gemini CLI report_generator creates a report template."""
+        _run_assign_test(
+            provider="gemini_cli",
             agent_profile="report_generator",
             task_message=REPORT_GENERATOR_TASK,
             content_keywords=REPORT_GENERATOR_KEYWORDS,

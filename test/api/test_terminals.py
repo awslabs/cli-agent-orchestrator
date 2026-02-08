@@ -1,6 +1,6 @@
-"""Tests for terminal-related API endpoints including working directory."""
+"""Tests for terminal-related API endpoints including working directory and exit."""
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -174,3 +174,90 @@ class TestTerminalCreationWithWorkingDirectory:
             assert response.status_code == 201
             call_kwargs = mock_svc.create_terminal.call_args.kwargs
             assert call_kwargs.get("working_directory") == "/session/path"
+
+
+class TestExitTerminalEndpoint:
+    """Test POST /terminals/{terminal_id}/exit endpoint.
+
+    Verifies that text commands (e.g., /exit) are sent via send_input()
+    and tmux special key sequences (e.g., C-d) are sent via send_special_key().
+    """
+
+    def test_exit_terminal_text_command(self, client):
+        """Text exit commands (e.g., /exit) should use send_input."""
+        mock_provider = MagicMock()
+        mock_provider.exit_cli.return_value = "/exit"
+
+        with (
+            patch("cli_agent_orchestrator.api.main.provider_manager") as mock_pm,
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            mock_pm.get_provider.return_value = mock_provider
+
+            response = client.post("/terminals/abcd1234/exit")
+
+            assert response.status_code == 200
+            assert response.json() == {"success": True}
+            mock_svc.send_input.assert_called_once_with("abcd1234", "/exit")
+            mock_svc.send_special_key.assert_not_called()
+
+    def test_exit_terminal_special_key(self, client):
+        """Tmux key sequences (e.g., C-d) should use send_special_key."""
+        mock_provider = MagicMock()
+        mock_provider.exit_cli.return_value = "C-d"
+
+        with (
+            patch("cli_agent_orchestrator.api.main.provider_manager") as mock_pm,
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            mock_pm.get_provider.return_value = mock_provider
+
+            response = client.post("/terminals/abcd1234/exit")
+
+            assert response.status_code == 200
+            assert response.json() == {"success": True}
+            mock_svc.send_special_key.assert_called_once_with("abcd1234", "C-d")
+            mock_svc.send_input.assert_not_called()
+
+    def test_exit_terminal_meta_key(self, client):
+        """Meta key sequences (M-x) should also use send_special_key."""
+        mock_provider = MagicMock()
+        mock_provider.exit_cli.return_value = "M-x"
+
+        with (
+            patch("cli_agent_orchestrator.api.main.provider_manager") as mock_pm,
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            mock_pm.get_provider.return_value = mock_provider
+
+            response = client.post("/terminals/abcd1234/exit")
+
+            assert response.status_code == 200
+            mock_svc.send_special_key.assert_called_once_with("abcd1234", "M-x")
+            mock_svc.send_input.assert_not_called()
+
+    def test_exit_terminal_provider_not_found(self, client):
+        """Should return 404 when provider is not found."""
+        with patch("cli_agent_orchestrator.api.main.provider_manager") as mock_pm:
+            mock_pm.get_provider.side_effect = ValueError("Terminal not found in database")
+
+            response = client.post("/terminals/deadbeef/exit")
+
+            assert response.status_code == 404
+
+    def test_exit_terminal_server_error(self, client):
+        """Should return 500 on unexpected errors."""
+        mock_provider = MagicMock()
+        mock_provider.exit_cli.return_value = "/exit"
+
+        with (
+            patch("cli_agent_orchestrator.api.main.provider_manager") as mock_pm,
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            mock_pm.get_provider.return_value = mock_provider
+            mock_svc.send_input.side_effect = RuntimeError("TMux error")
+
+            response = client.post("/terminals/abcd1234/exit")
+
+            assert response.status_code == 500
+            assert "Failed to exit terminal" in response.json()["detail"]

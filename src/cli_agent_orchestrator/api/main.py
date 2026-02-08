@@ -299,7 +299,13 @@ async def exit_terminal(terminal_id: TerminalId) -> Dict:
         if provider is None:
             raise ValueError(f"Provider not found for terminal {terminal_id}")
         exit_command = provider.exit_cli()
-        terminal_service.send_input(terminal_id, exit_command)
+        # Some providers use tmux key sequences (e.g., "C-d" for Ctrl+D) instead
+        # of text commands (e.g., "/exit"). Key sequences must be sent via
+        # send_special_key() to be interpreted by tmux, not as literal text.
+        if exit_command.startswith(("C-", "M-")):
+            terminal_service.send_special_key(terminal_id, exit_command)
+        else:
+            terminal_service.send_input(terminal_id, exit_command)
         return {"success": True}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))

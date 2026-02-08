@@ -19,6 +19,7 @@ The provider detects the following terminal states:
 
 import logging
 import re
+import shlex
 from typing import Optional
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
@@ -130,7 +131,7 @@ class KiroCliProvider(BaseProvider):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
         # Step 2: Start the Kiro CLI chat session with the specified agent profile
-        command = f"kiro-cli chat --agent {self._agent_profile}"
+        command = shlex.join(["kiro-cli", "chat", "--agent", self._agent_profile])
         tmux_client.send_keys(self.session_name, self.window_name, command)
 
         # Step 3: Wait for Kiro CLI to fully initialize and show the agent prompt

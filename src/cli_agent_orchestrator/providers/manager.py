@@ -27,6 +27,7 @@ from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
 from cli_agent_orchestrator.providers.codex import CodexProvider
+from cli_agent_orchestrator.providers.gemini_cli import GeminiCliProvider
 from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
 from cli_agent_orchestrator.providers.q_cli import QCliProvider
@@ -73,6 +74,8 @@ class ProviderManager:
                 provider = CodexProvider(terminal_id, tmux_session, tmux_window, agent_profile)
             elif provider_type == ProviderType.KIMI_CLI.value:
                 provider = KimiCliProvider(terminal_id, tmux_session, tmux_window, agent_profile)
+            elif provider_type == ProviderType.GEMINI_CLI.value:
+                provider = GeminiCliProvider(terminal_id, tmux_session, tmux_window, agent_profile)
             else:
                 raise ValueError(f"Unknown provider type: {provider_type}")
 

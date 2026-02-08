@@ -48,7 +48,7 @@ uv run pytest test/providers/test_kiro_cli_unit.py -v -k "test_initialization"
 Unit tests use mocked dependencies and don't require CLI tools or servers:
 
 ```bash
-# Run all unit tests (530 tests, excludes E2E and Q CLI integration)
+# Run all unit tests (598 tests, excludes E2E and Q CLI integration)
 uv run pytest test/ -v --ignore=test/e2e --ignore=test/providers/test_q_cli_integration.py
 
 # Run provider-specific tests
@@ -57,6 +57,7 @@ uv run pytest test/providers/test_claude_code_unit.py -v
 uv run pytest test/providers/test_codex_provider_unit.py -v
 uv run pytest test/providers/test_q_cli_unit.py -v
 uv run pytest test/providers/test_kimi_cli_unit.py -v
+uv run pytest test/providers/test_gemini_cli_unit.py -v
 
 # Run other test modules
 uv run pytest test/clients/ -v
@@ -94,6 +95,7 @@ uv run pytest -m e2e test/e2e/ -v -k codex
 uv run pytest -m e2e test/e2e/ -v -k claude_code
 uv run pytest -m e2e test/e2e/ -v -k kiro_cli
 uv run pytest -m e2e test/e2e/ -v -k kimi_cli
+uv run pytest -m e2e test/e2e/ -v -k gemini_cli
 
 # Run a specific test type
 uv run pytest -m e2e test/e2e/test_handoff.py -v
@@ -109,6 +111,7 @@ uv run pytest -m e2e test/e2e/test_send_message.py -v
   - **Claude Code**: `npm install -g @anthropic-ai/claude-code` + `ANTHROPIC_API_KEY` set
   - **Kiro CLI**: `npm install -g @anthropic-ai/kiro-cli` + AWS credentials configured
   - **Kimi CLI**: `brew install kimi-cli` or `uv tool install kimi-cli` + `kimi login`
+  - **Gemini CLI**: `npm install -g @google/gemini-cli` + OAuth or `GEMINI_API_KEY`
 - Agent profiles installed: `data_analyst`, `report_generator`
 
 E2E tests are excluded from default `pytest` runs via `-m 'not e2e'` in `pyproject.toml`.
@@ -251,7 +254,7 @@ cli-agent-orchestrator/
 │       ├── clients/                # Database and tmux clients
 │       ├── mcp_server/             # MCP server implementation
 │       ├── models/                 # Data models
-│       ├── providers/              # Agent providers (Kiro CLI, Claude Code, Codex, Kimi CLI, Q CLI)
+│       ├── providers/              # Agent providers (Kiro CLI, Claude Code, Codex, Kimi CLI, Gemini CLI, Q CLI)
 │       ├── services/               # Business logic services
 │       ├── agent_store/            # Built-in agent profiles (.md)
 │       └── utils/                  # Utility functions
@@ -267,6 +270,7 @@ cli-agent-orchestrator/
 │   │   ├── test_claude_code_unit.py
 │   │   ├── test_codex_provider_unit.py
 │   │   ├── test_kimi_cli_unit.py
+│   │   ├── test_gemini_cli_unit.py
 │   │   └── test_q_cli_unit.py
 │   ├── services/                   # Service layer tests
 │   └── utils/                      # Utility tests
@@ -276,7 +280,8 @@ cli-agent-orchestrator/
 │   ├── codex-cli.md                # Codex provider docs
 │   ├── claude-code.md              # Claude Code provider docs
 │   ├── kiro-cli.md                 # Kiro CLI provider docs
-│   └── kimi-cli.md                 # Kimi CLI provider docs
+│   ├── kimi-cli.md                 # Kimi CLI provider docs
+│   └── gemini-cli.md               # Gemini CLI provider docs
 ├── examples/                       # Example workflows
 │   ├── assign/                     # Assign (async parallel) workflow
 │   ├── codex-basic/                # Basic Codex usage

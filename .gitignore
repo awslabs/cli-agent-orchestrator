@@ -26,6 +26,8 @@ dist/
 *.db
 .amazonq/
 .obsidian/
+.ralph/
+.ralphrc
 
 # Memory
 context/

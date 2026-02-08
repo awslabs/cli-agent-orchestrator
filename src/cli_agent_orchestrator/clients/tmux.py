@@ -141,6 +141,36 @@ class TmuxClient:
                 check=False,
             )
 
+    def send_special_key(self, session_name: str, window_name: str, key: str) -> None:
+        """Send a tmux special key sequence (e.g., C-d, C-c) to a window.
+
+        Unlike send_keys(), this sends the key as a tmux key name (not literal text)
+        and does not append a carriage return. Used for control signals like Ctrl+D (EOF).
+
+        Args:
+            session_name: Name of tmux session
+            window_name: Name of window in session
+            key: Tmux key name (e.g., "C-d", "C-c", "Escape")
+        """
+        try:
+            logger.info(f"send_special_key: {session_name}:{window_name} - key: {key}")
+
+            session = self.server.sessions.get(session_name=session_name)
+            if not session:
+                raise ValueError(f"Session '{session_name}' not found")
+
+            window = session.windows.get(window_name=window_name)
+            if not window:
+                raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
+
+            pane = window.active_pane
+            if pane:
+                pane.send_keys(key, enter=False)
+                logger.debug(f"Sent special key to {session_name}:{window_name}")
+        except Exception as e:
+            logger.error(f"Failed to send special key to {session_name}:{window_name}: {e}")
+            raise
+
     def get_history(
         self, session_name: str, window_name: str, tail_lines: Optional[int] = None
     ) -> str:

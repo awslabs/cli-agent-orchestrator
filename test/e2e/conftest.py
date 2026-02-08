@@ -2,7 +2,7 @@
 
 E2E tests require:
 - A running CAO server (cao-server / uvicorn on localhost:9889)
-- The provider CLI tool installed and authenticated (codex, claude, kiro-cli)
+- The provider CLI tool installed and authenticated (codex, claude, kiro-cli, kimi, gemini)
 - tmux available on the system
 
 Run with: uv run pytest -m e2e test/e2e/ -v
@@ -66,6 +66,13 @@ def require_kimi():
     """Skip test if kimi CLI is not available."""
     if not _cli_available("kimi"):
         pytest.skip("kimi CLI not installed")
+
+
+@pytest.fixture()
+def require_gemini():
+    """Skip test if gemini CLI is not available."""
+    if not _cli_available("gemini"):
+        pytest.skip("gemini CLI not installed")
 
 
 def create_terminal(provider: str, agent_profile: str, session_name: str):

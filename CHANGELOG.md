@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fix shell command injection risk in Q CLI and Kiro CLI providers: replace f-string command interpolation with `shlex.join()` for safe shell escaping of `agent_profile` values, consistent with other providers
+- Fix Gemini CLI `exit_cli()` returning `C-d` (tmux key sequence) but being sent as literal text through `send_input()`: add `send_special_key()` to `TmuxClient` and `terminal_service`, update `exit_terminal` endpoint to detect key sequences (`C-` or `M-` prefix) and route through non-literal tmux key sending
+- Fix Claude Code provider not forwarding `CAO_TERMINAL_ID` to MCP server subprocesses: inject `CAO_TERMINAL_ID` into MCP server `env` config, matching Kimi CLI and Codex providers
+- Fix `constants.py` docstring missing Kimi CLI and Gemini CLI from provider list
 - Fix Claude Code provider failing to launch due to tmux `send-keys` corrupting single quotes in long commands; resolved by main branch's paste-buffer approach (`load-buffer` + `paste-buffer -p`)
 - Add missing `wait_for_shell` call to Claude Code provider `initialize()` to match other providers
 - Update Claude Code `IDLE_PROMPT_PATTERN` to match both `>` and `❯` prompt styles
@@ -53,11 +57,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI workflow `test-codex-provider.yml` for Codex provider-specific unit tests (path-triggered)
 - CI workflow `test-claude-code-provider.yml` for Claude Code provider-specific unit tests (path-triggered)
 - Kimi CLI provider (`providers/kimi_cli.py`): full integration with Kimi Code CLI (https://kimi.com/code) including idle/processing/completed/error status detection via TUI prompt patterns (✨/💫), response extraction with thinking-bullet filtering, agent profile support via temp YAML files, MCP server config injection, and temp file cleanup
-- Kimi CLI unit tests (`test/providers/test_kimi_cli_unit.py`): 54 tests across 6 test classes covering initialization, status detection, message extraction, command building, patterns, and lifecycle (100% code coverage)
+- Kimi CLI unit tests (`test/providers/test_kimi_cli_unit.py`): 57 tests across 6 test classes covering initialization, status detection, message extraction, command building, patterns, and lifecycle (100% code coverage)
 - Kimi CLI test fixtures: 5 fixture files (`kimi_cli_idle_output.txt`, `kimi_cli_completed_output.txt`, `kimi_cli_processing_output.txt`, `kimi_cli_error_output.txt`, `kimi_cli_complex_response.txt`) capturing real terminal output patterns
 - Kimi CLI E2E tests: handoff (2 tests), assign (2 tests), and send_message (1 test) in `test/e2e/` gated behind `require_kimi` fixture
 - CI workflow `test-kimi-cli-provider.yml` for Kimi CLI provider-specific unit tests (path-triggered)
 - Provider documentation: `docs/kimi-cli.md` covering prerequisites, status detection, message extraction, agent profiles, MCP config, and troubleshooting
+- Gemini CLI provider (`providers/gemini_cli.py`): full integration with Gemini CLI (https://github.com/google-gemini/gemini-cli) including idle/processing/completed/error status detection via Ink TUI patterns (`*   Type your message` idle prompt, `✦` response prefix, `>` query prefix), response extraction with TUI chrome filtering, MCP server registration via `gemini mcp add`, and `CAO_TERMINAL_ID` forwarding via shell export
+- Gemini CLI unit tests (`test/providers/test_gemini_cli_unit.py`): 57 tests across 6 test classes covering initialization, status detection, message extraction, command building, patterns, and miscellaneous (100% code coverage)
+- Gemini CLI test fixtures: 5 fixture files (`gemini_cli_idle_output.txt`, `gemini_cli_completed_output.txt`, `gemini_cli_processing_output.txt`, `gemini_cli_error_output.txt`, `gemini_cli_complex_response.txt`) capturing real terminal output patterns
+- Gemini CLI E2E tests: handoff (2 tests), assign (2 tests), and send_message (1 test) in `test/e2e/` gated behind `require_gemini` fixture
+- CI workflow `test-gemini-cli-provider.yml` for Gemini CLI provider-specific unit tests (path-triggered)
+- Provider documentation: `docs/gemini-cli.md` covering prerequisites, status detection, message extraction, MCP config, and troubleshooting
+- `TmuxClient.send_special_key()` method for sending tmux key sequences (e.g., `C-d`, `C-c`) non-literally, distinct from `send_keys()` which sends text literally
+- `terminal_service.send_special_key()` wrapper function for the new tmux client method
+- Exit terminal endpoint key sequence routing: `POST /terminals/{terminal_id}/exit` now detects `C-`/`M-` prefixed exit commands and sends them as tmux key sequences instead of literal text
 
 ## [1.0.2] - 2026-01-30
 
