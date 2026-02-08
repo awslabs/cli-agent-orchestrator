@@ -8,10 +8,15 @@ Tests the send_message / inbox flow:
 5. Verify receiver processes the message (status transitions)
 6. Cleanup
 
-Requires: running CAO server, authenticated CLI tools, tmux.
+Requires: running CAO server, authenticated CLI tools (codex, claude, kiro-cli, kimi, gemini), tmux.
 
 Run:
     uv run pytest -m e2e test/e2e/test_send_message.py -v
+    uv run pytest -m e2e test/e2e/test_send_message.py -v -k codex
+    uv run pytest -m e2e test/e2e/test_send_message.py -v -k claude_code
+    uv run pytest -m e2e test/e2e/test_send_message.py -v -k kiro_cli
+    uv run pytest -m e2e test/e2e/test_send_message.py -v -k kimi_cli
+    uv run pytest -m e2e test/e2e/test_send_message.py -v -k gemini_cli
 """
 
 import time
@@ -207,3 +212,17 @@ class TestKimiCliSendMessage:
     def test_send_message_to_inbox(self, require_kimi):
         """Send a message to another Kimi CLI terminal's inbox and verify delivery."""
         _run_send_message_test(provider="kimi_cli", agent_profile="developer")
+
+
+# ---------------------------------------------------------------------------
+# Gemini CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestGeminiCliSendMessage:
+    """E2E send_message tests for the Gemini CLI provider."""
+
+    def test_send_message_to_inbox(self, require_gemini):
+        """Send a message to another Gemini CLI terminal's inbox and verify delivery."""
+        _run_send_message_test(provider="gemini_cli", agent_profile="developer")

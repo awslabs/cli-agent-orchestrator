@@ -4,7 +4,7 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                         Entry Points                                 │
+│                         Entry Points                                │
 ├─────────────────────────────┬───────────────────────────────────────┤
 │       CLI Commands          │         MCP Server                    │
 │       (cao launch)          │    (handoff, send_message)            │
@@ -41,9 +41,11 @@
          │             │             │ • codex  │
          │             │             │ • kimi   │
     ┌────▼────┐  ┌─────▼─────┐      │   _cli   │
-    │  Tmux   │  │  SQLite   │      └────┬─────┘
-    │ Sessions│  │  Database │           │
-    └─────────┘  └───────────┘     ┌─────▼──────┐
+    │  Tmux   │  │  SQLite   │      │ • gemini │
+    │ Sessions│  │  Database │      │   _cli   │
+    └─────────┘  └───────────┘      └────┬─────┘
+                                         │
+                                   ┌─────▼──────┐
                                    │ CLI Tools  │
                                    │• Kiro CLI  │
                                    │  (default) │
@@ -51,6 +53,7 @@
                                    │  Code      │
                                    │• Codex CLI │
                                    │• Kimi CLI  │
+                                   │• Gemini CLI│
                                    └────────────┘
 ```
 
@@ -81,7 +84,8 @@ src/cli_agent_orchestrator/
 │   ├── q_cli.py           # Amazon Q CLI provider (q_cli)
 │   ├── claude_code.py     # Claude Code provider (claude_code, ❯ prompt, trust prompt handling)
 │   ├── codex.py           # Codex/ChatGPT CLI provider (codex, developer_instructions, › prompt + • bullet detection, trust prompt handling)
-│   └── kimi_cli.py        # Kimi CLI provider (kimi_cli, ✨/💫 prompt, • bullet response, thinking filter)
+│   ├── kimi_cli.py        # Kimi CLI provider (kimi_cli, ✨/💫 prompt, • bullet response, thinking filter)
+│   └── gemini_cli.py      # Gemini CLI provider (gemini_cli, Ink TUI, ✦ response prefix, > query prefix)
 ├── models/                # Data models
 │   ├── terminal.py        # Terminal, TerminalStatus
 │   ├── session.py         # Session model

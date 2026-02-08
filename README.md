@@ -98,6 +98,7 @@ Before using CAO, install at least one supported CLI agent tool:
 | **Claude Code** | [Provider docs](docs/claude-code.md) · [Installation](https://docs.anthropic.com/en/docs/claude-code/getting-started) | Anthropic API key |
 | **Codex CLI** | [Provider docs](docs/codex-cli.md) · [Installation](https://github.com/openai/codex) | OpenAI API key |
 | **Kimi CLI** | [Provider docs](docs/kimi-cli.md) · [Installation](https://kimi.com/code) | `kimi login` (OAuth) |
+| **Gemini CLI** | [Provider docs](docs/gemini-cli.md) · [Installation](https://github.com/google-gemini/gemini-cli) | OAuth or `GEMINI_API_KEY` |
 | **Q CLI** | [Installation](https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/command-line.html) | AWS credentials |
 
 ## Quick Start
@@ -144,6 +145,7 @@ cao launch --agents code_supervisor --provider kiro_cli
 cao launch --agents code_supervisor --provider claude_code
 cao launch --agents code_supervisor --provider codex
 cao launch --agents code_supervisor --provider kimi_cli
+cao launch --agents code_supervisor --provider gemini_cli
 
 # Skip workspace trust confirmation
 cao launch --agents code_supervisor --yolo

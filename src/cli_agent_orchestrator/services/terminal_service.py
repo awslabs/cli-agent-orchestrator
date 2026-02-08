@@ -229,6 +229,38 @@ def send_input(terminal_id: str, message: str) -> bool:
         raise
 
 
+def send_special_key(terminal_id: str, key: str) -> bool:
+    """Send a tmux special key sequence (e.g., C-d, C-c) to terminal.
+
+    Unlike send_input(), this sends the key as a tmux key name (not literal text)
+    and does not append a carriage return. Used for control signals like Ctrl+D (EOF).
+
+    Args:
+        terminal_id: Target terminal identifier
+        key: Tmux key name (e.g., "C-d", "C-c", "Escape")
+
+    Returns:
+        True if the key was sent successfully
+
+    Raises:
+        ValueError: If terminal not found
+    """
+    try:
+        metadata = get_terminal_metadata(terminal_id)
+        if not metadata:
+            raise ValueError(f"Terminal '{terminal_id}' not found")
+
+        tmux_client.send_special_key(metadata["tmux_session"], metadata["tmux_window"], key)
+
+        update_last_active(terminal_id)
+        logger.info(f"Sent special key '{key}' to terminal: {terminal_id}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to send special key to terminal {terminal_id}: {e}")
+        raise
+
+
 def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
     """Get terminal output."""
     try:

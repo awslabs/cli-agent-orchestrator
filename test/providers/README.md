@@ -21,6 +21,7 @@ test/providers/
 ├── test_claude_code_unit.py    # Claude Code unit tests (fast, mocked)
 ├── test_codex_provider_unit.py # Codex CLI unit tests (fast, mocked)
 ├── test_kimi_cli_unit.py       # Kimi CLI unit tests (fast, mocked)
+├── test_gemini_cli_unit.py    # Gemini CLI unit tests (fast, mocked)
 ├── test_base_provider.py       # Base provider abstract interface tests
 ├── test_tmux_working_directory.py # TmuxClient working directory tests
 ├── test_q_cli_integration.py   # Q CLI integration tests (slow, real Q CLI)
@@ -29,6 +30,7 @@ test/providers/
 │   ├── q_cli_*.txt             # Q CLI fixtures
 │   ├── codex_*.txt             # Codex CLI fixtures
 │   ├── kimi_cli_*.txt          # Kimi CLI fixtures
+│   ├── gemini_cli_*.txt        # Gemini CLI fixtures
 │   └── generate_fixtures.py    # Script to regenerate fixtures
 └── README.md
 ```
@@ -215,6 +217,7 @@ Each provider has a dedicated workflow that runs only when its files change:
 | `test-kiro-cli-provider.yml` | `test_kiro_cli_unit.py` | `providers/kiro_cli.py`, `test/providers/**` |
 | `test-q-cli-provider.yml` | `test_q_cli_unit.py` | `providers/q_cli.py`, `test/providers/**` |
 | `test-kimi-cli-provider.yml` | `test_kimi_cli_unit.py` | `providers/kimi_cli.py`, `test/providers/**` |
+| `test-gemini-cli-provider.yml` | `test_gemini_cli_unit.py` | `providers/gemini_cli.py`, `test/providers/**` |
 
 Each includes unit tests (Python 3.10/3.11/3.12) and code quality checks (black, isort, mypy).
 
@@ -577,6 +580,87 @@ uv run pytest test/providers/test_kimi_cli_unit.py --cov=src/cli_agent_orchestra
 uv run pytest test/providers/test_kimi_cli_unit.py::TestKimiCliStatusDetection -v
 ```
 
+## Gemini CLI Provider Tests
+
+### Test Coverage (`test_gemini_cli_unit.py`)
+
+**57 tests across 6 test classes covering:**
+
+1. **Initialization (6 tests)**
+   - Successful initialization (wait_for_shell + gemini --yolo --sandbox false + wait_until_status IDLE)
+   - Shell timeout handling
+   - Gemini CLI timeout handling
+   - Initialization with MCP servers
+   - Command verification
+   - Invalid agent profile error handling
+
+2. **Status Detection (13 tests)**
+   - IDLE status (`*   Type your message`)
+   - COMPLETED status (idle prompt + query + response)
+   - COMPLETED with tool calls
+   - PROCESSING status (no idle prompt at bottom)
+   - ERROR status (empty, None, error pattern)
+   - ANSI-coded output handling
+   - tail_lines parameter pass-through
+   - IDLE detection in tall terminals (46-row with 32 padding lines)
+   - PROCESSING when no idle prompt found
+   - False ERROR prevention when response mentions "Error:"
+   - Multi-turn PROCESSING with old response in scrollback
+
+3. **Message Extraction (10 tests)**
+   - Successful extraction
+   - Complex response with tool calls
+   - No query error
+   - Empty response error
+   - TUI chrome filtering (input borders, status bar, YOLO, model indicator)
+   - Status bar within response window filtering
+   - Multiple responses (extracts last)
+   - No trailing prompt
+   - Tool call box content
+   - ANSI code stripping
+
+4. **Command Building (6 tests)**
+   - Base command without agent profile
+   - MCP server config (dict and Pydantic)
+   - Profile without MCP
+   - Profile load failure
+   - Multiple MCP servers
+
+5. **Miscellaneous (8 tests)**
+   - Exit command (`C-d`), idle pattern for log, cleanup
+   - MCP server cleanup (remove commands sent)
+   - MCP removal error handling
+   - Provider inheritance, default state, agent profile
+
+6. **Pattern Tests (14 tests)**
+   - IDLE_PROMPT_PATTERN, WELCOME_BANNER_PATTERN, QUERY_BOX_PREFIX_PATTERN
+   - RESPONSE_PREFIX_PATTERN, MODEL_INDICATOR_PATTERN, TOOL_CALL_BOX_PATTERN
+   - INPUT_BOX borders, STATUS_BAR_PATTERN, YOLO_INDICATOR_PATTERN
+   - ERROR_PATTERN, ANSI_CODE_PATTERN, IDLE_PROMPT_TAIL_LINES bounds
+
+**Coverage:** 100% of gemini_cli.py (126 statements)
+
+### Test Fixtures
+
+- **gemini_cli_idle_output.txt** — Ink TUI with banner, YOLO indicator, and `*   Type your message` input box
+- **gemini_cli_completed_output.txt** — Banner + `> say hi` query + `✦ Hi!` response + idle input box
+- **gemini_cli_processing_output.txt** — Streaming output without idle prompt
+- **gemini_cli_error_output.txt** — Error message output
+- **gemini_cli_complex_response.txt** — Multi-line response with `╭╰` tool call box and ReadFile
+
+### Running Gemini CLI Tests
+
+```bash
+# Run all Gemini CLI unit tests
+uv run pytest test/providers/test_gemini_cli_unit.py -v
+
+# Run with coverage
+uv run pytest test/providers/test_gemini_cli_unit.py --cov=src/cli_agent_orchestrator/providers/gemini_cli.py --cov-report=term-missing -v
+
+# Run specific test class
+uv run pytest test/providers/test_gemini_cli_unit.py::TestGeminiCliProviderStatusDetection -v
+```
+
 ## Kiro CLI Provider Tests
 
 ### Running Kiro CLI Tests
@@ -662,11 +746,11 @@ uv run pytest test/cli/commands/test_launch.py -v
 
 ## Test Quality Metrics
 
-- **Provider Unit Test Count:** ~209 (across all providers)
+- **Provider Unit Test Count:** ~264 (across all providers)
 - **CLI Command Test Count:** ~10
 - **Client Unit Test Count:** ~20
 - **Integration Test Count:** 9
-- **Total Test Count:** 533
+- **Total Test Count:** 598
 - **Coverage:** 83% overall; 96-100% of all provider modules and launch.py
 - **Execution Time:** <5s (unit), <90s (integration)
 - **Test Categories:** 12 (initialization, status label-format, status bullet-format, extraction label-format, extraction bullet-format, command building, patterns, prompts, handoff, edge cases, tmux send_keys, workspace confirmation)

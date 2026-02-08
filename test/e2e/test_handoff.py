@@ -8,13 +8,15 @@ Tests the full handoff flow that _handoff_impl() executes:
 5. Extract and validate output
 6. Cleanup
 
-Requires: running CAO server, authenticated CLI tools, tmux.
+Requires: running CAO server, authenticated CLI tools (codex, claude, kiro-cli, kimi, gemini), tmux.
 
 Run:
     uv run pytest -m e2e test/e2e/test_handoff.py -v
     uv run pytest -m e2e test/e2e/test_handoff.py -v -k codex
     uv run pytest -m e2e test/e2e/test_handoff.py -v -k claude_code
     uv run pytest -m e2e test/e2e/test_handoff.py -v -k kiro_cli
+    uv run pytest -m e2e test/e2e/test_handoff.py -v -k kimi_cli
+    uv run pytest -m e2e test/e2e/test_handoff.py -v -k gemini_cli
 """
 
 import time
@@ -38,7 +40,7 @@ def _run_handoff_test(provider: str, agent_profile: str, task_message: str, cont
     """Core handoff test logic shared across providers.
 
     Args:
-        provider: Provider name ("codex", "claude_code", "kiro_cli")
+        provider: Provider name ("codex", "claude_code", "kiro_cli", "kimi_cli", "gemini_cli")
         agent_profile: Agent profile name ("developer")
         task_message: The task to send to the agent
         content_keywords: Words expected in the output (at least one must match)
@@ -228,4 +230,38 @@ class TestKimiCliHandoff:
                 "a and b and returns a divided by b. Output only the function code."
             ),
             content_keywords=["divide", "return", "def"],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Gemini CLI provider tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestGeminiCliHandoff:
+    """E2E handoff tests for the Gemini CLI provider."""
+
+    def test_handoff_simple_function(self, require_gemini):
+        """Gemini CLI developer creates a simple Python function and returns output."""
+        _run_handoff_test(
+            provider="gemini_cli",
+            agent_profile="developer",
+            task_message=(
+                "Create a Python function called 'greet' that takes a name parameter "
+                "and returns 'Hello, {name}!'. Output only the function code."
+            ),
+            content_keywords=["greet", "hello", "def"],
+        )
+
+    def test_handoff_second_task(self, require_gemini):
+        """Gemini CLI developer handles a second independent task."""
+        _run_handoff_test(
+            provider="gemini_cli",
+            agent_profile="developer",
+            task_message=(
+                "Create a Python function called 'square' that takes a parameter n "
+                "and returns n squared. Output only the function code."
+            ),
+            content_keywords=["square", "return", "def"],
         )

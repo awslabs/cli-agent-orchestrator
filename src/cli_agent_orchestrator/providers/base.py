@@ -15,6 +15,7 @@ Implemented Providers:
 - ClaudeCodeProvider: For Claude Code (claude)
 - CodexProvider: For Codex CLI (codex)
 - KimiCliProvider: For Kimi CLI (kimi)
+- GeminiCliProvider: For Gemini CLI (gemini)
 - QCliProvider: For Amazon Q Developer CLI (q chat)
 
 Each provider must implement pattern matching for its specific CLI's prompt

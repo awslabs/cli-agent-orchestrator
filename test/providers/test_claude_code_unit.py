@@ -1,5 +1,6 @@
 """Unit tests for Claude Code provider."""
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -103,8 +104,7 @@ class TestClaudeCodeProviderInitialization:
         mock_tmux.get_history.return_value = "Welcome to Claude Code v2.0"
         mock_profile = MagicMock()
         mock_profile.system_prompt = None
-        mock_profile.mcpServers = {"server1": {"command": "test"}}
-        mock_profile.model_dump_json = MagicMock(return_value='{"mcpServers": {}}')
+        mock_profile.mcpServers = {"server1": {"command": "test", "args": ["--flag"]}}
         mock_load.return_value = mock_profile
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0", "test-agent")
@@ -340,6 +340,83 @@ class TestClaudeCodeProviderMisc:
 
         assert "claude" in command
         assert "--append-system-prompt" in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_build_command_mcp_injects_terminal_id(self, mock_load):
+        """Test that _build_claude_command injects CAO_TERMINAL_ID into MCP server env."""
+        mock_profile = MagicMock()
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = {
+            "cao-mcp-server": {"command": "cao-mcp-server", "args": ["--port", "8080"]}
+        }
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("term-42", "test-session", "window-0", "test-agent")
+        command = provider._build_claude_command()
+
+        assert "--mcp-config" in command
+        # Extract the JSON arg after --mcp-config
+        parts = command.split("--mcp-config ")
+        mcp_json_str = parts[1].strip()
+        # shlex.join wraps the JSON in single quotes; strip them
+        if mcp_json_str.startswith("'") and mcp_json_str.endswith("'"):
+            mcp_json_str = mcp_json_str[1:-1]
+        mcp_data = json.loads(mcp_json_str)
+        server_env = mcp_data["mcpServers"]["cao-mcp-server"]["env"]
+        assert server_env["CAO_TERMINAL_ID"] == "term-42"
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_build_command_mcp_preserves_existing_env(self, mock_load):
+        """Test that existing env vars in MCP config are preserved when injecting CAO_TERMINAL_ID."""
+        mock_profile = MagicMock()
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = {
+            "my-server": {
+                "command": "my-server",
+                "env": {"MY_VAR": "my_value", "OTHER": "other_value"},
+            }
+        }
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("term-99", "test-session", "window-0", "test-agent")
+        command = provider._build_claude_command()
+
+        parts = command.split("--mcp-config ")
+        mcp_json_str = parts[1].strip()
+        if mcp_json_str.startswith("'") and mcp_json_str.endswith("'"):
+            mcp_json_str = mcp_json_str[1:-1]
+        mcp_data = json.loads(mcp_json_str)
+        server_env = mcp_data["mcpServers"]["my-server"]["env"]
+        # Original vars preserved
+        assert server_env["MY_VAR"] == "my_value"
+        assert server_env["OTHER"] == "other_value"
+        # CAO_TERMINAL_ID added
+        assert server_env["CAO_TERMINAL_ID"] == "term-99"
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_build_command_mcp_does_not_override_existing_terminal_id(self, mock_load):
+        """Test that an existing CAO_TERMINAL_ID in MCP env is NOT overwritten."""
+        mock_profile = MagicMock()
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = {
+            "my-server": {
+                "command": "my-server",
+                "env": {"CAO_TERMINAL_ID": "user-provided-id"},
+            }
+        }
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("term-99", "test-session", "window-0", "test-agent")
+        command = provider._build_claude_command()
+
+        parts = command.split("--mcp-config ")
+        mcp_json_str = parts[1].strip()
+        if mcp_json_str.startswith("'") and mcp_json_str.endswith("'"):
+            mcp_json_str = mcp_json_str[1:-1]
+        mcp_data = json.loads(mcp_json_str)
+        server_env = mcp_data["mcpServers"]["my-server"]["env"]
+        # Should keep the user-provided value, NOT overwrite with term-99
+        assert server_env["CAO_TERMINAL_ID"] == "user-provided-id"
 
 
 class TestClaudeCodeProviderTrustPrompt:
