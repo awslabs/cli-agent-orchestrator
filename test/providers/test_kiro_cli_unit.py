@@ -447,6 +447,16 @@ class TestKiroCliProviderRegexPatterns:
         permission_text = "Allow this action? [y/n/t]: [developer]>"
         assert re.search(provider._permission_prompt_pattern, permission_text)
 
+    def test_permission_prompt_no_match_stale_history(self):
+        """Test that stale permission prompts separated by newlines don't match."""
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+
+        # Stale permission prompt on earlier line, current idle prompt on later line
+        stale = (
+            "Allow this action? [y/n/t]:\n\n[developer] 29% > y\nsome output\n[developer] 29% > "
+        )
+        assert not re.search(provider._permission_prompt_pattern, stale, re.MULTILINE | re.DOTALL)
+
     def test_ansi_code_cleaning(self):
         """Test ANSI code pattern cleaning."""
         from cli_agent_orchestrator.providers.kiro_cli import ANSI_CODE_PATTERN
