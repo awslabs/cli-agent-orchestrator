@@ -49,13 +49,6 @@ CONTROL_CHAR_PATTERN = r"[\x00-\x1f\x7f-\x9f]"
 
 # Bell character (audible alert)
 BELL_CHAR = "\x07"
-
-# Generic prompt pattern with ANSI codes (purple arrow)
-# Used for detecting IDLE state in raw terminal output
-GENERIC_PROMPT_PATTERN = r"\x1b\[38;5;13m>\s*\x1b\[39m\s*$"
-
-# IDLE prompt pattern for log file monitoring
-# Matches the colored prompt indicator in pipe-pane output (flexible color code)
 IDLE_PROMPT_PATTERN_LOG = r"\x1b\[38;5;\d+m\[.+?\].*\x1b\[38;5;\d+m>\s*\x1b\[\d*m"
 
 # =============================================================================
