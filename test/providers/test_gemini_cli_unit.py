@@ -472,7 +472,7 @@ class TestGeminiCliProviderBuildCommand:
         provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
         command = provider._build_gemini_command()
 
-        assert "gemini mcp add test-server -- npx test-pkg" in command
+        assert "gemini mcp add test-server -e CAO_TERMINAL_ID=term-1 npx test-pkg" in command
         assert "CAO_TERMINAL_ID" in command
         assert "gemini --yolo --sandbox false" in command
         # MCP server should be tracked for cleanup
@@ -492,7 +492,7 @@ class TestGeminiCliProviderBuildCommand:
         provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
         command = provider._build_gemini_command()
 
-        assert "gemini mcp add my-server -- node server.js" in command
+        assert "gemini mcp add my-server -e CAO_TERMINAL_ID=term-1 node server.js" in command
         assert "CAO_TERMINAL_ID" in command
 
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")

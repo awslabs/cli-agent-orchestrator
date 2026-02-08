@@ -212,13 +212,18 @@ def get_working_directory(terminal_id: str) -> Optional[str]:
 
 
 def send_input(terminal_id: str, message: str) -> bool:
-    """Send input to terminal."""
+    """Send input to terminal via bracketed paste.
+
+    Uses tmux paste buffer with bracketed paste mode (-p) to bypass TUI hotkey
+    handling. Without this, characters like '!' in user messages can trigger
+    Gemini CLI's shell mode toggle and similar TUI hotkeys.
+    """
     try:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        tmux_client.send_keys(metadata["tmux_session"], metadata["tmux_window"], message)
+        tmux_client.send_keys_via_paste(metadata["tmux_session"], metadata["tmux_window"], message)
 
         update_last_active(terminal_id)
         logger.info(f"Sent input to terminal: {terminal_id}")

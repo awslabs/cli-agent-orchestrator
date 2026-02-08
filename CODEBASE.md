@@ -75,7 +75,7 @@ src/cli_agent_orchestrator/
 │   ├── inbox_service.py   # Terminal-to-terminal messaging with watchdog
 │   └── flow_service.py    # Scheduled flow execution
 ├── clients/               # Client Layer: External systems
-│   ├── tmux.py            # Tmux operations (sets CAO_TERMINAL_ID, literal send_keys)
+│   ├── tmux.py            # Tmux operations (sets CAO_TERMINAL_ID, send_keys, send_keys_via_paste for bracketed paste)
 │   └── database.py        # SQLite with terminals & inbox_messages tables
 ├── providers/             # Provider Layer: CLI tool integration
 │   ├── base.py            # Abstract provider interface
@@ -102,6 +102,20 @@ src/cli_agent_orchestrator/
 │   ├── reviewer.md
 │   └── code_supervisor.md
 └── constants.py           # Application constants
+
+skills/                        # Single source of truth for AI coding agent skills
+├── README.md                  # Install instructions per tool
+├── build-cao-provider/        # Full lifecycle guide for building a new provider
+│   ├── SKILL.md
+│   ├── references/
+│   │   ├── implementation-checklist.md
+│   │   ├── lessons-learned.md
+│   │   └── verification-checklist.md
+│   └── templates/ralph/
+└── skill-creator/             # Guide for creating new skills
+    ├── SKILL.md
+    ├── references/
+    └── scripts/
 ```
 
 ## Data Flow Examples

@@ -180,19 +180,25 @@ class GeminiCliProvider(BaseProvider):
                         command = cfg.get("command", "")
                         args = cfg.get("args", [])
 
-                        # Build `gemini mcp add <name> -- <command> [args...]`
-                        mcp_parts = ["gemini", "mcp", "add", server_name, "--", command]
+                        # Build `gemini mcp add <name> [-e KEY=VALUE] <command> [args...]`
+                        # Note: Do NOT use `--` separator — yargs in gemini-cli treats
+                        # it as end-of-options and fails with "not enough positional args".
+                        # Use -e flag for env vars (native gemini mcp add support).
+                        mcp_parts = [
+                            "gemini",
+                            "mcp",
+                            "add",
+                            server_name,
+                            "-e",
+                            f"CAO_TERMINAL_ID={self.terminal_id}",
+                            command,
+                        ]
                         mcp_parts.extend(args)
                         setup_commands.append(shlex.join(mcp_parts))
                         self._mcp_server_names.append(server_name)
 
-                    # Set CAO_TERMINAL_ID env var for MCP servers.
-                    # Gemini CLI forwards the parent shell environment to MCP
-                    # subprocesses, so we export it in the shell before launching.
-                    env_export = f"export CAO_TERMINAL_ID={shlex.quote(self.terminal_id)}"
-
-                    # Chain: export env → add MCP servers → launch gemini
-                    all_commands = [env_export] + setup_commands + [shlex.join(command_parts)]
+                    # Chain: add MCP servers → launch gemini
+                    all_commands = setup_commands + [shlex.join(command_parts)]
                     return " && ".join(all_commands)
 
             except Exception as e:

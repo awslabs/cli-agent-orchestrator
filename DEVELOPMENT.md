@@ -286,6 +286,9 @@ cli-agent-orchestrator/
 │   ├── assign/                     # Assign (async parallel) workflow
 │   ├── codex-basic/                # Basic Codex usage
 │   └── flow/                       # Scheduled flow examples
+├── skills/                        # AI coding agent skills (single source of truth)
+│   ├── build-cao-provider/        # Provider development lifecycle guide
+│   └── skill-creator/             # Skill creation guide
 ├── pyproject.toml                  # Project configuration
 └── uv.lock                         # Locked dependencies
 ```

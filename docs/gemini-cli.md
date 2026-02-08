@@ -84,14 +84,13 @@ If an agent profile provides MCP servers, those are registered via `gemini mcp a
 MCP servers from agent profiles are registered using `gemini mcp add` commands chained before the main `gemini` command:
 
 ```bash
-export CAO_TERMINAL_ID=abc12345 && \
-gemini mcp add cao-mcp-server -- npx -y cao-mcp-server && \
+gemini mcp add cao-mcp-server -e CAO_TERMINAL_ID=abc12345 npx -y cao-mcp-server && \
 gemini --yolo --sandbox false
 ```
 
 ### CAO_TERMINAL_ID Forwarding
 
-Gemini CLI forwards parent shell environment variables to MCP subprocesses, so `CAO_TERMINAL_ID` is set via `export` in the shell before launching. This ensures tools like `handoff` and `assign` create new agent windows in the same tmux session.
+Gemini CLI forwards `CAO_TERMINAL_ID` to MCP subprocesses via the `-e` flag on `gemini mcp add`, which sets environment variables in the MCP server process. This ensures tools like `handoff` and `assign` create new agent windows in the same tmux session.
 
 ### MCP Server Cleanup
 
