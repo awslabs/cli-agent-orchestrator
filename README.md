@@ -28,130 +28,128 @@ For detailed project structure and architecture, see [CODEBASE.md](CODEBASE.md).
 
 ## Installation
 
-1. Install tmux (version 3.3 or higher required)
+### Requirements
+
+- **Python 3.10 or higher** — CAO requires Python >=3.10 (see [pyproject.toml](pyproject.toml))
+- **tmux 3.3+** — Used for agent session isolation
+- **[uv](https://docs.astral.sh/uv/)** — Fast Python package installer and virtual environment manager
+
+### 1. Install Python 3.10+
+
+If you don't have Python 3.10+ installed, use your platform's package manager:
+
+```bash
+# macOS (Homebrew)
+brew install python@3.12
+
+# Ubuntu/Debian
+sudo apt update && sudo apt install python3.12 python3.12-venv
+
+# Amazon Linux 2023 / Fedora
+sudo dnf install python3.12
+```
+
+Verify your Python version:
+
+```bash
+python3 --version   # Should be 3.10 or higher
+```
+
+> **Note:** We recommend using [uv](https://docs.astral.sh/uv/) to manage Python environments instead of system-wide installations like Anaconda. `uv` automatically handles virtual environments and Python version resolution per-project.
+
+### 2. Install tmux (version 3.3 or higher required)
 
 ```bash
 bash <(curl -s https://raw.githubusercontent.com/awslabs/cli-agent-orchestrator/refs/heads/main/tmux-install.sh)
 ```
 
-2. Install uv
+### 3. Install uv
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-3. Install CLI Agent Orchestrator:
+### 4. Install CLI Agent Orchestrator
 
 ```bash
 uv tool install git+https://github.com/awslabs/cli-agent-orchestrator.git@main --upgrade
 ```
 
+### Development Setup
+
+For local development, clone the repo and install with `uv sync`:
+
+```bash
+git clone https://github.com/awslabs/cli-agent-orchestrator.git
+cd cli-agent-orchestrator/
+uv sync          # Creates .venv/ and installs all dependencies
+uv run cao --help  # Verify installation
+```
+
+For development workflow, testing, code quality checks, and project structure, see [DEVELOPMENT.md](DEVELOPMENT.md).
+
+## Prerequisites
+
+Before using CAO, install at least one supported CLI agent tool:
+
+| Provider | Documentation | Authentication |
+|----------|---------------|----------------|
+| **Kiro CLI** (default) | [Provider docs](docs/kiro-cli.md) · [Installation](https://kiro.dev/docs/kiro-cli) | AWS credentials |
+| **Claude Code** | [Provider docs](docs/claude-code.md) · [Installation](https://docs.anthropic.com/en/docs/claude-code/getting-started) | Anthropic API key |
+| **Codex CLI** | [Provider docs](docs/codex-cli.md) · [Installation](https://github.com/openai/codex) | OpenAI API key |
+| **Q CLI** | [Installation](https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/command-line.html) | AWS credentials |
+
 ## Quick Start
 
-### Installing Agents
+### 1. Install Agent Profiles
 
-CAO supports installing agents from multiple sources:
-
-**1. Install built-in agents (bundled with CAO):**
+Install the supervisor agent (the orchestrator that delegates to other agents):
 
 ```bash
 cao install code_supervisor
+```
+
+Optionally install additional worker agents:
+
+```bash
 cao install developer
 cao install reviewer
 ```
 
-**2. Install from a local file:**
+You can also install agents from local files or URLs:
 
 ```bash
 cao install ./my-custom-agent.md
-cao install /absolute/path/to/agent.md
-```
-
-**3. Install from a URL:**
-
-```bash
 cao install https://example.com/agents/custom-agent.md
 ```
 
-When installing from a file or URL, the agent is saved to your local agent store (`~/.aws/cli-agent-orchestrator/agent-store/`) and can be referenced by name in future installations.
-
-**Provider Selection:**
-
-By default, agents are installed for the `q_cli` provider (Amazon Q CLI). You can specify a different provider:
-
-```bash
-# Install for Kiro CLI
-cao install developer --provider kiro_cli
-
-# Install for Amazon Q CLI (default)
-cao install developer --provider q_cli
-```
-
-Note: The `claude_code` provider does not require agent installation.
-
 For details on creating custom agent profiles, see [docs/agent-profile.md](docs/agent-profile.md).
 
-## Codex CLI Provider
-
-The **Codex CLI provider** enables CAO to work with **ChatGPT/Codex CLI** through your ChatGPT subscription, allowing you to orchestrate multiple Codex-based agents without migrating to API-based agents.
-
-### Key Benefits
-
-- **ChatGPT Integration**: Use your existing ChatGPT subscription for agent orchestration
-- **No Migration Required**: Continue using Codex CLI without switching to API-based agents
-- **Multi-Agent Coordination**: Orchestrate multiple Codex agents in supervisor-worker patterns
-- **Status Detection**: Automatic detection of processing, waiting, completed, and error states
-
-### Quick Start
-
-```bash
-# Start the CAO server (in one terminal)
-cao-server
-
-# Install an example Codex agent profile
-cao install examples/codex-basic/codex_developer.md --provider codex
-
-# Launch a Codex-backed agent (opens a tmux window)
-cao launch --agents codex_developer --provider codex
-
-# In the tmux window, paste your prompt at the Codex prompt.
-
-# Optional: print the CAO terminal id (useful for API automation / MCP)
-echo "$CAO_TERMINAL_ID"
-```
-
-Optional automation (send input + fetch extracted last message) from another terminal:
-
-```bash
-TERMINAL_ID="<terminal-id>"
-
-curl -X POST "http://localhost:9889/terminals/${TERMINAL_ID}/input" \
-  --get \
-  --data-urlencode 'message=Review this Python code for security issues'
-
-curl "http://localhost:9889/terminals/${TERMINAL_ID}/output?mode=last"
-```
-
-For detailed documentation and examples, see [docs/codex-cli.md](docs/codex-cli.md).
-
-### Launching Agents
-
-Start the cao server:
+### 2. Start the Server
 
 ```bash
 cao-server
 ```
 
-In another terminal, launch a terminal with an agent profile:
+### 3. Launch the Supervisor
+
+In another terminal, launch the supervisor agent:
 
 ```bash
 cao launch --agents code_supervisor
 
 # Or specify a provider
 cao launch --agents code_supervisor --provider kiro_cli
+cao launch --agents code_supervisor --provider claude_code
+cao launch --agents code_supervisor --provider codex
+
+# Skip workspace trust confirmation
+cao launch --agents code_supervisor --yolo
 ```
 
-Shutdown sessions:
+The supervisor will coordinate and delegate tasks to worker agents (developer, reviewer, etc.) as needed using the orchestration patterns.
+
+### 4. Shutdown
 
 ```bash
 # Shutdown all cao sessions
@@ -198,7 +196,7 @@ CAO provides a local HTTP server that processes orchestration requests. CLI agen
 Each agent terminal is assigned a unique `CAO_TERMINAL_ID` environment variable. The server uses this ID to:
 
 - Route messages between agents
-- Track terminal status (IDLE, BUSY, COMPLETED, ERROR)
+- Track terminal status (IDLE, PROCESSING, COMPLETED, ERROR)
 - Manage terminal-to-terminal communication via inbox
 - Coordinate orchestration operations
 
@@ -308,7 +306,7 @@ A flow that runs at regular intervals with a static prompt (no script needed):
 name: daily-standup
 schedule: "0 9 * * 1-5"  # 9am weekdays
 agent_profile: developer
-provider: q_cli  # Optional, defaults to q_cli
+provider: kiro_cli  # Optional, defaults to kiro_cli
 ---
 
 Review yesterday's commits and create a standup summary.
@@ -374,49 +372,17 @@ cao flow remove daily-standup
 
 ## Working Directory Support
 
-CAO supports specifying working directories for agent handoff/delegation operations.
+CAO supports specifying working directories for agent handoff/delegation operations. By default this is disabled to prevent agents from hallucinating directory paths.
 
-### Configuration
-
-Enable working directory parameter in MCP tools:
-
-```bash
-export CAO_ENABLE_WORKING_DIRECTORY=true
-```
-
-### Behavior
-
-- **When disabled (default)**: Working directory parameter is hidden from tools, agents start in supervisor's current directory
-- **When enabled**: Tools expose `working_directory` parameter, allowing explicit directory specification
-- **Default directory**: Current working directory (`cwd`) of the supervisor agent
-
-### Usage Example
-
-With `CAO_ENABLE_WORKING_DIRECTORY=true`:
-
-```python
-# Handoff to agent in specific package directory
-result = await handoff(
-    agent_profile="developer",
-    message="Fix the bug in UserService.java",
-    working_directory="/workspace/src/MyPackage"
-)
-
-# Assign task with specific working directory
-result = await assign(
-    agent_profile="reviewer",
-    message="Review the changes in the authentication module",
-    working_directory="/workspace/src/AuthModule"
-)
-```
-
-### Why Disabled by Default?
-
-Q CLI includes current working directory in context, causing agents to hallucinate/infer directories when the parameter is available. Disabling by default prevents this hallucination for users who don't need explicit directory control.
+For configuration and usage details, see [docs/working-directory.md](docs/working-directory.md).
 
 ## Security
 
-See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
+See [SECURITY.md](SECURITY.md) for vulnerability reporting, security scanning, and best practices.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on contributing to this project.
 
 ## License
 

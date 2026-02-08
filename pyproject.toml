@@ -1,18 +1,19 @@
 [project]
 name = "cli-agent-orchestrator"
-version = "1.0.0"
+version = "1.1.0"
 description = "CLI Agent Orchestrator"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.104.0",
-    "fastmcp>=2.12.2",
+    "fastmcp>=2.14.0",
+    "mcp>=1.23.0",
     "pydantic>=2.10.6",
     "apscheduler>=3.10.4",
     "sqlalchemy>=2.0.0",
     "uvicorn[standard]>=0.24.0",
     "websockets>=12.0",
-    "libtmux==0.51.0",
+    "libtmux>=0.51.0",
     "aiofiles>=24.1.0",
     "click>=8.0.0",
     "python-frontmatter>=1.1.0",
@@ -70,4 +71,4 @@ testpaths = ["test"]
 python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
-addopts = "--cov=src --cov-report=term-missing"
+addopts = "--cov=src --cov-report=term-missing -m 'not e2e'"

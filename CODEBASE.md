@@ -33,20 +33,21 @@
            ┌────▼────┐               ┌────▼─────┐
            │ Clients │               │Providers │
            ├─────────┤               ├──────────┤
-           │ • tmux  │               │ • q_cli  │
-           │ • db    │               │ • kiro   │
-           └────┬────┘               │   _cli   │
+           │ • tmux  │               │ • kiro   │
+           │ • db    │               │   _cli   │
+           └────┬────┘               │ • q_cli  │
                 │                    │ • claude │
          ┌──────┴──────┐             │   _code  │
-         │             │             └────┬─────┘
-    ┌────▼────┐  ┌─────▼─────┐          │
-    │  Tmux   │  │  SQLite   │     ┌─────▼──────┐
-    │ Sessions│  │  Database │     │ CLI Tools  │
-    └─────────┘  └───────────┘     │• Amazon Q  │
-                                   │  CLI       │
+         │             │             │ • codex  │
+    ┌────▼────┐  ┌─────▼─────┐      └────┬─────┘
+    │  Tmux   │  │  SQLite   │          │
+    │ Sessions│  │  Database │     ┌─────▼──────┐
+    └─────────┘  └───────────┘     │ CLI Tools  │
                                    │• Kiro CLI  │
+                                   │  (default) │
                                    │• Claude    │
                                    │  Code      │
+                                   │• Codex CLI │
                                    └────────────┘
 ```
 
@@ -55,7 +56,7 @@
 ```
 src/cli_agent_orchestrator/
 ├── cli/commands/          # Entry Point: CLI commands
-│   ├── launch.py          # Creates terminals with agent profiles
+│   ├── launch.py          # Creates terminals with agent profiles (workspace trust confirmation, --yolo flag)
 │   └── init.py            # Initializes database
 ├── mcp_server/            # Entry Point: MCP server
 │   ├── server.py          # Handoff & send_message tools
@@ -68,14 +69,15 @@ src/cli_agent_orchestrator/
 │   ├── inbox_service.py   # Terminal-to-terminal messaging with watchdog
 │   └── flow_service.py    # Scheduled flow execution
 ├── clients/               # Client Layer: External systems
-│   ├── tmux.py            # Tmux operations (sets CAO_TERMINAL_ID)
+│   ├── tmux.py            # Tmux operations (sets CAO_TERMINAL_ID, literal send_keys)
 │   └── database.py        # SQLite with terminals & inbox_messages tables
 ├── providers/             # Provider Layer: CLI tool integration
 │   ├── base.py            # Abstract provider interface
 │   ├── manager.py         # Maps terminal_id → provider
+│   ├── kiro_cli.py        # Kiro CLI provider (kiro_cli) - default
 │   ├── q_cli.py           # Amazon Q CLI provider (q_cli)
-│   ├── kiro_cli.py        # Kiro CLI provider (kiro_cli)
-│   └── claude_code.py     # Claude Code provider (claude_code)
+│   ├── claude_code.py     # Claude Code provider (claude_code, ❯ prompt, trust prompt handling)
+│   └── codex.py           # Codex/ChatGPT CLI provider (codex, developer_instructions, › prompt + • bullet detection, trust prompt handling)
 ├── models/                # Data models
 │   ├── terminal.py        # Terminal, TerminalStatus
 │   ├── session.py         # Session model
@@ -108,7 +110,7 @@ database.create_terminal()
   ↓
 provider_manager.create_provider()
   ↓
-provider.initialize()  # Waits for shell, sends command, waits for IDLE
+provider.initialize()  # Waits for shell (all providers), sends command, waits for IDLE
   ↓
 inbox_service.register_terminal()  # Starts watchdog observer
   ↓
@@ -126,7 +128,7 @@ database.create_inbox_message()  # Status: PENDING
 inbox_service.check_and_send_pending_messages()
   ↓
 If receiver IDLE → send immediately
-If receiver BUSY → watchdog monitors log file
+If receiver PROCESSING → watchdog monitors log file
   ↓
 On log change → detect IDLE pattern → send message
   ↓
