@@ -76,7 +76,11 @@ Tool calls appear in rounded-corner boxes:
 
 Agent profiles are **optional** for Gemini CLI. When an agent profile is provided:
 
-1. **System prompt**: Written to a `GEMINI.md` file in the working directory before launch. Gemini CLI reads this file for project-level instructions. If an existing `GEMINI.md` is present, it is backed up to `GEMINI.md.cao_backup` and restored during cleanup.
+1. **System prompt**: Injected via two mechanisms:
+   - **Primary**: The `-i` (prompt-interactive) flag sends the system prompt as the first user message. Gemini strongly adopts the role from `-i`, making it effective for supervisor orchestration.
+   - **Supplementary**: Written to a `GEMINI.md` file in the working directory for persistent project-level context. If an existing `GEMINI.md` is present, it is backed up to `GEMINI.md.cao_backup` and restored during cleanup.
+
+   Note: `GEMINI.md` alone is insufficient — the model treats it as weak background context and does not adopt supervisor roles. The `-i` flag is required for reliable system prompt injection.
 2. **MCP servers**: Registered via `gemini mcp add` before launching (see below).
 
 ## MCP Server Configuration
@@ -85,7 +89,7 @@ MCP servers from agent profiles are registered using `gemini mcp add --scope use
 
 ```bash
 gemini mcp add cao-mcp-server --scope user -e CAO_TERMINAL_ID=abc12345 npx -y cao-mcp-server && \
-gemini --yolo --sandbox false
+gemini --yolo --sandbox false -i "You are the analysis_supervisor..."
 ```
 
 The `--scope user` flag writes MCP config to user-level settings instead of project-level settings. This is required because `gemini mcp add` refuses to write project-level settings in the home directory (returns "Please use --scope user to edit settings in the home directory").

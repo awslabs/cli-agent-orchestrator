@@ -128,7 +128,7 @@ Do NOT commit until every item in [verification-checklist.md](./references/verif
 | kimi_cli | `user@dir💫/✨` | `•` bullet | `--mcp-config` JSON |
 | claude_code | `>` or `❯` | `───` separator | `--mcp-config` JSON |
 | codex | `›` (U+203A) | `•` bullet | `-c mcp_servers.*` TOML |
-| gemini_cli | `*   Type your message` | `✦` (U+2726) | `gemini mcp add` pre-launch |
+| gemini_cli | `*   Type your message` | `✦` (U+2726) | `gemini mcp add` pre-launch, `-i` for system prompt |
 | kiro_cli | `%` + optional `λ` | Green arrow `❯` | Built-in |
 | q_cli | `%` + optional `λ` | Green arrow `❯` | N/A |
 

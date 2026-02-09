@@ -150,19 +150,22 @@ class GeminiCliProvider(BaseProvider):
         Uses shlex.join() for safe escaping of all arguments.
 
         Command structure:
-            gemini --yolo [--sandbox false]
+            gemini --yolo --sandbox false [-i "system prompt"]
 
         The --yolo flag auto-approves all tool actions, which is required for
         non-interactive operation in CAO-managed tmux sessions.
 
-        Note: Gemini CLI does not support inline system prompt injection via CLI
-        flags. Instead, it reads GEMINI.md files from the working directory for
-        project-level instructions. We write the agent profile's system prompt
-        to a GEMINI.md file in the tmux pane's working directory before launch,
-        and remove it during cleanup(). This matches the Kimi CLI temp file
-        approach (lesson #14 in lessons-learned.md).
+        System prompt injection uses the ``-i`` (``--prompt-interactive``) flag,
+        which sends the system prompt as the first user message and continues in
+        interactive mode. This is the primary injection method because Gemini CLI
+        treats ``-i`` text as a direct instruction the model strongly adopts.
 
-        MCP servers must be configured beforehand via `gemini mcp add`.
+        GEMINI.md is written as supplementary project context (the model sees it
+        as background documentation). On its own, GEMINI.md is too weak — the
+        model responds "I am an interactive CLI agent" instead of adopting the
+        supervisor role. The ``-i`` flag solves this (lesson #14).
+
+        MCP servers must be configured beforehand via ``gemini mcp add``.
         """
         command_parts = ["gemini", "--yolo", "--sandbox", "false"]
 
@@ -170,19 +173,24 @@ class GeminiCliProvider(BaseProvider):
             try:
                 profile = load_agent_profile(self._agent_profile)
 
-                # Inject system prompt via GEMINI.md file in the working directory.
-                # Gemini CLI reads GEMINI.md for project-level instructions on startup.
-                # Without this, supervisor agents don't know their role or available
-                # MCP tools (handoff, assign, send_message). See lessons-learned #14.
+                # Primary system prompt injection: -i (--prompt-interactive) flag.
+                # Sends the system prompt as the first user message and continues
+                # in interactive mode. The model strongly adopts the role from -i,
+                # unlike GEMINI.md which is treated as weak project context.
+                # See lessons-learned #14.
                 system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
                 if system_prompt:
+                    command_parts.extend(["-i", system_prompt])
+
+                    # Also write GEMINI.md as supplementary context.
+                    # This provides persistent background instructions that the
+                    # model can reference throughout the conversation. The -i flag
+                    # establishes the role; GEMINI.md reinforces it.
                     working_dir = tmux_client.get_pane_working_directory(
                         self.session_name, self.window_name
                     )
                     if working_dir:
                         gemini_md_path = os.path.join(working_dir, "GEMINI.md")
-                        # Back up existing GEMINI.md if present, so we can restore
-                        # it during cleanup instead of deleting the user's file.
                         backup_path = gemini_md_path + ".cao_backup"
                         if os.path.exists(gemini_md_path):
                             os.rename(gemini_md_path, backup_path)
@@ -190,11 +198,6 @@ class GeminiCliProvider(BaseProvider):
                         with open(gemini_md_path, "w") as f:
                             f.write(system_prompt)
                         self._gemini_md_path = gemini_md_path
-                    else:
-                        logger.warning(
-                            "Could not determine working directory for GEMINI.md; "
-                            "system prompt will not be injected"
-                        )
 
                 # Configure MCP servers via `gemini mcp add` if present.
                 # This must happen BEFORE launching gemini, so we return
@@ -284,11 +287,24 @@ class GeminiCliProvider(BaseProvider):
         # Send Gemini command to the tmux window
         tmux_client.send_keys(self.session_name, self.window_name, command)
 
-        # Wait for Gemini CLI to reach IDLE state (input box visible).
+        # Wait for Gemini CLI to reach IDLE or COMPLETED state.
+        # When launched with -i (prompt-interactive), Gemini processes the
+        # initial prompt and produces a response before returning to the input
+        # box. This means status will be COMPLETED (query + response + idle
+        # prompt) rather than IDLE (just idle prompt). We accept either state.
         # Gemini takes 10-15+ seconds to load due to Node.js/Ink startup.
-        # Longer timeout than shell (60s) to account for first-run setup.
-        if not wait_until_status(self, TerminalStatus.IDLE, timeout=60.0, polling_interval=1.0):
-            raise TimeoutError("Gemini CLI initialization timed out after 60 seconds")
+        init_start = time.time()
+        init_timeout = 120.0  # longer timeout for -i prompt processing
+        while time.time() - init_start < init_timeout:
+            status = self.get_status()
+            if status in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
+                break
+            time.sleep(1.0)
+        else:
+            raise TimeoutError(
+                f"Gemini CLI initialization timed out after {init_timeout}s. "
+                f"Last status: {self.get_status()}"
+            )
 
         self._initialized = True
         return True

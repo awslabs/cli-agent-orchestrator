@@ -47,15 +47,17 @@ class TestGeminiCliProviderInitialization:
     """Tests for GeminiCliProvider initialization flow."""
 
     @patch("cli_agent_orchestrator.providers.gemini_cli.time")
-    @patch("cli_agent_orchestrator.providers.gemini_cli.wait_until_status", return_value=True)
     @patch("cli_agent_orchestrator.providers.gemini_cli.wait_for_shell", return_value=True)
     @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
-    def test_initialize_success(self, mock_tmux, mock_wait_shell, mock_wait_status, mock_time):
+    def test_initialize_success(self, mock_tmux, mock_wait_shell, mock_time):
         """Test successful initialization sends warm-up + gemini command and reaches IDLE."""
-        # Configure time mock for warm-up loop arithmetic
-        mock_time.time.return_value = 0
-        # Simulate warm-up marker appearing in shell output
-        mock_tmux.get_history.return_value = "CAO_SHELL_READY"
+        # Configure time mock: first call returns 0 (warm-up start), subsequent calls
+        # for the init loop need to return 0 then trigger the IDLE status check.
+        mock_time.time.side_effect = [0, 0, 0, 0, 0]
+        mock_time.sleep = MagicMock()
+        # Simulate warm-up marker appearing in shell output, then IDLE status
+        idle_output = " *   Type your message or @path/to/file\n"
+        mock_tmux.get_history.side_effect = ["CAO_SHELL_READY", idle_output]
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
         result = provider.initialize()
 
@@ -64,7 +66,6 @@ class TestGeminiCliProviderInitialization:
         assert mock_tmux.send_keys.call_count == 2  # warm-up echo + gemini command
         mock_tmux.send_keys.assert_any_call("session-1", "window-1", "echo CAO_SHELL_READY")
         mock_wait_shell.assert_called_once()
-        mock_wait_status.assert_called_once()
 
     @patch("cli_agent_orchestrator.providers.gemini_cli.wait_for_shell", return_value=False)
     @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
@@ -75,30 +76,35 @@ class TestGeminiCliProviderInitialization:
             provider.initialize()
 
     @patch("cli_agent_orchestrator.providers.gemini_cli.time")
-    @patch("cli_agent_orchestrator.providers.gemini_cli.wait_until_status", return_value=False)
     @patch("cli_agent_orchestrator.providers.gemini_cli.wait_for_shell", return_value=True)
     @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
-    def test_initialize_gemini_timeout(
-        self, mock_tmux, mock_wait_shell, mock_wait_status, mock_time
-    ):
+    def test_initialize_gemini_timeout(self, mock_tmux, mock_wait_shell, mock_time):
         """Test Gemini CLI init timeout raises TimeoutError."""
-        mock_time.time.return_value = 0
+        # Simulate time progressing past timeout (120s)
+        call_count = [0]
+
+        def advancing_time():
+            call_count[0] += 1
+            return call_count[0] * 10.0  # each call advances 10s
+
+        mock_time.time.side_effect = advancing_time
+        mock_time.sleep = MagicMock()
+        # Warm-up succeeds, but CLI never reaches IDLE (always returns PROCESSING)
         mock_tmux.get_history.return_value = "CAO_SHELL_READY"
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
-        with pytest.raises(TimeoutError, match="Gemini CLI initialization"):
+        with pytest.raises(TimeoutError, match="Gemini CLI initialization timed out"):
             provider.initialize()
 
     @patch("cli_agent_orchestrator.providers.gemini_cli.time")
-    @patch("cli_agent_orchestrator.providers.gemini_cli.wait_until_status", return_value=True)
     @patch("cli_agent_orchestrator.providers.gemini_cli.wait_for_shell", return_value=True)
     @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
-    def test_initialize_with_mcp_servers(
-        self, mock_load, mock_tmux, mock_wait_shell, mock_wait_status, mock_time
-    ):
+    def test_initialize_with_mcp_servers(self, mock_load, mock_tmux, mock_wait_shell, mock_time):
         """Test initialization with MCP servers in profile adds gemini mcp add commands."""
-        mock_time.time.return_value = 0
-        mock_tmux.get_history.return_value = "CAO_SHELL_READY"
+        mock_time.time.side_effect = [0, 0, 0, 0, 0]
+        mock_time.sleep = MagicMock()
+        idle_output = " *   Type your message or @path/to/file\n"
+        mock_tmux.get_history.side_effect = ["CAO_SHELL_READY", idle_output]
         mock_profile = MagicMock()
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {
@@ -122,15 +128,14 @@ class TestGeminiCliProviderInitialization:
         assert "--scope user" in command
 
     @patch("cli_agent_orchestrator.providers.gemini_cli.time")
-    @patch("cli_agent_orchestrator.providers.gemini_cli.wait_until_status", return_value=True)
     @patch("cli_agent_orchestrator.providers.gemini_cli.wait_for_shell", return_value=True)
     @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
-    def test_initialize_sends_gemini_command(
-        self, mock_tmux, mock_wait_shell, mock_wait_status, mock_time
-    ):
+    def test_initialize_sends_gemini_command(self, mock_tmux, mock_wait_shell, mock_time):
         """Test that initialize sends warm-up echo then the correct gemini --yolo command."""
-        mock_time.time.return_value = 0
-        mock_tmux.get_history.return_value = "CAO_SHELL_READY"
+        mock_time.time.side_effect = [0, 0, 0, 0, 0]
+        mock_time.sleep = MagicMock()
+        idle_output = " *   Type your message or @path/to/file\n"
+        mock_tmux.get_history.side_effect = ["CAO_SHELL_READY", idle_output]
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
         provider.initialize()
 
@@ -526,7 +531,7 @@ class TestGeminiCliProviderBuildCommand:
     @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
     def test_build_command_profile_no_mcp(self, mock_load, mock_tmux, tmp_path):
-        """Test command with profile that has no MCP servers writes GEMINI.md."""
+        """Test command with profile uses -i flag for system prompt + writes GEMINI.md."""
         mock_profile = MagicMock()
         mock_profile.system_prompt = "You are a developer"
         mock_profile.mcpServers = None
@@ -536,8 +541,10 @@ class TestGeminiCliProviderBuildCommand:
         provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
         command = provider._build_gemini_command()
 
-        # System prompt injected via GEMINI.md file
-        assert command == "gemini --yolo --sandbox false"
+        # Primary injection: -i flag sends system prompt as first user message
+        assert "gemini --yolo --sandbox false -i" in command
+        assert "You are a developer" in command
+        # Supplementary: GEMINI.md also written for persistent context
         gemini_md = tmp_path / "GEMINI.md"
         assert gemini_md.exists()
         assert gemini_md.read_text() == "You are a developer"
@@ -560,9 +567,12 @@ class TestGeminiCliProviderBuildCommand:
         mock_tmux.get_pane_working_directory.return_value = str(tmp_path)
 
         provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
-        provider._build_gemini_command()
+        command = provider._build_gemini_command()
 
-        # Original backed up, new prompt written
+        # Primary: -i flag
+        assert "-i" in command
+        assert "Supervisor agent prompt" in command
+        # Supplementary: GEMINI.md backed up and overwritten
         assert existing_md.read_text() == "Supervisor agent prompt"
         backup = tmp_path / "GEMINI.md.cao_backup"
         assert backup.exists()
@@ -572,7 +582,7 @@ class TestGeminiCliProviderBuildCommand:
     @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
     def test_build_command_system_prompt_no_working_dir(self, mock_load, mock_tmux):
-        """Test system prompt skipped gracefully when working dir unavailable."""
+        """Test -i flag still used when working dir unavailable (GEMINI.md skipped)."""
         mock_profile = MagicMock()
         mock_profile.system_prompt = "You are a developer"
         mock_profile.mcpServers = None
@@ -582,7 +592,9 @@ class TestGeminiCliProviderBuildCommand:
         provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
         command = provider._build_gemini_command()
 
-        assert command == "gemini --yolo --sandbox false"
+        # -i flag is always added (primary injection), GEMINI.md is optional
+        assert "-i" in command
+        assert "You are a developer" in command
         assert provider._gemini_md_path is None
 
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")

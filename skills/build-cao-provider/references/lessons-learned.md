@@ -307,16 +307,19 @@ tmux_client.send_keys_via_paste(session, window, message)  # not send_keys()
 | Codex | `-c developer_instructions="..."` | TOML config override (added after hitting this bug) |
 | Claude Code | `--append-system-prompt <text>` | CLI flag |
 | Kimi CLI | `--agent-file <path>` | Temp YAML + markdown file |
-| Gemini CLI | **Not implemented** | GEMINI.md files (not created by CAO) |
+| Gemini CLI | `-i <text>` + `GEMINI.md` file | `-i` sends as first user message (primary); GEMINI.md for persistent context (supplementary) |
+
+**Important: GEMINI.md alone is NOT sufficient for Gemini CLI.** GEMINI.md is treated as weak project context — the model responds "I am an interactive CLI agent" instead of adopting the supervisor role. The `-i` (prompt-interactive) flag sends the system prompt as the first user message, which the model strongly adopts. Always use `-i` as the primary injection with GEMINI.md as supplementary context.
 
 **Fix options for CLIs without system prompt flags (in order of preference):**
-1. Create a temporary instruction file (e.g., `GEMINI.md`) in the working directory with the system prompt, and clean it up in `cleanup()` — matches Kimi CLI's temp file approach
-2. Use the CLI tool's `--prompt` or `--prompt-interactive` flag if available in newer versions
-3. Send the system prompt as the first user message after initialization (workaround — less reliable since it's a user message, not a system instruction)
+1. Use `--prompt-interactive` / `-i` flag to send the system prompt as the first user message (Gemini CLI pattern) — the model strongly adopts role instructions from `-i`
+2. Create a temporary instruction file (e.g., `GEMINI.md`) in the working directory as supplementary context, clean up in `cleanup()` — matches Kimi CLI's temp file approach
+3. If neither available, send the system prompt as the first user message after initialization (workaround — less reliable)
 
 **Rules:**
 - Every provider MUST inject the agent profile system prompt — without it, the agent has tools but no instructions
-- If the CLI tool doesn't support system prompt flags, use temp files (Kimi CLI pattern) rather than skipping injection entirely
+- If the CLI tool doesn't support system prompt flags, use `-i` / `--prompt-interactive` if available — it's more effective than instruction files
+- Instruction files (GEMINI.md, KIMI.md) provide weak context; `-i` provides strong role adoption — use both when possible
 - This is a recurring mistake across providers — add a check in code review: "Does _build_command() apply profile.system_prompt?"
 - Test that a supervisor agent actually describes its role correctly after launch (not just that it reaches IDLE)
 
