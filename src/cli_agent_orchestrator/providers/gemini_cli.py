@@ -12,7 +12,7 @@ Key characteristics:
 - Input box borders: ``▀`` (U+2580 top border), ``▄`` (U+2584 bottom border)
 - Tool call results: Bordered box using ``╭╰╮╯`` with ``✓`` checkmark
 - Auto-approve: ``--yolo`` / ``-y`` flag bypasses all tool action confirmations
-- MCP config: ``gemini mcp add <name> <command> [args...]`` (pre-launch setup, not inline flag)
+- MCP config: Written directly to ``~/.gemini/settings.json`` (not via ``gemini mcp add``)
 - Exit commands: Ctrl+D to exit; Ctrl+C cancels current query
 - Status bar: ``~/dir (branch*)  sandbox  Auto (Model) /model |XX.X MB``
 - YOLO indicator: ``YOLO mode (ctrl + y to toggle)`` above bottom input box
@@ -27,11 +27,13 @@ Status Detection Strategy:
     - ERROR: Error message patterns or empty output
 """
 
+import json
 import logging
 import os
 import re
 import shlex
 import time
+from pathlib import Path
 from typing import Optional
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
@@ -155,7 +157,7 @@ class GeminiCliProvider(BaseProvider):
         # a response before accepting new input. Accepting IDLE too early
         # (before -i is processed) causes sent messages to be lost.
         self._uses_prompt_interactive = False
-        # Track MCP servers that were configured via `gemini mcp add`
+        # Track MCP servers that were registered in ~/.gemini/settings.json
         # so they can be removed during cleanup.
         self._mcp_server_names: list[str] = []
         # Path to GEMINI.md file created for system prompt injection.
@@ -188,7 +190,7 @@ class GeminiCliProvider(BaseProvider):
         model responds "I am an interactive CLI agent" instead of adopting the
         supervisor role. The ``-i`` flag solves this (lesson #14).
 
-        MCP servers must be configured beforehand via ``gemini mcp add``.
+        MCP servers are configured by writing directly to ``~/.gemini/settings.json``.
         """
         command_parts = ["gemini", "--yolo", "--sandbox", "false"]
 
@@ -223,50 +225,96 @@ class GeminiCliProvider(BaseProvider):
                             f.write(system_prompt)
                         self._gemini_md_path = gemini_md_path
 
-                # Configure MCP servers via `gemini mcp add` if present.
-                # This must happen BEFORE launching gemini, so we return
-                # a compound command that sets up MCP servers first.
+                # Configure MCP servers by writing directly to ~/.gemini/settings.json.
+                # Previously used `gemini mcp add --scope user` commands chained with &&,
+                # but each invocation spawned a Node.js process (~2-3s each), making
+                # assign/handoff ~15s slower than other providers. Direct JSON write
+                # achieves the same result in <10ms (lesson #19).
                 if profile.mcpServers:
-                    setup_commands = []
-                    for server_name, server_config in profile.mcpServers.items():
-                        if isinstance(server_config, dict):
-                            cfg = server_config
-                        else:
-                            cfg = server_config.model_dump(exclude_none=True)
-
-                        command = cfg.get("command", "")
-                        args = cfg.get("args", [])
-
-                        # Build `gemini mcp add <name> --scope user [-e KEY=VALUE] <command> [args...]`
-                        # Note: Do NOT use `--` separator — yargs in gemini-cli treats
-                        # it as end-of-options and fails with "not enough positional args".
-                        # Use -e flag for env vars (native gemini mcp add support).
-                        # Use --scope user to avoid "Please use --scope user to edit
-                        # settings in the home directory" error when working_directory
-                        # is the user's home directory.
-                        mcp_parts = [
-                            "gemini",
-                            "mcp",
-                            "add",
-                            server_name,
-                            "--scope",
-                            "user",
-                            "-e",
-                            f"CAO_TERMINAL_ID={self.terminal_id}",
-                            command,
-                        ]
-                        mcp_parts.extend(args)
-                        setup_commands.append(shlex.join(mcp_parts))
-                        self._mcp_server_names.append(server_name)
-
-                    # Chain: add MCP servers → launch gemini
-                    all_commands = setup_commands + [shlex.join(command_parts)]
-                    return " && ".join(all_commands)
+                    self._register_mcp_servers(profile.mcpServers)
 
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
         return shlex.join(command_parts)
+
+    def _register_mcp_servers(self, mcp_servers: dict) -> None:
+        """Register MCP servers by writing directly to ~/.gemini/settings.json.
+
+        This replaces the previous approach of chaining ``gemini mcp add --scope user``
+        commands before the main ``gemini`` launch command. Each ``gemini mcp add``
+        invocation spawns a full Node.js process (~2-3 seconds), so for even a single
+        MCP server, the overhead was significant. Writing the JSON file directly
+        achieves the same result in milliseconds.
+
+        The settings.json format uses an ``mcpServers`` key at the top level, with
+        each server entry containing ``command``, ``args``, and ``env`` fields —
+        identical to what ``gemini mcp add --scope user`` writes.
+        """
+        settings_path = Path.home() / ".gemini" / "settings.json"
+
+        # Read existing settings (or start fresh)
+        if settings_path.exists():
+            with open(settings_path) as f:
+                settings = json.load(f)
+        else:
+            settings_path.parent.mkdir(parents=True, exist_ok=True)
+            settings = {}
+
+        if "mcpServers" not in settings:
+            settings["mcpServers"] = {}
+
+        for server_name, server_config in mcp_servers.items():
+            if isinstance(server_config, dict):
+                cfg = server_config
+            else:
+                cfg = server_config.model_dump(exclude_none=True)
+
+            entry = {
+                "command": cfg.get("command", ""),
+                "args": cfg.get("args", []),
+            }
+            # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
+            # can identify the current terminal for handoff/assign operations.
+            env = dict(cfg.get("env", {}))
+            env["CAO_TERMINAL_ID"] = self.terminal_id
+            entry["env"] = env
+
+            settings["mcpServers"][server_name] = entry
+            self._mcp_server_names.append(server_name)
+
+        with open(settings_path, "w") as f:
+            json.dump(settings, f, indent=2)
+
+    def _unregister_mcp_servers(self) -> None:
+        """Remove MCP servers that were registered during initialization.
+
+        Reads ~/.gemini/settings.json, removes entries that were added by
+        _register_mcp_servers(), and writes back. This replaces the previous
+        approach of running ``gemini mcp remove --scope user`` commands via tmux
+        (which also spawned Node.js processes).
+        """
+        if not self._mcp_server_names:
+            return
+
+        settings_path = Path.home() / ".gemini" / "settings.json"
+        if not settings_path.exists():
+            return
+
+        try:
+            with open(settings_path) as f:
+                settings = json.load(f)
+
+            mcp_servers = settings.get("mcpServers", {})
+            for server_name in self._mcp_server_names:
+                mcp_servers.pop(server_name, None)
+
+            with open(settings_path, "w") as f:
+                json.dump(settings, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to unregister MCP servers from settings.json: {e}")
+
+        self._mcp_server_names = []
 
     def initialize(self) -> bool:
         """Initialize Gemini CLI provider by starting the gemini command.
@@ -502,21 +550,12 @@ class GeminiCliProvider(BaseProvider):
     def cleanup(self) -> None:
         """Clean up Gemini CLI provider resources.
 
-        Removes any MCP servers that were configured via `gemini mcp add`,
-        removes the GEMINI.md file created for system prompt injection
-        (or restores the user's original if one existed), and resets state.
+        Removes MCP servers from ~/.gemini/settings.json, removes the GEMINI.md
+        file created for system prompt injection (or restores the user's original
+        if one existed), and resets state.
         """
-        # Remove MCP servers that were added during initialization
-        for server_name in self._mcp_server_names:
-            try:
-                tmux_client.send_keys(
-                    self.session_name,
-                    self.window_name,
-                    f"gemini mcp remove --scope user {shlex.quote(server_name)}",
-                )
-            except Exception as e:
-                logger.warning(f"Failed to remove MCP server '{server_name}': {e}")
-        self._mcp_server_names = []
+        # Remove MCP servers from settings.json (direct file write, no Node.js)
+        self._unregister_mcp_servers()
 
         # Remove GEMINI.md created for system prompt injection.
         # If the user had an existing GEMINI.md, restore it from backup.

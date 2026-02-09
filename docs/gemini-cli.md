@@ -81,26 +81,31 @@ Agent profiles are **optional** for Gemini CLI. When an agent profile is provide
    - **Supplementary**: Written to a `GEMINI.md` file in the working directory for persistent project-level context. If an existing `GEMINI.md` is present, it is backed up to `GEMINI.md.cao_backup` and restored during cleanup.
 
    Note: `GEMINI.md` alone is insufficient — the model treats it as weak background context and does not adopt supervisor roles. The `-i` flag is required for reliable system prompt injection.
-2. **MCP servers**: Registered via `gemini mcp add` before launching (see below).
+2. **MCP servers**: Registered by writing directly to `~/.gemini/settings.json` before launching (see below).
 
 ## MCP Server Configuration
 
-MCP servers from agent profiles are registered using `gemini mcp add --scope user` commands chained before the main `gemini` command:
+MCP servers from agent profiles are registered by writing directly to `~/.gemini/settings.json` before launching the `gemini` command. This replaces the previous approach of chaining `gemini mcp add --scope user` commands, which spawned a Node.js process for each server (~2-3s overhead each).
 
-```bash
-gemini mcp add cao-mcp-server --scope user -e CAO_TERMINAL_ID=abc12345 npx -y cao-mcp-server && \
-gemini --yolo --sandbox false -i "You are the analysis_supervisor..."
+```json
+{
+  "mcpServers": {
+    "cao-mcp-server": {
+      "command": "npx",
+      "args": ["-y", "cao-mcp-server"],
+      "env": { "CAO_TERMINAL_ID": "abc12345" }
+    }
+  }
+}
 ```
-
-The `--scope user` flag writes MCP config to user-level settings instead of project-level settings. This is required because `gemini mcp add` refuses to write project-level settings in the home directory (returns "Please use --scope user to edit settings in the home directory").
 
 ### CAO_TERMINAL_ID Forwarding
 
-Gemini CLI forwards `CAO_TERMINAL_ID` to MCP subprocesses via the `-e` flag on `gemini mcp add`, which sets environment variables in the MCP server process. This ensures tools like `handoff` and `assign` create new agent windows in the same tmux session.
+`CAO_TERMINAL_ID` is injected into the MCP server's `env` field in `settings.json`. This ensures tools like `handoff` and `assign` create new agent windows in the same tmux session.
 
 ### MCP Server Cleanup
 
-When the provider's `cleanup()` method is called, it sends `gemini mcp remove --scope user <name>` for each MCP server that was added during initialization.
+When the provider's `cleanup()` method is called, it removes the registered entries from `~/.gemini/settings.json` directly (no Node.js subprocess needed).
 
 ## Command Flags
 
@@ -181,9 +186,9 @@ gemini --version
 If Gemini CLI takes too long to start, check:
 - Network connectivity (Gemini requires API access)
 - Authentication status (re-run `gemini` to authenticate)
-- MCP server registration: `gemini mcp add` needs `--scope user` when the working directory is the home directory; without it the command fails silently and `gemini` never launches
+- MCP server registration: verify `~/.gemini/settings.json` contains the expected `mcpServers` entries
 - Shell environment: the provider sends a warm-up `echo` command and waits for the marker before launching `gemini`, ensuring PATH/nvm/homebrew are loaded
-- The provider waits up to 60 seconds for initialization
+- The provider waits up to 120 seconds for initialization (longer when `-i` flag is used)
 
 ### Status detection not working on tall terminals
 

@@ -101,8 +101,10 @@ class TestGeminiCliProviderInitialization:
     @patch("cli_agent_orchestrator.providers.gemini_cli.wait_for_shell", return_value=True)
     @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
-    def test_initialize_with_mcp_servers(self, mock_load, mock_tmux, mock_wait_shell, mock_time):
-        """Test initialization with MCP servers in profile adds gemini mcp add commands."""
+    def test_initialize_with_mcp_servers(
+        self, mock_load, mock_tmux, mock_wait_shell, mock_time, tmp_path
+    ):
+        """Test initialization with MCP servers writes to settings.json."""
         mock_time.time.side_effect = [0, 0, 0, 0, 0]
         mock_time.sleep = MagicMock()
         idle_output = " *   Type your message or @path/to/file\n"
@@ -117,17 +119,30 @@ class TestGeminiCliProviderInitialization:
         }
         mock_load.return_value = mock_profile
 
-        provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="developer")
-        result = provider.initialize()
-        assert result is True
+        # Use tmp_path as fake home so we don't touch real ~/.gemini/settings.json
+        settings_dir = tmp_path / ".gemini"
+        settings_dir.mkdir()
+        settings_file = settings_dir / "settings.json"
 
-        # Second send_keys call is the gemini command (first is warm-up echo)
+        with patch("cli_agent_orchestrator.providers.gemini_cli.Path.home", return_value=tmp_path):
+            provider = GeminiCliProvider(
+                "term-1", "session-1", "window-1", agent_profile="developer"
+            )
+            result = provider.initialize()
+
+        assert result is True
+        # MCP server should be registered in settings.json, not via gemini mcp add
+        import json
+
+        settings = json.loads(settings_file.read_text())
+        assert "cao-mcp-server" in settings["mcpServers"]
+        assert settings["mcpServers"]["cao-mcp-server"]["command"] == "npx"
+        assert settings["mcpServers"]["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"] == "term-1"
+        # Command should be plain gemini launch (no chained mcp add)
         call_args = mock_tmux.send_keys.call_args_list[1]
         command = call_args[0][2]
-        assert "gemini mcp add" in command
-        assert "cao-mcp-server" in command
-        assert "CAO_TERMINAL_ID" in command
-        assert "--scope user" in command
+        assert command == "gemini --yolo --sandbox false"
+        assert "cao-mcp-server" in provider._mcp_server_names
 
     @patch("cli_agent_orchestrator.providers.gemini_cli.time")
     @patch("cli_agent_orchestrator.providers.gemini_cli.wait_for_shell", return_value=True)
@@ -664,27 +679,34 @@ class TestGeminiCliProviderBuildCommand:
         assert command == "gemini --yolo --sandbox false"
 
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
-    def test_build_command_with_mcp_config(self, mock_load):
-        """Test command with MCP server configuration."""
+    def test_build_command_with_mcp_config(self, mock_load, tmp_path):
+        """Test command with MCP server writes to settings.json, not gemini mcp add."""
         mock_profile = MagicMock()
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {"test-server": {"command": "npx", "args": ["test-pkg"]}}
         mock_load.return_value = mock_profile
 
-        provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
-        command = provider._build_gemini_command()
+        settings_dir = tmp_path / ".gemini"
+        settings_dir.mkdir()
 
-        assert (
-            "gemini mcp add test-server --scope user -e CAO_TERMINAL_ID=term-1 npx test-pkg"
-            in command
-        )
-        assert "CAO_TERMINAL_ID" in command
-        assert "gemini --yolo --sandbox false" in command
+        with patch("cli_agent_orchestrator.providers.gemini_cli.Path.home", return_value=tmp_path):
+            provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
+            command = provider._build_gemini_command()
+
+        # Command should be plain gemini launch (MCP configured via settings.json)
+        assert command == "gemini --yolo --sandbox false"
         # MCP server should be tracked for cleanup
         assert "test-server" in provider._mcp_server_names
+        # Verify settings.json was written
+        import json
+
+        settings = json.loads((settings_dir / "settings.json").read_text())
+        assert settings["mcpServers"]["test-server"]["command"] == "npx"
+        assert settings["mcpServers"]["test-server"]["args"] == ["test-pkg"]
+        assert settings["mcpServers"]["test-server"]["env"]["CAO_TERMINAL_ID"] == "term-1"
 
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
-    def test_build_command_with_pydantic_mcp_config(self, mock_load):
+    def test_build_command_with_pydantic_mcp_config(self, mock_load, tmp_path):
         """Test command with MCP servers as Pydantic model objects."""
         mock_server = MagicMock()
         mock_server.model_dump.return_value = {"command": "node", "args": ["server.js"]}
@@ -694,14 +716,20 @@ class TestGeminiCliProviderBuildCommand:
         mock_profile.mcpServers = {"my-server": mock_server}
         mock_load.return_value = mock_profile
 
-        provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
-        command = provider._build_gemini_command()
+        settings_dir = tmp_path / ".gemini"
+        settings_dir.mkdir()
 
-        assert (
-            "gemini mcp add my-server --scope user -e CAO_TERMINAL_ID=term-1 node server.js"
-            in command
-        )
-        assert "CAO_TERMINAL_ID" in command
+        with patch("cli_agent_orchestrator.providers.gemini_cli.Path.home", return_value=tmp_path):
+            provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
+            command = provider._build_gemini_command()
+
+        assert command == "gemini --yolo --sandbox false"
+        import json
+
+        settings = json.loads((settings_dir / "settings.json").read_text())
+        assert settings["mcpServers"]["my-server"]["command"] == "node"
+        assert settings["mcpServers"]["my-server"]["args"] == ["server.js"]
+        assert settings["mcpServers"]["my-server"]["env"]["CAO_TERMINAL_ID"] == "term-1"
 
     @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
@@ -782,8 +810,8 @@ class TestGeminiCliProviderBuildCommand:
             provider._build_gemini_command()
 
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
-    def test_build_command_multiple_mcp_servers(self, mock_load):
-        """Test command chains multiple MCP server add commands."""
+    def test_build_command_multiple_mcp_servers(self, mock_load, tmp_path):
+        """Test multiple MCP servers are all written to settings.json."""
         mock_profile = MagicMock()
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {
@@ -792,13 +820,23 @@ class TestGeminiCliProviderBuildCommand:
         }
         mock_load.return_value = mock_profile
 
-        provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
-        command = provider._build_gemini_command()
+        settings_dir = tmp_path / ".gemini"
+        settings_dir.mkdir()
 
-        assert "gemini mcp add server-a" in command
-        assert "gemini mcp add server-b" in command
-        assert " && " in command
+        with patch("cli_agent_orchestrator.providers.gemini_cli.Path.home", return_value=tmp_path):
+            provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
+            command = provider._build_gemini_command()
+
+        # Command should be plain gemini launch (no && chaining)
+        assert command == "gemini --yolo --sandbox false"
+        assert " && " not in command
         assert len(provider._mcp_server_names) == 2
+        # Both servers written to settings.json
+        import json
+
+        settings = json.loads((settings_dir / "settings.json").read_text())
+        assert "server-a" in settings["mcpServers"]
+        assert "server-b" in settings["mcpServers"]
 
 
 # =============================================================================
@@ -829,30 +867,52 @@ class TestGeminiCliProviderMisc:
         provider.cleanup()
         assert provider._initialized is False
 
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
-    def test_cleanup_removes_mcp_servers(self, mock_tmux):
-        """Test cleanup removes MCP servers that were added."""
+    def test_cleanup_removes_mcp_servers(self, tmp_path):
+        """Test cleanup removes MCP servers from settings.json."""
+        import json
+
+        # Pre-populate settings.json with MCP servers
+        settings_dir = tmp_path / ".gemini"
+        settings_dir.mkdir()
+        settings_file = settings_dir / "settings.json"
+        settings_file.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "server-a": {"command": "npx", "args": ["-y", "a"], "env": {}},
+                        "server-b": {"command": "node", "args": ["b.js"], "env": {}},
+                        "unrelated": {"command": "other", "args": [], "env": {}},
+                    }
+                }
+            )
+        )
+
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
         provider._mcp_server_names = ["server-a", "server-b"]
 
-        provider.cleanup()
+        with patch("cli_agent_orchestrator.providers.gemini_cli.Path.home", return_value=tmp_path):
+            provider.cleanup()
 
         assert provider._mcp_server_names == []
-        assert mock_tmux.send_keys.call_count == 2
-        # Verify the remove commands were sent
-        calls = mock_tmux.send_keys.call_args_list
-        assert "gemini mcp remove --scope user server-a" in calls[0][0][2]
-        assert "gemini mcp remove --scope user server-b" in calls[1][0][2]
+        # server-a and server-b removed, unrelated preserved
+        settings = json.loads(settings_file.read_text())
+        assert "server-a" not in settings["mcpServers"]
+        assert "server-b" not in settings["mcpServers"]
+        assert "unrelated" in settings["mcpServers"]
 
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
-    def test_cleanup_handles_mcp_removal_error(self, mock_tmux):
-        """Test cleanup handles errors when removing MCP servers."""
-        mock_tmux.send_keys.side_effect = Exception("tmux error")
+    def test_cleanup_handles_mcp_removal_error(self, tmp_path):
+        """Test cleanup handles errors when settings.json is malformed."""
+        # Write invalid JSON to settings.json
+        settings_dir = tmp_path / ".gemini"
+        settings_dir.mkdir()
+        (settings_dir / "settings.json").write_text("not valid json{{{")
+
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
         provider._mcp_server_names = ["server-a"]
 
-        # Should not raise
-        provider.cleanup()
+        with patch("cli_agent_orchestrator.providers.gemini_cli.Path.home", return_value=tmp_path):
+            # Should not raise
+            provider.cleanup()
         assert provider._mcp_server_names == []
         assert provider._initialized is False
 

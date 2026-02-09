@@ -461,3 +461,34 @@ Also update E2E tests to use `_wait_for_ready()` (accepts both "idle" and "compl
 - The idle prompt appearance in Ink TUIs does NOT mean the CLI is ready for input
 - E2E tests should accept both "idle" and "completed" as valid post-initialization states
 - Track whether initial-prompt flags are used so the initialization logic can adapt
+
+---
+
+## 19. CLI Subprocess for Config Registration Adds Seconds Per Server — Write Config Files Directly
+
+**Symptom (Gemini CLI):** Assign and handoff operations take ~15 seconds for Gemini CLI versus ~1 second for other providers (Kiro CLI, Claude Code, Codex, Kimi CLI).
+
+**Root cause:** MCP server registration used `gemini mcp add --scope user` commands chained with `&&` before the main `gemini` launch command. Each `gemini mcp add` invocation spawns a full Node.js process (~2-3 seconds) just to write a JSON entry to `~/.gemini/settings.json`. For a single MCP server, this adds ~3 seconds of pure overhead. Combined with Gemini's Node.js/Ink startup time (~10-15s), this made the total initialization significantly slower than other providers.
+
+The cleanup path had the same issue: `gemini mcp remove --scope user` was sent via tmux, spawning another Node.js process per server.
+
+**Fix:** Write MCP server entries directly to `~/.gemini/settings.json` using Python's `json` module. The file format is simple — a top-level `mcpServers` key with nested objects per server, each containing `command`, `args`, and `env` fields. This is the exact same format that `gemini mcp add --scope user` writes. Direct write takes <10ms vs ~3s.
+
+```python
+def _register_mcp_servers(self, mcp_servers: dict) -> None:
+    settings_path = Path.home() / ".gemini" / "settings.json"
+    settings = json.load(open(settings_path)) if settings_path.exists() else {}
+    settings.setdefault("mcpServers", {})
+    for name, config in mcp_servers.items():
+        settings["mcpServers"][name] = {"command": ..., "args": ..., "env": ...}
+    json.dump(settings, open(settings_path, "w"), indent=2)
+
+def _unregister_mcp_servers(self) -> None:
+    # Read, pop entries, write back
+```
+
+**Rules:**
+- If a CLI tool offers `tool config add` commands, check whether they just write to a JSON/YAML config file — if so, write directly instead of spawning the CLI subprocess
+- This applies to registration AND cleanup paths (both `add` and `remove`)
+- Preserve existing entries in the config file — only add/remove what CAO manages
+- Other providers already do this correctly: Kimi CLI and Claude Code use `--mcp-config` JSON flags (single command), Codex uses `-c` flags (single command)

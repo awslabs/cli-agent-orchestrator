@@ -9,7 +9,7 @@ allowed-tools: Bash, Read, Write, Edit, Grep, Glob, Task
 The provider name is `$ARGUMENTS`. If no argument provided, ask the user.
 
 **Load references as needed** — do not read them all upfront:
-- [Lessons Learned](./references/lessons-learned.md) — 18 critical bugs and their fixes (load during Phase 2)
+- [Lessons Learned](./references/lessons-learned.md) — 19 critical bugs and their fixes (load during Phase 2)
 - [Implementation Checklist](./references/implementation-checklist.md) — File-by-file creation guide (load during Phase 2)
 - [Verification Checklist](./references/verification-checklist.md) — Testing, security, and documentation checks (load during Phase 6-7)
 
@@ -128,7 +128,7 @@ Do NOT commit until every item in [verification-checklist.md](./references/verif
 | kimi_cli | `user@dir💫/✨` | `•` bullet | `--mcp-config` JSON |
 | claude_code | `>` or `❯` | `───` separator | `--mcp-config` JSON |
 | codex | `›` (U+203A) | `•` bullet | `-c mcp_servers.*` TOML |
-| gemini_cli | `*   Type your message` | `✦` (U+2726) | `gemini mcp add` pre-launch, `-i` for system prompt |
+| gemini_cli | `*   Type your message` | `✦` (U+2726) | `~/.gemini/settings.json` direct write, `-i` for system prompt |
 | kiro_cli | `%` + optional `λ` | Green arrow `❯` | Built-in |
 | q_cli | `%` + optional `λ` | Green arrow `❯` | N/A |
 
