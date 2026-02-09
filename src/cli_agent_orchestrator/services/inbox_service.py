@@ -29,7 +29,7 @@ from pathlib import Path
 from watchdog.events import FileModifiedEvent, FileSystemEventHandler
 
 from cli_agent_orchestrator.clients.database import get_pending_messages, update_message_status
-from cli_agent_orchestrator.constants import INBOX_SERVICE_TAIL_LINES, TERMINAL_LOG_DIR
+from cli_agent_orchestrator.constants import TERMINAL_LOG_DIR
 from cli_agent_orchestrator.models.inbox import MessageStatus
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.manager import provider_manager
@@ -89,7 +89,12 @@ def check_and_send_pending_messages(terminal_id: str) -> bool:
     provider = provider_manager.get_provider(terminal_id)
     if provider is None:
         raise ValueError(f"Provider not found for terminal {terminal_id}")
-    status = provider.get_status(tail_lines=INBOX_SERVICE_TAIL_LINES)
+    # Let the provider use its own default tail_lines. Each provider knows how
+    # many lines it needs to reliably detect the idle prompt (e.g. Kimi CLI and
+    # Gemini CLI need 50 lines due to TUI padding). Previously this passed
+    # INBOX_SERVICE_TAIL_LINES=5, which was too few for TUI-based providers —
+    # the idle prompt was never found, so messages stayed PENDING forever.
+    status = provider.get_status()
 
     if status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
         logger.debug(f"Terminal {terminal_id} not ready (status={status})")

@@ -492,3 +492,30 @@ def _unregister_mcp_servers(self) -> None:
 - This applies to registration AND cleanup paths (both `add` and `remove`)
 - Preserve existing entries in the config file — only add/remove what CAO manages
 - Other providers already do this correctly: Kimi CLI and Claude Code use `--mcp-config` JSON flags (single command), Codex uses `-c` flags (single command)
+
+---
+
+## 20. Inbox Service Passes Hardcoded tail_lines=5 — TUI Providers Need 50+ Lines for Idle Detection
+
+**Symptom (Kimi CLI, Gemini CLI):** Supervisor never receives messages from workers via `send_message()`. Messages are stored in the database with PENDING status but never delivered to the supervisor's tmux terminal.
+
+**Root cause:** `inbox_service.check_and_send_pending_messages()` calls `provider.get_status(tail_lines=INBOX_SERVICE_TAIL_LINES)` with a hardcoded value of 5. This passes `tail_lines=5` to `tmux_client.get_history()`, which runs `capture-pane -S -5` (last 5 lines only).
+
+Kimi CLI and Gemini CLI have significant TUI padding between the idle prompt and the bottom of the terminal — up to 30-50 empty lines on tall terminals. With only 5 lines captured, the idle prompt is never found, `get_status()` returns PROCESSING, and the inbox service skips delivery.
+
+The log file watcher has the same bug: it triggers `check_and_send_pending_messages()` which again uses `tail_lines=5`.
+
+**Fix:** Remove the `tail_lines` parameter from the `get_status()` call in `check_and_send_pending_messages()`. Without it, `get_history()` defaults to `TMUX_HISTORY_LINES=200`, which is sufficient for all providers. Each provider's `get_status()` then slices to its own `IDLE_PROMPT_TAIL_LINES` internally.
+
+```python
+# Before (broken for TUI providers):
+status = provider.get_status(tail_lines=INBOX_SERVICE_TAIL_LINES)  # 5 lines
+
+# After (provider decides how many lines it needs):
+status = provider.get_status()  # defaults to 200 lines, provider slices internally
+```
+
+**Rules:**
+- Never hardcode `tail_lines` when calling `get_status()` from service-level code — let the provider use its default
+- The inbox service's "fast path" (log tail check with `_has_idle_pattern()`) is fine because it uses the simple emoji regex on the log file, not tmux capture
+- If performance is a concern, the provider can optimize internally — the service layer should not micro-optimize at the cost of correctness

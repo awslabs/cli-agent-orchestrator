@@ -56,10 +56,6 @@ TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
 # Lower values = faster response, higher CPU usage
 INBOX_POLLING_INTERVAL = 5
 
-# Number of terminal lines to check when determining agent status
-# Used by inbox service for quick IDLE state detection
-INBOX_SERVICE_TAIL_LINES = 5
-
 # =============================================================================
 # Cleanup Service Configuration
 # =============================================================================

@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fix inbox message delivery failing for TUI-based providers (Kimi CLI, Gemini CLI): inbox service passed `tail_lines=5` to `get_status()` but TUI providers need 50+ lines to find the idle prompt; messages stayed PENDING forever because the supervisor was never detected as IDLE
 - Fix shell command injection risk in Q CLI and Kiro CLI providers: replace f-string command interpolation with `shlex.join()` for safe shell escaping of `agent_profile` values, consistent with other providers
 - Fix Gemini CLI `exit_cli()` returning `C-d` (tmux key sequence) but being sent as literal text through `send_input()`: add `send_special_key()` to `TmuxClient` and `terminal_service`, update `exit_terminal` endpoint to detect key sequences (`C-` or `M-` prefix) and route through non-literal tmux key sending
 - Fix Claude Code provider not forwarding `CAO_TERMINAL_ID` to MCP server subprocesses: inject `CAO_TERMINAL_ID` into MCP server `env` config, matching Kimi CLI and Codex providers

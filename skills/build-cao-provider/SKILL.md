@@ -9,7 +9,7 @@ allowed-tools: Bash, Read, Write, Edit, Grep, Glob, Task
 The provider name is `$ARGUMENTS`. If no argument provided, ask the user.
 
 **Load references as needed** — do not read them all upfront:
-- [Lessons Learned](./references/lessons-learned.md) — 19 critical bugs and their fixes (load during Phase 2)
+- [Lessons Learned](./references/lessons-learned.md) — 20 critical bugs and their fixes (load during Phase 2)
 - [Implementation Checklist](./references/implementation-checklist.md) — File-by-file creation guide (load during Phase 2)
 - [Verification Checklist](./references/verification-checklist.md) — Testing, security, and documentation checks (load during Phase 6-7)
 
