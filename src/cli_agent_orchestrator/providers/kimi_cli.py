@@ -148,7 +148,7 @@ class KimiCliProvider(BaseProvider):
         Uses shlex.join() for safe escaping of all arguments.
 
         Command structure:
-            kimi --yolo [--agent-file FILE] [--mcp-config JSON]
+            kimi --yolo [--config KEY=VALUE] [--agent-file FILE] [--mcp-config JSON]
 
         The --yolo flag auto-approves all tool actions, which is required for
         non-interactive operation in CAO-managed tmux sessions.
@@ -189,6 +189,14 @@ class KimiCliProvider(BaseProvider):
                 # Add MCP server configuration if present in the agent profile.
                 # Kimi accepts --mcp-config as a JSON string (repeatable flag).
                 if profile.mcpServers:
+                    # Set a generous MCP tool call timeout for long-running operations
+                    # like handoff, which creates a worker terminal, waits for it to
+                    # complete, and extracts output. Kimi CLI defaults to 60s
+                    # (tool_call_timeout_ms=60000 in kimi_cli/config.py), which is too
+                    # short for multi-step operations. Use --config to override to 600s,
+                    # matching the default handoff timeout in _handoff_impl().
+                    command_parts.extend(["--config", "mcp.client.tool_call_timeout_ms=600000"])
+
                     mcp_config = {}
                     for server_name, server_config in profile.mcpServers.items():
                         if isinstance(server_config, dict):

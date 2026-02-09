@@ -9,7 +9,7 @@ allowed-tools: Bash, Read, Write, Edit, Grep, Glob, Task
 The provider name is `$ARGUMENTS`. If no argument provided, ask the user.
 
 **Load references as needed** — do not read them all upfront:
-- [Lessons Learned](./references/lessons-learnt.md) — 14 critical bugs and their fixes (load during Phase 2)
+- [Lessons Learned](./references/lessons-learnt.md) — 15 critical bugs and their fixes (load during Phase 2)
 - [Implementation Checklist](./references/implementation-checklist.md) — File-by-file creation guide (load during Phase 2)
 - [Verification Checklist](./references/verification-checklist.md) — Testing, security, and documentation checks (load during Phase 6-7)
 
@@ -27,9 +27,10 @@ For each size, capture 4 states: idle, processing, completed, error. These becom
 
 Load [implementation-checklist.md](./references/implementation-checklist.md) and [lessons-learnt.md](./references/lessons-learnt.md).
 
-Follow `kimi_cli.py` as reference template. Two non-obvious requirements that caused production bugs:
+Follow `kimi_cli.py` as reference template. Three non-obvious requirements that caused production bugs:
 1. **Forward `CAO_TERMINAL_ID` to MCP env** in `_build_command()` — without this, workers appear as separate tmux sessions invisible to the user (lessons #1)
 2. **Set `IDLE_PROMPT_TAIL_LINES >= 50`** — smaller values fail on tall terminals even though E2E tests pass at 80x24 (lessons #2)
+3. **Override MCP tool call timeout to 600s** — CLI tools default to 60s MCP tool timeout, which is too short for handoff operations; without this, the supervisor gets a ToolError timeout after 60s while the worker is still processing (lessons #15)
 
 ## Phase 3: Test
 

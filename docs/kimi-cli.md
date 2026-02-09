@@ -34,7 +34,7 @@ The provider detects Kimi CLI states by analyzing tmux terminal output:
 |--------|---------|-------------|
 | **IDLE** | `username@dirname💫` or `username@dirname✨` at bottom | Prompt visible, ready for input |
 | **PROCESSING** | No prompt at bottom | Response is streaming |
-| **COMPLETED** | Prompt at bottom + user input box + response bullets | Task finished |
+| **COMPLETED** | Prompt at bottom + latching flag (user input detected) | Task finished |
 | **ERROR** | `Error:`, `APIError:`, `ConnectionError:` patterns | Error detected |
 
 ### Prompt Symbols
@@ -84,8 +84,16 @@ Temp files are automatically cleaned up when the provider's `cleanup()` method i
 MCP servers from agent profiles are passed via `--mcp-config` as a JSON string:
 
 ```bash
-kimi --yolo --mcp-config '{"server-name": {"command": "npx", "args": ["-y", "cao-mcp-server"]}}'
+kimi --yolo --config mcp.client.tool_call_timeout_ms=600000 --mcp-config '{"server-name": {"command": "npx", "args": ["-y", "cao-mcp-server"]}}'
 ```
+
+### MCP Tool Call Timeout
+
+Kimi CLI defaults to a 60-second MCP tool call timeout (`tool_call_timeout_ms=60000` in `kimi_cli/config.py`). This is too short for `handoff` operations, which create a worker terminal, wait for completion, and extract output — routinely exceeding 60 seconds.
+
+The provider automatically adds `--config mcp.client.tool_call_timeout_ms=600000` when MCP servers are configured, increasing the timeout to 600 seconds (10 minutes) to match CAO's default handoff timeout. This is the same pattern used by the Codex provider (`tool_timeout_sec=600.0`).
+
+Without this override, the supervisor Kimi CLI agent receives a `ToolError("Timeout while calling MCP tool handoff")` after 60 seconds, even though the worker is still processing.
 
 ### CAO_TERMINAL_ID Forwarding
 
@@ -96,6 +104,7 @@ Kimi CLI does not automatically forward parent shell environment variables to MC
 | Flag | Purpose |
 |------|---------|
 | `--yolo` | Auto-approve all tool action confirmations |
+| `--config KEY=VALUE` | Override config values (e.g., MCP tool timeout) |
 | `--agent-file FILE` | Custom agent YAML file |
 | `--mcp-config TEXT` | MCP server configuration (JSON, repeatable) |
 | `--work-dir DIR` | Set working directory |

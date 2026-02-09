@@ -118,7 +118,7 @@ class TestKimiCliProviderInitialization:
     def test_initialize_with_mcp_servers(
         self, mock_load, mock_tmux, mock_wait_shell, mock_wait_status
     ):
-        """Test initialization with MCP servers in profile adds --mcp-config."""
+        """Test initialization with MCP servers in profile adds --mcp-config and tool timeout."""
         mock_profile = MagicMock()
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {
@@ -136,6 +136,8 @@ class TestKimiCliProviderInitialization:
         call_args = mock_tmux.send_keys.call_args
         command = call_args[0][2]
         assert "--mcp-config" in command
+        # MCP tool timeout should be increased to 600s for long-running handoff operations
+        assert "mcp.client.tool_call_timeout_ms=600000" in command
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.wait_until_status", return_value=True)
     @patch("cli_agent_orchestrator.providers.kimi_cli.wait_for_shell", return_value=True)
@@ -574,6 +576,8 @@ class TestKimiCliProviderBuildCommand:
         # CAO_TERMINAL_ID should be injected into MCP server env
         assert "CAO_TERMINAL_ID" in command
         assert "term-1" in command
+        # MCP tool timeout should be set to 600s for long-running handoff operations
+        assert "--config mcp.client.tool_call_timeout_ms=600000" in command
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
     def test_build_command_creates_agent_yaml(self, mock_load):
@@ -677,6 +681,47 @@ class TestKimiCliProviderBuildCommand:
 
         # Should keep the existing value, not override
         assert config["test-server"]["env"]["CAO_TERMINAL_ID"] == "existing-id"
+
+    @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
+    def test_build_command_mcp_tool_timeout(self, mock_load):
+        """Test that MCP tool timeout is set to 600s when MCP servers are configured.
+
+        Kimi CLI defaults to 60s MCP tool timeout (tool_call_timeout_ms=60000),
+        which is too short for handoff operations that create a worker terminal,
+        wait for it to complete, and extract output. Without this override, the
+        supervisor's handoff tool call times out after 60s even though the worker
+        is still processing.
+        """
+        mock_profile = MagicMock()
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = {
+            "cao-mcp-server": {"command": "uv", "args": ["run", "cao-mcp-server"]}
+        }
+        mock_load.return_value = mock_profile
+
+        provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
+        command = provider._build_kimi_command()
+
+        # --config flag should appear before --mcp-config
+        config_pos = command.index("--config")
+        mcp_config_pos = command.index("--mcp-config")
+        assert config_pos < mcp_config_pos
+        assert "mcp.client.tool_call_timeout_ms=600000" in command
+
+    @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
+    def test_build_command_no_timeout_without_mcp(self, mock_load):
+        """Test that MCP tool timeout is NOT set when no MCP servers are configured."""
+        mock_profile = MagicMock()
+        mock_profile.system_prompt = "You are helpful"
+        mock_profile.mcpServers = None
+        mock_load.return_value = mock_profile
+
+        provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
+        command = provider._build_kimi_command()
+
+        assert "tool_call_timeout_ms" not in command
+        # Cleanup temp files
+        provider.cleanup()
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
     def test_build_command_profile_no_system_prompt(self, mock_load):

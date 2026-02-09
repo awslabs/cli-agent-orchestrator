@@ -18,6 +18,7 @@ Critical bugs encountered during Kimi CLI, Codex, Gemini CLI, and Claude Code pr
 12. [System Prompt Injection Is Required for Supervisor Orchestration](#12-system-prompt-injection-is-required-for-supervisor-orchestration)
 13. [Ink TUI Always-Visible Idle Prompt Causes False Status Detection](#13-ink-tui-always-visible-idle-prompt-causes-false-status-detection)
 14. [CLI Subprocess for Config Registration Adds Seconds Per Server](#14-cli-subprocess-for-config-registration-adds-seconds-per-server)
+15. [MCP Tool Call Timeout Must Be Extended for Handoff](#15-mcp-tool-call-timeout-must-be-extended-for-handoff)
 
 ---
 
@@ -344,3 +345,30 @@ def _register_mcp_servers(self, mcp_servers: dict) -> None:
 - This applies to both registration AND cleanup paths
 - Preserve existing entries — only add/remove what CAO manages
 - Other providers already do this correctly: Kimi CLI/Claude Code use `--mcp-config` JSON flags, Codex uses `-c` flags (all single command)
+
+---
+
+## 15. MCP Tool Call Timeout Must Be Extended for Handoff
+
+**Symptom (Codex, then Kimi CLI):** Supervisor agent calls `handoff` MCP tool. Worker terminal is created, receives the task, starts processing. After 60 seconds, the supervisor receives a `ToolError("Timeout while calling MCP tool handoff")` and gives up — even though the worker is still processing and would have completed in 90-120 seconds.
+
+**Root cause:** CLI tools have a default MCP tool call timeout (typically 60 seconds):
+- **Codex:** `tool_timeout_sec = 60` (TOML config, per MCP server)
+- **Kimi CLI:** `tool_call_timeout_ms = 60000` (Python config, global)
+
+The `handoff` MCP tool creates a worker terminal, initializes the provider (~5-30s), sends the message, waits for the agent to complete (30-300s+), extracts output, and returns. This routinely exceeds 60 seconds.
+
+**Fix:** Override the timeout to match CAO's handoff timeout (600 seconds):
+
+| Provider | Config mechanism | Override |
+|----------|-----------------|----------|
+| Codex | Per-server TOML: `-c mcp_servers.<name>.tool_timeout_sec=600.0` | Must be TOML float (600.0), not int — Codex deserializes via `Option<f64>` and silently rejects integers |
+| Kimi CLI | Global config: `--config mcp.client.tool_call_timeout_ms=600000` | Integer milliseconds, set via `--config` CLI flag |
+| Claude Code | No known timeout issue | N/A |
+| Gemini CLI | No known timeout issue | N/A |
+
+**Rules:**
+- Check the CLI tool's MCP implementation for default tool timeout before shipping a provider
+- The timeout should match `_handoff_impl()`'s default timeout (600 seconds)
+- Only set the timeout when MCP servers are configured (no-op otherwise)
+- Watch for type parsing quirks — Codex silently rejects integer TOML values for float fields

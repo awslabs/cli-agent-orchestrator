@@ -486,46 +486,56 @@ uv run pytest test/providers/test_codex_provider_unit.py::TestCodexBuildCommand 
 
 ### Test Coverage (`test_kimi_cli_unit.py`)
 
-**57 tests across 6 test classes covering:**
+**64 tests across 6 test classes covering:**
 
-1. **Initialization (5 tests)**
+1. **Initialization (7 tests)**
    - Successful initialization (wait_for_shell + kimi --yolo + wait_until_status IDLE)
    - Shell timeout handling
    - Kimi CLI timeout handling
    - Initialization with agent profile
+   - Initialization with MCP servers (includes tool timeout verification)
    - Initialization state tracking
+   - Invalid agent profile error
 
-2. **Status Detection (11 tests)**
+2. **Status Detection (16 tests)**
    - IDLE status (💫 thinking prompt)
    - IDLE status (✨ normal prompt)
    - COMPLETED status (prompt + user input box + response bullets)
+   - COMPLETED status with complex multi-line response
+   - COMPLETED for long responses without • bullets (latching flag)
+   - COMPLETED with latching flag persisting after scrollout
    - PROCESSING status (no prompt at bottom)
+   - PROCESSING while streaming mid-response
+   - PROCESSING latches user input flag
+   - IDLE before any user input received
    - ERROR status (error pattern detection)
    - ERROR status (empty output)
+   - ERROR status (None output)
    - tail_lines parameter pass-through
-   - User input without response (still IDLE)
-   - Status bar not confused with content
    - ANSI-coded output handling
    - IDLE detection in tall terminals (46-row with 32 padding lines)
 
-3. **Message Extraction (10 tests)**
+3. **Message Extraction (11 tests)**
    - Successful extraction (response bullets after user input box)
    - Thinking bullet filtering (gray ANSI color 38;5;244 excluded)
-   - No user input box error
+   - No user input box fallback extraction
+   - Long response fallback extraction (input box scrolled out)
    - Empty response error
    - Status bar line filtering
    - Complex multi-line response with code blocks
    - Multiple user inputs (extracts last)
    - Extraction from fixture file
    - Fallback when all lines are thinking (returns all content)
-   - Thinking bullets with mixed content
+   - No trailing prompt extraction
 
-4. **Command Building (13 tests)**
+4. **Command Building (15 tests)**
    - Base command without agent profile (`kimi --yolo`)
    - Command with agent profile (temp YAML + system.md)
    - Temp file creation and content verification
    - Agent YAML extends default agent
    - MCP server config injection via `--mcp-config` JSON
+   - MCP tool call timeout set to 600s (`--config mcp.client.tool_call_timeout_ms=600000`)
+   - MCP tool timeout NOT set when no MCP servers configured
    - MCP server with dict config
    - MCP server with model config (Pydantic)
    - MCP server CAO_TERMINAL_ID auto-injection
@@ -550,14 +560,14 @@ uv run pytest test/providers/test_codex_provider_unit.py::TestCodexBuildCommand 
 6. **Lifecycle (8 tests)**
    - Cleanup removes temp directory
    - Cleanup with no temp directory (no-op)
-   - Cleanup resets initialized state
+   - Cleanup resets initialized state and latching flag
    - Exit command returns `/exit`
    - Idle pattern for log returns emoji pattern
    - Terminal attributes (terminal_id, session_name, window_name)
-   - Provider attributes after construction
+   - Provider attributes after construction (including _has_received_input)
    - Double cleanup is safe
 
-**Coverage:** 100% of kimi_cli.py (134 statements)
+**Coverage:** 98% of kimi_cli.py (163 statements)
 
 ### Test Fixtures
 
