@@ -27,6 +27,7 @@ from test.e2e.conftest import (
     cleanup_terminal,
     create_terminal,
     extract_output,
+    get_terminal_status,
     send_handoff_message,
     wait_for_status,
 )
@@ -57,10 +58,21 @@ def _run_handoff_test(provider: str, agent_profile: str, task_message: str, cont
         terminal_id, actual_session = create_terminal(provider, agent_profile, session_name)
         assert terminal_id, "Terminal ID should not be empty"
 
-        # Step 2: Wait for IDLE
-        assert wait_for_status(
-            terminal_id, "idle", timeout=90.0
-        ), f"Terminal did not reach IDLE within 90s (provider={provider})"
+        # Step 2: Wait for ready (idle or completed).
+        # Providers with initial prompts (Gemini CLI -i) reach 'completed'
+        # after processing the system prompt; others reach 'idle'.
+        start = time.time()
+        while time.time() - start < 90.0:
+            s = get_terminal_status(terminal_id)
+            if s in ("idle", "completed"):
+                break
+            if s == "error":
+                break
+            time.sleep(3)
+        assert s in (
+            "idle",
+            "completed",
+        ), f"Terminal did not become ready within 90s (provider={provider})"
 
         # Settle time before sending message
         time.sleep(2)
@@ -68,10 +80,19 @@ def _run_handoff_test(provider: str, agent_profile: str, task_message: str, cont
         # Step 3: Send handoff message
         send_handoff_message(terminal_id, task_message, provider)
 
-        # Step 4: Poll for COMPLETED
+        # Step 4: Poll for COMPLETED with stabilization.
         assert wait_for_status(
             terminal_id, "completed", timeout=COMPLETION_TIMEOUT
         ), f"Terminal did not reach COMPLETED within {COMPLETION_TIMEOUT}s (provider={provider})"
+
+        # Stabilization: re-check after short delay to catch premature COMPLETED.
+        time.sleep(5)
+        recheck_status = get_terminal_status(terminal_id)
+        if recheck_status != "completed":
+            assert wait_for_status(terminal_id, "completed", timeout=COMPLETION_TIMEOUT), (
+                f"Terminal did not re-reach COMPLETED within {COMPLETION_TIMEOUT}s "
+                f"(provider={provider}), status after stabilization: {recheck_status}"
+            )
 
         # Step 5: Extract output
         output = extract_output(terminal_id)

@@ -85,10 +85,21 @@ def _run_assign_test(provider: str, agent_profile: str, task_message: str, conte
         terminal_id, actual_session = create_terminal(provider, agent_profile, session_name)
         assert terminal_id, "Terminal ID should not be empty"
 
-        # Step 2: Wait for IDLE
-        assert wait_for_status(
-            terminal_id, "idle", timeout=90.0
-        ), f"Worker terminal did not reach IDLE within 90s (provider={provider})"
+        # Step 2: Wait for ready (idle or completed).
+        # Providers with initial prompts (Gemini CLI -i) reach 'completed'
+        # after processing the system prompt; others reach 'idle'.
+        start = time.time()
+        while time.time() - start < 90.0:
+            s = get_terminal_status(terminal_id)
+            if s in ("idle", "completed"):
+                break
+            if s == "error":
+                break
+            time.sleep(3)
+        assert s in (
+            "idle",
+            "completed",
+        ), f"Worker terminal did not become ready within 90s (provider={provider})"
         time.sleep(2)
 
         # Step 3: Send task to worker
@@ -98,10 +109,23 @@ def _run_assign_test(provider: str, agent_profile: str, task_message: str, conte
         )
         assert resp.status_code == 200, f"Send message failed: {resp.status_code}"
 
-        # Step 4: Poll for COMPLETED
+        # Step 4: Poll for COMPLETED with stabilization.
+        # Some providers (Gemini CLI) report premature COMPLETED between the
+        # initial text response and MCP tool execution. After detecting
+        # COMPLETED, wait briefly and re-verify to catch this case.
         assert wait_for_status(
             terminal_id, "completed", timeout=COMPLETION_TIMEOUT
         ), f"Worker did not reach COMPLETED within {COMPLETION_TIMEOUT}s (provider={provider})"
+
+        # Stabilization: re-check after short delay to catch premature COMPLETED.
+        # If the provider went back to PROCESSING, wait for COMPLETED again.
+        time.sleep(5)
+        recheck_status = get_terminal_status(terminal_id)
+        if recheck_status != "completed":
+            assert wait_for_status(terminal_id, "completed", timeout=COMPLETION_TIMEOUT), (
+                f"Worker did not re-reach COMPLETED within {COMPLETION_TIMEOUT}s "
+                f"(provider={provider}), status after stabilization: {recheck_status}"
+            )
 
         # Step 5: Validate output
         output = extract_output(terminal_id)

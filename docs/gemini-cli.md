@@ -30,7 +30,7 @@ The provider detects Gemini CLI states by analyzing tmux terminal output:
 | Status | Pattern | Description |
 |--------|---------|-------------|
 | **IDLE** | `*   Type your message` at bottom | Input box visible, ready for input |
-| **PROCESSING** | No idle prompt at bottom | Response is streaming |
+| **PROCESSING** | No idle prompt at bottom, OR spinner visible (Braille dots + "esc to cancel") | Response is streaming or tool executing |
 | **COMPLETED** | Idle prompt + user query (`>` prefix) + response (`✦` prefix) | Task finished |
 | **ERROR** | `Error:`, `APIError:`, `ConnectionError:`, `Traceback` patterns | Error detected |
 
@@ -113,8 +113,8 @@ When the provider's `cleanup()` method is called, it sends `gemini mcp remove --
 
 ### Provider Lifecycle
 
-1. **Initialize**: Wait for shell → warm-up echo (verify shell ready) → send command → wait for IDLE (up to 60s)
-2. **Status Detection**: Check bottom 50 lines for idle prompt pattern (`IDLE_PROMPT_TAIL_LINES = 50`)
+1. **Initialize**: Wait for shell → warm-up echo (verify shell ready) → send command → wait for IDLE or COMPLETED (up to 120s; when `-i` is used, waits for COMPLETED to ensure the system prompt has been fully processed before accepting input)
+2. **Status Detection**: Check bottom 50 lines for idle prompt + processing spinner (`IDLE_PROMPT_TAIL_LINES = 50`)
 3. **Message Extraction**: Line-based approach filtering TUI chrome
 4. **Exit**: Send `C-d` (Ctrl+D)
 5. **Cleanup**: Remove MCP servers, reset state
@@ -134,6 +134,14 @@ When the provider's `cleanup()` method is called, it sends `gemini mcp remove --
  *   Type your message or @path/to/file
 ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
  .../project (main)   no sandbox   Auto (Gemini 3) /model | 199.2 MB
+```
+
+### Processing Spinner Detection
+
+Gemini's Ink TUI keeps the idle input box (`* Type your message`) visible at the bottom at ALL times, even during active processing. This differs from other providers where the idle prompt disappears during processing. To avoid premature COMPLETED detection, `get_status()` checks for Braille spinner characters + "(esc to cancel" text in the bottom lines before returning COMPLETED.
+
+```
+⠴ Refining Delegation Parameters (esc to cancel, 50s)
 ```
 
 ### IDLE_PROMPT_TAIL_LINES

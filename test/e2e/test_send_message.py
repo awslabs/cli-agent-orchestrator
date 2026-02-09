@@ -100,19 +100,37 @@ def _run_send_message_test(provider: str, agent_profile: str):
         sender_id, actual_session = create_terminal(provider, agent_profile, session_name)
         assert sender_id, "Sender terminal ID should not be empty"
 
-        # Step 2: Wait for sender to reach IDLE
-        assert wait_for_status(
-            sender_id, "idle", timeout=90.0
-        ), f"Sender terminal did not reach IDLE within 90s (provider={provider})"
+        # Step 2: Wait for sender to be ready (idle or completed).
+        start = time.time()
+        while time.time() - start < 90.0:
+            s = get_terminal_status(sender_id)
+            if s in ("idle", "completed"):
+                break
+            if s == "error":
+                break
+            time.sleep(3)
+        assert s in (
+            "idle",
+            "completed",
+        ), f"Sender terminal did not become ready within 90s (provider={provider})"
 
         # Step 3: Create second terminal in the same session (acts as receiver)
         receiver_id = _create_terminal_in_session(actual_session, provider, agent_profile)
         assert receiver_id, "Receiver terminal ID should not be empty"
 
-        # Step 4: Wait for receiver to reach IDLE
-        assert wait_for_status(
-            receiver_id, "idle", timeout=90.0
-        ), f"Receiver terminal did not reach IDLE within 90s (provider={provider})"
+        # Step 4: Wait for receiver to be ready (idle or completed).
+        start = time.time()
+        while time.time() - start < 90.0:
+            s = get_terminal_status(receiver_id)
+            if s in ("idle", "completed"):
+                break
+            if s == "error":
+                break
+            time.sleep(3)
+        assert s in (
+            "idle",
+            "completed",
+        ), f"Receiver terminal did not become ready within 90s (provider={provider})"
 
         # Step 5: Send message from sender to receiver's inbox
         test_message = f"E2E test message from {sender_id} at {time.time()}"

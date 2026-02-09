@@ -107,6 +107,23 @@ STATUS_BAR_PATTERN = r"(?:sandbox|no sandbox).*(?:Auto|/mod(?:e|el))"
 # YOLO mode indicator text above the bottom input box.
 YOLO_INDICATOR_PATTERN = r"YOLO mode"
 
+# Processing spinner: Braille dots (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏) followed by text and
+# "(esc to cancel" indicator. Gemini shows this during active processing
+# (model thinking, tool execution, retries). CRITICAL: Gemini's Ink TUI keeps
+# the idle input box visible at the bottom even while processing, so the idle
+# prompt alone is NOT sufficient to determine idle/completed state. We must
+# also check for this spinner to avoid premature COMPLETED detection.
+# Examples:
+#   ⠴ Refining Delegation Parameters (esc to cancel, 50s)
+#   ⠧ Clarifying the Template Retrieval (esc to cancel, 1m 55s)
+#   ⠼ Trying to reach gemini-3-flash-preview (Attempt 2/3) (esc to cancel, 2s)
+PROCESSING_SPINNER_PATTERN = r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏].*\(esc to cancel"
+
+# "Responding with" model indicator, visible during active response generation.
+# When this text appears without a completed response (✦), the model is still
+# streaming its output. Used as a secondary processing indicator.
+RESPONDING_WITH_PATTERN = r"Responding with\s+\S+"
+
 # Generic error patterns for detecting failure states in terminal output.
 ERROR_PATTERN = (
     r"^(?:Error:|ERROR:|Traceback \(most recent call last\):|ConnectionError:|APIError:)"
@@ -132,6 +149,12 @@ class GeminiCliProvider(BaseProvider):
         super().__init__(terminal_id, session_name, window_name)
         self._initialized = False
         self._agent_profile = agent_profile
+        # Track whether -i (prompt-interactive) flag is used so initialize()
+        # can wait for COMPLETED instead of IDLE. When -i is used, Gemini
+        # processes the system prompt as the first user message and produces
+        # a response before accepting new input. Accepting IDLE too early
+        # (before -i is processed) causes sent messages to be lost.
+        self._uses_prompt_interactive = False
         # Track MCP servers that were configured via `gemini mcp add`
         # so they can be removed during cleanup.
         self._mcp_server_names: list[str] = []
@@ -181,6 +204,7 @@ class GeminiCliProvider(BaseProvider):
                 system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
                 if system_prompt:
                     command_parts.extend(["-i", system_prompt])
+                    self._uses_prompt_interactive = True
 
                     # Also write GEMINI.md as supplementary context.
                     # This provides persistent background instructions that the
@@ -287,17 +311,30 @@ class GeminiCliProvider(BaseProvider):
         # Send Gemini command to the tmux window
         tmux_client.send_keys(self.session_name, self.window_name, command)
 
-        # Wait for Gemini CLI to reach IDLE or COMPLETED state.
-        # When launched with -i (prompt-interactive), Gemini processes the
-        # initial prompt and produces a response before returning to the input
-        # box. This means status will be COMPLETED (query + response + idle
-        # prompt) rather than IDLE (just idle prompt). We accept either state.
+        # Wait for Gemini CLI to finish initialization.
         # Gemini takes 10-15+ seconds to load due to Node.js/Ink startup.
+        #
+        # IMPORTANT: Gemini's Ink TUI shows the idle prompt ("* Type your
+        # message") immediately on startup, BEFORE the -i prompt is processed
+        # and BEFORE MCP servers are connected. If we accept IDLE too early,
+        # messages sent to the terminal are lost because Gemini is still
+        # processing the -i system prompt (lesson #18).
+        #
+        # When -i is used: wait for COMPLETED specifically. The -i flag always
+        # produces a response (query + ✦ response + idle prompt), so COMPLETED
+        # means the system prompt has been fully processed and Gemini is ready.
+        #
+        # Without -i: accept IDLE (just the idle prompt, no prior interaction).
         init_start = time.time()
         init_timeout = 120.0  # longer timeout for -i prompt processing
+        if self._uses_prompt_interactive:
+            target_states = (TerminalStatus.COMPLETED,)
+        else:
+            target_states = (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
+
         while time.time() - init_start < init_timeout:
             status = self.get_status()
-            if status in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
+            if status in target_states:
                 break
             time.sleep(1.0)
         else:
@@ -341,7 +378,18 @@ class GeminiCliProvider(BaseProvider):
         has_idle_prompt = any(re.search(IDLE_PROMPT_PATTERN, line) for line in bottom_lines)
 
         if has_idle_prompt:
-            # Idle prompt is visible — check if there's a completed response.
+            # Gemini's Ink TUI keeps the idle input box visible at ALL times,
+            # even during active processing (tool calls, model thinking, retries).
+            # We must check for processing indicators before concluding the
+            # model is idle or has completed. Without this check, get_status()
+            # returns COMPLETED while a handoff/assign MCP tool is still running,
+            # causing the E2E supervisor test to check for worker terminals
+            # before they're created (lesson #16).
+            has_spinner = any(re.search(PROCESSING_SPINNER_PATTERN, line) for line in bottom_lines)
+            if has_spinner:
+                return TerminalStatus.PROCESSING
+
+            # No spinner — check if there's a completed response.
             # Look for ✦ response prefix anywhere in the output,
             # which indicates Gemini produced a response.
             has_response = bool(re.search(RESPONSE_PREFIX_PATTERN, clean_output))
@@ -430,6 +478,10 @@ class GeminiCliProvider(BaseProvider):
 
             # Skip model indicator ("Responding with ...")
             if re.search(MODEL_INDICATOR_PATTERN, line):
+                continue
+
+            # Skip processing spinner lines (Braille dots + "esc to cancel")
+            if re.search(PROCESSING_SPINNER_PATTERN, line):
                 continue
 
             response_lines.append(line)

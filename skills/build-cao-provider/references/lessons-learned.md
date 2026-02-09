@@ -351,3 +351,113 @@ tmux_client.send_keys_via_paste(session, window, message)  # not send_keys()
 - Worker-only E2E tests are necessary but not sufficient — they test the building blocks, not the orchestration
 - Add `test_supervisor_orchestration.py` to `test/e2e/` that launches a supervisor and verifies end-to-end delegation
 - The current `test_handoff.py` and `test_assign.py` should be renamed or documented to clarify they test provider lifecycle, not MCP tool delegation
+
+---
+
+## 16. Ink TUI Keeps Idle Prompt Visible During Processing — Check for Spinner
+
+**Symptom (Gemini CLI):** Supervisor E2E test detects COMPLETED status while the supervisor is still calling handoff/assign MCP tools. Worker terminals have not been created yet, so the test asserts "Expected at least 2 terminals, got 1" and fails.
+
+**Root cause:** Gemini CLI uses React Ink for its TUI. Unlike other providers (Kimi CLI, Claude Code, Codex) where the idle prompt disappears during processing, Ink renders the idle input box (`* Type your message`) at the bottom of the screen **at all times**, even while the model is actively processing (executing tool calls, retrying API calls, streaming responses).
+
+This means `get_status()` detects:
+- Idle prompt visible at bottom → check passes
+- Query with `>` prefix visible → `has_query = True`
+- Response with `✦` prefix visible → `has_response = True`
+- Returns COMPLETED even though a spinner like `⠴ Refining Delegation Parameters (esc to cancel, 50s)` is visible right above the idle prompt
+
+**What the processing spinner looks like:**
+```
+⠴ Refining Delegation Parameters (esc to cancel, 50s)
+⠧ Clarifying the Template Retrieval (esc to cancel, 1m 55s)
+⠼ Trying to reach gemini-3-flash-preview (Attempt 2/3) (esc to cancel, 2s)
+```
+
+Pattern: Braille dots spinner character + text + `(esc to cancel, ...)`
+
+**Fix:** Add `PROCESSING_SPINNER_PATTERN` that detects the Braille spinner + "esc to cancel" text. In `get_status()`, check for the spinner in the bottom N lines BEFORE checking for query/response:
+
+```python
+PROCESSING_SPINNER_PATTERN = r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏].*\(esc to cancel"
+
+if has_idle_prompt:
+    has_spinner = any(
+        re.search(PROCESSING_SPINNER_PATTERN, line) for line in bottom_lines
+    )
+    if has_spinner:
+        return TerminalStatus.PROCESSING
+    # ... then check for COMPLETED/IDLE
+```
+
+**Rules:**
+- Ink-based TUIs (Gemini CLI) do NOT hide the idle prompt during processing — do not rely on idle prompt visibility alone
+- Always check for active processing indicators (spinners, "Responding with" text) before concluding COMPLETED
+- This is specific to Ink-based TUIs; prompt_toolkit-based TUIs (Kimi CLI) DO hide the prompt during processing
+- Add `test_get_status_processing_spinner_with_idle_prompt` from day one for any Ink-based provider
+- The spinner characters are Unicode Braille pattern dots (U+280x range) — they're stable across Gemini CLI versions
+
+---
+
+## 17. Premature COMPLETED Between Text Output and MCP Tool Call — Use Combined Polling
+
+**Symptom (Gemini CLI):** Supervisor E2E test calls `wait_for_status("completed")` then checks `len(terminals) >= 2`. The wait returns immediately because the supervisor produced initial text output (✦ response + idle prompt = COMPLETED), but the handoff MCP tool call hasn't started yet. Worker terminals don't exist at this point.
+
+**Root cause:** When the supervisor receives a task requiring delegation, it produces an initial text response first (e.g., "I'll delegate this to the report_generator...") before calling the MCP tool. There's a brief window (2-5 seconds) between the text output and the MCP tool call where:
+- The idle prompt is visible (Ink TUI keeps it at all times)
+- A ✦ response is visible (from the initial text)
+- No spinner is visible yet (MCP call hasn't started)
+- `get_status()` returns COMPLETED
+
+The spinner fix (lesson #16) catches PROCESSING once the MCP call starts, but doesn't help with this gap between text output and MCP call start.
+
+**Fix:** Replace the sequential pattern (`wait_for_status("completed")` then check terminals) with a combined polling function `_wait_for_supervisor_done()` that waits for BOTH conditions simultaneously:
+
+```python
+def _wait_for_supervisor_done(supervisor_id, session_name, min_terminals, timeout, poll):
+    while time.time() - start < timeout:
+        status = get_terminal_status(supervisor_id)
+        terminals = _list_terminals_in_session(session_name)
+        if status == "completed" and len(terminals) >= min_terminals:
+            return status, terminals
+        time.sleep(poll)
+```
+
+This is in `test/e2e/test_supervisor_orchestration.py` and affects ALL providers (not just Gemini), but only Gemini CLI benefits because other providers don't report premature COMPLETED.
+
+**Rules:**
+- Never check terminal count immediately after `wait_for_status("completed")` for providers with always-visible idle prompts
+- Use combined polling (status + terminal count) for supervisor orchestration tests
+- This is a test-level fix, not a provider-level fix — the provider's status detection is correct (it reports what it sees), but the E2E test must account for the multi-step supervisor flow
+
+---
+
+## 18. Ink TUI Shows Idle Prompt Before -i Prompt Is Processed — Wait for COMPLETED
+
+**Symptom (Gemini CLI):** Supervisor E2E test is flaky — sometimes the task message sent after initialization is completely ignored. The supervisor stays at "idle" for the full 300s timeout and never processes the task.
+
+**Root cause:** Gemini's Ink TUI renders the idle input box (`* Type your message`) immediately on startup, BEFORE the `-i` system prompt is processed and BEFORE MCP servers are connected. The provider's `initialize()` method accepts IDLE as a valid state and returns early, thinking Gemini is ready. The test then sends the task message while Gemini is still processing the `-i` prompt. The task message gets lost.
+
+Timeline of the failing case:
+1. `gemini --yolo --sandbox false -i "system prompt"` launched
+2. Ink TUI renders idle prompt immediately → `get_status()` = IDLE
+3. `initialize()` sees IDLE → returns True (too early!)
+4. Test sends task message
+5. Gemini is still processing `-i` prompt → task message lost
+6. `-i` prompt completes → supervisor sits idle, task never received
+
+**Fix:** Track whether `-i` was used via `self._uses_prompt_interactive` flag. In `initialize()`, when `-i` is used, wait for COMPLETED specifically (not IDLE). The `-i` flag always produces a query + response, so COMPLETED means the system prompt has been fully processed and Gemini is truly ready.
+
+```python
+if self._uses_prompt_interactive:
+    target_states = (TerminalStatus.COMPLETED,)
+else:
+    target_states = (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
+```
+
+Also update E2E tests to use `_wait_for_ready()` (accepts both "idle" and "completed") instead of `wait_for_status("idle")`, since providers with initial prompts reach COMPLETED after initialization.
+
+**Rules:**
+- For Ink-based TUIs with initial prompts (-i), NEVER accept IDLE as initialization-complete — always wait for COMPLETED
+- The idle prompt appearance in Ink TUIs does NOT mean the CLI is ready for input
+- E2E tests should accept both "idle" and "completed" as valid post-initialization states
+- Track whether initial-prompt flags are used so the initialization logic can adapt

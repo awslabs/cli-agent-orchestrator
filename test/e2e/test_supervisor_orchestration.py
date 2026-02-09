@@ -33,7 +33,6 @@ from test.e2e.conftest import (
     create_terminal,
     extract_output,
     get_terminal_status,
-    wait_for_status,
 )
 
 import pytest
@@ -58,6 +57,65 @@ def _list_terminals_in_session(session_name: str) -> list:
     return data.get("terminals", [])
 
 
+def _wait_for_ready(terminal_id: str, timeout: float = 120.0, poll: float = 3.0) -> bool:
+    """Wait for provider to be ready (idle or completed).
+
+    After initialization, most providers reach 'idle'. However, providers
+    that use an initial prompt (e.g. Gemini CLI with -i flag) reach
+    'completed' because the prompt produces a response. Both states
+    indicate the provider is ready to accept input.
+    """
+    start = time.time()
+    while time.time() - start < timeout:
+        status = get_terminal_status(terminal_id)
+        if status in ("idle", "completed"):
+            return True
+        if status == "error":
+            return False
+        time.sleep(poll)
+    return False
+
+
+def _wait_for_supervisor_done(
+    supervisor_id: str,
+    session_name: str,
+    min_terminals: int,
+    timeout: float = SUPERVISOR_COMPLETION_TIMEOUT,
+    poll: float = 5.0,
+) -> tuple:
+    """Wait for supervisor to reach COMPLETED AND spawn expected workers.
+
+    Some providers (notably Gemini CLI) report COMPLETED after initial text
+    output but before MCP tool calls (handoff/assign) finish creating worker
+    terminals. Gemini's Ink TUI keeps the idle prompt visible at all times,
+    so the status detector sees "response + idle prompt" = COMPLETED even
+    while the model is between text output and the first MCP tool call.
+
+    This function polls until BOTH conditions are true:
+    - Terminal status is 'completed'
+    - At least min_terminals exist in the session (supervisor + workers)
+
+    Returns (last_status, terminals_list).
+    """
+    start = time.time()
+    last_status = "unknown"
+    terminals = []
+
+    while time.time() - start < timeout:
+        last_status = get_terminal_status(supervisor_id)
+        terminals = _list_terminals_in_session(session_name)
+
+        if last_status == "error":
+            return last_status, terminals
+
+        if last_status == "completed" and len(terminals) >= min_terminals:
+            return last_status, terminals
+
+        time.sleep(poll)
+
+    return last_status, terminals
+
+
 def _run_supervisor_handoff_test(provider: str):
     """Test supervisor uses handoff MCP tool to delegate to a worker.
 
@@ -80,10 +138,12 @@ def _run_supervisor_handoff_test(provider: str):
         )
         assert supervisor_id, "Supervisor terminal ID should not be empty"
 
-        # Step 2: Wait for IDLE
-        assert wait_for_status(
-            supervisor_id, "idle", timeout=120.0
-        ), f"Supervisor did not reach IDLE within 120s (provider={provider})"
+        # Step 2: Wait for provider to be ready (idle or completed).
+        # Providers with initial prompts (Gemini CLI -i) reach 'completed'
+        # after processing the system prompt; others reach 'idle'.
+        assert _wait_for_ready(
+            supervisor_id, timeout=120.0
+        ), f"Supervisor did not become ready within 120s (provider={provider})"
         time.sleep(2)
 
         # Step 3: Send task that requires delegation.
@@ -99,23 +159,16 @@ def _run_supervisor_handoff_test(provider: str):
         )
         assert resp.status_code == 200, f"Send message failed: {resp.status_code}"
 
-        # Step 4: Wait for supervisor to complete.
-        # The supervisor must: parse task → call handoff() → worker initializes →
-        # worker completes → handoff returns result → supervisor presents output.
-        assert wait_for_status(
-            supervisor_id,
-            "completed",
-            timeout=SUPERVISOR_COMPLETION_TIMEOUT,
-            poll=5.0,
-        ), (
-            f"Supervisor did not reach COMPLETED within {SUPERVISOR_COMPLETION_TIMEOUT}s "
-            f"(provider={provider}). Last status: {get_terminal_status(supervisor_id)}"
+        # Step 4+5: Wait for supervisor to complete AND create worker terminal.
+        # Uses combined polling because some providers (Gemini CLI) report
+        # COMPLETED from initial text output before MCP tool calls finish.
+        status, terminals = _wait_for_supervisor_done(
+            supervisor_id, actual_session, min_terminals=2
         )
-
-        # Step 5: Verify worker terminal was created.
-        # The handoff MCP tool creates a new terminal in the same session.
-        # List terminals to confirm the supervisor spawned a worker.
-        terminals = _list_terminals_in_session(actual_session)
+        assert status == "completed", (
+            f"Supervisor did not reach COMPLETED within {SUPERVISOR_COMPLETION_TIMEOUT}s "
+            f"(provider={provider}). Last status: {status}"
+        )
         assert len(terminals) >= 2, (
             f"Expected at least 2 terminals (supervisor + worker), got {len(terminals)}. "
             f"The supervisor may not have called the handoff MCP tool."
@@ -174,10 +227,12 @@ def _run_supervisor_assign_test(provider: str):
         )
         assert supervisor_id, "Supervisor terminal ID should not be empty"
 
-        # Step 2: Wait for IDLE
-        assert wait_for_status(
-            supervisor_id, "idle", timeout=120.0
-        ), f"Supervisor did not reach IDLE within 120s (provider={provider})"
+        # Step 2: Wait for provider to be ready (idle or completed).
+        # Providers with initial prompts (Gemini CLI -i) reach 'completed'
+        # after processing the system prompt; others reach 'idle'.
+        assert _wait_for_ready(
+            supervisor_id, timeout=120.0
+        ), f"Supervisor did not become ready within 120s (provider={provider})"
         time.sleep(2)
 
         # Step 3: Send task requiring assign + handoff.
@@ -195,20 +250,17 @@ def _run_supervisor_assign_test(provider: str):
         )
         assert resp.status_code == 200, f"Send message failed: {resp.status_code}"
 
-        # Step 4: Wait for supervisor to complete.
-        assert wait_for_status(
-            supervisor_id,
-            "completed",
-            timeout=SUPERVISOR_COMPLETION_TIMEOUT,
-            poll=5.0,
-        ), (
-            f"Supervisor did not reach COMPLETED within {SUPERVISOR_COMPLETION_TIMEOUT}s "
-            f"(provider={provider}). Last status: {get_terminal_status(supervisor_id)}"
-        )
-
-        # Step 5: Verify multiple worker terminals were created.
+        # Step 4+5: Wait for supervisor to complete AND create worker terminals.
         # assign(data_analyst) + handoff(report_generator) = at least 3 terminals.
-        terminals = _list_terminals_in_session(actual_session)
+        # Uses combined polling because some providers (Gemini CLI) report
+        # COMPLETED from initial text output before MCP tool calls finish.
+        status, terminals = _wait_for_supervisor_done(
+            supervisor_id, actual_session, min_terminals=3
+        )
+        assert status == "completed", (
+            f"Supervisor did not reach COMPLETED within {SUPERVISOR_COMPLETION_TIMEOUT}s "
+            f"(provider={provider}). Last status: {status}"
+        )
         assert len(terminals) >= 3, (
             f"Expected at least 3 terminals (supervisor + data_analyst + report_generator), "
             f"got {len(terminals)}. The supervisor may not have called assign/handoff tools."

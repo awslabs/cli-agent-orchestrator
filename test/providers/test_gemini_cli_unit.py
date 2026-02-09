@@ -20,7 +20,9 @@ from cli_agent_orchestrator.providers.gemini_cli import (
     INPUT_BOX_BOTTOM_PATTERN,
     INPUT_BOX_TOP_PATTERN,
     MODEL_INDICATOR_PATTERN,
+    PROCESSING_SPINNER_PATTERN,
     QUERY_BOX_PREFIX_PATTERN,
+    RESPONDING_WITH_PATTERN,
     RESPONSE_PREFIX_PATTERN,
     STATUS_BAR_PATTERN,
     TOOL_CALL_BOX_PATTERN,
@@ -152,6 +154,84 @@ class TestGeminiCliProviderInitialization:
         provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="nonexistent")
         with pytest.raises(ProviderError, match="Failed to load agent profile"):
             provider._build_gemini_command()
+
+    @patch("cli_agent_orchestrator.providers.gemini_cli.time")
+    @patch("cli_agent_orchestrator.providers.gemini_cli.wait_for_shell", return_value=True)
+    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
+    def test_initialize_with_prompt_interactive_waits_for_completed(
+        self, mock_load, mock_tmux, mock_wait_shell, mock_time
+    ):
+        """Test that -i flag makes initialize() wait for COMPLETED, not IDLE.
+
+        When -i is used, Gemini processes the system prompt as the first user
+        message and produces a response. IDLE alone is premature because the
+        Ink TUI shows the idle prompt before -i processing finishes (lesson #18).
+        """
+        mock_time.time.side_effect = [0, 0, 0, 0, 0, 0, 0]
+        mock_time.sleep = MagicMock()
+        mock_profile = MagicMock()
+        mock_profile.system_prompt = "You are a supervisor."
+        mock_profile.mcpServers = {}
+        mock_load.return_value = mock_profile
+
+        # First get_history: warm-up marker. Second: idle prompt (should NOT
+        # be accepted when -i is used). Third: completed state (response + idle).
+        idle_output = " *   Type your message or @path/to/file\n"
+        completed_output = (
+            "> You are a supervisor.\n"
+            "✦ I understand. I am a supervisor.\n"
+            " *   Type your message or @path/to/file\n"
+        )
+        mock_tmux.get_history.side_effect = [
+            "CAO_SHELL_READY",
+            idle_output,  # 1st status check: IDLE — skipped because -i requires COMPLETED
+            completed_output,  # 2nd status check: COMPLETED — accepted
+        ]
+        mock_tmux.get_pane_working_directory.return_value = None
+
+        provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="supervisor")
+        result = provider.initialize()
+
+        assert result is True
+        assert provider._uses_prompt_interactive is True
+        assert provider._initialized is True
+
+    def test_uses_prompt_interactive_flag_default(self):
+        """Test _uses_prompt_interactive defaults to False."""
+        provider = GeminiCliProvider("term-1", "session-1", "window-1")
+        assert provider._uses_prompt_interactive is False
+
+    @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
+    def test_build_command_sets_prompt_interactive_flag(self, mock_tmux, mock_load):
+        """Test _build_gemini_command sets _uses_prompt_interactive when -i is used."""
+        mock_profile = MagicMock()
+        mock_profile.system_prompt = "You are a supervisor."
+        mock_profile.mcpServers = {}
+        mock_load.return_value = mock_profile
+        mock_tmux.get_pane_working_directory.return_value = None
+
+        provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="supervisor")
+        command = provider._build_gemini_command()
+
+        assert provider._uses_prompt_interactive is True
+        assert "-i" in command
+
+    @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
+    def test_build_command_no_prompt_interactive_without_system_prompt(self, mock_tmux, mock_load):
+        """Test _uses_prompt_interactive stays False when profile has no system prompt."""
+        mock_profile = MagicMock()
+        mock_profile.system_prompt = ""
+        mock_profile.mcpServers = {}
+        mock_load.return_value = mock_profile
+
+        provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="worker")
+        command = provider._build_gemini_command()
+
+        assert provider._uses_prompt_interactive is False
+        assert "-i" not in command
 
 
 # =============================================================================
@@ -291,6 +371,82 @@ class TestGeminiCliProviderStatusDetection:
             " *   Type your message or @path/to/file\n"
             "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n"
             " .../dir (main)   no sandbox   Auto (Gemini 3) /model | 100 MB\n"
+        )
+        mock_tmux.get_history.return_value = output
+        provider = GeminiCliProvider("term-1", "session-1", "window-1")
+        assert provider.get_status() == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
+    def test_get_status_processing_spinner_with_idle_prompt(self, mock_tmux):
+        """Test PROCESSING when spinner is visible despite idle prompt being shown.
+
+        Gemini's Ink TUI keeps the idle input box visible at the bottom at ALL
+        times, even during active processing (tool calls, model thinking).
+        The processing spinner (Braille dots + 'esc to cancel') appears above
+        the idle prompt. Without spinner detection, get_status() would return
+        COMPLETED prematurely (lesson #16).
+        """
+        output = (
+            "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
+            " > Use the handoff tool to delegate this task\n"
+            "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n"
+            "  Responding with gemini-3-flash-preview\n"
+            "╭──────────────────────────────╮\n"
+            "│ ✓  handoff (cao-mcp-server)   │\n"
+            "╰──────────────────────────────╯\n"
+            "⠴ Refining Delegation Parameters (esc to cancel, 50s)\n"
+            "\n"
+            " 1 MCP server                  YOLO mode (ctrl + y to toggle)\n"
+            "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
+            " *   Type your message or @path/to/file\n"
+            "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n"
+            " .../dir (main)   no sandbox   Auto (Gemini 3) /model | 234 MB\n"
+        )
+        mock_tmux.get_history.return_value = output
+        provider = GeminiCliProvider("term-1", "session-1", "window-1")
+        assert provider.get_status() == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
+    def test_get_status_processing_spinner_retry(self, mock_tmux):
+        """Test PROCESSING when model is retrying API call (Attempt N/M spinner)."""
+        output = (
+            "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
+            " > create a report\n"
+            "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n"
+            "  Responding with gemini-3-flash-preview\n"
+            "⠼ Trying to reach gemini-3-flash-preview (Attempt 2/3) (esc to cancel, 2s)\n"
+            "\n"
+            "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
+            " *   Type your message or @path/to/file\n"
+            "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n"
+            " .../dir (main)   no sandbox   Auto (Gemini 3) /model | 100 MB\n"
+        )
+        mock_tmux.get_history.return_value = output
+        provider = GeminiCliProvider("term-1", "session-1", "window-1")
+        assert provider.get_status() == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
+    def test_get_status_completed_no_spinner(self, mock_tmux):
+        """Test COMPLETED when response finished and no spinner is present.
+
+        After the model finishes processing (no spinner), idle prompt visible,
+        and response with ✦ prefix visible → COMPLETED.
+        """
+        output = (
+            "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
+            " > Use the handoff tool to delegate this task\n"
+            "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n"
+            "  Responding with gemini-3-flash-preview\n"
+            "╭──────────────────────────────╮\n"
+            "│ ✓  handoff (cao-mcp-server)   │\n"
+            "╰──────────────────────────────╯\n"
+            "✦ Here is the report template from the worker:\n"
+            "\n"
+            " 1 MCP server                  YOLO mode (ctrl + y to toggle)\n"
+            "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
+            " *   Type your message or @path/to/file\n"
+            "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n"
+            " .../dir (main)   no sandbox   Auto (Gemini 3) /model | 234 MB\n"
         )
         mock_tmux.get_history.return_value = output
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
@@ -459,6 +615,25 @@ class TestGeminiCliProviderMessageExtraction:
         assert "Hello there!" in result
         assert "sandbox" not in result
         assert "/model" not in result
+
+    def test_extract_message_filters_spinner_lines(self):
+        """Test that processing spinner lines are filtered from extracted response."""
+        provider = GeminiCliProvider("term-1", "session-1", "window-1")
+        output = (
+            "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
+            " > create a report\n"
+            "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n"
+            "  Responding with gemini-3-flash-preview\n"
+            "✦ Here is the report:\n"
+            "✦ Summary section content.\n"
+            "⠼ I'm Feeling Lucky (esc to cancel, 1s)\n"
+            " *   Type your message or @path/to/file\n"
+        )
+        result = provider.extract_last_message_from_script(output)
+        assert "report" in result.lower()
+        assert "Summary section" in result
+        assert "esc to cancel" not in result
+        assert "Feeling Lucky" not in result
 
     def test_extract_message_with_ansi_codes(self):
         """Test extraction strips ANSI codes correctly."""
@@ -833,6 +1008,30 @@ class TestGeminiCliProviderPatterns:
         raw2 = "\x1b[38;2;243;139;168m*\x1b[39m   Type your message"
         clean2 = re.sub(ANSI_CODE_PATTERN, "", raw2)
         assert clean2 == "*   Type your message"
+
+    def test_processing_spinner_pattern(self):
+        """Test processing spinner detection (Braille dots + esc to cancel)."""
+        assert re.search(
+            PROCESSING_SPINNER_PATTERN, "⠴ Refining Delegation Parameters (esc to cancel, 50s)"
+        )
+        assert re.search(
+            PROCESSING_SPINNER_PATTERN,
+            "⠧ Clarifying the Template Retrieval (esc to cancel, 1m 55s)",
+        )
+        assert re.search(
+            PROCESSING_SPINNER_PATTERN,
+            "⠼ Trying to reach gemini-3-flash-preview (Attempt 2/3) (esc to cancel, 2s)",
+        )
+        assert re.search(PROCESSING_SPINNER_PATTERN, "⠋ I'm Feeling Lucky (esc to cancel, 1s)")
+        assert not re.search(PROCESSING_SPINNER_PATTERN, "Hello world")
+        assert not re.search(PROCESSING_SPINNER_PATTERN, "✦ Here is the response")
+        assert not re.search(PROCESSING_SPINNER_PATTERN, " *   Type your message")
+
+    def test_responding_with_pattern(self):
+        """Test 'Responding with' model indicator detection."""
+        assert re.search(RESPONDING_WITH_PATTERN, "  Responding with gemini-3-flash-preview")
+        assert re.search(RESPONDING_WITH_PATTERN, "Responding with gemini-2.5-flash")
+        assert not re.search(RESPONDING_WITH_PATTERN, "Hello world")
 
     def test_idle_prompt_tail_lines(self):
         """Test tail lines constant is reasonable for Gemini's TUI layout."""
