@@ -38,8 +38,13 @@ from cli_agent_orchestrator.services import terminal_service
 logger = logging.getLogger(__name__)
 
 
-def _get_log_tail(terminal_id: str, lines: int = 5) -> str:
-    """Get last N lines from terminal log file."""
+def _get_log_tail(terminal_id: str, lines: int = 100) -> str:
+    """Get last N lines from terminal log file.
+
+    Default of 100 lines covers full-screen TUI providers (e.g. Kimi CLI)
+    where the idle prompt sits mid-screen with 30+ padding lines below it.
+    Reading 100 lines via tail is still sub-millisecond.
+    """
     log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
     try:
         result = subprocess.run(

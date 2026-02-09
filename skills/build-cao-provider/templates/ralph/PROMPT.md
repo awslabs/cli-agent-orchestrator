@@ -34,7 +34,7 @@ A <provider> provider (`src/cli_agent_orchestrator/providers/<provider>.py`) has
 Detailed requirements and checklists are in `.ralph/specs/`. **Read these before starting any task.**
 
 - **specs/verification-checklist.md** — Comprehensive checklist covering testing, code quality, security, code comments, and documentation. **Nothing ships until every item is checked.**
-- **specs/lessons-learned.md** — Critical bugs from building previous providers. Read before making any provider changes.
+- **specs/lessons-learnt.md** — Critical bugs from building previous providers. Read before making any provider changes.
 - **specs/implementation-checklist.md** — File-by-file creation guide. Use when building new provider components.
 
 ## Key Principles

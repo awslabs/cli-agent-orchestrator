@@ -100,7 +100,7 @@ A new provider requires updates to **all** of these files. Check each one carefu
 
 ## Ralph Autonomous Verification (Optional but Highly Recommended)
 
-Run Ralph after Phase 4 (Code Quality) and before final documentation review. Ralph catches bugs that pass all automated tests but erode codebase trust — see [lessons #9](./lessons-learned.md#9-ralph-autonomous-loop-catches-bugs-manual-review-misses).
+Run Ralph after Phase 4 (Code Quality) and before final documentation review. Ralph catches bugs that pass all automated tests but erode codebase trust — see [lessons #9](./lessons-learnt.md#9-ralph-autonomous-loop-catches-bugs-manual-review-misses).
 
 ### Setup
 - [ ] `.ralph/` directory exists (run `ralph-enable-ci --project-type python` if not)
@@ -113,7 +113,7 @@ Run Ralph after Phase 4 (Code Quality) and before final documentation review. Ra
 - [ ] All Ralph-identified issues resolved or documented as intentional
 
 ### Ralph Verification Targets
-- [ ] All lessons-learned cross-checked against the provider implementation
+- [ ] All lessons-learnt cross-checked against the provider implementation
 - [ ] No copy-paste artifacts from reference provider (wrong package names, wrong CLI names in comments)
 - [ ] Unicode character names in comments match actual code points
 - [ ] Test counts in documentation match actual pytest output

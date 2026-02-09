@@ -91,7 +91,7 @@ skills/
 │   ├── SKILL.md                          # Main skill definition
 │   ├── references/
 │   │   ├── implementation-checklist.md   # File-by-file creation guide
-│   │   ├── lessons-learned.md            # Critical bugs and fixes from past providers
+│   │   ├── lessons-learnt.md            # Critical bugs and fixes from past providers
 │   │   └── verification-checklist.md     # Testing, security, and documentation checks
 │   └── templates/
 │       └── ralph/                        # Ralph autonomous verification templates

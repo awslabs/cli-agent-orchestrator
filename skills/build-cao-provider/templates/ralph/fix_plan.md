@@ -17,7 +17,7 @@ These require a running cao-server. Start it, run E2E, stop it. If any E2E test 
 - [ ] Security audit: verify shlex.join() used for ALL CLI argument building in <provider>.py (no f-string interpolation), no secrets, temp file cleanup
 
 ## Medium Priority
-- [ ] Review <provider>.py against kimi_cli.py for any missed patterns (cross-check all lessons-learned against the new provider)
+- [ ] Review <provider>.py against kimi_cli.py for any missed patterns (cross-check all lessons-learnt against the new provider)
 - [ ] Verify <provider>.py forwards CAO_TERMINAL_ID to MCP subprocesses (if applicable)
 - [ ] Verify <provider>.py exit_cli() return value works correctly through tmux send_keys (text commands sent literally, key sequences like C-d sent non-literally)
 - [ ] Check that CODEBASE.md architecture diagram formatting is correct (no broken ASCII art)

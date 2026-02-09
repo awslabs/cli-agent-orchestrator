@@ -11,6 +11,13 @@ Tests the worker side of the assign flow — validates that each provider can:
 4. Process the task and reach COMPLETED
 5. Return extractable output with analysis/report content
 
+Also tests the assign round-trip with callback:
+1. Create supervisor (idle) + worker terminals
+2. Worker completes task
+3. Worker result sent to supervisor's inbox (simulates send_message callback)
+4. Verify inbox message delivered to supervisor (status=delivered)
+5. Verify supervisor processes the callback message
+
 NOTE: These tests do NOT test a supervisor agent calling the assign() MCP tool.
 For real supervisor→worker delegation tests, see test_supervisor_orchestration.py.
 
@@ -44,6 +51,34 @@ import pytest
 import requests
 
 from cli_agent_orchestrator.constants import API_BASE_URL
+
+# ---------------------------------------------------------------------------
+# Helpers for inbox verification
+# ---------------------------------------------------------------------------
+
+
+def _send_inbox_message(sender_id: str, receiver_id: str, message: str):
+    """Send a message to a terminal's inbox via the API."""
+    resp = requests.post(
+        f"{API_BASE_URL}/terminals/{receiver_id}/inbox/messages",
+        params={"sender_id": sender_id, "message": message},
+    )
+    assert resp.status_code == 200, f"Inbox message send failed: {resp.status_code} {resp.text}"
+    return resp.json()
+
+
+def _get_inbox_messages(terminal_id: str, status_filter: str = None):
+    """Get inbox messages for a terminal."""
+    params = {"limit": 50}
+    if status_filter:
+        params["status"] = status_filter
+    resp = requests.get(
+        f"{API_BASE_URL}/terminals/{terminal_id}/inbox/messages",
+        params=params,
+    )
+    assert resp.status_code == 200, f"Get inbox messages failed: {resp.status_code} {resp.text}"
+    return resp.json()
+
 
 COMPLETION_TIMEOUT = 180
 
@@ -146,6 +181,142 @@ def _run_assign_test(provider: str, agent_profile: str, task_message: str, conte
             cleanup_terminal(terminal_id, actual_session)
 
 
+def _create_terminal_in_session(session_name: str, provider: str, agent_profile: str):
+    """Create a terminal in an existing session."""
+    resp = requests.post(
+        f"{API_BASE_URL}/sessions/{session_name}/terminals",
+        params={"provider": provider, "agent_profile": agent_profile},
+    )
+    assert resp.status_code in (
+        200,
+        201,
+    ), f"Terminal creation in session failed: {resp.status_code} {resp.text}"
+    return resp.json()["id"]
+
+
+def _run_assign_with_callback_test(provider: str):
+    """Test the full assign round-trip: worker completes → sends result → supervisor receives.
+
+    This tests the inbox delivery pipeline that is critical for the assign flow:
+    1. Create supervisor terminal (stays IDLE)
+    2. Create worker terminal, send it a data analysis task
+    3. Worker completes the task
+    4. Simulate worker callback: send worker's output to supervisor's inbox
+    5. Verify message is DELIVERED to supervisor (not stuck as PENDING)
+    6. Verify supervisor processes the callback (status transitions from IDLE)
+    """
+    session_suffix = uuid.uuid4().hex[:6]
+    session_name = f"e2e-assign-cb-{provider}-{session_suffix}"
+    supervisor_id = None
+    worker_id = None
+    actual_session = None
+
+    try:
+        # Step 1: Create supervisor terminal (will stay idle, waiting for callback)
+        supervisor_id, actual_session = create_terminal(provider, "developer", session_name)
+        assert supervisor_id, "Supervisor terminal ID should not be empty"
+
+        # Step 2: Wait for supervisor to be IDLE
+        start = time.time()
+        while time.time() - start < 90.0:
+            s = get_terminal_status(supervisor_id)
+            if s in ("idle", "completed"):
+                break
+            if s == "error":
+                break
+            time.sleep(3)
+        assert s in (
+            "idle",
+            "completed",
+        ), f"Supervisor terminal did not become ready within 90s (provider={provider})"
+
+        # Step 3: Create worker terminal in same session
+        worker_id = _create_terminal_in_session(actual_session, provider, "data_analyst")
+        assert worker_id, "Worker terminal ID should not be empty"
+
+        # Wait for worker to be ready
+        start = time.time()
+        while time.time() - start < 90.0:
+            s = get_terminal_status(worker_id)
+            if s in ("idle", "completed"):
+                break
+            if s == "error":
+                break
+            time.sleep(3)
+        assert s in (
+            "idle",
+            "completed",
+        ), f"Worker terminal did not become ready within 90s (provider={provider})"
+        time.sleep(2)
+
+        # Step 4: Send task to worker
+        resp = requests.post(
+            f"{API_BASE_URL}/terminals/{worker_id}/input",
+            params={"message": DATA_ANALYST_TASK},
+        )
+        assert resp.status_code == 200, f"Send task to worker failed: {resp.status_code}"
+
+        # Step 5: Wait for worker to complete
+        assert wait_for_status(
+            worker_id, "completed", timeout=COMPLETION_TIMEOUT
+        ), f"Worker did not reach COMPLETED within {COMPLETION_TIMEOUT}s (provider={provider})"
+        time.sleep(5)
+        recheck = get_terminal_status(worker_id)
+        if recheck != "completed":
+            assert wait_for_status(worker_id, "completed", timeout=COMPLETION_TIMEOUT)
+
+        # Step 6: Extract worker output and send it to supervisor's inbox
+        # (simulates the worker calling send_message MCP tool)
+        worker_output = extract_output(worker_id)
+        assert len(worker_output.strip()) > 0, "Worker output should not be empty"
+
+        callback_message = f"Results from data_analyst ({worker_id}):\n{worker_output}"
+        result = _send_inbox_message(worker_id, supervisor_id, callback_message)
+        assert result.get("message_id"), "Callback message should have an ID"
+
+        # Step 7: Verify message is DELIVERED to supervisor (not stuck PENDING).
+        # This is the critical assertion — it proves the inbox delivery pipeline
+        # works for this provider. Poll for up to 120s.
+        delivered = False
+        for _ in range(24):  # 24 * 5s = 120s
+            time.sleep(5)
+            messages = _get_inbox_messages(supervisor_id, status_filter="delivered")
+            if any(m.get("sender_id") == worker_id for m in messages):
+                delivered = True
+                break
+        assert delivered, (
+            f"Callback message should have been delivered to supervisor within 120s. "
+            f"All inbox messages: {_get_inbox_messages(supervisor_id)}"
+        )
+
+        # Step 8: Verify supervisor processed the callback (transitioned from IDLE)
+        transitioned = False
+        for _ in range(12):  # up to 60s
+            time.sleep(5)
+            sup_status = get_terminal_status(supervisor_id)
+            if sup_status in ("processing", "completed"):
+                transitioned = True
+                break
+        assert transitioned, (
+            f"Supervisor should have transitioned after receiving callback, " f"got: {sup_status}"
+        )
+
+    finally:
+        if actual_session:
+            # Clean up all terminals
+            for tid in [supervisor_id, worker_id]:
+                if tid:
+                    try:
+                        requests.post(f"{API_BASE_URL}/terminals/{tid}/exit")
+                    except Exception:
+                        pass
+            time.sleep(2)
+            try:
+                requests.delete(f"{API_BASE_URL}/sessions/{actual_session}")
+            except Exception:
+                pass
+
+
 # ---------------------------------------------------------------------------
 # Codex provider
 # ---------------------------------------------------------------------------
@@ -172,6 +343,10 @@ class TestCodexAssign:
             task_message=REPORT_GENERATOR_TASK,
             content_keywords=REPORT_GENERATOR_KEYWORDS,
         )
+
+    def test_assign_with_callback(self, require_codex):
+        """Codex full round-trip: worker completes → sends result → supervisor receives."""
+        _run_assign_with_callback_test(provider="codex")
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +376,10 @@ class TestClaudeCodeAssign:
             content_keywords=REPORT_GENERATOR_KEYWORDS,
         )
 
+    def test_assign_with_callback(self, require_claude):
+        """Claude Code full round-trip: worker completes → sends result → supervisor receives."""
+        _run_assign_with_callback_test(provider="claude_code")
+
 
 # ---------------------------------------------------------------------------
 # Kiro CLI provider
@@ -228,6 +407,10 @@ class TestKiroCliAssign:
             task_message=REPORT_GENERATOR_TASK,
             content_keywords=REPORT_GENERATOR_KEYWORDS,
         )
+
+    def test_assign_with_callback(self, require_kiro):
+        """Kiro CLI full round-trip: worker completes → sends result → supervisor receives."""
+        _run_assign_with_callback_test(provider="kiro_cli")
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +440,10 @@ class TestKimiCliAssign:
             content_keywords=REPORT_GENERATOR_KEYWORDS,
         )
 
+    def test_assign_with_callback(self, require_kimi):
+        """Kimi CLI full round-trip: worker completes → sends result → supervisor receives."""
+        _run_assign_with_callback_test(provider="kimi_cli")
+
 
 # ---------------------------------------------------------------------------
 # Gemini CLI provider
@@ -284,3 +471,7 @@ class TestGeminiCliAssign:
             task_message=REPORT_GENERATOR_TASK,
             content_keywords=REPORT_GENERATOR_KEYWORDS,
         )
+
+    def test_assign_with_callback(self, require_gemini):
+        """Gemini CLI full round-trip: worker completes → sends result → supervisor receives."""
+        _run_assign_with_callback_test(provider="gemini_cli")

@@ -40,6 +40,21 @@ import requests
 
 from cli_agent_orchestrator.constants import API_BASE_URL
 
+
+def _get_inbox_messages(terminal_id: str, status_filter: str = None):
+    """Get inbox messages for a terminal."""
+    params = {"limit": 50}
+    if status_filter:
+        params["status"] = status_filter
+    resp = requests.get(
+        f"{API_BASE_URL}/terminals/{terminal_id}/inbox/messages",
+        params=params,
+    )
+    if resp.status_code != 200:
+        return []
+    return resp.json()
+
+
 # Longer timeout for supervisor orchestration — the supervisor must:
 # 1. Process the task
 # 2. Call handoff/assign MCP tools (which create new terminals)
@@ -277,6 +292,32 @@ def _run_supervisor_assign_test(provider: str):
         assert matched, (
             f"Supervisor output should contain analysis content. "
             f"Expected at least one of {analysis_keywords}, got: {output[:300]}"
+        )
+
+        # Step 7: Verify inbox delivery for the assign flow.
+        # Workers should have called send_message to deliver results to
+        # the supervisor. Check that at least one message was delivered.
+        # Allow up to 30s extra for any pending deliveries.
+        inbox_verified = False
+        for _ in range(6):  # up to 30s
+            delivered = _get_inbox_messages(supervisor_id, status_filter="delivered")
+            if delivered:
+                inbox_verified = True
+                break
+            # Also check if there are pending messages (delivery bug)
+            pending = _get_inbox_messages(supervisor_id, status_filter="pending")
+            if not pending:
+                # No pending and no delivered — workers may have used handoff
+                # instead of assign+send_message, which is acceptable
+                inbox_verified = True
+                break
+            time.sleep(5)
+
+        # If there ARE pending messages that were never delivered, that's the bug
+        still_pending = _get_inbox_messages(supervisor_id, status_filter="pending")
+        assert not still_pending, (
+            f"Inbox messages stuck as PENDING — inbox delivery pipeline broken! "
+            f"Pending messages: {[(m.get('sender_id', '?'), m.get('message', '')[:80]) for m in still_pending]}"
         )
 
     finally:

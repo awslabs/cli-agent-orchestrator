@@ -188,7 +188,7 @@ class GeminiCliProvider(BaseProvider):
         GEMINI.md is written as supplementary project context (the model sees it
         as background documentation). On its own, GEMINI.md is too weak — the
         model responds "I am an interactive CLI agent" instead of adopting the
-        supervisor role. The ``-i`` flag solves this (lesson #14).
+        supervisor role. The ``-i`` flag solves this (lesson #12).
 
         MCP servers are configured by writing directly to ``~/.gemini/settings.json``.
         """
@@ -202,7 +202,7 @@ class GeminiCliProvider(BaseProvider):
                 # Sends the system prompt as the first user message and continues
                 # in interactive mode. The model strongly adopts the role from -i,
                 # unlike GEMINI.md which is treated as weak project context.
-                # See lessons-learned #14.
+                # See lessons-learnt #12.
                 system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
                 if system_prompt:
                     command_parts.extend(["-i", system_prompt])
@@ -229,7 +229,7 @@ class GeminiCliProvider(BaseProvider):
                 # Previously used `gemini mcp add --scope user` commands chained with &&,
                 # but each invocation spawned a Node.js process (~2-3s each), making
                 # assign/handoff ~15s slower than other providers. Direct JSON write
-                # achieves the same result in <10ms (lesson #19).
+                # achieves the same result in <10ms (lesson #14).
                 if profile.mcpServers:
                     self._register_mcp_servers(profile.mcpServers)
 
@@ -366,7 +366,7 @@ class GeminiCliProvider(BaseProvider):
         # message") immediately on startup, BEFORE the -i prompt is processed
         # and BEFORE MCP servers are connected. If we accept IDLE too early,
         # messages sent to the terminal are lost because Gemini is still
-        # processing the -i system prompt (lesson #18).
+        # processing the -i system prompt (lesson #13c).
         #
         # When -i is used: wait for COMPLETED specifically. The -i flag always
         # produces a response (query + ✦ response + idle prompt), so COMPLETED
@@ -432,7 +432,7 @@ class GeminiCliProvider(BaseProvider):
             # model is idle or has completed. Without this check, get_status()
             # returns COMPLETED while a handoff/assign MCP tool is still running,
             # causing the E2E supervisor test to check for worker terminals
-            # before they're created (lesson #16).
+            # before they're created (lesson #13a).
             has_spinner = any(re.search(PROCESSING_SPINNER_PATTERN, line) for line in bottom_lines)
             if has_spinner:
                 return TerminalStatus.PROCESSING

@@ -109,7 +109,7 @@ skills/                        # Single source of truth for AI coding agent skil
 │   ├── SKILL.md
 │   ├── references/
 │   │   ├── implementation-checklist.md
-│   │   ├── lessons-learned.md
+│   │   ├── lessons-learnt.md
 │   │   └── verification-checklist.md
 │   └── templates/ralph/
 └── skill-creator/             # Guide for creating new skills

@@ -156,10 +156,26 @@ def _run_send_message_test(provider: str, agent_profile: str):
             f"Messages: {[m.get('message', '')[:50] for m in messages]}"
         )
 
-        # Step 7: Verify receiver processes the message (should transition from IDLE)
+        # Step 7: Verify message was DELIVERED (not stuck as PENDING).
+        # Poll inbox message status — the inbox service may take a few seconds
+        # to detect IDLE and paste the message into the receiver's terminal.
+        delivered = False
+        for _ in range(24):  # up to 120s (TUI providers need time to go IDLE)
+            time.sleep(5)
+            messages = _get_inbox_messages(receiver_id, status_filter="delivered")
+            if any(
+                m.get("sender_id") == sender_id and test_message in m.get("message", "")
+                for m in messages
+            ):
+                delivered = True
+                break
+        assert delivered, (
+            f"Inbox message should have been delivered (status=delivered) within 120s. "
+            f"All messages: {_get_inbox_messages(receiver_id)}"
+        )
+
+        # Step 8: Verify receiver processes the message (should transition from IDLE).
         # After inbox delivery, the receiver gets the message as input.
-        # Poll for a non-idle status, since delivery + TUI processing can take
-        # 5-15s depending on the provider (Gemini CLI's Ink TUI is slowest).
         # Acceptable states: processing (working), completed (done),
         # waiting_user_answer (provider showing approval prompt for the message).
         transitioned = False
