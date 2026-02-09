@@ -132,6 +132,14 @@ class KimiCliProvider(BaseProvider):
         self._agent_profile = agent_profile
         # Track temp directory for cleanup (created when agent profile needs temp files)
         self._temp_dir: Optional[str] = None
+        # Latching flag: set True when user input box (╭─) is detected in ANY
+        # get_status() call. Persists even after the box scrolls out of the
+        # tmux capture window (200 lines). This is needed because:
+        # 1. Long responses push the user input box out of capture range
+        # 2. Not all responses use • bullets (tables, numbered lists, etc.)
+        # Without this, get_status() returns IDLE instead of COMPLETED after
+        # the agent finishes processing, causing handoff to time out.
+        self._has_received_input = False
 
     def _build_kimi_command(self) -> str:
         """Build Kimi CLI command with agent profile and MCP config if provided.
@@ -243,10 +251,20 @@ class KimiCliProvider(BaseProvider):
         Status detection logic:
         1. Capture tmux pane output (full or tail)
         2. Strip ANSI codes for reliable text matching
-        3. Check bottom N lines for the idle prompt pattern
-        4. If prompt found: distinguish IDLE vs COMPLETED by checking for user input
-        5. If no prompt: agent is PROCESSING (streaming response)
-        6. Check for ERROR patterns as fallback
+        3. Latch ``_has_received_input`` when user input box (╭─) is detected
+        4. Check bottom N lines for the idle prompt pattern
+        5. If prompt found + input was received → COMPLETED
+        6. If prompt found + no input yet → IDLE
+        7. If no prompt: agent is PROCESSING (streaming response)
+        8. Check for ERROR patterns as fallback
+
+        The latching flag approach is necessary because:
+        - Long responses (>200 lines) push the user input box out of the
+          tmux capture window, so checking for ╭─ on every call is unreliable
+        - Not all responses use ``•`` bullets (structured output like tables,
+          numbered lists, report templates have no bullet markers at all)
+        - The flag is set during the PROCESSING phase when the user input box
+          IS still visible in the capture, and persists through completion
 
         Args:
             tail_lines: Optional number of lines to capture from bottom
@@ -272,14 +290,25 @@ class KimiCliProvider(BaseProvider):
         idle_prompt_eol = IDLE_PROMPT_PATTERN + r"\s*$"
         has_idle_prompt = any(re.search(idle_prompt_eol, line) for line in bottom_lines)
 
-        if has_idle_prompt:
-            # Prompt is visible — check if there's a completed response.
-            # Look for user input box (╭─...╰─) anywhere in the output,
-            # which indicates a task was submitted and processed.
-            has_user_input = bool(re.search(USER_INPUT_BOX_START_PATTERN, clean_output))
-            has_response = bool(re.search(RESPONSE_BULLET_PATTERN, clean_output, re.MULTILINE))
+        # Latch: detect user input box to distinguish IDLE from COMPLETED.
+        # The welcome banner also uses ╭─/╰─ box-drawing characters, so a single
+        # box-start match is ambiguous. We use two strategies:
+        #
+        # 1. During PROCESSING (no idle prompt): the welcome banner may have scrolled
+        #    out, so any ╭─ match is from user input. Latch immediately.
+        # 2. During IDLE/COMPLETED (idle prompt visible): count ╰─ occurrences.
+        #    Welcome banner contributes exactly 1; each user input adds 1 more.
+        #    Two or more means a user message was submitted.
+        if not has_idle_prompt:
+            if re.search(USER_INPUT_BOX_START_PATTERN, clean_output):
+                self._has_received_input = True
+        else:
+            box_end_count = len(re.findall(USER_INPUT_BOX_END_PATTERN, clean_output))
+            if box_end_count >= 2:
+                self._has_received_input = True
 
-            if has_user_input and has_response:
+        if has_idle_prompt:
+            if self._has_received_input:
                 return TerminalStatus.COMPLETED
 
             return TerminalStatus.IDLE
@@ -308,6 +337,12 @@ class KimiCliProvider(BaseProvider):
         3. Filter out thinking bullets (gray ANSI-styled lines)
         4. Return the cleaned response text
 
+        Fallback for long responses (user input box scrolled out of capture):
+        - Extract all content from start of capture up to the idle prompt
+        - Filter out thinking/status bar lines
+        - This captures the tail end of the response, which is typically
+          sufficient for handoff result delivery
+
         The raw (ANSI-preserved) output is used to distinguish thinking
         from response bullets, since both use the ``•`` prefix character.
 
@@ -333,7 +368,10 @@ class KimiCliProvider(BaseProvider):
                 box_end_idx = i
 
         if box_end_idx is None:
-            raise ValueError("No Kimi CLI user input found - no input box detected")
+            # User input box scrolled out of capture (response > 200 lines).
+            # Fall back to extracting everything before the last idle prompt,
+            # excluding status bar and welcome banner lines.
+            return self._extract_without_input_box(raw_lines, clean_lines)
 
         # Find the next idle prompt line after the box end.
         # Use the general pattern (not end-of-line anchored) since
@@ -387,6 +425,59 @@ class KimiCliProvider(BaseProvider):
 
         return "\n".join(filtered_lines).strip()
 
+    def _extract_without_input_box(self, raw_lines: list, clean_lines: list) -> str:
+        """Fallback extraction when user input box has scrolled out of capture.
+
+        For long responses (>200 lines), the user input box (╭─/╰─) and early
+        response content are no longer in the tmux capture window. In this case,
+        extract all content from the start of capture up to the last idle prompt,
+        filtering out status bar and welcome banner lines.
+
+        Args:
+            raw_lines: Raw output split by newlines (ANSI preserved)
+            clean_lines: ANSI-stripped output split by newlines
+
+        Returns:
+            Extracted response text
+
+        Raises:
+            ValueError: If no extractable content found
+        """
+        # Find the last idle prompt line
+        prompt_idx = len(clean_lines)
+        for i in range(len(clean_lines) - 1, -1, -1):
+            if re.search(IDLE_PROMPT_PATTERN, clean_lines[i]):
+                prompt_idx = i
+                break
+
+        # Collect content from start to prompt, filtering out TUI chrome
+        filtered_lines = []
+        for i in range(0, prompt_idx):
+            raw_line = raw_lines[i] if i < len(raw_lines) else ""
+            clean_line = clean_lines[i] if i < len(clean_lines) else ""
+
+            if not clean_line.strip():
+                continue
+
+            # Skip thinking bullets
+            if re.search(THINKING_BULLET_RAW_PATTERN, raw_line):
+                continue
+
+            # Skip status bar
+            if re.search(STATUS_BAR_PATTERN, clean_line):
+                continue
+
+            # Skip welcome banner lines
+            if re.search(WELCOME_BANNER_PATTERN, clean_line):
+                continue
+
+            filtered_lines.append(clean_line.strip())
+
+        if not filtered_lines:
+            raise ValueError("No extractable content in Kimi CLI output (input box scrolled out)")
+
+        return "\n".join(filtered_lines).strip()
+
     def exit_cli(self) -> str:
         """Get the command to exit Kimi CLI.
 
@@ -408,3 +499,4 @@ class KimiCliProvider(BaseProvider):
             self._temp_dir = None
 
         self._initialized = False
+        self._has_received_input = False

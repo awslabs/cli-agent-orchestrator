@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fix Kimi CLI handoff timing out because `get_status()` never returned COMPLETED for long responses: the original logic required both user input box (`╭─`) and response bullets (`^•\s`) in the 200-line tmux capture, but long responses push the input box out of range and structured output (tables, numbered lists) has no `•` bullets; replaced with a latching `_has_received_input` flag that detects the user input box during PROCESSING (when it's still visible) and persists through completion
+- Fix Kimi CLI output extraction failing for long responses (>200 lines) where the user input box scrolled out of capture: added `_extract_without_input_box()` fallback that extracts all content before the idle prompt, filtering out status bar and welcome banner lines
 - Fix inbox message delivery failing for TUI-based providers (Kimi CLI, Gemini CLI): inbox service passed `tail_lines=5` to `get_status()` but TUI providers need 50+ lines to find the idle prompt; messages stayed PENDING forever because the supervisor was never detected as IDLE
 - Fix inbox watchdog log tail check (`_has_idle_pattern`) using only 5 lines, which missed the idle prompt for full-screen TUI providers where the prompt sits mid-screen with 30+ padding lines below; increased to 100 lines so the watchdog reliably triggers delivery when the terminal goes IDLE
 - Fix shell command injection risk in Q CLI and Kiro CLI providers: replace f-string command interpolation with `shlex.join()` for safe shell escaping of `agent_profile` values, consistent with other providers

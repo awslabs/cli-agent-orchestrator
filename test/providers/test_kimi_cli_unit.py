@@ -280,6 +280,95 @@ class TestKimiCliProviderStatusDetection:
         provider = KimiCliProvider("term-1", "session-1", "window-1")
         assert provider.get_status() == TerminalStatus.PROCESSING
 
+    @patch("cli_agent_orchestrator.providers.kimi_cli.tmux_client")
+    def test_get_status_completed_long_response_no_bullets(self, mock_tmux):
+        """Test COMPLETED for long structured responses without • bullet markers.
+
+        Kimi doesn't always use • bullets — report templates, tables, numbered lists
+        produce structured output with no bullets at all. The latching flag must detect
+        the user input box during PROCESSING and remember it for COMPLETED detection.
+        """
+        provider = KimiCliProvider("term-1", "session-1", "window-1")
+
+        # Step 1: During PROCESSING, the user input box is visible
+        processing_output = (
+            "╭──────────────────╮\n"
+            "│ create a report    │\n"
+            "╰──────────────────╯\n"
+            "  Data Analysis Report Template\n"
+            "  ━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "  1. Summary section...\n"
+        )
+        mock_tmux.get_history.return_value = processing_output
+        assert provider.get_status() == TerminalStatus.PROCESSING
+        # Flag should now be latched
+        assert provider._has_received_input is True
+
+        # Step 2: After completion, the user input box has scrolled out.
+        # Output now shows only the tail end of the response + idle prompt.
+        completed_output = (
+            "  Appendix C: Code Reference\n"
+            "  ━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "  [Reference to analysis code]\n"
+            "user@project💫\n"
+            "\n\n"
+            "19:12  yolo  agent (kimi-for-coding, thinking)  ctrl-x: toggle mode  context: 2.9%"
+        )
+        mock_tmux.get_history.return_value = completed_output
+        assert provider.get_status() == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.kimi_cli.tmux_client")
+    def test_get_status_latching_persists_after_scrollout(self, mock_tmux):
+        """Test that _has_received_input flag persists after user input box scrolls out."""
+        provider = KimiCliProvider("term-1", "session-1", "window-1")
+
+        # Simulate user input box detected during PROCESSING
+        provider._has_received_input = True
+
+        # Now output has idle prompt but NO user input box (scrolled out)
+        output = (
+            "  some response content\n"
+            "user@project💫\n"
+            "\n\n"
+            "23:14  yolo  agent (kimi-for-coding, thinking)  ctrl-x: toggle mode  context: 1.0%"
+        )
+        mock_tmux.get_history.return_value = output
+        assert provider.get_status() == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.kimi_cli.tmux_client")
+    def test_get_status_idle_before_any_input(self, mock_tmux):
+        """Test IDLE when no user input has been received yet (fresh startup)."""
+        provider = KimiCliProvider("term-1", "session-1", "window-1")
+        assert provider._has_received_input is False
+
+        output = (
+            "Welcome to Kimi Code CLI!\n"
+            "user@project💫\n"
+            "\n\n"
+            "23:14  yolo  agent (kimi-for-coding, thinking)  ctrl-x: toggle mode  context: 0.0%"
+        )
+        mock_tmux.get_history.return_value = output
+        assert provider.get_status() == TerminalStatus.IDLE
+        assert provider._has_received_input is False
+
+    @patch("cli_agent_orchestrator.providers.kimi_cli.tmux_client")
+    def test_get_status_processing_latches_flag(self, mock_tmux):
+        """Test that user input box detected during PROCESSING latches the flag."""
+        provider = KimiCliProvider("term-1", "session-1", "window-1")
+        assert provider._has_received_input is False
+
+        # PROCESSING output with user input box visible
+        output = (
+            "╭──────────────────╮\n"
+            "│ hello               │\n"
+            "╰──────────────────╯\n"
+            "Response content streaming...\n"
+        )
+        mock_tmux.get_history.return_value = output
+        status = provider.get_status()
+        assert status == TerminalStatus.PROCESSING
+        assert provider._has_received_input is True
+
 
 # =============================================================================
 # Message extraction tests
@@ -308,11 +397,37 @@ class TestKimiCliProviderMessageExtraction:
         assert "Calculator" in result or "calculator" in result
 
     def test_extract_message_no_input(self):
-        """Test ValueError when no user input box is found."""
+        """Test ValueError when no content at all (not even response text)."""
         provider = KimiCliProvider("term-1", "session-1", "window-1")
-        output = "Some random text without input box"
-        with pytest.raises(ValueError, match="No Kimi CLI user input found"):
+        # Only idle prompt, no response content
+        output = "user@my-app💫\n\n\n23:14  yolo  agent (kimi-for-coding)  context: 0.0%"
+        with pytest.raises(ValueError, match="No extractable content"):
             provider.extract_last_message_from_script(output)
+
+    def test_extract_message_long_response_fallback(self):
+        """Test fallback extraction when user input box scrolled out of capture.
+
+        For long responses (>200 lines), the user input box is not visible in the
+        tmux capture. The fallback extracts everything before the idle prompt.
+        """
+        provider = KimiCliProvider("term-1", "session-1", "window-1")
+        # Simulate long response where user input box has scrolled out
+        output = (
+            "  3. Statistical Analysis Results\n"
+            "  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "  Mean: 3.0, Median: 3.0, StdDev: 1.414\n"
+            "  4. Conclusions\n"
+            "  The data shows a normal distribution.\n"
+            "user@my-app💫\n"
+            "\n\n"
+            "23:14  yolo  agent (kimi-for-coding, thinking)  ctrl-x: toggle mode  context: 2.9%"
+        )
+        result = provider.extract_last_message_from_script(output)
+        assert "Statistical Analysis" in result
+        assert "Conclusions" in result
+        assert "normal distribution" in result
+        # Status bar should be filtered
+        assert "yolo" not in result
 
     def test_extract_message_empty_response(self):
         """Test ValueError on empty response after input box."""
@@ -615,11 +730,13 @@ class TestKimiCliProviderMisc:
         assert re.search(pattern, "user@app💫")
 
     def test_cleanup(self):
-        """Test cleanup resets initialized state."""
+        """Test cleanup resets initialized state and latching flag."""
         provider = KimiCliProvider("term-1", "session-1", "window-1")
         provider._initialized = True
+        provider._has_received_input = True
         provider.cleanup()
         assert provider._initialized is False
+        assert provider._has_received_input is False
 
     def test_cleanup_removes_temp_dir(self):
         """Test cleanup removes temporary directory and its contents."""
@@ -656,6 +773,7 @@ class TestKimiCliProviderMisc:
         assert provider._initialized is False
         assert provider._agent_profile is None
         assert provider._temp_dir is None
+        assert provider._has_received_input is False
         assert provider.terminal_id == "term-1"
         assert provider.session_name == "session-1"
         assert provider.window_name == "window-1"
