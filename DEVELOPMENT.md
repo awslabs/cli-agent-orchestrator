@@ -48,7 +48,7 @@ uv run pytest test/providers/test_kiro_cli_unit.py -v -k "test_initialization"
 Unit tests use mocked dependencies and don't require CLI tools or servers:
 
 ```bash
-# Run all unit tests (598 tests, excludes E2E and Q CLI integration)
+# Run all unit tests (603 tests, excludes E2E and Q CLI integration)
 uv run pytest test/ -v --ignore=test/e2e --ignore=test/providers/test_q_cli_integration.py
 
 # Run provider-specific tests
@@ -101,6 +101,7 @@ uv run pytest -m e2e test/e2e/ -v -k gemini_cli
 uv run pytest -m e2e test/e2e/test_handoff.py -v
 uv run pytest -m e2e test/e2e/test_assign.py -v
 uv run pytest -m e2e test/e2e/test_send_message.py -v
+uv run pytest -m e2e test/e2e/test_supervisor_orchestration.py -v -o "addopts="
 ```
 
 **Requirements for E2E Tests:**
@@ -112,7 +113,7 @@ uv run pytest -m e2e test/e2e/test_send_message.py -v
   - **Kiro CLI**: `npm install -g @anthropic-ai/kiro-cli` + AWS credentials configured
   - **Kimi CLI**: `brew install kimi-cli` or `uv tool install kimi-cli` + `kimi login`
   - **Gemini CLI**: `npm install -g @google/gemini-cli` + OAuth or `GEMINI_API_KEY`
-- Agent profiles installed: `data_analyst`, `report_generator`
+- Agent profiles installed: `analysis_supervisor`, `data_analyst`, `report_generator`
 
 E2E tests are excluded from default `pytest` runs via `-m 'not e2e'` in `pyproject.toml`.
 

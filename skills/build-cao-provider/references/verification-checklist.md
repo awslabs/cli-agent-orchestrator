@@ -15,10 +15,16 @@ Complete checklist for testing, code quality, security, and documentation before
 ### Full Unit Suite (No Regressions)
 - [ ] `uv run pytest test/ -v --ignore=test/e2e --ignore=test/providers/test_q_cli_integration.py`
 
-### E2E Tests — New Provider
+### E2E Tests — New Provider (Worker Lifecycle)
 - [ ] `uv run pytest -m e2e test/e2e/test_handoff.py -v -k <provider>`
 - [ ] `uv run pytest -m e2e test/e2e/test_assign.py -v -k <provider>`
 - [ ] `uv run pytest -m e2e test/e2e/test_send_message.py -v -k <provider>`
+
+### E2E Tests — New Provider (Supervisor Orchestration)
+- [ ] `uv run pytest -m e2e test/e2e/test_supervisor_orchestration.py -v -k <Provider> -o "addopts="`
+- [ ] Supervisor calls handoff MCP tool → worker terminal created in same session
+- [ ] Supervisor calls assign MCP tool → multiple worker terminals created
+- [ ] Supervisor output contains delegated results (not just "I am the CLI agent")
 
 ### E2E Tests — All Providers (No Regressions)
 - [ ] `uv run pytest -m e2e test/e2e/ -v`
@@ -78,6 +84,7 @@ A new provider requires updates to **all** of these files. Check each one carefu
 - [ ] `test/e2e/test_handoff.py` — Add test class
 - [ ] `test/e2e/test_assign.py` — Add test class
 - [ ] `test/e2e/test_send_message.py` — Add test class
+- [ ] `test/e2e/test_supervisor_orchestration.py` — Add test class (supervisor→worker delegation)
 - [ ] `docs/assets/cao_architecture.mmd` — Add to CLI Tools node
 - [ ] `docs/assets/cao_architecture.png` — Re-render: `npx -p @mermaid-js/mermaid-cli mmdc -i docs/assets/cao_architecture.mmd -o docs/assets/cao_architecture.png -s 6 -b transparent`
 

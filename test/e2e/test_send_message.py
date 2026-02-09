@@ -1,12 +1,16 @@
-"""End-to-end send_message (inbox delivery) tests for all providers.
+"""End-to-end inbox delivery tests (send_message API simulation).
 
-Tests the send_message / inbox flow:
+Tests the inbox delivery plumbing via the CAO API:
 1. Create two terminals (sender and receiver) in the same session
 2. Wait for both to reach IDLE
 3. Send message from sender to receiver's inbox via API
 4. Verify message appears in receiver's inbox
 5. Verify receiver processes the message (status transitions)
 6. Cleanup
+
+NOTE: These tests send messages via the CAO API, not via an agent calling
+the send_message() MCP tool. For real agent-to-agent communication via
+MCP tools, see test_supervisor_orchestration.py.
 
 Requires: running CAO server, authenticated CLI tools (codex, claude, kiro-cli, kimi, gemini), tmux.
 
@@ -136,16 +140,21 @@ def _run_send_message_test(provider: str, agent_profile: str):
 
         # Step 7: Verify receiver processes the message (should transition from IDLE)
         # After inbox delivery, the receiver gets the message as input.
-        # Wait briefly and check that the receiver is no longer idle.
+        # Poll for a non-idle status, since delivery + TUI processing can take
+        # 5-15s depending on the provider (Gemini CLI's Ink TUI is slowest).
         # Acceptable states: processing (working), completed (done),
         # waiting_user_answer (provider showing approval prompt for the message).
-        time.sleep(5)
-        receiver_status = get_terminal_status(receiver_id)
-        assert receiver_status in (
-            "processing",
-            "completed",
-            "waiting_user_answer",
-        ), f"Receiver should have transitioned from IDLE after inbox delivery, got: {receiver_status}"
+        transitioned = False
+        for _ in range(12):  # up to 60s
+            time.sleep(5)
+            receiver_status = get_terminal_status(receiver_id)
+            if receiver_status in ("processing", "completed", "waiting_user_answer"):
+                transitioned = True
+                break
+        assert transitioned, (
+            f"Receiver should have transitioned from IDLE after inbox delivery "
+            f"within 60s, got: {receiver_status}"
+        )
 
     finally:
         if sender_id and actual_session:

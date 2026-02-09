@@ -523,19 +523,67 @@ class TestGeminiCliProviderBuildCommand:
         )
         assert "CAO_TERMINAL_ID" in command
 
+    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
-    def test_build_command_profile_no_mcp(self, mock_load):
-        """Test command with profile that has no MCP servers (just system prompt)."""
+    def test_build_command_profile_no_mcp(self, mock_load, mock_tmux, tmp_path):
+        """Test command with profile that has no MCP servers writes GEMINI.md."""
         mock_profile = MagicMock()
         mock_profile.system_prompt = "You are a developer"
         mock_profile.mcpServers = None
         mock_load.return_value = mock_profile
+        mock_tmux.get_pane_working_directory.return_value = str(tmp_path)
 
         provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
         command = provider._build_gemini_command()
 
-        # System prompt is not applied (Gemini uses GEMINI.md files)
+        # System prompt injected via GEMINI.md file
         assert command == "gemini --yolo --sandbox false"
+        gemini_md = tmp_path / "GEMINI.md"
+        assert gemini_md.exists()
+        assert gemini_md.read_text() == "You are a developer"
+        assert provider._gemini_md_path == str(gemini_md)
+
+    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
+    def test_build_command_system_prompt_backs_up_existing_gemini_md(
+        self, mock_load, mock_tmux, tmp_path
+    ):
+        """Test GEMINI.md backup when user already has one in the working directory."""
+        # Create an existing GEMINI.md
+        existing_md = tmp_path / "GEMINI.md"
+        existing_md.write_text("User's existing instructions")
+
+        mock_profile = MagicMock()
+        mock_profile.system_prompt = "Supervisor agent prompt"
+        mock_profile.mcpServers = None
+        mock_load.return_value = mock_profile
+        mock_tmux.get_pane_working_directory.return_value = str(tmp_path)
+
+        provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
+        provider._build_gemini_command()
+
+        # Original backed up, new prompt written
+        assert existing_md.read_text() == "Supervisor agent prompt"
+        backup = tmp_path / "GEMINI.md.cao_backup"
+        assert backup.exists()
+        assert backup.read_text() == "User's existing instructions"
+        assert provider._gemini_md_backup_path == str(backup)
+
+    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
+    def test_build_command_system_prompt_no_working_dir(self, mock_load, mock_tmux):
+        """Test system prompt skipped gracefully when working dir unavailable."""
+        mock_profile = MagicMock()
+        mock_profile.system_prompt = "You are a developer"
+        mock_profile.mcpServers = None
+        mock_load.return_value = mock_profile
+        mock_tmux.get_pane_working_directory.return_value = None
+
+        provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
+        command = provider._build_gemini_command()
+
+        assert command == "gemini --yolo --sandbox false"
+        assert provider._gemini_md_path is None
 
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
     def test_build_command_profile_error(self, mock_load):
@@ -621,6 +669,37 @@ class TestGeminiCliProviderMisc:
         assert provider._mcp_server_names == []
         assert provider._initialized is False
 
+    def test_cleanup_removes_gemini_md(self, tmp_path):
+        """Test cleanup removes GEMINI.md file created for system prompt."""
+        gemini_md = tmp_path / "GEMINI.md"
+        gemini_md.write_text("Supervisor agent prompt")
+
+        provider = GeminiCliProvider("term-1", "session-1", "window-1")
+        provider._gemini_md_path = str(gemini_md)
+        provider.cleanup()
+
+        assert not gemini_md.exists()
+        assert provider._gemini_md_path is None
+
+    def test_cleanup_restores_backup_gemini_md(self, tmp_path):
+        """Test cleanup restores user's original GEMINI.md from backup."""
+        gemini_md = tmp_path / "GEMINI.md"
+        gemini_md.write_text("CAO injected prompt")
+        backup = tmp_path / "GEMINI.md.cao_backup"
+        backup.write_text("User's original instructions")
+
+        provider = GeminiCliProvider("term-1", "session-1", "window-1")
+        provider._gemini_md_path = str(gemini_md)
+        provider._gemini_md_backup_path = str(backup)
+        provider.cleanup()
+
+        # Original restored, backup removed
+        assert gemini_md.exists()
+        assert gemini_md.read_text() == "User's original instructions"
+        assert not backup.exists()
+        assert provider._gemini_md_path is None
+        assert provider._gemini_md_backup_path is None
+
     def test_provider_inherits_base(self):
         """Test provider inherits from BaseProvider."""
         from cli_agent_orchestrator.providers.base import BaseProvider
@@ -634,6 +713,8 @@ class TestGeminiCliProviderMisc:
         assert provider._initialized is False
         assert provider._agent_profile is None
         assert provider._mcp_server_names == []
+        assert provider._gemini_md_path is None
+        assert provider._gemini_md_backup_path is None
         assert provider.terminal_id == "term-1"
         assert provider.session_name == "session-1"
         assert provider.window_name == "window-1"

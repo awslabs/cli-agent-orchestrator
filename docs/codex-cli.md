@@ -250,19 +250,21 @@ The E2E test suite validates handoff, assign, and send_message flows against rea
 
 ```
 test/e2e/
-├── conftest.py           # Shared fixtures (server health, CLI checks, helpers)
-├── test_handoff.py       # Handoff (blocking) tests — 6 tests (2 per provider)
-├── test_assign.py        # Assign (async) tests — 6 tests (2 per provider)
-└── test_send_message.py  # Inbox delivery tests — 3 tests (1 per provider)
+├── conftest.py                        # Shared fixtures (server health, CLI checks, helpers)
+├── test_handoff.py                    # Worker lifecycle tests (handoff) — 10 tests (2 per provider)
+├── test_assign.py                     # Worker lifecycle tests (assign) — 10 tests (2 per provider)
+├── test_send_message.py               # Inbox delivery tests — 5 tests (1 per provider)
+└── test_supervisor_orchestration.py   # Supervisor→worker delegation tests — 10 tests (2 per provider)
 ```
 
 ### Prerequisites
 
 - Running CAO server: `uv run cao-server`
-- Authenticated CLI tools: `codex`, `claude`, `kiro-cli`
+- Authenticated CLI tools: `codex`, `claude`, `kiro-cli`, `kimi`, `gemini`
 - tmux installed
-- Agent profiles installed: `data_analyst`, `report_generator`
+- Agent profiles installed: `analysis_supervisor`, `data_analyst`, `report_generator`
   ```bash
+  cao install examples/assign/analysis_supervisor.md
   cao install examples/assign/data_analyst.md
   cao install examples/assign/report_generator.md
   ```
@@ -277,11 +279,14 @@ uv run pytest -m e2e test/e2e/ -v
 uv run pytest -m e2e test/e2e/ -v -k codex
 uv run pytest -m e2e test/e2e/ -v -k claude_code
 uv run pytest -m e2e test/e2e/ -v -k kiro_cli
+uv run pytest -m e2e test/e2e/ -v -k kimi_cli
+uv run pytest -m e2e test/e2e/ -v -k gemini_cli
 
 # Run a specific test type
 uv run pytest -m e2e test/e2e/test_handoff.py -v
 uv run pytest -m e2e test/e2e/test_assign.py -v
 uv run pytest -m e2e test/e2e/test_send_message.py -v
+uv run pytest -m e2e test/e2e/test_supervisor_orchestration.py -v -o "addopts="
 ```
 
 E2E tests are excluded from default `pytest` runs via the `-m 'not e2e'` addopts in `pyproject.toml`.

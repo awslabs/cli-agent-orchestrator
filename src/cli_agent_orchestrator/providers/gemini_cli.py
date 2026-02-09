@@ -28,6 +28,7 @@ Status Detection Strategy:
 """
 
 import logging
+import os
 import re
 import shlex
 import time
@@ -134,6 +135,13 @@ class GeminiCliProvider(BaseProvider):
         # Track MCP servers that were configured via `gemini mcp add`
         # so they can be removed during cleanup.
         self._mcp_server_names: list[str] = []
+        # Path to GEMINI.md file created for system prompt injection.
+        # Gemini CLI reads GEMINI.md from the working directory for
+        # project-level instructions. We create this file during
+        # initialization and remove it during cleanup.
+        self._gemini_md_path: Optional[str] = None
+        # Backup path for existing GEMINI.md (restored during cleanup).
+        self._gemini_md_backup_path: Optional[str] = None
 
     def _build_gemini_command(self) -> str:
         """Build Gemini CLI command with appropriate flags.
@@ -147,9 +155,13 @@ class GeminiCliProvider(BaseProvider):
         The --yolo flag auto-approves all tool actions, which is required for
         non-interactive operation in CAO-managed tmux sessions.
 
-        Note: Gemini CLI does not support inline agent profiles or system prompts
-        via CLI flags in the same way as Kimi or Claude Code. Agent profile system
-        prompts are handled by creating a GEMINI.md file in the working directory.
+        Note: Gemini CLI does not support inline system prompt injection via CLI
+        flags. Instead, it reads GEMINI.md files from the working directory for
+        project-level instructions. We write the agent profile's system prompt
+        to a GEMINI.md file in the tmux pane's working directory before launch,
+        and remove it during cleanup(). This matches the Kimi CLI temp file
+        approach (lesson #14 in lessons-learned.md).
+
         MCP servers must be configured beforehand via `gemini mcp add`.
         """
         command_parts = ["gemini", "--yolo", "--sandbox", "false"]
@@ -158,11 +170,31 @@ class GeminiCliProvider(BaseProvider):
             try:
                 profile = load_agent_profile(self._agent_profile)
 
-                # Gemini CLI reads system instructions from GEMINI.md files.
-                # We don't create these automatically since it would modify the
-                # user's working directory. Instead, the system prompt from the
-                # agent profile is not applied for Gemini CLI.
-                # Future: consider --prompt-interactive for initial instruction.
+                # Inject system prompt via GEMINI.md file in the working directory.
+                # Gemini CLI reads GEMINI.md for project-level instructions on startup.
+                # Without this, supervisor agents don't know their role or available
+                # MCP tools (handoff, assign, send_message). See lessons-learned #14.
+                system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
+                if system_prompt:
+                    working_dir = tmux_client.get_pane_working_directory(
+                        self.session_name, self.window_name
+                    )
+                    if working_dir:
+                        gemini_md_path = os.path.join(working_dir, "GEMINI.md")
+                        # Back up existing GEMINI.md if present, so we can restore
+                        # it during cleanup instead of deleting the user's file.
+                        backup_path = gemini_md_path + ".cao_backup"
+                        if os.path.exists(gemini_md_path):
+                            os.rename(gemini_md_path, backup_path)
+                            self._gemini_md_backup_path = backup_path
+                        with open(gemini_md_path, "w") as f:
+                            f.write(system_prompt)
+                        self._gemini_md_path = gemini_md_path
+                    else:
+                        logger.warning(
+                            "Could not determine working directory for GEMINI.md; "
+                            "system prompt will not be injected"
+                        )
 
                 # Configure MCP servers via `gemini mcp add` if present.
                 # This must happen BEFORE launching gemini, so we return
@@ -402,8 +434,9 @@ class GeminiCliProvider(BaseProvider):
     def cleanup(self) -> None:
         """Clean up Gemini CLI provider resources.
 
-        Removes any MCP servers that were configured via `gemini mcp add`
-        and resets the initialization state.
+        Removes any MCP servers that were configured via `gemini mcp add`,
+        removes the GEMINI.md file created for system prompt injection
+        (or restores the user's original if one existed), and resets state.
         """
         # Remove MCP servers that were added during initialization
         for server_name in self._mcp_server_names:
@@ -416,5 +449,18 @@ class GeminiCliProvider(BaseProvider):
             except Exception as e:
                 logger.warning(f"Failed to remove MCP server '{server_name}': {e}")
         self._mcp_server_names = []
+
+        # Remove GEMINI.md created for system prompt injection.
+        # If the user had an existing GEMINI.md, restore it from backup.
+        if self._gemini_md_path and os.path.exists(self._gemini_md_path):
+            try:
+                os.remove(self._gemini_md_path)
+                if self._gemini_md_backup_path and os.path.exists(self._gemini_md_backup_path):
+                    os.rename(self._gemini_md_backup_path, self._gemini_md_path)
+                    logger.info(f"Restored original GEMINI.md from backup")
+            except Exception as e:
+                logger.warning(f"Failed to clean up GEMINI.md: {e}")
+        self._gemini_md_path = None
+        self._gemini_md_backup_path = None
 
         self._initialized = False

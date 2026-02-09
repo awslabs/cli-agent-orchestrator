@@ -17,6 +17,8 @@ Critical bugs encountered during Kimi CLI, Codex, Gemini CLI, and Claude Code pr
 11. [Exit Key Sequences Must Use Non-Literal tmux send_keys](#11-exit-key-sequences-must-use-non-literal-tmux-send_keys)
 12. [TUI Hotkeys Intercept Literal send_keys — Use Bracketed Paste](#12-tui-hotkeys-intercept-literal-send_keys--use-bracketed-paste)
 13. [Unit Test Coverage Is Not Functional Correctness — Run Real E2E](#13-unit-test-coverage-is-not-functional-correctness--run-real-e2e)
+14. [System Prompt Injection Is Required for Supervisor Orchestration](#14-system-prompt-injection-is-required-for-supervisor-orchestration)
+15. [E2E Tests Must Cover Supervisor Delegation, Not Just Worker Tasks](#15-e2e-tests-must-cover-supervisor-delegation-not-just-worker-tasks)
 
 ---
 
@@ -283,3 +285,66 @@ tmux_client.send_keys_via_paste(session, window, message)  # not send_keys()
 - After writing provider code, run `cao launch` manually before writing any tests
 - Ralph's fix_plan.md must run E2E as the first task, not cosmetic checks
 - 100% unit test coverage does not mean the system works — it means every line of code was executed in isolation with mocks
+
+---
+
+## 14. System Prompt Injection Is Required for Supervisor Orchestration
+
+**Symptom (Codex, then Gemini CLI):** Supervisor agent launched with the `analysis_supervisor` profile responds "I am the [CLI tool] agent" and does not know it can use `handoff()`, `assign()`, or `send_message()` tools. It cannot orchestrate worker agents because it never received the system prompt describing its role, available tools, or the multi-agent protocol.
+
+**History:** This first hit Codex — the initial implementation registered MCP servers but did not inject the agent profile system prompt. The supervisor had the tools available but no instructions on how to use them. Fixed by adding `-c developer_instructions="..."` support. The same mistake was repeated with Gemini CLI — MCP servers are registered, but the system prompt is silently skipped because Gemini CLI reads instructions from `GEMINI.md` files and the provider avoids creating files in the user's working directory.
+
+**Root cause:** When adding a new provider, it's easy to focus on MCP server registration (which enables the tools) and forget that the system prompt is what tells the agent *how* to use those tools. Without the system prompt the agent has no context about:
+- Its role as a supervisor
+- When to use handoff (blocking) vs assign (non-blocking)
+- How to read inbox messages from workers
+- The multi-agent communication protocol
+
+**How each provider injects the system prompt:**
+
+| Provider | System Prompt Method | Mechanism |
+|----------|---------------------|-----------|
+| Codex | `-c developer_instructions="..."` | TOML config override (added after hitting this bug) |
+| Claude Code | `--append-system-prompt <text>` | CLI flag |
+| Kimi CLI | `--agent-file <path>` | Temp YAML + markdown file |
+| Gemini CLI | **Not implemented** | GEMINI.md files (not created by CAO) |
+
+**Fix options for CLIs without system prompt flags (in order of preference):**
+1. Create a temporary instruction file (e.g., `GEMINI.md`) in the working directory with the system prompt, and clean it up in `cleanup()` — matches Kimi CLI's temp file approach
+2. Use the CLI tool's `--prompt` or `--prompt-interactive` flag if available in newer versions
+3. Send the system prompt as the first user message after initialization (workaround — less reliable since it's a user message, not a system instruction)
+
+**Rules:**
+- Every provider MUST inject the agent profile system prompt — without it, the agent has tools but no instructions
+- If the CLI tool doesn't support system prompt flags, use temp files (Kimi CLI pattern) rather than skipping injection entirely
+- This is a recurring mistake across providers — add a check in code review: "Does _build_command() apply profile.system_prompt?"
+- Test that a supervisor agent actually describes its role correctly after launch (not just that it reaches IDLE)
+
+---
+
+## 15. E2E Tests Must Cover Real Handoff/Assign Delegation, Not Just Worker Tasks
+
+**Symptom:** All 5 Gemini CLI E2E tests (2 handoff, 2 assign, 1 send_message) pass, but supervisor orchestration is completely broken. The tests never test a supervisor agent actually calling `handoff()` or `assign()` MCP tools to delegate work.
+
+**What the current E2E tests actually do:**
+- `test_handoff.py` — **simulates** handoff by manually creating a `developer` terminal via API, sending it a task, and extracting output. It tests the provider's ability to receive input and produce output, but does NOT test the `handoff()` MCP tool being called by a supervisor agent.
+- `test_assign.py` — same pattern: manually creates `data_analyst`/`report_generator` worker terminals and sends tasks directly. Uses `examples/assign/` worker profiles but never launches the `analysis_supervisor`.
+- `test_send_message.py` — tests inbox message delivery between two terminals via API.
+
+**The gap:** These tests verify the **building blocks** (provider lifecycle, input/output, inbox delivery) but not the **orchestration flow** (supervisor receives task → calls handoff/assign MCP tool → workers spawn → results flow back). The `analysis_supervisor` profile exists in `examples/assign/` with complete orchestration instructions, but no E2E test exercises it.
+
+**Why this matters:** The system prompt injection bug (lesson #14) was invisible to all E2E tests. A supervisor that can't delegate still passes every test because no test asks a supervisor to delegate. The handoff/assign E2E tests only test the worker side.
+
+**What a real handoff/assign E2E test should verify:**
+1. Launch a supervisor agent with `analysis_supervisor` profile
+2. Send it a task that requires delegation (e.g., "Analyze datasets A and B in parallel, then generate a report")
+3. Verify the supervisor calls `assign()` or `handoff()` (check that worker windows appear in the tmux session)
+4. Verify the supervisor collects results from workers
+5. Verify the supervisor produces a combined final response
+
+**Rules:**
+- Every provider must have at least one E2E test using a supervisor profile (e.g., `analysis_supervisor`)
+- The test must verify that delegation actually happens (worker windows created in the same tmux session)
+- Worker-only E2E tests are necessary but not sufficient — they test the building blocks, not the orchestration
+- Add `test_supervisor_orchestration.py` to `test/e2e/` that launches a supervisor and verifies end-to-end delegation
+- The current `test_handoff.py` and `test_assign.py` should be renamed or documented to clarify they test provider lifecycle, not MCP tool delegation

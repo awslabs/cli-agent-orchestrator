@@ -1,12 +1,14 @@
-"""End-to-end handoff tests for all providers.
+"""End-to-end provider lifecycle tests (handoff worker simulation).
 
-Tests the full handoff flow that _handoff_impl() executes:
-1. Create session + terminal with provider and developer profile
-2. Wait for IDLE
-3. Send handoff message
-4. Poll for COMPLETED
-5. Extract and validate output
-6. Cleanup
+Tests the worker side of the handoff flow — validates that each provider can:
+1. Create session + terminal with a developer agent profile
+2. Reach IDLE state (CLI tool initialized)
+3. Receive a task message via the API
+4. Process the task and reach COMPLETED
+5. Return extractable output
+
+NOTE: These tests do NOT test a supervisor agent calling the handoff() MCP tool.
+For real supervisor→worker delegation tests, see test_supervisor_orchestration.py.
 
 Requires: running CAO server, authenticated CLI tools (codex, claude, kiro-cli, kimi, gemini), tmux.
 

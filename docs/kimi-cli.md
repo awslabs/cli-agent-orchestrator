@@ -140,6 +140,7 @@ uv run pytest -m e2e test/e2e/ -v -k kimi_cli
 uv run pytest -m e2e test/e2e/test_handoff.py -v -k kimi_cli
 uv run pytest -m e2e test/e2e/test_assign.py -v -k kimi_cli
 uv run pytest -m e2e test/e2e/test_send_message.py -v -k kimi_cli
+uv run pytest -m e2e test/e2e/test_supervisor_orchestration.py -v -k KimiCli -o "addopts="
 ```
 
 Prerequisites for E2E tests:

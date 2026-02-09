@@ -122,6 +122,7 @@ uv run pytest -m e2e test/e2e/ -v -k claude_code
 uv run pytest -m e2e test/e2e/test_handoff.py -v -k claude_code
 uv run pytest -m e2e test/e2e/test_assign.py -v -k claude_code
 uv run pytest -m e2e test/e2e/test_send_message.py -v -k claude_code
+uv run pytest -m e2e test/e2e/test_supervisor_orchestration.py -v -k ClaudeCode -o "addopts="
 ```
 
 ## Troubleshooting

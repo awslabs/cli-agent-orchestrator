@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fix Gemini CLI initialization timeout when working directory is the home directory: `gemini mcp add` refuses project-level settings in `~/` ("Please use --scope user"); add `--scope user` to both `gemini mcp add` and `gemini mcp remove` commands
 - Fix Gemini CLI failing to launch in fresh tmux sessions: add warm-up `echo CAO_SHELL_READY` command with marker-based polling (15s timeout) before sending the `gemini` command, ensuring the shell environment (PATH, nvm, homebrew) is fully loaded
 - Fix all providers' `send_input()` using `tmux send_keys(literal=True)` which sends characters individually, allowing TUI hotkeys (e.g., Gemini CLI's `!` shell mode toggle) to intercept user messages; replace with `send_keys_via_paste()` using `tmux set-buffer` + `paste-buffer -p` (bracketed paste mode) to bypass per-character hotkey handling
+- Fix Gemini CLI supervisor agents not receiving system prompt: inject agent profile system prompt via `GEMINI.md` file in the working directory (Gemini CLI reads this for project-level instructions); backs up existing `GEMINI.md` and restores during cleanup
 
 ### Added
 
@@ -74,6 +75,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Provider documentation: `docs/gemini-cli.md` covering prerequisites, status detection, message extraction, MCP config, and troubleshooting
 - `TmuxClient.send_keys_via_paste()` method for sending text via bracketed paste mode (`tmux set-buffer` + `paste-buffer -p`), bypassing TUI hotkey interception in Ink-based and prompt_toolkit-based CLIs
 - `TmuxClient.send_special_key()` method for sending tmux key sequences (e.g., `C-d`, `C-c`) non-literally, distinct from `send_keys()` which sends text literally
+- Supervisor orchestration E2E tests (`test/e2e/test_supervisor_orchestration.py`): 10 tests across all 5 providers (2 per provider) that verify the full supervisor→worker delegation flow via MCP tools (handoff and assign+handoff), using `analysis_supervisor` profile from `examples/assign/`
 - Centralized `skills/` directory as single source of truth for AI coding agent skills (`build-cao-provider`, `skill-creator`), with install instructions for Claude Code (`.claude/skills/`), Codex (`.agents/skills/`), Gemini (`.gemini/skills/`), Kimi (`.kimi/skills/`), and Kiro (`.kiro/skills/`)
 - `terminal_service.send_special_key()` wrapper function for the new tmux client method
 - Exit terminal endpoint key sequence routing: `POST /terminals/{terminal_id}/exit` now detects `C-`/`M-` prefixed exit commands and sends them as tmux key sequences instead of literal text

@@ -136,6 +136,7 @@ uv run pytest -m e2e test/e2e/ -v -k kiro_cli
 uv run pytest -m e2e test/e2e/test_handoff.py -v -k kiro_cli
 uv run pytest -m e2e test/e2e/test_assign.py -v -k kiro_cli
 uv run pytest -m e2e test/e2e/test_send_message.py -v -k kiro_cli
+uv run pytest -m e2e test/e2e/test_supervisor_orchestration.py -v -k KiroCli -o "addopts="
 ```
 
 ## Troubleshooting

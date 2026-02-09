@@ -74,9 +74,10 @@ Tool calls appear in rounded-corner boxes:
 
 ## Agent Profiles
 
-Agent profiles are **optional** for Gemini CLI. Gemini uses `GEMINI.md` files in the project directory for system-level instructions — these are not managed by CAO.
+Agent profiles are **optional** for Gemini CLI. When an agent profile is provided:
 
-If an agent profile provides MCP servers, those are registered via `gemini mcp add` before launching. System prompts from agent profiles are not applied (Gemini does not support inline system prompt injection).
+1. **System prompt**: Written to a `GEMINI.md` file in the working directory before launch. Gemini CLI reads this file for project-level instructions. If an existing `GEMINI.md` is present, it is backed up to `GEMINI.md.cao_backup` and restored during cleanup.
+2. **MCP servers**: Registered via `gemini mcp add` before launching (see below).
 
 ## MCP Server Configuration
 
@@ -145,12 +146,13 @@ uv run pytest test/e2e/ -v -k Gemini -o "addopts="
 uv run pytest test/e2e/test_handoff.py -v -k Gemini -o "addopts="
 uv run pytest test/e2e/test_assign.py -v -k Gemini -o "addopts="
 uv run pytest test/e2e/test_send_message.py -v -k Gemini -o "addopts="
+uv run pytest test/e2e/test_supervisor_orchestration.py -v -k Gemini -o "addopts="
 ```
 
 Prerequisites for E2E tests:
 - CAO server running (`cao-server`)
 - `gemini` CLI authenticated
-- Agent profiles installed (`cao install developer`)
+- Agent profiles installed (`cao install developer`, `cao install examples/assign/analysis_supervisor.md`)
 
 ## Troubleshooting
 

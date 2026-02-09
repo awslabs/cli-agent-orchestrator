@@ -9,7 +9,7 @@ allowed-tools: Bash, Read, Write, Edit, Grep, Glob, Task
 The provider name is `$ARGUMENTS`. If no argument provided, ask the user.
 
 **Load references as needed** — do not read them all upfront:
-- [Lessons Learned](./references/lessons-learned.md) — 9 critical bugs and their fixes (load during Phase 2)
+- [Lessons Learned](./references/lessons-learned.md) — 15 critical bugs and their fixes (load during Phase 2)
 - [Implementation Checklist](./references/implementation-checklist.md) — File-by-file creation guide (load during Phase 2)
 - [Verification Checklist](./references/verification-checklist.md) — Testing, security, and documentation checks (load during Phase 6-7)
 
@@ -34,9 +34,10 @@ Follow `kimi_cli.py` as reference template. Two non-obvious requirements that ca
 ## Phase 3: Test
 
 1. **Unit tests** — >90% coverage, include `test_get_status_idle_tall_terminal` from day one
-2. **E2E** — handoff, assign, send_message for the new provider
-3. **E2E all providers** — `uv run pytest -m e2e test/e2e/ -v` — verify no regressions
-4. **Security** — `uv run pip-audit` or `trivy fs --severity HIGH,CRITICAL .`
+2. **E2E worker lifecycle** — handoff, assign, send_message for the new provider
+3. **E2E supervisor orchestration** — `uv run pytest -m e2e test/e2e/test_supervisor_orchestration.py -v -k <provider> -o "addopts="` — verify supervisor can call handoff/assign MCP tools to delegate work (see lessons #15)
+4. **E2E all providers** — `uv run pytest -m e2e test/e2e/ -v` — verify no regressions
+5. **Security** — `uv run pip-audit` or `trivy fs --severity HIGH,CRITICAL .`
 
 ## Phase 4: Code Quality
 
