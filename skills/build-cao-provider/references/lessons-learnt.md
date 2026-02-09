@@ -363,12 +363,29 @@ The `handoff` MCP tool creates a worker terminal, initializes the provider (~5-3
 | Provider | Config mechanism | Override |
 |----------|-----------------|----------|
 | Codex | Per-server TOML: `-c mcp_servers.<name>.tool_timeout_sec=600.0` | Must be TOML float (600.0), not int — Codex deserializes via `Option<f64>` and silently rejects integers |
-| Kimi CLI | Global config: `--config mcp.client.tool_call_timeout_ms=600000` | Integer milliseconds, set via `--config` CLI flag |
+| Kimi CLI | Direct config file write: `~/.kimi/config.toml` | Modify `tool_call_timeout_ms` in `[mcp.client]` section; restore on cleanup |
 | Claude Code | No known timeout issue | N/A |
 | Gemini CLI | No known timeout issue | N/A |
+
+**Important:** Do NOT use Kimi CLI's `--config` flag for this — it causes Kimi to bypass its default config file (`~/.kimi/config.toml`), which breaks OAuth authentication (shows "model: not set" and `/login` refuses to work with "Login requires the default config file; restart without --config/--config-file"). Instead, modify the config file directly and restore the original value during cleanup, following the same pattern as Gemini CLI's `~/.gemini/settings.json` approach.
+
+### 15b. Handoff IDLE Wait Too Short for Slow-Initializing Providers
+
+**Symptom (Kimi CLI, Gemini CLI):** Handoff fails with "Terminal [ID] did not reach IDLE status within 30 seconds". Assign to the same provider works fine.
+
+**Root cause:** `_handoff_impl()` creates the worker terminal (which calls `provider.initialize()` synchronously), then checks `wait_until_terminal_status(IDLE, timeout=30)`. If the provider's own `initialize()` times out (60-90s), `terminal_service.create_terminal()` ignores the failure (doesn't check return value) and returns the terminal anyway. The 30-second IDLE check then fails because the CLI hasn't started yet.
+
+Assign is unaffected because `_assign_impl()` sends the message immediately via `_send_direct_input()` without checking IDLE — the message sits in the tmux buffer and gets processed when the CLI eventually starts.
+
+**Fix:** Increase the IDLE wait from 30s to 120s in `_handoff_impl()`, acting as a fallback for slow initialization:
+```python
+wait_until_terminal_status(terminal_id, TerminalStatus.IDLE, timeout=120.0)
+```
 
 **Rules:**
 - Check the CLI tool's MCP implementation for default tool timeout before shipping a provider
 - The timeout should match `_handoff_impl()`'s default timeout (600 seconds)
 - Only set the timeout when MCP servers are configured (no-op otherwise)
 - Watch for type parsing quirks — Codex silently rejects integer TOML values for float fields
+- Never use CLI `--config` flags that bypass the default config file — modify the config file directly instead and restore during cleanup
+- The handoff IDLE wait must be generous enough for the slowest provider's initialization (currently Gemini CLI ~90s)

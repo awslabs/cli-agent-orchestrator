@@ -486,7 +486,7 @@ uv run pytest test/providers/test_codex_provider_unit.py::TestCodexBuildCommand 
 
 ### Test Coverage (`test_kimi_cli_unit.py`)
 
-**64 tests across 6 test classes covering:**
+**66 tests across 6 test classes covering:**
 
 1. **Initialization (7 tests)**
    - Successful initialization (wait_for_shell + kimi --yolo + wait_until_status IDLE)
@@ -528,14 +528,16 @@ uv run pytest test/providers/test_codex_provider_unit.py::TestCodexBuildCommand 
    - Fallback when all lines are thinking (returns all content)
    - No trailing prompt extraction
 
-4. **Command Building (15 tests)**
+4. **Command Building (17 tests)**
    - Base command without agent profile (`kimi --yolo`)
    - Command with agent profile (temp YAML + system.md)
    - Temp file creation and content verification
    - Agent YAML extends default agent
    - MCP server config injection via `--mcp-config` JSON
-   - MCP tool call timeout set to 600s (`--config mcp.client.tool_call_timeout_ms=600000`)
+   - MCP tool call timeout set to 600s via `~/.kimi/config.toml` direct write (not `--config` flag which breaks OAuth)
    - MCP tool timeout NOT set when no MCP servers configured
+   - MCP timeout config file missing handled gracefully
+   - MCP timeout not downgraded if already >= 600000
    - MCP server with dict config
    - MCP server with model config (Pydantic)
    - MCP server CAO_TERMINAL_ID auto-injection

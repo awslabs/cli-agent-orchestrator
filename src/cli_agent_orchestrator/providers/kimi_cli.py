@@ -32,6 +32,7 @@ import re
 import shlex
 import shutil
 import tempfile
+from pathlib import Path
 from typing import Optional
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
@@ -148,7 +149,7 @@ class KimiCliProvider(BaseProvider):
         Uses shlex.join() for safe escaping of all arguments.
 
         Command structure:
-            kimi --yolo [--config KEY=VALUE] [--agent-file FILE] [--mcp-config JSON]
+            kimi --yolo [--agent-file FILE] [--mcp-config JSON]
 
         The --yolo flag auto-approves all tool actions, which is required for
         non-interactive operation in CAO-managed tmux sessions.
@@ -189,13 +190,11 @@ class KimiCliProvider(BaseProvider):
                 # Add MCP server configuration if present in the agent profile.
                 # Kimi accepts --mcp-config as a JSON string (repeatable flag).
                 if profile.mcpServers:
-                    # Set a generous MCP tool call timeout for long-running operations
-                    # like handoff, which creates a worker terminal, waits for it to
-                    # complete, and extracts output. Kimi CLI defaults to 60s
-                    # (tool_call_timeout_ms=60000 in kimi_cli/config.py), which is too
-                    # short for multi-step operations. Use --config to override to 600s,
-                    # matching the default handoff timeout in _handoff_impl().
-                    command_parts.extend(["--config", "mcp.client.tool_call_timeout_ms=600000"])
+                    # Set MCP tool call timeout to 600s by modifying ~/.kimi/config.toml
+                    # directly. We cannot use --config flag because it causes Kimi CLI
+                    # to bypass its default config file, which breaks OAuth authentication
+                    # (shows "model: not set" and /login says "restart without --config").
+                    self._set_mcp_timeout()
 
                     mcp_config = {}
                     for server_name, server_config in profile.mcpServers.items():
@@ -219,6 +218,68 @@ class KimiCliProvider(BaseProvider):
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
         return shlex.join(command_parts)
+
+    def _set_mcp_timeout(self) -> None:
+        """Set MCP tool call timeout to 600s in ~/.kimi/config.toml.
+
+        Kimi CLI defaults to tool_call_timeout_ms=60000 (60s) for MCP tool calls.
+        The handoff MCP tool creates a worker terminal, waits for completion, and
+        extracts output — routinely exceeding 60s. We modify the config file directly
+        instead of using ``--config`` CLI flag, because ``--config`` causes Kimi CLI
+        to bypass the default config file and breaks OAuth authentication.
+
+        Saves the original value so cleanup() can restore it.
+        """
+        config_path = Path.home() / ".kimi" / "config.toml"
+        if not config_path.exists():
+            logger.warning(f"Kimi config not found at {config_path}, skipping MCP timeout override")
+            return
+
+        try:
+            content = config_path.read_text()
+            self._original_mcp_timeout = None
+
+            # Match the existing timeout line under [mcp.client] section
+            # Format: tool_call_timeout_ms = 60000
+            pattern = r"(tool_call_timeout_ms\s*=\s*)(\d+)"
+            match = re.search(pattern, content)
+            if match:
+                self._original_mcp_timeout = int(match.group(2))
+                if self._original_mcp_timeout < 600000:
+                    new_content = re.sub(pattern, r"\g<1>600000", content)
+                    config_path.write_text(new_content)
+                    logger.info(
+                        f"Set MCP tool_call_timeout_ms to 600000 "
+                        f"(was {self._original_mcp_timeout}) in {config_path}"
+                    )
+            else:
+                logger.warning(
+                    f"tool_call_timeout_ms not found in {config_path}, "
+                    "MCP tool calls may time out during handoff"
+                )
+        except Exception as e:
+            logger.warning(f"Failed to set MCP timeout in {config_path}: {e}")
+
+    def _restore_mcp_timeout(self) -> None:
+        """Restore the original MCP tool call timeout in ~/.kimi/config.toml."""
+        if not hasattr(self, "_original_mcp_timeout") or self._original_mcp_timeout is None:
+            return
+
+        config_path = Path.home() / ".kimi" / "config.toml"
+        if not config_path.exists():
+            return
+
+        try:
+            content = config_path.read_text()
+            pattern = r"(tool_call_timeout_ms\s*=\s*)(\d+)"
+            new_content = re.sub(pattern, rf"\g<1>{self._original_mcp_timeout}", content)
+            config_path.write_text(new_content)
+            logger.info(
+                f"Restored MCP tool_call_timeout_ms to {self._original_mcp_timeout} "
+                f"in {config_path}"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to restore MCP timeout in {config_path}: {e}")
 
     def initialize(self) -> bool:
         """Initialize Kimi CLI provider by starting the kimi command.
@@ -497,7 +558,8 @@ class KimiCliProvider(BaseProvider):
     def cleanup(self) -> None:
         """Clean up Kimi CLI provider resources.
 
-        Removes any temporary files created for agent profiles
+        Removes any temporary files created for agent profiles,
+        restores the original MCP timeout in ~/.kimi/config.toml,
         and resets the initialization state.
         """
         # Remove temp directory if it was created for agent profile
@@ -505,6 +567,9 @@ class KimiCliProvider(BaseProvider):
             if os.path.exists(self._temp_dir):
                 shutil.rmtree(self._temp_dir, ignore_errors=True)
             self._temp_dir = None
+
+        # Restore original MCP tool call timeout
+        self._restore_mcp_timeout()
 
         self._initialized = False
         self._has_received_input = False

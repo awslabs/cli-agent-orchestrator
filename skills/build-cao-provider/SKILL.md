@@ -126,7 +126,7 @@ Do NOT commit until every item in [verification-checklist.md](./references/verif
 
 | Provider | Prompt | Response Marker | MCP Config |
 |----------|--------|-----------------|------------|
-| kimi_cli | `user@dir💫/✨` | `•` bullet | `--mcp-config` JSON |
+| kimi_cli | `user@dir💫/✨` | `•` bullet | `--mcp-config` JSON, timeout via `~/.kimi/config.toml` direct write |
 | claude_code | `>` or `❯` | `───` separator | `--mcp-config` JSON |
 | codex | `›` (U+203A) | `•` bullet | `-c mcp_servers.*` TOML |
 | gemini_cli | `*   Type your message` | `✦` (U+2726) | `~/.gemini/settings.json` direct write, `-i` for system prompt |
