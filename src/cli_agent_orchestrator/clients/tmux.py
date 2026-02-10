@@ -3,6 +3,7 @@
 import logging
 import os
 import subprocess
+import time
 import uuid
 from typing import Dict, List, Optional
 
@@ -106,13 +107,23 @@ class TmuxClient:
             logger.error(f"Failed to create window in session {session_name}: {e}")
             raise
 
-    def send_keys(self, session_name: str, window_name: str, keys: str) -> None:
+    def send_keys(
+        self, session_name: str, window_name: str, keys: str, enter_count: int = 1
+    ) -> None:
         """Send keys to window using tmux paste-buffer for instant delivery.
 
         Uses load-buffer + paste-buffer instead of chunked send-keys to avoid
         slow character-by-character input and special character interpretation.
         The -p flag enables bracketed paste mode so multi-line content is treated
         as a single input rather than submitting on each newline.
+
+        Args:
+            session_name: Name of tmux session
+            window_name: Name of window in session
+            keys: Text to send
+            enter_count: Number of Enter keys to send after pasting (default 1).
+                Some TUIs (e.g., Gemini CLI's Ink) enter multi-line mode after
+                bracketed paste, requiring 2 Enters to submit.
         """
         target = f"{session_name}:{window_name}"
         buf_name = f"cao_{uuid.uuid4().hex[:8]}"
@@ -127,10 +138,16 @@ class TmuxClient:
                 ["tmux", "paste-buffer", "-p", "-b", buf_name, "-t", target],
                 check=True,
             )
-            subprocess.run(
-                ["tmux", "send-keys", "-t", target, "Enter"],
-                check=True,
-            )
+            for i in range(enter_count):
+                if i > 0:
+                    # Delay between Enter presses for TUIs that need time to
+                    # process the previous Enter (e.g., Ink adding a newline)
+                    # before the next Enter triggers form submission.
+                    time.sleep(0.5)
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", target, "Enter"],
+                    check=True,
+                )
             logger.debug(f"Sent keys to {target}")
         except Exception as e:
             logger.error(f"Failed to send keys to {target}: {e}")

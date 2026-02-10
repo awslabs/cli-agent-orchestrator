@@ -41,6 +41,17 @@ import requests
 from cli_agent_orchestrator.constants import API_BASE_URL
 
 
+def _get_full_output(terminal_id: str) -> str:
+    """Get full terminal output (entire scrollback)."""
+    resp = requests.get(
+        f"{API_BASE_URL}/terminals/{terminal_id}/output",
+        params={"mode": "full"},
+    )
+    if resp.status_code != 200:
+        return ""
+    return resp.json().get("output", "")
+
+
 def _get_inbox_messages(terminal_id: str, status_filter: str = None):
     """Get inbox messages for a terminal."""
     params = {"limit": 50}
@@ -97,6 +108,7 @@ def _wait_for_supervisor_done(
     min_terminals: int,
     timeout: float = SUPERVISOR_COMPLETION_TIMEOUT,
     poll: float = 5.0,
+    stable_count: int = 2,
 ) -> tuple:
     """Wait for supervisor to reach COMPLETED AND spawn expected workers.
 
@@ -106,8 +118,12 @@ def _wait_for_supervisor_done(
     so the status detector sees "response + idle prompt" = COMPLETED even
     while the model is between text output and the first MCP tool call.
 
+    Similarly, Codex can briefly show COMPLETED between consecutive MCP tool
+    calls (e.g., after assign returns but before handoff starts). Requiring
+    ``stable_count`` consecutive COMPLETED readings avoids these false positives.
+
     This function polls until BOTH conditions are true:
-    - Terminal status is 'completed'
+    - Terminal status is 'completed' for ``stable_count`` consecutive polls
     - At least min_terminals exist in the session (supervisor + workers)
 
     Returns (last_status, terminals_list).
@@ -115,6 +131,7 @@ def _wait_for_supervisor_done(
     start = time.time()
     last_status = "unknown"
     terminals = []
+    consecutive_completed = 0
 
     while time.time() - start < timeout:
         last_status = get_terminal_status(supervisor_id)
@@ -124,7 +141,11 @@ def _wait_for_supervisor_done(
             return last_status, terminals
 
         if last_status == "completed" and len(terminals) >= min_terminals:
-            return last_status, terminals
+            consecutive_completed += 1
+            if consecutive_completed >= stable_count:
+                return last_status, terminals
+        else:
+            consecutive_completed = 0
 
         time.sleep(poll)
 
@@ -281,30 +302,19 @@ def _run_supervisor_assign_test(provider: str):
             f"got {len(terminals)}. The supervisor may not have called assign/handoff tools."
         )
 
-        # Step 6: Validate supervisor output.
-        output = extract_output(supervisor_id)
-        assert len(output.strip()) > 0, "Supervisor output should not be empty"
-
-        output_lower = output.lower()
-        # Should contain both analysis results and report structure
-        analysis_keywords = ["mean", "median", "dataset", "analysis", "3.0"]
-        matched = [kw for kw in analysis_keywords if kw in output_lower]
-        assert matched, (
-            f"Supervisor output should contain analysis content. "
-            f"Expected at least one of {analysis_keywords}, got: {output[:300]}"
-        )
-
-        # Step 7: Verify inbox delivery for the assign flow.
-        # Workers should have called send_message to deliver results to
-        # the supervisor. Check that at least one message was delivered.
-        # Allow up to 30s extra for any pending deliveries.
+        # Step 6: Wait for inbox delivery and supervisor reprocessing.
+        # The assign flow creates a worker that calls send_message() to the
+        # supervisor's inbox.  The inbox service delivers the message when the
+        # supervisor becomes idle, which causes the supervisor to start
+        # processing again (showing "Working...").  We must wait for the
+        # supervisor to finish processing the inbox message before extracting
+        # output, otherwise we get the spinner text instead of the report.
         inbox_verified = False
-        for _ in range(6):  # up to 30s
+        for _ in range(12):  # up to 60s
             delivered = _get_inbox_messages(supervisor_id, status_filter="delivered")
             if delivered:
                 inbox_verified = True
                 break
-            # Also check if there are pending messages (delivery bug)
             pending = _get_inbox_messages(supervisor_id, status_filter="pending")
             if not pending:
                 # No pending and no delivered — workers may have used handoff
@@ -318,6 +328,31 @@ def _run_supervisor_assign_test(provider: str):
         assert not still_pending, (
             f"Inbox messages stuck as PENDING — inbox delivery pipeline broken! "
             f"Pending messages: {[(m.get('sender_id', '?'), m.get('message', '')[:80]) for m in still_pending]}"
+        )
+
+        # Step 7: Wait for supervisor to re-stabilize after processing inbox
+        # messages.  The delivered message may have triggered reprocessing.
+        for _ in range(24):  # up to 120s
+            s = get_terminal_status(supervisor_id)
+            if s in ("completed", "idle"):
+                break
+            time.sleep(5)
+
+        # Step 8: Validate supervisor output.
+        # Use FULL output (entire scrollback) because the analysis keywords
+        # may appear in earlier messages — the supervisor's last message may
+        # be a summary that doesn't repeat the raw stats, or the supervisor
+        # may have received an inbox message that triggered further processing.
+        output = _get_full_output(supervisor_id)
+        assert len(output.strip()) > 0, "Supervisor output should not be empty"
+
+        output_lower = output.lower()
+        # Should contain both analysis results and report structure
+        analysis_keywords = ["mean", "median", "dataset", "analysis", "3.0"]
+        matched = [kw for kw in analysis_keywords if kw in output_lower]
+        assert matched, (
+            f"Supervisor output should contain analysis content. "
+            f"Expected at least one of {analysis_keywords}, got: {output[:500]}"
         )
 
     finally:

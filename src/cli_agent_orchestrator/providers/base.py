@@ -60,6 +60,19 @@ class BaseProvider(ABC):
         """Get current provider status."""
         return self._status
 
+    @property
+    def paste_enter_count(self) -> int:
+        """Number of Enter keys to send after pasting user input.
+
+        After bracketed paste (``paste-buffer -p``), many TUIs (Gemini CLI's
+        Ink, Claude Code) enter multi-line mode. The first Enter adds a
+        newline; the second Enter on the empty line triggers submission.
+
+        Default is 2 (double-Enter). Override to 1 for TUIs where single
+        Enter submits after bracketed paste (e.g., Kimi CLI's prompt_toolkit).
+        """
+        return 2
+
     @abstractmethod
     def initialize(self) -> bool:
         """Initialize the provider (e.g., start CLI tool, send setup commands).
@@ -117,6 +130,16 @@ class BaseProvider(ABC):
     @abstractmethod
     def cleanup(self) -> None:
         """Clean up provider resources."""
+        pass
+
+    def mark_input_received(self) -> None:
+        """Notify the provider that external input was sent to the terminal.
+
+        Called by the terminal service after send_input() delivers a message.
+        Providers can override this to adjust status detection behavior.
+        For example, GeminiCliProvider uses this to distinguish post-init
+        idle (ready for first input) from post-task completed.
+        """
         pass
 
     def _update_status(self, status: TerminalStatus) -> None:

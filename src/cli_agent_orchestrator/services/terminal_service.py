@@ -145,8 +145,12 @@ def create_terminal(
         return terminal
 
     except Exception as e:
-        # Cleanup on failure: kill the session if we created one
+        # Cleanup on failure: clean up provider resources and kill session
         logger.error(f"Failed to create terminal: {e}")
+        try:
+            provider_manager.cleanup_provider(terminal_id)
+        except Exception:
+            pass  # Ignore cleanup errors
         if new_session and session_name:
             try:
                 tmux_client.kill_session(session_name)
@@ -212,18 +216,32 @@ def get_working_directory(terminal_id: str) -> Optional[str]:
 
 
 def send_input(terminal_id: str, message: str) -> bool:
-    """Send input to terminal via bracketed paste.
+    """Send input to terminal via tmux paste buffer.
 
-    Uses tmux paste buffer with bracketed paste mode (-p) to bypass TUI hotkey
-    handling. Without this, characters like '!' in user messages can trigger
-    Gemini CLI's shell mode toggle and similar TUI hotkeys.
+    Uses bracketed paste mode (-p) to bypass TUI hotkey handling. The number
+    of Enter keys sent after pasting is determined by the provider's
+    ``paste_enter_count`` property (e.g., Gemini CLI's Ink TUI needs 2 Enters
+    because bracketed paste triggers multi-line mode).
     """
     try:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        tmux_client.send_keys(metadata["tmux_session"], metadata["tmux_window"], message)
+        # Check how many Enter keys the provider needs after paste
+        provider = provider_manager.get_provider(terminal_id)
+        enter_count = provider.paste_enter_count if provider else 1
+
+        tmux_client.send_keys(
+            metadata["tmux_session"], metadata["tmux_window"], message, enter_count=enter_count
+        )
+
+        # Notify the provider that external input was received.
+        # This allows providers (e.g. GeminiCliProvider) to adjust status
+        # detection — specifically to stop reporting IDLE for the post-init
+        # state and resume normal COMPLETED detection after a real task.
+        if provider:
+            provider.mark_input_received()
 
         update_last_active(terminal_id)
         logger.info(f"Sent input to terminal: {terminal_id}")

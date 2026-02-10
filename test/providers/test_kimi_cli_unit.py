@@ -131,7 +131,10 @@ class TestKimiCliProviderInitialization:
 
         provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="developer")
 
-        with patch("cli_agent_orchestrator.providers.kimi_cli.Path.home", return_value=Path(tempfile.mkdtemp())):
+        with patch(
+            "cli_agent_orchestrator.providers.kimi_cli.Path.home",
+            return_value=Path(tempfile.mkdtemp()),
+        ):
             result = provider.initialize()
         assert result is True
 
@@ -690,9 +693,8 @@ class TestKimiCliProviderBuildCommand:
     def test_build_command_mcp_tool_timeout(self, mock_load, tmp_path):
         """Test that MCP tool timeout is set to 600s in config.toml when MCP servers present.
 
-        Kimi CLI defaults to 60s MCP tool timeout (tool_call_timeout_ms=60000),
-        which is too short for handoff operations. We modify ~/.kimi/config.toml
-        directly instead of using --config flag (which breaks OAuth authentication).
+        Uses class-level flag to ensure config is modified only once per process,
+        avoiding race conditions when multiple workers are created in parallel.
         """
         mock_profile = MagicMock()
         mock_profile.system_prompt = None
@@ -707,6 +709,9 @@ class TestKimiCliProviderBuildCommand:
         config_file = fake_kimi_dir / "config.toml"
         config_file.write_text("[mcp.client]\ntool_call_timeout_ms = 60000\n")
 
+        # Reset class-level flag so test runs the config modification
+        KimiCliProvider._mcp_timeout_configured = False
+
         provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
 
         with patch("cli_agent_orchestrator.providers.kimi_cli.Path.home", return_value=tmp_path):
@@ -716,11 +721,41 @@ class TestKimiCliProviderBuildCommand:
         assert "--config" not in command
         # Config file should be updated to 600000
         assert "tool_call_timeout_ms = 600000" in config_file.read_text()
-        assert provider._original_mcp_timeout == 60000
+        # Class-level flag should be set
+        assert KimiCliProvider._mcp_timeout_configured is True
 
-        # Cleanup should restore original value
+        # Cleanup should NOT restore timeout (shared config, concurrent instances)
+        provider.cleanup()
+        assert "tool_call_timeout_ms = 600000" in config_file.read_text()
+
+    @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
+    def test_build_command_mcp_timeout_only_once(self, mock_load, tmp_path):
+        """Test that config.toml is only modified once even with multiple instances."""
+        mock_profile = MagicMock()
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = {
+            "cao-mcp-server": {"command": "uv", "args": ["run", "cao-mcp-server"]}
+        }
+        mock_load.return_value = mock_profile
+
+        fake_kimi_dir = tmp_path / ".kimi"
+        fake_kimi_dir.mkdir()
+        config_file = fake_kimi_dir / "config.toml"
+        config_file.write_text("[mcp.client]\ntool_call_timeout_ms = 60000\n")
+
+        KimiCliProvider._mcp_timeout_configured = False
+
         with patch("cli_agent_orchestrator.providers.kimi_cli.Path.home", return_value=tmp_path):
-            provider.cleanup()
+            p1 = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
+            p1._build_kimi_command()
+
+            # Manually reset config to 60000 to verify second call doesn't write
+            config_file.write_text("[mcp.client]\ntool_call_timeout_ms = 60000\n")
+
+            p2 = KimiCliProvider("term-2", "session-1", "window-2", agent_profile="dev")
+            p2._build_kimi_command()
+
+        # Second instance should NOT have modified config (flag was already set)
         assert "tool_call_timeout_ms = 60000" in config_file.read_text()
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
@@ -731,11 +766,12 @@ class TestKimiCliProviderBuildCommand:
         mock_profile.mcpServers = None
         mock_load.return_value = mock_profile
 
-        # Create a fake config.toml
         fake_kimi_dir = tmp_path / ".kimi"
         fake_kimi_dir.mkdir()
         config_file = fake_kimi_dir / "config.toml"
         config_file.write_text("[mcp.client]\ntool_call_timeout_ms = 60000\n")
+
+        KimiCliProvider._mcp_timeout_configured = False
 
         provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
 
@@ -744,7 +780,6 @@ class TestKimiCliProviderBuildCommand:
 
         # Config file should remain unchanged
         assert "tool_call_timeout_ms = 60000" in config_file.read_text()
-        # Cleanup temp files
         provider.cleanup()
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
@@ -756,6 +791,8 @@ class TestKimiCliProviderBuildCommand:
             "cao-mcp-server": {"command": "uv", "args": ["run", "cao-mcp-server"]}
         }
         mock_load.return_value = mock_profile
+
+        KimiCliProvider._mcp_timeout_configured = False
 
         provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
 
@@ -780,6 +817,8 @@ class TestKimiCliProviderBuildCommand:
         fake_kimi_dir.mkdir()
         config_file = fake_kimi_dir / "config.toml"
         config_file.write_text("[mcp.client]\ntool_call_timeout_ms = 900000\n")
+
+        KimiCliProvider._mcp_timeout_configured = False
 
         provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
 

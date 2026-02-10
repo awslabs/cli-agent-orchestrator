@@ -211,6 +211,8 @@ class TestGeminiCliProviderInitialization:
         assert result is True
         assert provider._uses_prompt_interactive is True
         assert provider._initialized is True
+        # After init, no external input received yet
+        assert provider._received_input_after_init is False
 
     def test_uses_prompt_interactive_flag_default(self):
         """Test _uses_prompt_interactive defaults to False."""

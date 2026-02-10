@@ -121,6 +121,12 @@ class KimiCliProvider(BaseProvider):
     Kimi uses its built-in default agent.
     """
 
+    # Class-level flag: ensures ~/.kimi/config.toml MCP timeout is set only once,
+    # even when multiple KimiCliProvider instances are created in parallel (e.g.,
+    # 3 data_analyst workers via assign). Without this, concurrent read/write to
+    # the config file causes race conditions and file corruption.
+    _mcp_timeout_configured = False
+
     def __init__(
         self,
         terminal_id: str,
@@ -141,6 +147,11 @@ class KimiCliProvider(BaseProvider):
         # Without this, get_status() returns IDLE instead of COMPLETED after
         # the agent finishes processing, causing handoff to time out.
         self._has_received_input = False
+
+    @property
+    def paste_enter_count(self) -> int:
+        """Kimi CLI's prompt_toolkit submits on single Enter after bracketed paste."""
+        return 1
 
     def _build_kimi_command(self) -> str:
         """Build Kimi CLI command with agent profile and MCP config if provided.
@@ -194,7 +205,8 @@ class KimiCliProvider(BaseProvider):
                     # directly. We cannot use --config flag because it causes Kimi CLI
                     # to bypass its default config file, which breaks OAuth authentication
                     # (shows "model: not set" and /login says "restart without --config").
-                    self._set_mcp_timeout()
+                    # Class-level guard ensures this runs only once per process.
+                    self._ensure_mcp_timeout()
 
                     mcp_config = {}
                     for server_name, server_config in profile.mcpServers.items():
@@ -219,38 +231,45 @@ class KimiCliProvider(BaseProvider):
 
         return shlex.join(command_parts)
 
-    def _set_mcp_timeout(self) -> None:
-        """Set MCP tool call timeout to 600s in ~/.kimi/config.toml.
+    @classmethod
+    def _ensure_mcp_timeout(cls) -> None:
+        """Ensure MCP tool call timeout is set to 600s in ~/.kimi/config.toml.
 
-        Kimi CLI defaults to tool_call_timeout_ms=60000 (60s) for MCP tool calls.
-        The handoff MCP tool creates a worker terminal, waits for completion, and
-        extracts output — routinely exceeding 60s. We modify the config file directly
-        instead of using ``--config`` CLI flag, because ``--config`` causes Kimi CLI
-        to bypass the default config file and breaks OAuth authentication.
+        Called once per process (guarded by class-level flag). Kimi CLI defaults
+        to tool_call_timeout_ms=60000 (60s) for MCP tool calls, which is too short
+        for handoff operations. We modify the config file directly instead of using
+        ``--config`` CLI flag, because ``--config`` causes Kimi CLI to bypass the
+        default config file and breaks OAuth authentication.
 
-        Saves the original value so cleanup() can restore it.
+        The timeout is NOT restored on cleanup because:
+        1. Multiple Kimi instances may share the config file concurrently
+        2. 600s is a strictly better default for anyone using MCP tools
+        3. Restoring while other instances are running causes race conditions
         """
+        if cls._mcp_timeout_configured:
+            return
+
         config_path = Path.home() / ".kimi" / "config.toml"
         if not config_path.exists():
             logger.warning(f"Kimi config not found at {config_path}, skipping MCP timeout override")
+            cls._mcp_timeout_configured = True
             return
 
         try:
             content = config_path.read_text()
-            self._original_mcp_timeout = None
 
             # Match the existing timeout line under [mcp.client] section
             # Format: tool_call_timeout_ms = 60000
             pattern = r"(tool_call_timeout_ms\s*=\s*)(\d+)"
             match = re.search(pattern, content)
             if match:
-                self._original_mcp_timeout = int(match.group(2))
-                if self._original_mcp_timeout < 600000:
+                current_value = int(match.group(2))
+                if current_value < 600000:
                     new_content = re.sub(pattern, r"\g<1>600000", content)
                     config_path.write_text(new_content)
                     logger.info(
                         f"Set MCP tool_call_timeout_ms to 600000 "
-                        f"(was {self._original_mcp_timeout}) in {config_path}"
+                        f"(was {current_value}) in {config_path}"
                     )
             else:
                 logger.warning(
@@ -260,26 +279,7 @@ class KimiCliProvider(BaseProvider):
         except Exception as e:
             logger.warning(f"Failed to set MCP timeout in {config_path}: {e}")
 
-    def _restore_mcp_timeout(self) -> None:
-        """Restore the original MCP tool call timeout in ~/.kimi/config.toml."""
-        if not hasattr(self, "_original_mcp_timeout") or self._original_mcp_timeout is None:
-            return
-
-        config_path = Path.home() / ".kimi" / "config.toml"
-        if not config_path.exists():
-            return
-
-        try:
-            content = config_path.read_text()
-            pattern = r"(tool_call_timeout_ms\s*=\s*)(\d+)"
-            new_content = re.sub(pattern, rf"\g<1>{self._original_mcp_timeout}", content)
-            config_path.write_text(new_content)
-            logger.info(
-                f"Restored MCP tool_call_timeout_ms to {self._original_mcp_timeout} "
-                f"in {config_path}"
-            )
-        except Exception as e:
-            logger.warning(f"Failed to restore MCP timeout in {config_path}: {e}")
+        cls._mcp_timeout_configured = True
 
     def initialize(self) -> bool:
         """Initialize Kimi CLI provider by starting the kimi command.
@@ -307,9 +307,10 @@ class KimiCliProvider(BaseProvider):
 
         # Wait for Kimi CLI to reach IDLE state (prompt visible).
         # Kimi takes a few seconds to load and display the welcome banner.
-        # Longer timeout than shell (60s) to account for first-run setup.
-        if not wait_until_status(self, TerminalStatus.IDLE, timeout=60.0, polling_interval=1.0):
-            raise TimeoutError("Kimi CLI initialization timed out after 60 seconds")
+        # Longer timeout (120s) to account for first-run setup and when
+        # multiple Kimi instances are starting concurrently (e.g. assign flow).
+        if not wait_until_status(self, TerminalStatus.IDLE, timeout=120.0, polling_interval=1.0):
+            raise TimeoutError("Kimi CLI initialization timed out after 120 seconds")
 
         self._initialized = True
         return True
@@ -558,18 +559,15 @@ class KimiCliProvider(BaseProvider):
     def cleanup(self) -> None:
         """Clean up Kimi CLI provider resources.
 
-        Removes any temporary files created for agent profiles,
-        restores the original MCP timeout in ~/.kimi/config.toml,
-        and resets the initialization state.
+        Removes any temporary files created for agent profiles
+        and resets the initialization state. MCP timeout is NOT restored
+        because multiple Kimi instances may share the config file concurrently.
         """
         # Remove temp directory if it was created for agent profile
         if self._temp_dir:
             if os.path.exists(self._temp_dir):
                 shutil.rmtree(self._temp_dir, ignore_errors=True)
             self._temp_dir = None
-
-        # Restore original MCP tool call timeout
-        self._restore_mcp_timeout()
 
         self._initialized = False
         self._has_received_input = False

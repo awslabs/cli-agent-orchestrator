@@ -70,30 +70,72 @@ def require_kimi():
 
 @pytest.fixture()
 def require_gemini():
-    """Skip test if gemini CLI is not available."""
+    """Skip test if gemini CLI is not available.
+
+    Includes a post-test cooldown to avoid Gemini API rate limiting (429).
+    Gemini CLI has known issues with rate limit retry logic (GitHub #6986,
+    #9248) — sequential tests can exhaust the per-minute RPM quota, causing
+    the CLI to hang during initialization or task processing.
+    """
     if not _cli_available("gemini"):
         pytest.skip("gemini CLI not installed")
+    yield
+    # Cool down after each Gemini CLI test to stay within API rate limits.
+    # Gemini's free-tier RPM limit is low; sequential tests exhaust the quota
+    # and cause the CLI to hang in a retry loop during initialization.
+    time.sleep(15)
 
 
-def create_terminal(provider: str, agent_profile: str, session_name: str):
+def create_terminal(
+    provider: str,
+    agent_profile: str,
+    session_name: str,
+    retries: int = 1,
+    retry_delay: float = 30.0,
+):
     """Create a CAO session + terminal via the API.
 
     Returns (terminal_id, actual_session_name).
+
+    If creation fails with a 500 error (typically an init timeout caused by
+    API rate limiting), retries up to ``retries`` times with ``retry_delay``
+    seconds between attempts. The retry uses a fresh session name to avoid
+    conflicts with partially-created resources from the failed attempt.
     """
-    resp = requests.post(
-        f"{API_BASE_URL}/sessions",
-        params={
-            "provider": provider,
-            "agent_profile": agent_profile,
-            "session_name": session_name,
-        },
-    )
-    assert resp.status_code in (
+    last_resp = None
+    for attempt in range(1 + retries):
+        # Use a fresh session name suffix on retries to avoid collisions
+        # with partially-created sessions from failed attempts.
+        if attempt > 0:
+            import uuid
+
+            retry_suffix = uuid.uuid4().hex[:6]
+            attempt_session_name = f"{session_name}-r{retry_suffix}"
+            time.sleep(retry_delay)
+        else:
+            attempt_session_name = session_name
+
+        resp = requests.post(
+            f"{API_BASE_URL}/sessions",
+            params={
+                "provider": provider,
+                "agent_profile": agent_profile,
+                "session_name": attempt_session_name,
+            },
+        )
+        last_resp = resp
+        if resp.status_code in (200, 201):
+            data = resp.json()
+            return data["id"], data["session_name"]
+
+        # Only retry on server errors (500) — likely rate-limit-induced init timeout
+        if resp.status_code != 500 or attempt >= retries:
+            break
+
+    assert last_resp is not None and last_resp.status_code in (
         200,
         201,
-    ), f"Session creation failed: {resp.status_code} {resp.text}"
-    data = resp.json()
-    return data["id"], data["session_name"]
+    ), f"Session creation failed: {last_resp.status_code} {last_resp.text}"
 
 
 def get_terminal_status(terminal_id: str) -> str:

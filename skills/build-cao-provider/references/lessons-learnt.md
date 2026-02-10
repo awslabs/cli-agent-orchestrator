@@ -19,6 +19,7 @@ Critical bugs encountered during Kimi CLI, Codex, Gemini CLI, and Claude Code pr
 13. [Ink TUI Always-Visible Idle Prompt Causes False Status Detection](#13-ink-tui-always-visible-idle-prompt-causes-false-status-detection)
 14. [CLI Subprocess for Config Registration Adds Seconds Per Server](#14-cli-subprocess-for-config-registration-adds-seconds-per-server)
 15. [MCP Tool Call Timeout Must Be Extended for Handoff](#15-mcp-tool-call-timeout-must-be-extended-for-handoff)
+16. [Post-Init Status Must Be IDLE for MCP Handoff Compatibility](#16-post-init-status-must-be-idle-for-mcp-handoff-compatibility)
 
 ---
 
@@ -389,3 +390,40 @@ wait_until_terminal_status(terminal_id, TerminalStatus.IDLE, timeout=120.0)
 - Watch for type parsing quirks — Codex silently rejects integer TOML values for float fields
 - Never use CLI `--config` flags that bypass the default config file — modify the config file directly instead and restore during cleanup
 - The handoff IDLE wait must be generous enough for the slowest provider's initialization (currently Gemini CLI ~90s)
+
+---
+
+## 16. Post-Init Status Must Be IDLE for MCP Handoff Compatibility
+
+**Symptom (Gemini CLI):** Supervisor handoff consistently times out at 300s. Worker terminal is created, provider initializes successfully, but the handoff tool never sends the task message.
+
+**Root cause:** The MCP server (`cao-mcp-server`, installed from GitHub `main` via `uvx`) calls `wait_until_terminal_status(IDLE, timeout=120)` after creating the worker. Providers that use an initial prompt flag (Gemini CLI `-i`) process the system prompt as the first user message and reach COMPLETED — never IDLE. The handoff waits for IDLE, times out, returns an error, and the supervisor retries in a loop until the 300s E2E timeout.
+
+**Critical constraint:** The MCP server runs from the published package on GitHub (`uvx --from git+https://github.com/...@main`), NOT from local development code. Fixing `server.py` locally has no effect on the MCP server subprocess spawned by the CLI tool.
+
+**Fix:** Use `mark_input_received()` pattern in the provider:
+
+```python
+# In __init__:
+self._received_input_after_init = False
+
+# In get_status(), when query + response detected:
+if self._initialized and self._uses_prompt_interactive and not self._received_input_after_init:
+    return TerminalStatus.IDLE  # Report IDLE so MCP handoff proceeds
+
+# Called by terminal_service.send_input() after delivering external input:
+def mark_input_received(self):
+    self._received_input_after_init = True
+```
+
+The `_initialized` guard prevents a chicken-and-egg: during `initialize()`, COMPLETED detection must work normally so the init loop can detect when `-i` processing finishes.
+
+**Why not query counting:** An earlier approach counted `>` query markers in tmux capture and compared against the init count. This broke when the scrollback window (`capture-pane -S -200`) shifted — after many MCP tool calls, the init query scrolled off screen, the count dropped to match `_init_query_count`, and `get_status()` falsely returned IDLE during active processing.
+
+**Also fixed defensively:** Updated `_handoff_impl()` to accept both IDLE and COMPLETED as ready states, and `wait_until_terminal_status()` to accept `Union[TerminalStatus, set]`. These fixes apply when the local MCP server code is eventually deployed.
+
+**Rules:**
+- After initialization with an initial prompt, the provider must report IDLE until external input arrives
+- Use a flag set by the terminal service (not terminal output parsing) to track input — tmux scrollback is unreliable for historical state
+- Add `mark_input_received()` to any provider that uses an initial prompt flag (`-i`, `--prompt-interactive`)
+- Test with the production MCP server (not just local code) — the published version may have different assumptions

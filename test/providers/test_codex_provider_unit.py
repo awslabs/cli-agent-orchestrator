@@ -751,7 +751,13 @@ class TestCodexBulletFormatExtraction:
 class TestCodexProviderMisc:
     def test_get_idle_pattern_for_log(self):
         provider = CodexProvider("test1234", "test-session", "window-0")
-        assert provider.get_idle_pattern_for_log() == "❯"
+        pattern = provider.get_idle_pattern_for_log()
+        # Codex TUI renders ❯ via cursor positioning (capture-pane only).
+        # The pipe-pane log contains "? for shortcuts" from the TUI footer.
+        assert pattern == r"\? for shortcuts"
+        import re
+
+        assert re.search(pattern, "? for shortcuts")
 
     def test_exit_cli(self):
         provider = CodexProvider("test1234", "test-session", "window-0")

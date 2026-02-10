@@ -71,21 +71,21 @@ src/cli_agent_orchestrator/
 │   └── main.py            # FastAPI endpoints (port 9889)
 ├── services/              # Service Layer: Business logic
 │   ├── session_service.py # List, get, delete sessions
-│   ├── terminal_service.py# Create, get, send input, get output, delete terminals
+│   ├── terminal_service.py# Create, get, send input (+ mark_input_received), get output, delete terminals
 │   ├── inbox_service.py   # Terminal-to-terminal messaging with watchdog
 │   └── flow_service.py    # Scheduled flow execution
 ├── clients/               # Client Layer: External systems
 │   ├── tmux.py            # Tmux operations (sets CAO_TERMINAL_ID, send_keys, send_keys_via_paste for bracketed paste)
 │   └── database.py        # SQLite with terminals & inbox_messages tables
 ├── providers/             # Provider Layer: CLI tool integration
-│   ├── base.py            # Abstract provider interface
+│   ├── base.py            # Abstract provider interface (mark_input_received hook)
 │   ├── manager.py         # Maps terminal_id → provider
 │   ├── kiro_cli.py        # Kiro CLI provider (kiro_cli) - default
 │   ├── q_cli.py           # Amazon Q CLI provider (q_cli)
 │   ├── claude_code.py     # Claude Code provider (claude_code, ❯ prompt, trust prompt handling)
 │   ├── codex.py           # Codex/ChatGPT CLI provider (codex, developer_instructions, › prompt + • bullet detection, trust prompt handling)
 │   ├── kimi_cli.py        # Kimi CLI provider (kimi_cli, ✨/💫 prompt, • bullet response, thinking filter)
-│   └── gemini_cli.py      # Gemini CLI provider (gemini_cli, Ink TUI, ✦ response prefix, > query prefix)
+│   └── gemini_cli.py      # Gemini CLI provider (gemini_cli, Ink TUI, ✦ response prefix, > query prefix, mark_input_received for post-init IDLE)
 ├── models/                # Data models
 │   ├── terminal.py        # Terminal, TerminalStatus
 │   ├── session.py         # Session model

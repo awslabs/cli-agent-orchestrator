@@ -48,7 +48,7 @@ uv run pytest test/providers/test_kiro_cli_unit.py -v -k "test_initialization"
 Unit tests use mocked dependencies and don't require CLI tools or servers:
 
 ```bash
-# Run all unit tests (613 tests, excludes E2E and Q CLI integration)
+# Run all unit tests (626 tests, excludes E2E and Q CLI integration)
 uv run pytest test/ -v --ignore=test/e2e --ignore=test/providers/test_q_cli_integration.py
 
 # Run provider-specific tests

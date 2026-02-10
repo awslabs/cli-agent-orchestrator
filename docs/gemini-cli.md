@@ -118,7 +118,7 @@ When the provider's `cleanup()` method is called, it removes the registered entr
 
 ### Provider Lifecycle
 
-1. **Initialize**: Wait for shell → warm-up echo (verify shell ready) → send command → wait for IDLE or COMPLETED (up to 120s; when `-i` is used, waits for COMPLETED to ensure the system prompt has been fully processed before accepting input)
+1. **Initialize**: Wait for shell → warm-up echo (verify shell ready) → 2s settle delay → send command → wait for IDLE or COMPLETED (up to 240s; when `-i` is used, waits for COMPLETED to ensure the system prompt has been fully processed before accepting input)
 2. **Status Detection**: Check bottom 50 lines for idle prompt + processing spinner (`IDLE_PROMPT_TAIL_LINES = 50`)
 3. **Message Extraction**: Line-based approach filtering TUI chrome
 4. **Exit**: Send `C-d` (Ctrl+D)
@@ -148,6 +148,18 @@ Gemini's Ink TUI keeps the idle input box (`* Type your message`) visible at the
 ```
 ⠴ Refining Delegation Parameters (esc to cancel, 50s)
 ```
+
+### Post-Init Status Override (`mark_input_received`)
+
+When the `-i` flag is used, Gemini CLI processes the system prompt as the first query and produces a response, putting the terminal in COMPLETED state. However, the MCP handoff tool (running from the production `cao-mcp-server`) waits for IDLE before sending its task message. Without intervention, the handoff times out.
+
+The provider solves this with a `mark_input_received()` pattern:
+
+1. After `initialize()` completes with `-i`, `get_status()` returns **IDLE** (not COMPLETED) because the only query/response is from the system prompt
+2. When `terminal_service.send_input()` delivers external input, it calls `provider.mark_input_received()`, setting `_received_input_after_init = True`
+3. After this flag is set, `get_status()` resumes normal COMPLETED detection
+
+An `_initialized` guard prevents a chicken-and-egg problem: during initialization itself, COMPLETED detection works normally so `initialize()` can detect when the `-i` processing finishes.
 
 ### IDLE_PROMPT_TAIL_LINES
 
@@ -188,7 +200,7 @@ If Gemini CLI takes too long to start, check:
 - Authentication status (re-run `gemini` to authenticate)
 - MCP server registration: verify `~/.gemini/settings.json` contains the expected `mcpServers` entries
 - Shell environment: the provider sends a warm-up `echo` command and waits for the marker before launching `gemini`, ensuring PATH/nvm/homebrew are loaded
-- The provider waits up to 120 seconds for initialization (longer when `-i` flag is used)
+- The provider waits up to 240 seconds for initialization (accounts for MCP server download via `uvx` and `-i` prompt processing)
 
 ### Status detection not working on tall terminals
 

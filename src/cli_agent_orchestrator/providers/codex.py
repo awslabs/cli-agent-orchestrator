@@ -22,7 +22,13 @@ IDLE_PROMPT_PATTERN = r"(?:❯|›|codex>)"
 # so we can't anchor to \Z. Instead, check the last few lines where the prompt
 # and status bar appear.
 IDLE_PROMPT_TAIL_LINES = 5
-IDLE_PROMPT_PATTERN_LOG = r"❯"
+# The idle prompt character ❯ (U+276F) is rendered on-screen by capture-pane
+# but is NOT written to the raw output stream captured by pipe-pane.  Instead,
+# the TUI footer text "? for shortcuts" is reliably present whenever the TUI
+# is active.  This is intentionally permissive — _has_idle_pattern() is a
+# lightweight pre-check; the real status decision is made by get_status()
+# which uses capture-pane (rendered screen).
+IDLE_PROMPT_PATTERN_LOG = r"\? for shortcuts"
 # Match assistant response start: "assistant:/codex:/agent:" (label style from synthetic
 # test fixtures) or "•" bullet point (real Codex interactive output format).
 ASSISTANT_PREFIX_PATTERN = r"^(?:(?:assistant|codex|agent)\s*:|\s*•)"

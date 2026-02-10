@@ -198,3 +198,37 @@ class TestWaitUntilTerminalStatus:
         )
 
         assert result is False
+
+    @patch("cli_agent_orchestrator.utils.terminal.httpx.get")
+    def test_wait_until_terminal_status_multi_status_set(self, mock_get):
+        """Test waiting for multiple target statuses (set)."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"status": TerminalStatus.COMPLETED.value}
+        mock_get.return_value = mock_response
+
+        result = wait_until_terminal_status(
+            "test-terminal",
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+            timeout=1.0,
+            polling_interval=0.1,
+        )
+
+        assert result is True
+
+    @patch("cli_agent_orchestrator.utils.terminal.httpx.get")
+    def test_wait_until_terminal_status_multi_status_no_match(self, mock_get):
+        """Test multi-status wait times out when status doesn't match any target."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"status": TerminalStatus.PROCESSING.value}
+        mock_get.return_value = mock_response
+
+        result = wait_until_terminal_status(
+            "test-terminal",
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+            timeout=0.5,
+            polling_interval=0.1,
+        )
+
+        assert result is False

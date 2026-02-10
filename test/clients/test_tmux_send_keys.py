@@ -120,6 +120,22 @@ class TestSendKeys:
         # Second call (index 4, after 4 calls from first send_keys) uses cao_cccc2222
         assert calls[4][0][0][3] == "cao_cccc2222"
 
+    def test_double_enter(self, client, mock_subprocess, mock_uuid):
+        """When enter_count=2, two Enter keys are sent after pasting."""
+        client.send_keys("sess", "win", "hello", enter_count=2)
+
+        assert mock_subprocess.run.call_count == 5  # load + paste + 2 Enter + delete
+        calls = mock_subprocess.run.call_args_list
+        # Both Enters
+        assert calls[2] == call(
+            ["tmux", "send-keys", "-t", "sess:win", "Enter"],
+            check=True,
+        )
+        assert calls[3] == call(
+            ["tmux", "send-keys", "-t", "sess:win", "Enter"],
+            check=True,
+        )
+
     def test_large_message(self, client, mock_subprocess, mock_uuid):
         """Large messages go through in a single load-buffer call (no chunking)."""
         msg = "X" * 50000

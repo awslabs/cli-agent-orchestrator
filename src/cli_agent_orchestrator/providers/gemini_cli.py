@@ -157,6 +157,15 @@ class GeminiCliProvider(BaseProvider):
         # a response before accepting new input. Accepting IDLE too early
         # (before -i is processed) causes sent messages to be lost.
         self._uses_prompt_interactive = False
+        # Flag indicating whether external input has been sent to this
+        # terminal after initialization. Used by get_status() to return
+        # IDLE (instead of COMPLETED) when the only response is from the
+        # -i initialization prompt. This is critical for MCP handoff: the
+        # handoff tool waits for IDLE before sending the task message.
+        # Without this, Gemini CLI with -i reports COMPLETED right after
+        # init, causing the handoff to time out.
+        # Set to True by mark_input_received() (called from terminal_service).
+        self._received_input_after_init = False
         # Track MCP servers that were registered in ~/.gemini/settings.json
         # so they can be removed during cleanup.
         self._mcp_server_names: list[str] = []
@@ -353,6 +362,13 @@ class GeminiCliProvider(BaseProvider):
         else:
             logger.warning("Shell warm-up marker not detected within timeout, proceeding anyway")
 
+        # Allow the shell to fully render the post-echo prompt before sending
+        # the next paste. Without this delay, zsh may still be processing the
+        # previous command's output when the bracketed paste arrives, causing
+        # the gemini command to be silently dropped. 2 seconds is sufficient
+        # for prompt rendering + any .zshrc hooks.
+        time.sleep(2)
+
         # Build properly escaped command string
         command = self._build_gemini_command()
 
@@ -374,7 +390,7 @@ class GeminiCliProvider(BaseProvider):
         #
         # Without -i: accept IDLE (just the idle prompt, no prior interaction).
         init_start = time.time()
-        init_timeout = 120.0  # longer timeout for -i prompt processing
+        init_timeout = 240.0  # MCP server download (uvx from git) + -i prompt processing
         if self._uses_prompt_interactive:
             target_states = (TerminalStatus.COMPLETED,)
         else:
@@ -386,6 +402,15 @@ class GeminiCliProvider(BaseProvider):
                 break
             time.sleep(1.0)
         else:
+            # Capture diagnostic info for debugging initialization failures.
+            diag_output = tmux_client.get_history(self.session_name, self.window_name)
+            diag_last_50 = "\n".join((diag_output or "").splitlines()[-50:])
+            logger.error(
+                f"Gemini CLI init timeout diagnostic — terminal {self.terminal_id}, "
+                f"uses_prompt_interactive={self._uses_prompt_interactive}, "
+                f"target_states={target_states}, "
+                f"last 50 lines:\n{diag_last_50}"
+            )
             raise TimeoutError(
                 f"Gemini CLI initialization timed out after {init_timeout}s. "
                 f"Last status: {self.get_status()}"
@@ -393,6 +418,15 @@ class GeminiCliProvider(BaseProvider):
 
         self._initialized = True
         return True
+
+    def mark_input_received(self) -> None:
+        """Notify that external input was sent to this terminal.
+
+        After this is called, get_status() resumes normal COMPLETED detection.
+        Before this, get_status() returns IDLE for the post-init -i state so
+        that the MCP handoff tool can proceed.
+        """
+        self._received_input_after_init = True
 
     def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
         """Get Gemini CLI status by analyzing terminal output.
@@ -445,6 +479,22 @@ class GeminiCliProvider(BaseProvider):
             has_query = bool(re.search(QUERY_BOX_PREFIX_PATTERN, clean_output, re.MULTILINE))
 
             if has_query and has_response:
+                # After initialization with -i, the terminal shows a query
+                # and response from the system prompt processing. The MCP
+                # handoff tool waits for IDLE before sending its task. If we
+                # return COMPLETED here, the handoff times out. Return IDLE
+                # until external input has been received (mark_input_received).
+                #
+                # The _initialized guard ensures this override only applies
+                # AFTER initialize() completes. During init, we must return
+                # COMPLETED so initialize() can detect when -i processing
+                # finishes (otherwise init would wait for COMPLETED forever).
+                if (
+                    self._initialized
+                    and self._uses_prompt_interactive
+                    and not self._received_input_after_init
+                ):
+                    return TerminalStatus.IDLE
                 return TerminalStatus.COMPLETED
 
             return TerminalStatus.IDLE
