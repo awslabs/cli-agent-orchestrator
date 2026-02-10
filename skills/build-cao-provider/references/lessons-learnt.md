@@ -41,7 +41,7 @@ if "CAO_TERMINAL_ID" not in env:
 **Rules:**
 - Preserve existing env vars (merge, don't overwrite)
 - Never override an existing `CAO_TERMINAL_ID` value
-- This hit BOTH Codex and Kimi CLI — it's a universal requirement for any provider with MCP support
+- This hit Codex, Kimi CLI, Gemini CLI, and Claude Code — it's a universal requirement for any provider with external MCP config
 
 ---
 
@@ -189,25 +189,26 @@ else:
     terminal_service.send_input(terminal_id, exit_command)
 ```
 
-### TUI hotkeys intercept literal send_keys — use bracketed paste
+### TUI hotkeys intercept character-by-character input — use bracketed paste
 
 **Symptom:** Messages containing `!` sent to Gemini CLI toggle shell mode. The `!` character is a Gemini hotkey. After `!`, subsequent text is entered as a shell command. Status stays PROCESSING forever.
 
-**Root cause:** `tmux send_keys(literal=True)` sends text character-by-character. TUI apps process each character through their input handler, checking for hotkeys before inserting text.
+**Root cause:** Character-by-character `tmux send-keys` sends text one keystroke at a time. TUI apps process each character through their input handler, checking for hotkeys before inserting text.
 
-**Fix:** Use `tmux set-buffer` + `paste-buffer -p` (bracketed paste mode) for user messages. Bracketed paste wraps text in escape sequences, telling the TUI "this is pasted text" so it bypasses per-character hotkey handling.
+**Fix:** Use `tmux load-buffer` + `paste-buffer -p` (bracketed paste mode) for all input. Bracketed paste wraps text in escape sequences, telling the TUI "this is pasted text" so it bypasses per-character hotkey handling. The current `tmux_client.send_keys()` method uses this approach:
 
 ```python
-def send_keys_via_paste(self, session_name, window_name, text):
-    self.server.cmd("set-buffer", "-b", "cao_paste", text)
-    pane.cmd("paste-buffer", "-p", "-b", "cao_paste")
-    time.sleep(0.3)
-    pane.send_keys("C-m", enter=False)
+def send_keys(self, session_name, window_name, keys, enter_count=1):
+    buf_name = f"cao_{uuid.uuid4().hex[:8]}"
+    subprocess.run(["tmux", "load-buffer", "-b", buf_name, "-"], input=keys.encode())
+    subprocess.run(["tmux", "paste-buffer", "-p", "-b", buf_name, "-t", target])
+    for _ in range(enter_count):
+        subprocess.run(["tmux", "send-keys", "-t", target, "C-m"])
 ```
 
 **Rules:**
-- `send_keys()` (literal mode) — only for initialization commands sent to a shell prompt
-- `send_keys_via_paste()` (bracketed paste) — for all user messages sent to a running CLI TUI
+- `tmux_client.send_keys()` (bracketed paste via load-buffer + paste-buffer -p) — used for all input: initialization commands, user messages, and exit commands
+- `enter_count` parameter controls how many Enter keys follow the paste (Gemini CLI's Ink TUI needs 2 due to multi-line mode)
 - Text exit commands (`/exit`, `quit`) → `send_input()`; key sequences (`C-d`, `C-c`) → `send_special_key()`
 
 ---

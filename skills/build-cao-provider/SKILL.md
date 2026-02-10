@@ -1,6 +1,6 @@
 ---
 name: build-cao-provider
-description: Use when building a new CLI agent provider for CAO (e.g., Gemini CLI). Guides the full lifecycle — capturing real terminal output, implementing the provider, unit tests (90%+ coverage), E2E tests across all providers, security scans, and updating 10+ documentation files. Encodes lessons learned from building Kimi CLI, Codex, and Claude Code providers.
+description: Use when building a new CLI agent provider for CAO (e.g., Gemini CLI). Guides the full lifecycle — capturing real terminal output, implementing the provider, unit tests (90%+ coverage), E2E tests across all providers, security scans, and updating 10+ documentation files. Encodes lessons learned from building Kimi CLI, Gemini CLI, Codex, and Claude Code providers.
 allowed-tools: Bash, Read, Write, Edit, Grep, Glob, Task
 ---
 
@@ -9,7 +9,7 @@ allowed-tools: Bash, Read, Write, Edit, Grep, Glob, Task
 The provider name is `$ARGUMENTS`. If no argument provided, ask the user.
 
 **Load references as needed** — do not read them all upfront:
-- [Lessons Learned](./references/lessons-learnt.md) — 15 critical bugs and their fixes (load during Phase 2)
+- [Lessons Learned](./references/lessons-learnt.md) — 16 critical bugs and their fixes (load during Phase 2)
 - [Implementation Checklist](./references/implementation-checklist.md) — File-by-file creation guide (load during Phase 2)
 - [Verification Checklist](./references/verification-checklist.md) — Testing, security, and documentation checks (load during Phase 6-7)
 
@@ -49,7 +49,7 @@ uv run pytest test/ -v --ignore=test/e2e --ignore=test/providers/test_q_cli_inte
 
 ## Phase 5: Ralph Autonomous Verification (Optional but Highly Recommended)
 
-> **Ralph** ([github.com/frankbria/ralph-claude-code](https://github.com/frankbria/ralph-claude-code)) is an autonomous AI development loop that runs Claude Code iteratively with intelligent exit detection. It catches bugs that manual review misses — in the Gemini CLI provider work, Ralph found 3 real bugs in its first loop alone (see lessons #9).
+> **Ralph** ([github.com/frankbria/ralph-claude-code](https://github.com/frankbria/ralph-claude-code)) is an autonomous AI development loop that runs Claude Code iteratively with intelligent exit detection. It catches bugs that manual review misses — in the Gemini CLI provider work, Ralph found 3 real bugs in its first loop alone (see lessons #8).
 
 **Important:** Ralph must be run from a **real terminal**, NOT from within Claude Code.
 
@@ -130,8 +130,8 @@ Do NOT commit until every item in [verification-checklist.md](./references/verif
 | claude_code | `>` or `❯` | `───` separator | `--mcp-config` JSON |
 | codex | `›` (U+203A) | `•` bullet | `-c mcp_servers.*` TOML |
 | gemini_cli | `*   Type your message` | `✦` (U+2726) | `~/.gemini/settings.json` direct write, `-i` for system prompt |
-| kiro_cli | `%` + optional `λ` | Green arrow `❯` | Built-in |
-| q_cli | `%` + optional `λ` | Green arrow `❯` | N/A |
+| kiro_cli | `[agent] >` + optional `λ`, `%` | `>` at line start (green-colored) | Built-in |
+| q_cli | `[agent] >` + optional `λ`, `%` | `>` at line start (green-colored) | N/A |
 
 ```
 src/cli_agent_orchestrator/

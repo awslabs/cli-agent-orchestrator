@@ -9,7 +9,7 @@ These require a running cao-server. Start it, run E2E, stop it. If any E2E test 
 - [ ] Run E2E assign for new provider: `uv run pytest -m e2e test/e2e/test_assign.py -v -k <Provider> --tb=long`
 - [ ] Run E2E send_message for new provider: `uv run pytest -m e2e test/e2e/test_send_message.py -v -k <Provider> --tb=long`
 - [ ] Stop cao-server: `kill $(pgrep -f cao-server)`
-- [ ] All 5 E2E tests pass for <provider> (2 handoff + 2 assign + 1 send_message)
+- [ ] All 8 E2E tests pass for <provider> (2 handoff + 3 assign + 1 send_message + 2 supervisor)
 
 ## High Priority
 - [ ] Verify all documentation consistency (IDLE_PROMPT_TAIL_LINES value matches code in docs/<provider-kebab>.md, test counts match actual pytest output, no stale values)

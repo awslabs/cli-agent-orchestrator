@@ -138,7 +138,7 @@ Organize into test classes:
 - Add `require_<provider>` fixture (skip if CLI not installed)
 
 **Files:** `test/e2e/test_handoff.py`, `test_assign.py`, `test_send_message.py`, `test_supervisor_orchestration.py`
-- Add test classes: `Test<Provider>Handoff` (2 tests), `Test<Provider>Assign` (2 tests), `Test<Provider>SendMessage` (1 test), `Test<Provider>SupervisorOrchestration` (2 tests: handoff delegation + assign+handoff delegation)
+- Add test classes: `Test<Provider>Handoff` (2 tests), `Test<Provider>Assign` (3 tests), `Test<Provider>SendMessage` (1 test), `Test<Provider>SupervisorOrchestration` (2 tests: handoff delegation + assign+handoff delegation)
 - Supervisor orchestration tests verify the full flow: supervisor calls MCP tools → workers spawn → results flow back (see lessons #15)
 
 ---

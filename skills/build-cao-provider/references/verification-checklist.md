@@ -28,7 +28,7 @@ Complete checklist for testing, code quality, security, and documentation before
 
 ### E2E Tests — All Providers (No Regressions)
 - [ ] `uv run pytest -m e2e test/e2e/ -v`
-- [ ] Verify handoff, assign, send_message pass for: kimi_cli, claude_code, codex, kiro_cli, AND new provider
+- [ ] Verify handoff, assign, send_message pass for: kimi_cli, claude_code, codex, kiro_cli, gemini_cli, AND new provider
 
 ---
 
