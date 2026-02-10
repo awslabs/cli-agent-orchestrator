@@ -179,6 +179,8 @@ cao launch --agents analysis_supervisor
 # Or specify a different provider
 cao launch --agents analysis_supervisor --provider claude_code
 cao launch --agents analysis_supervisor --provider codex
+cao launch --agents analysis_supervisor --provider kimi_cli
+cao launch --agents analysis_supervisor --provider gemini_cli
 ```
 
 ## Usage
@@ -299,6 +301,14 @@ sequenceDiagram
 4. **Inbox queuing**: Messages wait if receiver is busy, delivered when IDLE
 5. **Efficient workflow**: Supervisor uses wait time productively (getting report template)
 
+## Important: Message Delivery Model
+
+Messages from workers are delivered to the supervisor's terminal **automatically when the supervisor becomes idle**. This means:
+
+- The supervisor must **finish its turn** after dispatching assign tasks and handoff — do not run shell commands to "wait"
+- Running sleep/echo in a loop keeps the supervisor busy and **blocks message delivery**
+- See `analysis_supervisor.md` "How Message Delivery Works" section for the full guidance
+
 ## Timing Example
 
 ```
@@ -317,7 +327,7 @@ T=33s:  Present final report
 
 ## E2E Testing
 
-The `data_analyst` and `report_generator` profiles from this directory are used in the E2E test suite to validate assign and handoff flows across all providers (codex, claude_code, kiro_cli).
+The `data_analyst` and `report_generator` profiles from this directory are used in the E2E test suite to validate assign and handoff flows across all providers (codex, claude_code, kiro_cli, kimi_cli, gemini_cli).
 
 ```bash
 # Install profiles for E2E testing
