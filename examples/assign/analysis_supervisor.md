@@ -22,6 +22,14 @@ From cao-mcp-server, you have:
 - **handoff**(agent_profile, message) - spawn agent, wait for completion
 - **send_message**(receiver_id, message) - send to terminal inbox
 
+## How Message Delivery Works
+
+After you call assign(), workers will send results back via send_message(). Messages are delivered to your terminal **automatically when your turn ends and you become idle**. This means:
+
+- **DO NOT** run shell commands (sleep, echo, etc.) to wait for results — this keeps you busy and **blocks message delivery**.
+- **DO** finish your turn by stating what you dispatched and what you expect. Messages will arrive as your next input automatically.
+- If you have multiple steps (assign + handoff), do all dispatching first, then finish your turn.
+
 ## Your Workflow
 
 1. Get your terminal ID: `echo $CAO_TERMINAL_ID`
@@ -34,9 +42,9 @@ From cao-mcp-server, you have:
    - agent_profile: "report_generator"
    - message: "Create report template with sections: [requirements]"
 
-4. Wait for data analyst results in your inbox
+4. **Finish your turn** — state what you dispatched and that you're waiting for results. Do not run any commands. Worker results will be delivered to your terminal automatically.
 
-5. Combine template + analysis results and present to user
+5. When results arrive (as new messages), combine template + analysis results and present to user.
 
 ## Example
 
@@ -49,8 +57,9 @@ You do:
 3. assign(agent_profile="data_analyst", message="Analyze [dataset_2]. Send to {my_id}.")
 4. assign(agent_profile="data_analyst", message="Analyze [dataset_3]. Send to {my_id}.")
 5. handoff(agent_profile="report_generator", message="Create template")
-6. Wait for 3 results in inbox
-7. Combine and present
+6. Finish turn — say "Dispatched 3 analysts and got report template. Waiting for analyst results."
+7. (Results arrive automatically as new messages)
+8. Combine and present
 ```
 
 Use the assign and handoff tools from cao-mcp-server.

@@ -60,7 +60,7 @@ def initialize(self) -> bool:
         raise TimeoutError("Shell initialization timed out")
     command = self._build_command()
     tmux_client.send_keys(self.session_name, self.window_name, command)
-    if not wait_until_status(self, TerminalStatus.IDLE, timeout=60.0, polling_interval=1.0):
+    if not wait_until_status(self, TerminalStatus.IDLE, timeout=120.0, polling_interval=1.0):
         raise TimeoutError("CLI initialization timed out")
     self._initialized = True
     return True
@@ -139,7 +139,8 @@ Organize into test classes:
 
 **Files:** `test/e2e/test_handoff.py`, `test_assign.py`, `test_send_message.py`, `test_supervisor_orchestration.py`
 - Add test classes: `Test<Provider>Handoff` (2 tests), `Test<Provider>Assign` (3 tests), `Test<Provider>SendMessage` (1 test), `Test<Provider>SupervisorOrchestration` (2 tests: handoff delegation + assign+handoff delegation)
-- Supervisor orchestration tests verify the full flow: supervisor calls MCP tools → workers spawn → results flow back (see lessons #15)
+- Supervisor orchestration tests verify the full flow: supervisor calls MCP tools → workers spawn → results flow back (see lessons #11, #12)
+- Verify supervisor does not busy-wait after assign — if the model runs shell commands (sleep/echo) to "wait" for results, update the supervisor agent profile with message delivery guidance (see lessons #17)
 
 ---
 

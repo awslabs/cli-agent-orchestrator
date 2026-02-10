@@ -25,6 +25,7 @@ Complete checklist for testing, code quality, security, and documentation before
 - [ ] Supervisor calls handoff MCP tool → worker terminal created in same session
 - [ ] Supervisor calls assign MCP tool → multiple worker terminals created
 - [ ] Supervisor output contains delegated results (not just "I am the CLI agent")
+- [ ] Supervisor does NOT busy-wait after assign (no shell sleep/echo loops) — if it does, update the agent profile with message delivery guidance (see lessons #17)
 
 ### E2E Tests — All Providers (No Regressions)
 - [ ] `uv run pytest -m e2e test/e2e/ -v`
@@ -100,7 +101,7 @@ A new provider requires updates to **all** of these files. Check each one carefu
 
 ## Ralph Autonomous Verification (Optional but Highly Recommended)
 
-Run Ralph after Phase 4 (Code Quality) and before final documentation review. Ralph catches bugs that pass all automated tests but erode codebase trust — see [lessons #9](./lessons-learnt.md#9-ralph-autonomous-loop-catches-bugs-manual-review-misses).
+Run Ralph after Phase 4 (Code Quality) and before final documentation review. Ralph catches bugs that pass all automated tests but erode codebase trust — see [lessons #8](./lessons-learnt.md#8-ralph-autonomous-loop-catches-bugs-manual-review-misses).
 
 ### Setup
 - [ ] `.ralph/` directory exists (run `ralph-enable-ci --project-type python` if not)

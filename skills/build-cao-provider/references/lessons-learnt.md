@@ -1,6 +1,6 @@
 # Lessons Learnt from Building CAO Providers
 
-Critical bugs encountered during Kimi CLI, Codex, Gemini CLI, and Claude Code provider development. Each lesson includes root cause, fix, and prevention strategy.
+Critical bugs encountered during Kimi CLI, Codex, Gemini CLI, Kiro CLI, and Claude Code provider development. Each lesson includes root cause, fix, and prevention strategy.
 
 ## Table of Contents
 
@@ -20,6 +20,7 @@ Critical bugs encountered during Kimi CLI, Codex, Gemini CLI, and Claude Code pr
 14. [CLI Subprocess for Config Registration Adds Seconds Per Server](#14-cli-subprocess-for-config-registration-adds-seconds-per-server)
 15. [MCP Tool Call Timeout Must Be Extended for Handoff](#15-mcp-tool-call-timeout-must-be-extended-for-handoff)
 16. [Post-Init Status Must Be IDLE for MCP Handoff Compatibility](#16-post-init-status-must-be-idle-for-mcp-handoff-compatibility)
+17. [Proactive Models Block Inbox Delivery by Busy-Waiting After Assign](#17-proactive-models-block-inbox-delivery-by-busy-waiting-after-assign)
 
 ---
 
@@ -178,7 +179,7 @@ Two related but distinct issues with how CAO sends input to CLI tools via tmux.
 
 ### Key sequences must use non-literal send_keys
 
-**Symptom:** Provider `exit_cli()` returns `C-d` (Ctrl+D), but the exit endpoint sends it via `send_input()` which uses `literal=True` — so the shell receives the literal text "C-d" instead of the Ctrl+D key press.
+**Symptom:** Provider `exit_cli()` returns `C-d` (Ctrl+D), but the exit endpoint sends it via `send_input()` which uses bracketed paste — so the terminal receives the literal text "C-d" pasted into the input buffer instead of the Ctrl+D key press.
 
 **Fix:** Add `send_special_key()` method that sends without literal mode, and route exit commands through it when they match the `C-`/`M-` prefix pattern:
 
@@ -265,7 +266,7 @@ All three levels are required. Each catches a different class of bugs that the o
 
 ## 13. Ink TUI Always-Visible Idle Prompt Causes False Status Detection
 
-Gemini CLI uses React Ink for its TUI. Unlike prompt_toolkit-based TUIs (Kimi CLI, Codex) where the idle prompt disappears during processing, Ink renders the idle input box (`* Type your message`) at the bottom **at all times**. This causes three distinct failures:
+Gemini CLI uses React Ink for its TUI. Unlike other TUIs (Kimi CLI uses prompt_toolkit, Codex uses a Rust-native TUI) where the idle prompt disappears during processing, Ink renders the idle input box (`* Type your message`) at the bottom **at all times**. This causes three distinct failures:
 
 ### 13a. Spinner visible but idle prompt also visible → false COMPLETED
 
@@ -365,11 +366,11 @@ The `handoff` MCP tool creates a worker terminal, initializes the provider (~5-3
 | Provider | Config mechanism | Override |
 |----------|-----------------|----------|
 | Codex | Per-server TOML: `-c mcp_servers.<name>.tool_timeout_sec=600.0` | Must be TOML float (600.0), not int — Codex deserializes via `Option<f64>` and silently rejects integers |
-| Kimi CLI | Direct config file write: `~/.kimi/config.toml` | Modify `tool_call_timeout_ms` in `[mcp.client]` section; restore on cleanup |
+| Kimi CLI | Direct config file write: `~/.kimi/config.toml` | Modify `tool_call_timeout_ms` in `[mcp.client]` section; NOT restored on cleanup (concurrent instances share the file, 600s is a better default) |
 | Claude Code | No known timeout issue | N/A |
 | Gemini CLI | No known timeout issue | N/A |
 
-**Important:** Do NOT use Kimi CLI's `--config` flag for this — it causes Kimi to bypass its default config file (`~/.kimi/config.toml`), which breaks OAuth authentication (shows "model: not set" and `/login` refuses to work with "Login requires the default config file; restart without --config/--config-file"). Instead, modify the config file directly and restore the original value during cleanup, following the same pattern as Gemini CLI's `~/.gemini/settings.json` approach.
+**Important:** Do NOT use Kimi CLI's `--config` flag for this — it causes Kimi to bypass its default config file (`~/.kimi/config.toml`), which breaks OAuth authentication (shows "model: not set" and `/login` refuses to work with "Login requires the default config file; restart without --config/--config-file"). Instead, modify the config file directly. Unlike Gemini CLI's `~/.gemini/settings.json` (where CAO-managed entries are removed during cleanup), the Kimi timeout is NOT restored because multiple Kimi instances may share the config concurrently and 600s is a strictly better default for any MCP user.
 
 ### 15b. Handoff IDLE Wait Too Short for Slow-Initializing Providers
 
@@ -428,3 +429,43 @@ The `_initialized` guard prevents a chicken-and-egg: during `initialize()`, COMP
 - Use a flag set by the terminal service (not terminal output parsing) to track input — tmux scrollback is unreliable for historical state
 - Add `mark_input_received()` to any provider that uses an initial prompt flag (`-i`, `--prompt-interactive`)
 - Test with the production MCP server (not just local code) — the published version may have different assumptions
+
+---
+
+## 17. Proactive Models Block Inbox Delivery by Busy-Waiting After Assign
+
+**Symptom (Kimi CLI):** Supervisor calls `assign()` x3 to dispatch parallel workers. Workers complete and call `send_message()`. Messages are stored as PENDING in SQLite but never delivered to the supervisor. When the user interrupts the supervisor (Ctrl-C), all pending messages are delivered at once.
+
+**Root cause:** CAO's push-based inbox delivery requires the receiver terminal to be IDLE or COMPLETED. The watchdog (`PollingObserver`, 5s interval) checks terminal status before delivering. After dispatching workers, Kimi CLI's model "waits" for results by continuously running shell commands (`sleep 5`, `sleep 10`, `sleep 30`...). This keeps the terminal in PROCESSING, so the watchdog never delivers.
+
+```
+Kimi:     PROCESSING → COMPLETED(50ms) → PROCESSING → COMPLETED(50ms) → ...
+Watchdog:           ↑ poll (5s gap, miss)           ↑ poll (5s gap, miss)
+```
+
+The brief COMPLETED windows between shell commands (~50-100ms) are too short for the 5s watchdog polling cycle to reliably catch.
+
+**Why only Kimi CLI:** Other models (Claude Code, Codex) acknowledge the limitation — "I've dispatched the workers, I'll wait for their results" — and finish their turn, going IDLE. Kimi's model is more proactive and refuses to stop, improvising with shell commands. This is a model behavior difference, not a provider code bug.
+
+**Fix:** Update the supervisor agent profile to explain how CAO's message delivery works:
+
+```markdown
+## How Message Delivery Works
+
+After you call assign(), workers will send results back via send_message().
+Messages are delivered to your terminal **automatically when your turn ends
+and you become idle**. This means:
+
+- **DO NOT** run shell commands (sleep, echo, etc.) to wait for results —
+  this keeps you busy and **blocks message delivery**.
+- **DO** finish your turn by stating what you dispatched and what you expect.
+  Messages will arrive as your next input automatically.
+```
+
+This goes in the shared supervisor agent profile (e.g., `analysis_supervisor.md`), not a provider-specific one. It's harmless for models that already behave correctly (Claude Code, Codex) and fixes models that busy-wait (Kimi CLI).
+
+**Rules:**
+- Every supervisor agent profile that uses `assign()` must explain the message delivery model
+- The instruction must explicitly say DO NOT run shell commands to wait
+- This is a prompt-level fix, not a provider code fix — the underlying architecture limitation (push-based delivery) is addressed by the `check_inbox` design
+- Test the assign+inbox flow for every new provider during E2E — a provider may work for handoff but fail for assign if the model busy-waits
