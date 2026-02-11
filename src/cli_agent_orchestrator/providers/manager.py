@@ -1,4 +1,23 @@
-"""Provider manager as module singleton with direct terminal_id → provider mapping."""
+"""Provider manager as module singleton with direct terminal_id → provider mapping.
+
+This module provides the ProviderManager class which acts as a registry and factory
+for provider instances. It maintains a mapping from terminal_id to provider instance,
+ensuring each terminal has exactly one provider managing it.
+
+Design Decisions:
+- Singleton pattern: A single provider_manager instance is shared across the application
+- On-demand creation: Providers can be created explicitly or lazily from database metadata
+- Direct mapping: Uses terminal_id as the key for O(1) provider lookup
+
+Provider Lifecycle:
+1. create_provider() - Creates and registers a new provider
+2. get_provider() - Retrieves existing or creates on-demand
+3. cleanup_provider() - Removes provider and runs cleanup logic
+
+Thread Safety:
+The current implementation is NOT thread-safe. If concurrent access is needed,
+consider adding locks around the _providers dictionary operations.
+"""
 
 import logging
 from typing import Dict, Optional
@@ -15,9 +34,17 @@ logger = logging.getLogger(__name__)
 
 
 class ProviderManager:
-    """Simplified provider manager with direct mapping."""
+    """Registry and factory for CLI provider instances.
+
+    Maintains a direct mapping from terminal_id to provider instance.
+    Supports both explicit creation and on-demand creation from database metadata.
+
+    Attributes:
+        _providers: Dictionary mapping terminal_id to BaseProvider instances
+    """
 
     def __init__(self) -> None:
+        """Initialize empty provider registry."""
         self._providers: Dict[str, BaseProvider] = {}
 
     def create_provider(

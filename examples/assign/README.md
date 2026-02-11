@@ -173,7 +173,12 @@ cao install examples/assign/report_generator.md
 
 3. Launch the supervisor:
 ```bash
+# Using default provider (kiro_cli)
 cao launch --agents analysis_supervisor
+
+# Or specify a different provider
+cao launch --agents analysis_supervisor --provider claude_code
+cao launch --agents analysis_supervisor --provider codex
 ```
 
 ## Usage
@@ -309,6 +314,21 @@ T=22s:  Data Analyst 3 completes (started at T=2s)
 T=33s:  Supervisor receives all results, combines with template
 T=33s:  Present final report
 ```
+
+## E2E Testing
+
+The `data_analyst` and `report_generator` profiles from this directory are used in the E2E test suite to validate assign and handoff flows across all providers (codex, claude_code, kiro_cli).
+
+```bash
+# Install profiles for E2E testing
+cao install examples/assign/data_analyst.md
+cao install examples/assign/report_generator.md
+
+# Run assign E2E tests
+uv run pytest -m e2e test/e2e/test_assign.py -v
+```
+
+See `test/e2e/test_assign.py` for the test implementation.
 
 ## Tips
 
