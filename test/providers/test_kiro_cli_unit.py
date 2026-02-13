@@ -447,15 +447,21 @@ class TestKiroCliProviderRegexPatterns:
         permission_text = "Allow this action? [y/n/t]: [developer]>"
         assert re.search(provider._permission_prompt_pattern, permission_text)
 
-    def test_permission_prompt_no_match_stale_history(self):
-        """Test that stale permission prompts separated by newlines don't match."""
-        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_permission_prompt_no_match_stale_history(self, mock_tmux):
+        """Test that stale permission prompts are not detected as active.
 
-        # Stale permission prompt on earlier line, current idle prompt on later line
+        The regex matches all [y/n/t]: occurrences; get_status() uses
+        line-based counting to distinguish active from stale prompts.
+        """
         stale = (
             "Allow this action? [y/n/t]:\n\n[developer] 29% > y\nsome output\n[developer] 29% > "
         )
-        assert not re.search(provider._permission_prompt_pattern, stale, re.MULTILINE | re.DOTALL)
+        mock_tmux.get_history.return_value = stale
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        status = provider.get_status()
+        assert status != TerminalStatus.WAITING_USER_ANSWER
 
     def test_ansi_code_cleaning(self):
         """Test ANSI code pattern cleaning."""
