@@ -38,9 +38,7 @@ class QCliProvider(BaseProvider):
         self._idle_prompt_pattern = (
             rf"\[{re.escape(self._agent_profile)}\]\s*(?:\d+%\s*)?(?:\u03bb\s*)?!?>\s*"
         )
-        self._permission_prompt_pattern = (
-            r"Allow this action\?.*\[.*y.*\/.*n.*\/.*t.*\]:[ \t]*" + self._idle_prompt_pattern
-        )
+        self._permission_prompt_pattern = r"Allow this action\?.*?\[.*?y.*?/.*?n.*?/.*?t.*?\]:"
 
     def initialize(self) -> bool:
         """Initialize Q CLI provider by starting q chat command."""
@@ -78,9 +76,19 @@ class QCliProvider(BaseProvider):
         if any(indicator.lower() in clean_output.lower() for indicator in ERROR_INDICATORS):
             return TerminalStatus.ERROR
 
-        # Check for permission prompt
-        if re.search(self._permission_prompt_pattern, clean_output, re.MULTILINE | re.DOTALL):
-            return TerminalStatus.WAITING_USER_ANSWER
+        # Check for permission prompt — count lines with idle prompt after last [y/n/t]:
+        # Active prompt: 0-1 lines with idle prompt (CLI renders prompt on next line)
+        # Stale prompt: 2+ lines with idle prompt (user answered, agent continued)
+        # Line-based counting handles \r redraws (same line, no \n) correctly
+        perm_matches = list(re.finditer(self._permission_prompt_pattern, clean_output, re.DOTALL))
+        if perm_matches:
+            after_last_perm = clean_output[perm_matches[-1].end() :]
+            lines_after = after_last_perm.split("\n")
+            idle_lines = sum(
+                1 for line in lines_after if re.search(self._idle_prompt_pattern, line)
+            )
+            if idle_lines <= 1:
+                return TerminalStatus.WAITING_USER_ANSWER
 
         # Check for completed state (has response + agent prompt AFTER the response)
         green_arrows = list(re.finditer(GREEN_ARROW_PATTERN, clean_output, re.MULTILINE))
