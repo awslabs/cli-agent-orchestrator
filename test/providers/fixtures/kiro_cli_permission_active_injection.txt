@@ -1,0 +1,6 @@
+$ kiro-cli chat --agent cao-code-explorer-expert
+✓ cao-mcp-server loaded in 1.58 s
+
+Allow this action? Use 't' to trust (always allow) this tool for the session. [y/n/t]:
+
+[cao-code-explorer-expert] 15% λ > [Assigned by terminal 63878fc7. When done, send results back to terminal 63878fc7 using send_message] [Message from terminal 63878fc7. To reply, use send_message with receiver_id 63878fc7]
