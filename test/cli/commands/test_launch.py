@@ -25,8 +25,8 @@ def test_launch_includes_working_directory():
         }
         mock_post.return_value.raise_for_status.return_value = None
 
-        # Run the command
-        result = runner.invoke(launch, ["--agents", "test-agent"])
+        # Run the command (--yolo skips workspace trust confirmation)
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
 
         # Verify the command succeeded
         assert result.exit_code == 0

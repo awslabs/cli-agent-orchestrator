@@ -3,6 +3,7 @@
 import logging
 import os
 import subprocess
+import time
 import uuid
 from typing import Dict, List, Optional
 
@@ -127,6 +128,10 @@ class TmuxClient:
                 ["tmux", "paste-buffer", "-p", "-b", buf_name, "-t", target],
                 check=True,
             )
+            # Brief delay to let the TUI process the bracketed paste end sequence
+            # before sending Enter. Without this, Claude Code 2.x TUI swallows
+            # the Enter that immediately follows paste-buffer -p.
+            time.sleep(0.3)
             subprocess.run(
                 ["tmux", "send-keys", "-t", target, "Enter"],
                 check=True,
