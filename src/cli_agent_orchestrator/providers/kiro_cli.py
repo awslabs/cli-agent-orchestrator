@@ -17,7 +17,7 @@ ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
 ESCAPE_SEQUENCE_PATTERN = r"\[[?0-9;]*[a-zA-Z]"
 CONTROL_CHAR_PATTERN = r"[\x00-\x1f\x7f-\x9f]"
 BELL_CHAR = "\x07"
-IDLE_PROMPT_PATTERN_LOG = r"\x1b\[38;5;13m>\s*\x1b\[39m"
+IDLE_PROMPT_PATTERN_LOG = r"\x1b\[38;5;\d+m\[.+?\].*\x1b\[38;5;\d+m>\s*\x1b\[\d*m"
 
 # Error indicators
 ERROR_INDICATORS = ["Kiro is having trouble responding right now"]
@@ -37,9 +37,7 @@ class KiroCliProvider(BaseProvider):
         self._idle_prompt_pattern = (
             rf"\[{re.escape(self._agent_profile)}\]\s*(?:\d+%\s*)?(?:\u03bb\s*)?!?>\s*"
         )
-        self._permission_prompt_pattern = (
-            r"Allow this action\?.*\[.*y.*\/.*n.*\/.*t.*\]:\s*" + self._idle_prompt_pattern
-        )
+        self._permission_prompt_pattern = r"Allow this action\?.*?\[.*?y.*?/.*?n.*?/.*?t.*?\]:"
 
     def initialize(self) -> bool:
         """Initialize Kiro CLI provider by starting kiro-cli chat command."""
@@ -77,15 +75,34 @@ class KiroCliProvider(BaseProvider):
         if any(indicator.lower() in clean_output.lower() for indicator in ERROR_INDICATORS):
             return TerminalStatus.ERROR
 
-        # Check for permission prompt
-        if re.search(self._permission_prompt_pattern, clean_output, re.MULTILINE | re.DOTALL):
-            return TerminalStatus.WAITING_USER_ANSWER
+        # Check for permission prompt — count lines with idle prompt after last [y/n/t]:
+        # Active prompt: 0-1 lines with idle prompt (CLI renders prompt on next line)
+        # Stale prompt: 2+ lines with idle prompt (user answered, agent continued)
+        # Line-based counting handles \r redraws (same line, no \n) correctly
+        perm_matches = list(re.finditer(self._permission_prompt_pattern, clean_output, re.DOTALL))
+        if perm_matches:
+            after_last_perm = clean_output[perm_matches[-1].end() :]
+            lines_after = after_last_perm.split("\n")
+            idle_lines = sum(
+                1 for line in lines_after if re.search(self._idle_prompt_pattern, line)
+            )
+            if idle_lines <= 1:
+                return TerminalStatus.WAITING_USER_ANSWER
 
-        # Check for completed state (has response + agent prompt)
-        # Note: The extraction logic will verify the prompt is after the response
-        if re.search(GREEN_ARROW_PATTERN, clean_output, re.MULTILINE):
-            logger.debug(f"get_status: returning COMPLETED")
-            return TerminalStatus.COMPLETED
+        # Check for completed state (has response + agent prompt AFTER the response)
+        green_arrows = list(re.finditer(GREEN_ARROW_PATTERN, clean_output, re.MULTILINE))
+        if green_arrows:
+            # Find if there's an idle prompt after the last green arrow
+            last_arrow_pos = green_arrows[-1].end()
+            idle_prompts = list(re.finditer(self._idle_prompt_pattern, clean_output))
+
+            for prompt in idle_prompts:
+                if prompt.start() > last_arrow_pos:
+                    logger.debug(f"get_status: returning COMPLETED")
+                    return TerminalStatus.COMPLETED
+
+            # Has green arrow but no prompt after it - still processing
+            return TerminalStatus.PROCESSING
 
         # Just agent prompt, no response
         return TerminalStatus.IDLE
