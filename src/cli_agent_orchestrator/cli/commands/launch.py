@@ -16,7 +16,8 @@ from cli_agent_orchestrator.constants import DEFAULT_PROVIDER, PROVIDERS, SERVER
 @click.option(
     "--provider", default=DEFAULT_PROVIDER, help=f"Provider to use (default: {DEFAULT_PROVIDER})"
 )
-def launch(agents, session_name, headless, provider):
+@click.option("--port", default=SERVER_PORT, help=f"Server port to use (default: {SERVER_PORT})")
+def launch(agents, session_name, headless, provider, port):
     """Launch cao session with specified agent profile."""
     try:
         # Validate provider
@@ -26,7 +27,7 @@ def launch(agents, session_name, headless, provider):
             )
 
         # Call API to create session
-        url = f"http://{SERVER_HOST}:{SERVER_PORT}/sessions"
+        url = f"http://{SERVER_HOST}:{port}/sessions"
         params = {
             "provider": provider,
             "agent_profile": agents,
