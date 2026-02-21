@@ -20,8 +20,19 @@ class TmuxClient:
     def __init__(self) -> None:
         self.server = libtmux.Server()
 
+    # Directories that should never be used as working directories.
+    # Prevents user-supplied paths from pointing at sensitive system locations.
+    _BLOCKED_DIRECTORIES = frozenset({
+        "/", "/bin", "/sbin", "/usr/bin", "/usr/sbin",
+        "/etc", "/var", "/tmp", "/dev", "/proc", "/sys",
+        "/root", "/boot", "/lib", "/lib64",
+    })
+
     def _resolve_and_validate_working_directory(self, working_directory: Optional[str]) -> str:
         """Resolve and validate working directory.
+
+        Canonicalizes the path (resolves symlinks, normalizes ``..``) and
+        rejects paths that point to sensitive system directories.
 
         Args:
             working_directory: Optional directory path, defaults to current directory
@@ -30,7 +41,7 @@ class TmuxClient:
             Canonicalized absolute path
 
         Raises:
-            ValueError: If directory does not exist
+            ValueError: If directory does not exist or is a blocked system path
         """
         if working_directory is None:
             working_directory = os.getcwd()
@@ -40,6 +51,13 @@ class TmuxClient:
 
         if not os.path.isdir(real_path):
             raise ValueError(f"Working directory does not exist: {working_directory}")
+
+        # Block sensitive system directories
+        if real_path in self._BLOCKED_DIRECTORIES:
+            raise ValueError(
+                f"Working directory not allowed: {working_directory} "
+                f"(resolves to blocked path {real_path})"
+            )
 
         return real_path
 
@@ -107,13 +125,23 @@ class TmuxClient:
             logger.error(f"Failed to create window in session {session_name}: {e}")
             raise
 
-    def send_keys(self, session_name: str, window_name: str, keys: str) -> None:
+    def send_keys(
+        self, session_name: str, window_name: str, keys: str, enter_count: int = 1
+    ) -> None:
         """Send keys to window using tmux paste-buffer for instant delivery.
 
         Uses load-buffer + paste-buffer instead of chunked send-keys to avoid
         slow character-by-character input and special character interpretation.
         The -p flag enables bracketed paste mode so multi-line content is treated
         as a single input rather than submitting on each newline.
+
+        Args:
+            session_name: Name of tmux session
+            window_name: Name of window in session
+            keys: Text to send
+            enter_count: Number of Enter keys to send after pasting (default 1).
+                Some TUIs enter multi-line mode after bracketed paste,
+                requiring 2 Enters to submit.
         """
         target = f"{session_name}:{window_name}"
         buf_name = f"cao_{uuid.uuid4().hex[:8]}"
@@ -129,13 +157,19 @@ class TmuxClient:
                 check=True,
             )
             # Brief delay to let the TUI process the bracketed paste end sequence
-            # before sending Enter. Without this, Claude Code 2.x TUI swallows
-            # the Enter that immediately follows paste-buffer -p.
+            # before sending Enter. Without this, some TUIs (e.g., Claude Code 2.x)
+            # swallow the Enter that immediately follows paste-buffer -p.
             time.sleep(0.3)
-            subprocess.run(
-                ["tmux", "send-keys", "-t", target, "Enter"],
-                check=True,
-            )
+            for i in range(enter_count):
+                if i > 0:
+                    # Delay between Enter presses for TUIs that need time to
+                    # process the previous Enter (e.g., Ink adding a newline)
+                    # before the next Enter triggers form submission.
+                    time.sleep(0.5)
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", target, "Enter"],
+                    check=True,
+                )
             logger.debug(f"Sent keys to {target}")
         except Exception as e:
             logger.error(f"Failed to send keys to {target}: {e}")
@@ -145,6 +179,91 @@ class TmuxClient:
                 ["tmux", "delete-buffer", "-b", buf_name],
                 check=False,
             )
+
+    def send_keys_via_paste(self, session_name: str, window_name: str, text: str) -> None:
+        """Send text to window via tmux paste buffer with bracketed paste mode.
+
+        Uses tmux set-buffer + paste-buffer -p to send text as a bracketed paste,
+        which bypasses TUI hotkey handling. Essential for Ink-based CLIs and
+        other TUI apps where individual keystrokes may trigger hotkeys.
+
+        After pasting, sends C-m (Enter) to submit the input.
+
+        Args:
+            session_name: Name of tmux session
+            window_name: Name of window in session
+            text: Text to paste into the pane
+        """
+        try:
+            logger.info(
+                f"send_keys_via_paste: {session_name}:{window_name} - text length: {len(text)}"
+            )
+
+            session = self.server.sessions.get(session_name=session_name)
+            if not session:
+                raise ValueError(f"Session '{session_name}' not found")
+
+            window = session.windows.get(window_name=window_name)
+            if not window:
+                raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
+
+            pane = window.active_pane
+            if pane:
+                buf_name = "cao_paste"
+
+                # Load text into tmux buffer
+                self.server.cmd("set-buffer", "-b", buf_name, text)
+
+                # Paste with bracketed paste mode (-p flag).
+                # This wraps the text in \x1b[200~ ... \x1b[201~ escape sequences,
+                # telling the TUI "this is pasted text" so it bypasses hotkey handling.
+                pane.cmd("paste-buffer", "-p", "-b", buf_name)
+
+                time.sleep(0.3)
+
+                # Send Enter to submit the pasted text
+                pane.send_keys("C-m", enter=False)
+
+                # Clean up the paste buffer
+                try:
+                    self.server.cmd("delete-buffer", "-b", buf_name)
+                except Exception:
+                    pass
+
+                logger.debug(f"Sent text via paste to {session_name}:{window_name}")
+        except Exception as e:
+            logger.error(f"Failed to send text via paste to {session_name}:{window_name}: {e}")
+            raise
+
+    def send_special_key(self, session_name: str, window_name: str, key: str) -> None:
+        """Send a tmux special key sequence (e.g., C-d, C-c) to a window.
+
+        Unlike send_keys(), this sends the key as a tmux key name (not literal text)
+        and does not append a carriage return. Used for control signals like Ctrl+D (EOF).
+
+        Args:
+            session_name: Name of tmux session
+            window_name: Name of window in session
+            key: Tmux key name (e.g., "C-d", "C-c", "Escape")
+        """
+        try:
+            logger.info(f"send_special_key: {session_name}:{window_name} - key: {key}")
+
+            session = self.server.sessions.get(session_name=session_name)
+            if not session:
+                raise ValueError(f"Session '{session_name}' not found")
+
+            window = session.windows.get(window_name=window_name)
+            if not window:
+                raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
+
+            pane = window.active_pane
+            if pane:
+                pane.send_keys(key, enter=False)
+                logger.debug(f"Sent special key to {session_name}:{window_name}")
+        except Exception as e:
+            logger.error(f"Failed to send special key to {session_name}:{window_name}: {e}")
+            raise
 
     def get_history(
         self, session_name: str, window_name: str, tail_lines: Optional[int] = None

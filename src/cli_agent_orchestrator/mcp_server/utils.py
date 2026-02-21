@@ -2,7 +2,8 @@
 
 from typing import Optional
 
-from cli_agent_orchestrator.adapters.database import SessionLocal, TerminalModel
+# Fix: was `adapters.database` which doesn't exist; correct module is `clients.database`
+from cli_agent_orchestrator.clients.database import SessionLocal, TerminalModel
 
 
 def get_terminal_record(terminal_id: str) -> Optional[TerminalModel]:

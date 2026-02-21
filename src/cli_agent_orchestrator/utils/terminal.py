@@ -3,7 +3,7 @@
 import logging
 import time
 import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Union
 
 import httpx
 
@@ -80,11 +80,26 @@ def wait_until_status(
 
 def wait_until_terminal_status(
     terminal_id: str,
-    target_status: TerminalStatus,
+    target_status: Union[TerminalStatus, set],
     timeout: float = 30.0,
     polling_interval: float = 1.0,
 ) -> bool:
-    """Wait until terminal reaches target status using API endpoint."""
+    """Wait until terminal reaches target status using API endpoint.
+
+    Args:
+        terminal_id: Terminal to poll.
+        target_status: A single TerminalStatus or a set of acceptable statuses.
+        timeout: Maximum wait time in seconds.
+        polling_interval: Seconds between polls.
+
+    Returns:
+        True if the terminal reached one of the target statuses within timeout.
+    """
+    if isinstance(target_status, TerminalStatus):
+        target_values = {target_status.value}
+    else:
+        target_values = {s.value for s in target_status}
+
     start_time = time.time()
     while time.time() - start_time < timeout:
         try:
@@ -92,7 +107,7 @@ def wait_until_terminal_status(
             logger.info(response)
             if response.status_code == 200:
                 terminal_data = response.json()
-                if terminal_data["status"] == target_status.value:
+                if terminal_data["status"] in target_values:
                     return True
         except Exception:
             pass

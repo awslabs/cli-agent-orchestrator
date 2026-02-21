@@ -163,19 +163,55 @@ async def _handoff_impl(
         # Create terminal
         terminal_id, provider = _create_terminal(agent_profile, working_directory)
 
-        # Wait for terminal to be IDLE before sending message
-        if not wait_until_terminal_status(terminal_id, TerminalStatus.IDLE, timeout=30.0):
+        # Wait for terminal to be ready (IDLE or COMPLETED) before sending
+        # the handoff message. Accept COMPLETED in addition to IDLE because
+        # some providers process the system prompt as the first user message
+        # and produce a response, reaching COMPLETED without ever showing a
+        # bare IDLE state.
+        # Both states indicate the provider is ready to accept input.
+        #
+        # Use a generous timeout (120s) because provider initialization can be
+        # slow: shell warm-up (~5s), CLI startup with MCP server registration
+        # (~10-30s), and API authentication (~5-10s). If the provider's own
+        # initialize() timed out (60-90s), this acts as a fallback to catch
+        # cases where the CLI starts slightly after the provider timeout.
+        # Startup times vary by provider (~15-45s).
+        if not wait_until_terminal_status(
+            terminal_id,
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+            timeout=120.0,
+        ):
             return HandoffResult(
                 success=False,
-                message=f"Terminal {terminal_id} did not reach IDLE status within 30 seconds",
+                message=f"Terminal {terminal_id} did not reach ready status within 120 seconds",
                 output=None,
                 terminal_id=terminal_id,
             )
 
         await asyncio.sleep(2)  # wait another 2s
 
+        # For Codex provider: prepend handoff context so the worker agent knows
+        # this is a blocking handoff and should simply output results rather than
+        # attempting to call send_message back to the supervisor.
+        # Includes the supervisor's terminal ID (from CAO_TERMINAL_ID env var in
+        # the MCP server process) so the worker can call back if needed.
+        # Other providers (Claude Code, Kiro CLI) naturally complete and return
+        # to idle without this hint, so the message is left unchanged for them.
+        if provider == "codex":
+            supervisor_id = os.environ.get("CAO_TERMINAL_ID", "unknown")
+            handoff_message = (
+                f"[CAO Handoff] Supervisor terminal ID: {supervisor_id}. "
+                "This is a blocking handoff — the orchestrator will automatically "
+                "capture your response when you finish. Complete the task and output "
+                "your results directly. Do NOT use send_message to notify the supervisor "
+                "unless explicitly needed — just do the work and present your deliverables.\n\n"
+                f"{message}"
+            )
+        else:
+            handoff_message = message
+
         # Send message to terminal
-        _send_direct_input(terminal_id, message)
+        _send_direct_input(terminal_id, handoff_message)
 
         # Monitor until completion with timeout
         if not wait_until_terminal_status(

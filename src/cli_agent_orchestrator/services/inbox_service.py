@@ -1,4 +1,25 @@
-"""Inbox service with watchdog for automatic message delivery."""
+"""Inbox service with watchdog for automatic message delivery.
+
+This module provides the inbox functionality for agent-to-agent communication,
+using file system monitoring to detect when agents become idle and can receive messages.
+
+Architecture:
+- Messages are queued in the database (inbox table) via send_message MCP tool
+- LogFileHandler monitors terminal log files for changes using watchdog
+- When a terminal becomes idle (detected via log patterns), pending messages are delivered
+- Messages are sent via terminal_service.send_input() which types into the tmux pane
+
+Message Flow:
+1. Agent A calls send_message(terminal_id, message) → message queued in DB
+2. Agent B's terminal log file updates (via tmux pipe-pane)
+3. LogFileHandler.on_modified() triggered → checks for pending messages
+4. If terminal is IDLE and has pending messages → deliver via send_input()
+5. Message status updated to DELIVERED or FAILED
+
+Performance Optimization:
+- Uses fast log tail check before expensive tmux status queries
+- Only queries full provider status when idle pattern detected in log
+"""
 
 import logging
 import re
@@ -8,7 +29,7 @@ from pathlib import Path
 from watchdog.events import FileModifiedEvent, FileSystemEventHandler
 
 from cli_agent_orchestrator.clients.database import get_pending_messages, update_message_status
-from cli_agent_orchestrator.constants import INBOX_SERVICE_TAIL_LINES, TERMINAL_LOG_DIR
+from cli_agent_orchestrator.constants import TERMINAL_LOG_DIR
 from cli_agent_orchestrator.models.inbox import MessageStatus
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.manager import provider_manager
@@ -17,8 +38,13 @@ from cli_agent_orchestrator.services import terminal_service
 logger = logging.getLogger(__name__)
 
 
-def _get_log_tail(terminal_id: str, lines: int = 5) -> str:
-    """Get last N lines from terminal log file."""
+def _get_log_tail(terminal_id: str, lines: int = 100) -> str:
+    """Get last N lines from terminal log file.
+
+    Default of 100 lines covers full-screen TUI providers where the idle
+    prompt sits mid-screen with 30+ padding lines below it.
+    Reading 100 lines via tail is still sub-millisecond.
+    """
     log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
     try:
         result = subprocess.run(
@@ -68,7 +94,12 @@ def check_and_send_pending_messages(terminal_id: str) -> bool:
     provider = provider_manager.get_provider(terminal_id)
     if provider is None:
         raise ValueError(f"Provider not found for terminal {terminal_id}")
-    status = provider.get_status(tail_lines=INBOX_SERVICE_TAIL_LINES)
+    # Let the provider use its own default tail_lines. Each provider knows how
+    # many lines it needs to reliably detect the idle prompt (some TUI providers
+    # need 50+ lines due to TUI padding). Previously this passed
+    # INBOX_SERVICE_TAIL_LINES=5, which was too few for TUI-based providers —
+    # the idle prompt was never found, so messages stayed PENDING forever.
+    status = provider.get_status()
 
     if status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
         logger.debug(f"Terminal {terminal_id} not ready (status={status})")

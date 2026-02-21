@@ -23,7 +23,7 @@ Check if the server is running.
 Create a new session with one terminal.
 
 **Parameters:**
-- `provider` (string, required): Provider type ("q_cli" or "claude_code")
+- `provider` (string, required): Provider type ("kiro_cli", "claude_code", "codex", or "q_cli")
 - `agent_profile` (string, required): Agent profile name
 - `session_name` (string, optional): Custom session name
 - `working_directory` (string, optional): Working directory for the agent session
@@ -79,7 +79,7 @@ Get terminal details.
 {
   "id": "string",
   "name": "string",
-  "provider": "q_cli|claude_code",
+  "provider": "kiro_cli|claude_code|codex|q_cli",
   "session_name": "string",
   "agent_profile": "string",
   "status": "idle|processing|completed|waiting_user_answer|error",
@@ -128,6 +128,18 @@ Get the current working directory of a terminal's pane.
 
 ### POST /terminals/{terminal_id}/exit
 Send provider-specific exit command to terminal.
+
+**Behavior:**
+- Calls the provider's `exit_cli()` method to get the exit command
+- Text commands (e.g., `/exit`, `quit`) are sent as literal text via `send_input()`
+- Key sequences prefixed with `C-` or `M-` (e.g., `C-d` for Ctrl+D) are sent as tmux key sequences via `send_special_key()`, which tmux interprets as actual key presses
+
+| Provider | Exit Command | Type |
+|----------|-------------|------|
+| kiro_cli | `/exit` | Text |
+| claude_code | `/exit` | Text |
+| codex | `/exit` | Text |
+| q_cli | `/exit` | Text |
 
 **Response:**
 ```json
