@@ -17,12 +17,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fix Claude Code `PROCESSING_PATTERN` not matching newer Claude Code 2.x spinner format: broaden pattern to match both `(esc to interrupt)` and `(Ns · ↓ tokens · thinking)` formats
 - Fix tmux `paste-buffer -p` Enter key being swallowed by Claude Code 2.x TUI: add 0.3s delay between bracketed paste and Enter submission
 - Fix Claude Code MCP servers not receiving `CAO_TERMINAL_ID` env var: inject it explicitly via `--mcp-config` env field since Claude Code doesn't forward parent shell env vars to MCP subprocesses
+- Rewrite Codex CLI provider: fix `IDLE_PROMPT_PATTERN_LOG` matching `❯` instead of `? for shortcuts`, add `--no-alt-screen` flag, TUI footer/progress detection, bottom-N-lines status parsing, two-phase response extraction
+- Fix Codex `_handle_trust_prompt()` to auto-accept trust dialog during initialization
+- Fix MCP server `utils.py` import: `adapters.database` → `clients.database`
+- Fix inbox service tail lines: increase from 5 to 100 for TUI-based providers; remove unused `INBOX_SERVICE_TAIL_LINES` constant
 
 ### Added
 
 - Workspace trust confirmation prompt in `launch.py` before starting providers: asks "Do you trust all the actions in this folder?" since providers are granted full permissions (read, write, execute) in the working directory; supports `--yolo` flag to skip
 - Provider documentation: `docs/claude-code.md` covering status detection, message extraction, configuration, implementation notes, and troubleshooting
+- Provider documentation: `docs/codex-cli.md` covering Codex CLI provider status detection, message extraction, and troubleshooting
 - Working directory documentation: `docs/working-directory.md` covering `CAO_ENABLE_WORKING_DIRECTORY` feature
+- MCP server Codex `[CAO Handoff]` prefix and multi-status wait (`IDLE`∪`COMPLETED`) with 120s timeout
+- Framework: `paste_enter_count` property and `mark_input_received()` on `BaseProvider` for TUI-aware input handling
+- Framework: `send_special_key()` in terminal service and tmux client for control signals (e.g., Ctrl+D)
+- Framework: `send_keys_via_paste()` in tmux client for bracketed paste mode input
+- API: exit terminal route supports special keys; inbox endpoint uses best-effort delivery
 
 ### Changed
 

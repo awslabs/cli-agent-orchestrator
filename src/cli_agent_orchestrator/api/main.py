@@ -299,7 +299,13 @@ async def exit_terminal(terminal_id: TerminalId) -> Dict:
         if provider is None:
             raise ValueError(f"Provider not found for terminal {terminal_id}")
         exit_command = provider.exit_cli()
-        terminal_service.send_input(terminal_id, exit_command)
+        # Some providers use tmux key sequences (e.g., "C-d" for Ctrl+D) instead
+        # of text commands (e.g., "/exit"). Key sequences must be sent via
+        # send_special_key() to be interpreted by tmux, not as literal text.
+        if exit_command.startswith(("C-", "M-")):
+            terminal_service.send_special_key(terminal_id, exit_command)
+        else:
+            terminal_service.send_input(terminal_id, exit_command)
         return {"success": True}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -332,15 +338,6 @@ async def create_inbox_message_endpoint(
     """Create inbox message and attempt immediate delivery."""
     try:
         inbox_msg = create_inbox_message(sender_id, receiver_id, message)
-        inbox_service.check_and_send_pending_messages(receiver_id)
-
-        return {
-            "success": True,
-            "message_id": inbox_msg.id,
-            "sender_id": inbox_msg.sender_id,
-            "receiver_id": inbox_msg.receiver_id,
-            "created_at": inbox_msg.created_at.isoformat(),
-        }
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -348,6 +345,23 @@ async def create_inbox_message_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create inbox message: {str(e)}",
         )
+
+    # Best-effort immediate delivery. If the receiver terminal is idle, the
+    # message is delivered now; otherwise the watchdog will deliver it when
+    # the terminal becomes idle. Delivery failures must not cause the API
+    # to report an error — the message was already persisted above.
+    try:
+        inbox_service.check_and_send_pending_messages(receiver_id)
+    except Exception as e:
+        logger.warning(f"Immediate delivery attempt failed for {receiver_id}: {e}")
+
+    return {
+        "success": True,
+        "message_id": inbox_msg.id,
+        "sender_id": inbox_msg.sender_id,
+        "receiver_id": inbox_msg.receiver_id,
+        "created_at": inbox_msg.created_at.isoformat(),
+    }
 
 
 @app.get("/terminals/{terminal_id}/inbox/messages")

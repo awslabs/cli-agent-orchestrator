@@ -1,10 +1,10 @@
 # Codex CLI Basic Usage Example
 
-This example demonstrates how to use the **Codex CLI provider** for basic AI agent orchestration tasks with your ChatGPT subscription.
+This example demonstrates how to use the **Codex CLI provider** for basic AI agent orchestration tasks with your OpenAI API key.
 
 ## What You'll Learn
 
-- **ChatGPT Integration**: Use your existing ChatGPT subscription with CAO
+- **OpenAI Integration**: Use your OpenAI API key with CAO
 - **Basic Agent Creation**: Create Codex agents for different development tasks
 - **Status Detection**: Understand how CAO detects Codex CLI states
 - **Message Extraction**: Extract responses from Codex agents
@@ -12,12 +12,12 @@ This example demonstrates how to use the **Codex CLI provider** for basic AI age
 
 ## Prerequisites
 
-1. **ChatGPT Subscription**: Active subscription required
+1. **OpenAI API Key** or **ChatGPT Subscription**: Authentication for Codex CLI
 2. **Codex CLI**: Install and authenticate:
    ```bash
-   pip install codex-cli
-   codex auth login
-   codex auth status  # Should show authenticated
+   npm install -g @openai/codex
+   export OPENAI_API_KEY=your-key-here  # Or use: codex login
+   codex --version  # Verify installation
    ```
 
 3. **CLI Agent Orchestrator**: Installed and running
@@ -98,7 +98,11 @@ The example includes pre-configured agent profiles for different Codex-based tas
 
 ## Setup
 
-No CAO-side agent installation is required for the `codex` provider. The `--agents` value is used for naming/metadata only.
+When using the `codex` provider with `--agents`, CAO loads the specified agent profile and injects its system prompt into Codex as `developer_instructions`. This means Codex will adopt the role defined in the agent profile (e.g., supervisor, developer, reviewer).
+
+Agent profiles are loaded from:
+1. Local store: `~/.aws/cli-agent-orchestrator/agent_store/<name>.md`
+2. Built-in store: `src/cli_agent_orchestrator/agent_store/<name>.md`
 
 ## Usage Examples
 
@@ -257,13 +261,15 @@ Then provide a refactored version with explanations.
 
 1. **Authentication Failed**:
    ```bash
-   codex auth logout
-   codex auth login
+   codex logout
+   codex login
+   # Or set API key directly
+   export OPENAI_API_KEY=your-key-here
    ```
 
 2. **Agent Not Responding**:
    - Check `tmux list-sessions` for session status
-   - Verify ChatGPT subscription is active
+   - Verify your OpenAI API key is valid (`codex --version`)
    - Check network connectivity
 
 3. **Status Detection Issues**:
