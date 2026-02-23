@@ -10,6 +10,7 @@ export interface AgentOnMap {
   position: Position
   assignedBeadId: string | null
   color: string
+  parentSession: string | null
 }
 
 export interface BeadOnMap {
@@ -43,6 +44,13 @@ interface ContextMenu {
   targetId: string | null
 }
 
+interface DeleteProgress {
+  parentId: string
+  children: string[]
+  deletedIds: string[]
+  currentTarget: string | null
+}
+
 interface StarCraftStore {
   // Map state
   zoom: number
@@ -64,6 +72,7 @@ interface StarCraftStore {
   terminalOpen: boolean
   terminalAgentId: string | null
   contextMenu: ContextMenu | null
+  deleteProgress: DeleteProgress | null
   
   // Actions
   setZoom: (zoom: number) => void
@@ -85,12 +94,14 @@ interface StarCraftStore {
   addBead: (bead: BeadOnMap) => void
   addRalphLoop: (loop: RalphLoop) => void
   updateAgentStatus: (id: string, status: AgentOnMap['status']) => void
+  setDeleteProgress: (progress: DeleteProgress | null) => void
+  markDeleted: (id: string) => void
 }
 
 const AGENT_ICONS: Record<string, string> = {
   generalist: '🤖', 'bob-the-builder': '🔧', 'log-diver': '🔍',
   'oncall-buddy': '🛠️', 'ticket-ninja': '🥷', 'sns-ticket-ninja': '📨',
-  atlas: '🗺️', 'ralph-wiggum': '🔄', 'amzn-builder': '📦'
+  atlas: '🗺️', 'ralph-wiggum': '🔄'
 }
 
 const AGENT_COLORS = ['#00ff88', '#00d4ff', '#ff00ff', '#ffcc00', '#ff4444', '#88ff00']
@@ -112,6 +123,7 @@ export const useStarCraftStore = create<StarCraftStore>((set) => ({
   terminalOpen: false,
   terminalAgentId: null,
   contextMenu: null,
+  deleteProgress: null,
 
   setZoom: (zoom) => set({ zoom: Math.max(0.25, Math.min(2, zoom)) }),
   setPan: (panX, panY) => set({ panX, panY }),
@@ -176,5 +188,14 @@ export const useStarCraftStore = create<StarCraftStore>((set) => ({
   })),
   updateAgentStatus: (id, status) => set((s) => ({
     agentsOnMap: s.agentsOnMap.map(a => a.id === id ? { ...a, status } : a)
+  })),
+  setDeleteProgress: (deleteProgress) => set({ deleteProgress }),
+  markDeleted: (id) => set((s) => ({
+    deleteProgress: s.deleteProgress ? {
+      ...s.deleteProgress,
+      deletedIds: [...s.deleteProgress.deletedIds, id],
+      currentTarget: null
+    } : null,
+    agentsOnMap: s.agentsOnMap.filter(a => a.id !== id)
   }))
 }))

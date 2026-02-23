@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { useStore } from '../store'
 import { api } from '../api'
 import { TerminalView } from './TerminalView'
-import { Bot, Wrench, Search, Shield, Swords, Mail, Map, RefreshCw, Package, User, Play, Pause, X, ChevronDown, Loader2, Terminal, Zap, Info } from 'lucide-react'
+import { Bot, Wrench, Search, Shield, Swords, Mail, Map, RefreshCw, User, Play, Pause, X, ChevronDown, Loader2, Terminal, Zap, Info, Check } from 'lucide-react'
 
 const AGENT_ICONS: Record<string, React.ReactNode> = {
   'generalist': <Bot size={20} />,
@@ -12,26 +12,26 @@ const AGENT_ICONS: Record<string, React.ReactNode> = {
   'ticket-ninja': <Swords size={20} />,
   'sns-ticket-ninja': <Mail size={20} />,
   'atlas': <Map size={20} />,
-  'ralph-wiggum': <RefreshCw size={20} />,
-  'amzn-builder': <Package size={20} />
+  'ralph-wiggum': <RefreshCw size={20} />
 }
 
-const STATUS_CONFIG: Record<string, { color: string; text: string; label: string; animate?: string }> = {
-  IDLE: { color: 'bg-emerald-500', text: 'text-emerald-400', label: 'Ready' },
-  PROCESSING: { color: 'bg-amber-500', text: 'text-amber-400', label: 'Working', animate: 'animate-pulse' },
-  WAITING_INPUT: { color: 'bg-emerald-500', text: 'text-emerald-400', label: 'Waiting' },
-  ERROR: { color: 'bg-red-500', text: 'text-red-400', label: 'Error' }
+const STATUS_CONFIG: Record<string, { color: string; text: string; label: string; hint: string; animate?: string }> = {
+  IDLE: { color: 'bg-emerald-500', text: 'text-emerald-400', label: 'Ready', hint: 'Waiting for input' },
+  PROCESSING: { color: 'bg-amber-500', text: 'text-amber-400', label: 'Working', hint: 'Agent is executing', animate: 'animate-pulse' },
+  WAITING_INPUT: { color: 'bg-emerald-500', text: 'text-emerald-400', label: 'Waiting', hint: 'Needs your response' },
+  ERROR: { color: 'bg-red-500', text: 'text-red-400', label: 'Error', hint: 'Something went wrong' }
 }
 
 export function AgentPanel() {
-  const { agents, setAgents, sessions, setSessions, activeSession, setActiveSession, tasks, setTasks, autoModeSessions, toggleAutoMode } = useStore()
-  const [spawning, setSpawning] = useState<{ agent: string; logs: string[] } | null>(null)
+  const { agents, setAgents, sessions, setSessions, activeSession, setActiveSession, tasks, setTasks, autoModeSessions, toggleAutoMode, showSnackbar } = useStore()
+  const [spawning, setSpawning] = useState<string | null>(null)
   const [sessionStatuses, setSessionStatuses] = useState<Record<string, string>>({})
   const [sessionContext, setSessionContext] = useState<Record<string, { total: number; tools: number; files: number; responses: number; prompts: number }>>({})
   const [view, setView] = useState<'agents' | 'sessions'>('sessions')
   const [editingAgent, setEditingAgent] = useState<{ name: string; context: string; contextPath?: string } | null>(null)
-  const [closingSession, setClosingSession] = useState<{ id: string; logs: string[] } | null>(null)
+  const [closingSession, setClosingSession] = useState<string | null>(null)
   const [focusedSession, setFocusedSession] = useState<string | null>(null)
+  const [focusedTerminal, setFocusedTerminal] = useState<string | null>(null)
 
   const fetchContextUsage = async (sessionId: string) => {
     try {
@@ -62,14 +62,20 @@ export function AgentPanel() {
     }
   }
 
+  const [saveSuccess, setSaveSuccess] = useState(false)
+
   const saveAgentContext = async () => {
     if (!editingAgent) return
     try {
       await api.agents.update(editingAgent.name, { name: editingAgent.name, steering: editingAgent.context })
-      setEditingAgent(null)
-      refresh()
+      setSaveSuccess(true)
+      setTimeout(() => {
+        setSaveSuccess(false)
+        setEditingAgent(null)
+        refresh()
+      }, 1500)
     } catch (e) {
-      alert('Failed to save')
+      showSnackbar('Failed to save', 'error')
     }
   }
 
@@ -118,52 +124,32 @@ export function AgentPanel() {
 
   const spawnSession = async (agentName: string) => {
     if (spawning) return
-    setSpawning({ agent: agentName, logs: [`Initializing ${agentName}...`] })
-    
+    setSpawning(agentName)
+
     try {
-      setSpawning(s => s ? { ...s, logs: [...s.logs, `Creating tmux session...`] } : null)
-      await new Promise(r => setTimeout(r, 300))
-      
-      setSpawning(s => s ? { ...s, logs: [...s.logs, `Loading agent profile...`] } : null)
-      await new Promise(r => setTimeout(r, 300))
-      
-      setSpawning(s => s ? { ...s, logs: [...s.logs, `Spawning kiro-cli agent...`] } : null)
       const session = await api.sessions.create({ agent_name: agentName })
-      
-      setSpawning(s => s ? { ...s, logs: [...s.logs, `Session ${session.id} created`, `Connecting terminal...`] } : null)
-      await new Promise(r => setTimeout(r, 500))
-      
       await refresh()
       setActiveSession(session.id)
-      setSpawning(null)
       setView('sessions')
+      showSnackbar(`Agent ${agentName} spawned`, 'success')
     } catch (e) {
-      setSpawning(s => s ? { ...s, logs: [...s.logs, `Error: Failed to spawn ${agentName}`] } : null)
-      setTimeout(() => setSpawning(null), 2000)
+      showSnackbar(`Failed to spawn ${agentName}`, 'error')
     }
+    setSpawning(null)
   }
 
   const deleteSession = async (id: string) => {
     if (closingSession) return
-    setClosingSession({ id, logs: [`Killing tmux session ${id}...`] })
-    
+    setClosingSession(id)
+
     try {
       await api.sessions.delete(id)
-      setClosingSession(s => s ? { ...s, logs: [...s.logs, 'Verifying session closed...'] } : null)
-      await new Promise(r => setTimeout(r, 300))
-      
-      setClosingSession(s => s ? { ...s, logs: [...s.logs, 'Unassigning beads...'] } : null)
-      await api.tasks.unassignSession(id)
-      await new Promise(r => setTimeout(r, 300))
-      
-      setClosingSession(s => s ? { ...s, logs: [...s.logs, 'Done'] } : null)
-      await new Promise(r => setTimeout(r, 500))
-      
+      await api.tasks.unassignSession(id).catch(() => {})
       if (activeSession === id) setActiveSession(null)
       refresh()
+      showSnackbar('Session closed', 'success')
     } catch (e) {
-      setClosingSession(s => s ? { ...s, logs: [...s.logs, `Error: ${e}`] } : null)
-      await new Promise(r => setTimeout(r, 2000))
+      showSnackbar('Failed to close session', 'error')
     }
     setClosingSession(null)
   }
@@ -184,64 +170,6 @@ export function AgentPanel() {
 
   return (
     <div className="space-y-4">
-      {/* Spawning Modal */}
-      {spawning && (
-        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50">
-          <div className="bg-gray-900 rounded-2xl p-6 w-full max-w-md border border-gray-700 shadow-2xl">
-            <div className="flex items-center gap-3 mb-4">
-              <div className="w-10 h-10 rounded-lg bg-emerald-500/20 flex items-center justify-center text-emerald-400 animate-pulse">
-                {AGENT_ICONS[spawning.agent] || <Bot size={20} />}
-              </div>
-              <div>
-                <h3 className="font-semibold text-white">Spawning {spawning.agent}</h3>
-                <p className="text-xs text-gray-500">Setting up agent session...</p>
-              </div>
-            </div>
-            <div className="bg-black/50 rounded-lg p-3 font-mono text-xs space-y-1 max-h-48 overflow-y-auto">
-              {spawning.logs.map((log, i) => (
-                <div key={i} className={`flex items-center gap-2 ${log.includes('Error') ? 'text-red-400' : 'text-gray-400'}`}>
-                  <Terminal size={12} className="text-gray-600" />
-                  {log}
-                </div>
-              ))}
-              <div className="flex items-center gap-2 text-emerald-400">
-                <Loader2 size={12} className="animate-spin" />
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Closing Session Modal */}
-      {closingSession && (
-        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50">
-          <div className="bg-gray-900 rounded-2xl p-6 w-full max-w-md border border-gray-700 shadow-2xl">
-            <div className="flex items-center gap-3 mb-4">
-              <div className="w-10 h-10 rounded-lg bg-red-500/20 flex items-center justify-center text-red-400 animate-pulse">
-                <X size={20} />
-              </div>
-              <div>
-                <h3 className="font-semibold text-white">Closing Session</h3>
-                <p className="text-xs text-gray-500">{closingSession.id}</p>
-              </div>
-            </div>
-            <div className="bg-black/50 rounded-lg p-3 font-mono text-xs space-y-1 max-h-48 overflow-y-auto">
-              {closingSession.logs.map((log, i) => (
-                <div key={i} className={`flex items-center gap-2 ${log.includes('Error') ? 'text-red-400' : log === 'Done' ? 'text-emerald-400' : 'text-gray-400'}`}>
-                  <Terminal size={12} className="text-gray-600" />
-                  {log}
-                </div>
-              ))}
-              {!closingSession.logs.includes('Done') && !closingSession.logs.some(l => l.includes('Error')) && (
-                <div className="flex items-center gap-2 text-red-400">
-                  <Loader2 size={12} className="animate-spin" />
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* Agent Context Modal */}
       {editingAgent && (
         <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50" onClick={() => setEditingAgent(null)}>
@@ -265,11 +193,15 @@ export function AgentPanel() {
               />
             </div>
             <div className="flex gap-3">
-              <button onClick={() => setEditingAgent(null)} className="flex-1 py-2.5 rounded-lg border border-gray-700 text-gray-400 hover:bg-gray-800">
+              <button onClick={() => { setEditingAgent(null); setSaveSuccess(false) }} className="flex-1 py-2.5 rounded-lg border border-gray-700 text-gray-400 hover:bg-gray-800">
                 Cancel
               </button>
-              <button onClick={saveAgentContext} className="flex-1 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white">
-                Save Changes
+              <button 
+                onClick={saveAgentContext} 
+                disabled={saveSuccess}
+                className={`flex-1 py-2.5 rounded-lg text-white flex items-center justify-center gap-2 ${saveSuccess ? 'bg-emerald-600' : 'bg-blue-600 hover:bg-blue-500'}`}
+              >
+                {saveSuccess ? <><Check size={16} /> Saved!</> : 'Save Changes'}
               </button>
             </div>
           </div>
@@ -329,6 +261,29 @@ export function AgentPanel() {
         </div>
       )}
 
+      {/* Focused Sub-agent Terminal View */}
+      {focusedTerminal && (
+        <div className="fixed inset-0 bg-gray-950 z-50 flex flex-col">
+          <div className="flex items-center justify-between px-4 py-2 bg-gray-900 border-b border-gray-800">
+            <div className="flex items-center gap-3">
+              <button
+                onClick={() => setFocusedTerminal(null)}
+                className="p-2 rounded-lg hover:bg-gray-800 text-gray-400 hover:text-white"
+              >
+                ← Back
+              </button>
+              <span className="text-white font-medium">Sub-agent Terminal</span>
+              <span className="px-2 py-0.5 text-xs rounded-full bg-purple-500/20 text-purple-400">
+                {focusedTerminal}
+              </span>
+            </div>
+          </div>
+          <div className="flex-1">
+            <TerminalView terminalId={focusedTerminal} onStatusChange={() => {}} />
+          </div>
+        </div>
+      )}
+
       {/* Sessions View */}
       {view === 'sessions' && (
         <div className="space-y-4">
@@ -337,10 +292,12 @@ export function AgentPanel() {
               <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-gray-800 flex items-center justify-center text-gray-600">
                 <Terminal size={32} />
               </div>
-              <p className="text-gray-400 mb-4">No active sessions</p>
+              <p className="text-gray-400 mb-2">No active sessions</p>
+              <p className="text-gray-500 text-sm mb-4">Spawn an agent to start working on tasks</p>
               <button
                 onClick={() => setView('agents')}
                 className="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-sm flex items-center gap-2 mx-auto"
+                title="Browse available agents and spawn a new session"
               >
                 <Play size={16} /> Spawn an Agent
               </button>
@@ -393,12 +350,17 @@ export function AgentPanel() {
                               <span className="px-2 py-0.5 text-xs rounded-full bg-gray-700 text-gray-300">
                                 {getAgentType(agentName)}
                               </span>
-                              <span className={`px-2 py-0.5 text-xs rounded-full bg-gray-800 ${config.text}`}>
+                              <span className={`px-2 py-0.5 text-xs rounded-full bg-gray-800 ${config.text}`} title={config.hint}>
                                 {config.label}
                               </span>
                               {wCount > 0 && (
                                 <span className="px-2 py-0.5 text-xs rounded-full bg-purple-500/20 text-purple-400">
                                   {wCount} worker{wCount > 1 ? 's' : ''}
+                                </span>
+                              )}
+                              {session.terminals && session.terminals.length > 1 && (
+                                <span className="px-2 py-0.5 text-xs rounded-full bg-purple-500/20 text-purple-400 flex items-center gap-1">
+                                  <User size={10} /> {session.terminals.length - 1} sub-agent{session.terminals.length > 2 ? 's' : ''}
                                 </span>
                               )}
                               {isWorker && (
@@ -423,22 +385,6 @@ export function AgentPanel() {
                           </div>
                           <div className="flex items-center gap-2">
                             <button
-                              onClick={(e) => { 
-                                e.stopPropagation()
-                                const wasAutoMode = isAutoMode
-                                toggleAutoMode(session.id)
-                                if (!wasAutoMode) tryAssignBead(session.id)
-                              }}
-                              className={`px-3 py-1.5 text-xs rounded-lg transition-all font-medium flex items-center gap-1.5 ${
-                                isAutoMode 
-                                  ? 'bg-purple-500/20 text-purple-400 border border-purple-500/30' 
-                                  : 'bg-gray-800 text-gray-400 hover:text-white border border-gray-700'
-                              }`}
-                            >
-                              {isAutoMode ? <Pause size={12} /> : <Play size={12} />}
-                              {isAutoMode ? 'Auto ON' : 'Auto'}
-                            </button>
-                            <button
                               onClick={(e) => { e.stopPropagation(); setFocusedSession(session.id) }}
                               className="p-2 rounded-lg hover:bg-blue-500/20 text-gray-400 hover:text-blue-400 transition-all"
                               title="Focus Terminal"
@@ -459,6 +405,66 @@ export function AgentPanel() {
                       {isActive && (
                         <div className="border-t border-gray-800 h-80">
                           <TerminalView sessionId={session.id} onStatusChange={(s) => handleStatusChange(session.id, s)} />
+                        </div>
+                      )}
+                      
+                      {/* Sub-agents rendered as nested session cards - always visible if they exist */}
+                      {session.terminals && session.terminals.length > 1 && (
+                        <div className="ml-6 mt-2 space-y-2 border-l-2 border-purple-500/30 pl-4 pb-2">
+                          {session.terminals.slice(1).map(terminal => {
+                            const subAgentName = terminal.agent_profile || 'unknown'
+                            const subIcon = AGENT_ICONS[subAgentName] || <User size={20} />
+                            const subKey = `terminal-${terminal.id}`
+                            const isSubActive = activeSession === subKey
+                            
+                            return (
+                              <div
+                                key={terminal.id}
+                                className={`rounded-xl border transition-all ${
+                                  isSubActive 
+                                    ? 'border-purple-500/50 bg-purple-500/5' 
+                                    : 'border-gray-800 bg-gray-900/50 hover:border-gray-700'
+                                }`}
+                              >
+                                <div 
+                                  className="p-3 cursor-pointer"
+                                  onClick={(e) => { e.stopPropagation(); setActiveSession(isSubActive ? null : subKey) }}
+                                >
+                                  <div className="flex items-center gap-3">
+                                    <div className="relative">
+                                      <div className="w-10 h-10 rounded-lg bg-purple-500/20 flex items-center justify-center text-purple-400">
+                                        {subIcon}
+                                      </div>
+                                    </div>
+                                    <div className="flex-1 min-w-0">
+                                      <div className="flex items-center gap-2">
+                                        <h3 className="font-medium text-white text-sm">{subAgentName}</h3>
+                                        <span className="px-2 py-0.5 text-xs rounded-full bg-purple-500/20 text-purple-400">
+                                          sub-agent
+                                        </span>
+                                      </div>
+                                      <p className="text-xs text-gray-500 font-mono">{terminal.id}</p>
+                                    </div>
+                                    <div className="flex items-center gap-2">
+                                      <button
+                                        onClick={(e) => { e.stopPropagation(); setFocusedTerminal(terminal.id) }}
+                                        className="p-2 rounded-lg hover:bg-purple-500/20 text-gray-400 hover:text-purple-400 transition-all"
+                                        title="Focus Terminal"
+                                      >
+                                        <Terminal size={14} />
+                                      </button>
+                                      <ChevronDown size={14} className={`text-gray-400 transition-transform ${isSubActive ? 'rotate-180' : ''}`} />
+                                    </div>
+                                  </div>
+                                </div>
+                                {isSubActive && (
+                                  <div className="border-t border-gray-800 h-64">
+                                    <TerminalView terminalId={terminal.id} onStatusChange={() => {}} />
+                                  </div>
+                                )}
+                              </div>
+                            )
+                          })}
                         </div>
                       )}
                     </div>
@@ -489,7 +495,7 @@ export function AgentPanel() {
         <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
           {agents.map(agent => {
             const icon = AGENT_ICONS[agent.name] || <User size={20} />
-            const isSpawning = spawning?.agent === agent.name
+            const isSpawning = spawning === agent.name
             
             return (
               <div

@@ -2,3 +2,9 @@
 @tailwind components;
 @tailwind utilities;
 body { @apply bg-gray-900 text-gray-100; }
+* { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #374151; border-radius: 2px; }
+:focus-visible { outline: 2px solid #10b981; outline-offset: 2px; }
+:focus:not(:focus-visible) { outline: none; }

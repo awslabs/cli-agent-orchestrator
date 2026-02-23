@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useStore } from '../store'
 import { api } from '../api'
-import { Plus, Edit2, Check, Trash2, ChevronDown, ChevronRight, Inbox, Bot, Wrench, Search, Shield, Swords, Mail, Map, RefreshCw, Package, User, Sparkles, Loader2, X, Terminal } from 'lucide-react'
+import { Plus, Edit2, Check, Trash2, ChevronDown, ChevronRight, Inbox, Bot, Wrench, Search, Shield, Swords, Mail, Map, RefreshCw, User, Sparkles, Loader2, X, Terminal } from 'lucide-react'
 
 const PRIORITY_STYLES = {
   1: { bg: 'bg-red-500/10', border: 'border-red-500/30', text: 'text-red-400', badge: 'bg-red-500', label: 'P1 Critical' },
@@ -23,8 +23,7 @@ const AGENT_ICONS: Record<string, React.ReactNode> = {
   'ticket-ninja': <Swords size={14} />,
   'sns-ticket-ninja': <Mail size={14} />,
   'atlas': <Map size={14} />,
-  'ralph-wiggum': <RefreshCw size={14} />,
-  'amzn-builder': <Package size={14} />
+  'ralph-wiggum': <RefreshCw size={14} />
 }
 
 interface Bead {
@@ -256,27 +255,68 @@ export function BeadsPanel() {
 
   return (
     <div className="space-y-4">
-      {/* AI Bead Generation */}
-      <div className="p-4 rounded-xl border border-purple-500/30 bg-purple-500/5">
-        <div className="flex items-center gap-2 mb-2">
-          <Sparkles size={16} className="text-purple-400" />
-          <span className="text-sm font-medium text-purple-300">AI Bead Generator</span>
+      {/* Quick Add + AI Generator */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {/* Quick Add */}
+        <div className="p-4 rounded-xl border border-emerald-500/30 bg-emerald-500/5">
+          <div className="flex items-center gap-2 mb-3">
+            <Plus size={16} className="text-emerald-400" />
+            <span className="text-sm font-medium text-emerald-300">Quick Add Bead</span>
+          </div>
+          <input
+            value={newBead.title}
+            onChange={e => setNewBead({ ...newBead, title: e.target.value })}
+            onKeyDown={e => e.key === 'Enter' && newBead.title.trim() && createBead()}
+            placeholder="Type a task and press Enter..."
+            className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white text-sm focus:border-emerald-500 focus:outline-none"
+          />
+          <div className="flex items-center gap-2 mt-2">
+            <div className="flex gap-1">
+              {[1, 2, 3].map(p => (
+                <button
+                  key={p}
+                  onClick={() => setNewBead({ ...newBead, priority: p })}
+                  className={`px-2 py-1 text-xs rounded ${
+                    newBead.priority === p 
+                      ? PRIORITY_STYLES[p as 1|2|3].bg + ' ' + PRIORITY_STYLES[p as 1|2|3].text
+                      : 'bg-gray-800 text-gray-500 hover:text-gray-300'
+                  }`}
+                >
+                  P{p}
+                </button>
+              ))}
+            </div>
+            <button
+              onClick={() => setShowCreate(true)}
+              className="ml-auto text-xs text-gray-400 hover:text-white"
+            >
+              + Add details
+            </button>
+          </div>
         </div>
-        <textarea
-          value={aiText}
-          onChange={e => setAiText(e.target.value)}
-          placeholder="Paste requirements, task list, or PRD here..."
-          className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white text-sm focus:border-purple-500 focus:outline-none resize-none"
-          rows={3}
-        />
-        <button
-          onClick={generateBeads}
-          disabled={!aiText.trim() || aiGenerating}
-          className="mt-2 px-4 py-2 text-sm rounded-lg bg-purple-600 hover:bg-purple-500 text-white font-medium transition-all flex items-center gap-2 disabled:opacity-50"
-        >
-          {aiGenerating ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />}
-          {aiGenerating ? 'Generating...' : 'Generate Beads'}
-        </button>
+
+        {/* AI Generator */}
+        <div className="p-4 rounded-xl border border-purple-500/30 bg-purple-500/5">
+          <div className="flex items-center gap-2 mb-3">
+            <Sparkles size={16} className="text-purple-400" />
+            <span className="text-sm font-medium text-purple-300">AI Bead Generator</span>
+          </div>
+          <textarea
+            value={aiText}
+            onChange={e => setAiText(e.target.value)}
+            placeholder="Paste requirements, task list, or describe what you need..."
+            className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-white text-sm focus:border-purple-500 focus:outline-none resize-none"
+            rows={2}
+          />
+          <button
+            onClick={generateBeads}
+            disabled={!aiText.trim() || aiGenerating}
+            className="mt-2 px-4 py-2 text-sm rounded-lg bg-purple-600 hover:bg-purple-500 text-white font-medium transition-all flex items-center gap-2 disabled:opacity-50 w-full justify-center"
+          >
+            {aiGenerating ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />}
+            {aiGenerating ? 'Generating...' : 'Generate Beads from Text'}
+          </button>
+        </div>
       </div>
 
       {/* Header */}

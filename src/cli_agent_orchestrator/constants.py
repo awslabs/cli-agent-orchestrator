@@ -1,5 +1,6 @@
 """Constants for CLI Agent Orchestrator application."""
 
+import os
 from pathlib import Path
 
 from cli_agent_orchestrator.models.provider import ProviderType
@@ -41,16 +42,16 @@ LOCAL_AGENT_STORE_DIR = CAO_HOME_DIR / "agent-store"
 # Q CLI directories
 Q_AGENTS_DIR = Path.home() / ".aws" / "amazonq" / "cli-agents"
 
-# Kiro CLI directories
-KIRO_AGENTS_DIR = Path.home() / ".kiro" / "agents"
+# Kiro CLI directories - configurable via CAO_AGENTS_DIR env var
+KIRO_AGENTS_DIR = Path(os.environ.get("CAO_AGENTS_DIR", str(Path.home() / ".kiro" / "agents")))
 
 # Database configuration
 DATABASE_FILE = DB_DIR / "cli-agent-orchestrator.db"
 DATABASE_URL = f"sqlite:///{DATABASE_FILE}"
 
 # Server configuration
-SERVER_HOST = "localhost"
-SERVER_PORT = 9889
+SERVER_HOST = os.environ.get("CAO_API_HOST", "localhost")
+SERVER_PORT = int(os.environ.get("CAO_API_PORT", "8000"))
 SERVER_VERSION = "0.1.0"
 API_BASE_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
 CORS_ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"]

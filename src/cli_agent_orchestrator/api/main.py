@@ -17,6 +17,7 @@ from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
     get_inbox_messages,
     init_db,
+    list_all_terminals,
 )
 from cli_agent_orchestrator.constants import (
     INBOX_POLLING_INTERVAL,
@@ -214,7 +215,7 @@ async def delete_session(session_name: str) -> Dict:
     status_code=status.HTTP_201_CREATED,
 )
 async def create_terminal_in_session(
-    session_name: str, provider: str, agent_profile: str
+    session_name: str, provider: str, agent_profile: str, parent_terminal_id: Optional[str] = None
 ) -> Terminal:
     """Create additional terminal in existing session."""
     try:
@@ -223,6 +224,7 @@ async def create_terminal_in_session(
             agent_profile=agent_profile,
             session_name=session_name,
             new_session=False,
+            parent_terminal_id=parent_terminal_id,
         )
         return result
     except ValueError as e:
@@ -246,6 +248,24 @@ async def list_terminals_in_session(session_name: str) -> List[Dict]:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to list terminals: {str(e)}",
         )
+
+
+@app.get("/terminals/tree")
+async def get_terminal_tree() -> Dict:
+    """Get all terminals with parent-child relationships for visualization."""
+    terminals = list_all_terminals()
+    # Build tree structure
+    by_id = {t["id"]: t for t in terminals}
+    roots = []
+    for t in terminals:
+        t["children"] = []
+    for t in terminals:
+        parent_id = t.get("parent_terminal_id")
+        if parent_id and parent_id in by_id:
+            by_id[parent_id]["children"].append(t)
+        else:
+            roots.append(t)
+    return {"terminals": terminals, "roots": roots}
 
 
 @app.get("/terminals/{terminal_id}", response_model=Terminal)
@@ -429,9 +449,28 @@ if WEB_DIST.exists():
 
 def main():
     """Entry point for cao-server command."""
+    import argparse
     import uvicorn
 
-    uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT)
+    parser = argparse.ArgumentParser(description="CLI Agent Orchestrator Server")
+    parser.add_argument(
+        "--agents-dir",
+        type=str,
+        default=None,
+        help="Path to agents directory (overrides CAO_AGENTS_DIR env var)",
+    )
+    parser.add_argument("--host", type=str, default=None, help="Server host")
+    parser.add_argument("--port", type=int, default=None, help="Server port")
+    args = parser.parse_args()
+
+    if args.agents_dir:
+        import cli_agent_orchestrator.constants as constants
+        constants.KIRO_AGENTS_DIR = FilePath(args.agents_dir)
+        logger.info(f"Using agents directory: {args.agents_dir}")
+
+    host = args.host or SERVER_HOST
+    port = args.port or SERVER_PORT
+    uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":

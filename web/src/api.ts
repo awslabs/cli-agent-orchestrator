@@ -1,105 +1,133 @@
 const API = '/api'
 
+async function fetchWithResilience(url: string, opts?: RequestInit): Promise<Response> {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 10000)
+  try {
+    const res = await fetch(url, { ...opts, signal: controller.signal })
+    clearTimeout(timeout)
+    return res
+  } catch (e) {
+    clearTimeout(timeout)
+    // Single retry on network error
+    const res = await fetch(url, opts)
+    return res
+  }
+}
+
+function jsonOr<T>(fallback: T) {
+  return (res: Response): Promise<T> => res.ok ? res.json() : Promise.resolve(fallback)
+}
+
 export const api = {
   // V2 Agents
   agents: {
-    list: () => fetch(`${API}/v2/agents`).then(r => r.json()),
-    get: (name: string) => fetch(`${API}/v2/agents/${name}`).then(r => r.json()),
-    create: (data: { name: string; description?: string; steering?: string }) => 
-      fetch(`${API}/v2/agents`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(r => r.json()),
+    list: () => fetchWithResilience(`${API}/v2/agents`).then(jsonOr([])),
+    get: (name: string) => fetchWithResilience(`${API}/v2/agents/${name}`).then(jsonOr({})),
+    create: (data: { name: string; description?: string; steering?: string }) =>
+      fetchWithResilience(`${API}/v2/agents`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(jsonOr({})),
     update: (name: string, data: { name: string; description?: string; steering?: string }) =>
-      fetch(`${API}/v2/agents/${name}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(r => r.json()),
-    delete: (name: string) => fetch(`${API}/v2/agents/${name}`, { method: 'DELETE' })
+      fetchWithResilience(`${API}/v2/agents/${name}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(jsonOr({})),
+    delete: (name: string) => fetchWithResilience(`${API}/v2/agents/${name}`, { method: 'DELETE' })
   },
 
   // V2 Sessions
   sessions: {
-    list: () => fetch(`${API}/v2/sessions`).then(r => r.json()),
-    get: (id: string) => fetch(`${API}/v2/sessions/${id}`).then(r => r.json()),
+    list: () => fetchWithResilience(`${API}/v2/sessions`).then(jsonOr([])),
+    get: (id: string) => fetchWithResilience(`${API}/v2/sessions/${id}`).then(jsonOr({})),
+    getChildren: (id: string) => fetchWithResilience(`${API}/v2/sessions/${id}/children`).then(jsonOr([])),
     create: (data: { agent_name: string; provider?: string }) =>
-      fetch(`${API}/v2/sessions`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(r => r.json()),
-    delete: (id: string) => fetch(`${API}/v2/sessions/${id}`, { method: 'DELETE' }),
+      fetchWithResilience(`${API}/v2/sessions`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(jsonOr({})),
+    delete: (id: string) => fetchWithResilience(`${API}/v2/sessions/${id}`, { method: 'DELETE' }).then(jsonOr({})),
     input: (id: string, message: string, raw: boolean = false) =>
-      fetch(`${API}/v2/sessions/${id}/input?message=${encodeURIComponent(message)}&raw=${raw}`, { method: 'POST' }),
-    output: (id: string) => fetch(`${API}/v2/sessions/${id}/output`).then(r => r.json()),
-    context: (id: string) => fetch(`${API}/v2/sessions/${id}/context`).then(r => r.json()),
+      fetchWithResilience(`${API}/v2/sessions/${id}/input?message=${encodeURIComponent(message)}&raw=${raw}`, { method: 'POST' }),
+    output: (id: string) => fetchWithResilience(`${API}/v2/sessions/${id}/output`).then(jsonOr({})),
+    context: (id: string) => fetchWithResilience(`${API}/v2/sessions/${id}/context`).then(jsonOr({})),
+    getHistory: (id: string) => fetchWithResilience(`${API}/v2/sessions/${id}/history`).then(jsonOr({})),
     autoMode: (id: string, enabled: boolean) =>
-      fetch(`${API}/v2/sessions/${id}/auto-mode`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }) }).then(r => r.json()),
+      fetchWithResilience(`${API}/v2/sessions/${id}/auto-mode`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }) }).then(jsonOr({})),
     updatePosition: (id: string, x: number, y: number) =>
-      fetch(`${API}/v2/sessions/${id}/position`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ x, y }) }).then(r => r.json())
+      fetchWithResilience(`${API}/v2/sessions/${id}/position`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ x, y }) }).then(jsonOr({}))
   },
 
   // V2 Activity
   activity: {
-    list: (sessionId?: string) => fetch(`${API}/v2/activity${sessionId ? `?session_id=${sessionId}` : ''}`).then(r => r.json())
+    list: (sessionId?: string) => fetchWithResilience(`${API}/v2/activity${sessionId ? `?session_id=${sessionId}` : ''}`).then(jsonOr([]))
   },
 
   // Beads (Tasks)
   tasks: {
-    list: () => fetch(`${API}/tasks`).then(r => r.json()),
-    get: (id: string) => fetch(`${API}/tasks/${id}`).then(r => r.json()),
-    create: (data: { title: string; description?: string; priority?: number }) => 
-      fetch(`${API}/tasks`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(r => r.json()),
+    list: () => fetchWithResilience(`${API}/tasks`).then(jsonOr([])),
+    get: (id: string) => fetchWithResilience(`${API}/tasks/${id}`).then(jsonOr({})),
+    create: (data: { title: string; description?: string; priority?: number }) =>
+      fetchWithResilience(`${API}/tasks`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(jsonOr({})),
     createChild: (parentId: string, data: { title: string; description?: string; priority?: number }) =>
-      fetch(`${API}/v2/beads/${parentId}/children`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(r => r.json()),
-    getChildren: (parentId: string) => fetch(`${API}/v2/beads/${parentId}/children`).then(r => r.json()),
+      fetchWithResilience(`${API}/v2/beads/${parentId}/children`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(jsonOr({})),
+    getChildren: (parentId: string) => fetchWithResilience(`${API}/v2/beads/${parentId}/children`).then(jsonOr([])),
     update: (id: string, data: Partial<{ title: string; description: string; priority: number; status: string }>) =>
-      fetch(`${API}/tasks/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(r => r.json()),
-    wip: (id: string) => fetch(`${API}/tasks/${id}/wip`, { method: 'POST' }).then(r => r.json()),
-    close: (id: string) => fetch(`${API}/tasks/${id}/close`, { method: 'POST' }).then(r => r.json()),
-    delete: (id: string) => fetch(`${API}/tasks/${id}`, { method: 'DELETE' }),
+      fetchWithResilience(`${API}/tasks/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(jsonOr({})),
+    wip: (id: string) => fetchWithResilience(`${API}/tasks/${id}/wip`, { method: 'POST' }).then(jsonOr({})),
+    close: (id: string) => fetchWithResilience(`${API}/tasks/${id}/close`, { method: 'POST' }).then(jsonOr({})),
+    delete: (id: string) => fetchWithResilience(`${API}/tasks/${id}`, { method: 'DELETE' }),
     assign: (id: string, sessionId: string) =>
-      fetch(`${API}/v2/beads/${id}/assign`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session_id: sessionId }) }).then(r => r.json()),
+      fetchWithResilience(`${API}/v2/beads/${id}/assign`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session_id: sessionId }) }).then(jsonOr({})),
     assignAgent: (id: string, agentName: string, provider: string = 'kiro_cli') =>
-      fetch(`${API}/v2/beads/${id}/assign-agent`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ agent_name: agentName, provider }) }).then(r => r.json()),
+      fetchWithResilience(`${API}/v2/beads/${id}/assign-agent`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ agent_name: agentName, provider }) }).then(jsonOr({})),
     unassignSession: (sessionId: string) =>
-      fetch(`${API}/tasks/unassign-session/${sessionId}`, { method: 'POST' }).then(r => r.json()),
+      fetchWithResilience(`${API}/tasks/unassign-session/${sessionId}`, { method: 'POST' }).then(jsonOr({})),
     decompose: (text: string) =>
-      fetch(`${API}/v2/beads/decompose`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) }).then(r => r.json()),
+      fetchWithResilience(`${API}/v2/beads/decompose`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) }).then(jsonOr({})),
     updatePosition: (id: string, x: number, y: number) =>
-      fetch(`${API}/v2/beads/${id}/position`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ x, y }) }).then(r => r.json())
+      fetchWithResilience(`${API}/v2/beads/${id}/position`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ x, y }) }).then(jsonOr({}))
   },
 
   // Context Learning
   learn: {
-    trigger: (sessionId: string) => fetch(`${API}/v2/learn/sessions/${sessionId}`, { method: 'POST' }).then(r => r.json()),
-    proposals: () => fetch(`${API}/v2/learn/proposals`).then(r => r.json()),
-    approve: (id: string) => fetch(`${API}/v2/learn/proposals/${id}/approve`, { method: 'POST' }).then(r => r.json()),
-    reject: (id: string) => fetch(`${API}/v2/learn/proposals/${id}/reject`, { method: 'POST' }).then(r => r.json()),
-    memories: () => fetch(`${API}/v2/learn/memories`).then(r => r.json()),
-    addMemory: (title: string, content: string) => fetch(`${API}/v2/learn/memories?title=${encodeURIComponent(title)}&content=${encodeURIComponent(content)}`, { method: 'POST' }).then(r => r.json()),
-    stats: () => fetch(`${API}/v2/learn/stats`).then(r => r.json()),
-    context: () => fetch(`${API}/v2/learn/context`).then(r => r.json())
+    trigger: (sessionId: string) => fetchWithResilience(`${API}/v2/learn/sessions/${sessionId}`, { method: 'POST' }).then(jsonOr({})),
+    fromTerminal: (terminalId: string, outcome: string = 'neutral') =>
+      fetchWithResilience(`${API}/v2/learn/terminals/${terminalId}?outcome=${outcome}`, { method: 'POST' }).then(jsonOr({})),
+    diffProposals: (status?: string) => fetchWithResilience(`${API}/v2/learn/diff-proposals${status ? `?status=${status}` : ''}`).then(jsonOr([])),
+    approveDiff: (id: string) => fetchWithResilience(`${API}/v2/learn/diff-proposals/${id}/approve`, { method: 'POST' }).then(jsonOr({})),
+    rejectDiff: (id: string, feedback?: string) => fetchWithResilience(`${API}/v2/learn/diff-proposals/${id}/reject${feedback ? `?feedback=${encodeURIComponent(feedback)}` : ''}`, { method: 'POST' }).then(jsonOr({})),
+    proposals: () => fetchWithResilience(`${API}/v2/learn/proposals`).then(jsonOr([])),
+    approve: (id: string) => fetchWithResilience(`${API}/v2/learn/proposals/${id}/approve`, { method: 'POST' }).then(jsonOr({})),
+    reject: (id: string) => fetchWithResilience(`${API}/v2/learn/proposals/${id}/reject`, { method: 'POST' }).then(jsonOr({})),
+    memories: () => fetchWithResilience(`${API}/v2/learn/memories`).then(jsonOr([])),
+    addMemory: (title: string, content: string) => fetchWithResilience(`${API}/v2/learn/memories?title=${encodeURIComponent(title)}&content=${encodeURIComponent(content)}`, { method: 'POST' }).then(jsonOr({})),
+    stats: () => fetchWithResilience(`${API}/v2/learn/stats`).then(jsonOr({})),
+    context: () => fetchWithResilience(`${API}/v2/learn/context`).then(jsonOr({}))
   },
 
   // Ralph
   ralph: {
-    list: () => fetch(`${API}/v2/ralph`).then(r => r.json()),
-    get: (id: string) => fetch(`${API}/v2/ralph/${id}`).then(r => r.json()),
-    create: (data: { prompt: string; min_iterations?: number; max_iterations?: number; agent_count?: number }) => 
-      fetch(`${API}/v2/ralph`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(r => r.json()),
-    delete: (id: string) => fetch(`${API}/v2/ralph/${id}`, { method: 'DELETE' }),
-    status: () => fetch(`${API}/ralph`).then(r => r.json()),
-    start: (data: { prompt: string; min_iterations?: number; max_iterations?: number }) => 
-      fetch(`${API}/ralph`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(r => r.json()),
-    stop: () => fetch(`${API}/ralph/stop`, { method: 'POST' })
+    list: () => fetchWithResilience(`${API}/v2/ralph`).then(jsonOr([])),
+    get: (id: string) => fetchWithResilience(`${API}/v2/ralph/${id}`).then(jsonOr({})),
+    create: (data: { prompt: string; min_iterations?: number; max_iterations?: number; agent_count?: number }) =>
+      fetchWithResilience(`${API}/v2/ralph`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(jsonOr({})),
+    delete: (id: string) => fetchWithResilience(`${API}/v2/ralph/${id}`, { method: 'DELETE' }),
+    status: () => fetchWithResilience(`${API}/ralph`).then(jsonOr({})),
+    start: (data: { prompt: string; min_iterations?: number; max_iterations?: number }) =>
+      fetchWithResilience(`${API}/ralph`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(jsonOr({})),
+    stop: () => fetchWithResilience(`${API}/ralph/stop`, { method: 'POST' })
   },
 
   // Map state
   map: {
-    getState: () => fetch(`${API}/v2/map/state`).then(r => r.json())
+    getState: () => fetchWithResilience(`${API}/v2/map/state`).then(jsonOr({}))
   },
 
   // Flows
   flows: {
-    list: () => fetch(`${API}/v2/flows`).then(r => r.json()),
-    get: (name: string) => fetch(`${API}/v2/flows/${name}`).then(r => r.json()),
+    list: () => fetchWithResilience(`${API}/v2/flows`).then(jsonOr([])),
+    get: (name: string) => fetchWithResilience(`${API}/v2/flows/${name}`).then(jsonOr({})),
     create: (data: { name: string; schedule: string; agent_profile: string; prompt: string; provider?: string }) =>
-      fetch(`${API}/v2/flows`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(r => r.json()),
-    run: (name: string) => fetch(`${API}/v2/flows/${name}/run`, { method: 'POST' }).then(r => r.json()),
-    enable: (name: string) => fetch(`${API}/v2/flows/${name}/enable`, { method: 'POST' }).then(r => r.json()),
-    disable: (name: string) => fetch(`${API}/v2/flows/${name}/disable`, { method: 'POST' }).then(r => r.json()),
-    delete: (name: string) => fetch(`${API}/v2/flows/${name}`, { method: 'DELETE' })
+      fetchWithResilience(`${API}/v2/flows`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(jsonOr({})),
+    run: (name: string) => fetchWithResilience(`${API}/v2/flows/${name}/run`, { method: 'POST' }).then(jsonOr({})),
+    enable: (name: string) => fetchWithResilience(`${API}/v2/flows/${name}/enable`, { method: 'POST' }).then(jsonOr({})),
+    disable: (name: string) => fetchWithResilience(`${API}/v2/flows/${name}/disable`, { method: 'POST' }).then(jsonOr({})),
+    delete: (name: string) => fetchWithResilience(`${API}/v2/flows/${name}`, { method: 'DELETE' }),
+    executions: (name: string) => fetchWithResilience(`${API}/v2/flows/${name}/executions`).then(jsonOr({})),
+    executionLog: (id: number) => fetchWithResilience(`${API}/v2/flows/executions/${id}/log`).then(jsonOr({})),
   },
 
   // Messages
@@ -109,8 +137,15 @@ export const api = {
       if (status) params.set('status', status)
       if (limit) params.set('limit', limit.toString())
       const query = params.toString()
-      return fetch(`${API}/terminals/${terminalId}/inbox/messages${query ? `?${query}` : ''}`).then(r => r.json())
+      return fetchWithResilience(`${API}/terminals/${terminalId}/inbox/messages${query ? `?${query}` : ''}`).then(jsonOr([]))
     }
+  },
+
+  // Terminals (sub-agents)
+  terminals: {
+    output: (terminalId: string) => fetchWithResilience(`${API}/v2/terminals/${terminalId}/output`).then(jsonOr({})),
+    input: (terminalId: string, text: string) =>
+      fetchWithResilience(`${API}/v2/terminals/${terminalId}/input`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) }).then(jsonOr({}))
   }
 }
 
