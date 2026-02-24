@@ -45,38 +45,45 @@ uv run pytest test/providers/test_q_cli_unit.py -v -k "test_initialization"
 
 ### Unit Tests
 
-Unit tests are fast (< 1 second) and use mocked dependencies:
+Unit tests are fast and use mocked dependencies:
 
 ```bash
-# Run all unit tests
-uv run pytest test/providers/test_q_cli_unit.py -v
+# Run all unit tests (excludes E2E and integration tests)
+uv run pytest test/ --ignore=test/e2e --ignore=test/providers/test_q_cli_integration.py -v
 
 # Run with coverage report
-uv run pytest test/providers/test_q_cli_unit.py --cov=src/cli_agent_orchestrator/providers/q_cli.py --cov-report=term-missing -v
+uv run pytest test/ --ignore=test/e2e --cov=src --cov-report=term-missing -v
+
+# Run specific test file
+uv run pytest test/providers/test_claude_code_unit.py -v
 
 # Run specific test class
-uv run pytest test/providers/test_q_cli_unit.py::TestQCliProviderStatusDetection -v
-
-# Run specific test
-uv run pytest test/providers/test_q_cli_unit.py::TestQCliProviderStatusDetection::test_get_status_idle -v
+uv run pytest test/providers/test_codex_provider_unit.py::TestCodexBuildCommand -v
 ```
 
 ### Integration Tests
 
-Integration tests require Q CLI to be installed and authenticated:
+Integration tests require the provider CLI to be installed and authenticated:
 
 ```bash
-# Run all integration tests (requires Q CLI setup)
+# Run Q CLI integration tests (requires Q CLI setup)
 uv run pytest test/providers/test_q_cli_integration.py -v
 
 # Skip integration tests
 uv run pytest test/providers/ -m "not integration" -v
 ```
 
-**Requirements for Integration Tests:**
-- Q CLI must be installed (`q` command available)
-- Q CLI must be authenticated (AWS credentials configured)
-- tmux 3.2+ must be installed
+### E2E Tests
+
+E2E tests require a running CAO server, authenticated CLI tools, and tmux:
+
+```bash
+# Run all E2E tests
+uv run pytest -m e2e test/e2e/ -v
+
+# Run E2E tests for a specific provider
+uv run pytest -m e2e test/e2e/ -v -k codex
+```
 
 ### Run All Tests
 
@@ -170,11 +177,11 @@ Add or update tests in `test/`
 ### 4. Run Tests Locally
 
 ```bash
-# Run unit tests (fast)
-uv run pytest test/providers/test_q_cli_unit.py -v
+# Run unit tests (fast, excludes E2E and integration)
+uv run pytest test/ --ignore=test/e2e --ignore=test/providers/test_q_cli_integration.py -v
 
-# Run all tests
-uv run pytest -v
+# Run all tests with coverage
+uv run pytest test/ --ignore=test/e2e --cov=src --cov-report=term-missing -v
 ```
 
 ### 5. Check Code Quality
@@ -195,7 +202,30 @@ git push origin feature/your-feature-name
 
 ### 7. Create Pull Request
 
-Create a pull request on GitHub. CI/CD will automatically run tests.
+Create a pull request on GitHub. CI will automatically run tests and code quality checks.
+
+## CI/CD
+
+### Comprehensive Workflow (`ci.yml`)
+
+Runs on all pushes to `main` and all PRs targeting `main`:
+- **Unit tests**: Python 3.10, 3.11, 3.12 matrix with coverage
+- **Code quality**: black, isort, mypy
+- **Security scan**: Trivy vulnerability scanner (CRITICAL/HIGH)
+- **Dependency review**: License and vulnerability checks on PRs
+
+### Provider-Specific Workflows (path-triggered)
+
+Each provider has a dedicated workflow that runs only when its files change:
+
+| Workflow | Tests | Trigger Paths |
+|---|---|---|
+| `test-codex-provider.yml` | `test_codex_provider_unit.py` | `providers/codex.py`, `test/providers/**` |
+| `test-claude-code-provider.yml` | `test_claude_code_unit.py` | `providers/claude_code.py`, `test/providers/**` |
+| `test-kiro-cli-provider.yml` | `test_kiro_cli_unit.py` | `providers/kiro_cli.py`, `test/providers/**` |
+| `test-q-cli-provider.yml` | `test_q_cli_unit.py` | `providers/q_cli.py`, `test/providers/**` |
+
+Each includes unit tests (Python 3.10/3.11/3.12) and code quality checks (black, isort, mypy).
 
 ## Working with the Q CLI Provider
 
@@ -292,11 +322,16 @@ cli-agent-orchestrator/
 │       ├── providers/              # Agent providers (Q CLI, Claude Code)
 │       ├── services/               # Business logic services
 │       └── utils/                  # Utility functions
-├── test/                           # Test suite
-│   └── providers/                  # Provider tests
-│       ├── fixtures/               # Test fixtures
-│       ├── test_q_cli_unit.py     # Unit tests
-│       └── test_q_cli_integration.py  # Integration tests
+├── test/                           # Test suite (511 tests, 84% coverage)
+│   ├── api/                       # API endpoint tests
+│   ├── cli/                       # CLI command tests
+│   ├── clients/                   # Client tests (database, tmux)
+│   ├── e2e/                       # End-to-end tests (require running CAO server)
+│   ├── mcp_server/                # MCP server tests
+│   ├── models/                    # Data model tests
+│   ├── providers/                 # Provider tests (unit + integration)
+│   ├── services/                  # Service layer tests
+│   └── utils/                     # Utility tests
 ├── docs/                           # Documentation
 ├── examples/                       # Example workflows
 ├── pyproject.toml                  # Project configuration
@@ -306,7 +341,7 @@ cli-agent-orchestrator/
 ## Resources
 
 - [Project README](README.md)
-- [Test Documentation](test/providers/README.md)
+- [Test Documentation](test/README.md)
 - [Contributing Guidelines](CONTRIBUTING.md)
 - [uv Documentation](https://docs.astral.sh/uv/)
 - [pytest Documentation](https://docs.pytest.org/)
