@@ -22,11 +22,25 @@ class TmuxClient:
 
     # Directories that should never be used as working directories.
     # Prevents user-supplied paths from pointing at sensitive system locations.
-    _BLOCKED_DIRECTORIES = frozenset({
-        "/", "/bin", "/sbin", "/usr/bin", "/usr/sbin",
-        "/etc", "/var", "/tmp", "/dev", "/proc", "/sys",
-        "/root", "/boot", "/lib", "/lib64",
-    })
+    _BLOCKED_DIRECTORIES = frozenset(
+        {
+            "/",
+            "/bin",
+            "/sbin",
+            "/usr/bin",
+            "/usr/sbin",
+            "/etc",
+            "/var",
+            "/tmp",
+            "/dev",
+            "/proc",
+            "/sys",
+            "/root",
+            "/boot",
+            "/lib",
+            "/lib64",
+        }
+    )
 
     def _resolve_and_validate_working_directory(self, working_directory: Optional[str]) -> str:
         """Resolve and validate working directory.

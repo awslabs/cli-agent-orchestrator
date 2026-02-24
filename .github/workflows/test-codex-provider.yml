@@ -1,4 +1,4 @@
-name: Test Kiro CLI Provider
+name: Test Codex CLI Provider
 
 permissions:
   contents: read
@@ -7,19 +7,19 @@ on:
   push:
     branches: [ main, develop ]
     paths:
-      - 'src/cli_agent_orchestrator/providers/kiro_cli.py'
-      - 'test/providers/test_kiro_cli_unit.py'
-      - 'test/providers/fixtures/kiro_cli_*.txt'
+      - 'src/cli_agent_orchestrator/providers/codex.py'
+      - 'test/providers/test_codex_provider_unit.py'
+      - 'test/providers/fixtures/codex_*.txt'
       - 'pyproject.toml'
-      - '.github/workflows/test-kiro-cli-provider.yml'
+      - '.github/workflows/test-codex-provider.yml'
   pull_request:
     branches: [ main, develop ]
     paths:
-      - 'src/cli_agent_orchestrator/providers/kiro_cli.py'
-      - 'test/providers/test_kiro_cli_unit.py'
-      - 'test/providers/fixtures/kiro_cli_*.txt'
+      - 'src/cli_agent_orchestrator/providers/codex.py'
+      - 'test/providers/test_codex_provider_unit.py'
+      - 'test/providers/fixtures/codex_*.txt'
       - 'pyproject.toml'
-      - '.github/workflows/test-kiro-cli-provider.yml'
+      - '.github/workflows/test-codex-provider.yml'
 
 jobs:
   unit-tests:
@@ -28,7 +28,7 @@ jobs:
     strategy:
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -47,8 +47,8 @@ jobs:
 
       - name: Run unit tests with coverage
         run: |
-          uv run pytest test/providers/test_kiro_cli_unit.py \
-            --cov=src/cli_agent_orchestrator/providers/kiro_cli.py \
+          uv run pytest test/providers/test_codex_provider_unit.py \
+            --cov=src/cli_agent_orchestrator/providers/codex.py \
             --cov-report=xml \
             --cov-report=term-missing \
             -v
@@ -66,7 +66,7 @@ jobs:
   lint:
     name: Code Quality
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
