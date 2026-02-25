@@ -26,7 +26,7 @@ def list_sessions() -> List[Dict]:
 
 def get_session(session_name: str) -> Dict:
     """Get session with terminals.
-    
+
     Automatically cleans up database records for terminals whose tmux windows no longer exist.
     If the session itself doesn't exist in tmux, cleans up all associated terminal records.
     """
@@ -45,19 +45,17 @@ def get_session(session_name: str) -> Dict:
 
         # Get terminals and filter out those whose tmux windows no longer exist
         from cli_agent_orchestrator.clients.database import delete_terminal
-        
+
         terminals = list_terminals_by_session(session_name)
         active_terminals = []
-        
+
         for terminal in terminals:
             if tmux_client.window_exists(terminal["tmux_session"], terminal["tmux_window"]):
                 active_terminals.append(terminal)
             else:
-                logger.info(
-                    f"Cleaning up terminal {terminal['id']} - tmux window no longer exists"
-                )
+                logger.info(f"Cleaning up terminal {terminal['id']} - tmux window no longer exists")
                 delete_terminal(terminal["id"])
-        
+
         return {"session": session_data, "terminals": active_terminals}
 
     except Exception as e:
@@ -86,7 +84,7 @@ def delete_session(session_name: str) -> bool:
         kill_success = tmux_client.kill_session(session_name)
         if not kill_success:
             logger.warning(f"kill_session returned False for {session_name}")
-        
+
         # Verify session is actually gone
         if tmux_client.session_exists(session_name):
             raise RuntimeError(f"Tmux session {session_name} still exists after kill attempt")
@@ -94,9 +92,10 @@ def delete_session(session_name: str) -> bool:
         # Delete terminal metadata
         deleted_count = delete_terminals_by_session(session_name)
         logger.info(f"Deleted {deleted_count} terminal records for session {session_name}")
-        
+
         # Delete log files for all terminals
         from cli_agent_orchestrator.constants import TERMINAL_LOG_DIR
+
         for terminal in terminals:
             log_path = TERMINAL_LOG_DIR / f"{terminal['id']}.log"
             try:

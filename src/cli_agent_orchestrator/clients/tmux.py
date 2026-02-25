@@ -328,12 +328,11 @@ class TmuxClient:
             for window in session.windows:
                 if window.name == window_name:
                     return True
-            
+
             return False
         except Exception as e:
             logger.debug(f"Window check failed for {session_name}:{window_name}: {e}")
             return False
-
 
     def list_sessions(self) -> List[Dict[str, str]]:
         """List all tmux sessions."""
@@ -379,6 +378,7 @@ class TmuxClient:
         except Exception as e:
             logger.error(f"Failed to kill session {session_name}: {e}")
             return False
+
     def kill_window(self, session_name: str, window_name: str) -> bool:
         """Kill a specific tmux window.
 
@@ -406,7 +406,6 @@ class TmuxClient:
         except Exception as e:
             logger.error(f"Failed to kill window {session_name}:{window_name}: {e}")
             return False
-
 
     def session_exists(self, session_name: str) -> bool:
         """Check if session exists."""
@@ -439,7 +438,6 @@ class TmuxClient:
         except Exception as e:
             logger.debug(f"Failed to get session {session_name}: {e}")
             return None
-
 
     def get_pane_working_directory(self, session_name: str, window_name: str) -> Optional[str]:
         """Get the current working directory of a pane."""

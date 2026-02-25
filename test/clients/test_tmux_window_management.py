@@ -279,7 +279,6 @@ class TestSessionExists:
         assert result is False
 
 
-
 class TestGetSession:
     """Tests for get_session method."""
 

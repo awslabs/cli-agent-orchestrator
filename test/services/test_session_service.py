@@ -69,7 +69,12 @@ class TestGetSession:
         mock_tmux.get_session.return_value = {"id": "cao-test", "name": "Test Session"}
         mock_tmux.window_exists.return_value = True
         mock_list_terminals.return_value = [
-            {"id": "terminal1", "session": "cao-test", "tmux_session": "cao-test", "tmux_window": "window1"}
+            {
+                "id": "terminal1",
+                "session": "cao-test",
+                "tmux_session": "cao-test",
+                "tmux_window": "window1",
+            }
         ]
 
         result = get_session("cao-test")

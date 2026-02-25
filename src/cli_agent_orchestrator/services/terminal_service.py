@@ -147,15 +147,15 @@ def create_terminal(
     except Exception as e:
         # Cleanup on failure: clean up all created resources
         logger.error(f"Failed to create terminal: {e}")
-        
+
         # For new sessions, kill the entire session
-        if new_session and 'session_name' in locals():
+        if new_session and "session_name" in locals():
             try:
                 tmux_client.kill_session(session_name)
                 logger.debug(f"Killed session {session_name} during cleanup")
             except Exception as cleanup_err:
                 logger.warning(f"Failed to kill session during cleanup: {cleanup_err}")
-        
+
         # For existing sessions or if session kill failed, use delete_terminal
         # to clean up the window and all associated resources
         try:
@@ -163,15 +163,15 @@ def create_terminal(
             logger.debug(f"Cleaned up terminal {terminal_id} via delete_terminal")
         except Exception as cleanup_err:
             logger.warning(f"Failed to cleanup terminal during create failure: {cleanup_err}")
-        
+
         raise
 
 
 def get_terminal(terminal_id: str) -> Dict:
     """Get terminal data.
-    
+
     Automatically cleans up database record if tmux window no longer exists.
-    
+
     Raises:
         ValueError: If terminal not found or tmux window no longer exists
     """
@@ -182,10 +182,9 @@ def get_terminal(terminal_id: str) -> Dict:
 
         # Check if tmux window still exists
         if not tmux_client.window_exists(metadata["tmux_session"], metadata["tmux_window"]):
-            logger.info(
-                f"Cleaning up terminal {terminal_id} - tmux window no longer exists"
-            )
+            logger.info(f"Cleaning up terminal {terminal_id} - tmux window no longer exists")
             from cli_agent_orchestrator.clients.database import delete_terminal
+
             delete_terminal(terminal_id)
             raise ValueError(f"Terminal '{terminal_id}' no longer exists (tmux window closed)")
 
@@ -361,7 +360,7 @@ def delete_terminal(terminal_id: str) -> bool:
 
         # 4. Delete database record
         deleted = db_delete_terminal(terminal_id)
-        
+
         # 5. Delete log file
         log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
         try:
@@ -369,7 +368,7 @@ def delete_terminal(terminal_id: str) -> bool:
             logger.debug(f"Deleted log file for {terminal_id}")
         except Exception as e:
             logger.warning(f"Failed to delete log file for {terminal_id}: {e}")
-        
+
         logger.info(f"Deleted terminal: {terminal_id}")
         return deleted
 
