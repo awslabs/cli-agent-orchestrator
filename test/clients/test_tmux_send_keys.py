@@ -52,6 +52,8 @@ class TestSendKeys:
         assert calls[2] == call(
             ["tmux", "send-keys", "-t", "sess:win", "Enter"],
             check=True,
+            capture_output=True,
+            text=True,
         )
         # delete-buffer (best-effort)
         assert calls[3] == call(
@@ -130,10 +132,14 @@ class TestSendKeys:
         assert calls[2] == call(
             ["tmux", "send-keys", "-t", "sess:win", "Enter"],
             check=True,
+            capture_output=True,
+            text=True,
         )
         assert calls[3] == call(
             ["tmux", "send-keys", "-t", "sess:win", "Enter"],
             check=True,
+            capture_output=True,
+            text=True,
         )
 
     def test_large_message(self, client, mock_subprocess, mock_uuid):

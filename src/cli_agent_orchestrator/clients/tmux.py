@@ -237,11 +237,21 @@ class TmuxClient:
                     # process the previous Enter (e.g., Ink adding a newline)
                     # before the next Enter triggers form submission.
                     time.sleep(0.5)
-                subprocess.run(
-                    ["tmux", "send-keys", "-t", target, "Enter"],
-                    check=True,
-                )
-            logger.debug(f"Sent keys to {target}")
+                try:
+                    result = subprocess.run(
+                        ["tmux", "send-keys", "-t", target, "Enter"],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+                    logger.debug(f"Sent Enter key {i+1}/{enter_count} to {target}")
+                except subprocess.CalledProcessError as e:
+                    logger.error(
+                        f"Failed to send Enter key {i+1}/{enter_count} to {target}: "
+                        f"returncode={e.returncode}, stderr={e.stderr}"
+                    )
+                    raise
+            logger.debug(f"Sent keys to {target} with {enter_count} Enter key(s)")
         except Exception as e:
             logger.error(f"Failed to send keys to {target}: {e}")
             raise
