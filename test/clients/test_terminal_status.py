@@ -13,8 +13,18 @@ from cli_agent_orchestrator.clients.database import (
 
 @pytest.fixture(autouse=True)
 def setup_db():
-    """Initialize database before each test."""
+    """Initialize database before each test and clean up after."""
     init_db()
+    yield
+    # Clean up test terminals after each test
+    from cli_agent_orchestrator.clients.database import SessionLocal, TerminalModel
+    with SessionLocal() as db:
+        db.query(TerminalModel).filter(
+            TerminalModel.id.in_([
+                "test1234", "test5678", "test9999", "testaaaa", "testbbbb", "testcccc"
+            ])
+        ).delete(synchronize_session=False)
+        db.commit()
 
 
 class TestTerminalStatus:
