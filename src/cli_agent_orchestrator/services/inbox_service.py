@@ -95,8 +95,8 @@ def check_and_send_pending_messages(terminal_id: str) -> bool:
     if provider is None:
         raise ValueError(f"Provider not found for terminal {terminal_id}")
     # Let the provider use its own default tail_lines. Each provider knows how
-    # many lines it needs to reliably detect the idle prompt (some TUI providers
-    # need 50+ lines due to TUI padding). Previously this passed
+    # many lines it needs to reliably detect the idle prompt (TUI providers
+    # need 50 lines due to TUI padding). Previously this passed
     # INBOX_SERVICE_TAIL_LINES=5, which was too few for TUI-based providers —
     # the idle prompt was never found, so messages stayed PENDING forever.
     status = provider.get_status()

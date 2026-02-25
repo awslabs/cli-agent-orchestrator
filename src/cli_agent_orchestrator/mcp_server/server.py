@@ -165,9 +165,9 @@ async def _handoff_impl(
 
         # Wait for terminal to be ready (IDLE or COMPLETED) before sending
         # the handoff message. Accept COMPLETED in addition to IDLE because
-        # some providers process the system prompt as the first user message
-        # and produce a response, reaching COMPLETED without ever showing a
-        # bare IDLE state.
+        # providers that use an initial prompt flag process the system prompt
+        # as the first user message and produce a response, reaching COMPLETED
+        # without ever showing a bare IDLE state.
         # Both states indicate the provider is ready to accept input.
         #
         # Use a generous timeout (120s) because provider initialization can be
@@ -175,7 +175,7 @@ async def _handoff_impl(
         # (~10-30s), and API authentication (~5-10s). If the provider's own
         # initialize() timed out (60-90s), this acts as a fallback to catch
         # cases where the CLI starts slightly after the provider timeout.
-        # Startup times vary by provider (~15-45s).
+        # Provider initialization can be slow (~15-45s depending on provider).
         if not wait_until_terminal_status(
             terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},

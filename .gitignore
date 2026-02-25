@@ -26,6 +26,15 @@ dist/
 *.db
 .amazonq/
 .obsidian/
+.ralph/
+.ralphrc
+work/
+
+# AI tool configs
+.claude/
+.codex/
+.agents/
+.kiro/
 
 # Memory
 context/

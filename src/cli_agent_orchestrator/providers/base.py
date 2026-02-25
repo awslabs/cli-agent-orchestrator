@@ -62,9 +62,9 @@ class BaseProvider(ABC):
     def paste_enter_count(self) -> int:
         """Number of Enter keys to send after pasting user input.
 
-        After bracketed paste (``paste-buffer -p``), many TUIs enter
-        multi-line mode. The first Enter adds a newline; the second Enter
-        on the empty line triggers submission.
+        After bracketed paste (``paste-buffer -p``), many TUIs (e.g.
+        Claude Code) enter multi-line mode. The first Enter adds a
+        newline; the second Enter on the empty line triggers submission.
 
         Default is 2 (double-Enter). Override to 1 for TUIs where single
         Enter submits after bracketed paste.
@@ -134,9 +134,10 @@ class BaseProvider(ABC):
         """Notify the provider that external input was sent to the terminal.
 
         Called by the terminal service after send_input() delivers a message.
-        Providers can override this to adjust status detection behavior —
-        e.g., to distinguish post-init idle (ready for first input)
-        from post-task completed.
+        Providers can override this to adjust status detection behavior.
+        For example, providers with initial prompts can use this to
+        distinguish post-init idle (ready for first input) from
+        post-task completed.
         """
         pass
 

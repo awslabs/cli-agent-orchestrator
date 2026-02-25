@@ -142,7 +142,6 @@ cao launch --agents code_supervisor
 cao launch --agents code_supervisor --provider kiro_cli
 cao launch --agents code_supervisor --provider claude_code
 cao launch --agents code_supervisor --provider codex
-
 # Skip workspace trust confirmation
 cao launch --agents code_supervisor --yolo
 ```

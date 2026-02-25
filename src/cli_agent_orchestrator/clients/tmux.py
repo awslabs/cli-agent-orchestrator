@@ -46,7 +46,8 @@ class TmuxClient:
         """Resolve and validate working directory.
 
         Canonicalizes the path (resolves symlinks, normalizes ``..``) and
-        rejects paths that point to sensitive system directories.
+        rejects paths that point to sensitive system directories or escape
+        the user's home directory.
 
         Args:
             working_directory: Optional directory path, defaults to current directory
@@ -55,23 +56,62 @@ class TmuxClient:
             Canonicalized absolute path
 
         Raises:
-            ValueError: If directory does not exist or is a blocked system path
+            ValueError: If directory does not exist, is a blocked system path,
+                or is outside the user's home directory
         """
         if working_directory is None:
             working_directory = os.getcwd()
 
-        # Canonicalize path (resolve symlinks and normalize)
-        real_path = os.path.realpath(working_directory)
+        # Step 1: Normalize the path to resolve .. sequences.
+        # os.path.normpath is recognized by CodeQL as a PathNormalization
+        # that transitions taint from NotNormalized to NormalizedUnchecked.
+        safe_working_directory = os.path.normpath(os.path.abspath(working_directory))
+
+        home_dir = os.path.normpath(os.path.expanduser("~"))
+
+        # Step 2: Path containment — startswith is recognized by CodeQL as a
+        # SafeAccessCheck that clears the NormalizedUnchecked taint state.
+        # This MUST be an unconditional startswith guard (no compound `and`)
+        # so CodeQL recognizes it on all code paths to filesystem operations.
+        if not safe_working_directory.startswith(home_dir):
+            raise ValueError(
+                f"Working directory not allowed: {working_directory} "
+                f"(resolves to {safe_working_directory}, which is outside "
+                f"home directory {home_dir})"
+            )
+
+        # Step 3: Precise directory boundary check.
+        # The startswith(home_dir) above is slightly permissive (e.g.,
+        # "/home/user2" matches "/home/user"). This ensures the path is
+        # either exactly home_dir or a proper child of it.
+        if safe_working_directory != home_dir and not safe_working_directory.startswith(
+            home_dir + os.sep
+        ):
+            raise ValueError(
+                f"Working directory not allowed: {working_directory} "
+                f"(resolves to {safe_working_directory}, which is outside "
+                f"home directory {home_dir})"
+            )
+
+        # Step 4: Block sensitive system directories
+        if safe_working_directory in self._BLOCKED_DIRECTORIES:
+            raise ValueError(
+                f"Working directory not allowed: {working_directory} "
+                f"(resolves to blocked path {safe_working_directory})"
+            )
+
+        # Step 5: Resolve symlinks and re-validate containment.
+        # This prevents symlink-based escapes from the home directory.
+        real_path = os.path.realpath(safe_working_directory)
+        if not real_path.startswith(home_dir + os.sep) and real_path != home_dir:
+            raise ValueError(
+                f"Working directory not allowed: {working_directory} "
+                f"(symlink resolves to {real_path}, which is outside "
+                f"home directory {home_dir})"
+            )
 
         if not os.path.isdir(real_path):
             raise ValueError(f"Working directory does not exist: {working_directory}")
-
-        # Block sensitive system directories
-        if real_path in self._BLOCKED_DIRECTORIES:
-            raise ValueError(
-                f"Working directory not allowed: {working_directory} "
-                f"(resolves to blocked path {real_path})"
-            )
 
         return real_path
 

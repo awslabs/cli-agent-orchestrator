@@ -4,7 +4,8 @@ This module defines all configuration constants used throughout the CAO applicat
 including directory paths, server settings, and provider configurations.
 
 The CAO application orchestrates multiple CLI-based AI agents (Kiro CLI, Claude Code,
-Codex, Q CLI) through tmux sessions, providing a unified interface for agent management.
+Codex, Q CLI) through tmux sessions, providing a unified interface
+for agent management.
 """
 
 from pathlib import Path
@@ -54,7 +55,6 @@ TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
 # Polling interval for detecting log file changes (seconds)
 # Lower values = faster response, higher CPU usage
 INBOX_POLLING_INTERVAL = 5
-
 
 # =============================================================================
 # Cleanup Service Configuration
