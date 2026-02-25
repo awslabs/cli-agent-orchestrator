@@ -209,10 +209,10 @@ class TestInstallCommand:
                     # Should use || to fail if curl fails when CAO_TERMINAL_ID is set
                     assert "||" in hook_command, f"{event} hook should fail loudly when CAO_TERMINAL_ID is set"
                     assert "curl" in hook_command, f"{event} hook should use curl"
-                    assert "--max-time 2" in hook_command, f"{event} hook should have 2 second timeout"
-                    assert "--retry 3" in hook_command, f"{event} hook should retry 3 times"
-                    assert "--retry-delay 1" in hook_command, f"{event} hook should have 1 second retry delay"
-                    assert "--retry-max-time 10" in hook_command, f"{event} hook should have 10 second max retry time"
+                    assert "--max-time 5" in hook_command, f"{event} hook should have 5 second timeout"
+                    assert "--retry 5" in hook_command, f"{event} hook should retry 5 times"
+                    assert "--retry-delay 2" in hook_command, f"{event} hook should have 2 second retry delay"
+                    assert "--retry-max-time 30" in hook_command, f"{event} hook should have 30 second max retry time"
                     assert "$CAO_TERMINAL_ID" in hook_command, f"{event} hook should use CAO_TERMINAL_ID"
                     # Should NOT redirect output (we want to see errors)
                     assert ">/dev/null" not in hook_command, f"{event} hook should not redirect output"
