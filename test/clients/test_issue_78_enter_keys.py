@@ -82,3 +82,36 @@ class TestEnterKeySending:
         sleep_calls = [c[0][0] for c in mock_sleep.call_args_list]
         assert 0.3 in sleep_calls  # Initial delay after paste
         assert 0.5 in sleep_calls  # Delay between Enter keys
+
+    @patch("cli_agent_orchestrator.clients.tmux.subprocess.run")
+    @patch("cli_agent_orchestrator.clients.tmux.time.sleep")
+    def test_enter_key_retry_on_failure(self, mock_sleep, mock_run):
+        """Test that Enter key sending retries on transient failures."""
+        # Make first attempt fail, second succeed
+        call_count = 0
+        def run_side_effect(*args, **kwargs):
+            nonlocal call_count
+            cmd = args[0]
+            if "send-keys" in cmd and "Enter" in cmd:
+                call_count += 1
+                if call_count == 1:
+                    # First attempt fails
+                    raise subprocess.CalledProcessError(
+                        returncode=1, cmd=cmd, stderr="session not found"
+                    )
+                # Second attempt succeeds
+                return MagicMock(returncode=0)
+            return MagicMock(returncode=0)
+        
+        mock_run.side_effect = run_side_effect
+        
+        client = TmuxClient()
+        # Should succeed after retry
+        client.send_keys("test-session", "test-window", "Hello", enter_count=1)
+        
+        # Verify retry happened (2 attempts for Enter key)
+        enter_calls = [
+            c for c in mock_run.call_args_list 
+            if c[0][0][:2] == ["tmux", "send-keys"] and "Enter" in c[0][0]
+        ]
+        assert len(enter_calls) == 2  # First failed, second succeeded
