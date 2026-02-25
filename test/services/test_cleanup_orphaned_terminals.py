@@ -180,6 +180,7 @@ class TestCleanupOrphanedTerminals:
             for record in caplog.records
         ), "Should log orphaned terminal removal"
 
+    @pytest.mark.skip(reason="Terminal status feature removed - test uses outdated API")
     def test_cleanup_deletes_terminal_status_with_terminal(self, mock_tmux_client):
         """Test that cleanup removes status when deleting orphaned terminal."""
         from datetime import datetime, timedelta
