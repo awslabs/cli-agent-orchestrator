@@ -4,7 +4,7 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import Boolean, Column, DateTime, Integer, String, create_engine, text
+from sqlalchemy import Boolean, Column, DateTime, Integer, String, create_engine, event, text
 from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
 
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
@@ -61,13 +61,49 @@ class FlowModel(Base):
 
 # Module-level singletons
 DB_DIR.mkdir(parents=True, exist_ok=True)
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={
+        "check_same_thread": False,
+        "timeout": 30.0,  # 30 second timeout for safety
+    },
+    pool_pre_ping=True,  # Verify connections before using
+    pool_size=10,  # Increased from default 5 for multi-worker support
+    max_overflow=20,  # Increased from default 10 for multi-worker support
+)
+
+
+# Set synchronous=NORMAL on every connection (per-connection setting)
+@event.listens_for(engine, "connect")
+def set_sqlite_pragma(dbapi_conn, connection_record):
+    """Set SQLite pragmas on each connection.
+    
+    synchronous=NORMAL is a per-connection setting that must be set on each connection.
+    With WAL mode, NORMAL is safe and much faster than FULL.
+    """
+    cursor = dbapi_conn.cursor()
+    cursor.execute("PRAGMA synchronous=NORMAL")
+    cursor.close()
+
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
 def init_db() -> None:
     """Initialize database tables and perform migrations."""
     Base.metadata.create_all(bind=engine)
+    
+    # Enable WAL mode for better concurrent access (persistent database setting)
+    # WAL allows readers and writers to operate concurrently
+    with SessionLocal() as db:
+        try:
+            result = db.execute(text("PRAGMA journal_mode=WAL"))
+            mode = result.fetchone()[0]
+            logger.info(f"Database journal_mode: {mode}")
+            db.commit()
+        except Exception as e:
+            logger.warning(f"Failed to set WAL mode: {e}")
+            db.rollback()
     
     # Migration: Add status column to terminals table if it doesn't exist
     # This ensures backward compatibility with existing databases
@@ -196,15 +232,23 @@ def update_terminal_status(terminal_id: str, status: str) -> bool:
         True if updated successfully, False if terminal not found
     """
     with SessionLocal() as db:
-        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
-        if terminal:
-            terminal.status = status
-            terminal.last_active = datetime.now()
-            db.commit()
+        # Use direct UPDATE instead of SELECT-then-UPDATE for better performance
+        # This reduces database round trips and lock contention
+        from sqlalchemy import update
+        stmt = update(TerminalModel).where(TerminalModel.id == terminal_id).values(
+            status=status,
+            last_active=datetime.now()
+        )
+        
+        result = db.execute(stmt)
+        db.commit()
+        
+        if result.rowcount > 0:
             logger.debug(f"Updated terminal {terminal_id} status to: {status}")
             return True
-        logger.warning(f"Terminal {terminal_id} not found for status update")
-        return False
+        else:
+            logger.warning(f"Terminal {terminal_id} not found for status update")
+            return False
 
 
 def get_terminal_status(terminal_id: str) -> Optional[str]:

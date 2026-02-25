@@ -357,12 +357,14 @@ async def update_terminal_status_endpoint(
         success = update_terminal_status(terminal_id, new_status)
         if not success:
             raise ValueError(f"Terminal '{terminal_id}' not found")
+        
         return {"success": True, "terminal_id": terminal_id, "status": new_status}
     except HTTPException:
         raise
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
+        logger.error(f"Failed to update terminal status: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to update terminal status: {str(e)}",
@@ -480,9 +482,24 @@ async def get_inbox_messages_endpoint(
 
 def main():
     """Entry point for cao-server command."""
+    import os
     import uvicorn
 
-    uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT)
+    # Calculate optimal worker count based on CPU cores
+    # Formula from Gunicorn docs: (2 * CPU_count) + 1 for I/O-bound applications
+    # Reasoning: For each core, one worker handles I/O while another processes requests
+    # Cap at 8 workers to avoid excessive resource usage on high-core machines
+    cpu_count = os.cpu_count() or 1
+    workers = min((2 * cpu_count) + 1, 8)
+    
+    logger.info(f"Starting CAO server with {workers} workers (CPUs: {cpu_count})")
+    
+    uvicorn.run(
+        "cli_agent_orchestrator.api.main:app",
+        host=SERVER_HOST,
+        port=SERVER_PORT,
+        workers=workers
+    )
 
 
 if __name__ == "__main__":
