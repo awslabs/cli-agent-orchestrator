@@ -117,7 +117,7 @@ class TestInstallCommand:
         runner,
         mock_agent_profile,
     ):
-        """Test installing built-in agent for kiro_cli provider."""
+        """Test installing built-in agent for kiro_cli provider without hooks."""
         with tempfile.TemporaryDirectory() as tmpdir:
             tmppath = Path(tmpdir)
             mock_local_store.__truediv__ = lambda self, x: tmppath / "local" / x
@@ -146,6 +146,82 @@ class TestInstallCommand:
                 result = runner.invoke(install, ["test-agent", "--provider", "kiro_cli"])
 
                 # Should not fail (may have issues with file writes in test env)
+                mock_load.assert_called_once_with("test-agent")
+
+    @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
+    @patch("cli_agent_orchestrator.cli.commands.install.AGENT_CONTEXT_DIR")
+    @patch("cli_agent_orchestrator.cli.commands.install.KIRO_AGENTS_DIR")
+    @patch("cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR")
+    def test_install_kiro_cli_with_hooks(
+        self,
+        mock_local_store,
+        mock_kiro_dir,
+        mock_context_dir,
+        mock_load,
+        runner,
+        mock_agent_profile,
+    ):
+        """Test installing agent for kiro_cli provider with --use-hooks flag."""
+        import json
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            mock_local_store.__truediv__ = lambda self, x: tmppath / "local" / x
+            mock_local_store.exists = MagicMock(return_value=False)
+            mock_kiro_dir.__truediv__ = lambda self, x: tmppath / "kiro" / x
+            mock_kiro_dir.mkdir = MagicMock()
+            mock_context_dir.__truediv__ = lambda self, x: tmppath / "context" / x
+            mock_context_dir.mkdir = MagicMock()
+
+            mock_load.return_value = mock_agent_profile
+
+            # Create mock for resources.files
+            with patch(
+                "cli_agent_orchestrator.cli.commands.install.resources.files"
+            ) as mock_resources:
+                mock_agent_store = MagicMock()
+                mock_agent_store.__truediv__ = lambda self, x: tmppath / "builtin" / x
+                mock_resources.return_value = mock_agent_store
+
+                # Create builtin file
+                (tmppath / "builtin").mkdir(parents=True, exist_ok=True)
+                (tmppath / "builtin" / "test-agent.md").write_text("# Test\nname: test-agent")
+                (tmppath / "context").mkdir(parents=True, exist_ok=True)
+                (tmppath / "kiro").mkdir(parents=True, exist_ok=True)
+
+                result = runner.invoke(install, ["test-agent", "--provider", "kiro_cli", "--use-hooks"])
+
+                # Verify hooks were injected
+                agent_file = tmppath / "kiro" / "test-agent.json"
+                assert agent_file.exists(), "Agent file should be created"
+                
+                config = json.loads(agent_file.read_text())
+                assert "hooks" in config, "Config should have hooks"
+                assert "agentSpawn" in config["hooks"], "Should have agentSpawn hook"
+                assert "userPromptSubmit" in config["hooks"], "Should have userPromptSubmit hook"
+                assert "stop" in config["hooks"], "Should have stop hook"
+                
+                # Verify hooks check for CAO_TERMINAL_ID and fail loudly if set
+                for event in ["agentSpawn", "userPromptSubmit", "stop"]:
+                    hook_command = config["hooks"][event][0]["command"]
+                    # Should check if CAO_TERMINAL_ID is empty
+                    assert '[ -z "$CAO_TERMINAL_ID" ]' in hook_command, f"{event} hook should check if CAO_TERMINAL_ID is set"
+                    # Should use || to fail if curl fails when CAO_TERMINAL_ID is set
+                    assert "||" in hook_command, f"{event} hook should fail loudly when CAO_TERMINAL_ID is set"
+                    assert "curl" in hook_command, f"{event} hook should use curl"
+                    assert "--max-time 2" in hook_command, f"{event} hook should have 2 second timeout"
+                    assert "--retry 3" in hook_command, f"{event} hook should retry 3 times"
+                    assert "--retry-delay 1" in hook_command, f"{event} hook should have 1 second retry delay"
+                    assert "--retry-max-time 10" in hook_command, f"{event} hook should have 10 second max retry time"
+                    assert "$CAO_TERMINAL_ID" in hook_command, f"{event} hook should use CAO_TERMINAL_ID"
+                    # Should NOT redirect output (we want to see errors)
+                    assert ">/dev/null" not in hook_command, f"{event} hook should not redirect output"
+                    assert "2>&1" not in hook_command, f"{event} hook should not redirect stderr"
+                
+                # Verify success message includes hook confirmation
+                assert result.exit_code == 0
+                assert "CAO status hooks enabled" in result.output
+                
                 mock_load.assert_called_once_with("test-agent")
 
     @patch("cli_agent_orchestrator.cli.commands.install._download_agent")

@@ -13,6 +13,7 @@ from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
     get_inbox_messages,
     init_db,
+    update_terminal_status,
 )
 from cli_agent_orchestrator.constants import (
     INBOX_POLLING_INTERVAL,
@@ -222,9 +223,11 @@ async def create_terminal_in_session(
 async def list_terminals_in_session(session_name: str) -> List[Dict]:
     """List all terminals in a session."""
     try:
-        from cli_agent_orchestrator.clients.database import list_terminals_by_session
-
-        return list_terminals_by_session(session_name)
+        from cli_agent_orchestrator.services import session_service
+        session_data = session_service.get_session(session_name)
+        return session_data["terminals"]
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -234,6 +237,7 @@ async def list_terminals_in_session(session_name: str) -> List[Dict]:
 
 @app.get("/terminals/{terminal_id}", response_model=Terminal)
 async def get_terminal(terminal_id: TerminalId) -> Terminal:
+    """Get terminal information."""
     try:
         terminal = terminal_service.get_terminal(terminal_id)
         return Terminal(**terminal)
@@ -313,6 +317,55 @@ async def exit_terminal(terminal_id: TerminalId) -> Dict:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to exit terminal: {str(e)}",
+        )
+
+
+@app.post("/terminals/{terminal_id}/status")
+async def update_terminal_status_endpoint(
+    terminal_id: TerminalId,
+    new_status: str = Query(
+        ..., 
+        description="New status value (e.g., 'idle', 'processing', 'completed')",
+        pattern="^(idle|processing|completed|waiting_user_answer|error)$"
+    ),
+) -> Dict:
+    """Update terminal status (used by hooks).
+
+    Args:
+        terminal_id: Terminal ID to update
+        new_status: New status value - must be one of: idle, processing, completed, 
+                   waiting_user_answer, error
+
+    Returns:
+        Success response with updated status
+        
+    Raises:
+        422: Invalid status value
+        404: Terminal not found
+    """
+    try:
+        # Validate status value against TerminalStatus enum
+        try:
+            from cli_agent_orchestrator.models.terminal import TerminalStatus
+            TerminalStatus(new_status)  # Validates the value
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Invalid status value: {new_status}. Must be one of: idle, processing, completed, waiting_user_answer, error"
+            )
+        
+        success = update_terminal_status(terminal_id, new_status)
+        if not success:
+            raise ValueError(f"Terminal '{terminal_id}' not found")
+        return {"success": True, "terminal_id": terminal_id, "status": new_status}
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update terminal status: {str(e)}",
         )
 
 
