@@ -488,9 +488,9 @@ def main():
     # Calculate optimal worker count based on CPU cores
     # Formula from Gunicorn docs: (2 * CPU_count) + 1 for I/O-bound applications
     # Reasoning: For each core, one worker handles I/O while another processes requests
-    # Cap at 8 workers to avoid excessive resource usage on high-core machines
+    # Cap at 16 workers (increased from 8) to handle burst of concurrent agent spawns
     cpu_count = os.cpu_count() or 1
-    workers = min((2 * cpu_count) + 1, 8)
+    workers = min((2 * cpu_count) + 1, 16)
     
     logger.info(f"Starting CAO server with {workers} workers (CPUs: {cpu_count})")
     
