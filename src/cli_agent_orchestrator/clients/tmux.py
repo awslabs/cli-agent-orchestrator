@@ -102,6 +102,10 @@ class TmuxClient:
             window_name_result = session.windows[0].name
             if window_name_result is None:
                 raise ValueError(f"Window name is None for session {session_name}")
+            
+            # Configure window to auto-close on exit and cleanup terminal record
+            self._configure_window_lifecycle(session_name, window_name_result, terminal_id)
+            
             return window_name_result
         except Exception as e:
             logger.error(f"Failed to create session {session_name}: {e}")
@@ -134,6 +138,10 @@ class TmuxClient:
             window_name_result = window.name
             if window_name_result is None:
                 raise ValueError(f"Window name is None for session {session_name}")
+            
+            # Configure window to auto-close on exit and cleanup terminal record
+            self._configure_window_lifecycle(session_name, window_name_result, terminal_id)
+            
             return window_name_result
         except Exception as e:
             logger.error(f"Failed to create window in session {session_name}: {e}")
@@ -438,6 +446,76 @@ class TmuxClient:
         except Exception as e:
             logger.error(f"Failed to stop pipe-pane for {session_name}:{window_name}: {e}")
             raise
+
+    def _configure_window_lifecycle(
+        self, session_name: str, window_name: str, terminal_id: str
+    ) -> None:
+        """Configure window to auto-close on exit and cleanup terminal record.
+
+        Sets up:
+        1. remain-on-exit off - Window closes automatically when process exits
+        2. pane-exited hook - Calls DELETE terminal API for cleanup (best-effort)
+
+        The hook command is designed to never fail and disrupt tmux:
+        - Runs in background with timeout
+        - Always exits 0 regardless of curl outcome
+        - Logs failures for debugging but doesn't block
+
+        Args:
+            session_name: Tmux session name
+            window_name: Tmux window name
+            terminal_id: Terminal ID for API cleanup
+        """
+        try:
+            from cli_agent_orchestrator.constants import SERVER_PORT
+
+            session = self.server.sessions.get(session_name=session_name)
+            if not session:
+                logger.warning(f"Session '{session_name}' not found for lifecycle config")
+                return
+
+            window = session.windows.get(window_name=window_name)
+            if not window:
+                logger.warning(
+                    f"Window '{window_name}' not found in session '{session_name}' for lifecycle config"
+                )
+                return
+
+            pane = window.active_pane
+            if not pane:
+                logger.warning(f"No active pane for {session_name}:{window_name}")
+                return
+
+            # Set remain-on-exit off so window closes when process exits
+            pane.cmd("set-option", "-t", f"{session_name}:{window_name}", "remain-on-exit", "off")
+            logger.debug(f"Set remain-on-exit off for {session_name}:{window_name}")
+
+            # Set pane-exited hook to cleanup terminal record
+            # Hook design principles:
+            # 1. Always exit 0 (true) so tmux never fails
+            # 2. Run curl in background with timeout to avoid blocking
+            # 3. Redirect output to avoid tmux display-message
+            # 4. Use --max-time for hard timeout (no retries needed - cleanup is best-effort)
+            hook_command = (
+                f"run-shell -b '"
+                f"curl -sf --max-time 2 "
+                f'-X DELETE "http://localhost:{SERVER_PORT}/terminals/{terminal_id}" '
+                f">/dev/null 2>&1 || true"
+                f"'"
+            )
+
+            pane.cmd(
+                "set-hook",
+                "-t",
+                f"{session_name}:{window_name}",
+                "pane-exited",
+                hook_command,
+            )
+            logger.debug(f"Set pane-exited hook for {session_name}:{window_name}")
+
+        except Exception as e:
+            # Log but don't raise - lifecycle config is best-effort
+            logger.warning(f"Failed to configure window lifecycle for {session_name}:{window_name}: {e}")
 
 
 # Module-level singleton
