@@ -182,6 +182,54 @@ class TestTmuxClientWorkingDirectory:
                 with pytest.raises(ValueError, match="outside home directory"):
                     client._resolve_and_validate_working_directory("/opt/some/dir")
 
+    def test_resolve_symlinked_home_directory(self, tmp_path):
+        """Test that a symlinked home directory works (AWS /local/home pattern).
+
+        On AWS environments, /home/user is often a symlink to /local/home/user.
+        A working directory under /local/home/user should be allowed when ~ resolves
+        to /home/user (which is a symlink to /local/home/user).
+        """
+        client = TmuxClient()
+
+        # Simulate AWS layout: /local/home/user is real, /home/user is a symlink
+        real_home = tmp_path / "local" / "home" / "user"
+        real_home.mkdir(parents=True)
+        symlink_home = tmp_path / "home" / "user"
+        symlink_home.parent.mkdir(parents=True)
+        symlink_home.symlink_to(real_home)
+
+        project_dir = real_home / "cli-agent-orchestrator"
+        project_dir.mkdir()
+
+        # expanduser returns the symlink path (like /home/user)
+        with patch("os.path.expanduser", return_value=str(symlink_home)):
+            result = client._resolve_and_validate_working_directory(str(project_dir))
+
+        # Should succeed — realpath resolves both to the same real tree
+        assert result == str(project_dir.resolve())
+
+    def test_resolve_symlinked_home_via_symlink_path(self, tmp_path):
+        """Test passing the symlink path when home is symlinked."""
+        client = TmuxClient()
+
+        real_home = tmp_path / "local" / "home" / "user"
+        real_home.mkdir(parents=True)
+        symlink_home = tmp_path / "home" / "user"
+        symlink_home.parent.mkdir(parents=True)
+        symlink_home.symlink_to(real_home)
+
+        project_dir = real_home / "project"
+        project_dir.mkdir()
+
+        # Pass the symlink-based path as working directory
+        symlink_project = symlink_home / "project"
+
+        with patch("os.path.expanduser", return_value=str(symlink_home)):
+            result = client._resolve_and_validate_working_directory(str(symlink_project))
+
+        # Both resolve to the real path
+        assert result == str(project_dir.resolve())
+
     def test_get_pane_working_directory_window_not_found(self):
         """Test returns None when window not found."""
         mock_session = Mock()

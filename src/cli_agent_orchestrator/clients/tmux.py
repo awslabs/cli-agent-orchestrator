@@ -49,6 +49,20 @@ class TmuxClient:
         rejects paths that point to sensitive system directories or escape
         the user's home directory.
 
+        **Allowed (safe) directories:**
+
+        - The user's home directory itself (``~/``)
+        - Any subdirectory under the home directory (``~/projects/foo``)
+        - Paths that resolve to the home tree after symlink resolution
+          (e.g., ``/home/user`` -> ``/local/home/user`` on AWS)
+
+        **Blocked (unsafe) directories:**
+
+        - System directories: ``/``, ``/bin``, ``/sbin``, ``/usr/bin``,
+          ``/usr/sbin``, ``/etc``, ``/var``, ``/tmp``, ``/dev``, ``/proc``,
+          ``/sys``, ``/root``, ``/boot``, ``/lib``, ``/lib64``
+        - Any path outside the user's home directory tree
+
         Args:
             working_directory: Optional directory path, defaults to current directory
 
@@ -62,12 +76,15 @@ class TmuxClient:
         if working_directory is None:
             working_directory = os.getcwd()
 
-        # Step 1: Normalize the path to resolve .. sequences.
-        # os.path.normpath is recognized by CodeQL as a PathNormalization
-        # that transitions taint from NotNormalized to NormalizedUnchecked.
-        safe_working_directory = os.path.normpath(os.path.abspath(working_directory))
+        # Step 1: Canonicalize both paths via realpath to resolve symlinks
+        # and .. sequences.  os.path.realpath is recognized by CodeQL as a
+        # PathNormalization (transitions taint to NormalizedUnchecked).
+        # Using realpath on both sides ensures the comparison is consistent
+        # in environments where the home directory is a symlink (e.g.,
+        # /home/user -> /local/home/user on AWS).
+        safe_working_directory = os.path.realpath(os.path.abspath(working_directory))
 
-        home_dir = os.path.normpath(os.path.expanduser("~"))
+        home_dir = os.path.realpath(os.path.expanduser("~"))
 
         # Step 2: Path containment — startswith is recognized by CodeQL as a
         # SafeAccessCheck that clears the NormalizedUnchecked taint state.
