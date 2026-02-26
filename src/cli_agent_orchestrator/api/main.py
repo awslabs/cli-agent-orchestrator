@@ -224,6 +224,7 @@ async def list_terminals_in_session(session_name: str) -> List[Dict]:
     """List all terminals in a session."""
     try:
         from cli_agent_orchestrator.services import session_service
+
         session_data = session_service.get_session(session_name)
         return session_data["terminals"]
     except ValueError as e:
@@ -324,21 +325,21 @@ async def exit_terminal(terminal_id: TerminalId) -> Dict:
 async def update_terminal_status_endpoint(
     terminal_id: TerminalId,
     new_status: str = Query(
-        ..., 
+        ...,
         description="New status value (e.g., 'idle', 'processing', 'completed')",
-        pattern="^(idle|processing|completed|waiting_user_answer|error)$"
+        pattern="^(idle|processing|completed|waiting_user_answer|error)$",
     ),
 ) -> Dict:
     """Update terminal status (used by hooks).
 
     Args:
         terminal_id: Terminal ID to update
-        new_status: New status value - must be one of: idle, processing, completed, 
+        new_status: New status value - must be one of: idle, processing, completed,
                    waiting_user_answer, error
 
     Returns:
         Success response with updated status
-        
+
     Raises:
         422: Invalid status value
         404: Terminal not found
@@ -347,17 +348,18 @@ async def update_terminal_status_endpoint(
         # Validate status value against TerminalStatus enum
         try:
             from cli_agent_orchestrator.models.terminal import TerminalStatus
+
             TerminalStatus(new_status)  # Validates the value
         except ValueError:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"Invalid status value: {new_status}. Must be one of: idle, processing, completed, waiting_user_answer, error"
+                detail=f"Invalid status value: {new_status}. Must be one of: idle, processing, completed, waiting_user_answer, error",
             )
-        
+
         success = update_terminal_status(terminal_id, new_status)
         if not success:
             raise ValueError(f"Terminal '{terminal_id}' not found")
-        
+
         return {"success": True, "terminal_id": terminal_id, "status": new_status}
     except HTTPException:
         raise
@@ -491,14 +493,11 @@ def main():
     # Cap at 16 workers (increased from 8) to handle burst of concurrent agent spawns
     cpu_count = os.cpu_count() or 1
     workers = min((2 * cpu_count) + 1, 16)
-    
+
     logger.info(f"Starting CAO server with {workers} workers (CPUs: {cpu_count})")
-    
+
     uvicorn.run(
-        "cli_agent_orchestrator.api.main:app",
-        host=SERVER_HOST,
-        port=SERVER_PORT,
-        workers=workers
+        "cli_agent_orchestrator.api.main:app", host=SERVER_HOST, port=SERVER_PORT, workers=workers
     )
 
 

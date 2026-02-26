@@ -27,7 +27,9 @@ class TerminalModel(Base):
     provider = Column(String, nullable=False)  # "q_cli", "claude_code"
     agent_profile = Column(String)  # "developer", "reviewer" (optional)
     last_active = Column(DateTime, default=datetime.now)
-    status = Column(String, nullable=True, index=True)  # "idle", "processing", etc. (for hook-based status)
+    status = Column(
+        String, nullable=True, index=True
+    )  # "idle", "processing", etc. (for hook-based status)
 
 
 class InboxModel(Base):
@@ -77,7 +79,7 @@ engine = create_engine(
 @event.listens_for(engine, "connect")
 def set_sqlite_pragma(dbapi_conn, connection_record):
     """Set SQLite pragmas on each connection.
-    
+
     synchronous=NORMAL is a per-connection setting that must be set on each connection.
     With WAL mode, NORMAL is safe and much faster than FULL.
     """
@@ -92,7 +94,7 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 def init_db() -> None:
     """Initialize database tables and perform migrations."""
     Base.metadata.create_all(bind=engine)
-    
+
     # Enable WAL mode for better concurrent access (persistent database setting)
     # WAL allows readers and writers to operate concurrently
     with SessionLocal() as db:
@@ -104,7 +106,7 @@ def init_db() -> None:
         except Exception as e:
             logger.warning(f"Failed to set WAL mode: {e}")
             db.rollback()
-    
+
     # Migration: Add status column to terminals table if it doesn't exist
     # This ensures backward compatibility with existing databases
     with SessionLocal() as db:
@@ -123,14 +125,16 @@ def init_db() -> None:
                 logger.error(f"Failed to add status column: {e}")
                 db.rollback()
                 raise
-        
+
         # Migration: Add index on status column for performance
         try:
             # Check if index exists (SQLite specific)
-            result = db.execute(text(
-                "SELECT name FROM sqlite_master WHERE type='index' AND name='ix_terminals_status'"
-            )).fetchone()
-            
+            result = db.execute(
+                text(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND name='ix_terminals_status'"
+                )
+            ).fetchone()
+
             if not result:
                 logger.info("Creating index on terminals.status column")
                 db.execute(text("CREATE INDEX ix_terminals_status ON terminals(status)"))
@@ -235,14 +239,16 @@ def update_terminal_status(terminal_id: str, status: str) -> bool:
         # Use direct UPDATE instead of SELECT-then-UPDATE for better performance
         # This reduces database round trips and lock contention
         from sqlalchemy import update
-        stmt = update(TerminalModel).where(TerminalModel.id == terminal_id).values(
-            status=status,
-            last_active=datetime.now()
+
+        stmt = (
+            update(TerminalModel)
+            .where(TerminalModel.id == terminal_id)
+            .values(status=status, last_active=datetime.now())
         )
-        
+
         result = db.execute(stmt)
         db.commit()
-        
+
         if result.rowcount > 0:
             logger.debug(f"Updated terminal {terminal_id} status to: {status}")
             return True

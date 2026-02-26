@@ -18,11 +18,12 @@ def setup_db():
     yield
     # Clean up test terminals after each test
     from cli_agent_orchestrator.clients.database import SessionLocal, TerminalModel
+
     with SessionLocal() as db:
         db.query(TerminalModel).filter(
-            TerminalModel.id.in_([
-                "test1234", "test5678", "test9999", "testaaaa", "testbbbb", "testcccc"
-            ])
+            TerminalModel.id.in_(
+                ["test1234", "test5678", "test9999", "testaaaa", "testbbbb", "testcccc"]
+            )
         ).delete(synchronize_session=False)
         db.commit()
 
@@ -61,6 +62,7 @@ class TestTerminalStatus:
 
         # Wait a tiny bit and update status
         import time
+
         time.sleep(0.01)
         update_terminal_status(terminal_id, "processing")
 

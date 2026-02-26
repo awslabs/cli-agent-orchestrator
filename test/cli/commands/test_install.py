@@ -163,7 +163,7 @@ class TestInstallCommand:
     ):
         """Test installing agent for kiro_cli provider with --use-hooks flag."""
         import json
-        
+
         with tempfile.TemporaryDirectory() as tmpdir:
             tmppath = Path(tmpdir)
             mock_local_store.__truediv__ = lambda self, x: tmppath / "local" / x
@@ -189,39 +189,55 @@ class TestInstallCommand:
                 (tmppath / "context").mkdir(parents=True, exist_ok=True)
                 (tmppath / "kiro").mkdir(parents=True, exist_ok=True)
 
-                result = runner.invoke(install, ["test-agent", "--provider", "kiro_cli", "--use-hooks"])
+                result = runner.invoke(
+                    install, ["test-agent", "--provider", "kiro_cli", "--use-hooks"]
+                )
 
                 # Verify hooks were injected
                 agent_file = tmppath / "kiro" / "test-agent.json"
                 assert agent_file.exists(), "Agent file should be created"
-                
+
                 config = json.loads(agent_file.read_text())
                 assert "hooks" in config, "Config should have hooks"
                 assert "agentSpawn" in config["hooks"], "Should have agentSpawn hook"
                 assert "userPromptSubmit" in config["hooks"], "Should have userPromptSubmit hook"
                 assert "stop" in config["hooks"], "Should have stop hook"
-                
+
                 # Verify hooks check for CAO_TERMINAL_ID and fail loudly if set
                 for event in ["agentSpawn", "userPromptSubmit", "stop"]:
                     hook_command = config["hooks"][event][0]["command"]
                     # Should check if CAO_TERMINAL_ID is empty
-                    assert '[ -z "$CAO_TERMINAL_ID" ]' in hook_command, f"{event} hook should check if CAO_TERMINAL_ID is set"
+                    assert (
+                        '[ -z "$CAO_TERMINAL_ID" ]' in hook_command
+                    ), f"{event} hook should check if CAO_TERMINAL_ID is set"
                     # Should use || to fail if curl fails when CAO_TERMINAL_ID is set
-                    assert "||" in hook_command, f"{event} hook should fail loudly when CAO_TERMINAL_ID is set"
+                    assert (
+                        "||" in hook_command
+                    ), f"{event} hook should fail loudly when CAO_TERMINAL_ID is set"
                     assert "curl" in hook_command, f"{event} hook should use curl"
-                    assert "--max-time 5" in hook_command, f"{event} hook should have 5 second timeout"
+                    assert (
+                        "--max-time 5" in hook_command
+                    ), f"{event} hook should have 5 second timeout"
                     assert "--retry 5" in hook_command, f"{event} hook should retry 5 times"
-                    assert "--retry-delay 2" in hook_command, f"{event} hook should have 2 second retry delay"
-                    assert "--retry-max-time 30" in hook_command, f"{event} hook should have 30 second max retry time"
-                    assert "$CAO_TERMINAL_ID" in hook_command, f"{event} hook should use CAO_TERMINAL_ID"
+                    assert (
+                        "--retry-delay 2" in hook_command
+                    ), f"{event} hook should have 2 second retry delay"
+                    assert (
+                        "--retry-max-time 30" in hook_command
+                    ), f"{event} hook should have 30 second max retry time"
+                    assert (
+                        "$CAO_TERMINAL_ID" in hook_command
+                    ), f"{event} hook should use CAO_TERMINAL_ID"
                     # Should NOT redirect output (we want to see errors)
-                    assert ">/dev/null" not in hook_command, f"{event} hook should not redirect output"
+                    assert (
+                        ">/dev/null" not in hook_command
+                    ), f"{event} hook should not redirect output"
                     assert "2>&1" not in hook_command, f"{event} hook should not redirect stderr"
-                
+
                 # Verify success message includes hook confirmation
                 assert result.exit_code == 0
                 assert "CAO status hooks enabled" in result.output
-                
+
                 mock_load.assert_called_once_with("test-agent")
 
     @patch("cli_agent_orchestrator.cli.commands.install._download_agent")

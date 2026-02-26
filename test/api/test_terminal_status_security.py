@@ -18,7 +18,7 @@ class TestTerminalStatusSecurity:
         """Test that invalid status values are rejected with 422."""
         # Use a valid terminal ID format (8-char hex)
         terminal_id = "abc12345"
-        
+
         invalid_statuses = [
             "invalid",
             "'; DROP TABLE terminals; --",
@@ -35,7 +35,7 @@ class TestTerminalStatusSecurity:
             "idle\nprocessing",  # Newline injection
             "idle\rprocessing",  # Carriage return injection
         ]
-        
+
         for invalid_status in invalid_statuses:
             response = client.post(
                 f"/terminals/{terminal_id}/status",
@@ -51,7 +51,7 @@ class TestTerminalStatusSecurity:
     def test_status_update_accepts_valid_values(self, client):
         """Test that valid status values are accepted (even if terminal doesn't exist)."""
         terminal_id = "abc12345"
-        
+
         valid_statuses = [
             "idle",
             "processing",
@@ -59,7 +59,7 @@ class TestTerminalStatusSecurity:
             "waiting_user_answer",
             "error",
         ]
-        
+
         for valid_status in valid_statuses:
             response = client.post(
                 f"/terminals/{terminal_id}/status",
@@ -80,7 +80,7 @@ class TestTerminalStatusSecurity:
             "ABC12345",  # Uppercase not allowed
             "abc1234g",  # 'g' not hex
         ]
-        
+
         for invalid_id in invalid_terminal_ids:
             response = client.post(
                 f"/terminals/{invalid_id}/status",
@@ -101,7 +101,7 @@ class TestTerminalStatusSecurity:
             "deadbeef",
             "cafebabe",
         ]
-        
+
         for valid_id in valid_terminal_ids:
             response = client.post(
                 f"/terminals/{valid_id}/status",
@@ -116,7 +116,7 @@ class TestTerminalStatusSecurity:
     def test_sql_injection_attempts(self, client):
         """Test that SQL injection attempts are blocked."""
         terminal_id = "abc12345"
-        
+
         sql_injection_attempts = [
             "idle'; DROP TABLE terminals; --",
             "idle' OR '1'='1",
@@ -124,7 +124,7 @@ class TestTerminalStatusSecurity:
             "idle' UNION SELECT * FROM terminals --",
             "idle'; UPDATE terminals SET status='hacked' --",
         ]
-        
+
         for injection in sql_injection_attempts:
             response = client.post(
                 f"/terminals/{terminal_id}/status",
@@ -139,14 +139,14 @@ class TestTerminalStatusSecurity:
     def test_xss_attempts(self, client):
         """Test that XSS attempts are blocked."""
         terminal_id = "abc12345"
-        
+
         xss_attempts = [
             "<script>alert('xss')</script>",
             "<img src=x onerror=alert('xss')>",
             "javascript:alert('xss')",
             "<iframe src='javascript:alert(1)'>",
         ]
-        
+
         for xss in xss_attempts:
             response = client.post(
                 f"/terminals/{terminal_id}/status",
@@ -154,8 +154,7 @@ class TestTerminalStatusSecurity:
             )
             # Should be rejected by validation
             assert response.status_code == 422, (
-                f"XSS attempt '{xss}' should be rejected with 422, "
-                f"got {response.status_code}"
+                f"XSS attempt '{xss}' should be rejected with 422, " f"got {response.status_code}"
             )
 
     def test_path_traversal_attempts(self, client):
@@ -167,7 +166,7 @@ class TestTerminalStatusSecurity:
         path_traversal_attempts = [
             "12345678",  # Valid format but could be malicious intent - passes validation
         ]
-        
+
         for path in path_traversal_attempts:
             response = client.post(
                 f"/terminals/{path}/status",
@@ -180,7 +179,7 @@ class TestTerminalStatusSecurity:
     def test_command_injection_in_status(self, client):
         """Test that command injection attempts in status are blocked."""
         terminal_id = "abc12345"
-        
+
         command_injection_attempts = [
             "idle; rm -rf /",
             "idle && cat /etc/passwd",
@@ -189,7 +188,7 @@ class TestTerminalStatusSecurity:
             "idle$(whoami)",
             "idle\n/bin/sh",
         ]
-        
+
         for injection in command_injection_attempts:
             response = client.post(
                 f"/terminals/{terminal_id}/status",
@@ -201,7 +200,7 @@ class TestTerminalStatusSecurity:
     def test_unicode_and_special_chars(self, client):
         """Test that unicode and special characters are rejected."""
         terminal_id = "abc12345"
-        
+
         special_chars = [
             "idle\x00",  # Null byte
             "idle\r\n",  # CRLF injection
@@ -210,7 +209,7 @@ class TestTerminalStatusSecurity:
             "idle\u0000",  # Unicode null
             "idle\u202e",  # Right-to-left override
         ]
-        
+
         for special in special_chars:
             response = client.post(
                 f"/terminals/{terminal_id}/status",
