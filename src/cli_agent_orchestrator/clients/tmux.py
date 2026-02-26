@@ -237,7 +237,7 @@ class TmuxClient:
                     # process the previous Enter (e.g., Ink adding a newline)
                     # before the next Enter triggers form submission.
                     time.sleep(0.5)
-                
+
                 # Retry Enter key sending up to 3 times if it fails
                 max_retries = 3
                 for attempt in range(max_retries):
