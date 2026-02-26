@@ -4,7 +4,7 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import Boolean, Column, DateTime, Integer, String, create_engine
+from sqlalchemy import Boolean, Column, DateTime, Integer, String, create_engine, event, text
 from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
 
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
@@ -27,6 +27,9 @@ class TerminalModel(Base):
     provider = Column(String, nullable=False)  # "q_cli", "claude_code"
     agent_profile = Column(String)  # "developer", "reviewer" (optional)
     last_active = Column(DateTime, default=datetime.now)
+    status = Column(
+        String, nullable=True, index=True
+    )  # "idle", "processing", etc. (for hook-based status)
 
 
 class InboxModel(Base):
@@ -60,13 +63,89 @@ class FlowModel(Base):
 
 # Module-level singletons
 DB_DIR.mkdir(parents=True, exist_ok=True)
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={
+        "check_same_thread": False,
+        "timeout": 30.0,  # 30 second timeout for safety
+    },
+    pool_pre_ping=True,  # Verify connections before using
+    pool_size=10,  # Increased from default 5 for multi-worker support
+    max_overflow=20,  # Increased from default 10 for multi-worker support
+)
+
+
+# Set synchronous=NORMAL on every connection (per-connection setting)
+@event.listens_for(engine, "connect")
+def set_sqlite_pragma(dbapi_conn, connection_record):
+    """Set SQLite pragmas on each connection.
+
+    synchronous=NORMAL is a per-connection setting that must be set on each connection.
+    With WAL mode, NORMAL is safe and much faster than FULL.
+    """
+    cursor = dbapi_conn.cursor()
+    cursor.execute("PRAGMA synchronous=NORMAL")
+    cursor.close()
+
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
 def init_db() -> None:
-    """Initialize database tables."""
+    """Initialize database tables and perform migrations."""
     Base.metadata.create_all(bind=engine)
+
+    # Enable WAL mode for better concurrent access (persistent database setting)
+    # WAL allows readers and writers to operate concurrently
+    with SessionLocal() as db:
+        try:
+            result = db.execute(text("PRAGMA journal_mode=WAL"))
+            mode = result.fetchone()[0]
+            logger.info(f"Database journal_mode: {mode}")
+            db.commit()
+        except Exception as e:
+            logger.warning(f"Failed to set WAL mode: {e}")
+            db.rollback()
+
+    # Migration: Add status column to terminals table if it doesn't exist
+    # This ensures backward compatibility with existing databases
+    with SessionLocal() as db:
+        try:
+            # Test if status column exists
+            db.execute(text("SELECT status FROM terminals LIMIT 1"))
+            logger.debug("Status column already exists in terminals table")
+        except Exception:
+            # Column doesn't exist, add it
+            logger.info("Adding status column to terminals table (migration)")
+            try:
+                db.execute(text("ALTER TABLE terminals ADD COLUMN status TEXT"))
+                db.commit()
+                logger.info("Successfully added status column to terminals table")
+            except Exception as e:
+                logger.error(f"Failed to add status column: {e}")
+                db.rollback()
+                raise
+
+        # Migration: Add index on status column for performance
+        try:
+            # Check if index exists (SQLite specific)
+            result = db.execute(
+                text(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND name='ix_terminals_status'"
+                )
+            ).fetchone()
+
+            if not result:
+                logger.info("Creating index on terminals.status column")
+                db.execute(text("CREATE INDEX ix_terminals_status ON terminals(status)"))
+                db.commit()
+                logger.info("Successfully created index on status column")
+            else:
+                logger.debug("Index on status column already exists")
+        except Exception as e:
+            logger.warning(f"Failed to create index on status column: {e}")
+            # Don't fail if index creation fails - it's a performance optimization
+            db.rollback()
 
 
 def create_terminal(
@@ -113,6 +192,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
             "last_active": terminal.last_active,
+            "status": terminal.status,
         }
 
 
@@ -128,6 +208,7 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
                 "last_active": t.last_active,
+                "status": t.status,
             }
             for t in terminals
         ]
@@ -142,6 +223,54 @@ def update_last_active(terminal_id: str) -> bool:
             db.commit()
             return True
         return False
+
+
+def update_terminal_status(terminal_id: str, status: str) -> bool:
+    """Update terminal status.
+
+    Args:
+        terminal_id: The terminal identifier
+        status: Status value (e.g., "idle", "processing", "completed")
+
+    Returns:
+        True if updated successfully, False if terminal not found
+    """
+    with SessionLocal() as db:
+        # Use direct UPDATE instead of SELECT-then-UPDATE for better performance
+        # This reduces database round trips and lock contention
+        from sqlalchemy import update
+
+        stmt = (
+            update(TerminalModel)
+            .where(TerminalModel.id == terminal_id)
+            .values(status=status, last_active=datetime.now())
+        )
+
+        result = db.execute(stmt)
+        db.commit()
+
+        if result.rowcount > 0:
+            logger.debug(f"Updated terminal {terminal_id} status to: {status}")
+            return True
+        else:
+            logger.warning(f"Terminal {terminal_id} not found for status update")
+            return False
+
+
+def get_terminal_status(terminal_id: str) -> Optional[str]:
+    """Get terminal status from database.
+
+    Args:
+        terminal_id: The terminal identifier
+
+    Returns:
+        Status string if found, None otherwise
+    """
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if terminal:
+            return terminal.status
+        return None
 
 
 def delete_terminal(terminal_id: str) -> bool:

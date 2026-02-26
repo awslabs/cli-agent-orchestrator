@@ -64,8 +64,8 @@ def create_terminal(
 
     This function orchestrates the complete terminal creation workflow:
     1. Generate unique terminal ID and window name
-    2. Create tmux session/window (new or existing)
-    3. Save terminal metadata to database
+    2. Save terminal metadata to database
+    3. Create tmux session/window (triggers agentSpawn hook)
     4. Initialize the CLI provider (starts the agent)
     5. Set up terminal logging via tmux pipe-pane
 
@@ -92,7 +92,12 @@ def create_terminal(
 
         window_name = generate_window_name(agent_profile)
 
-        # Step 2: Create tmux session or window
+        # Step 2: Persist terminal metadata to database BEFORE creating tmux window
+        # This ensures the database record exists when agentSpawn hook fires
+        db_create_terminal(terminal_id, session_name, window_name, provider, agent_profile)
+
+        # Step 3: Create tmux session or window
+        # The agentSpawn hook will fire here and can now find the terminal in the database
         if new_session:
             # Ensure session name has the CAO prefix for identification
             if not session_name.startswith(SESSION_PREFIX):
@@ -111,9 +116,6 @@ def create_terminal(
             window_name = tmux_client.create_window(
                 session_name, window_name, terminal_id, working_directory
             )
-
-        # Step 3: Persist terminal metadata to database
-        db_create_terminal(terminal_id, session_name, window_name, provider, agent_profile)
 
         # Step 4: Create and initialize the CLI provider
         # This starts the agent (e.g., runs "kiro-cli chat --agent developer")

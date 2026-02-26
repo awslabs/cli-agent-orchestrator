@@ -55,8 +55,28 @@ class KiroCliProvider(BaseProvider):
         return True
 
     def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
-        """Get Kiro CLI status by analyzing terminal output."""
+        """Get Kiro CLI status with hook-based status priority.
+
+        Hook-based status (from database) takes priority over tmux polling
+        to avoid race conditions where hooks update status faster than polling.
+        """
         logger.debug(f"get_status: tail_lines={tail_lines}")
+
+        # Check database first for hook-based status
+        from cli_agent_orchestrator.clients.database import get_terminal_status
+
+        db_status = get_terminal_status(self.terminal_id)
+
+        if db_status:
+            # Hook-based status takes priority
+            try:
+                status_enum = TerminalStatus(db_status)
+                logger.debug(f"get_status: using hook-based status from DB: {status_enum}")
+                return status_enum
+            except ValueError:
+                logger.warning(f"Invalid status in DB: {db_status}, falling back to tmux polling")
+
+        # Fallback to tmux polling if no hook-based status
         output = tmux_client.get_history(self.session_name, self.window_name, tail_lines=tail_lines)
 
         if not output:

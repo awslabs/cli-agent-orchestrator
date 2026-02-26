@@ -13,6 +13,7 @@ from cli_agent_orchestrator.constants import (
     LOCAL_AGENT_STORE_DIR,
     PROVIDERS,
     Q_AGENTS_DIR,
+    SERVER_PORT,
 )
 from cli_agent_orchestrator.models.kiro_agent import KiroAgentConfig
 from cli_agent_orchestrator.models.provider import ProviderType
@@ -64,7 +65,13 @@ def _download_agent(source: str) -> str:
     default=DEFAULT_PROVIDER,
     help=f"Provider to use (default: {DEFAULT_PROVIDER})",
 )
-def install(agent_source: str, provider: str):
+@click.option(
+    "--use-hooks",
+    is_flag=True,
+    default=False,
+    help="Enable CAO status hooks for kiro_cli provider (auto-updates terminal status)",
+)
+def install(agent_source: str, provider: str, use_hooks: bool):
     """
     Install an agent from local store, built-in store, URL, or file path.
 
@@ -139,6 +146,42 @@ def install(agent_source: str, provider: str):
 
         elif provider == ProviderType.KIRO_CLI.value:
             KIRO_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+
+            # Conditionally inject CAO status hooks based on --use-hooks flag
+            hooks = profile.hooks or {}
+            if use_hooks:
+                # Auto-inject CAO status hooks for kiro_cli provider
+                # Hook behavior:
+                # - If CAO_TERMINAL_ID not set: succeed silently (agent usable outside CAO)
+                # - If CAO_TERMINAL_ID is set: fail loudly if curl fails (we expect it to work)
+                # - Retries: 3 attempts with exponential backoff for transient failures
+                # This ensures hooks work correctly in CAO but don't break standalone usage
+                cao_hooks = {
+                    "agentSpawn": [
+                        {
+                            "command": f'[ -z "$CAO_TERMINAL_ID" ] || curl -sf --max-time 2 --retry 3 --retry-delay 1 --retry-max-time 10 -X POST "http://localhost:{SERVER_PORT}/terminals/$CAO_TERMINAL_ID/status?new_status=idle"'
+                        }
+                    ],
+                    "userPromptSubmit": [
+                        {
+                            "command": f'[ -z "$CAO_TERMINAL_ID" ] || curl -sf --max-time 2 --retry 3 --retry-delay 1 --retry-max-time 10 -X POST "http://localhost:{SERVER_PORT}/terminals/$CAO_TERMINAL_ID/status?new_status=processing"'
+                        }
+                    ],
+                    "stop": [
+                        {
+                            "command": f'[ -z "$CAO_TERMINAL_ID" ] || curl -sf --max-time 2 --retry 3 --retry-delay 1 --retry-max-time 10 -X POST "http://localhost:{SERVER_PORT}/terminals/$CAO_TERMINAL_ID/status?new_status=idle"'
+                        }
+                    ],
+                }
+
+                # Merge with existing hooks if any
+                for event, handlers in cao_hooks.items():
+                    if event not in hooks:
+                        hooks[event] = handlers
+                    else:
+                        # Prepend CAO hook to existing handlers
+                        hooks[event] = handlers + hooks[event]
+
             agent_config = KiroAgentConfig(
                 name=profile.name,
                 description=profile.description,
@@ -149,7 +192,7 @@ def install(agent_source: str, provider: str):
                 mcpServers=profile.mcpServers,
                 toolAliases=profile.toolAliases,
                 toolsSettings=profile.toolsSettings,
-                hooks=profile.hooks,
+                hooks=hooks,
                 model=profile.model,
             )
             safe_filename = profile.name.replace("/", "__")
@@ -161,6 +204,22 @@ def install(agent_source: str, provider: str):
         click.echo(f"✓ Context file: {dest_file}")
         if agent_file:
             click.echo(f"✓ {provider} agent: {agent_file}")
+
+            # Verify hooks were injected if --use-hooks was specified
+            if use_hooks and provider == ProviderType.KIRO_CLI.value:
+                import json
+
+                if agent_file.exists():
+                    config = json.loads(agent_file.read_text())
+                    if "hooks" in config and all(
+                        event in config["hooks"]
+                        for event in ["agentSpawn", "userPromptSubmit", "stop"]
+                    ):
+                        click.echo(
+                            f"✓ CAO status hooks enabled (agentSpawn, userPromptSubmit, stop)"
+                        )
+                    else:
+                        click.echo("⚠ Warning: Failed to inject CAO status hooks", err=True)
 
     except FileNotFoundError as e:
         click.echo(f"Error: {e}", err=True)

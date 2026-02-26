@@ -42,7 +42,119 @@ curl -X POST "http://localhost:9889/sessions?provider=kiro_cli&agent_profile=dev
 
 ### Status Detection
 
-The Kiro CLI provider detects terminal states by analyzing ANSI-stripped output:
+The Kiro CLI provider supports two modes for status detection:
+
+#### 1. Hook-Based Status Tracking (Recommended)
+
+Hook-based status tracking provides improved performance and reliability:
+
+- Status updates sent directly to CAO API via hooks
+- No continuous tmux polling required
+- Faster and more reliable status detection
+- Better scalability with many concurrent agents
+
+Enable hooks during installation using the `--use-hooks` flag:
+
+```bash
+# Install with hooks enabled for automatic status updates
+cao install my-agent.md --use-hooks
+cao launch --provider kiro_cli --agent my-agent
+```
+
+```bash
+# Install without hooks (default) - status checks via tmux polling only
+cao install my-agent.md
+cao launch --provider kiro_cli --agent my-agent
+```
+
+##### Hook Variables
+
+The following environment variables are available in hook commands:
+
+- `$CAO_TERMINAL_ID`: Terminal identifier (8-character hex string, e.g., "abc12345")
+- `$CAO_SESSION_NAME`: Tmux session name
+- `$CAO_AGENT_PROFILE`: Agent profile name
+
+##### Hook Implementation
+
+Hooks use `curl` to make HTTP requests to the CAO API with smart failure handling and retries:
+
+```bash
+# Example hook command (auto-injected by --use-hooks)
+[ -z "$CAO_TERMINAL_ID" ] || \
+  curl -sf --max-time 2 --retry 3 --retry-delay 1 --retry-max-time 10 \
+    -X POST "http://localhost:9889/terminals/$CAO_TERMINAL_ID/status?new_status=idle"
+```
+
+**Behavior:**
+- **If `CAO_TERMINAL_ID` is NOT set**: Hook succeeds immediately (agent usable outside CAO)
+- **If `CAO_TERMINAL_ID` IS set**: Hook fails if curl fails after retries (ensures hooks work correctly in CAO)
+
+This design allows the same agent definition to work both inside CAO (with hooks) and standalone (without hooks).
+
+**Retry Strategy:**
+- **3 retry attempts** on transient failures (network errors, timeouts, 5xx server errors)
+- **Exponential backoff**: 1s, 2s, 4s between retries
+- **10 second max total time** across all attempts
+- **No retry on 4xx errors** (like 422 validation errors - these are permanent failures)
+
+**Security Features:**
+- Terminal ID validated at API level (8-char hex pattern)
+- URL properly quoted to prevent injection
+- Silent mode (`-s`) and fail fast (`-f`)
+- 2 second timeout per request
+
+##### Hook Failure Handling
+
+**When `CAO_TERMINAL_ID` is not set** (standalone usage):
+- Hook succeeds immediately without making API call
+- Agent works normally without CAO integration
+
+**When `CAO_TERMINAL_ID` is set** (CAO usage):
+- Hook retries up to 3 times with exponential backoff (1s, 2s, 4s)
+- Hook fails if all retries exhausted (network error, API unavailable, timeout, etc.)
+- Kiro CLI will show the hook failure after all retries
+- This is intentional - if hooks are expected to work, failures should be visible
+
+**Important**: Once hooks start working, if they fail later (e.g., persistent network issue after retries), status may become stale. This is acceptable as the alternative (continuous tmux polling) creates resource bottlenecks.
+
+**Failure scenarios when `CAO_TERMINAL_ID` is set**:
+- **curl not installed**: Hook fails immediately ❌
+- **Transient network error**: Retries 3 times, may succeed ✅
+- **Persistent network error**: Hook fails after retries ❌
+- **API unavailable**: Retries 3 times, fails if API doesn't come back ❌
+- **Invalid terminal ID**: API returns 422, no retry (permanent error) ❌
+- **Timeout**: Retries up to 3 times, fails if all timeout ❌
+
+##### Debugging Hooks
+
+Check if hooks are working:
+
+```bash
+# View CAO server logs
+tail -f ~/.cao/logs/server.log
+
+# Test hook manually
+export CAO_TERMINAL_ID=abc12345
+curl -sf --max-time 2 -X POST \
+  "http://localhost:9889/terminals/$CAO_TERMINAL_ID/status?new_status=idle"
+
+# Check terminal status via API
+curl http://localhost:9889/terminals/abc12345
+```
+
+To disable hook-based status for debugging (when hooks are installed):
+
+```bash
+export CAO_KIRO_USE_HOOK_STATUS=false
+cao launch --provider kiro_cli --agent my-agent
+```
+
+See the [Kiro Hooks Example](../examples/kiro-hooks/README.md) for detailed information.
+
+#### 2. Tmux Polling (Fallback)
+
+When hook-based status is unavailable or disabled, detects terminal states by analyzing ANSI-stripped output:
 
 - **IDLE**: Agent prompt visible (`[profile_name] >` pattern), no response content
 - **PROCESSING**: No idle prompt found in output (agent is generating response)
@@ -51,6 +163,20 @@ The Kiro CLI provider detects terminal states by analyzing ANSI-stripped output:
 - **ERROR**: Known error indicators present (e.g., "Kiro is having trouble responding right now")
 
 Status detection priority: no prompt → PROCESSING → ERROR → WAITING_USER_ANSWER → COMPLETED → IDLE.
+
+### Status Values
+
+CAO uses the following status values to track terminal state:
+
+| Status | Meaning | When Set |
+|--------|---------|----------|
+| `idle` | Agent is ready for input | After agent starts, after response completes |
+| `processing` | Agent is generating response | After user submits prompt |
+| `completed` | Response finished, prompt visible | After agent completes response (polling only) |
+| `waiting_user_answer` | Agent waiting for permission | When permission prompt detected (polling only) |
+| `error` | Agent encountered an error | When error indicators detected (polling only) |
+
+**Note**: Hook-based status only sets `idle` and `processing`. Other statuses are detected via tmux polling.
 
 ### Dynamic Prompt Pattern
 
