@@ -5,6 +5,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from cli_agent_orchestrator.constants import DEFAULT_PROVIDER
+from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.terminal_service import (
     OutputMode,
@@ -117,6 +119,84 @@ class TestCreateTerminal:
 
         with pytest.raises(ValueError, match="already exists"):
             create_terminal("kiro_cli", "developer", session_name="cao-existing", new_session=True)
+
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    def test_create_terminal_resolves_provider_from_profile(
+        self,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_log_dir,
+        mock_load_profile,
+    ):
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = False
+        mock_provider = MagicMock()
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_log_path = MagicMock()
+        mock_log_dir.__truediv__.return_value = mock_log_path
+        mock_load_profile.return_value = type("Profile", (), {"provider": ProviderType.COPILOT})()
+
+        result = create_terminal(None, "developer", new_session=True)
+
+        assert result.provider == ProviderType.COPILOT.value
+        mock_db_create.assert_called_once_with(
+            "test1234", "cao-session", "developer-abcd", ProviderType.COPILOT.value, "developer"
+        )
+        mock_provider_manager.create_provider.assert_called_once_with(
+            ProviderType.COPILOT.value, "test1234", "cao-session", "developer-abcd", "developer"
+        )
+
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    def test_create_terminal_falls_back_to_default_provider(
+        self,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_log_dir,
+        mock_load_profile,
+    ):
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = False
+        mock_provider = MagicMock()
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_log_path = MagicMock()
+        mock_log_dir.__truediv__.return_value = mock_log_path
+        mock_load_profile.side_effect = RuntimeError("profile not found")
+
+        result = create_terminal(None, "developer", new_session=True)
+
+        assert result.provider == DEFAULT_PROVIDER
+        mock_db_create.assert_called_once_with(
+            "test1234", "cao-session", "developer-abcd", DEFAULT_PROVIDER, "developer"
+        )
+        mock_provider_manager.create_provider.assert_called_once_with(
+            DEFAULT_PROVIDER, "test1234", "cao-session", "developer-abcd", "developer"
+        )
 
 
 class TestGetTerminal:

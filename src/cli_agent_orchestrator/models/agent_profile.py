@@ -4,6 +4,8 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
+from cli_agent_orchestrator.models.provider import ProviderType
+
 
 class McpServer(BaseModel):
     """MCP server configuration."""
@@ -33,3 +35,4 @@ class AgentProfile(BaseModel):
     hooks: Optional[Dict[str, Any]] = None
     useLegacyMcpJson: Optional[bool] = None
     model: Optional[str] = None
+    provider: Optional[ProviderType] = None

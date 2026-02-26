@@ -7,6 +7,7 @@ import pytest
 from click.testing import CliRunner
 
 from cli_agent_orchestrator.cli.commands.launch import launch
+from cli_agent_orchestrator.models.provider import ProviderType
 
 
 def test_launch_includes_working_directory():
@@ -209,3 +210,61 @@ def test_launch_workspace_confirmation_for_default_provider():
         assert result.exit_code == 0
         assert "provider (kiro_cli) will be trusted to perform all actions" in result.output
         assert "Do you trust all the actions in this folder?" in result.output
+
+
+def test_launch_uses_provider_from_agent_profile_when_not_explicit():
+    """Test that launch resolves provider from profile when --provider is omitted."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run"),
+        patch("cli_agent_orchestrator.cli.commands.launch.load_agent_profile") as mock_load_profile,
+    ):
+        profile = type("Profile", (), {"provider": ProviderType.CODEX})()
+        mock_load_profile.return_value = profile
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+
+        result = runner.invoke(launch, ["--agents", "developer", "--headless", "--yolo"])
+
+        assert result.exit_code == 0
+        params = mock_post.call_args.kwargs["params"]
+        assert params["provider"] == ProviderType.CODEX.value
+
+
+def test_launch_explicit_provider_overrides_profile_provider():
+    """Test explicit --provider takes precedence over profile provider."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run"),
+        patch("cli_agent_orchestrator.cli.commands.launch.load_agent_profile") as mock_load_profile,
+    ):
+        profile = type("Profile", (), {"provider": ProviderType.CODEX})()
+        mock_load_profile.return_value = profile
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+
+        result = runner.invoke(
+            launch,
+            [
+                "--agents",
+                "developer",
+                "--provider",
+                ProviderType.CLAUDE_CODE.value,
+                "--headless",
+                "--yolo",
+            ],
+        )
+
+        assert result.exit_code == 0
+        params = mock_post.call_args.kwargs["params"]
+        assert params["provider"] == ProviderType.CLAUDE_CODE.value

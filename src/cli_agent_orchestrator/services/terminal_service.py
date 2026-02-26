@@ -29,10 +29,11 @@ from cli_agent_orchestrator.clients.database import (
     update_last_active,
 )
 from cli_agent_orchestrator.clients.tmux import tmux_client
-from cli_agent_orchestrator.constants import SESSION_PREFIX, TERMINAL_LOG_DIR
+from cli_agent_orchestrator.constants import DEFAULT_PROVIDER, SESSION_PREFIX, TERMINAL_LOG_DIR
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
 from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
     generate_terminal_id,
@@ -53,8 +54,24 @@ class OutputMode(str, Enum):
     LAST = "last"
 
 
+def _resolve_provider(agent_profile: str, provider: Optional[str]) -> str:
+    """Resolve provider from explicit input -> profile field -> default."""
+    if provider:
+        return provider
+
+    try:
+        profile = load_agent_profile(agent_profile)
+        if profile.provider is not None:
+            return profile.provider.value
+    except Exception:
+        # Keep backward-compatible behavior if profile cannot be loaded.
+        pass
+
+    return DEFAULT_PROVIDER
+
+
 def create_terminal(
-    provider: str,
+    provider: Optional[str],
     agent_profile: str,
     session_name: Optional[str] = None,
     new_session: bool = False,
@@ -70,7 +87,7 @@ def create_terminal(
     5. Set up terminal logging via tmux pipe-pane
 
     Args:
-        provider: Provider type string (e.g., "kiro_cli", "claude_code")
+        provider: Optional provider type string (e.g., "kiro_cli", "claude_code")
         agent_profile: Name of the agent profile to use
         session_name: Optional custom session name. If not provided, auto-generated.
         new_session: If True, creates a new tmux session. If False, adds to existing.
@@ -84,6 +101,8 @@ def create_terminal(
         TimeoutError: If provider initialization times out
     """
     try:
+        resolved_provider = _resolve_provider(agent_profile, provider)
+
         # Step 1: Generate unique identifiers
         terminal_id = generate_terminal_id()
 
@@ -113,12 +132,12 @@ def create_terminal(
             )
 
         # Step 3: Persist terminal metadata to database
-        db_create_terminal(terminal_id, session_name, window_name, provider, agent_profile)
+        db_create_terminal(terminal_id, session_name, window_name, resolved_provider, agent_profile)
 
         # Step 4: Create and initialize the CLI provider
         # This starts the agent (e.g., runs "kiro-cli chat --agent developer")
         provider_instance = provider_manager.create_provider(
-            provider, terminal_id, session_name, window_name, agent_profile
+            resolved_provider, terminal_id, session_name, window_name, agent_profile
         )
         provider_instance.initialize()
 
@@ -132,7 +151,7 @@ def create_terminal(
         terminal = Terminal(
             id=terminal_id,
             name=window_name,
-            provider=ProviderType(provider),
+            provider=ProviderType(resolved_provider),
             session_name=session_name,
             agent_profile=agent_profile,
             status=TerminalStatus.IDLE,

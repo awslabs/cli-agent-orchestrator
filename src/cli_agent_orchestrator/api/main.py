@@ -125,8 +125,8 @@ async def health_check():
 
 @app.post("/sessions", response_model=Terminal, status_code=status.HTTP_201_CREATED)
 async def create_session(
-    provider: str,
     agent_profile: str,
+    provider: Optional[str] = None,
     session_name: Optional[str] = None,
     working_directory: Optional[str] = None,
 ) -> Terminal:
@@ -195,8 +195,8 @@ async def delete_session(session_name: str) -> Dict:
 )
 async def create_terminal_in_session(
     session_name: str,
-    provider: str,
     agent_profile: str,
+    provider: Optional[str] = None,
     working_directory: Optional[str] = None,
 ) -> Terminal:
     """Create additional terminal in existing session."""

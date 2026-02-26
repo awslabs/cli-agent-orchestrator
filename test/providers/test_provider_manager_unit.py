@@ -5,8 +5,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from cli_agent_orchestrator.models.provider import ProviderType
+from cli_agent_orchestrator.providers.codebuddy import CodeBuddyProvider
+from cli_agent_orchestrator.providers.copilot import CopilotProvider
 from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.manager import ProviderManager
+from cli_agent_orchestrator.providers.opencode import OpenCodeProvider
+from cli_agent_orchestrator.providers.qoder_cli import QoderCliProvider
 
 
 def test_create_provider_codex_stores_mapping():
@@ -168,3 +172,60 @@ def test_list_providers():
         "t1": "CodexProvider",
         "t2": "ClaudeCodeProvider",
     }
+
+
+def test_create_provider_qoder_cli():
+    manager = ProviderManager()
+    provider = manager.create_provider(
+        ProviderType.QODER_CLI.value,
+        terminal_id="t1",
+        tmux_session="s1",
+        tmux_window="w1",
+        agent_profile=None,
+    )
+
+    assert isinstance(provider, QoderCliProvider)
+
+
+def test_create_provider_opencode():
+    manager = ProviderManager()
+    provider = manager.create_provider(
+        ProviderType.OPENCODE.value,
+        terminal_id="t1",
+        tmux_session="s1",
+        tmux_window="w1",
+        agent_profile=None,
+    )
+
+    assert isinstance(provider, OpenCodeProvider)
+
+
+@patch("cli_agent_orchestrator.providers.codebuddy.load_agent_profile")
+def test_create_provider_codebuddy(mock_load_profile):
+    mock_profile = MagicMock()
+    mock_profile.system_prompt = "You are a helper."
+    mock_load_profile.return_value = mock_profile
+
+    manager = ProviderManager()
+    provider = manager.create_provider(
+        ProviderType.CODEBUDDY.value,
+        terminal_id="t1",
+        tmux_session="s1",
+        tmux_window="w1",
+        agent_profile="developer",
+    )
+
+    assert isinstance(provider, CodeBuddyProvider)
+
+
+def test_create_provider_copilot():
+    manager = ProviderManager()
+    provider = manager.create_provider(
+        ProviderType.COPILOT.value,
+        terminal_id="t1",
+        tmux_session="s1",
+        tmux_window="w1",
+        agent_profile=None,
+    )
+
+    assert isinstance(provider, CopilotProvider)

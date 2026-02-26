@@ -98,6 +98,10 @@ Before using CAO, install at least one supported CLI agent tool:
 | **Claude Code** | [Provider docs](docs/claude-code.md) · [Installation](https://docs.anthropic.com/en/docs/claude-code/getting-started) | Anthropic API key |
 | **Codex CLI** | [Provider docs](docs/codex-cli.md) · [Installation](https://github.com/openai/codex) | OpenAI API key |
 | **Q CLI** | [Installation](https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/command-line.html) | AWS credentials |
+| **Qoder CLI** | [Installation](https://www.npmjs.com/package/@qoder-ai/qodercli) | Qoder account/token |
+| **OpenCode CLI** | [Installation](https://opencode.ai/docs/cli/) | Model provider credentials |
+| **CodeBuddy CLI** | [CLI docs](https://www.codebuddy.ai/docs/cli/cli-reference) | CodeBuddy account/token |
+| **GitHub Copilot CLI** | [Getting started](https://docs.github.com/en/copilot/how-tos/copilot-cli/cli-getting-started) | GitHub Copilot access |
 
 ## Quick Start
 
@@ -142,6 +146,10 @@ cao launch --agents code_supervisor
 cao launch --agents code_supervisor --provider kiro_cli
 cao launch --agents code_supervisor --provider claude_code
 cao launch --agents code_supervisor --provider codex
+cao launch --agents code_supervisor --provider qoder_cli
+cao launch --agents code_supervisor --provider opencode
+cao launch --agents code_supervisor --provider codebuddy
+cao launch --agents code_supervisor --provider copilot
 
 # Skip workspace trust confirmation
 cao launch --agents code_supervisor --yolo

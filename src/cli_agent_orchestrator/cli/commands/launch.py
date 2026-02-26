@@ -2,14 +2,40 @@
 
 import os
 import subprocess
+from typing import Optional
 
 import click
 import requests
 
 from cli_agent_orchestrator.constants import DEFAULT_PROVIDER, PROVIDERS, SERVER_HOST, SERVER_PORT
+from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 
 # Providers that require workspace folder access
-PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {"claude_code", "codex", "kiro_cli"}
+PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
+    "claude_code",
+    "codex",
+    "kiro_cli",
+    "qoder_cli",
+    "opencode",
+    "codebuddy",
+    "copilot",
+}
+
+
+def _resolve_provider(agent_name: str, provider: Optional[str]) -> str:
+    """Resolve provider from explicit option -> profile field -> default."""
+    if provider:
+        return provider
+
+    try:
+        profile = load_agent_profile(agent_name)
+        if profile.provider is not None:
+            return profile.provider.value
+    except Exception:
+        # Keep backward-compatible behavior when profile cannot be loaded.
+        pass
+
+    return DEFAULT_PROVIDER
 
 
 @click.command()
@@ -17,16 +43,18 @@ PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {"claude_code", "codex", "kiro_cli"}
 @click.option("--session-name", help="Name of the session (default: auto-generated)")
 @click.option("--headless", is_flag=True, help="Launch in detached mode")
 @click.option(
-    "--provider", default=DEFAULT_PROVIDER, help=f"Provider to use (default: {DEFAULT_PROVIDER})"
+    "--provider", default=None, help="Provider to use (default: profile provider or system default)"
 )
 @click.option("--yolo", is_flag=True, help="Skip workspace trust confirmation")
 def launch(agents, session_name, headless, provider, yolo):
     """Launch cao session with specified agent profile."""
     try:
+        resolved_provider = _resolve_provider(agents, provider)
+
         # Validate provider
-        if provider not in PROVIDERS:
+        if resolved_provider not in PROVIDERS:
             raise click.ClickException(
-                f"Invalid provider '{provider}'. Available providers: {', '.join(PROVIDERS)}"
+                f"Invalid provider '{resolved_provider}'. Available providers: {', '.join(PROVIDERS)}"
             )
         working_directory = os.path.realpath(os.getcwd())
 
@@ -34,9 +62,9 @@ def launch(agents, session_name, headless, provider, yolo):
         # Note: CAO itself does not access the workspace — it is the underlying
         # provider (e.g. claude_code, codex) that reads, writes, and executes
         # commands in the workspace directory.
-        if provider in PROVIDERS_REQUIRING_WORKSPACE_ACCESS and not yolo:
+        if resolved_provider in PROVIDERS_REQUIRING_WORKSPACE_ACCESS and not yolo:
             click.echo(
-                f"The underlying provider ({provider}) will be trusted to perform all actions "
+                f"The underlying provider ({resolved_provider}) will be trusted to perform all actions "
                 f"(read, write, and execute) in:\n"
                 f"  {working_directory}\n\n"
                 f"To skip this confirmation, use: cao launch --yolo\n"
@@ -47,7 +75,7 @@ def launch(agents, session_name, headless, provider, yolo):
         # Call API to create session
         url = f"http://{SERVER_HOST}:{SERVER_PORT}/sessions"
         params = {
-            "provider": provider,
+            "provider": resolved_provider,
             "agent_profile": agents,
             "working_directory": working_directory,
         }

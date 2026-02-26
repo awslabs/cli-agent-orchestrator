@@ -31,6 +31,9 @@ Define the agent's role, responsibilities, and behavior here.
 - `toolsSettings` (object): Tool-specific configuration
 - `model` (string): AI model to use
 - `prompt` (string): Additional prompt text
+- `provider` (string): Preferred CAO provider for launching this profile (e.g., `codex`, `claude_code`)
+
+When `provider` is set in the profile, CAO uses it as the default for launches and MCP handoff/assign unless an explicit provider is passed.
 
 ## Example
 
@@ -38,6 +41,7 @@ Define the agent's role, responsibilities, and behavior here.
 ---
 name: developer
 description: Developer Agent in a multi-agent system
+provider: codex
 mcpServers:
   cao-mcp-server:
     type: stdio

@@ -123,6 +123,23 @@ class TestSessionCreationWithWorkingDirectory:
             call_kwargs = mock_svc.create_terminal.call_args.kwargs
             assert call_kwargs.get("working_directory") == "/custom/path"
 
+    def test_create_session_without_provider_uses_optional_param(self, client):
+        """Test POST /sessions accepts missing provider and passes None to service."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.create_terminal.return_value = Terminal(
+                id="abcd1234",
+                name="test-window",
+                session_name="test-session",
+                provider="kiro_cli",
+                agent_profile="developer",
+            )
+
+            response = client.post("/sessions", params={"agent_profile": "developer"})
+
+            assert response.status_code == 201
+            call_kwargs = mock_svc.create_terminal.call_args.kwargs
+            assert call_kwargs.get("provider") is None
+
 
 class TestTerminalCreationWithWorkingDirectory:
     """Test terminal creation with working_directory parameter."""
@@ -174,6 +191,26 @@ class TestTerminalCreationWithWorkingDirectory:
             assert response.status_code == 201
             call_kwargs = mock_svc.create_terminal.call_args.kwargs
             assert call_kwargs.get("working_directory") == "/session/path"
+
+    def test_create_terminal_in_session_without_provider_uses_optional_param(self, client):
+        """Test POST /sessions/{session}/terminals accepts missing provider."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.create_terminal.return_value = Terminal(
+                id="abcd5678",
+                name="test-window",
+                session_name="test-session",
+                provider="kiro_cli",
+                agent_profile="analyst",
+            )
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={"agent_profile": "analyst"},
+            )
+
+            assert response.status_code == 201
+            call_kwargs = mock_svc.create_terminal.call_args.kwargs
+            assert call_kwargs.get("provider") is None
 
 
 class TestExitTerminalEndpoint:

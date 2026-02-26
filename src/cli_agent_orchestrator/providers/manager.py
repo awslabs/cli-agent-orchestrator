@@ -7,8 +7,12 @@ from cli_agent_orchestrator.clients.database import get_terminal_metadata
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+from cli_agent_orchestrator.providers.codebuddy import CodeBuddyProvider
+from cli_agent_orchestrator.providers.copilot import CopilotProvider
 from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
+from cli_agent_orchestrator.providers.opencode import OpenCodeProvider
+from cli_agent_orchestrator.providers.qoder_cli import QoderCliProvider
 from cli_agent_orchestrator.providers.q_cli import QCliProvider
 
 logger = logging.getLogger(__name__)
@@ -43,6 +47,14 @@ class ProviderManager:
                 provider = ClaudeCodeProvider(terminal_id, tmux_session, tmux_window, agent_profile)
             elif provider_type == ProviderType.CODEX.value:
                 provider = CodexProvider(terminal_id, tmux_session, tmux_window, agent_profile)
+            elif provider_type == ProviderType.QODER_CLI.value:
+                provider = QoderCliProvider(terminal_id, tmux_session, tmux_window)
+            elif provider_type == ProviderType.OPENCODE.value:
+                provider = OpenCodeProvider(terminal_id, tmux_session, tmux_window)
+            elif provider_type == ProviderType.CODEBUDDY.value:
+                provider = CodeBuddyProvider(terminal_id, tmux_session, tmux_window, agent_profile)
+            elif provider_type == ProviderType.COPILOT.value:
+                provider = CopilotProvider(terminal_id, tmux_session, tmux_window)
             else:
                 raise ValueError(f"Unknown provider type: {provider_type}")
 
