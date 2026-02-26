@@ -1,5 +1,6 @@
 """Tests for the inbox service."""
 
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -12,6 +13,8 @@ from cli_agent_orchestrator.services.inbox_service import (
     _get_log_tail,
     _has_idle_pattern,
     check_and_send_pending_messages,
+    start_polling,
+    stop_polling,
 )
 
 
@@ -250,3 +253,29 @@ class TestLogFileHandler:
 
         # Should not raise exception - handles it gracefully
         handler._handle_log_change("test-terminal")
+
+
+
+class TestPolling:
+    """Tests for polling functionality."""
+
+    def test_start_stop_polling(self):
+        """Test starting and stopping the polling thread."""
+        start_polling()
+        time.sleep(0.1)
+        stop_polling()
+
+    @patch("cli_agent_orchestrator.clients.database.get_inbox_messages")
+    @patch("cli_agent_orchestrator.services.inbox_service.check_and_send_pending_messages")
+    def test_polling_attempts_delivery(self, mock_check, mock_get_messages):
+        """Test that polling thread attempts delivery for pending messages."""
+        mock_message = MagicMock()
+        mock_message.receiver_id = "term-123"
+        mock_get_messages.return_value = [mock_message]
+
+        start_polling()
+        time.sleep(2.5)
+        stop_polling()
+
+        assert mock_check.called
+        mock_check.assert_any_call("term-123")

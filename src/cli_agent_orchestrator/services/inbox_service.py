@@ -8,6 +8,7 @@ Architecture:
 - LogFileHandler monitors terminal log files for changes using watchdog
 - When a terminal becomes idle (detected via log patterns), pending messages are delivered
 - Messages are sent via terminal_service.send_input() which types into the tmux pane
+- Periodic polling ensures messages are delivered even when log files don't change
 
 Message Flow:
 1. Agent A calls send_message(terminal_id, message) → message queued in DB
@@ -15,6 +16,7 @@ Message Flow:
 3. LogFileHandler.on_modified() triggered → checks for pending messages
 4. If terminal is IDLE and has pending messages → deliver via send_input()
 5. Message status updated to DELIVERED or FAILED
+6. Fallback: Periodic polling checks for pending messages every 2 seconds
 
 Performance Optimization:
 - Uses fast log tail check before expensive tmux status queries
@@ -24,6 +26,8 @@ Performance Optimization:
 import logging
 import re
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 from watchdog.events import FileModifiedEvent, FileSystemEventHandler
@@ -36,6 +40,9 @@ from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services import terminal_service
 
 logger = logging.getLogger(__name__)
+
+_polling_thread = None
+_stop_polling = threading.Event()
 
 
 def _get_log_tail(terminal_id: str, lines: int = 100) -> str:
@@ -149,3 +156,42 @@ class LogFileHandler(FileSystemEventHandler):
 
         except Exception as e:
             logger.error(f"Error handling log change for {terminal_id}: {e}")
+
+
+def _poll_pending_messages():
+    """Background thread that polls for pending messages every 2 seconds."""
+    while not _stop_polling.is_set():
+        try:
+            from cli_agent_orchestrator.clients.database import get_inbox_messages
+
+            messages = get_inbox_messages(status=MessageStatus.PENDING, limit=100)
+            terminal_ids = {msg.receiver_id for msg in messages}
+
+            for terminal_id in terminal_ids:
+                try:
+                    check_and_send_pending_messages(terminal_id)
+                except Exception as e:
+                    logger.debug(f"Polling delivery failed for {terminal_id}: {e}")
+
+        except Exception as e:
+            logger.error(f"Error in polling thread: {e}")
+
+        _stop_polling.wait(2)
+
+
+def start_polling():
+    """Start the background polling thread."""
+    global _polling_thread
+    if _polling_thread is None or not _polling_thread.is_alive():
+        _stop_polling.clear()
+        _polling_thread = threading.Thread(target=_poll_pending_messages, daemon=True)
+        _polling_thread.start()
+        logger.info("Started inbox polling thread")
+
+
+def stop_polling():
+    """Stop the background polling thread."""
+    _stop_polling.set()
+    if _polling_thread:
+        _polling_thread.join(timeout=5)
+    logger.info("Stopped inbox polling thread")

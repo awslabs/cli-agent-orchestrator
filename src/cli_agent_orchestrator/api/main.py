@@ -93,7 +93,13 @@ async def lifespan(app: FastAPI):
     inbox_observer.start()
     logger.info("Inbox watcher started (PollingObserver)")
 
+    # Start inbox polling thread
+    inbox_service.start_polling()
+
     yield
+
+    # Stop inbox polling
+    inbox_service.stop_polling()
 
     # Stop inbox observer
     inbox_observer.stop()
