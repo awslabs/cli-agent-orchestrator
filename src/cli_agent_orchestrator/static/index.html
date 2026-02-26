@@ -1,0 +1,950 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CLI Agent Orchestrator — Console</title>
+  <style>
+    /* ===== Reset & Base ===== */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #0f1117;
+      --surface: #1a1d27;
+      --surface2: #22263a;
+      --border: #2d3148;
+      --accent: #4f8ef7;
+      --accent-hover: #6aa0ff;
+      --danger: #e05252;
+      --success: #3dbe7a;
+      --warn: #e0a83d;
+      --text: #c9cdd9;
+      --text-dim: #6b7196;
+      --text-bright: #eef0f8;
+      --radius: 8px;
+      --sidebar: 220px;
+      --font: system-ui, -apple-system, sans-serif;
+      --mono: "Cascadia Code", "Fira Code", "Consolas", monospace;
+    }
+    html, body { height: 100%; font-family: var(--font); background: var(--bg); color: var(--text); font-size: 14px; }
+
+    /* ===== Layout ===== */
+    .layout { display: flex; height: 100vh; }
+    .sidebar {
+      width: var(--sidebar); min-width: var(--sidebar); background: var(--surface);
+      border-right: 1px solid var(--border); display: flex; flex-direction: column;
+      overflow-y: auto; z-index: 10;
+    }
+    .sidebar-brand {
+      padding: 18px 16px 12px; border-bottom: 1px solid var(--border);
+      font-size: 13px; font-weight: 700; color: var(--accent); letter-spacing: .5px;
+      line-height: 1.4;
+    }
+    .sidebar-brand small { display: block; font-weight: 400; color: var(--text-dim); font-size: 11px; }
+    nav { padding: 8px 0; flex: 1; }
+    .nav-group { padding: 12px 16px 4px; font-size: 10px; font-weight: 600; color: var(--text-dim); text-transform: uppercase; letter-spacing: 1px; }
+    .nav-item {
+      display: flex; align-items: center; gap: 8px; padding: 8px 16px;
+      cursor: pointer; color: var(--text); font-size: 13px; border-left: 3px solid transparent;
+      transition: background .15s, color .15s, border-color .15s;
+    }
+    .nav-item:hover { background: var(--surface2); color: var(--text-bright); }
+    .nav-item.active { border-left-color: var(--accent); background: var(--surface2); color: var(--accent); }
+    .nav-item .badge {
+      margin-left: auto; font-size: 10px; padding: 1px 6px; border-radius: 9px;
+      font-weight: 600;
+    }
+    .badge-get { background: #1b3a6a; color: #4f8ef7; }
+    .badge-post { background: #1b4a2a; color: #3dbe7a; }
+    .badge-delete { background: #4a1b1b; color: #e05252; }
+
+    .main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+    .topbar {
+      padding: 12px 24px; border-bottom: 1px solid var(--border); background: var(--surface);
+      display: flex; align-items: center; gap: 12px; flex-shrink: 0;
+    }
+    .topbar h1 { font-size: 16px; font-weight: 600; color: var(--text-bright); flex: 1; }
+    .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-dim); flex-shrink: 0; }
+    .status-dot.ok { background: var(--success); }
+    .status-dot.error { background: var(--danger); }
+    #server-status-text { font-size: 12px; color: var(--text-dim); }
+    .base-url-input {
+      padding: 5px 10px; border-radius: 6px; border: 1px solid var(--border);
+      background: var(--surface2); color: var(--text); font-family: var(--mono); font-size: 12px;
+      width: 260px; outline: none;
+    }
+    .base-url-input:focus { border-color: var(--accent); }
+
+    .content { flex: 1; overflow-y: auto; padding: 24px; }
+
+    /* ===== Panels ===== */
+    .panel { display: none; }
+    .panel.active { display: block; }
+
+    /* ===== Cards ===== */
+    .card {
+      background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+      margin-bottom: 16px; overflow: hidden;
+    }
+    .card-header {
+      padding: 14px 18px; border-bottom: 1px solid var(--border); display: flex;
+      align-items: center; gap: 10px; background: var(--surface2); cursor: pointer;
+    }
+    .card-header:hover { background: #252940; }
+    .method-badge {
+      font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 4px;
+      font-family: var(--mono); flex-shrink: 0;
+    }
+    .method-get { background: #1b3a6a; color: #4f8ef7; }
+    .method-post { background: #1b4a2a; color: #3dbe7a; }
+    .method-delete { background: #4a1b1b; color: #e05252; }
+    .card-title { font-size: 13px; font-weight: 600; color: var(--text-bright); font-family: var(--mono); }
+    .card-desc { font-size: 12px; color: var(--text-dim); margin-left: auto; }
+    .card-body { padding: 18px; }
+
+    /* ===== Form Controls ===== */
+    .field { margin-bottom: 14px; }
+    .field label { display: block; font-size: 12px; font-weight: 600; color: var(--text-dim); margin-bottom: 5px; }
+    .field label .req { color: var(--danger); }
+    .field label .opt { color: var(--text-dim); font-weight: 400; }
+    input[type=text], input[type=number], select, textarea {
+      width: 100%; padding: 8px 12px; border-radius: 6px; border: 1px solid var(--border);
+      background: var(--surface2); color: var(--text); font-size: 13px; outline: none;
+      font-family: var(--font);
+      transition: border-color .15s;
+    }
+    input[type=text]:focus, input[type=number]:focus, select:focus, textarea:focus { border-color: var(--accent); }
+    textarea { font-family: var(--mono); resize: vertical; min-height: 60px; }
+    select option { background: var(--surface2); }
+
+    .fields-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    @media (max-width: 700px) { .fields-row { grid-template-columns: 1fr; } }
+
+    /* ===== Buttons ===== */
+    .btn {
+      display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px;
+      border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer;
+      border: none; transition: background .15s, opacity .15s;
+    }
+    .btn:disabled { opacity: .5; cursor: not-allowed; }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
+    .btn-danger { background: var(--danger); color: #fff; }
+    .btn-danger:hover:not(:disabled) { background: #ee6060; }
+    .btn-secondary { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
+    .btn-secondary:hover:not(:disabled) { background: var(--border); }
+    .btn-sm { padding: 5px 10px; font-size: 12px; }
+
+    /* ===== Response Box ===== */
+    .response-box {
+      margin-top: 14px; background: var(--bg); border: 1px solid var(--border);
+      border-radius: 6px; padding: 12px 14px; font-family: var(--mono); font-size: 12px;
+      white-space: pre-wrap; word-break: break-all; max-height: 360px; overflow-y: auto;
+      color: var(--text);
+    }
+    .response-box.ok { border-color: var(--success); color: #7de9aa; }
+    .response-box.error { border-color: var(--danger); color: #f08080; }
+    .response-meta { margin-top: 8px; font-size: 11px; color: var(--text-dim); display: flex; gap: 14px; }
+    .response-meta .meta-ok { color: var(--success); }
+    .response-meta .meta-err { color: var(--danger); }
+
+    /* ===== Overview / Health ===== */
+    .health-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 14px; margin-bottom: 20px; }
+    .health-card {
+      background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 18px 16px; display: flex; flex-direction: column; gap: 6px;
+    }
+    .health-card .label { font-size: 11px; color: var(--text-dim); text-transform: uppercase; font-weight: 600; letter-spacing: .5px; }
+    .health-card .value { font-size: 22px; font-weight: 700; color: var(--text-bright); }
+    .health-card .sub { font-size: 12px; color: var(--text-dim); }
+
+    /* ===== Table ===== */
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th { padding: 8px 12px; text-align: left; font-size: 11px; font-weight: 600; color: var(--text-dim); text-transform: uppercase; letter-spacing: .5px; border-bottom: 1px solid var(--border); }
+    td { padding: 10px 12px; border-bottom: 1px solid var(--border); color: var(--text); vertical-align: top; }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: var(--surface2); }
+    .status-pill {
+      display: inline-block; padding: 2px 8px; border-radius: 9px; font-size: 11px; font-weight: 600;
+    }
+    .status-idle { background: #1b3a6a; color: #4f8ef7; }
+    .status-processing { background: #3a341b; color: #e0c43d; }
+    .status-completed { background: #1b4a2a; color: #3dbe7a; }
+    .status-error { background: #4a1b1b; color: #e05252; }
+    .status-waiting_user_answer { background: #3a1b4a; color: #bf7af0; }
+
+    /* ===== Misc ===== */
+    .empty-state { text-align: center; padding: 40px; color: var(--text-dim); }
+    .spin { animation: spin .8s linear infinite; display: inline-block; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .section-title { font-size: 18px; font-weight: 700; color: var(--text-bright); margin-bottom: 6px; }
+    .section-desc { font-size: 13px; color: var(--text-dim); margin-bottom: 20px; }
+
+    /* ===== Collapsible ===== */
+    .collapsed .card-body { display: none; }
+    .chevron { margin-left: auto; color: var(--text-dim); transition: transform .2s; }
+    .collapsed .chevron { transform: rotate(-90deg); }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <!-- ===== Sidebar ===== -->
+  <aside class="sidebar">
+    <div class="sidebar-brand">
+      CLI Agent Orchestrator
+      <small>API Console</small>
+    </div>
+    <nav>
+      <div class="nav-group">Overview</div>
+      <div class="nav-item active" data-panel="panel-health">
+        🏥 Health Check
+        <span class="badge badge-get">GET</span>
+      </div>
+
+      <div class="nav-group">Sessions</div>
+      <div class="nav-item" data-panel="panel-sessions-list">
+        📋 List Sessions
+        <span class="badge badge-get">GET</span>
+      </div>
+      <div class="nav-item" data-panel="panel-sessions-create">
+        ➕ Create Session
+        <span class="badge badge-post">POST</span>
+      </div>
+      <div class="nav-item" data-panel="panel-sessions-get">
+        🔍 Get Session
+        <span class="badge badge-get">GET</span>
+      </div>
+      <div class="nav-item" data-panel="panel-sessions-delete">
+        🗑 Delete Session
+        <span class="badge badge-delete">DEL</span>
+      </div>
+
+      <div class="nav-group">Session Terminals</div>
+      <div class="nav-item" data-panel="panel-session-terminals-list">
+        📋 List Terminals
+        <span class="badge badge-get">GET</span>
+      </div>
+      <div class="nav-item" data-panel="panel-session-terminals-create">
+        ➕ Add Terminal
+        <span class="badge badge-post">POST</span>
+      </div>
+
+      <div class="nav-group">Terminals</div>
+      <div class="nav-item" data-panel="panel-terminals-get">
+        🔍 Get Terminal
+        <span class="badge badge-get">GET</span>
+      </div>
+      <div class="nav-item" data-panel="panel-terminals-workdir">
+        📂 Working Dir
+        <span class="badge badge-get">GET</span>
+      </div>
+      <div class="nav-item" data-panel="panel-terminals-input">
+        ⌨️ Send Input
+        <span class="badge badge-post">POST</span>
+      </div>
+      <div class="nav-item" data-panel="panel-terminals-output">
+        📄 Get Output
+        <span class="badge badge-get">GET</span>
+      </div>
+      <div class="nav-item" data-panel="panel-terminals-exit">
+        🚪 Exit Terminal
+        <span class="badge badge-post">POST</span>
+      </div>
+      <div class="nav-item" data-panel="panel-terminals-delete">
+        🗑 Delete Terminal
+        <span class="badge badge-delete">DEL</span>
+      </div>
+
+      <div class="nav-group">Inbox</div>
+      <div class="nav-item" data-panel="panel-inbox-send">
+        📨 Send Message
+        <span class="badge badge-post">POST</span>
+      </div>
+      <div class="nav-item" data-panel="panel-inbox-list">
+        📬 Get Messages
+        <span class="badge badge-get">GET</span>
+      </div>
+    </nav>
+  </aside>
+
+  <!-- ===== Main ===== -->
+  <div class="main">
+    <div class="topbar">
+      <h1 id="panel-title">Health Check</h1>
+      <div class="status-dot" id="status-dot"></div>
+      <span id="server-status-text">—</span>
+      <input class="base-url-input" id="base-url" type="text" value="http://localhost:9889" placeholder="http://localhost:9889" />
+      <button class="btn btn-secondary btn-sm" onclick="checkHealth()">⟳ Ping</button>
+    </div>
+
+    <div class="content">
+
+      <!-- ===== Health ===== -->
+      <div class="panel active" id="panel-health">
+        <p class="section-title">Health Check</p>
+        <p class="section-desc">Verify the server is running and reachable.</p>
+        <div class="card">
+          <div class="card-header" onclick="toggleCard(this)">
+            <span class="method-badge method-get">GET</span>
+            <span class="card-title">/health</span>
+            <span class="card-desc">Server liveness probe</span>
+            <span class="chevron">▾</span>
+          </div>
+          <div class="card-body">
+            <button class="btn btn-primary" onclick="runHealth()">Send Request</button>
+            <div id="res-health"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== List Sessions ===== -->
+      <div class="panel" id="panel-sessions-list">
+        <p class="section-title">List Sessions</p>
+        <p class="section-desc">Retrieve all active sessions managed by the orchestrator.</p>
+        <div class="card">
+          <div class="card-header" onclick="toggleCard(this)">
+            <span class="method-badge method-get">GET</span>
+            <span class="card-title">/sessions</span>
+            <span class="card-desc">List all sessions</span>
+            <span class="chevron">▾</span>
+          </div>
+          <div class="card-body">
+            <button class="btn btn-primary" onclick="runListSessions()">Send Request</button>
+            <div id="res-sessions-list"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== Create Session ===== -->
+      <div class="panel" id="panel-sessions-create">
+        <p class="section-title">Create Session</p>
+        <p class="section-desc">Start a new tmux session with one agent terminal.</p>
+        <div class="card">
+          <div class="card-header" onclick="toggleCard(this)">
+            <span class="method-badge method-post">POST</span>
+            <span class="card-title">/sessions</span>
+            <span class="card-desc">Create session + terminal</span>
+            <span class="chevron">▾</span>
+          </div>
+          <div class="card-body">
+            <div class="fields-row">
+              <div class="field">
+                <label>agent_profile <span class="req">*</span></label>
+                <input type="text" id="cs-agent-profile" placeholder="e.g. my-agent" />
+              </div>
+              <div class="field">
+                <label>provider <span class="opt">(optional)</span></label>
+                <select id="cs-provider">
+                  <option value="">— default (kiro_cli) —</option>
+                  <option value="kiro_cli">kiro_cli</option>
+                  <option value="q_cli">q_cli</option>
+                  <option value="claude_code">claude_code</option>
+                  <option value="codex">codex</option>
+                  <option value="qoder_cli">qoder_cli</option>
+                  <option value="opencode">opencode</option>
+                  <option value="codebuddy">codebuddy</option>
+                  <option value="copilot">copilot</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>session_name <span class="opt">(optional)</span></label>
+                <input type="text" id="cs-session-name" placeholder="auto-generated if empty" />
+              </div>
+              <div class="field">
+                <label>working_directory <span class="opt">(optional)</span></label>
+                <input type="text" id="cs-working-dir" placeholder="e.g. /home/user/project" />
+              </div>
+            </div>
+            <button class="btn btn-primary" onclick="runCreateSession()">Send Request</button>
+            <div id="res-sessions-create"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== Get Session ===== -->
+      <div class="panel" id="panel-sessions-get">
+        <p class="section-title">Get Session</p>
+        <p class="section-desc">Retrieve details of a specific session by name.</p>
+        <div class="card">
+          <div class="card-header" onclick="toggleCard(this)">
+            <span class="method-badge method-get">GET</span>
+            <span class="card-title">/sessions/{session_name}</span>
+            <span class="card-desc">Session details</span>
+            <span class="chevron">▾</span>
+          </div>
+          <div class="card-body">
+            <div class="field">
+              <label>session_name <span class="req">*</span></label>
+              <input type="text" id="gs-session-name" placeholder="e.g. cao-abc123" />
+            </div>
+            <button class="btn btn-primary" onclick="runGetSession()">Send Request</button>
+            <div id="res-sessions-get"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== Delete Session ===== -->
+      <div class="panel" id="panel-sessions-delete">
+        <p class="section-title">Delete Session</p>
+        <p class="section-desc">Delete a session and all its terminals.</p>
+        <div class="card">
+          <div class="card-header" onclick="toggleCard(this)">
+            <span class="method-badge method-delete">DELETE</span>
+            <span class="card-title">/sessions/{session_name}</span>
+            <span class="card-desc">Terminate session</span>
+            <span class="chevron">▾</span>
+          </div>
+          <div class="card-body">
+            <div class="field">
+              <label>session_name <span class="req">*</span></label>
+              <input type="text" id="ds-session-name" placeholder="e.g. cao-abc123" />
+            </div>
+            <button class="btn btn-danger" onclick="runDeleteSession()">Send Request</button>
+            <div id="res-sessions-delete"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== List Terminals in Session ===== -->
+      <div class="panel" id="panel-session-terminals-list">
+        <p class="section-title">List Terminals in Session</p>
+        <p class="section-desc">Retrieve all terminals belonging to a session.</p>
+        <div class="card">
+          <div class="card-header" onclick="toggleCard(this)">
+            <span class="method-badge method-get">GET</span>
+            <span class="card-title">/sessions/{session_name}/terminals</span>
+            <span class="card-desc">List session terminals</span>
+            <span class="chevron">▾</span>
+          </div>
+          <div class="card-body">
+            <div class="field">
+              <label>session_name <span class="req">*</span></label>
+              <input type="text" id="stl-session-name" placeholder="e.g. cao-abc123" />
+            </div>
+            <button class="btn btn-primary" onclick="runListSessionTerminals()">Send Request</button>
+            <div id="res-session-terminals-list"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== Add Terminal to Session ===== -->
+      <div class="panel" id="panel-session-terminals-create">
+        <p class="section-title">Add Terminal to Session</p>
+        <p class="section-desc">Create an additional terminal inside an existing session.</p>
+        <div class="card">
+          <div class="card-header" onclick="toggleCard(this)">
+            <span class="method-badge method-post">POST</span>
+            <span class="card-title">/sessions/{session_name}/terminals</span>
+            <span class="card-desc">Add terminal to session</span>
+            <span class="chevron">▾</span>
+          </div>
+          <div class="card-body">
+            <div class="fields-row">
+              <div class="field">
+                <label>session_name <span class="req">*</span></label>
+                <input type="text" id="stc-session-name" placeholder="e.g. cao-abc123" />
+              </div>
+              <div class="field">
+                <label>agent_profile <span class="req">*</span></label>
+                <input type="text" id="stc-agent-profile" placeholder="e.g. my-agent" />
+              </div>
+              <div class="field">
+                <label>provider <span class="opt">(optional)</span></label>
+                <select id="stc-provider">
+                  <option value="">— default (kiro_cli) —</option>
+                  <option value="kiro_cli">kiro_cli</option>
+                  <option value="q_cli">q_cli</option>
+                  <option value="claude_code">claude_code</option>
+                  <option value="codex">codex</option>
+                  <option value="qoder_cli">qoder_cli</option>
+                  <option value="opencode">opencode</option>
+                  <option value="codebuddy">codebuddy</option>
+                  <option value="copilot">copilot</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>working_directory <span class="opt">(optional)</span></label>
+                <input type="text" id="stc-working-dir" placeholder="e.g. /home/user/project" />
+              </div>
+            </div>
+            <button class="btn btn-primary" onclick="runCreateSessionTerminal()">Send Request</button>
+            <div id="res-session-terminals-create"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== Get Terminal ===== -->
+      <div class="panel" id="panel-terminals-get">
+        <p class="section-title">Get Terminal</p>
+        <p class="section-desc">Retrieve details of a terminal by its 8-character hex ID.</p>
+        <div class="card">
+          <div class="card-header" onclick="toggleCard(this)">
+            <span class="method-badge method-get">GET</span>
+            <span class="card-title">/terminals/{terminal_id}</span>
+            <span class="card-desc">Terminal details</span>
+            <span class="chevron">▾</span>
+          </div>
+          <div class="card-body">
+            <div class="field">
+              <label>terminal_id <span class="req">*</span> <span class="opt">(8-char hex)</span></label>
+              <input type="text" id="gt-terminal-id" placeholder="e.g. a1b2c3d4" maxlength="8" />
+            </div>
+            <button class="btn btn-primary" onclick="runGetTerminal()">Send Request</button>
+            <div id="res-terminals-get"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== Working Directory ===== -->
+      <div class="panel" id="panel-terminals-workdir">
+        <p class="section-title">Get Working Directory</p>
+        <p class="section-desc">Retrieve the current working directory of a terminal's pane.</p>
+        <div class="card">
+          <div class="card-header" onclick="toggleCard(this)">
+            <span class="method-badge method-get">GET</span>
+            <span class="card-title">/terminals/{terminal_id}/working-directory</span>
+            <span class="card-desc">Terminal working dir</span>
+            <span class="chevron">▾</span>
+          </div>
+          <div class="card-body">
+            <div class="field">
+              <label>terminal_id <span class="req">*</span> <span class="opt">(8-char hex)</span></label>
+              <input type="text" id="wd-terminal-id" placeholder="e.g. a1b2c3d4" maxlength="8" />
+            </div>
+            <button class="btn btn-primary" onclick="runGetWorkingDir()">Send Request</button>
+            <div id="res-terminals-workdir"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== Send Input ===== -->
+      <div class="panel" id="panel-terminals-input">
+        <p class="section-title">Send Input to Terminal</p>
+        <p class="section-desc">Send a message/command to a running terminal.</p>
+        <div class="card">
+          <div class="card-header" onclick="toggleCard(this)">
+            <span class="method-badge method-post">POST</span>
+            <span class="card-title">/terminals/{terminal_id}/input</span>
+            <span class="card-desc">Send input text</span>
+            <span class="chevron">▾</span>
+          </div>
+          <div class="card-body">
+            <div class="field">
+              <label>terminal_id <span class="req">*</span> <span class="opt">(8-char hex)</span></label>
+              <input type="text" id="si-terminal-id" placeholder="e.g. a1b2c3d4" maxlength="8" />
+            </div>
+            <div class="field">
+              <label>message <span class="req">*</span></label>
+              <textarea id="si-message" rows="3" placeholder="Enter the message to send to the agent..."></textarea>
+            </div>
+            <button class="btn btn-primary" onclick="runSendInput()">Send Request</button>
+            <div id="res-terminals-input"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== Get Output ===== -->
+      <div class="panel" id="panel-terminals-output">
+        <p class="section-title">Get Terminal Output</p>
+        <p class="section-desc">Read the terminal's captured output log.</p>
+        <div class="card">
+          <div class="card-header" onclick="toggleCard(this)">
+            <span class="method-badge method-get">GET</span>
+            <span class="card-title">/terminals/{terminal_id}/output</span>
+            <span class="card-desc">Terminal output log</span>
+            <span class="chevron">▾</span>
+          </div>
+          <div class="card-body">
+            <div class="fields-row">
+              <div class="field">
+                <label>terminal_id <span class="req">*</span> <span class="opt">(8-char hex)</span></label>
+                <input type="text" id="go-terminal-id" placeholder="e.g. a1b2c3d4" maxlength="8" />
+              </div>
+              <div class="field">
+                <label>mode <span class="opt">(optional)</span></label>
+                <select id="go-mode">
+                  <option value="full">full (default)</option>
+                  <option value="last">last</option>
+                  <option value="tail">tail</option>
+                </select>
+              </div>
+            </div>
+            <button class="btn btn-primary" onclick="runGetOutput()">Send Request</button>
+            <div id="res-terminals-output"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== Exit Terminal ===== -->
+      <div class="panel" id="panel-terminals-exit">
+        <p class="section-title">Exit Terminal</p>
+        <p class="section-desc">Send a provider-specific exit command to gracefully stop the agent.</p>
+        <div class="card">
+          <div class="card-header" onclick="toggleCard(this)">
+            <span class="method-badge method-post">POST</span>
+            <span class="card-title">/terminals/{terminal_id}/exit</span>
+            <span class="card-desc">Send exit command</span>
+            <span class="chevron">▾</span>
+          </div>
+          <div class="card-body">
+            <div class="field">
+              <label>terminal_id <span class="req">*</span> <span class="opt">(8-char hex)</span></label>
+              <input type="text" id="et-terminal-id" placeholder="e.g. a1b2c3d4" maxlength="8" />
+            </div>
+            <button class="btn btn-primary" onclick="runExitTerminal()">Send Request</button>
+            <div id="res-terminals-exit"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== Delete Terminal ===== -->
+      <div class="panel" id="panel-terminals-delete">
+        <p class="section-title">Delete Terminal</p>
+        <p class="section-desc">Permanently remove a terminal from the session.</p>
+        <div class="card">
+          <div class="card-header" onclick="toggleCard(this)">
+            <span class="method-badge method-delete">DELETE</span>
+            <span class="card-title">/terminals/{terminal_id}</span>
+            <span class="card-desc">Remove terminal</span>
+            <span class="chevron">▾</span>
+          </div>
+          <div class="card-body">
+            <div class="field">
+              <label>terminal_id <span class="req">*</span> <span class="opt">(8-char hex)</span></label>
+              <input type="text" id="dt-terminal-id" placeholder="e.g. a1b2c3d4" maxlength="8" />
+            </div>
+            <button class="btn btn-danger" onclick="runDeleteTerminal()">Send Request</button>
+            <div id="res-terminals-delete"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== Send Inbox Message ===== -->
+      <div class="panel" id="panel-inbox-send">
+        <p class="section-title">Send Inbox Message</p>
+        <p class="section-desc">Queue a message from one terminal to another. Delivered when the receiver is idle.</p>
+        <div class="card">
+          <div class="card-header" onclick="toggleCard(this)">
+            <span class="method-badge method-post">POST</span>
+            <span class="card-title">/terminals/{receiver_id}/inbox/messages</span>
+            <span class="card-desc">Send inbox message</span>
+            <span class="chevron">▾</span>
+          </div>
+          <div class="card-body">
+            <div class="fields-row">
+              <div class="field">
+                <label>receiver_id <span class="req">*</span> <span class="opt">(8-char hex)</span></label>
+                <input type="text" id="im-receiver-id" placeholder="e.g. a1b2c3d4" maxlength="8" />
+              </div>
+              <div class="field">
+                <label>sender_id <span class="req">*</span> <span class="opt">(8-char hex)</span></label>
+                <input type="text" id="im-sender-id" placeholder="e.g. b2c3d4e5" maxlength="8" />
+              </div>
+            </div>
+            <div class="field">
+              <label>message <span class="req">*</span></label>
+              <textarea id="im-message" rows="3" placeholder="Message content to deliver to the receiver terminal..."></textarea>
+            </div>
+            <button class="btn btn-primary" onclick="runSendInboxMessage()">Send Request</button>
+            <div id="res-inbox-send"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== Get Inbox Messages ===== -->
+      <div class="panel" id="panel-inbox-list">
+        <p class="section-title">Get Inbox Messages</p>
+        <p class="section-desc">Retrieve queued or delivered inbox messages for a terminal.</p>
+        <div class="card">
+          <div class="card-header" onclick="toggleCard(this)">
+            <span class="method-badge method-get">GET</span>
+            <span class="card-title">/terminals/{terminal_id}/inbox/messages</span>
+            <span class="card-desc">List inbox messages</span>
+            <span class="chevron">▾</span>
+          </div>
+          <div class="card-body">
+            <div class="fields-row">
+              <div class="field">
+                <label>terminal_id <span class="req">*</span> <span class="opt">(8-char hex)</span></label>
+                <input type="text" id="il-terminal-id" placeholder="e.g. a1b2c3d4" maxlength="8" />
+              </div>
+              <div class="field">
+                <label>limit <span class="opt">(optional, max 100)</span></label>
+                <input type="number" id="il-limit" value="10" min="1" max="100" />
+              </div>
+              <div class="field">
+                <label>status <span class="opt">(optional)</span></label>
+                <select id="il-status">
+                  <option value="">— all statuses —</option>
+                  <option value="pending">pending</option>
+                  <option value="delivered">delivered</option>
+                  <option value="failed">failed</option>
+                </select>
+              </div>
+            </div>
+            <button class="btn btn-primary" onclick="runGetInboxMessages()">Send Request</button>
+            <div id="res-inbox-list"></div>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- /content -->
+  </div><!-- /main -->
+</div><!-- /layout -->
+
+<script>
+  /* ===== Navigation ===== */
+  const navItems = document.querySelectorAll('.nav-item[data-panel]');
+  const panels = document.querySelectorAll('.panel');
+  const panelTitle = document.getElementById('panel-title');
+
+  navItems.forEach(item => {
+    item.addEventListener('click', () => {
+      navItems.forEach(n => n.classList.remove('active'));
+      panels.forEach(p => p.classList.remove('active'));
+      item.classList.add('active');
+      document.getElementById(item.dataset.panel).classList.add('active');
+      panelTitle.textContent = item.textContent.replace(/GET|POST|DEL/g, '').trim();
+    });
+  });
+
+  /* ===== Collapsible cards ===== */
+  function toggleCard(header) {
+    header.closest('.card').classList.toggle('collapsed');
+  }
+
+  /* ===== Helpers ===== */
+  function baseUrl() {
+    return document.getElementById('base-url').value.replace(/\/$/, '');
+  }
+
+  function showResult(id, data, ok, statusCode, duration) {
+    const el = document.getElementById(id);
+    const text = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
+    el.innerHTML = `<div class="response-box ${ok ? 'ok' : 'error'}">${escapeHtml(text)}</div>
+      <div class="response-meta">
+        <span class="${ok ? 'meta-ok' : 'meta-err'}">${ok ? '✓' : '✗'} HTTP ${statusCode}</span>
+        <span>${duration}ms</span>
+      </div>`;
+  }
+
+  function showError(id, err) {
+    const el = document.getElementById(id);
+    el.innerHTML = `<div class="response-box error">${escapeHtml(String(err))}</div>
+      <div class="response-meta"><span class="meta-err">✗ Network Error</span></div>`;
+  }
+
+  function escapeHtml(s) {
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  async function apiFetch(method, path, params) {
+    const url = new URL(baseUrl() + path);
+    if (params) Object.entries(params).forEach(([k,v]) => { if (v !== '' && v !== null && v !== undefined) url.searchParams.set(k, v); });
+    const t0 = Date.now();
+    const res = await fetch(url.toString(), { method });
+    const duration = Date.now() - t0;
+    let body;
+    try { body = await res.json(); } catch { body = await res.text(); }
+    return { ok: res.ok, status: res.status, body, duration };
+  }
+
+  async function apiPost(path, params) {
+    const url = new URL(baseUrl() + path);
+    if (params) Object.entries(params).forEach(([k,v]) => { if (v !== '' && v !== null && v !== undefined) url.searchParams.set(k, v); });
+    const t0 = Date.now();
+    const res = await fetch(url.toString(), { method: 'POST' });
+    const duration = Date.now() - t0;
+    let body;
+    try { body = await res.json(); } catch { body = await res.text(); }
+    return { ok: res.ok, status: res.status, body, duration };
+  }
+
+  async function apiDelete(path) {
+    const url = new URL(baseUrl() + path);
+    const t0 = Date.now();
+    const res = await fetch(url.toString(), { method: 'DELETE' });
+    const duration = Date.now() - t0;
+    let body;
+    try { body = await res.json(); } catch { body = await res.text(); }
+    return { ok: res.ok, status: res.status, body, duration };
+  }
+
+  /* ===== Server health indicator ===== */
+  const statusDot = document.getElementById('status-dot');
+  const statusText = document.getElementById('server-status-text');
+
+  async function checkHealth() {
+    try {
+      const r = await apiFetch('GET', '/health');
+      statusDot.className = 'status-dot ' + (r.ok ? 'ok' : 'error');
+      statusText.textContent = r.ok ? 'Server online' : 'HTTP ' + r.status;
+    } catch (e) {
+      statusDot.className = 'status-dot error';
+      statusText.textContent = 'Unreachable';
+    }
+  }
+  checkHealth();
+
+  /* ===== Endpoint handlers ===== */
+
+  async function runHealth() {
+    try {
+      const r = await apiFetch('GET', '/health');
+      showResult('res-health', r.body, r.ok, r.status, r.duration);
+      statusDot.className = 'status-dot ' + (r.ok ? 'ok' : 'error');
+      statusText.textContent = r.ok ? 'Server online' : 'HTTP ' + r.status;
+    } catch(e) { showError('res-health', e); }
+  }
+
+  async function runListSessions() {
+    try {
+      const r = await apiFetch('GET', '/sessions');
+      showResult('res-sessions-list', r.body, r.ok, r.status, r.duration);
+    } catch(e) { showError('res-sessions-list', e); }
+  }
+
+  async function runCreateSession() {
+    const agentProfile = document.getElementById('cs-agent-profile').value.trim();
+    if (!agentProfile) { alert('agent_profile is required'); return; }
+    const params = {
+      agent_profile: agentProfile,
+      provider: document.getElementById('cs-provider').value,
+      session_name: document.getElementById('cs-session-name').value.trim(),
+      working_directory: document.getElementById('cs-working-dir').value.trim(),
+    };
+    try {
+      const r = await apiPost('/sessions', params);
+      showResult('res-sessions-create', r.body, r.ok, r.status, r.duration);
+    } catch(e) { showError('res-sessions-create', e); }
+  }
+
+  async function runGetSession() {
+    const name = document.getElementById('gs-session-name').value.trim();
+    if (!name) { alert('session_name is required'); return; }
+    try {
+      const r = await apiFetch('GET', `/sessions/${encodeURIComponent(name)}`);
+      showResult('res-sessions-get', r.body, r.ok, r.status, r.duration);
+    } catch(e) { showError('res-sessions-get', e); }
+  }
+
+  async function runDeleteSession() {
+    const name = document.getElementById('ds-session-name').value.trim();
+    if (!name) { alert('session_name is required'); return; }
+    if (!confirm(`Delete session "${name}"?`)) return;
+    try {
+      const r = await apiDelete(`/sessions/${encodeURIComponent(name)}`);
+      showResult('res-sessions-delete', r.body, r.ok, r.status, r.duration);
+    } catch(e) { showError('res-sessions-delete', e); }
+  }
+
+  async function runListSessionTerminals() {
+    const name = document.getElementById('stl-session-name').value.trim();
+    if (!name) { alert('session_name is required'); return; }
+    try {
+      const r = await apiFetch('GET', `/sessions/${encodeURIComponent(name)}/terminals`);
+      showResult('res-session-terminals-list', r.body, r.ok, r.status, r.duration);
+    } catch(e) { showError('res-session-terminals-list', e); }
+  }
+
+  async function runCreateSessionTerminal() {
+    const sessionName = document.getElementById('stc-session-name').value.trim();
+    const agentProfile = document.getElementById('stc-agent-profile').value.trim();
+    if (!sessionName || !agentProfile) { alert('session_name and agent_profile are required'); return; }
+    const params = {
+      agent_profile: agentProfile,
+      provider: document.getElementById('stc-provider').value,
+      working_directory: document.getElementById('stc-working-dir').value.trim(),
+    };
+    try {
+      const r = await apiPost(`/sessions/${encodeURIComponent(sessionName)}/terminals`, params);
+      showResult('res-session-terminals-create', r.body, r.ok, r.status, r.duration);
+    } catch(e) { showError('res-session-terminals-create', e); }
+  }
+
+  async function runGetTerminal() {
+    const id = document.getElementById('gt-terminal-id').value.trim();
+    if (!id) { alert('terminal_id is required'); return; }
+    try {
+      const r = await apiFetch('GET', `/terminals/${encodeURIComponent(id)}`);
+      showResult('res-terminals-get', r.body, r.ok, r.status, r.duration);
+    } catch(e) { showError('res-terminals-get', e); }
+  }
+
+  async function runGetWorkingDir() {
+    const id = document.getElementById('wd-terminal-id').value.trim();
+    if (!id) { alert('terminal_id is required'); return; }
+    try {
+      const r = await apiFetch('GET', `/terminals/${encodeURIComponent(id)}/working-directory`);
+      showResult('res-terminals-workdir', r.body, r.ok, r.status, r.duration);
+    } catch(e) { showError('res-terminals-workdir', e); }
+  }
+
+  async function runSendInput() {
+    const id = document.getElementById('si-terminal-id').value.trim();
+    const msg = document.getElementById('si-message').value;
+    if (!id || !msg) { alert('terminal_id and message are required'); return; }
+    try {
+      const r = await apiPost(`/terminals/${encodeURIComponent(id)}/input`, { message: msg });
+      showResult('res-terminals-input', r.body, r.ok, r.status, r.duration);
+    } catch(e) { showError('res-terminals-input', e); }
+  }
+
+  async function runGetOutput() {
+    const id = document.getElementById('go-terminal-id').value.trim();
+    if (!id) { alert('terminal_id is required'); return; }
+    const mode = document.getElementById('go-mode').value;
+    try {
+      const r = await apiFetch('GET', `/terminals/${encodeURIComponent(id)}/output`, { mode });
+      showResult('res-terminals-output', r.body, r.ok, r.status, r.duration);
+    } catch(e) { showError('res-terminals-output', e); }
+  }
+
+  async function runExitTerminal() {
+    const id = document.getElementById('et-terminal-id').value.trim();
+    if (!id) { alert('terminal_id is required'); return; }
+    try {
+      const r = await apiPost(`/terminals/${encodeURIComponent(id)}/exit`);
+      showResult('res-terminals-exit', r.body, r.ok, r.status, r.duration);
+    } catch(e) { showError('res-terminals-exit', e); }
+  }
+
+  async function runDeleteTerminal() {
+    const id = document.getElementById('dt-terminal-id').value.trim();
+    if (!id) { alert('terminal_id is required'); return; }
+    if (!confirm(`Delete terminal "${id}"?`)) return;
+    try {
+      const r = await apiDelete(`/terminals/${encodeURIComponent(id)}`);
+      showResult('res-terminals-delete', r.body, r.ok, r.status, r.duration);
+    } catch(e) { showError('res-terminals-delete', e); }
+  }
+
+  async function runSendInboxMessage() {
+    const receiverId = document.getElementById('im-receiver-id').value.trim();
+    const senderId = document.getElementById('im-sender-id').value.trim();
+    const msg = document.getElementById('im-message').value;
+    if (!receiverId || !senderId || !msg) { alert('receiver_id, sender_id and message are required'); return; }
+    try {
+      const r = await apiPost(
+        `/terminals/${encodeURIComponent(receiverId)}/inbox/messages`,
+        { sender_id: senderId, message: msg }
+      );
+      showResult('res-inbox-send', r.body, r.ok, r.status, r.duration);
+    } catch(e) { showError('res-inbox-send', e); }
+  }
+
+  async function runGetInboxMessages() {
+    const id = document.getElementById('il-terminal-id').value.trim();
+    if (!id) { alert('terminal_id is required'); return; }
+    const params = {
+      limit: document.getElementById('il-limit').value,
+      status: document.getElementById('il-status').value,
+    };
+    try {
+      const r = await apiFetch('GET', `/terminals/${encodeURIComponent(id)}/inbox/messages`, params);
+      showResult('res-inbox-list', r.body, r.ok, r.status, r.duration);
+    } catch(e) { showError('res-inbox-list', e); }
+  }
+</script>
+</body>
+</html>
