@@ -255,7 +255,6 @@ class TestLogFileHandler:
         handler._handle_log_change("test-terminal")
 
 
-
 class TestPolling:
     """Tests for polling functionality."""
 
