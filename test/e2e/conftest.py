@@ -9,6 +9,7 @@ Run with: uv run pytest -m e2e test/e2e/ -v
 """
 
 import shutil
+import time
 
 import pytest
 import requests

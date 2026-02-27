@@ -242,8 +242,8 @@ def send_input(terminal_id: str, message: str) -> bool:
 
     Uses bracketed paste mode (-p) to bypass TUI hotkey handling. The number
     of Enter keys sent after pasting is determined by the provider's
-    ``paste_enter_count`` property (some TUIs need 2 Enters because bracketed
-    paste triggers multi-line mode).
+    ``paste_enter_count`` property (e.g., some TUIs need 2 Enters because
+    bracketed paste triggers multi-line mode).
     """
     try:
         metadata = get_terminal_metadata(terminal_id)
