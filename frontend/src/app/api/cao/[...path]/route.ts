@@ -1,13 +1,13 @@
 /**
- * Middleware proxy layer: forwards all /api/cao/* requests to the cao-server.
+ * Middleware proxy layer: forwards all /api/cao/* requests to the cao-control-panel.
  * This decouples the frontend from the backend and allows the Next.js app to
- * act as a middle layer between the browser and the CAO REST API.
+ * act as a middle layer between the browser and the CAO Control Panel API.
  */
 
 import { NextRequest, NextResponse } from "next/server";
 
 const CAO_SERVER_URL =
-  process.env.CAO_SERVER_URL || "http://localhost:9889";
+  process.env.CAO_SERVER_URL || "http://localhost:8000";
 
 type RouteContext = { params: Promise<{ path: string[] }> };
 
@@ -56,7 +56,7 @@ async function proxyToCao(
     return NextResponse.json(responseData, { status: upstream.status });
   } catch (err) {
     return NextResponse.json(
-      { error: "Failed to reach cao-server", detail: String(err) },
+      { error: "Failed to reach cao-control-panel", detail: String(err) },
       { status: 502 }
     );
   }

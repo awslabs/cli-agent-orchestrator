@@ -14,13 +14,18 @@ Next.js App (port 3000)          ← this directory
     │  (middleware layer)
     │  HTTP *
     ▼
+cao-control-panel (port 8000)    ← FastAPI interface layer
+    │  Proxy layer
+    │  HTTP *
+    ▼
 cao-server (port 9889)           ← FastAPI backend
 ```
 
 The Next.js API routes at `/api/cao/[...path]` act as a **middleware layer**
-that proxies all requests from the browser to the `cao-server`. This keeps
-the frontend decoupled from the backend and allows the `cao-server` URL to
-be configured via the `CAO_SERVER_URL` environment variable.
+that proxies all requests from the browser to the `cao-control-panel`. The
+`cao-control-panel` is a FastAPI interface layer that communicates with the
+`cao-server` backend. This three-tier architecture keeps the frontend, control
+panel, and backend services decoupled and independent.
 
 ## Getting Started
 
@@ -30,31 +35,37 @@ be configured via the `CAO_SERVER_URL` environment variable.
    uv run cao-server
    ```
 
-2. Install frontend dependencies:
+2. Start the `cao-control-panel` interface layer (from the repo root):
+
+   ```bash
+   uv run cao-control-panel
+   ```
+
+3. Install frontend dependencies:
 
    ```bash
    cd frontend
    npm install
    ```
 
-3. Run the development server:
+4. Run the development server:
 
    ```bash
    npm run dev
    ```
 
-4. Open [http://localhost:3000](http://localhost:3000) in your browser.
+5. Open [http://localhost:3000](http://localhost:3000) in your browser.
 
 ## Configuration
 
-| Environment variable | Default                  | Description            |
-| -------------------- | ------------------------ | ---------------------- |
-| `CAO_SERVER_URL`     | `http://localhost:9889`  | URL of the cao-server  |
+| Environment variable | Default                  | Description                       |
+| -------------------- | ------------------------ | --------------------------------- |
+| `CAO_SERVER_URL`     | `http://localhost:8000`  | URL of the cao-control-panel      |
 
-Set `CAO_SERVER_URL` to override the default backend address:
+Set `CAO_SERVER_URL` to override the default control panel address:
 
 ```bash
-CAO_SERVER_URL=http://my-server:9889 npm run dev
+CAO_SERVER_URL=http://my-control-panel:8000 npm run dev
 ```
 
 ## Scripts
