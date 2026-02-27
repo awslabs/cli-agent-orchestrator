@@ -2,7 +2,6 @@
 
 from typing import Optional
 
-# Fix: was `adapters.database` which doesn't exist; correct module is `clients.database`
 from cli_agent_orchestrator.clients.database import SessionLocal, TerminalModel
 
 

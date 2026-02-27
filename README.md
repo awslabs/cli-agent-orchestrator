@@ -142,7 +142,6 @@ cao launch --agents code_supervisor
 cao launch --agents code_supervisor --provider kiro_cli
 cao launch --agents code_supervisor --provider claude_code
 cao launch --agents code_supervisor --provider codex
-
 # Skip workspace trust confirmation
 cao launch --agents code_supervisor --yolo
 ```
@@ -373,6 +372,11 @@ cao flow remove daily-standup
 ## Working Directory Support
 
 CAO supports specifying working directories for agent handoff/delegation operations. By default this is disabled to prevent agents from hallucinating directory paths.
+
+All paths are canonicalized via `realpath` and validated against a security policy:
+
+- **Allowed:** the user's home directory (`~/`) and any subdirectory under it, including paths through symlinks (e.g., `/home/user` -> `/local/home/user` on AWS)
+- **Blocked:** system directories (`/`, `/etc`, `/var`, `/tmp`, `/proc`, `/sys`, `/root`, `/boot`, `/bin`, `/sbin`, `/usr/bin`, `/usr/sbin`, `/lib`, `/lib64`, `/dev`) and any path outside the home directory tree
 
 For configuration and usage details, see [docs/working-directory.md](docs/working-directory.md).
 
