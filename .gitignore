@@ -29,3 +29,8 @@ dist/
 
 # Memory
 context/
+
+# Node.js / Next.js frontend
+frontend/node_modules/
+frontend/.next/
+frontend/.swc/

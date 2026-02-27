@@ -2,10 +2,13 @@
 
 import asyncio
 import logging
+import pathlib
 from contextlib import asynccontextmanager
 from typing import Annotated, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Path, Query, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 from watchdog.observers.polling import PollingObserver
 
@@ -15,6 +18,7 @@ from cli_agent_orchestrator.clients.database import (
     init_db,
 )
 from cli_agent_orchestrator.constants import (
+    CORS_ORIGINS,
     INBOX_POLLING_INTERVAL,
     SERVER_HOST,
     SERVER_PORT,
@@ -116,6 +120,19 @@ app = FastAPI(
     version=SERVER_VERSION,
     lifespan=lifespan,
 )
+
+# CORS — allow browser-based clients (including the bundled console UI)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Mount static files for the built-in web console
+_STATIC_DIR = pathlib.Path(__file__).parent.parent / "static"
+app.mount("/ui", StaticFiles(directory=str(_STATIC_DIR), html=True), name="ui")
 
 
 @app.get("/health")

@@ -1,0 +1,29 @@
+/* ===== Reset & Base ===== */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #0f1117;
+  --surface: #1a1d27;
+  --surface2: #22263a;
+  --border: #2d3148;
+  --accent: #4f8ef7;
+  --accent-hover: #6aa0ff;
+  --danger: #e05252;
+  --success: #3dbe7a;
+  --warn: #e0a83d;
+  --text: #c9cdd9;
+  --text-dim: #6b7196;
+  --text-bright: #eef0f8;
+  --radius: 8px;
+  --sidebar: 220px;
+  --font: system-ui, -apple-system, sans-serif;
+  --mono: "Cascadia Code", "Fira Code", "Consolas", monospace;
+}
+
+html, body {
+  height: 100%;
+  font-family: var(--font);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+}
