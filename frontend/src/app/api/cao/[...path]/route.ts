@@ -6,8 +6,7 @@
 
 import { NextRequest, NextResponse } from "next/server";
 
-const CAO_SERVER_URL =
-  process.env.CAO_SERVER_URL || "http://localhost:8000";
+const CAO_SERVER_URL = process.env.CAO_CONTROL_PANEL_URL || "http://localhost:8000";
 
 type RouteContext = { params: Promise<{ path: string[] }> };
 
@@ -24,9 +23,24 @@ async function proxyToCao(
     searchParams ? "?" + searchParams : ""
   }`;
 
-  const headers: HeadersInit = {
-    "Content-Type": "application/json",
-  };
+  const requestId = request.headers.get("x-request-id") ?? crypto.randomUUID();
+  const headers = new Headers();
+  headers.set("x-request-id", requestId);
+
+  const contentType = request.headers.get("content-type");
+  if (contentType) {
+    headers.set("content-type", contentType);
+  }
+
+  const authorization = request.headers.get("authorization");
+  if (authorization) {
+    headers.set("authorization", authorization);
+  }
+
+  const cookie = request.headers.get("cookie");
+  if (cookie) {
+    headers.set("cookie", cookie);
+  }
 
   let body: string | undefined;
   if (request.method !== "GET" && request.method !== "HEAD") {
@@ -43,17 +57,35 @@ async function proxyToCao(
       method: request.method,
       headers,
       body,
+      cache: "no-store",
     });
 
-    const responseText = await upstream.text();
-    let responseData: unknown;
-    try {
-      responseData = JSON.parse(responseText);
-    } catch {
-      responseData = responseText;
+    const responseHeaders = new Headers();
+    responseHeaders.set("x-request-id", upstream.headers.get("x-request-id") ?? requestId);
+    const upstreamContentType = upstream.headers.get("content-type");
+    if (upstreamContentType) {
+      responseHeaders.set("content-type", upstreamContentType);
     }
 
-    return NextResponse.json(responseData, { status: upstream.status });
+    const setCookie = upstream.headers.get("set-cookie");
+    if (setCookie) {
+      responseHeaders.set("set-cookie", setCookie);
+    }
+
+    if (upstreamContentType?.includes("text/event-stream")) {
+      return new NextResponse(upstream.body, {
+        status: upstream.status,
+        headers: responseHeaders,
+      });
+    }
+
+    const responseText = await upstream.text();
+    const response = new NextResponse(responseText, {
+      status: upstream.status,
+      headers: responseHeaders,
+    });
+
+    return response;
   } catch (err) {
     return NextResponse.json(
       { error: "Failed to reach cao-control-panel", detail: String(err) },

@@ -25,7 +25,7 @@ class ProviderError(Exception):
 
 # Regex patterns for Claude Code output analysis
 ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
-RESPONSE_PATTERN = r"⏺(?:\x1b\[[0-9;]*m)*\s+"  # Handle any ANSI codes between marker and text
+RESPONSE_PATTERN = r"[⏺●](?:\x1b\[[0-9;]*m)*\s+"  # Handle old/new response markers
 # Match Claude Code processing spinners:
 # - Old format: "✽ Cooking… (esc to interrupt)" / "✶ Thinking… (esc to interrupt)"
 # - New format: "✽ Cooking… (6s · ↓ 174 tokens · thinking)"
@@ -210,7 +210,7 @@ class ClaudeCodeProvider(BaseProvider):
         matches = list(re.finditer(RESPONSE_PATTERN, script_output))
 
         if not matches:
-            raise ValueError("No Claude Code response found - no ⏺ pattern detected")
+            raise ValueError("No Claude Code response found - no ⏺/● pattern detected")
 
         # Get the last match (final answer)
         last_match = matches[-1]
@@ -224,8 +224,9 @@ class ClaudeCodeProvider(BaseProvider):
         response_lines = []
 
         for line in lines:
+            clean_line_for_match = re.sub(ANSI_CODE_PATTERN, "", line)
             # Stop at next > prompt or separator line
-            if re.match(r">\s", line) or "────────" in line:
+            if re.match(r"[>❯]\s", clean_line_for_match) or "────────" in clean_line_for_match:
                 break
 
             # Clean the line

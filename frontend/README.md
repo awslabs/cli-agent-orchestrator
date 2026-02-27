@@ -58,14 +58,14 @@ panel, and backend services decoupled and independent.
 
 ## Configuration
 
-| Environment variable | Default                  | Description                       |
-| -------------------- | ------------------------ | --------------------------------- |
-| `CAO_SERVER_URL`     | `http://localhost:8000`  | URL of the cao-control-panel      |
+| Environment variable     | Default                 | Description                       |
+| ------------------------ | ----------------------- | --------------------------------- |
+| `CAO_CONTROL_PANEL_URL`  | `http://localhost:8000` | URL of the cao-control-panel      |
 
-Set `CAO_SERVER_URL` to override the default control panel address:
+Set `CAO_CONTROL_PANEL_URL` to override the default control panel address:
 
 ```bash
-CAO_SERVER_URL=http://my-control-panel:8000 npm run dev
+CAO_CONTROL_PANEL_URL=http://my-control-panel:8000 npm run dev
 ```
 
 ## Scripts

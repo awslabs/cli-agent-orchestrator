@@ -187,6 +187,16 @@ class TestClaudeCodeProviderStatusDetection:
         assert status == TerminalStatus.COMPLETED
 
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_get_status_completed_with_new_response_marker(self, mock_tmux):
+        """Test COMPLETED status detection with newer '●' response marker."""
+        mock_tmux.get_history.return_value = "● Response text\n❯ "
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
     def test_get_status_processing(self, mock_tmux):
         """Test PROCESSING status detection."""
         mock_tmux.get_history.return_value = "✶ Processing… (esc to interrupt)"
@@ -292,6 +302,15 @@ More content
 
         assert "Response content" in result
         assert "More content" not in result
+
+    def test_extract_message_with_new_marker_and_prompt(self):
+        """Test extraction with newer marker and ❯ prompt."""
+        output = """● Response content
+❯ """
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        result = provider.extract_last_message_from_script(output)
+
+        assert "Response content" in result
 
 
 class TestClaudeCodeProviderMisc:
