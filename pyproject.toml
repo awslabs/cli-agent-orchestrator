@@ -25,6 +25,7 @@ dependencies = [
 "cao" = "cli_agent_orchestrator.cli.main:cli"
 "cao-server" = "cli_agent_orchestrator.api.main:main"
 "cao-mcp-server" = "cli_agent_orchestrator.mcp_server.server:main"
+"cao-control-panel" = "cli_agent_orchestrator.control_panel.main:main"
 
 [build-system]
 requires = ["hatchling"]
