@@ -1,6 +1,6 @@
 # CLI Agent Orchestrator
 
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/awslabs/cli-agent-orchestrator)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/BSTester/cli-agent-orchestrator)
 
 CLI Agent Orchestrator（CAO，读作 “kay-oh”）是一套轻量级编排系统，用于在 tmux 终端中管理多个 AI Agent 会话，通过 MCP server 实现多智能体协作。
 
@@ -70,7 +70,7 @@ python3 --version   # 需 ≥ 3.10
 ### 2. 安装 tmux（需 3.3+）
 
 ```bash
-bash <(curl -s https://raw.githubusercontent.com/awslabs/cli-agent-orchestrator/refs/heads/main/tmux-install.sh)
+bash <(curl -s https://raw.githubusercontent.com/BSTester/cli-agent-orchestrator/refs/heads/main/tmux-install.sh)
 ```
 
 ### 3. 安装 uv
@@ -82,7 +82,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ### 4. 安装 CLI Agent Orchestrator
 
 ```bash
-uv tool install git+https://github.com/awslabs/cli-agent-orchestrator.git@main --upgrade
+uv tool install git+https://github.com/BSTester/cli-agent-orchestrator.git@main --upgrade
 ```
 
 ### 本地开发
@@ -90,7 +90,7 @@ uv tool install git+https://github.com/awslabs/cli-agent-orchestrator.git@main -
 克隆仓库并安装依赖：
 
 ```bash
-git clone https://github.com/awslabs/cli-agent-orchestrator.git
+git clone https://github.com/BSTester/cli-agent-orchestrator.git
 cd cli-agent-orchestrator/
 uv sync             # 创建 .venv/ 并安装依赖
 uv run cao --help   # 校验安装
