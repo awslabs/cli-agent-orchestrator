@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import ConsoleNav from "@/components/ConsoleNav";
 import RequireAuth from "@/components/RequireAuth";
@@ -109,6 +109,17 @@ export default function DashboardPage() {
   const providerRows = Object.entries(overview?.provider_counts || {});
   const statusRows = Object.entries(overview?.status_counts || {});
   const mainAgents: ConsoleAgent[] = overview?.main_agents || [];
+  const mainStatusRows = useMemo(() => {
+    const counts = new Map<string, number>();
+    mainAgents.forEach((agent) => {
+      const key = agent.status || "unknown";
+      counts.set(key, (counts.get(key) || 0) + 1);
+    });
+    return Array.from(counts.entries()).map(([label, value]) => ({
+      label: toStatusLabel(label),
+      value,
+    }));
+  }, [mainAgents]);
 
   return (
     <RequireAuth>
@@ -151,6 +162,11 @@ export default function DashboardPage() {
 
         <section style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 12, padding: 12 }}>
           <div style={{ color: "var(--text-bright)", fontWeight: 700, marginBottom: 8 }}>团队负责人看板</div>
+          {mainStatusRows.length > 0 && (
+            <div style={{ marginBottom: 12 }}>
+              <BarChartCard title="负责人状态分布" rows={mainStatusRows} />
+            </div>
+          )}
           {mainAgents.length === 0 ? (
             <div style={{ color: "var(--text-dim)" }}>当前没有在营团队</div>
           ) : (
