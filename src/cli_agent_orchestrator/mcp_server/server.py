@@ -18,6 +18,12 @@ from cli_agent_orchestrator.utils.terminal import generate_session_name, wait_un
 
 logger = logging.getLogger(__name__)
 
+REQUEST_TIMEOUT_SECONDS = 15
+REQUEST_RETRY_ATTEMPTS = 3
+REQUEST_RETRY_BACKOFF_SECONDS = 0.5
+PROVIDER_READY_TIMEOUT_SECONDS = 120.0
+PROVIDER_READY_STATUSES = {TerminalStatus.IDLE, TerminalStatus.COMPLETED}
+
 # Environment variable to enable/disable working_directory parameter
 ENABLE_WORKING_DIRECTORY = os.getenv("CAO_ENABLE_WORKING_DIRECTORY", "false").lower() == "true"
 
@@ -36,6 +42,27 @@ mcp = FastMCP(
     - Ensure you're running within a CAO terminal (CAO_TERMINAL_ID must be set)
     """,
 )
+
+
+def _request_with_retry(method: str, url: str, **kwargs: Any) -> requests.Response:
+    """Send HTTP request with simple retry for transient connection errors."""
+    timeout = kwargs.pop("timeout", REQUEST_TIMEOUT_SECONDS)
+    last_error: Optional[Exception] = None
+
+    for attempt in range(1, REQUEST_RETRY_ATTEMPTS + 1):
+        try:
+            response = requests.request(method=method, url=url, timeout=timeout, **kwargs)
+            response.raise_for_status()
+            return response
+        except requests.exceptions.RequestException as exc:
+            last_error = exc
+            if attempt == REQUEST_RETRY_ATTEMPTS:
+                break
+            time.sleep(REQUEST_RETRY_BACKOFF_SECONDS * attempt)
+
+    if last_error is None:
+        raise RuntimeError("Request failed without exception details")
+    raise last_error
 
 
 def _create_terminal(
@@ -68,8 +95,7 @@ def _create_terminal(
     current_terminal_id = os.environ.get("CAO_TERMINAL_ID")
     if current_terminal_id:
         # Get terminal metadata via API
-        response = requests.get(f"{API_BASE_URL}/terminals/{current_terminal_id}")
-        response.raise_for_status()
+        response = _request_with_retry("GET", f"{API_BASE_URL}/terminals/{current_terminal_id}")
         terminal_metadata = response.json()
 
         inherited_provider = terminal_metadata["provider"]
@@ -78,17 +104,12 @@ def _create_terminal(
         # If no working_directory specified, get conductor's current directory
         if working_directory is None:
             try:
-                response = requests.get(
-                    f"{API_BASE_URL}/terminals/{current_terminal_id}/working-directory"
+                response = _request_with_retry(
+                    "GET",
+                    f"{API_BASE_URL}/terminals/{current_terminal_id}/working-directory",
                 )
-                if response.status_code == 200:
-                    working_directory = response.json().get("working_directory")
-                    logger.info(f"Inherited working directory from conductor: {working_directory}")
-                else:
-                    logger.warning(
-                        f"Failed to get conductor's working directory (status {response.status_code}), "
-                        "will use server default"
-                    )
+                working_directory = response.json().get("working_directory")
+                logger.info(f"Inherited working directory from conductor: {working_directory}")
             except Exception as e:
                 logger.warning(
                     f"Error fetching conductor's working directory: {e}, will use server default"
@@ -110,8 +131,11 @@ def _create_terminal(
         if working_directory:
             params["working_directory"] = working_directory
 
-        response = requests.post(f"{API_BASE_URL}/sessions/{session_name}/terminals", params=params)
-        response.raise_for_status()
+        response = _request_with_retry(
+            "POST",
+            f"{API_BASE_URL}/sessions/{session_name}/terminals",
+            params=params,
+        )
         terminal = response.json()
     else:
         # Create new session with terminal
@@ -134,8 +158,7 @@ def _create_terminal(
         if working_directory:
             params["working_directory"] = working_directory
 
-        response = requests.post(f"{API_BASE_URL}/sessions", params=params)
-        response.raise_for_status()
+        response = _request_with_retry("POST", f"{API_BASE_URL}/sessions", params=params)
         terminal = response.json()
 
     if resolved_provider is None:
@@ -154,10 +177,9 @@ def _send_direct_input(terminal_id: str, message: str) -> None:
     Raises:
         Exception: If sending fails
     """
-    response = requests.post(
-        f"{API_BASE_URL}/terminals/{terminal_id}/input", params={"message": message}
+    _request_with_retry(
+        "POST", f"{API_BASE_URL}/terminals/{terminal_id}/input", params={"message": message}
     )
-    response.raise_for_status()
 
 
 def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
@@ -178,11 +200,11 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
     if not sender_id:
         raise ValueError("CAO_TERMINAL_ID not set - cannot determine sender")
 
-    response = requests.post(
+    response = _request_with_retry(
+        "POST",
         f"{API_BASE_URL}/terminals/{receiver_id}/inbox/messages",
         params={"sender_id": sender_id, "message": message},
     )
-    response.raise_for_status()
     return response.json()
 
 
@@ -218,12 +240,15 @@ async def _handoff_impl(
         # Startup times vary by provider (~15-45s).
         if not wait_until_terminal_status(
             terminal_id,
-            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-            timeout=120.0,
+            PROVIDER_READY_STATUSES,
+            timeout=PROVIDER_READY_TIMEOUT_SECONDS,
         ):
             return HandoffResult(
                 success=False,
-                message=f"Terminal {terminal_id} did not reach ready status within 120 seconds",
+                message=(
+                    f"Terminal {terminal_id} did not reach ready status within "
+                    f"{int(PROVIDER_READY_TIMEOUT_SECONDS)} seconds"
+                ),
                 output=None,
                 terminal_id=terminal_id,
             )
@@ -265,16 +290,14 @@ async def _handoff_impl(
             )
 
         # Get the response
-        response = requests.get(
-            f"{API_BASE_URL}/terminals/{terminal_id}/output", params={"mode": "last"}
+        response = _request_with_retry(
+            "GET", f"{API_BASE_URL}/terminals/{terminal_id}/output", params={"mode": "last"}
         )
-        response.raise_for_status()
         output_data = response.json()
         output = output_data["output"]
 
         # Send provider-specific exit command to cleanup terminal
-        response = requests.post(f"{API_BASE_URL}/terminals/{terminal_id}/exit")
-        response.raise_for_status()
+        _request_with_retry("POST", f"{API_BASE_URL}/terminals/{terminal_id}/exit")
 
         execution_time = time.time() - start_time
 
@@ -427,6 +450,20 @@ def _assign_impl(
         terminal_id, resolved_provider = _create_terminal(
             agent_profile, working_directory=working_directory, provider=provider
         )
+
+        if not wait_until_terminal_status(
+            terminal_id,
+            PROVIDER_READY_STATUSES,
+            timeout=PROVIDER_READY_TIMEOUT_SECONDS,
+        ):
+            return {
+                "success": False,
+                "terminal_id": terminal_id,
+                "message": (
+                    f"Assignment failed: terminal {terminal_id} did not become ready within "
+                    f"{int(PROVIDER_READY_TIMEOUT_SECONDS)} seconds"
+                ),
+            }
 
         # Send message immediately
         _send_direct_input(terminal_id, message)

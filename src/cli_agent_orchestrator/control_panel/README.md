@@ -38,11 +38,11 @@ The server will start on `http://localhost:8000` by default.
 
 ## Configuration
 
-The control panel can be configured by modifying the constants in `src/cli_agent_orchestrator/control_panel/main.py`:
+The control panel reads configuration from environment variables:
 
 - `CONTROL_PANEL_HOST`: Host to bind to (default: `localhost`)
 - `CONTROL_PANEL_PORT`: Port to listen on (default: `8000`)
-- `CAO_SERVER_URL`: URL of the CAO server to proxy to (default: from `constants.API_BASE_URL`)
+- `CAO_SERVER_URL`: URL of the CAO server to proxy to (default: `http://localhost:9889`)
 
 ## API Endpoints
 

@@ -7,6 +7,8 @@ The CAO application orchestrates multiple CLI-based AI agents (Kiro CLI, Claude 
 Codex, Q CLI) through tmux sessions, providing a unified interface for agent management.
 """
 
+import os
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 from cli_agent_orchestrator.models.provider import ProviderType
@@ -86,9 +88,12 @@ DATABASE_URL = f"sqlite:///{DATABASE_FILE}"
 # Server Configuration
 # =============================================================================
 # FastAPI server settings for the CAO API
-SERVER_HOST = "localhost"
-SERVER_PORT = 9889
-SERVER_VERSION = "0.1.0"
+SERVER_HOST = os.getenv("SERVER_HOST", "localhost")
+SERVER_PORT = int(os.getenv("SERVER_PORT", "9889"))
+try:
+    SERVER_VERSION = version("cli-agent-orchestrator")
+except PackageNotFoundError:
+    SERVER_VERSION = "1.1.0"
 API_BASE_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
 
 # CORS allowed origins for web-based clients

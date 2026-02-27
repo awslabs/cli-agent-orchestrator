@@ -23,7 +23,7 @@ cd cli-agent-orchestrator/
 The project uses `uv` for package management. Install all dependencies including development packages:
 
 ```bash
-uv sync
+uv sync --all-extras --dev
 ```
 
 This command:
@@ -49,7 +49,7 @@ Unit tests are fast and use mocked dependencies:
 
 ```bash
 # Run all unit tests (excludes E2E and integration tests)
-uv run pytest test/ --ignore=test/e2e --ignore=test/providers/test_q_cli_integration.py -v
+uv run pytest test/ --ignore=test/providers/test_q_cli_integration.py --ignore=test/e2e -m "not e2e" -v
 
 # Run with coverage report
 uv run pytest test/ --ignore=test/e2e --cov=src --cov-report=term-missing -v

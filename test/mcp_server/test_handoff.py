@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from cli_agent_orchestrator.mcp_server.server import _handoff_impl
+from cli_agent_orchestrator.mcp_server.server import _assign_impl, _handoff_impl
 
 
 class TestHandoffMessageContext:
@@ -27,8 +27,7 @@ class TestHandoffMessageContext:
                 mock_response = MagicMock()
                 mock_response.json.return_value = {"output": "task done"}
                 mock_response.raise_for_status.return_value = None
-                mock_requests.get.return_value = mock_response
-                mock_requests.post.return_value = mock_response
+                mock_requests.request.return_value = mock_response
 
                 result = asyncio.get_event_loop().run_until_complete(
                     _handoff_impl("developer", "Implement hello world")
@@ -55,8 +54,7 @@ class TestHandoffMessageContext:
             mock_response = MagicMock()
             mock_response.json.return_value = {"output": "task done"}
             mock_response.raise_for_status.return_value = None
-            mock_requests.get.return_value = mock_response
-            mock_requests.post.return_value = mock_response
+            mock_requests.request.return_value = mock_response
 
             result = asyncio.get_event_loop().run_until_complete(
                 _handoff_impl("developer", "Implement hello world")
@@ -80,8 +78,7 @@ class TestHandoffMessageContext:
             mock_response = MagicMock()
             mock_response.json.return_value = {"output": "task done"}
             mock_response.raise_for_status.return_value = None
-            mock_requests.get.return_value = mock_response
-            mock_requests.post.return_value = mock_response
+            mock_requests.request.return_value = mock_response
 
             result = asyncio.get_event_loop().run_until_complete(
                 _handoff_impl("developer", "Implement hello world")
@@ -107,8 +104,7 @@ class TestHandoffMessageContext:
                 mock_response = MagicMock()
                 mock_response.json.return_value = {"output": "done"}
                 mock_response.raise_for_status.return_value = None
-                mock_requests.get.return_value = mock_response
-                mock_requests.post.return_value = mock_response
+                mock_requests.request.return_value = mock_response
 
                 asyncio.get_event_loop().run_until_complete(
                     _handoff_impl("developer", "Build feature X")
@@ -132,8 +128,7 @@ class TestHandoffMessageContext:
                 mock_response = MagicMock()
                 mock_response.json.return_value = {"output": "done"}
                 mock_response.raise_for_status.return_value = None
-                mock_requests.get.return_value = mock_response
-                mock_requests.post.return_value = mock_response
+                mock_requests.request.return_value = mock_response
 
                 asyncio.get_event_loop().run_until_complete(_handoff_impl("developer", "Do task"))
 
@@ -157,10 +152,25 @@ class TestHandoffMessageContext:
                 mock_response = MagicMock()
                 mock_response.json.return_value = {"output": "done"}
                 mock_response.raise_for_status.return_value = None
-                mock_requests.get.return_value = mock_response
-                mock_requests.post.return_value = mock_response
+                mock_requests.request.return_value = mock_response
 
                 asyncio.get_event_loop().run_until_complete(_handoff_impl("developer", original))
 
         sent_message = mock_send.call_args[0][1]
         assert sent_message.endswith(original)
+
+
+@patch("cli_agent_orchestrator.mcp_server.server.wait_until_terminal_status")
+@patch("cli_agent_orchestrator.mcp_server.server._send_direct_input")
+@patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
+def test_assign_fails_when_terminal_not_ready(mock_create, mock_send, mock_wait):
+    """Assign should fail fast if worker terminal never reaches ready status."""
+    mock_create.return_value = ("dev-terminal-7", "kiro_cli")
+    mock_wait.return_value = False
+
+    result = _assign_impl("developer", "Do work")
+
+    assert result["success"] is False
+    assert result["terminal_id"] == "dev-terminal-7"
+    assert "did not become ready" in result["message"]
+    mock_send.assert_not_called()

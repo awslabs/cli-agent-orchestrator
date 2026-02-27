@@ -55,6 +55,9 @@ def test_proxy_get_request(client: TestClient) -> None:
         response = client.get("/sessions")
 
         assert response.status_code == 200
+        assert response.headers.get("x-request-id")
+        call_headers = mock_request.call_args.kwargs["headers"]
+        assert call_headers.get("X-Request-Id")
         mock_request.assert_called_once()
 
 

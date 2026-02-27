@@ -1,6 +1,8 @@
 """Control Panel FastAPI server - middleware layer between frontend and cao-server."""
 
 import logging
+import os
+import uuid
 from typing import Any
 
 import requests
@@ -12,11 +14,11 @@ from cli_agent_orchestrator.constants import API_BASE_URL
 logger = logging.getLogger(__name__)
 
 # Control panel server configuration
-CONTROL_PANEL_HOST = "localhost"
-CONTROL_PANEL_PORT = 8000
+CONTROL_PANEL_HOST = os.getenv("CONTROL_PANEL_HOST", "localhost")
+CONTROL_PANEL_PORT = int(os.getenv("CONTROL_PANEL_PORT", "8000"))
 
 # CAO server URL (the actual backend)
-CAO_SERVER_URL = API_BASE_URL
+CAO_SERVER_URL = os.getenv("CAO_SERVER_URL", API_BASE_URL)
 
 # CORS origins for frontend
 CONTROL_PANEL_CORS_ORIGINS = [
@@ -64,6 +66,7 @@ async def proxy_to_cao(request: Request, path: str) -> Response:
     """
     # Construct the upstream URL
     upstream_url = f"{CAO_SERVER_URL}/{path}"
+    request_id = request.headers.get("X-Request-Id") or uuid.uuid4().hex
 
     # Forward query parameters
     if request.url.query:
@@ -72,6 +75,7 @@ async def proxy_to_cao(request: Request, path: str) -> Response:
     # Prepare headers
     headers = {
         "Content-Type": "application/json",
+        "X-Request-Id": request_id,
     }
 
     # Get request body if present
@@ -83,6 +87,14 @@ async def proxy_to_cao(request: Request, path: str) -> Response:
             pass
 
     try:
+        logger.info(
+            "Proxying request id=%s method=%s path=/%s upstream=%s",
+            request_id,
+            request.method,
+            path,
+            upstream_url,
+        )
+
         # Make request to cao-server
         response = requests.request(
             method=request.method,
@@ -96,7 +108,7 @@ async def proxy_to_cao(request: Request, path: str) -> Response:
         return Response(
             content=response.content,
             status_code=response.status_code,
-            headers=dict(response.headers),
+            headers={**dict(response.headers), "X-Request-Id": request_id},
         )
     except requests.exceptions.RequestException as e:
         logger.error(f"Error proxying request to cao-server: {e}")
