@@ -5,42 +5,74 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.1.0] - Unreleased
+## [1.1.0] - 2026-02-26
 
 ### Fixed
 
-- Fix Claude Code provider failing to launch due to tmux `send-keys` corrupting single quotes in long commands; use `literal=True` for text chunks in `tmux.py`
+- Fix `_handoff_impl()` only accepting IDLE as ready state: providers with initial prompts reach COMPLETED after processing the system prompt; updated to accept both IDLE and COMPLETED via multi-status `wait_until_terminal_status()`
+- Fix `wait_until_terminal_status()` only accepting a single status: now accepts `Union[TerminalStatus, set]` for polling multiple acceptable statuses
+- Fix handoff worker IDLE wait timeout too short (30s) for slow-initializing providers: some providers can exceed 30s during shell warm-up, CLI startup, and MCP server registration; increased to 120s to act as a fallback
+- Fix inbox message delivery failing for TUI-based providers: inbox service passed `tail_lines=5` to `get_status()` but TUI providers need 50+ lines to find the idle prompt; messages stayed PENDING forever because the supervisor was never detected as IDLE
+- Fix inbox watchdog log tail check (`_has_idle_pattern`) using only 5 lines, which missed the idle prompt for full-screen TUI providers where the prompt sits mid-screen with 30+ padding lines below; increased to 100 lines so the watchdog reliably triggers delivery when the terminal goes IDLE
+- Fix shell command injection risk in Q CLI and Kiro CLI providers: replace f-string command interpolation with `shlex.join()` for safe shell escaping of `agent_profile` values
+- Fix Claude Code provider not forwarding `CAO_TERMINAL_ID` to MCP server subprocesses: inject `CAO_TERMINAL_ID` into MCP server `env` config, matching other providers
+- Fix Claude Code provider failing to launch due to tmux `send-keys` corrupting single quotes in long commands; resolved by main branch's paste-buffer approach (`load-buffer` + `paste-buffer -p`)
 - Add missing `wait_for_shell` call to Claude Code provider `initialize()` to match other providers
 - Update Claude Code `IDLE_PROMPT_PATTERN` to match both `>` and `❯` prompt styles
 - Add `_handle_trust_prompt()` to Claude Code provider to auto-accept the workspace trust dialog when opened in a new/untrusted directory; exclude trust prompt from `WAITING_USER_ANSWER` detection
+- Fix Codex provider failing to launch in tmux: add warm-up `echo ready` command before starting codex to prevent immediate exit in fresh sessions
+- Fix Codex idle prompt detection for `--no-alt-screen` mode: replace `\Z`-anchored regex with bottom-N-lines approach (`IDLE_PROMPT_TAIL_LINES = 5`) since inline mode keeps scrollback history
+- Fix Codex trust prompt `›` falsely matching idle prompt pattern by checking trust prompt before idle prompt in `get_status()`
+- Fix Codex status detection not recognizing real interactive output format: update `ASSISTANT_PREFIX_PATTERN` to match `•` bullet responses and `USER_PREFIX_PATTERN` to match `›` user input prompts, enabling `get_status()` to return `COMPLETED` for real Codex output (previously always returned `IDLE`, causing handoff/assign to time out)
+- Fix `USER_PREFIX_PATTERN` crossing newline boundaries: use `[^\S\n]` (horizontal whitespace) instead of `\s` to prevent `› \n  ?` from matching as user input
+- Add `IDLE_PROMPT_STRICT_PATTERN` for extraction: matches only empty prompt lines (`› ` without text) to distinguish idle prompts from user input lines
+- Rewrite `extract_last_message_from_script()` to use user-message-based extraction as primary approach (works for both label and bullet formats) with assistant-marker fallback
+- Fix Codex MCP `tool_timeout_sec` not taking effect: change value from `600` (TOML integer) to `600.0` (TOML float) because Codex deserializes via `Option<f64>` and silently rejects integers, falling back to the 60s default
+- Fix handoff worker agents not returning results: prepend `[CAO Handoff]` context to the message in `_handoff_impl()` so the worker agent knows this is a blocking handoff and should output results directly instead of attempting to call `send_message` back to the supervisor (which fails because the worker doesn't have the supervisor's terminal ID)
+- Fix Codex TUI footer causing false IDLE during handoff: `› Summarize recent commits` in the TUI status bar matched `USER_PREFIX_PATTERN` as a user message, preventing COMPLETED detection; now detects TUI footer (`? for shortcuts` / `context left`) and excludes bottom lines from user-message matching
+- Fix Codex TUI progress spinner causing false COMPLETED: `• Working (0s • esc to interrupt)` matched `ASSISTANT_PREFIX_PATTERN` while TUI `›` hint matched idle prompt; added `TUI_PROGRESS_PATTERN` check to return PROCESSING when spinner is active
+- Fix Codex output extraction returning TUI chrome: apply same TUI footer detection to `extract_last_message_from_script()` and use `cutoff_pos` as extraction boundary when no strict idle prompt found
+- Fix Codex extraction of multi-line user messages: find first `•` assistant marker after user message instead of skipping one line, correctly handling wrapped `[CAO Handoff]` prefix text
 - Fix Claude Code worker agents blocking on workspace trust prompt during handoff/assign: add `--dangerously-skip-permissions` flag to bypass trust dialog since CAO already confirms workspace trust during `cao launch`
 - Fix Claude Code `PROCESSING_PATTERN` not matching newer Claude Code 2.x spinner format: broaden pattern to match both `(esc to interrupt)` and `(Ns · ↓ tokens · thinking)` formats
-- Fix tmux `paste-buffer -p` Enter key being swallowed by Claude Code 2.x TUI: add 0.3s delay between bracketed paste and Enter submission
-- Fix Claude Code MCP servers not receiving `CAO_TERMINAL_ID` env var: inject it explicitly via `--mcp-config` env field since Claude Code doesn't forward parent shell env vars to MCP subprocesses
-- Rewrite Codex CLI provider: fix `IDLE_PROMPT_PATTERN_LOG` matching `❯` instead of `? for shortcuts`, add `--no-alt-screen` flag, TUI footer/progress detection, bottom-N-lines status parsing, two-phase response extraction
-- Fix Codex `_handle_trust_prompt()` to auto-accept trust dialog during initialization
-- Fix MCP server `utils.py` import: `adapters.database` → `clients.database`
-- Fix inbox service tail lines: increase from 5 to 100 for TUI-based providers; remove unused `INBOX_SERVICE_TAIL_LINES` constant
+- Fix all providers' `send_input()` using `tmux send_keys(literal=True)` which sends characters individually, allowing TUI hotkeys to intercept user messages; replace with `send_keys_via_paste()` using `tmux set-buffer` + `paste-buffer -p` (bracketed paste mode) to bypass per-character hotkey handling
 
 ### Added
 
+- E2E assign callback round-trip test (`test_assign_with_callback`) for all providers: verifies full assign flow where worker completes task, result is sent to supervisor's inbox, inbox message delivered (status=DELIVERED), and supervisor processes the callback
+- E2E send_message test now verifies inbox message status = DELIVERED (not just stored), proving the inbox delivery pipeline works end-to-end for each provider
+- E2E supervisor orchestration test now verifies no inbox messages stuck as PENDING after supervisor completes, catching inbox delivery pipeline failures
 - Workspace trust confirmation prompt in `launch.py` before starting providers: asks "Do you trust all the actions in this folder?" since providers are granted full permissions (read, write, execute) in the working directory; supports `--yolo` flag to skip
-- Provider documentation: `docs/claude-code.md` covering status detection, message extraction, configuration, implementation notes, and troubleshooting
-- Provider documentation: `docs/codex-cli.md` covering Codex CLI provider status detection, message extraction, and troubleshooting
-- Working directory documentation: `docs/working-directory.md` covering `CAO_ENABLE_WORKING_DIRECTORY` feature
-- MCP server Codex `[CAO Handoff]` prefix and multi-status wait (`IDLE`∪`COMPLETED`) with 120s timeout
-- Framework: `paste_enter_count` property and `mark_input_received()` on `BaseProvider` for TUI-aware input handling
-- Framework: `send_special_key()` in terminal service and tmux client for control signals (e.g., Ctrl+D)
-- Framework: `send_keys_via_paste()` in tmux client for bracketed paste mode input
-- API: exit terminal route supports special keys; inbox endpoint uses best-effort delivery
-
-### Changed
-
-- Bump `fastmcp` from 2.12.2 to 2.14.0
-- Add `mcp>=1.23.0` as explicit dependency
-- Relax `libtmux` pin from `==0.51.0` to `>=0.51.0`
-- Change default provider from `q_cli` to `kiro_cli`
-- Exclude e2e tests from default pytest runs (`-m 'not e2e'`)
+- Unit tests for `TmuxClient.send_keys` validating paste-buffer delivery (`test/clients/test_tmux_send_keys.py`)
+- Claude Code unit tests for `wait_for_shell` lifecycle, shell timeout, `❯` prompt detection, and ANSI-coded output
+- Trust prompt handling tests (6 tests) and workspace confirmation tests (4 tests)
+- Codex provider agent profile support: inject system prompt via `-c developer_instructions` config override, mirroring Claude Code's `--append-system-prompt` behavior
+- Codex provider MCP server support: inject MCP servers from agent profiles via `-c mcp_servers.<name>.<field>=<value>` config overrides (per-session, no global config changes), enabling tools like `handoff` and `send_message` for multi-agent orchestration
+- Codex MCP server `CAO_TERMINAL_ID` environment forwarding: automatically adds `env_vars=["CAO_TERMINAL_ID"]` to all MCP server configs so handoff can create new agent windows in the same tmux session
+- Codex `_build_codex_command()` method with `shlex.join()` for safe shell escaping and proper quote/backslash/newline handling
+- Codex launch flags: `--no-alt-screen` (inline mode for reliable tmux capture) and `--disable shell_snapshot` (prevent SIGTTIN in tmux)
+- Codex `_handle_trust_prompt()` to auto-accept workspace trust dialog during initialization
+- Codex unit tests: `TestCodexBuildCommand` (10 tests) for command building, agent profile injection, MCP server config, escaping, and error handling
+- Codex bullet-format status detection tests: `TestCodexBulletFormatStatusDetection` (7 tests) for COMPLETED, PROCESSING, IDLE, code blocks, error detection, multi-turn, and TUI status bar using real `•` bullet response format
+- Codex bullet-format extraction tests: `TestCodexBulletFormatExtraction` (5 tests) for single-line, multi-line, code block, multi-turn, and no-trailing-prompt extraction from `•` bullet format
+- Codex TUI spinner status detection tests: `test_get_status_processing_tui_spinner`, `test_get_status_processing_tui_thinking_spinner`, `test_get_status_processing_dynamic_spinner_text` (3 tests) verifying PROCESSING is returned when TUI progress spinner is active
+- Handoff message context tests: `TestHandoffMessageContext` (6 tests) in `test/mcp_server/test_handoff.py` verifying `[CAO Handoff]` prefix is prepended only for Codex provider, includes supervisor terminal ID, and preserves the original message
+- Multi-agent communication protocol section added to `developer.md` and `reviewer.md` agent profiles explaining handoff vs assign behavior
+- End-to-end test suite (`test/e2e/`) with 15 tests covering handoff, assign, and send_message flows across all 3 providers (codex, claude_code, kiro_cli); uses real `data_analyst` and `report_generator` profiles from `examples/assign/`; gated behind `@pytest.mark.e2e` marker, excluded from default `pytest` runs
+- Provider documentation: `docs/claude-code.md` and `docs/kiro-cli.md` covering status detection, message extraction, configuration, implementation notes, E2E testing, and troubleshooting
+- CI workflow `test-codex-provider.yml` for Codex provider-specific unit tests (path-triggered)
+- CI workflow `test-claude-code-provider.yml` for Claude Code provider-specific unit tests (path-triggered)
+- `BaseProvider.mark_input_received()` hook called by `terminal_service.send_input()` after delivering external input; allows providers to adjust status detection based on whether external input has been received since initialization
+- `TmuxClient.send_keys_via_paste()` method for sending text via bracketed paste mode (`tmux set-buffer` + `paste-buffer -p`), bypassing TUI hotkey interception
+- `TmuxClient.send_special_key()` method for sending tmux key sequences (e.g., `C-d`, `C-c`) non-literally, distinct from `send_keys()` which sends text literally
+- Supervisor orchestration E2E tests (`test/e2e/test_supervisor_orchestration.py`): tests across providers that verify the full supervisor→worker delegation flow via MCP tools (handoff and assign+handoff), using `analysis_supervisor` profile from `examples/assign/`
+- `terminal_service.send_special_key()` wrapper function for the new tmux client method
+- Exit terminal endpoint key sequence routing: `POST /terminals/{terminal_id}/exit` now detects `C-`/`M-` prefixed exit commands and sends them as tmux key sequences instead of literal text
+- New CLI commands: `cao info` (show session info) and `cao mcp-server` (start MCP server)
+- New example profiles: `data_analyst` and `report_generator` in `examples/assign/`
+- Kiro CLI provider: comprehensive docstrings and `shlex.join()` shell safety fix
+- Q CLI provider: `shlex.join()` shell safety fix
+- Session service: comprehensive docstrings
 
 ## [1.0.2] - 2026-01-30
 
@@ -133,5 +165,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bump to v0.51.0, update method name (#31)
 
 - accept optional U+03BB (λ) after % in kiro and q CLIs (#44)
-
 
