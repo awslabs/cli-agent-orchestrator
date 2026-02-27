@@ -218,9 +218,6 @@ export default function OrganizationPage() {
       <ConsoleNav />
       <main style={{ padding: 18 }}>
         <h1 style={{ fontSize: 22, color: "var(--text-bright)", marginBottom: 12 }}>组织管理</h1>
-        <div style={{ color: "var(--text-dim)", marginBottom: 14 }}>
-          集团采用两层组织：团队负责人（主控）→ 团队成员（执行员工）。
-        </div>
 
         {error && <div style={{ color: "var(--danger)", marginBottom: 12 }}>{error}</div>}
 
@@ -381,9 +378,6 @@ export default function OrganizationPage() {
               {creatingWorker ? "办理中..." : "办理入职"}
             </button>
           </form>
-          <div style={{ color: "var(--text-dim)", fontSize: 12, marginTop: 8 }}>
-            提示：未分配团队的员工会自动登记为独立团队负责人。
-          </div>
         </section>
 
         <section style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 8, padding: 14 }}>
