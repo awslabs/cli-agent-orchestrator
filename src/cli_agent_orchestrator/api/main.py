@@ -383,6 +383,13 @@ async def get_inbox_messages_endpoint(
         List of inbox messages with sender_id, message, created_at, status
     """
     try:
+        # Best-effort catch-up delivery when clients poll inbox.
+        # This avoids messages staying pending if a filesystem idle event is missed.
+        try:
+            inbox_service.check_and_send_pending_messages(terminal_id)
+        except Exception as e:
+            logger.debug(f"Inbox catch-up delivery skipped for {terminal_id}: {e}")
+
         # Convert status filter if provided
         status_filter = None
         if status_param:

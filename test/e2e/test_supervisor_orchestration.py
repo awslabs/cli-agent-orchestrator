@@ -23,8 +23,10 @@ Requires:
 Run:
     uv run pytest -m e2e test/e2e/test_supervisor_orchestration.py -v -o "addopts="
     uv run pytest -m e2e test/e2e/test_supervisor_orchestration.py -v -o "addopts=" -k codex
+    uv run pytest -m e2e test/e2e/test_supervisor_orchestration.py -v -o "addopts=" -k copilot
 """
 
+import re
 import time
 import uuid
 from test.e2e.conftest import (
@@ -371,6 +373,116 @@ def _run_supervisor_assign_test(provider: str):
                 pass
 
 
+def _run_supervisor_assign_three_analysts_test(provider: str):
+    """Test supervisor assigns A/B/C analysts, receives callbacks, and finalizes report."""
+    session_suffix = uuid.uuid4().hex[:6]
+    session_name = f"e2e-super-3a-{provider}-{session_suffix}"
+    supervisor_id = None
+    actual_session = None
+
+    try:
+        supervisor_id, actual_session = create_terminal(
+            provider, "analysis_supervisor", session_name
+        )
+        assert supervisor_id, "Supervisor terminal ID should not be empty"
+
+        assert _wait_for_ready(
+            supervisor_id, timeout=120.0
+        ), f"Supervisor did not become ready within 120s (provider={provider})"
+        time.sleep(2)
+
+        task_message = (
+            "Run the full workflow exactly.\n"
+            "Dataset A: [1, 2, 3, 4, 5]\n"
+            "Dataset B: [10, 20, 30, 40, 50]\n"
+            "Dataset C: [2, 2, 3, 3, 4]\n"
+            "Use assign to dispatch one data_analyst per dataset (A, B, C), "
+            "then use handoff to report_generator for the template, then combine "
+            "all three analyst results into the final report."
+        )
+        resp = requests.post(
+            f"{API_BASE_URL}/terminals/{supervisor_id}/input",
+            params={"message": task_message},
+        )
+        assert resp.status_code == 200, f"Send message failed: {resp.status_code}"
+
+        # Expected minimum: supervisor + 3 analysts + report generator
+        status, terminals = _wait_for_supervisor_done(
+            supervisor_id, actual_session, min_terminals=5, timeout=420
+        )
+        assert status == "completed", (
+            f"Supervisor did not reach COMPLETED within timeout (provider={provider}). "
+            f"Last status: {status}"
+        )
+        assert len(terminals) >= 5, (
+            "Expected at least 5 terminals " "(supervisor + analyst A/B/C + report_generator)"
+        )
+
+        # Verify 3 analyst callbacks were delivered to supervisor inbox.
+        delivered_messages = []
+        for _ in range(36):  # up to 180s
+            delivered_messages = _get_inbox_messages(supervisor_id, status_filter="delivered")
+            unique_senders = {m.get("sender_id") for m in delivered_messages if m.get("sender_id")}
+            if len(unique_senders) >= 3:
+                break
+            time.sleep(5)
+
+        unique_senders = {m.get("sender_id") for m in delivered_messages if m.get("sender_id")}
+        assert len(unique_senders) >= 3, (
+            "Expected delivered callbacks from at least 3 distinct worker terminals. "
+            f"Got {len(unique_senders)} senders: {sorted(unique_senders)}"
+        )
+
+        # Ensure final output reflects combined multi-dataset report.
+        # After callbacks are delivered, the supervisor may need extra time to
+        # synthesize and emit a final narrative response.
+        output = ""
+        cleaned = ""
+        for _ in range(24):  # up to 120s
+            candidate = extract_output(supervisor_id)
+            if not candidate.strip():
+                candidate = _get_full_output(supervisor_id)
+
+            if candidate.strip():
+                candidate_cleaned = re.sub(r"\x1b\[[0-9;]*m", "", candidate).lower()
+                has_report = bool(re.search(r"\b(summary|report)\b", candidate_cleaned))
+                has_synthesis = bool(
+                    re.search(
+                        r"\b(conclusions?|recommendations?|overall|synthesis|final)\b",
+                        candidate_cleaned,
+                    )
+                )
+                output = candidate
+                cleaned = candidate_cleaned
+                if has_report and has_synthesis:
+                    break
+            time.sleep(5)
+
+        assert len(output.strip()) > 0, "Supervisor output should not be empty"
+        assert re.search(
+            r"\b(summary|report)\b", cleaned
+        ), "Expected report-style summary content in final output"
+        assert re.search(
+            r"\b(conclusions?|recommendations?|overall|synthesis|final)\b", cleaned
+        ), f"Expected final synthesis/conclusion content in final report output. Got: {output[-500:]}"
+
+    finally:
+        if actual_session:
+            terminals = _list_terminals_in_session(actual_session)
+            for term in terminals:
+                tid = term.get("id", "")
+                if tid:
+                    try:
+                        requests.post(f"{API_BASE_URL}/terminals/{tid}/exit")
+                    except Exception:
+                        pass
+            time.sleep(3)
+            try:
+                requests.delete(f"{API_BASE_URL}/sessions/{actual_session}")
+            except Exception:
+                pass
+
+
 # ---------------------------------------------------------------------------
 # Codex provider
 # ---------------------------------------------------------------------------
@@ -423,3 +535,25 @@ class TestKiroCliSupervisorOrchestration:
     def test_supervisor_assign_and_handoff(self, require_kiro):
         """Supervisor uses assign + handoff to orchestrate multi-agent workflow."""
         _run_supervisor_assign_test(provider="kiro_cli")
+
+
+# ---------------------------------------------------------------------------
+# Copilot CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestCopilotCliSupervisorOrchestration:
+    """E2E supervisor orchestration tests for the Copilot CLI provider."""
+
+    def test_supervisor_handoff(self, require_copilot):
+        """Supervisor uses handoff MCP tool to delegate to report_generator."""
+        _run_supervisor_handoff_test(provider="copilot_cli")
+
+    def test_supervisor_assign_and_handoff(self, require_copilot):
+        """Supervisor uses assign + handoff to orchestrate multi-agent workflow."""
+        _run_supervisor_assign_test(provider="copilot_cli")
+
+    def test_supervisor_assign_three_analysts(self, require_copilot):
+        """Supervisor assigns A/B/C analysts, receives callbacks, and finalizes report."""
+        _run_supervisor_assign_three_analysts_test(provider="copilot_cli")

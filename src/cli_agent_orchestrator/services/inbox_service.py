@@ -88,33 +88,35 @@ def check_and_send_pending_messages(terminal_id: str) -> bool:
     if not messages:
         return False
 
-    message = messages[0]
-
-    # Get provider and check status
+    # Get provider once and repeatedly drain pending messages while terminal is ready.
     provider = provider_manager.get_provider(terminal_id)
     if provider is None:
         raise ValueError(f"Provider not found for terminal {terminal_id}")
-    # Let the provider use its own default tail_lines. Each provider knows how
-    # many lines it needs to reliably detect the idle prompt (TUI providers
-    # need 50 lines due to TUI padding). Previously this passed
-    # INBOX_SERVICE_TAIL_LINES=5, which was too few for TUI-based providers —
-    # the idle prompt was never found, so messages stayed PENDING forever.
-    status = provider.get_status()
 
-    if status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
-        logger.debug(f"Terminal {terminal_id} not ready (status={status})")
-        return False
+    sent_any = False
 
-    # Send message
-    try:
-        terminal_service.send_input(terminal_id, message.message)
-        update_message_status(message.id, MessageStatus.DELIVERED)
-        logger.info(f"Delivered message {message.id} to terminal {terminal_id}")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to send message {message.id} to {terminal_id}: {e}")
-        update_message_status(message.id, MessageStatus.FAILED)
-        raise
+    while messages:
+        # Let the provider use its own default tail_lines. Each provider knows
+        # how many lines it needs to reliably detect the idle prompt.
+        status = provider.get_status()
+        if status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
+            logger.debug(f"Terminal {terminal_id} not ready (status={status})")
+            return sent_any
+
+        message = messages[0]
+        try:
+            terminal_service.send_input(terminal_id, message.message)
+            update_message_status(message.id, MessageStatus.DELIVERED)
+            logger.info(f"Delivered message {message.id} to terminal {terminal_id}")
+            sent_any = True
+        except Exception as e:
+            logger.error(f"Failed to send message {message.id} to {terminal_id}: {e}")
+            update_message_status(message.id, MessageStatus.FAILED)
+            raise
+
+        messages = get_pending_messages(terminal_id, limit=1)
+
+    return sent_any
 
 
 class LogFileHandler(FileSystemEventHandler):

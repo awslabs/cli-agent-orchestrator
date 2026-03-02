@@ -9,7 +9,7 @@ import requests
 from cli_agent_orchestrator.constants import DEFAULT_PROVIDER, PROVIDERS, SERVER_HOST, SERVER_PORT
 
 # Providers that require workspace folder access
-PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {"claude_code", "codex", "kiro_cli"}
+PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {"claude_code", "codex", "copilot_cli", "kiro_cli"}
 
 
 @click.command()
@@ -32,7 +32,7 @@ def launch(agents, session_name, headless, provider, yolo):
 
         # Ask for workspace trust confirmation for providers that need it.
         # Note: CAO itself does not access the workspace — it is the underlying
-        # provider (e.g. claude_code, codex) that reads, writes, and executes
+        # provider (e.g. claude_code, codex, copilot_cli) that reads, writes, and executes
         # commands in the workspace directory.
         if provider in PROVIDERS_REQUIRING_WORKSPACE_ACCESS and not yolo:
             click.echo(
