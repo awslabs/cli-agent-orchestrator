@@ -31,7 +31,7 @@ RESPONSE_PATTERN = r"⏺(?:\x1b\[[0-9;]*m)*\s+"  # Handle any ANSI codes between
 # - New format: "✽ Cooking… (6s · ↓ 174 tokens · thinking)"
 # - Minimal format: "✻ Orbiting…" (no parenthesized status)
 # Common: spinner char + text + ellipsis, optionally followed by parenthesized status
-PROCESSING_PATTERN = r"[✶✢✽✻·✳].*…"
+PROCESSING_PATTERN = r"[✶✢✽✻✳].*…"
 IDLE_PROMPT_PATTERN = r"[>❯][\s\xa0]"  # Handle both old ">" and new "❯" prompt styles
 WAITING_USER_ANSWER_PATTERN = (
     r"❯.*\d+\."  # Pattern for Claude showing selection options with arrow cursor

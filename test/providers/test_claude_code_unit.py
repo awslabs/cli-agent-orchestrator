@@ -222,6 +222,19 @@ class TestClaudeCodeProviderStatusDetection:
         assert status == TerminalStatus.PROCESSING
 
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_get_status_idle_not_false_processing_from_status_bar(self, mock_tmux):
+        """Status bar '· latest:…' must not false-positive as PROCESSING."""
+        mock_tmux.get_history.return_value = (
+            "Claude Code v2.1.63\n"
+            "────────────────────\n"
+            "❯ \n"
+            "────────────────────\n"
+            "  current: 2.1.63 · latest:…"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
     def test_get_status_waiting_user_answer(self, mock_tmux):
         """Test WAITING_USER_ANSWER status detection."""
         mock_tmux.get_history.return_value = "❯ 1. Option one\n  2. Option two"
