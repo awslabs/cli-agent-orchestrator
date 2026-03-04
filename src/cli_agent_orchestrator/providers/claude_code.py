@@ -5,9 +5,13 @@ import logging
 import re
 import shlex
 import time
-from typing import Optional
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import frontmatter
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.constants import CLAUDE_AGENTS_DIR
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -40,6 +44,32 @@ TRUST_PROMPT_PATTERN = r"Yes, I trust this folder"  # Workspace trust dialog
 IDLE_PROMPT_PATTERN_LOG = r"[>❯][\s\xa0]"  # Same pattern for log files
 
 
+def _load_claude_agent_profile(agent_name: str) -> Optional[Dict[str, Any]]:
+    """Search the global Claude Code agent directory for an agent profile.
+
+    Searches only the global (~/.claude/agents/) directory.
+
+    Args:
+        agent_name: Name of the agent to find (without .md extension)
+
+    Returns:
+        Dict with 'name' and optional 'mcpServers' keys, or None if not found.
+    """
+    agent_path = CLAUDE_AGENTS_DIR / f"{agent_name}.md"
+    if agent_path.exists():
+        try:
+            parsed = frontmatter.loads(agent_path.read_text())
+            result: Dict[str, Any] = {"name": parsed.metadata.get("name", agent_name)}
+            if "mcpServers" in parsed.metadata:
+                result["mcpServers"] = parsed.metadata["mcpServers"]
+            logger.info(f"Found Claude agent profile at: {agent_path}")
+            return result
+        except Exception as e:
+            logger.warning(f"Failed to parse Claude agent profile at {agent_path}: {e}")
+
+    return None
+
+
 class ClaudeCodeProvider(BaseProvider):
     """Provider for Claude Code CLI tool integration."""
 
@@ -54,8 +84,38 @@ class ClaudeCodeProvider(BaseProvider):
         self._initialized = False
         self._agent_profile = agent_profile
 
+
+    def _inject_mcp_terminal_id(
+        self, mcp_servers: Dict[str, Any], command_parts: list
+    ) -> None:
+        """Inject CAO_TERMINAL_ID into MCP server env and add --mcp-config to command.
+
+        Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server) can identify
+        the current terminal for handoff/assign operations. Claude Code does not
+        automatically forward parent shell env vars to MCP subprocesses, so we
+        inject it explicitly via the env field.
+        """
+        mcp_config = {}
+        for server_name, server_config in mcp_servers.items():
+            if isinstance(server_config, dict):
+                mcp_config[server_name] = dict(server_config)
+            else:
+                mcp_config[server_name] = server_config.model_dump(exclude_none=True)
+
+            env = mcp_config[server_name].get("env", {})
+            if "CAO_TERMINAL_ID" not in env:
+                env["CAO_TERMINAL_ID"] = self.terminal_id
+                mcp_config[server_name]["env"] = env
+
+        mcp_json = json.dumps({"mcpServers": mcp_config})
+        command_parts.extend(["--mcp-config", mcp_json])
+
     def _build_claude_command(self) -> str:
         """Build Claude Code command with agent profile if provided.
+
+        Searches for agent profiles in this order:
+        1. Global Claude Code agent directory (~/.claude/agents/)
+        2. CAO agent store (local + built-in via load_agent_profile)
 
         Returns properly escaped shell command string that can be safely sent via tmux.
         Uses shlex.join() to handle multiline strings and special characters correctly.
@@ -67,40 +127,26 @@ class ClaudeCodeProvider(BaseProvider):
         command_parts = ["claude", "--dangerously-skip-permissions"]
 
         if self._agent_profile is not None:
-            try:
-                profile = load_agent_profile(self._agent_profile)
+            # Try global Claude Code agent directory first (~/.claude/agents/)
+            claude_profile = _load_claude_agent_profile(self._agent_profile)
 
-                # Add system prompt - escape newlines to prevent tmux chunking issues
-                system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
-                if system_prompt:
-                    # Replace actual newlines with \n escape sequences
-                    # This prevents tmux send_keys chunking from breaking the command
-                    escaped_prompt = system_prompt.replace("\\", "\\\\").replace("\n", "\\n")
-                    command_parts.extend(["--append-system-prompt", escaped_prompt])
+            if claude_profile is not None:
+                command_parts.extend(["--agent", claude_profile["name"]])
+                if claude_profile.get("mcpServers"):
+                    self._inject_mcp_terminal_id(claude_profile["mcpServers"], command_parts)
+            else:
+                # Fall back to CAO agent store (local + built-in)
+                try:
+                    profile = load_agent_profile(self._agent_profile)
+                except (FileNotFoundError, ValueError):
+                    raise ProviderError(
+                        f"Agent profile '{self._agent_profile}' not found in "
+                        f"global Claude Code agent directory or CAO store"
+                    )
 
-                # Add MCP config if present.
-                # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
-                # can identify the current terminal for handoff/assign operations.
-                # Claude Code does not automatically forward parent shell env vars
-                # to MCP subprocesses, so we inject it explicitly via the env field.
+                command_parts.extend(["--agent", profile.name])
                 if profile.mcpServers:
-                    mcp_config = {}
-                    for server_name, server_config in profile.mcpServers.items():
-                        if isinstance(server_config, dict):
-                            mcp_config[server_name] = dict(server_config)
-                        else:
-                            mcp_config[server_name] = server_config.model_dump(exclude_none=True)
-
-                        env = mcp_config[server_name].get("env", {})
-                        if "CAO_TERMINAL_ID" not in env:
-                            env["CAO_TERMINAL_ID"] = self.terminal_id
-                            mcp_config[server_name]["env"] = env
-
-                    mcp_json = json.dumps({"mcpServers": mcp_config})
-                    command_parts.extend(["--mcp-config", mcp_json])
-
-            except Exception as e:
-                raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
+                    self._inject_mcp_terminal_id(profile.mcpServers, command_parts)
 
         # Use shlex.join() for proper shell escaping of all arguments
         # This correctly handles multiline strings, quotes, and special characters

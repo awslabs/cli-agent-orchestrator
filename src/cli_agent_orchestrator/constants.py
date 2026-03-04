@@ -74,6 +74,7 @@ LOCAL_AGENT_STORE_DIR = CAO_HOME_DIR / "agent-store"
 # Provider-specific agent directories
 Q_AGENTS_DIR = Path.home() / ".aws" / "amazonq" / "cli-agents"  # Q CLI agents
 KIRO_AGENTS_DIR = Path.home() / ".kiro" / "agents"  # Kiro CLI agents
+CLAUDE_AGENTS_DIR = Path.home() / ".claude" / "agents"  # Claude Code user-level subagents
 
 # =============================================================================
 # Database Configuration

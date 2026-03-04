@@ -56,18 +56,22 @@ class TestClaudeCodeProviderInitialization:
         with pytest.raises(TimeoutError, match="Claude Code initialization timed out"):
             provider.initialize()
 
+    @patch("cli_agent_orchestrator.providers.claude_code._load_claude_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
     def test_initialize_with_agent_profile(
-        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load, mock_load_claude
     ):
-        """Test initialization with agent profile."""
+        """Test initialization with agent profile (found via CAO store fallback)."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
         mock_tmux.get_history.return_value = "Welcome to Claude Code v2.0"
+        # Global Claude dir misses → falls through to CAO store
+        mock_load_claude.return_value = None
         mock_profile = MagicMock()
+        mock_profile.name = "test-agent"
         mock_profile.system_prompt = "Test system prompt"
         mock_profile.mcpServers = None
         mock_load.return_value = mock_profile
@@ -78,31 +82,41 @@ class TestClaudeCodeProviderInitialization:
         assert result is True
         mock_load.assert_called_once_with("test-agent")
 
+    @patch("cli_agent_orchestrator.providers.claude_code._load_claude_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_initialize_with_invalid_agent_profile(self, mock_tmux, mock_load, mock_wait_shell):
-        """Test initialization with invalid agent profile."""
+    def test_initialize_with_invalid_agent_profile(
+        self, mock_tmux, mock_load, mock_wait_shell, mock_load_claude
+    ):
+        """Test initialization with invalid agent profile not found in global dir or CAO store."""
         mock_wait_shell.return_value = True
+        # Global Claude directory lookup returns None
+        mock_load_claude.return_value = None
+        # CAO store also raises → ProviderError
         mock_load.side_effect = FileNotFoundError("Profile not found")
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0", "invalid-agent")
 
-        with pytest.raises(ProviderError, match="Failed to load agent profile"):
+        with pytest.raises(ProviderError, match="not found in global Claude Code agent directory or CAO store"):
             provider.initialize()
 
+    @patch("cli_agent_orchestrator.providers.claude_code._load_claude_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
     def test_initialize_with_mcp_servers(
-        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load, mock_load_claude
     ):
-        """Test initialization with MCP servers in profile."""
+        """Test initialization with MCP servers in profile (CAO store fallback)."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
         mock_tmux.get_history.return_value = "Welcome to Claude Code v2.0"
+        # Global Claude dir misses → falls through to CAO store
+        mock_load_claude.return_value = None
         mock_profile = MagicMock()
+        mock_profile.name = "test-agent"
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {"server1": {"command": "test", "args": ["--flag"]}}
         mock_load.return_value = mock_profile
@@ -365,10 +379,13 @@ class TestClaudeCodeProviderMisc:
 
         assert command == "claude --dangerously-skip-permissions"
 
+    @patch("cli_agent_orchestrator.providers.claude_code._load_claude_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
-    def test_build_claude_command_with_system_prompt(self, mock_load):
-        """Test building Claude command with system prompt."""
+    def test_build_claude_command_with_system_prompt(self, mock_load, mock_load_claude):
+        """Test building Claude command with system prompt (CAO store fallback)."""
+        mock_load_claude.return_value = None
         mock_profile = MagicMock()
+        mock_profile.name = "test-agent"
         mock_profile.system_prompt = "Test prompt\nwith newlines"
         mock_profile.mcpServers = None
         mock_load.return_value = mock_profile
@@ -377,12 +394,16 @@ class TestClaudeCodeProviderMisc:
         command = provider._build_claude_command()
 
         assert "claude" in command
-        assert "--append-system-prompt" in command
+        assert "--agent" in command
+        assert "test-agent" in command
 
+    @patch("cli_agent_orchestrator.providers.claude_code._load_claude_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
-    def test_build_command_mcp_injects_terminal_id(self, mock_load):
+    def test_build_command_mcp_injects_terminal_id(self, mock_load, mock_load_claude):
         """Test that _build_claude_command injects CAO_TERMINAL_ID into MCP server env."""
+        mock_load_claude.return_value = None
         mock_profile = MagicMock()
+        mock_profile.name = "test-agent"
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {
             "cao-mcp-server": {"command": "cao-mcp-server", "args": ["--port", "8080"]}
@@ -403,10 +424,13 @@ class TestClaudeCodeProviderMisc:
         server_env = mcp_data["mcpServers"]["cao-mcp-server"]["env"]
         assert server_env["CAO_TERMINAL_ID"] == "term-42"
 
+    @patch("cli_agent_orchestrator.providers.claude_code._load_claude_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
-    def test_build_command_mcp_preserves_existing_env(self, mock_load):
+    def test_build_command_mcp_preserves_existing_env(self, mock_load, mock_load_claude):
         """Test that existing env vars in MCP config are preserved when injecting CAO_TERMINAL_ID."""
+        mock_load_claude.return_value = None
         mock_profile = MagicMock()
+        mock_profile.name = "test-agent"
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {
             "my-server": {
@@ -431,10 +455,13 @@ class TestClaudeCodeProviderMisc:
         # CAO_TERMINAL_ID added
         assert server_env["CAO_TERMINAL_ID"] == "term-99"
 
+    @patch("cli_agent_orchestrator.providers.claude_code._load_claude_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
-    def test_build_command_mcp_does_not_override_existing_terminal_id(self, mock_load):
+    def test_build_command_mcp_does_not_override_existing_terminal_id(self, mock_load, mock_load_claude):
         """Test that an existing CAO_TERMINAL_ID in MCP env is NOT overwritten."""
+        mock_load_claude.return_value = None
         mock_profile = MagicMock()
+        mock_profile.name = "test-agent"
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {
             "my-server": {
@@ -565,3 +592,170 @@ class TestClaudeCodeProviderTrustPrompt:
         assert result is True
         # Verify trust prompt was auto-accepted (Enter sent)
         mock_pane.send_keys.assert_called_with("", enter=True)
+
+
+class TestLoadClaudeAgentProfile:
+    """Tests for the module-level _load_claude_agent_profile helper."""
+
+    def test_finds_global_agent(self, tmp_path):
+        """Returns agent profile from the global ~/.claude/agents/ directory."""
+        from cli_agent_orchestrator.providers.claude_code import _load_claude_agent_profile
+
+        global_dir = tmp_path / "agents"
+        global_dir.mkdir(parents=True)
+        (global_dir / "my-agent.md").write_text(
+            "---\nname: my-agent\ndescription: test\n---\nDo stuff."
+        )
+
+        with patch(
+            "cli_agent_orchestrator.providers.claude_code.CLAUDE_AGENTS_DIR",
+            global_dir,
+        ):
+            result = _load_claude_agent_profile("my-agent")
+
+        assert result is not None
+        assert result["name"] == "my-agent"
+        assert "mcpServers" not in result
+
+    def test_returns_none_when_not_found(self, tmp_path):
+        """Returns None when the agent file does not exist in the global directory."""
+        from cli_agent_orchestrator.providers.claude_code import _load_claude_agent_profile
+
+        empty_dir = tmp_path / "agents"
+        empty_dir.mkdir()
+
+        with patch(
+            "cli_agent_orchestrator.providers.claude_code.CLAUDE_AGENTS_DIR",
+            empty_dir,
+        ):
+            result = _load_claude_agent_profile("nonexistent")
+
+        assert result is None
+
+    def test_returns_none_on_parse_error(self, tmp_path):
+        """Returns None when the frontmatter cannot be parsed (logs a warning)."""
+        from cli_agent_orchestrator.providers.claude_code import _load_claude_agent_profile
+
+        global_dir = tmp_path / "agents"
+        global_dir.mkdir(parents=True)
+        (global_dir / "bad-agent.md").write_text("---\nname: [invalid yaml\n---\nBody.")
+
+        with patch(
+            "cli_agent_orchestrator.providers.claude_code.CLAUDE_AGENTS_DIR",
+            global_dir,
+        ):
+            result = _load_claude_agent_profile("bad-agent")
+
+        assert result is None
+
+    def test_includes_mcp_servers_when_present(self, tmp_path):
+        """Returns mcpServers from frontmatter when present."""
+        from cli_agent_orchestrator.providers.claude_code import _load_claude_agent_profile
+
+        global_dir = tmp_path / "agents"
+        global_dir.mkdir(parents=True)
+        (global_dir / "mcp-agent.md").write_text(
+            "---\nname: mcp-agent\ndescription: mcp\n"
+            "mcpServers:\n  my-server:\n    command: my-cmd\n---\nBody."
+        )
+
+        with patch(
+            "cli_agent_orchestrator.providers.claude_code.CLAUDE_AGENTS_DIR",
+            global_dir,
+        ):
+            result = _load_claude_agent_profile("mcp-agent")
+
+        assert result is not None
+        assert "mcpServers" in result
+        assert "my-server" in result["mcpServers"]
+
+    def test_uses_filename_as_name_fallback(self, tmp_path):
+        """Falls back to agent_name when 'name' key is absent from frontmatter."""
+        from cli_agent_orchestrator.providers.claude_code import _load_claude_agent_profile
+
+        global_dir = tmp_path / "agents"
+        global_dir.mkdir(parents=True)
+        # Frontmatter exists but has no 'name' key
+        (global_dir / "unnamed-agent.md").write_text(
+            "---\ndescription: no name here\n---\nBody."
+        )
+
+        with patch(
+            "cli_agent_orchestrator.providers.claude_code.CLAUDE_AGENTS_DIR",
+            global_dir,
+        ):
+            result = _load_claude_agent_profile("unnamed-agent")
+
+        assert result is not None
+        assert result["name"] == "unnamed-agent"
+
+
+class TestBuildClaudeCommandResolutionOrder:
+    """Tests for agent resolution order: global Claude dir first, CAO store fallback."""
+
+    @patch("cli_agent_orchestrator.providers.claude_code._load_claude_agent_profile")
+    def test_global_claude_dir_checked_first(self, mock_load_claude):
+        """When agent exists in global Claude dir, it is used without touching CAO store."""
+        mock_load_claude.return_value = {"name": "claude-native-agent"}
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0", "claude-native-agent")
+        command = provider._build_claude_command()
+
+        assert "--agent" in command
+        assert "claude-native-agent" in command
+        assert "--mcp-config" not in command
+        mock_load_claude.assert_called_once_with("claude-native-agent")
+
+    @patch("cli_agent_orchestrator.providers.claude_code._load_claude_agent_profile")
+    def test_global_claude_dir_with_mcp_servers(self, mock_load_claude):
+        """Global Claude dir path injects CAO_TERMINAL_ID when profile has mcpServers."""
+        mock_load_claude.return_value = {
+            "name": "claude-mcp-agent",
+            "mcpServers": {"my-server": {"command": "my-cmd", "args": []}},
+        }
+
+        provider = ClaudeCodeProvider("term-77", "test-session", "window-0", "claude-mcp-agent")
+        command = provider._build_claude_command()
+
+        assert "--agent" in command
+        assert "--mcp-config" in command
+        import json as _json
+        import shlex as _shlex
+        parts = _shlex.split(command)
+        mcp_json = parts[parts.index("--mcp-config") + 1]
+        mcp_data = _json.loads(mcp_json)
+        assert mcp_data["mcpServers"]["my-server"]["env"]["CAO_TERMINAL_ID"] == "term-77"
+
+    @patch("cli_agent_orchestrator.providers.claude_code._load_claude_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_falls_back_to_cao_store(self, mock_load, mock_load_claude):
+        """When global Claude dir misses, falls back to CAO agent store."""
+        mock_load_claude.return_value = None
+        mock_profile = MagicMock()
+        mock_profile.name = "cao-agent"
+        mock_profile.mcpServers = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0", "cao-agent")
+        command = provider._build_claude_command()
+
+        assert "--agent" in command
+        assert "cao-agent" in command
+        mock_load_claude.assert_called_once_with("cao-agent")
+        mock_load.assert_called_once_with("cao-agent")
+
+    @patch("cli_agent_orchestrator.providers.claude_code._load_claude_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_raises_provider_error_when_not_found_anywhere(self, mock_load, mock_load_claude):
+        """Raises ProviderError when agent is not found in global dir or CAO store."""
+        mock_load_claude.return_value = None
+        mock_load.side_effect = FileNotFoundError("not in CAO store")
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0", "missing-agent")
+
+        with pytest.raises(
+            ProviderError, match="not found in global Claude Code agent directory or CAO store"
+        ):
+            provider._build_claude_command()
+
+
