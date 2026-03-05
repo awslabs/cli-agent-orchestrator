@@ -286,7 +286,13 @@ class TestInstallCommand:
     @patch("cli_agent_orchestrator.cli.commands.install.AGENT_CONTEXT_DIR")
     @patch("cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR")
     def test_install_claude_code_provider(
-        self, mock_local_store, mock_context_dir, mock_claude_dir, mock_load, runner, mock_agent_profile
+        self,
+        mock_local_store,
+        mock_context_dir,
+        mock_claude_dir,
+        mock_load,
+        runner,
+        mock_agent_profile,
     ):
         """Test installing agent for claude_code provider writes correct .md file.
 
@@ -337,7 +343,13 @@ class TestInstallCommand:
     @patch("cli_agent_orchestrator.cli.commands.install.AGENT_CONTEXT_DIR")
     @patch("cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR")
     def test_install_claude_code_no_system_prompt(
-        self, mock_local_store, mock_context_dir, mock_claude_dir, mock_load, runner, mock_agent_profile
+        self,
+        mock_local_store,
+        mock_context_dir,
+        mock_claude_dir,
+        mock_load,
+        runner,
+        mock_agent_profile,
     ):
         """Test Claude Code install when source file has no body produces empty body."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -424,9 +436,7 @@ class TestInstallCommand:
 
             result = runner.invoke(install, ["org/sub-agent", "--provider", "claude_code"])
 
-            assert "installed successfully" in result.output, (
-                f"Unexpected output: {result.output}"
-            )
+            assert "installed successfully" in result.output, f"Unexpected output: {result.output}"
             # Filename should use __ instead of / — must not create a subdirectory
             sanitized_file = claude_dir / "org__sub-agent.md"
             assert sanitized_file.exists(), (
@@ -439,7 +449,13 @@ class TestInstallCommand:
     @patch("cli_agent_orchestrator.cli.commands.install.AGENT_CONTEXT_DIR")
     @patch("cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR")
     def test_install_claude_code_extra_frontmatter_passthrough(
-        self, mock_local_store, mock_context_dir, mock_claude_dir, mock_load, runner, mock_agent_profile
+        self,
+        mock_local_store,
+        mock_context_dir,
+        mock_claude_dir,
+        mock_load,
+        runner,
+        mock_agent_profile,
     ):
         """Test that extra frontmatter fields in the source file are preserved in output.
 

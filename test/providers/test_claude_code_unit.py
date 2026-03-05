@@ -98,7 +98,9 @@ class TestClaudeCodeProviderInitialization:
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0", "invalid-agent")
 
-        with pytest.raises(ProviderError, match="not found in global Claude Code agent directory or CAO store"):
+        with pytest.raises(
+            ProviderError, match="not found in global Claude Code agent directory or CAO store"
+        ):
             provider.initialize()
 
     @patch("cli_agent_orchestrator.providers.claude_code._load_claude_agent_profile")
@@ -457,7 +459,9 @@ class TestClaudeCodeProviderMisc:
 
     @patch("cli_agent_orchestrator.providers.claude_code._load_claude_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
-    def test_build_command_mcp_does_not_override_existing_terminal_id(self, mock_load, mock_load_claude):
+    def test_build_command_mcp_does_not_override_existing_terminal_id(
+        self, mock_load, mock_load_claude
+    ):
         """Test that an existing CAO_TERMINAL_ID in MCP env is NOT overwritten."""
         mock_load_claude.return_value = None
         mock_profile = MagicMock()
@@ -676,9 +680,7 @@ class TestLoadClaudeAgentProfile:
         global_dir = tmp_path / "agents"
         global_dir.mkdir(parents=True)
         # Frontmatter exists but has no 'name' key
-        (global_dir / "unnamed-agent.md").write_text(
-            "---\ndescription: no name here\n---\nBody."
-        )
+        (global_dir / "unnamed-agent.md").write_text("---\ndescription: no name here\n---\nBody.")
 
         with patch(
             "cli_agent_orchestrator.providers.claude_code.CLAUDE_AGENTS_DIR",
@@ -721,6 +723,7 @@ class TestBuildClaudeCommandResolutionOrder:
         assert "--mcp-config" in command
         import json as _json
         import shlex as _shlex
+
         parts = _shlex.split(command)
         mcp_json = parts[parts.index("--mcp-config") + 1]
         mcp_data = _json.loads(mcp_json)
@@ -757,5 +760,3 @@ class TestBuildClaudeCommandResolutionOrder:
             ProviderError, match="not found in global Claude Code agent directory or CAO store"
         ):
             provider._build_claude_command()
-
-

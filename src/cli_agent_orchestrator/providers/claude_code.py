@@ -84,10 +84,7 @@ class ClaudeCodeProvider(BaseProvider):
         self._initialized = False
         self._agent_profile = agent_profile
 
-
-    def _inject_mcp_terminal_id(
-        self, mcp_servers: Dict[str, Any], command_parts: list
-    ) -> None:
+    def _inject_mcp_terminal_id(self, mcp_servers: Dict[str, Any], command_parts: list) -> None:
         """Inject CAO_TERMINAL_ID into MCP server env and add --mcp-config to command.
 
         Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server) can identify
