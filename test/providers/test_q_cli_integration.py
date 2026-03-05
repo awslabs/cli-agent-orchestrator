@@ -424,12 +424,15 @@ class TestQCliProviderWorkingDirectory:
         """Create a temporary directory inside home directory to pass path validation."""
         import shutil
         import uuid
+
         path = Path.home() / f".cao_test_tmp_{uuid.uuid4().hex[:8]}"
         path.mkdir(parents=True, exist_ok=True)
         yield path
         shutil.rmtree(path, ignore_errors=True)
 
-    def test_session_starts_in_custom_directory(self, test_session_name, cleanup_session, home_tmp_path):
+    def test_session_starts_in_custom_directory(
+        self, test_session_name, cleanup_session, home_tmp_path
+    ):
         """Test that terminal starts in specified working directory."""
         # Create session with custom working directory
         window_name = tmux_client.create_session(
