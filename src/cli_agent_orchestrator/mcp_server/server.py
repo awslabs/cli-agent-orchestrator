@@ -389,34 +389,60 @@ def _assign_impl(
         return {"success": False, "terminal_id": None, "message": f"Assignment failed: {str(e)}"}
 
 
-# Conditional tool registration for assign
-# Build assign tool description based on ENABLE_SENDER_ID_INJECTION.
-if ENABLE_SENDER_ID_INJECTION:
-    _assign_description = (
-        "Assigns a task to another agent without blocking.\n\n"
-        "The sender's terminal ID and callback instructions will automatically be appended to the message."
-    )
-    _assign_message_field_desc = "The task message to send to the worker agent."
-else:
-    _assign_description = (
-        "Assigns a task to another agent without blocking.\n\n"
-        "In the message to the worker agent include instruction to send results back via send_message tool.\n"
-        "**IMPORTANT**: The terminal id of each agent is available in environment variable CAO_TERMINAL_ID.\n"
-        "When assigning, first find out your own CAO_TERMINAL_ID value, then include the terminal_id value "
-        "in the message to the worker agent to allow callback.\n"
-        'Example message: "Analyze the logs. When done, send results back to terminal ee3f93b3 using send_message tool."'
-    )
-    _assign_message_field_desc = "The task message to send. Include callback instructions for the worker to send results back."
+def _build_assign_description(enable_sender_id: bool, enable_workdir: bool) -> str:
+    """Build the assign tool description based on feature flags."""
+    # Build tool description overview.
+    if enable_sender_id:
+        desc = """\
+Assigns a task to another agent without blocking.
 
-_ASSIGN_WORKDIR_SECTION = """
+The sender's terminal ID and callback instructions will automatically be appended to the message."""
+    else:
+        desc = """\
+Assigns a task to another agent without blocking.
+
+In the message to the worker agent include instruction to send results back via send_message tool.
+**IMPORTANT**: The terminal id of each agent is available in environment variable CAO_TERMINAL_ID.
+When assigning, first find out your own CAO_TERMINAL_ID value, then include the terminal_id value in the message to the worker agent to allow callback.
+Example message: "Analyze the logs. When done, send results back to terminal ee3f93b3 using send_message tool.\""""
+
+    if enable_workdir:
+        desc += """
+
 ## Working Directory
 
 - By default, agents start in the supervisor's current working directory
 - You can specify a custom directory via working_directory parameter
 - Directory must exist and be accessible"""
 
+    desc += """
+
+Args:
+    agent_profile: Agent profile for the worker terminal
+    message: Task message (include callback instructions)"""
+
+    if enable_workdir:
+        desc += """
+    working_directory: Optional working directory where the agent should execute"""
+
+    desc += """
+
+Returns:
+    Dict with success status, worker terminal_id, and message"""
+
+    return desc
+
+
+_assign_description = _build_assign_description(
+    ENABLE_SENDER_ID_INJECTION, ENABLE_WORKING_DIRECTORY
+)
+_assign_message_field_desc = (
+    "The task message to send to the worker agent."
+    if ENABLE_SENDER_ID_INJECTION
+    else "The task message to send. Include callback instructions for the worker to send results back."
+)
+
 if ENABLE_WORKING_DIRECTORY:
-    _assign_description += _ASSIGN_WORKDIR_SECTION
 
     @mcp.tool(description=_assign_description)
     async def assign(
