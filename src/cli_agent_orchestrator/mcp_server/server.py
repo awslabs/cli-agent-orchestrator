@@ -406,9 +406,7 @@ else:
         "in the message to the worker agent to allow callback.\n"
         'Example message: "Analyze the logs. When done, send results back to terminal ee3f93b3 using send_message tool."'
     )
-    _assign_message_field_desc = (
-        "The task message to send. Include callback instructions for the worker to send results back."
-    )
+    _assign_message_field_desc = "The task message to send. Include callback instructions for the worker to send results back."
 
 _ASSIGN_WORKDIR_SECTION = """
 ## Working Directory
@@ -442,7 +440,6 @@ else:
         message: str = Field(description=_assign_message_field_desc),
     ) -> Dict[str, Any]:
         return _assign_impl(agent_profile, message, None)
-
 
 
 # Implementation function for send_message
