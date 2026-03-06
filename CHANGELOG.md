@@ -4,26 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-## [1.1.0] - Unreleased
+
+## [1.1.0] - 2026-02-26
 
 ### Fixed
 
-- Fix Gemini CLI post-init status detection breaking MCP handoff: after `-i` initialization, `get_status()` returned COMPLETED (from system prompt processing), but the MCP handoff tool waits for IDLE; added `mark_input_received()` pattern — provider returns IDLE until `terminal_service.send_input()` delivers external input, then resumes normal COMPLETED detection; `_initialized` guard prevents chicken-and-egg during init
-- Fix `_handoff_impl()` only accepting IDLE as ready state: providers with initial prompts (Gemini CLI `-i`) reach COMPLETED after processing the system prompt; updated to accept both IDLE and COMPLETED via multi-status `wait_until_terminal_status()`
+- Fix `_handoff_impl()` only accepting IDLE as ready state: providers with initial prompts reach COMPLETED after processing the system prompt; updated to accept both IDLE and COMPLETED via multi-status `wait_until_terminal_status()`
 - Fix `wait_until_terminal_status()` only accepting a single status: now accepts `Union[TerminalStatus, set]` for polling multiple acceptable statuses
-- Fix Gemini CLI initialization timeout too short for MCP server download: increased from 120s to 240s to account for `uvx --from git+...` downloading cao-mcp-server on first launch
-- Fix Gemini CLI command silently dropped in fresh tmux sessions: added 2s delay after shell warm-up echo to allow zsh to fully render the prompt before sending bracketed paste
-- Fix Gemini CLI E2E intermittent failures from API rate limiting: increased inter-test cooldown from 5s to 15s and added retry logic with 30s backoff to `create_terminal()` conftest helper for 500 errors (rate-limit-induced init timeouts)
-- Fix handoff worker IDLE wait timeout too short (30s) for slow-initializing providers: Kimi CLI (~30s), Gemini CLI (~45s), and others can exceed 30s during shell warm-up, CLI startup, and MCP server registration; if the provider's own `initialize()` times out (60-90s), `terminal_service.create_terminal()` ignores the failure and returns the terminal anyway, but the 30s IDLE check in `_handoff_impl()` fails; increased to 120s to act as a fallback; assign is unaffected because it sends messages immediately without checking IDLE
-- Fix Kimi CLI supervisor handoff always timing out because Kimi CLI's default MCP tool call timeout is 60s (`tool_call_timeout_ms=60000` in `kimi_cli/config.py`): the `handoff` MCP tool creates a worker terminal, waits for completion, and extracts output, which routinely exceeds 60s; modify `~/.kimi/config.toml` directly to set `tool_call_timeout_ms=600000` when MCP servers are configured (cannot use `--config` CLI flag because it bypasses the default config file and breaks OAuth authentication); original value restored during cleanup
-- Fix Kimi CLI handoff timing out because `get_status()` never returned COMPLETED for long responses: the original logic required both user input box (`╭─`) and response bullets (`^•\s`) in the 200-line tmux capture, but long responses push the input box out of range and structured output (tables, numbered lists) has no `•` bullets; replaced with a latching `_has_received_input` flag that detects the user input box during PROCESSING (when it's still visible) and persists through completion
-- Fix Kimi CLI output extraction failing for long responses (>200 lines) where the user input box scrolled out of capture: added `_extract_without_input_box()` fallback that extracts all content before the idle prompt, filtering out status bar and welcome banner lines
-- Fix inbox message delivery failing for TUI-based providers (Kimi CLI, Gemini CLI): inbox service passed `tail_lines=5` to `get_status()` but TUI providers need 50+ lines to find the idle prompt; messages stayed PENDING forever because the supervisor was never detected as IDLE
+- Fix handoff worker IDLE wait timeout too short (30s) for slow-initializing providers: some providers can exceed 30s during shell warm-up, CLI startup, and MCP server registration; increased to 120s to act as a fallback
+- Fix inbox message delivery failing for TUI-based providers: inbox service passed `tail_lines=5` to `get_status()` but TUI providers need 50+ lines to find the idle prompt; messages stayed PENDING forever because the supervisor was never detected as IDLE
 - Fix inbox watchdog log tail check (`_has_idle_pattern`) using only 5 lines, which missed the idle prompt for full-screen TUI providers where the prompt sits mid-screen with 30+ padding lines below; increased to 100 lines so the watchdog reliably triggers delivery when the terminal goes IDLE
-- Fix shell command injection risk in Q CLI and Kiro CLI providers: replace f-string command interpolation with `shlex.join()` for safe shell escaping of `agent_profile` values, consistent with other providers
-- Fix Gemini CLI `exit_cli()` returning `C-d` (tmux key sequence) but being sent as literal text through `send_input()`: add `send_special_key()` to `TmuxClient` and `terminal_service`, update `exit_terminal` endpoint to detect key sequences (`C-` or `M-` prefix) and route through non-literal tmux key sending
-- Fix Claude Code provider not forwarding `CAO_TERMINAL_ID` to MCP server subprocesses: inject `CAO_TERMINAL_ID` into MCP server `env` config, matching Kimi CLI and Codex providers
-- Fix `constants.py` docstring missing Kimi CLI and Gemini CLI from provider list
+- Fix shell command injection risk in Q CLI and Kiro CLI providers: replace f-string command interpolation with `shlex.join()` for safe shell escaping of `agent_profile` values
+- Fix Claude Code provider not forwarding `CAO_TERMINAL_ID` to MCP server subprocesses: inject `CAO_TERMINAL_ID` into MCP server `env` config, matching other providers
 - Fix Claude Code provider failing to launch due to tmux `send-keys` corrupting single quotes in long commands; resolved by main branch's paste-buffer approach (`load-buffer` + `paste-buffer -p`)
 - Add missing `wait_for_shell` call to Claude Code provider `initialize()` to match other providers
 - Update Claude Code `IDLE_PROMPT_PATTERN` to match both `>` and `❯` prompt styles
@@ -43,21 +35,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fix Codex extraction of multi-line user messages: find first `•` assistant marker after user message instead of skipping one line, correctly handling wrapped `[CAO Handoff]` prefix text
 - Fix Claude Code worker agents blocking on workspace trust prompt during handoff/assign: add `--dangerously-skip-permissions` flag to bypass trust dialog since CAO already confirms workspace trust during `cao launch`
 - Fix Claude Code `PROCESSING_PATTERN` not matching newer Claude Code 2.x spinner format: broaden pattern to match both `(esc to interrupt)` and `(Ns · ↓ tokens · thinking)` formats
-- Fix Kimi CLI worker agents created as separate sessions instead of windows: forward `CAO_TERMINAL_ID` to MCP server subprocess via `env` field in `--mcp-config` JSON, matching Codex provider's `env_vars` approach
-- Fix Kimi CLI initialization timeout on tall terminals (46+ rows): increase `IDLE_PROMPT_TAIL_LINES` from 10 to 50 to account for TUI padding lines between idle prompt and status bar
-- Fix Gemini CLI `_build_gemini_command()` using `--` separator and `export` for MCP server registration: replace with `-e` flag for `CAO_TERMINAL_ID` forwarding and positional command argument without `--`
-- Fix Gemini CLI initialization timeout when working directory is the home directory: replace `gemini mcp add` commands with direct `~/.gemini/settings.json` writes, eliminating Node.js subprocess overhead (~2-3s per MCP server)
-- Fix Gemini CLI slow assign/handoff (~15s vs ~1s for other providers): MCP server registration now writes directly to `~/.gemini/settings.json` instead of chaining `gemini mcp add --scope user` commands that each spawned a Node.js process
-- Fix Gemini CLI failing to launch in fresh tmux sessions: add warm-up `echo CAO_SHELL_READY` command with marker-based polling (15s timeout) before sending the `gemini` command, ensuring the shell environment (PATH, nvm, homebrew) is fully loaded
-- Fix all providers' `send_input()` using `tmux send_keys(literal=True)` which sends characters individually, allowing TUI hotkeys (e.g., Gemini CLI's `!` shell mode toggle) to intercept user messages; replace with `send_keys_via_paste()` using `tmux set-buffer` + `paste-buffer -p` (bracketed paste mode) to bypass per-character hotkey handling
-- Fix Gemini CLI supervisor agents not receiving system prompt: inject agent profile system prompt via `GEMINI.md` file in the working directory (Gemini CLI reads this for project-level instructions); backs up existing `GEMINI.md` and restores during cleanup
+- Fix all providers' `send_input()` using `tmux send_keys(literal=True)` which sends characters individually, allowing TUI hotkeys to intercept user messages; replace with `send_keys_via_paste()` using `tmux set-buffer` + `paste-buffer -p` (bracketed paste mode) to bypass per-character hotkey handling
 
 ### Added
 
 - E2E assign callback round-trip test (`test_assign_with_callback`) for all providers: verifies full assign flow where worker completes task, result is sent to supervisor's inbox, inbox message delivered (status=DELIVERED), and supervisor processes the callback
 - E2E send_message test now verifies inbox message status = DELIVERED (not just stored), proving the inbox delivery pipeline works end-to-end for each provider
 - E2E supervisor orchestration test now verifies no inbox messages stuck as PENDING after supervisor completes, catching inbox delivery pipeline failures
-- Consolidated `lessons-learned.md` into `lessons-learnt.md` (20 lessons → 14), merging related entries and removing operational notes
 - Workspace trust confirmation prompt in `launch.py` before starting providers: asks "Do you trust all the actions in this folder?" since providers are granted full permissions (read, write, execute) in the working directory; supports `--yolo` flag to skip
 - Unit tests for `TmuxClient.send_keys` validating paste-buffer delivery (`test/clients/test_tmux_send_keys.py`)
 - Claude Code unit tests for `wait_for_shell` lifecycle, shell timeout, `❯` prompt detection, and ANSI-coded output
@@ -78,26 +62,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Provider documentation: `docs/claude-code.md` and `docs/kiro-cli.md` covering status detection, message extraction, configuration, implementation notes, E2E testing, and troubleshooting
 - CI workflow `test-codex-provider.yml` for Codex provider-specific unit tests (path-triggered)
 - CI workflow `test-claude-code-provider.yml` for Claude Code provider-specific unit tests (path-triggered)
-- Kimi CLI provider (`providers/kimi_cli.py`): full integration with Kimi Code CLI (https://kimi.com/code) including idle/processing/completed/error status detection via TUI prompt patterns (✨/💫), response extraction with thinking-bullet filtering, agent profile support via temp YAML files, MCP server config injection, and temp file cleanup
-- Kimi CLI unit tests (`test/providers/test_kimi_cli_unit.py`): 66 tests across 6 test classes covering initialization, status detection, message extraction, command building, patterns, and lifecycle (95% code coverage)
-- Kimi CLI test fixtures: 5 fixture files (`kimi_cli_idle_output.txt`, `kimi_cli_completed_output.txt`, `kimi_cli_processing_output.txt`, `kimi_cli_error_output.txt`, `kimi_cli_complex_response.txt`) capturing real terminal output patterns
-- Kimi CLI E2E tests: handoff (2 tests), assign (2 tests), and send_message (1 test) in `test/e2e/` gated behind `require_kimi` fixture
-- CI workflow `test-kimi-cli-provider.yml` for Kimi CLI provider-specific unit tests (path-triggered)
-- Provider documentation: `docs/kimi-cli.md` covering prerequisites, status detection, message extraction, agent profiles, MCP config, and troubleshooting
-- Gemini CLI provider (`providers/gemini_cli.py`): full integration with Gemini CLI (https://github.com/google-gemini/gemini-cli) including idle/processing/completed/error status detection via Ink TUI patterns (`*   Type your message` idle prompt, `✦` response prefix, `>` query prefix), response extraction with TUI chrome filtering, MCP server registration via direct `~/.gemini/settings.json` writes, and `CAO_TERMINAL_ID` forwarding via env field
-- Gemini CLI unit tests (`test/providers/test_gemini_cli_unit.py`): 57 tests across 6 test classes covering initialization, status detection, message extraction, command building, patterns, and miscellaneous (100% code coverage)
-- Gemini CLI test fixtures: 5 fixture files (`gemini_cli_idle_output.txt`, `gemini_cli_completed_output.txt`, `gemini_cli_processing_output.txt`, `gemini_cli_error_output.txt`, `gemini_cli_complex_response.txt`) capturing real terminal output patterns
-- Gemini CLI E2E tests: handoff (2 tests), assign (2 tests), and send_message (1 test) in `test/e2e/` gated behind `require_gemini` fixture
-- CI workflow `test-gemini-cli-provider.yml` for Gemini CLI provider-specific unit tests (path-triggered)
-- Provider documentation: `docs/gemini-cli.md` covering prerequisites, status detection, message extraction, MCP config, and troubleshooting
-- `BaseProvider.mark_input_received()` hook called by `terminal_service.send_input()` after delivering external input; allows providers (e.g. Gemini CLI) to adjust status detection based on whether external input has been received since initialization
-- Diagnostic logging on Gemini CLI initialization timeout: captures last 50 lines of terminal output for debugging rate-limit-induced failures
-- `TmuxClient.send_keys_via_paste()` method for sending text via bracketed paste mode (`tmux set-buffer` + `paste-buffer -p`), bypassing TUI hotkey interception in Ink-based and prompt_toolkit-based CLIs
+- `BaseProvider.mark_input_received()` hook called by `terminal_service.send_input()` after delivering external input; allows providers to adjust status detection based on whether external input has been received since initialization
+- `TmuxClient.send_keys_via_paste()` method for sending text via bracketed paste mode (`tmux set-buffer` + `paste-buffer -p`), bypassing TUI hotkey interception
 - `TmuxClient.send_special_key()` method for sending tmux key sequences (e.g., `C-d`, `C-c`) non-literally, distinct from `send_keys()` which sends text literally
-- Supervisor orchestration E2E tests (`test/e2e/test_supervisor_orchestration.py`): 10 tests across all 5 providers (2 per provider) that verify the full supervisor→worker delegation flow via MCP tools (handoff and assign+handoff), using `analysis_supervisor` profile from `examples/assign/`
-- Centralized `skills/` directory as single source of truth for AI coding agent skills (`build-cao-provider`, `skill-creator`), with install instructions for Claude Code (`.claude/skills/`), Codex (`.agents/skills/`), Gemini (`.gemini/skills/`), Kimi (`.kimi/skills/`), and Kiro (`.kiro/skills/`)
+- Supervisor orchestration E2E tests (`test/e2e/test_supervisor_orchestration.py`): tests across providers that verify the full supervisor→worker delegation flow via MCP tools (handoff and assign+handoff), using `analysis_supervisor` profile from `examples/assign/`
 - `terminal_service.send_special_key()` wrapper function for the new tmux client method
 - Exit terminal endpoint key sequence routing: `POST /terminals/{terminal_id}/exit` now detects `C-`/`M-` prefixed exit commands and sends them as tmux key sequences instead of literal text
+- New CLI commands: `cao info` (show session info) and `cao mcp-server` (start MCP server)
+- New example profiles: `data_analyst` and `report_generator` in `examples/assign/`
+- Kiro CLI provider: comprehensive docstrings and `shlex.join()` shell safety fix
+- Q CLI provider: `shlex.join()` shell safety fix
+- Session service: comprehensive docstrings
 
 ## [1.0.2] - 2026-01-30
 
@@ -190,5 +165,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bump to v0.51.0, update method name (#31)
 
 - accept optional U+03BB (λ) after % in kiro and q CLIs (#44)
-
 

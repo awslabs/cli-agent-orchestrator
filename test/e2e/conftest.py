@@ -86,6 +86,7 @@ def require_gemini():
     time.sleep(15)
 
 
+
 def create_terminal(
     provider: str,
     agent_profile: str,

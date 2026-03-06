@@ -30,12 +30,10 @@ dist/
 .ralphrc
 work/
 
-# AI tool configs (skills are in skills/ as single source of truth)
+# AI tool configs
 .claude/
 .codex/
 .agents/
-.gemini/
-.kimi/
 .kiro/
 
 # Memory

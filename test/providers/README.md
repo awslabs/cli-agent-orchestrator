@@ -758,11 +758,11 @@ uv run pytest test/cli/commands/test_launch.py -v
 
 ## Test Quality Metrics
 
-- **Provider Unit Test Count:** ~264 (across all providers)
+- **Provider Unit Test Count:** ~200 (across all providers)
 - **CLI Command Test Count:** ~10
 - **Client Unit Test Count:** ~20
 - **Integration Test Count:** 9
-- **Total Test Count:** 598
-- **Coverage:** 83% overall; 96-100% of all provider modules and launch.py
+- **Total Test Count:** 511
+- **Coverage:** 84% overall; 96-100% of all provider modules and launch.py
 - **Execution Time:** <5s (unit), <90s (integration)
 - **Test Categories:** 12 (initialization, status label-format, status bullet-format, extraction label-format, extraction bullet-format, command building, patterns, prompts, handoff, edge cases, tmux send_keys, workspace confirmation)

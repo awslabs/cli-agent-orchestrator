@@ -77,11 +77,11 @@ pytest test/ -v --ignore=test/providers/test_q_cli_integration.py
 
 ```
 test/
-├── README.md              # This file
-├── api/                   # API endpoint tests
+├── README.md                 # This file
+├── api/                      # API endpoint tests
 │   ├── test_inbox_messages.py
 │   └── test_terminals.py
-├── cli/                   # CLI command tests
+├── cli/                      # CLI command tests
 │   ├── test_main.py
 │   └── commands/
 │       ├── test_flow.py
@@ -89,25 +89,36 @@ test/
 │       ├── test_install.py
 │       ├── test_launch.py
 │       └── test_shutdown.py
-├── clients/               # Client tests
+├── clients/                  # Client tests
 │   ├── test_database.py
 │   └── test_tmux_send_keys.py
-├── mcp_server/            # MCP server tests
-│   └── test_models.py
-├── models/                # Model tests
+├── e2e/                      # End-to-end tests (require running CAO server)
+│   ├── conftest.py
+│   ├── test_assign.py
+│   ├── test_handoff.py
+│   ├── test_send_message.py
+│   └── test_supervisor_orchestration.py
+├── mcp_server/               # MCP server tests
+│   ├── test_handoff.py
+│   ├── test_models.py
+│   └── test_utils.py
+├── models/                   # Model tests
 │   └── test_session.py
-├── providers/             # Provider tests
+├── providers/                # Provider tests
 │   ├── test_base_provider.py
 │   ├── test_claude_code_unit.py
 │   ├── test_codex_provider_unit.py
 │   ├── test_kiro_cli_unit.py
 │   ├── test_provider_manager_unit.py
 │   └── test_q_cli_unit.py
-├── services/              # Service tests
+├── services/                 # Service tests
+│   ├── test_cleanup_service.py
+│   ├── test_flow_service.py
 │   ├── test_inbox_service.py
 │   ├── test_session_service.py
-│   └── test_terminal_service.py
-└── utils/                 # Utility tests
+│   └── test_terminal_service_full.py
+└── utils/                    # Utility tests
+    ├── test_agent_profiles.py
     ├── test_logging.py
     ├── test_template.py
     └── test_terminal.py
@@ -117,14 +128,14 @@ test/
 
 The project aims for >90% test coverage for core modules.
 
-### Current Coverage Status (467 tests passing)
+### Current Coverage Status (511 tests passing)
 
 **Modules at 100% Coverage:**
 - `cli/commands/` - All CLI commands (flow, init, install, launch, shutdown)
 - `constants.py` - Configuration constants
 - `mcp_server/models.py`, `mcp_server/utils.py` - MCP models and utilities
 - `models/` - All Pydantic models
-- `providers/` - All provider implementations (claude_code, codex, kiro_cli, q_cli)
+- `providers/` - All provider implementations (claude_code, codex, kiro_cli, kimi_cli, gemini_cli, q_cli)
 - `services/inbox_service.py`, `services/session_service.py` - Core services
 - `utils/` - All utility modules (agent_profiles, logging, template, terminal)
 

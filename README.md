@@ -97,8 +97,6 @@ Before using CAO, install at least one supported CLI agent tool:
 | **Kiro CLI** (default) | [Provider docs](docs/kiro-cli.md) · [Installation](https://kiro.dev/docs/kiro-cli) | AWS credentials |
 | **Claude Code** | [Provider docs](docs/claude-code.md) · [Installation](https://docs.anthropic.com/en/docs/claude-code/getting-started) | Anthropic API key |
 | **Codex CLI** | [Provider docs](docs/codex-cli.md) · [Installation](https://github.com/openai/codex) | OpenAI API key |
-| **Kimi CLI** | [Provider docs](docs/kimi-cli.md) · [Installation](https://kimi.com/code) | `kimi login` (OAuth) |
-| **Gemini CLI** | [Provider docs](docs/gemini-cli.md) · [Installation](https://github.com/google-gemini/gemini-cli) | OAuth or `GEMINI_API_KEY` |
 | **Q CLI** | [Installation](https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/command-line.html) | AWS credentials |
 
 ## Quick Start
@@ -144,9 +142,6 @@ cao launch --agents code_supervisor
 cao launch --agents code_supervisor --provider kiro_cli
 cao launch --agents code_supervisor --provider claude_code
 cao launch --agents code_supervisor --provider codex
-cao launch --agents code_supervisor --provider kimi_cli
-cao launch --agents code_supervisor --provider gemini_cli
-
 # Skip workspace trust confirmation
 cao launch --agents code_supervisor --yolo
 ```
@@ -378,28 +373,12 @@ cao flow remove daily-standup
 
 CAO supports specifying working directories for agent handoff/delegation operations. By default this is disabled to prevent agents from hallucinating directory paths.
 
+All paths are canonicalized via `realpath` and validated against a security policy:
+
+- **Allowed:** the user's home directory (`~/`) and any subdirectory under it, including paths through symlinks (e.g., `/home/user` -> `/local/home/user` on AWS)
+- **Blocked:** system directories (`/`, `/etc`, `/var`, `/tmp`, `/proc`, `/sys`, `/root`, `/boot`, `/bin`, `/sbin`, `/usr/bin`, `/usr/sbin`, `/lib`, `/lib64`, `/dev`) and any path outside the home directory tree
+
 For configuration and usage details, see [docs/working-directory.md](docs/working-directory.md).
-
-## Skills for AI Coding Agents
-
-CAO includes reusable [skills](skills/) that provide specialized knowledge and workflows for AI coding agents. Skills encode lessons learned, verification checklists, and implementation guides.
-
-| Skill | Description |
-|-------|-------------|
-| `build-cao-provider` | Full lifecycle guide for building a new CLI agent provider |
-| `skill-creator` | Guide for creating new skills |
-
-Skills live in `skills/` as the single source of truth. Copy them to your tool's directory before use:
-
-```bash
-# Install skills for all tools
-for tool in .claude .agents .gemini .kimi .kiro; do
-  mkdir -p "$tool/skills"
-  cp -r skills/* "$tool/skills/"
-done
-```
-
-See [skills/README.md](skills/README.md) for per-tool instructions and Ralph setup.
 
 ## Security
 

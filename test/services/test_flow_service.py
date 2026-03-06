@@ -58,7 +58,8 @@ class TestParseFlowFile:
     def test_parse_valid_flow_file(self):
         """Test parsing a valid flow file with frontmatter."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
-            f.write("""---
+            f.write(
+                """---
 name: test-flow
 schedule: "* * * * *"
 agent_profile: developer
@@ -66,7 +67,8 @@ provider: kiro_cli
 ---
 
 This is the prompt template.
-""")
+"""
+            )
             f.flush()
 
             metadata, content = _parse_flow_file(Path(f.name))
@@ -85,7 +87,8 @@ This is the prompt template.
     def test_parse_flow_file_with_script(self):
         """Test parsing flow file with optional script field."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
-            f.write("""---
+            f.write(
+                """---
 name: scripted-flow
 schedule: "0 * * * *"
 agent_profile: developer
@@ -93,7 +96,8 @@ script: ./check.sh
 ---
 
 Prompt with [[variable]].
-""")
+"""
+            )
             f.flush()
 
             metadata, content = _parse_flow_file(Path(f.name))
@@ -120,14 +124,16 @@ class TestAddFlow:
         mock_db_create.return_value = mock_flow
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
-            f.write("""---
+            f.write(
+                """---
 name: test-flow
 schedule: "* * * * *"
 agent_profile: developer
 ---
 
 Test prompt.
-""")
+"""
+            )
             f.flush()
 
             result = add_flow(f.name)
@@ -138,12 +144,14 @@ Test prompt.
     def test_add_flow_missing_required_field(self):
         """Test that missing required field raises error."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
-            f.write("""---
+            f.write(
+                """---
 name: incomplete-flow
 ---
 
 Missing schedule and agent_profile.
-""")
+"""
+            )
             f.flush()
 
             with pytest.raises(ValueError, match="Missing required field"):
@@ -152,14 +160,16 @@ Missing schedule and agent_profile.
     def test_add_flow_invalid_cron(self):
         """Test that invalid cron expression raises error."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
-            f.write("""---
+            f.write(
+                """---
 name: bad-cron-flow
 schedule: "not a cron"
 agent_profile: developer
 ---
 
 Test prompt.
-""")
+"""
+            )
             f.flush()
 
             with pytest.raises(ValueError, match="Invalid cron expression"):
@@ -180,7 +190,8 @@ Test prompt.
         mock_db_create.return_value = mock_flow
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
-            f.write("""---
+            f.write(
+                """---
 name: custom-provider-flow
 schedule: "0 9 * * *"
 agent_profile: developer
@@ -188,7 +199,8 @@ provider: claude_code
 ---
 
 Test prompt.
-""")
+"""
+            )
             f.flush()
 
             result = add_flow(f.name)
@@ -369,14 +381,16 @@ class TestExecuteFlow:
         """Test executing a flow without a script."""
         # Create temp flow file
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
-            f.write("""---
+            f.write(
+                """---
 name: simple-flow
 schedule: "* * * * *"
 agent_profile: developer
 ---
 
 Simple prompt without variables.
-""")
+"""
+            )
             f.flush()
             flow_path = f.name
 
@@ -424,7 +438,8 @@ Simple prompt without variables.
             flow_path = Path(tmpdir) / "flow.md"
             script_path = Path(tmpdir) / "check.sh"
 
-            flow_path.write_text("""---
+            flow_path.write_text(
+                """---
 name: scripted-flow
 schedule: "* * * * *"
 agent_profile: developer
@@ -432,7 +447,8 @@ script: ./check.sh
 ---
 
 Value is [[value]].
-""")
+"""
+            )
             script_path.write_text("#!/bin/bash\necho 'test'")
             script_path.chmod(0o755)
 
@@ -480,7 +496,8 @@ Value is [[value]].
             flow_path = Path(tmpdir) / "flow.md"
             script_path = Path(tmpdir) / "check.sh"
 
-            flow_path.write_text("""---
+            flow_path.write_text(
+                """---
 name: skip-flow
 schedule: "* * * * *"
 agent_profile: developer
@@ -488,7 +505,8 @@ script: ./check.sh
 ---
 
 Prompt.
-""")
+"""
+            )
             script_path.write_text("#!/bin/bash\necho 'test'")
             script_path.chmod(0o755)
 
@@ -531,7 +549,8 @@ Prompt.
             flow_path = Path(tmpdir) / "flow.md"
             script_path = Path(tmpdir) / "check.sh"
 
-            flow_path.write_text("""---
+            flow_path.write_text(
+                """---
 name: fail-flow
 schedule: "* * * * *"
 agent_profile: developer
@@ -539,7 +558,8 @@ script: ./check.sh
 ---
 
 Prompt.
-""")
+"""
+            )
             script_path.write_text("#!/bin/bash\nexit 1")
             script_path.chmod(0o755)
 
@@ -568,7 +588,8 @@ Prompt.
             flow_path = Path(tmpdir) / "flow.md"
             script_path = Path(tmpdir) / "check.sh"
 
-            flow_path.write_text("""---
+            flow_path.write_text(
+                """---
 name: bad-json-flow
 schedule: "* * * * *"
 agent_profile: developer
@@ -576,7 +597,8 @@ script: ./check.sh
 ---
 
 Prompt.
-""")
+"""
+            )
             script_path.write_text("#!/bin/bash\necho 'not json'")
             script_path.chmod(0o755)
 

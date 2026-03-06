@@ -39,10 +39,9 @@
                 │                    │ • claude │
          ┌──────┴──────┐             │   _code  │
          │             │             │ • codex  │
-         │             │             │ • kimi   │
-    ┌────▼────┐  ┌─────▼─────┐      │   _cli   │
-    │  Tmux   │  │  SQLite   │      │ • gemini │
-    │ Sessions│  │  Database │      │   _cli   │
+    ┌────▼────┐  ┌─────▼─────┐      │          │
+    │  Tmux   │  │  SQLite   │      │          │
+    │ Sessions│  │  Database │      │          │
     └─────────┘  └───────────┘      └────┬─────┘
                                          │
                                    ┌─────▼──────┐
@@ -52,8 +51,6 @@
                                    │• Claude    │
                                    │  Code      │
                                    │• Codex CLI │
-                                   │• Kimi CLI  │
-                                   │• Gemini CLI│
                                    └────────────┘
 ```
 
@@ -63,6 +60,8 @@
 src/cli_agent_orchestrator/
 ├── cli/commands/          # Entry Point: CLI commands
 │   ├── launch.py          # Creates terminals with agent profiles (workspace trust confirmation, --yolo flag)
+│   ├── info.py            # Show session info (cao info)
+│   ├── mcp_server.py      # Start MCP server (cao mcp-server)
 │   └── init.py            # Initializes database
 ├── mcp_server/            # Entry Point: MCP server
 │   ├── server.py          # Handoff & send_message tools
@@ -83,9 +82,7 @@ src/cli_agent_orchestrator/
 │   ├── kiro_cli.py        # Kiro CLI provider (kiro_cli) - default
 │   ├── q_cli.py           # Amazon Q CLI provider (q_cli)
 │   ├── claude_code.py     # Claude Code provider (claude_code, ❯ prompt, trust prompt handling)
-│   ├── codex.py           # Codex/ChatGPT CLI provider (codex, developer_instructions, › prompt + • bullet detection, trust prompt handling)
-│   ├── kimi_cli.py        # Kimi CLI provider (kimi_cli, ✨/💫 prompt, • bullet response, thinking filter)
-│   └── gemini_cli.py      # Gemini CLI provider (gemini_cli, Ink TUI, ✦ response prefix, > query prefix, mark_input_received for post-init IDLE)
+│   └── codex.py           # Codex/ChatGPT CLI provider (codex, developer_instructions, › prompt + • bullet detection, trust prompt handling)
 ├── models/                # Data models
 │   ├── terminal.py        # Terminal, TerminalStatus
 │   ├── session.py         # Session model
@@ -102,20 +99,6 @@ src/cli_agent_orchestrator/
 │   ├── reviewer.md
 │   └── code_supervisor.md
 └── constants.py           # Application constants
-
-skills/                        # Single source of truth for AI coding agent skills
-├── README.md                  # Install instructions per tool
-├── build-cao-provider/        # Full lifecycle guide for building a new provider
-│   ├── SKILL.md
-│   ├── references/
-│   │   ├── implementation-checklist.md
-│   │   ├── lessons-learnt.md
-│   │   └── verification-checklist.md
-│   └── templates/ralph/
-└── skill-creator/             # Guide for creating new skills
-    ├── SKILL.md
-    ├── references/
-    └── scripts/
 ```
 
 ## Data Flow Examples

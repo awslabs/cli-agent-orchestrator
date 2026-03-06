@@ -260,7 +260,7 @@ test/e2e/
 ### Prerequisites
 
 - Running CAO server: `uv run cao-server`
-- Authenticated CLI tools: `codex`, `claude`, `kiro-cli`, `kimi`, `gemini`
+- Authenticated CLI tools: `codex`, `claude`, `kiro-cli`
 - tmux installed
 - Agent profiles installed: `analysis_supervisor`, `data_analyst`, `report_generator`
   ```bash
@@ -279,8 +279,6 @@ uv run pytest -m e2e test/e2e/ -v
 uv run pytest -m e2e test/e2e/ -v -k codex
 uv run pytest -m e2e test/e2e/ -v -k claude_code
 uv run pytest -m e2e test/e2e/ -v -k kiro_cli
-uv run pytest -m e2e test/e2e/ -v -k kimi_cli
-uv run pytest -m e2e test/e2e/ -v -k gemini_cli
 
 # Run a specific test type
 uv run pytest -m e2e test/e2e/test_handoff.py -v

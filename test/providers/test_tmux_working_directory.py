@@ -24,10 +24,12 @@ class TestTmuxClientWorkingDirectory:
     def test_resolve_defaults_to_cwd(self):
         """Test that None defaults to current working directory."""
         client = TmuxClient()
-        with patch("os.getcwd", return_value="/current/dir"):
-            with patch("os.path.isdir", return_value=True):
-                result = client._resolve_and_validate_working_directory(None)
-                assert result == os.path.realpath("/current/dir")
+        with patch("os.getcwd", return_value="/home/user/project"):
+            with patch("os.path.realpath", return_value="/home/user/project"):
+                with patch("os.path.isdir", return_value=True):
+                    with patch("os.path.expanduser", return_value="/home/user"):
+                        result = client._resolve_and_validate_working_directory(None)
+                        assert result == "/home/user/project"
 
     def test_resolve_symlinks(self, tmp_path):
         """Test that symlinks are resolved to real paths."""
@@ -39,15 +41,22 @@ class TestTmuxClientWorkingDirectory:
         link_dir = tmp_path / "link"
         link_dir.symlink_to(real_dir)
 
-        result = client._resolve_and_validate_working_directory(str(link_dir))
-        assert result == str(real_dir.resolve())
+        real_dir_resolved = str(real_dir.resolve())
+        # Mock expanduser so the tmp_path (outside ~) passes the home dir check
+        parent = str(tmp_path.resolve())
+        with patch("os.path.expanduser", return_value=parent):
+            result = client._resolve_and_validate_working_directory(str(link_dir))
+        assert result == real_dir_resolved
 
     def test_raises_for_nonexistent_directory(self):
-        """Test ValueError for non-existent directory."""
+        """Test ValueError for non-existent directory under home."""
         client = TmuxClient()
+        # Use a path under home so it passes the containment check but fails isdir
+        home = os.path.expanduser("~")
+        fake_path = os.path.join(home, "nonexistent_dir_abc123")
 
         with pytest.raises(ValueError, match="Working directory does not exist"):
-            client._resolve_and_validate_working_directory("/nonexistent/path")
+            client._resolve_and_validate_working_directory(fake_path)
 
     def test_get_pane_working_directory_success(self):
         """Test successful working directory retrieval."""
@@ -100,15 +109,16 @@ class TestTmuxClientWorkingDirectory:
 
         client = TmuxClient()
         with patch("os.path.isdir", return_value=True):
-            with patch("os.path.realpath", return_value="/test/dir"):
-                result = client.create_session(
-                    "test-session", "test-window", "terminal-1", "/test/dir"
-                )
+            with patch("os.path.realpath", return_value="/home/user/test/dir"):
+                with patch("os.path.expanduser", return_value="/home/user"):
+                    result = client.create_session(
+                        "test-session", "test-window", "terminal-1", "/home/user/test/dir"
+                    )
 
         assert result == "test-window"
         self.mock_server.new_session.assert_called_once()
         call_args = self.mock_server.new_session.call_args
-        assert call_args[1]["start_directory"] == "/test/dir"
+        assert call_args[1]["start_directory"] == "/home/user/test/dir"
 
     def test_create_session_defaults_working_directory(self):
         """Test create_session with None working_directory."""
@@ -120,17 +130,18 @@ class TestTmuxClientWorkingDirectory:
         self.mock_server.new_session.return_value = mock_session
 
         client = TmuxClient()
-        with patch("os.getcwd", return_value="/current/dir"):
+        with patch("os.getcwd", return_value="/home/user/project"):
             with patch("os.path.isdir", return_value=True):
-                with patch("os.path.realpath", return_value="/current/dir"):
-                    result = client.create_session(
-                        "test-session", "test-window", "terminal-1", None
-                    )
+                with patch("os.path.realpath", return_value="/home/user/project"):
+                    with patch("os.path.expanduser", return_value="/home/user"):
+                        result = client.create_session(
+                            "test-session", "test-window", "terminal-1", None
+                        )
 
         assert result == "test-window"
         self.mock_server.new_session.assert_called_once()
         call_args = self.mock_server.new_session.call_args
-        assert call_args[1]["start_directory"] == "/current/dir"
+        assert call_args[1]["start_directory"] == "/home/user/project"
 
     def test_create_window_with_working_directory(self):
         """Test create_window passes working_directory to tmux."""
@@ -143,15 +154,81 @@ class TestTmuxClientWorkingDirectory:
 
         client = TmuxClient()
         with patch("os.path.isdir", return_value=True):
-            with patch("os.path.realpath", return_value="/test/dir"):
-                result = client.create_window(
-                    "test-session", "test-window", "terminal-1", "/test/dir"
-                )
+            with patch("os.path.realpath", return_value="/home/user/test/dir"):
+                with patch("os.path.expanduser", return_value="/home/user"):
+                    result = client.create_window(
+                        "test-session", "test-window", "terminal-1", "/home/user/test/dir"
+                    )
 
         assert result == "test-window"
         mock_session.new_window.assert_called_once()
         call_args = mock_session.new_window.call_args
-        assert call_args[1]["start_directory"] == "/test/dir"
+        assert call_args[1]["start_directory"] == "/home/user/test/dir"
+
+    def test_resolve_home_directory_itself(self):
+        """Test that home directory itself is allowed."""
+        client = TmuxClient()
+        with patch("os.path.isdir", return_value=True):
+            with patch("os.path.realpath", return_value="/home/user"):
+                with patch("os.path.expanduser", return_value="/home/user"):
+                    result = client._resolve_and_validate_working_directory("/home/user")
+        assert result == "/home/user"
+
+    def test_raises_for_path_outside_home_directory(self):
+        """Test ValueError for path outside user's home directory."""
+        client = TmuxClient()
+        with patch("os.path.isdir", return_value=True):
+            with patch("os.path.expanduser", return_value="/home/user"):
+                with pytest.raises(ValueError, match="outside home directory"):
+                    client._resolve_and_validate_working_directory("/opt/some/dir")
+
+    def test_resolve_symlinked_home_directory(self, tmp_path):
+        """Test that a symlinked home directory works (AWS /local/home pattern).
+
+        On AWS environments, /home/user is often a symlink to /local/home/user.
+        A working directory under /local/home/user should be allowed when ~ resolves
+        to /home/user (which is a symlink to /local/home/user).
+        """
+        client = TmuxClient()
+
+        # Simulate AWS layout: /local/home/user is real, /home/user is a symlink
+        real_home = tmp_path / "local" / "home" / "user"
+        real_home.mkdir(parents=True)
+        symlink_home = tmp_path / "home" / "user"
+        symlink_home.parent.mkdir(parents=True)
+        symlink_home.symlink_to(real_home)
+
+        project_dir = real_home / "cli-agent-orchestrator"
+        project_dir.mkdir()
+
+        # expanduser returns the symlink path (like /home/user)
+        with patch("os.path.expanduser", return_value=str(symlink_home)):
+            result = client._resolve_and_validate_working_directory(str(project_dir))
+
+        # Should succeed — realpath resolves both to the same real tree
+        assert result == str(project_dir.resolve())
+
+    def test_resolve_symlinked_home_via_symlink_path(self, tmp_path):
+        """Test passing the symlink path when home is symlinked."""
+        client = TmuxClient()
+
+        real_home = tmp_path / "local" / "home" / "user"
+        real_home.mkdir(parents=True)
+        symlink_home = tmp_path / "home" / "user"
+        symlink_home.parent.mkdir(parents=True)
+        symlink_home.symlink_to(real_home)
+
+        project_dir = real_home / "project"
+        project_dir.mkdir()
+
+        # Pass the symlink-based path as working directory
+        symlink_project = symlink_home / "project"
+
+        with patch("os.path.expanduser", return_value=str(symlink_home)):
+            result = client._resolve_and_validate_working_directory(str(symlink_project))
+
+        # Both resolve to the real path
+        assert result == str(project_dir.resolve())
 
     def test_get_pane_working_directory_window_not_found(self):
         """Test returns None when window not found."""

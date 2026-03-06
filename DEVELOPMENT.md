@@ -7,7 +7,7 @@ This guide covers setting up your development environment and running tests for 
 - Python 3.10 or higher
 - [uv](https://docs.astral.sh/uv/) - Fast Python package installer and resolver
 - Git
-- tmux 3.3+ (for running the orchestrator and integration tests)
+- tmux 3.2+ (for running the orchestrator and integration tests)
 
 ## Getting Started
 
@@ -38,103 +38,64 @@ This command:
 uv run cao --help
 
 # Run a quick test to ensure everything is working
-uv run pytest test/providers/test_kiro_cli_unit.py -v -k "test_initialization"
+uv run pytest test/providers/test_q_cli_unit.py -v -k "test_initialization"
 ```
 
 ## Running Tests
 
 ### Unit Tests
 
-Unit tests use mocked dependencies and don't require CLI tools or servers:
+Unit tests are fast and use mocked dependencies:
 
 ```bash
-# Run all unit tests (626 tests, excludes E2E and Q CLI integration)
-uv run pytest test/ -v --ignore=test/e2e --ignore=test/providers/test_q_cli_integration.py
-
-# Run provider-specific tests
-uv run pytest test/providers/test_kiro_cli_unit.py -v
-uv run pytest test/providers/test_claude_code_unit.py -v
-uv run pytest test/providers/test_codex_provider_unit.py -v
-uv run pytest test/providers/test_q_cli_unit.py -v
-uv run pytest test/providers/test_kimi_cli_unit.py -v
-uv run pytest test/providers/test_gemini_cli_unit.py -v
-
-# Run other test modules
-uv run pytest test/clients/ -v
-uv run pytest test/services/ -v
-uv run pytest test/mcp_server/ -v
-uv run pytest test/cli/ -v
-uv run pytest test/models/ -v
-uv run pytest test/utils/ -v
+# Run all unit tests (excludes E2E and integration tests)
+uv run pytest test/ --ignore=test/e2e --ignore=test/providers/test_q_cli_integration.py -v
 
 # Run with coverage report
-uv run pytest test/ --cov=src --cov-report=term-missing -v \
-  --ignore=test/e2e --ignore=test/providers/test_q_cli_integration.py
+uv run pytest test/ --ignore=test/e2e --cov=src --cov-report=term-missing -v
+
+# Run specific test file
+uv run pytest test/providers/test_claude_code_unit.py -v
 
 # Run specific test class
 uv run pytest test/providers/test_codex_provider_unit.py::TestCodexBuildCommand -v
 ```
 
-### End-to-End Tests
+### Integration Tests
 
-E2E tests validate handoff, assign, and send_message flows against real CLI providers. They require a running CAO server and authenticated CLI tools:
-
-```bash
-# Start CAO server
-uv run cao-server
-
-# Install required agent profiles
-cao install examples/assign/data_analyst.md
-cao install examples/assign/report_generator.md
-
-# Run all E2E tests (all providers)
-uv run pytest -m e2e test/e2e/ -v
-
-# Run for a specific provider
-uv run pytest -m e2e test/e2e/ -v -k codex
-uv run pytest -m e2e test/e2e/ -v -k claude_code
-uv run pytest -m e2e test/e2e/ -v -k kiro_cli
-uv run pytest -m e2e test/e2e/ -v -k kimi_cli
-uv run pytest -m e2e test/e2e/ -v -k gemini_cli
-
-# Run a specific test type
-uv run pytest -m e2e test/e2e/test_handoff.py -v
-uv run pytest -m e2e test/e2e/test_assign.py -v
-uv run pytest -m e2e test/e2e/test_send_message.py -v
-uv run pytest -m e2e test/e2e/test_supervisor_orchestration.py -v -o "addopts="
-```
-
-**Requirements for E2E Tests:**
-- CAO server running (`uv run cao-server`)
-- tmux 3.3+ installed
-- At least one CLI tool installed and authenticated:
-  - **Codex CLI**: `npm install -g @openai/codex` + `OPENAI_API_KEY` set
-  - **Claude Code**: `npm install -g @anthropic-ai/claude-code` + `ANTHROPIC_API_KEY` set
-  - **Kiro CLI**: `npm install -g @anthropic-ai/kiro-cli` + AWS credentials configured
-  - **Kimi CLI**: `brew install kimi-cli` or `uv tool install kimi-cli` + `kimi login`
-  - **Gemini CLI**: `npm install -g @google/gemini-cli` + OAuth or `GEMINI_API_KEY`
-- Agent profiles installed: `analysis_supervisor`, `data_analyst`, `report_generator`
-
-E2E tests are excluded from default `pytest` runs via `-m 'not e2e'` in `pyproject.toml`.
-
-### Q CLI Integration Tests
-
-Q CLI integration tests require the Q CLI to be installed and authenticated:
+Integration tests require the provider CLI to be installed and authenticated:
 
 ```bash
 # Run Q CLI integration tests (requires Q CLI setup)
 uv run pytest test/providers/test_q_cli_integration.py -v
+
+# Skip integration tests
+uv run pytest test/providers/ -m "not integration" -v
+```
+
+### E2E Tests
+
+E2E tests require a running CAO server, authenticated CLI tools, and tmux:
+
+```bash
+# Run all E2E tests
+uv run pytest -m e2e test/e2e/ -v
+
+# Run E2E tests for a specific provider
+uv run pytest -m e2e test/e2e/ -v -k codex
 ```
 
 ### Run All Tests
 
 ```bash
-# Run all unit tests (excludes E2E and Q CLI integration)
-uv run pytest test/ -v --ignore=test/e2e --ignore=test/providers/test_q_cli_integration.py
+# Run all tests
+uv run pytest -v
 
-# Run tests with coverage
-uv run pytest test/ --cov=src --cov-report=term-missing -v \
-  --ignore=test/e2e --ignore=test/providers/test_q_cli_integration.py
+# Run tests with coverage for all modules
+uv run pytest --cov=src --cov-report=term-missing -v
+
+# Run tests in parallel (faster)
+uv run pytest -n auto
 ```
 
 ### Test Markers
@@ -142,11 +103,11 @@ uv run pytest test/ --cov=src --cov-report=term-missing -v \
 Tests are organized with pytest markers:
 
 ```bash
-# Run only E2E tests
-uv run pytest -m e2e test/e2e/ -v
+# Run only integration tests
+uv run pytest -m integration -v
 
-# Run only unit tests (exclude E2E)
-uv run pytest -m "not e2e" test/ -v
+# Skip slow tests
+uv run pytest -m "not slow" -v
 
 # Run only async tests
 uv run pytest -m asyncio -v
@@ -194,7 +155,7 @@ uv run mypy src/
 uv run black src/ test/
 uv run isort src/ test/
 uv run mypy src/
-uv run pytest test/ -v --ignore=test/e2e --ignore=test/providers/test_q_cli_integration.py
+uv run pytest -v
 ```
 
 ## Development Workflow
@@ -216,19 +177,18 @@ Add or update tests in `test/`
 ### 4. Run Tests Locally
 
 ```bash
-# Run unit tests
-uv run pytest test/ -v --ignore=test/e2e --ignore=test/providers/test_q_cli_integration.py
+# Run unit tests (fast, excludes E2E and integration)
+uv run pytest test/ --ignore=test/e2e --ignore=test/providers/test_q_cli_integration.py -v
 
-# Run E2E tests if you changed provider code
-uv run cao-server &
-uv run pytest -m e2e test/e2e/ -v -k <provider>
+# Run all tests with coverage
+uv run pytest test/ --ignore=test/e2e --cov=src --cov-report=term-missing -v
 ```
 
 ### 5. Check Code Quality
 
 ```bash
-uv run black --check src/ test/
-uv run isort --check-only src/ test/
+uv run black src/ test/
+uv run isort src/ test/
 uv run mypy src/
 ```
 
@@ -242,7 +202,111 @@ git push origin feature/your-feature-name
 
 ### 7. Create Pull Request
 
-Create a pull request on GitHub. CI/CD will automatically run unit tests and code quality checks.
+Create a pull request on GitHub. CI will automatically run tests and code quality checks.
+
+## CI/CD
+
+### Comprehensive Workflow (`ci.yml`)
+
+Runs on all pushes to `main` and all PRs targeting `main`:
+- **Unit tests**: Python 3.10, 3.11, 3.12 matrix with coverage
+- **Code quality**: black, isort, mypy
+- **Security scan**: Trivy vulnerability scanner (CRITICAL/HIGH)
+- **Dependency review**: License and vulnerability checks on PRs
+
+### Provider-Specific Workflows (path-triggered)
+
+Each provider has a dedicated workflow that runs only when its files change:
+
+| Workflow | Tests | Trigger Paths |
+|---|---|---|
+| `test-codex-provider.yml` | `test_codex_provider_unit.py` | `providers/codex.py`, `test/providers/**` |
+| `test-claude-code-provider.yml` | `test_claude_code_unit.py` | `providers/claude_code.py`, `test/providers/**` |
+| `test-kiro-cli-provider.yml` | `test_kiro_cli_unit.py` | `providers/kiro_cli.py`, `test/providers/**` |
+| `test-q-cli-provider.yml` | `test_q_cli_unit.py` | `providers/q_cli.py`, `test/providers/**` |
+
+Each includes unit tests (Python 3.10/3.11/3.12) and code quality checks (black, isort, mypy).
+
+## Working with the Q CLI Provider
+
+### Regenerate Test Fixtures
+
+If Q CLI output format changes:
+
+```bash
+uv run python test/providers/fixtures/generate_fixtures.py
+```
+
+### Test Against Real Q CLI
+
+```bash
+# Ensure Q CLI is available
+which q
+
+# Ensure Q CLI is authenticated
+q status
+
+# Run integration tests
+uv run pytest test/providers/test_q_cli_integration.py -v
+```
+
+## Troubleshooting
+
+### Import Errors
+
+If you encounter import errors when running tests:
+
+```bash
+# Re-sync dependencies
+uv sync
+
+# If that doesn't work, remove the virtual environment and start fresh
+rm -rf .venv
+uv sync
+```
+
+### Test Failures
+
+```bash
+# Run with verbose output
+uv run pytest -vv
+
+# Run a specific failing test
+uv run pytest test/path/to/test.py::test_name -vv
+
+# Show print statements
+uv run pytest -s
+```
+
+### Coverage Issues
+
+```bash
+# Generate detailed coverage report
+uv run pytest --cov=src --cov-report=html
+# Open htmlcov/index.html in your browser
+
+# Show missing lines
+uv run pytest --cov=src --cov-report=term-missing
+```
+
+## Adding New Dependencies
+
+### Runtime Dependencies
+
+```bash
+# Add a new runtime dependency
+uv add package-name
+
+# Add with version constraint
+uv add "package-name>=1.0.0"
+```
+
+### Development Dependencies
+
+```bash
+# Add a new development dependency
+uv add --dev package-name
+```
 
 ## Project Structure
 
@@ -255,41 +319,21 @@ cli-agent-orchestrator/
 │       ├── clients/                # Database and tmux clients
 │       ├── mcp_server/             # MCP server implementation
 │       ├── models/                 # Data models
-│       ├── providers/              # Agent providers (Kiro CLI, Claude Code, Codex, Kimi CLI, Gemini CLI, Q CLI)
+│       ├── providers/              # Agent providers (Q CLI, Claude Code)
 │       ├── services/               # Business logic services
-│       ├── agent_store/            # Built-in agent profiles (.md)
 │       └── utils/                  # Utility functions
-├── test/                           # Test suite
-│   ├── cli/                        # CLI command tests
-│   ├── clients/                    # Tmux and database client tests
-│   ├── e2e/                        # End-to-end tests (all providers)
-│   ├── mcp_server/                 # MCP server and handoff tests
-│   ├── models/                     # Data model tests
-│   ├── providers/                  # Provider unit tests
-│   │   ├── fixtures/               # Test fixtures
-│   │   ├── test_kiro_cli_unit.py
-│   │   ├── test_claude_code_unit.py
-│   │   ├── test_codex_provider_unit.py
-│   │   ├── test_kimi_cli_unit.py
-│   │   ├── test_gemini_cli_unit.py
-│   │   └── test_q_cli_unit.py
-│   ├── services/                   # Service layer tests
-│   └── utils/                      # Utility tests
+├── test/                           # Test suite (511 tests, 84% coverage)
+│   ├── api/                       # API endpoint tests
+│   ├── cli/                       # CLI command tests
+│   ├── clients/                   # Client tests (database, tmux)
+│   ├── e2e/                       # End-to-end tests (require running CAO server)
+│   ├── mcp_server/                # MCP server tests
+│   ├── models/                    # Data model tests
+│   ├── providers/                 # Provider tests (unit + integration)
+│   ├── services/                  # Service layer tests
+│   └── utils/                     # Utility tests
 ├── docs/                           # Documentation
-│   ├── api.md                      # API reference
-│   ├── agent-profile.md            # Agent profile format
-│   ├── codex-cli.md                # Codex provider docs
-│   ├── claude-code.md              # Claude Code provider docs
-│   ├── kiro-cli.md                 # Kiro CLI provider docs
-│   ├── kimi-cli.md                 # Kimi CLI provider docs
-│   └── gemini-cli.md               # Gemini CLI provider docs
 ├── examples/                       # Example workflows
-│   ├── assign/                     # Assign (async parallel) workflow
-│   ├── codex-basic/                # Basic Codex usage
-│   └── flow/                       # Scheduled flow examples
-├── skills/                        # AI coding agent skills (single source of truth)
-│   ├── build-cao-provider/        # Provider development lifecycle guide
-│   └── skill-creator/             # Skill creation guide
 ├── pyproject.toml                  # Project configuration
 └── uv.lock                         # Locked dependencies
 ```
@@ -298,8 +342,6 @@ cli-agent-orchestrator/
 
 - [Project README](README.md)
 - [Test Documentation](test/README.md)
-- [Provider Test Documentation](test/providers/README.md)
-- [API Documentation](docs/api.md)
 - [Contributing Guidelines](CONTRIBUTING.md)
 - [uv Documentation](https://docs.astral.sh/uv/)
 - [pytest Documentation](https://docs.pytest.org/)

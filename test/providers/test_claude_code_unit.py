@@ -197,6 +197,44 @@ class TestClaudeCodeProviderStatusDetection:
         assert status == TerminalStatus.PROCESSING
 
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_get_status_processing_minimal_spinner(self, mock_tmux):
+        """Test PROCESSING detection with minimal spinner format (no parenthesized text)."""
+        mock_tmux.get_history.return_value = "✻ Orbiting…"
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_get_status_processing_beats_stale_completed(self, mock_tmux):
+        """Test that PROCESSING is detected even when stale ⏺ and ❯ markers are in scrollback."""
+        mock_tmux.get_history.return_value = (
+            "⏺ Previous response from init\n"
+            "❯ user task message\n"
+            "⏺ Let me read the file\n"
+            "✻ Orbiting…"
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_get_status_idle_not_false_processing_from_status_bar(self, mock_tmux):
+        """Status bar '· latest:…' must not false-positive as PROCESSING."""
+        mock_tmux.get_history.return_value = (
+            "Claude Code v2.1.63\n"
+            "────────────────────\n"
+            "❯ \n"
+            "────────────────────\n"
+            "  current: 2.1.63 · latest:…"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
     def test_get_status_waiting_user_answer(self, mock_tmux):
         """Test WAITING_USER_ANSWER status detection."""
         mock_tmux.get_history.return_value = "❯ 1. Option one\n  2. Option two"

@@ -179,8 +179,6 @@ cao launch --agents analysis_supervisor
 # Or specify a different provider
 cao launch --agents analysis_supervisor --provider claude_code
 cao launch --agents analysis_supervisor --provider codex
-cao launch --agents analysis_supervisor --provider kimi_cli
-cao launch --agents analysis_supervisor --provider gemini_cli
 ```
 
 ## Usage
@@ -327,7 +325,7 @@ T=33s:  Present final report
 
 ## E2E Testing
 
-The `data_analyst` and `report_generator` profiles from this directory are used in the E2E test suite to validate assign and handoff flows across all providers (codex, claude_code, kiro_cli, kimi_cli, gemini_cli).
+The `data_analyst` and `report_generator` profiles from this directory are used in the E2E test suite to validate assign and handoff flows across all providers (codex, claude_code, kiro_cli).
 
 ```bash
 # Install profiles for E2E testing
