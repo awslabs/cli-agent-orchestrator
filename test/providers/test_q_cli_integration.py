@@ -2,8 +2,8 @@
 
 import json
 import shutil
-import subprocess
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -60,8 +60,6 @@ def ensure_test_agent(q_cli_available):
 @pytest.fixture
 def test_session_name():
     """Generate a unique test session name."""
-    import uuid
-
     return f"test-q-cli-{uuid.uuid4().hex[:8]}"
 
 
@@ -422,9 +420,6 @@ class TestQCliProviderWorkingDirectory:
     @pytest.fixture
     def home_tmp_path(self):
         """Create a temporary directory inside home directory to pass path validation."""
-        import shutil
-        import uuid
-
         path = Path.home() / f".cao_test_tmp_{uuid.uuid4().hex[:8]}"
         path.mkdir(parents=True, exist_ok=True)
         yield path
