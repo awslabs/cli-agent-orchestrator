@@ -3,7 +3,7 @@
 Converts AgentProfile fields to Claude Code CLI flags at runtime.
 Used by ClaudeCodeProvider._build_claude_command() to extend the
 base 'claude --agent <name>' command with additional flags like
---model, --allowedTools, --tools, and --settings (for hooks).
+--model, --allowedTools, --disallowedTools, --tools, and --settings (for hooks).
 """
 
 import json
@@ -26,6 +26,7 @@ class ClaudeAgentConfig(BaseModel):
     # Optional pass-through fields mapped to CLI flags
     model: Optional[str] = None
     allowedTools: Optional[List[str]] = None
+    disallowedTools: Optional[List[str]] = None
     tools: Optional[List[str]] = None
     mcpServers: Optional[Dict[str, Any]] = None
     hooks: Optional[Dict[str, Any]] = None
@@ -44,6 +45,9 @@ class ClaudeAgentConfig(BaseModel):
 
         if self.allowedTools:
             flags.extend(["--allowedTools"] + self.allowedTools)
+
+        if self.disallowedTools:
+            flags.extend(["--disallowedTools"] + self.disallowedTools)
 
         if self.tools:
             flags.extend(["--tools", ",".join(self.tools)])

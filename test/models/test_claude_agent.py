@@ -28,6 +28,7 @@ class TestClaudeAgentConfigConstruction:
             description="Full agent",
             model="claude-sonnet-4-6",
             allowedTools=["Read", "Edit", "Bash(git *)"],
+            disallowedTools=["Bash(git log *)", "Bash(git diff *)", "Edit"],
             tools=["Bash", "Edit", "Read"],
             mcpServers={"my-server": {"command": "my-cmd"}},
             hooks={
@@ -38,6 +39,7 @@ class TestClaudeAgentConfigConstruction:
         )
         assert config.model == "claude-sonnet-4-6"
         assert len(config.allowedTools) == 3
+        assert len(config.disallowedTools) == 3
         assert len(config.tools) == 3
         assert "my-server" in config.mcpServers
         assert "PreToolUse" in config.hooks
@@ -58,7 +60,7 @@ class TestToCliFlags:
         assert flags == ["--model", "sonnet"]
 
     def test_allowed_tools_flag(self):
-        """Test --allowedTools flag generation with space-separated list."""
+        """Test --allowedTools flag generates space-separated list (each tool is a separate arg)."""
         config = ClaudeAgentConfig(
             name="test",
             description="Test",
@@ -66,6 +68,16 @@ class TestToCliFlags:
         )
         flags = config.to_cli_flags()
         assert flags == ["--allowedTools", "Read", "Edit", "Bash(git *)"]
+
+    def test_disallowed_tools_flag(self):
+        """Test --disallowedTools flag generates space-separated list (each tool is a separate arg)."""
+        config = ClaudeAgentConfig(
+            name="test",
+            description="Test",
+            disallowedTools=["Bash(git log *)", "Bash(git diff *)", "Edit"],
+        )
+        flags = config.to_cli_flags()
+        assert flags == ["--disallowedTools", "Bash(git log *)", "Bash(git diff *)", "Edit"]
 
     def test_tools_flag(self):
         """Test --tools flag generation with comma-separated list."""
@@ -153,6 +165,7 @@ class TestToCliFlags:
             description="Test",
             model="opus",
             allowedTools=["Read"],
+            disallowedTools=["Edit"],
             tools=["Bash", "Read"],
             hooks={"PostToolUse": []},
             mcpServers={"s1": {"command": "cmd"}},
@@ -162,27 +175,31 @@ class TestToCliFlags:
         assert "opus" in flags
         assert "--allowedTools" in flags
         assert "Read" in flags
+        assert "--disallowedTools" in flags
+        assert "Edit" in flags
         assert "--tools" in flags
         assert "Bash,Read" in flags
         assert "--settings" in flags
         assert "--mcp-config" in flags
 
     def test_flag_ordering(self):
-        """Test that flags are generated in consistent order: model, allowedTools, tools, settings."""
+        """Test flag order: model, allowedTools, disallowedTools, tools, settings."""
         config = ClaudeAgentConfig(
             name="test",
             description="Test",
             model="haiku",
             allowedTools=["Read"],
+            disallowedTools=["Edit"],
             tools=["Bash"],
             hooks={"PreToolUse": []},
         )
         flags = config.to_cli_flags()
         model_idx = flags.index("--model")
         allowed_idx = flags.index("--allowedTools")
+        disallowed_idx = flags.index("--disallowedTools")
         tools_idx = flags.index("--tools")
         settings_idx = flags.index("--settings")
-        assert model_idx < allowed_idx < tools_idx < settings_idx
+        assert model_idx < allowed_idx < disallowed_idx < tools_idx < settings_idx
 
 
 class TestJsonSerialization:
@@ -194,6 +211,7 @@ class TestJsonSerialization:
         data = json.loads(config.model_dump_json(exclude_none=True))
         assert "model" in data
         assert "allowedTools" not in data
+        assert "disallowedTools" not in data
         assert "tools" not in data
         assert "hooks" not in data
         assert "mcpServers" not in data

@@ -86,6 +86,7 @@ class ClaudeCodeProvider(BaseProvider):
                 description=profile.description,
                 model=profile.model,
                 allowedTools=profile.allowedTools,
+                disallowedTools=profile.disallowedTools,
                 tools=profile.tools,
                 mcpServers=profile.mcpServers,
                 hooks=profile.hooks,

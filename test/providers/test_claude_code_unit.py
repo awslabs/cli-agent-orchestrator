@@ -16,6 +16,7 @@ def _make_profile(
     model=None,
     tools=None,
     allowedTools=None,
+    disallowedTools=None,
     mcpServers=None,
     hooks=None,
 ):
@@ -27,6 +28,7 @@ def _make_profile(
     profile.model = model
     profile.tools = tools
     profile.allowedTools = allowedTools
+    profile.disallowedTools = disallowedTools
     profile.mcpServers = mcpServers
     profile.hooks = hooks
     return profile
@@ -650,18 +652,47 @@ class TestBuildClaudeCommandCliFlags:
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     def test_allowed_tools_flag_in_command(self, mock_load):
-        """Test that --allowedTools flag is added when profile has allowedTools set."""
+        """Test --allowedTools is passed as space-separated args (not comma-joined)."""
+        import shlex as _shlex
+
         mock_load.return_value = _make_profile(
             name="allowed-agent",
             description="Allowed agent",
             system_prompt="Be an allowed agent",
-            allowedTools=["Read", "Bash(git *)"],
+            allowedTools=["Read", "Bash(git log *)", "Bash(git diff *)"],
         )
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0", "allowed-agent")
         command = provider._build_claude_command()
+        parts = _shlex.split(command)
 
-        assert "--allowedTools" in command
+        allowed_idx = parts.index("--allowedTools")
+        # Each tool must be a separate element, not comma-joined
+        assert parts[allowed_idx + 1] == "Read"
+        assert parts[allowed_idx + 2] == "Bash(git log *)"
+        assert parts[allowed_idx + 3] == "Bash(git diff *)"
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_disallowed_tools_flag_in_command(self, mock_load):
+        """Test --disallowedTools is passed as space-separated args (not comma-joined)."""
+        import shlex as _shlex
+
+        mock_load.return_value = _make_profile(
+            name="disallowed-agent",
+            description="Disallowed agent",
+            system_prompt="Be a disallowed agent",
+            disallowedTools=["Bash(git log *)", "Bash(git diff *)", "Edit"],
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0", "disallowed-agent")
+        command = provider._build_claude_command()
+        parts = _shlex.split(command)
+
+        disallowed_idx = parts.index("--disallowedTools")
+        # Each tool must be a separate element, not comma-joined
+        assert parts[disallowed_idx + 1] == "Bash(git log *)"
+        assert parts[disallowed_idx + 2] == "Bash(git diff *)"
+        assert parts[disallowed_idx + 3] == "Edit"
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     def test_hooks_via_settings_flag(self, mock_load):
@@ -699,6 +730,7 @@ class TestBuildClaudeCommandCliFlags:
             model="opus",
             mcpServers={"srv": {"command": "srv-cmd"}},
             allowedTools=["Read"],
+            disallowedTools=["Edit"],
             tools=["Bash"],
             hooks={"PostToolUse": []},
         )
@@ -711,6 +743,7 @@ class TestBuildClaudeCommandCliFlags:
         assert "--model" in command
         assert "--tools" in command
         assert "--allowedTools" in command
+        assert "--disallowedTools" in command
         assert "--settings" in command
         assert "--mcp-config" in command
 
