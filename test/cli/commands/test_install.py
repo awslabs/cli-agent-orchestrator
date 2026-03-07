@@ -280,3 +280,30 @@ class TestInstallCommand:
             result = runner.invoke(install, ["test-agent", "--provider", "kiro_cli"])
 
             mock_load.assert_called_once_with("test-agent")
+
+    @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
+    @patch("cli_agent_orchestrator.cli.commands.install.AGENT_CONTEXT_DIR")
+    @patch("cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR")
+    def test_install_without_provider_specific_config(
+        self, mock_local_store, mock_context_dir, mock_load, runner, mock_agent_profile
+    ):
+        """Test installing agent for claude_code provider (no agent file created)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+
+            local_path = tmppath / "local"
+            local_path.mkdir(parents=True, exist_ok=True)
+            local_profile = local_path / "test-agent.md"
+            local_profile.write_text("# Test\nname: test-agent")
+
+            mock_local_store.__truediv__ = lambda self, x: local_path / x
+            mock_context_dir.__truediv__ = lambda self, x: tmppath / "context" / x
+            mock_context_dir.mkdir = MagicMock()
+
+            mock_load.return_value = mock_agent_profile
+
+            (tmppath / "context").mkdir(parents=True, exist_ok=True)
+
+            result = runner.invoke(install, ["test-agent", "--provider", "claude_code"])
+
+            assert "installed successfully" in result.output
