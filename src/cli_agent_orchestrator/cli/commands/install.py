@@ -4,12 +4,10 @@ from importlib import resources
 from pathlib import Path
 
 import click
-import frontmatter
 import requests
 
 from cli_agent_orchestrator.constants import (
     AGENT_CONTEXT_DIR,
-    CLAUDE_AGENTS_DIR,
     DEFAULT_PROVIDER,
     KIRO_AGENTS_DIR,
     LOCAL_AGENT_STORE_DIR,
@@ -103,10 +101,13 @@ def install(agent_source: str, provider: str):
             agent_store = resources.files("cli_agent_orchestrator.agent_store")
             source_file = agent_store / f"{agent_name}.md"
 
+        # Read source file once — reused for context copy and Claude Code install
+        with open(source_file, "r") as src:
+            source_content = src.read()
+
         # Copy markdown file to agent-context directory
         dest_file = AGENT_CONTEXT_DIR / f"{profile.name}.md"
-        with open(source_file, "r") as src:
-            dest_file.write_text(src.read())
+        dest_file.write_text(source_content)
 
         # Build allowedTools default if not specified
         allowed_tools = profile.allowedTools
@@ -158,22 +159,6 @@ def install(agent_source: str, provider: str):
             agent_file = KIRO_AGENTS_DIR / f"{safe_filename}.json"
             with open(agent_file, "w") as f:
                 f.write(agent_config.model_dump_json(indent=2, exclude_none=True))
-
-        elif provider == ProviderType.CLAUDE_CODE.value:
-            CLAUDE_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
-
-            # Read raw frontmatter from source file and copy it wholesale,
-            # overriding permissionMode to bypassPermissions.
-            raw = frontmatter.loads(source_file.read_text())
-            raw.metadata["permissionMode"] = "bypassPermissions"
-
-            # Use frontmatter.dumps() for safe round-tripping
-            full_content = frontmatter.dumps(raw)
-
-            safe_filename = profile.name.replace("/", "__")
-            agent_file = CLAUDE_AGENTS_DIR / f"{safe_filename}.md"
-            with open(agent_file, "w") as f:
-                f.write(full_content)
 
         click.echo(f"✓ Agent '{profile.name}' installed successfully")
         click.echo(f"✓ Context file: {dest_file}")
