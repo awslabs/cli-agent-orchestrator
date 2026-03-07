@@ -28,6 +28,7 @@ class AgentProfile(BaseModel):
     tools: Optional[List[str]] = Field(default=None)
     toolAliases: Optional[Dict[str, str]] = None
     allowedTools: Optional[List[str]] = None
+    disallowedTools: Optional[List[str]] = None
     toolsSettings: Optional[Dict[str, Any]] = None
     resources: Optional[List[str]] = None
     hooks: Optional[Dict[str, Any]] = None

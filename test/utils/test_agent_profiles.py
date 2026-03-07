@@ -95,13 +95,46 @@ class TestLoadAgentProfile:
             load_agent_profile("nonexistent")
 
     @patch("cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR")
+    @patch("cli_agent_orchestrator.utils.agent_profiles.frontmatter")
+    def test_load_agent_profile_tools_fields_are_lists(self, mock_frontmatter, mock_local_dir):
+        """Test that tools, allowedTools, and disallowedTools frontmatter fields parse as lists."""
+        mock_local_path = MagicMock(spec=Path)
+        mock_local_path.exists.return_value = True
+        mock_local_path.read_text.return_value = (
+            "---\nname: tool-agent\ndescription: Tool agent\n"
+            "tools:\n  - Bash\n  - Edit\n"
+            "allowedTools:\n  - Read\n  - Bash(git log *)\n"
+            "disallowedTools:\n  - Bash(git push *)\n  - Edit\n"
+            "---\nSystem prompt"
+        )
+        mock_local_dir.__truediv__.return_value = mock_local_path
+
+        mock_parsed = MagicMock()
+        mock_parsed.metadata = {
+            "name": "tool-agent",
+            "description": "Tool agent",
+            "tools": ["Bash", "Edit"],
+            "allowedTools": ["Read", "Bash(git log *)"],
+            "disallowedTools": ["Bash(git push *)", "Edit"],
+        }
+        mock_parsed.content = "System prompt"
+        mock_frontmatter.loads.return_value = mock_parsed
+
+        result = load_agent_profile("tool-agent")
+
+        assert isinstance(result.tools, list)
+        assert result.tools == ["Bash", "Edit"]
+        assert isinstance(result.allowedTools, list)
+        assert result.allowedTools == ["Read", "Bash(git log *)"]
+        assert isinstance(result.disallowedTools, list)
+        assert result.disallowedTools == ["Bash(git push *)", "Edit"]
+
+    @patch("cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR")
     def test_load_agent_profile_exception_handling(self, mock_local_dir):
         """Test exception handling in load_agent_profile."""
-        # Setup mock to raise exception
         mock_local_path = MagicMock(spec=Path)
         mock_local_path.exists.side_effect = Exception("File system error")
         mock_local_dir.__truediv__.return_value = mock_local_path
 
-        # Execute and verify
         with pytest.raises(RuntimeError, match="Failed to load agent profile"):
             load_agent_profile("test-agent")
