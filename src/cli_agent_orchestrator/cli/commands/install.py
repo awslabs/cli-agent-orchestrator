@@ -101,12 +101,10 @@ def install(agent_source: str, provider: str):
             agent_store = resources.files("cli_agent_orchestrator.agent_store")
             source_file = agent_store / f"{agent_name}.md"
 
-            source_content = src.read()
-
         # Copy markdown file to agent-context directory
         dest_file = AGENT_CONTEXT_DIR / f"{profile.name}.md"
         with open(source_file, "r") as src:
-            dest_file.write_text(source_content)
+            dest_file.write_text(src.read())
 
         # Build allowedTools default if not specified
         allowed_tools = profile.allowedTools
