@@ -4,7 +4,7 @@ import logging
 import re
 import shlex
 import time
-from typing import Any, Dict, Optional
+from typing import Optional
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.models.claude_agent import ClaudeAgentConfig
@@ -40,33 +40,6 @@ TRUST_PROMPT_PATTERN = r"Yes, I trust this folder"  # Workspace trust dialog
 IDLE_PROMPT_PATTERN_LOG = r"[>❯][\s\xa0]"  # Same pattern for log files
 
 
-def _load_claude_agent_profile(agent_name: str) -> Optional[Dict[str, Any]]:
-    """Resolve an agent profile from the CAO agent store.
-
-    Args:
-        agent_name: Name of the agent to find (without .md extension)
-
-    Returns:
-        Dict with 'name', 'description', and optional config keys
-        (mcpServers, model, tools, allowedTools, hooks, system_prompt),
-        or None if not found.
-    """
-    try:
-        profile = load_agent_profile(agent_name)
-        return {
-            "name": profile.name,
-            "description": profile.description,
-            "system_prompt": profile.system_prompt,
-            "model": profile.model,
-            "tools": profile.tools,
-            "allowedTools": profile.allowedTools,
-            "mcpServers": profile.mcpServers,
-            "hooks": profile.hooks,
-        }
-    except (FileNotFoundError, ValueError, RuntimeError):
-        return None
-
-
 class ClaudeCodeProvider(BaseProvider):
     """Provider for Claude Code CLI tool integration."""
 
@@ -95,26 +68,27 @@ class ClaudeCodeProvider(BaseProvider):
         command_parts = ["claude", "--dangerously-skip-permissions"]
 
         if self._agent_profile is not None:
-            resolved = _load_claude_agent_profile(self._agent_profile)
-            if resolved is None:
+            try:
+                profile = load_agent_profile(self._agent_profile)
+            except RuntimeError:
                 raise ProviderError(
                     f"Agent profile '{self._agent_profile}' not found in CAO agent store"
                 )
 
-            system_prompt = resolved.get("system_prompt") or ""
+            system_prompt = profile.system_prompt or ""
             if system_prompt:
                 escaped = system_prompt.replace("\\", "\\\\").replace("\n", "\\n")
                 command_parts.extend(["--append-system-prompt", escaped])
 
             # Build CLI flags from resolved profile (model, tools, hooks, MCP, etc.)
             config = ClaudeAgentConfig(
-                name=resolved["name"],
-                description=resolved.get("description", ""),
-                model=resolved.get("model"),
-                allowedTools=resolved.get("allowedTools"),
-                tools=resolved.get("tools"),
-                mcpServers=resolved.get("mcpServers"),
-                hooks=resolved.get("hooks"),
+                name=profile.name,
+                description=profile.description,
+                model=profile.model,
+                allowedTools=profile.allowedTools,
+                tools=profile.tools,
+                mcpServers=profile.mcpServers,
+                hooks=profile.hooks,
             )
             command_parts.extend(config.to_cli_flags(terminal_id=self.terminal_id))
 
