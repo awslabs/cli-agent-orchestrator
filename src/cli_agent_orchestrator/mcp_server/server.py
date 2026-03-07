@@ -20,6 +20,9 @@ logger = logging.getLogger(__name__)
 # Environment variable to enable/disable working_directory parameter
 ENABLE_WORKING_DIRECTORY = os.getenv("CAO_ENABLE_WORKING_DIRECTORY", "false").lower() == "true"
 
+# Environment variable to enable/disable automatic sender terminal ID injection
+ENABLE_SENDER_ID_INJECTION = os.getenv("CAO_ENABLE_SENDER_ID_INJECTION", "false").lower() == "true"
+
 # Create MCP server
 mcp = FastMCP(
     "cao-mcp-server",
@@ -365,6 +368,14 @@ def _assign_impl(
         # Create terminal
         terminal_id, _ = _create_terminal(agent_profile, working_directory)
 
+        # Auto-inject sender terminal ID suffix when enabled
+        if ENABLE_SENDER_ID_INJECTION:
+            sender_id = os.environ.get("CAO_TERMINAL_ID", "unknown")
+            message += (
+                f"\n\n[Assigned by terminal {sender_id}. "
+                f"When done, send results back to terminal {sender_id} using send_message]"
+            )
+
         # Send message immediately
         _send_direct_input(terminal_id, message)
 
@@ -378,70 +389,100 @@ def _assign_impl(
         return {"success": False, "terminal_id": None, "message": f"Assignment failed: {str(e)}"}
 
 
-# Conditional tool registration for assign
+def _build_assign_description(enable_sender_id: bool, enable_workdir: bool) -> str:
+    """Build the assign tool description based on feature flags."""
+    # Build tool description overview.
+    if enable_sender_id:
+        desc = """\
+Assigns a task to another agent without blocking.
+
+The sender's terminal ID and callback instructions will automatically be appended to the message."""
+    else:
+        desc = """\
+Assigns a task to another agent without blocking.
+
+In the message to the worker agent include instruction to send results back via send_message tool.
+**IMPORTANT**: The terminal id of each agent is available in environment variable CAO_TERMINAL_ID.
+When assigning, first find out your own CAO_TERMINAL_ID value, then include the terminal_id value in the message to the worker agent to allow callback.
+Example message: "Analyze the logs. When done, send results back to terminal ee3f93b3 using send_message tool.\""""
+
+    if enable_workdir:
+        desc += """
+
+## Working Directory
+
+- By default, agents start in the supervisor's current working directory
+- You can specify a custom directory via working_directory parameter
+- Directory must exist and be accessible"""
+
+    desc += """
+
+Args:
+    agent_profile: Agent profile for the worker terminal
+    message: Task message (include callback instructions)"""
+
+    if enable_workdir:
+        desc += """
+    working_directory: Optional working directory where the agent should execute"""
+
+    desc += """
+
+Returns:
+    Dict with success status, worker terminal_id, and message"""
+
+    return desc
+
+
+_assign_description = _build_assign_description(
+    ENABLE_SENDER_ID_INJECTION, ENABLE_WORKING_DIRECTORY
+)
+_assign_message_field_desc = (
+    "The task message to send to the worker agent."
+    if ENABLE_SENDER_ID_INJECTION
+    else "The task message to send. Include callback instructions for the worker to send results back."
+)
+
 if ENABLE_WORKING_DIRECTORY:
 
-    @mcp.tool()
+    @mcp.tool(description=_assign_description)
     async def assign(
         agent_profile: str = Field(
             description='The agent profile for the worker agent (e.g., "developer", "analyst")'
         ),
-        message: str = Field(
-            description="The task message to send. Include callback instructions for the worker to send results back."
-        ),
+        message: str = Field(description=_assign_message_field_desc),
         working_directory: Optional[str] = Field(
             default=None, description="Optional working directory where the agent should execute"
         ),
     ) -> Dict[str, Any]:
-        """Assigns a task to another agent without blocking.
-
-        In the message to the worker agent include instruction to send results back via send_message tool.
-        **IMPORTANT**: The terminal id of each agent is available in environment variable CAO_TERMINAL_ID.
-        When assigning, first find out your own CAO_TERMINAL_ID value, then include the terminal_id value in the message to the worker agent to allow callback.
-        Example message: "Analyze the logs. When done, send results back to terminal ee3f93b3 using send_message tool."
-
-        ## Working Directory
-
-        - By default, agents start in the supervisor's current working directory
-        - You can specify a custom directory via working_directory parameter
-        - Directory must exist and be accessible
-
-        Args:
-            agent_profile: Agent profile for the worker terminal
-            message: Task message (include callback instructions)
-            working_directory: Optional directory path where agent should execute
-
-        Returns:
-            Dict with success status, worker terminal_id, and message
-        """
         return _assign_impl(agent_profile, message, working_directory)
 
 else:
 
-    @mcp.tool()
+    @mcp.tool(description=_assign_description)
     async def assign(
         agent_profile: str = Field(
             description='The agent profile for the worker agent (e.g., "developer", "analyst")'
         ),
-        message: str = Field(
-            description="The task message to send. Include callback instructions for the worker to send results back."
-        ),
+        message: str = Field(description=_assign_message_field_desc),
     ) -> Dict[str, Any]:
-        """Assigns a task to another agent without blocking.
-
-        In the message to the worker agent include instruction to send results back via send_message tool.
-        **IMPORTANT**: The terminal id of each agent is available in environment variable CAO_TERMINAL_ID.
-        When assigning, first find out your own CAO_TERMINAL_ID value, then include the terminal_id value in the message to the worker agent to allow callback.
-        Example message: "Analyze the logs. When done, send results back to terminal ee3f93b3 using send_message tool."
-
-        Args:
-            agent_profile: Agent profile for the worker terminal
-            message: Task message (include callback instructions)
-
-        Returns:
-            Dict with success status, worker terminal_id, and message
-        """
         return _assign_impl(agent_profile, message, None)
+
+
+# Implementation function for send_message
+def _send_message_impl(receiver_id: str, message: str) -> Dict[str, Any]:
+    """Implementation of send_message logic."""
+    try:
+        # Auto-inject sender terminal ID suffix when enabled
+        if ENABLE_SENDER_ID_INJECTION:
+            sender_id = os.environ.get("CAO_TERMINAL_ID", "unknown")
+            message += (
+                f"\n\n[Message from terminal {sender_id}. "
+                "Use send_message MCP tool for any follow-up work.]"
+            )
+
+        return _send_to_inbox(receiver_id, message)
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 @mcp.tool()
@@ -461,10 +502,7 @@ async def send_message(
     Returns:
         Dict with success status and message details
     """
-    try:
-        return _send_to_inbox(receiver_id, message)
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    return _send_message_impl(receiver_id, message)
 
 
 def main():
