@@ -145,28 +145,50 @@ def create_terminal(
         return terminal
 
     except Exception as e:
-        # Cleanup on failure: clean up provider resources and kill session
+        # Cleanup on failure: clean up all created resources
         logger.error(f"Failed to create terminal: {e}")
-        try:
-            provider_manager.cleanup_provider(terminal_id)
-        except Exception:
-            pass  # Ignore cleanup errors
-        if new_session and session_name:
+
+        # For new sessions, kill the entire session
+        if new_session and "session_name" in locals():
             try:
                 tmux_client.kill_session(session_name)
-            except:
-                pass  # Ignore cleanup errors
+                logger.debug(f"Killed session {session_name} during cleanup")
+            except Exception as cleanup_err:
+                logger.warning(f"Failed to kill session during cleanup: {cleanup_err}")
+
+        # For existing sessions or if session kill failed, use delete_terminal
+        # to clean up the window and all associated resources
+        try:
+            delete_terminal(terminal_id)
+            logger.debug(f"Cleaned up terminal {terminal_id} via delete_terminal")
+        except Exception as cleanup_err:
+            logger.warning(f"Failed to cleanup terminal during create failure: {cleanup_err}")
+
         raise
 
 
 def get_terminal(terminal_id: str) -> Dict:
-    """Get terminal data."""
+    """Get terminal data.
+
+    Automatically cleans up database record if tmux window no longer exists.
+
+    Raises:
+        ValueError: If terminal not found or tmux window no longer exists
+    """
     try:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        # Get status from provider
+        # Check if tmux window still exists
+        if not tmux_client.window_exists(metadata["tmux_session"], metadata["tmux_window"]):
+            logger.info(f"Cleaning up terminal {terminal_id} - tmux window no longer exists")
+            from cli_agent_orchestrator.clients.database import delete_terminal
+
+            delete_terminal(terminal_id)
+            raise ValueError(f"Terminal '{terminal_id}' no longer exists (tmux window closed)")
+
+        # Get status from provider (which checks database first for hook-based status)
         provider = provider_manager.get_provider(terminal_id)
         if provider is None:
             raise ValueError(f"Provider not found for terminal {terminal_id}")
@@ -307,21 +329,46 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
 
 
 def delete_terminal(terminal_id: str) -> bool:
-    """Delete terminal."""
+    """Delete terminal and clean up all associated resources including the tmux window."""
     try:
         # Get metadata before deletion
         metadata = get_terminal_metadata(terminal_id)
+        if not metadata:
+            logger.warning(f"Terminal {terminal_id} not found in database")
+            return False
 
-        # Stop pipe-pane
-        if metadata:
-            try:
-                tmux_client.stop_pipe_pane(metadata["tmux_session"], metadata["tmux_window"])
-            except Exception as e:
-                logger.warning(f"Failed to stop pipe-pane for {terminal_id}: {e}")
+        # 1. Stop pipe-pane
+        try:
+            tmux_client.stop_pipe_pane(metadata["tmux_session"], metadata["tmux_window"])
+            logger.debug(f"Stopped pipe-pane for {terminal_id}")
+        except Exception as e:
+            logger.warning(f"Failed to stop pipe-pane for {terminal_id}: {e}")
 
-        # Existing cleanup
-        provider_manager.cleanup_provider(terminal_id)
+        # 2. Cleanup provider (removes from manager)
+        try:
+            provider_manager.cleanup_provider(terminal_id)
+            logger.debug(f"Cleaned up provider for {terminal_id}")
+        except Exception as e:
+            logger.warning(f"Failed to cleanup provider for {terminal_id}: {e}")
+
+        # 3. Kill the tmux window
+        try:
+            tmux_client.kill_window(metadata["tmux_session"], metadata["tmux_window"])
+            logger.debug(f"Killed tmux window for {terminal_id}")
+        except Exception as e:
+            logger.warning(f"Failed to kill tmux window for {terminal_id}: {e}")
+
+        # 4. Delete database record
         deleted = db_delete_terminal(terminal_id)
+
+        # 5. Delete log file
+        log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
+        try:
+            log_path.unlink(missing_ok=True)
+            logger.debug(f"Deleted log file for {terminal_id}")
+        except Exception as e:
+            logger.warning(f"Failed to delete log file for {terminal_id}: {e}")
+
         logger.info(f"Deleted terminal: {terminal_id}")
         return deleted
 

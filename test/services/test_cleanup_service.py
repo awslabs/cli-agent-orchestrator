@@ -37,18 +37,20 @@ class TestCleanupOldData:
         assert mock_db.query.called
         assert mock_db.commit.called
 
-    @patch("cli_agent_orchestrator.services.cleanup_service.SessionLocal")
-    @patch("cli_agent_orchestrator.services.cleanup_service.TERMINAL_LOG_DIR")
-    @patch("cli_agent_orchestrator.services.cleanup_service.LOG_DIR")
     @patch("cli_agent_orchestrator.services.cleanup_service.RETENTION_DAYS", 7)
+    @patch("cli_agent_orchestrator.services.cleanup_service.LOG_DIR")
+    @patch("cli_agent_orchestrator.services.cleanup_service.TERMINAL_LOG_DIR")
+    @patch("cli_agent_orchestrator.services.cleanup_service.SessionLocal")
+    @patch("cli_agent_orchestrator.clients.tmux.tmux_client")
     def test_cleanup_old_data_deletes_old_inbox_messages(
-        self, mock_log_dir, mock_terminal_log_dir, mock_session_local
+        self, mock_tmux, mock_session_local, mock_terminal_log_dir, mock_log_dir
     ):
         """Test that cleanup deletes old inbox messages from database."""
         # Setup mock database session
         mock_db = MagicMock()
         mock_session_local.return_value.__enter__.return_value = mock_db
         mock_db.query.return_value.filter.return_value.delete.return_value = 10
+        mock_db.query.return_value.all.return_value = []  # No terminals for orphan check
 
         # Setup mock directories (non-existent)
         mock_log_dir.exists.return_value = False
@@ -57,8 +59,8 @@ class TestCleanupOldData:
         # Execute
         cleanup_old_data()
 
-        # Verify inbox cleanup was called (query called twice - once for terminals, once for inbox)
-        assert mock_db.query.call_count == 2
+        # Verify cleanup was called (3 queries: old terminals, all terminals for orphan check, old inbox)
+        assert mock_db.query.call_count == 3
         assert mock_db.commit.call_count == 2
 
     @patch("cli_agent_orchestrator.services.cleanup_service.SessionLocal")
