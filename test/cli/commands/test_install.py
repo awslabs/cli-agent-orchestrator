@@ -4,6 +4,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import frontmatter
 import pytest
 from click.testing import CliRunner
 
@@ -97,6 +98,7 @@ class TestInstallCommand:
         profile.tools = ["*"]
         profile.allowedTools = None
         profile.mcpServers = None
+        profile.system_prompt = "Test system prompt"
         profile.prompt = "Test prompt"
         profile.toolAliases = None
         profile.toolsSettings = None
@@ -307,3 +309,92 @@ class TestInstallCommand:
             result = runner.invoke(install, ["test-agent", "--provider", "claude_code"])
 
             assert "installed successfully" in result.output
+
+    @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
+    @patch("cli_agent_orchestrator.cli.commands.install.AGENT_CONTEXT_DIR")
+    @patch("cli_agent_orchestrator.cli.commands.install.COPILOT_AGENTS_DIR")
+    @patch("cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR")
+    def test_install_copilot_cli_provider(
+        self,
+        mock_local_store,
+        mock_copilot_dir,
+        mock_context_dir,
+        mock_load,
+        runner,
+        mock_agent_profile,
+    ):
+        """Test installing agent for copilot_cli provider."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+
+            local_path = tmppath / "local"
+            local_path.mkdir(parents=True, exist_ok=True)
+            local_profile = local_path / "test-agent.md"
+            local_profile.write_text("# Test\nname: test-agent")
+
+            context_path = tmppath / "context"
+            context_path.mkdir(parents=True, exist_ok=True)
+            copilot_path = tmppath / "copilot"
+            copilot_path.mkdir(parents=True, exist_ok=True)
+
+            mock_local_store.__truediv__ = lambda self, x: local_path / x
+            mock_context_dir.__truediv__ = lambda self, x: context_path / x
+            mock_context_dir.mkdir = MagicMock()
+            mock_copilot_dir.__truediv__ = lambda self, x: copilot_path / x
+            mock_copilot_dir.mkdir = MagicMock()
+            mock_load.return_value = mock_agent_profile
+
+            result = runner.invoke(install, ["test-agent", "--provider", "copilot_cli"])
+
+            assert result.exit_code == 0
+            assert "installed successfully" in result.output
+            assert "copilot_cli agent:" in result.output
+
+            agent_file = copilot_path / "test-agent.agent.md"
+            assert agent_file.exists()
+            post = frontmatter.loads(agent_file.read_text())
+            assert post.metadata["name"] == "test-agent"
+            assert post.metadata["description"] == "Test agent description"
+            assert "Test system prompt" in post.content
+
+    @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
+    @patch("cli_agent_orchestrator.cli.commands.install.AGENT_CONTEXT_DIR")
+    @patch("cli_agent_orchestrator.cli.commands.install.COPILOT_AGENTS_DIR")
+    @patch("cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR")
+    def test_install_copilot_cli_provider_requires_prompt(
+        self,
+        mock_local_store,
+        mock_copilot_dir,
+        mock_context_dir,
+        mock_load,
+        runner,
+        mock_agent_profile,
+    ):
+        """Test copilot_cli install fails when profile has no prompt text."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+
+            local_path = tmppath / "local"
+            local_path.mkdir(parents=True, exist_ok=True)
+            local_profile = local_path / "test-agent.md"
+            local_profile.write_text("# Test\nname: test-agent")
+
+            context_path = tmppath / "context"
+            context_path.mkdir(parents=True, exist_ok=True)
+            copilot_path = tmppath / "copilot"
+            copilot_path.mkdir(parents=True, exist_ok=True)
+
+            mock_local_store.__truediv__ = lambda self, x: local_path / x
+            mock_context_dir.__truediv__ = lambda self, x: context_path / x
+            mock_context_dir.mkdir = MagicMock()
+            mock_copilot_dir.__truediv__ = lambda self, x: copilot_path / x
+            mock_copilot_dir.mkdir = MagicMock()
+
+            mock_agent_profile.system_prompt = ""
+            mock_agent_profile.prompt = ""
+            mock_load.return_value = mock_agent_profile
+
+            result = runner.invoke(install, ["test-agent", "--provider", "copilot_cli"])
+
+            assert "Failed to install agent" in result.output
+            assert "has no system prompt content for Copilot" in result.output
