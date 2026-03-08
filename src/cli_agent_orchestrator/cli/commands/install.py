@@ -4,16 +4,19 @@ from importlib import resources
 from pathlib import Path
 
 import click
+import frontmatter
 import requests
 
 from cli_agent_orchestrator.constants import (
     AGENT_CONTEXT_DIR,
+    COPILOT_AGENTS_DIR,
     DEFAULT_PROVIDER,
     KIRO_AGENTS_DIR,
     LOCAL_AGENT_STORE_DIR,
     PROVIDERS,
     Q_AGENTS_DIR,
 )
+from cli_agent_orchestrator.models.copilot_agent import CopilotAgentConfig
 from cli_agent_orchestrator.models.kiro_agent import KiroAgentConfig
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.q_agent import QAgentConfig
@@ -156,6 +159,26 @@ def install(agent_source: str, provider: str):
             agent_file = KIRO_AGENTS_DIR / f"{safe_filename}.json"
             with open(agent_file, "w") as f:
                 f.write(agent_config.model_dump_json(indent=2, exclude_none=True))
+
+        elif provider == ProviderType.COPILOT_CLI.value:
+            COPILOT_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+            prompt = (profile.system_prompt or "").strip() or (profile.prompt or "").strip()
+            if not prompt:
+                raise ValueError(f"Agent '{profile.name}' has no system prompt content for Copilot")
+
+            safe_filename = profile.name.replace("/", "__")
+            agent_file = COPILOT_AGENTS_DIR / f"{safe_filename}.agent.md"
+            agent_config = CopilotAgentConfig(
+                name=profile.name,
+                description=profile.description,
+                prompt=prompt,
+            )
+            agent_post = frontmatter.Post(
+                agent_config.prompt.rstrip(),
+                name=agent_config.name,
+                description=agent_config.description,
+            )
+            agent_file.write_text(frontmatter.dumps(agent_post), encoding="utf-8")
 
         click.echo(f"✓ Agent '{profile.name}' installed successfully")
         click.echo(f"✓ Context file: {dest_file}")

@@ -140,7 +140,7 @@ class TestCheckAndSendPendingMessages:
         mock_message = MagicMock()
         mock_message.id = 1
         mock_message.message = "test message"
-        mock_get_messages.return_value = [mock_message]
+        mock_get_messages.side_effect = [[mock_message], []]
         mock_provider = MagicMock()
         mock_provider.get_status.return_value = TerminalStatus.IDLE
         mock_provider_manager.get_provider.return_value = mock_provider
@@ -162,7 +162,7 @@ class TestCheckAndSendPendingMessages:
         mock_message = MagicMock()
         mock_message.id = 1
         mock_message.message = "test message"
-        mock_get_messages.return_value = [mock_message]
+        mock_get_messages.side_effect = [[mock_message]]
         mock_provider = MagicMock()
         mock_provider.get_status.return_value = TerminalStatus.IDLE
         mock_provider_manager.get_provider.return_value = mock_provider
@@ -172,6 +172,36 @@ class TestCheckAndSendPendingMessages:
             check_and_send_pending_messages("test-terminal")
 
         mock_update_status.assert_called_once_with(1, MessageStatus.FAILED)
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_delivers_multiple_pending_messages_while_ready(
+        self, mock_get_messages, mock_provider_manager, mock_terminal_service, mock_update_status
+    ):
+        """Test draining multiple pending messages while terminal remains ready."""
+        mock_message_1 = MagicMock()
+        mock_message_1.id = 1
+        mock_message_1.message = "first"
+        mock_message_2 = MagicMock()
+        mock_message_2.id = 2
+        mock_message_2.message = "second"
+        mock_get_messages.side_effect = [[mock_message_1], [mock_message_2], []]
+
+        mock_provider = MagicMock()
+        mock_provider.get_status.return_value = TerminalStatus.IDLE
+        mock_provider_manager.get_provider.return_value = mock_provider
+
+        result = check_and_send_pending_messages("test-terminal")
+
+        assert result is True
+        assert mock_terminal_service.send_input.call_count == 2
+        mock_terminal_service.send_input.assert_any_call("test-terminal", "first")
+        mock_terminal_service.send_input.assert_any_call("test-terminal", "second")
+        assert mock_update_status.call_count == 2
+        mock_update_status.assert_any_call(1, MessageStatus.DELIVERED)
+        mock_update_status.assert_any_call(2, MessageStatus.DELIVERED)
 
 
 class TestLogFileHandler:

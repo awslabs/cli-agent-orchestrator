@@ -61,6 +61,13 @@ def require_kiro():
         pytest.skip("kiro-cli CLI not installed")
 
 
+@pytest.fixture()
+def require_copilot():
+    """Skip test if copilot CLI is not available."""
+    if not _cli_available("copilot"):
+        pytest.skip("copilot CLI not installed")
+
+
 def create_terminal(
     provider: str,
     agent_profile: str,

@@ -71,6 +71,19 @@ class TestGetInboxMessagesEndpoint:
                 assert "status" in msg_data
                 assert "created_at" in msg_data
 
+    def test_poll_triggers_best_effort_delivery(self, client, sample_inbox_messages):
+        """Test inbox polling triggers best-effort pending delivery."""
+        with patch(
+            "cli_agent_orchestrator.api.main.inbox_service.check_and_send_pending_messages"
+        ) as mock_check_send:
+            with patch("cli_agent_orchestrator.api.main.get_inbox_messages") as mock_get:
+                mock_get.return_value = sample_inbox_messages
+
+                response = client.get("/terminals/abcdef12/inbox/messages")
+
+                assert response.status_code == 200
+                mock_check_send.assert_called_once_with("abcdef12")
+
     def test_get_messages_with_status_filter(self, client, sample_inbox_messages):
         """Test getting messages with status filter."""
         pending_messages = [

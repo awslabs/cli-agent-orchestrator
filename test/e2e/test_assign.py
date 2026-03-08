@@ -23,7 +23,7 @@ For real supervisor→worker delegation tests, see test_supervisor_orchestration
 
 Requires:
 - Running CAO server
-- Authenticated CLI tools (codex, claude, kiro-cli)
+- Authenticated CLI tools (codex, claude, kiro-cli, copilot)
 - tmux
 - Agent profiles installed: data_analyst, report_generator
   (install with: cao install examples/assign/data_analyst.md)
@@ -33,6 +33,7 @@ Run:
     uv run pytest -m e2e test/e2e/test_assign.py -v -k codex
     uv run pytest -m e2e test/e2e/test_assign.py -v -k claude_code
     uv run pytest -m e2e test/e2e/test_assign.py -v -k kiro_cli
+    uv run pytest -m e2e test/e2e/test_assign.py -v -k copilot
 """
 
 import time
@@ -409,3 +410,35 @@ class TestKiroCliAssign:
     def test_assign_with_callback(self, require_kiro):
         """Kiro CLI full round-trip: worker completes → sends result → supervisor receives."""
         _run_assign_with_callback_test(provider="kiro_cli")
+
+
+# ---------------------------------------------------------------------------
+# Copilot CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestCopilotCliAssign:
+    """E2E assign tests for the Copilot CLI provider using examples/assign/ profiles."""
+
+    def test_assign_data_analyst(self, require_copilot):
+        """Copilot CLI data_analyst receives dataset, performs statistical analysis."""
+        _run_assign_test(
+            provider="copilot_cli",
+            agent_profile="data_analyst",
+            task_message=DATA_ANALYST_TASK,
+            content_keywords=DATA_ANALYST_KEYWORDS,
+        )
+
+    def test_assign_report_generator(self, require_copilot):
+        """Copilot CLI report_generator creates a report template."""
+        _run_assign_test(
+            provider="copilot_cli",
+            agent_profile="report_generator",
+            task_message=REPORT_GENERATOR_TASK,
+            content_keywords=REPORT_GENERATOR_KEYWORDS,
+        )
+
+    def test_assign_with_callback(self, require_copilot):
+        """Copilot CLI full round-trip: worker completes → sends result → supervisor receives."""
+        _run_assign_with_callback_test(provider="copilot_cli")
