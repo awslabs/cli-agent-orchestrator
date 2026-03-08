@@ -129,7 +129,10 @@ class TestTerminalCreationWithWorkingDirectory:
 
     def test_create_terminal_passes_working_directory(self, client, tmp_path):
         """Test that working_directory parameter is passed to service."""
-        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+        with (
+            patch("cli_agent_orchestrator.api.main.resolve_provider", side_effect=lambda _, fallback_provider: fallback_provider),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
             mock_svc.create_terminal.return_value = Terminal(
                 id="abcd5678",
                 name="test-window",
@@ -153,7 +156,10 @@ class TestTerminalCreationWithWorkingDirectory:
 
     def test_create_terminal_in_session_with_working_directory(self, client):
         """Test POST /sessions/{session}/terminals with working_directory."""
-        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+        with (
+            patch("cli_agent_orchestrator.api.main.resolve_provider", side_effect=lambda _, fallback_provider: fallback_provider),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
             mock_svc.create_terminal.return_value = Terminal(
                 id="abcd5678",
                 name="test-window",
