@@ -261,3 +261,114 @@ class TestExitTerminalEndpoint:
 
             assert response.status_code == 500
             assert "Failed to exit terminal" in response.json()["detail"]
+
+
+class TestCrossProviderResolution:
+    """Test that create_terminal_in_session resolves provider from agent profile
+    while create_session always uses the explicit provider parameter."""
+
+    def test_create_terminal_uses_profile_provider(self, client):
+        """create_terminal_in_session should resolve provider from agent profile."""
+        with (
+            patch("cli_agent_orchestrator.api.main.resolve_provider") as mock_resolve,
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            mock_resolve.return_value = "claude_code"
+            mock_svc.create_terminal.return_value = Terminal(
+                id="abcd1234",
+                name="test-window",
+                session_name="test-session",
+                provider="claude_code",
+                agent_profile="developer",
+            )
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                },
+            )
+
+            assert response.status_code == 201
+            # Verify resolve_provider was called with the fallback
+            mock_resolve.assert_called_once_with("developer", fallback_provider="kiro_cli")
+            # Verify terminal_service got the resolved provider
+            call_kwargs = mock_svc.create_terminal.call_args.kwargs
+            assert call_kwargs["provider"] == "claude_code"
+
+    def test_create_terminal_falls_back_when_no_profile_provider(self, client):
+        """create_terminal_in_session should use fallback when profile has no provider."""
+        with (
+            patch("cli_agent_orchestrator.api.main.resolve_provider") as mock_resolve,
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            # resolve_provider returns the fallback (no profile provider key)
+            mock_resolve.return_value = "kiro_cli"
+            mock_svc.create_terminal.return_value = Terminal(
+                id="abcd5678",
+                name="test-window",
+                session_name="test-session",
+                provider="kiro_cli",
+                agent_profile="reviewer",
+            )
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "reviewer",
+                },
+            )
+
+            assert response.status_code == 201
+            call_kwargs = mock_svc.create_terminal.call_args.kwargs
+            assert call_kwargs["provider"] == "kiro_cli"
+
+    def test_create_session_does_not_resolve_provider(self, client):
+        """create_session should NOT call resolve_provider — CLI flag is the override."""
+        with (
+            patch("cli_agent_orchestrator.api.main.resolve_provider") as mock_resolve,
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            mock_svc.create_terminal.return_value = Terminal(
+                id="abcd1234",
+                name="test-window",
+                session_name="test-session",
+                provider="kiro_cli",
+                agent_profile="supervisor",
+            )
+
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "supervisor",
+                },
+            )
+
+            assert response.status_code == 201
+            # resolve_provider should NOT have been called
+            mock_resolve.assert_not_called()
+            # terminal_service should get the raw provider param
+            call_kwargs = mock_svc.create_terminal.call_args.kwargs
+            assert call_kwargs["provider"] == "kiro_cli"
+
+    def test_create_terminal_returns_500_on_resolve_error(self, client):
+        """Internal errors during provider resolution should return 500."""
+        with (
+            patch("cli_agent_orchestrator.api.main.resolve_provider") as mock_resolve,
+            patch("cli_agent_orchestrator.api.main.terminal_service"),
+        ):
+            mock_resolve.side_effect = Exception("Unexpected filesystem error")
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                },
+            )
+
+            assert response.status_code == 500
+            assert "Failed to create terminal" in response.json()["detail"]
