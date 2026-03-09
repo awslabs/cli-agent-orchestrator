@@ -2,7 +2,7 @@
 
 E2E tests require:
 - A running CAO server (cao-server / uvicorn on localhost:9889)
-- The provider CLI tool installed and authenticated (codex, claude, kiro-cli, gemini)
+- The provider CLI tool installed and authenticated (codex, claude, kiro-cli, gemini, copilot)
 - tmux available on the system
 
 Run with: uv run pytest -m e2e test/e2e/ -v
@@ -84,6 +84,13 @@ def require_gemini():
     # Gemini's free-tier RPM limit is low; sequential tests exhaust the quota
     # and cause the CLI to hang in a retry loop during initialization.
     time.sleep(15)
+
+
+@pytest.fixture()
+def require_copilot():
+    """Skip test if copilot CLI is not available."""
+    if not _cli_available("copilot"):
+        pytest.skip("copilot CLI not installed")
 
 
 def create_terminal(
