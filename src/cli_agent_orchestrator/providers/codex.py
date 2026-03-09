@@ -48,7 +48,9 @@ ERROR_PATTERN = r"^(?:Error:|ERROR:|Traceback \(most recent call last\):|panic:)
 
 # Codex TUI footer indicators (status bar below the idle prompt).
 # Used to detect when the bottom lines contain TUI chrome rather than user input.
-TUI_FOOTER_PATTERN = r"(?:\?\s+for shortcuts|context left)"
+# v0.110 and earlier: "? for shortcuts" and "N% context left"
+# v0.111+: "model · N% left · path" (PR #13202 restored draft footer hints)
+TUI_FOOTER_PATTERN = r"(?:\?\s+for shortcuts|context left|\d+%\s+left)"
 # Codex TUI progress spinner: "• Working (0s • esc to interrupt)",
 # "• Thinking (2s ...)", "• Starting script creation (10s • esc to interrupt)".
 # The prefix text varies but the "(Ns • esc to interrupt)" format is consistent.
@@ -61,6 +63,45 @@ TUI_PROGRESS_PATTERN = r"•.*\(\d+s\s*•\s*esc to interrupt\)"
 TRUST_PROMPT_PATTERN = r"allow Codex to work in this folder"
 # Codex welcome banner indicating normal startup (no trust prompt)
 CODEX_WELCOME_PATTERN = r"OpenAI Codex"
+
+
+def _compute_tui_footer_cutoff(all_lines: list) -> int:
+    """Compute the character position where the TUI footer area starts.
+
+    Scans backward from the last line to find the TUI footer status bar
+    (matches TUI_FOOTER_PATTERN), then continues upward to include any
+    blank lines and the suggestion hint line (› with text) that appear
+    above the status bar as part of the footer area.
+
+    Returns the character position in the joined text (``'\\n'.join(all_lines)``)
+    where the footer starts. Returns ``len('\\n'.join(all_lines))`` if no
+    footer is found.
+    """
+    n = len(all_lines)
+    footer_start_idx = n
+
+    # Find the status bar line (last TUI_FOOTER_PATTERN match in the bottom area)
+    for i in range(n - 1, max(n - IDLE_PROMPT_TAIL_LINES - 1, -1), -1):
+        if re.search(TUI_FOOTER_PATTERN, all_lines[i]):
+            footer_start_idx = i
+            break
+
+    if footer_start_idx == n:
+        return len("\n".join(all_lines))
+
+    # Scan upward from the status bar to include blank lines and the
+    # suggestion hint (› with text) that are part of the TUI footer chrome.
+    for j in range(footer_start_idx - 1, max(footer_start_idx - 4, -1), -1):
+        line = all_lines[j]
+        if not line.strip():
+            footer_start_idx = j
+        elif re.match(rf"\s*{IDLE_PROMPT_PATTERN}", line):
+            footer_start_idx = j
+            break
+        else:
+            break
+
+    return len("\n".join(all_lines[:footer_start_idx]))
 
 
 class ProviderError(Exception):
@@ -232,8 +273,8 @@ class CodexProvider(BaseProvider):
         tui_footer_detected = any(
             re.search(TUI_FOOTER_PATTERN, line) for line in all_lines[-IDLE_PROMPT_TAIL_LINES:]
         )
-        if tui_footer_detected and len(all_lines) > IDLE_PROMPT_TAIL_LINES:
-            cutoff_pos = len("\n".join(all_lines[:-IDLE_PROMPT_TAIL_LINES]))
+        if tui_footer_detected:
+            cutoff_pos = _compute_tui_footer_cutoff(all_lines)
         else:
             cutoff_pos = len(clean_output)
 
@@ -335,8 +376,8 @@ class CodexProvider(BaseProvider):
         tui_footer_detected = any(
             re.search(TUI_FOOTER_PATTERN, line) for line in all_lines[-IDLE_PROMPT_TAIL_LINES:]
         )
-        if tui_footer_detected and len(all_lines) > IDLE_PROMPT_TAIL_LINES:
-            cutoff_pos = len("\n".join(all_lines[:-IDLE_PROMPT_TAIL_LINES]))
+        if tui_footer_detected:
+            cutoff_pos = _compute_tui_footer_cutoff(all_lines)
         else:
             cutoff_pos = len(clean_output)
 
