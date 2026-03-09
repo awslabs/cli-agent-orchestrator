@@ -91,7 +91,7 @@ def _compute_tui_footer_cutoff(all_lines: list) -> int:
 
     # Scan upward from the status bar to include blank lines and the
     # suggestion hint (› with text) that are part of the TUI footer chrome.
-    for j in range(footer_start_idx - 1, max(footer_start_idx - 3, -1), -1):
+    for j in range(footer_start_idx - 1, max(footer_start_idx - 4, -1), -1):
         line = all_lines[j]
         if not line.strip():
             footer_start_idx = j
