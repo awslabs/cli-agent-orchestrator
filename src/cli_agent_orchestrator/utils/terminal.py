@@ -3,24 +3,19 @@
 import logging
 import time
 import uuid
-from typing import TYPE_CHECKING, Union
+from typing import Union
 
-import httpx
+import requests
 
 from cli_agent_orchestrator.constants import API_BASE_URL, SESSION_PREFIX
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-
-if TYPE_CHECKING:
-    from cli_agent_orchestrator.clients.tmux import TmuxClient
-    from cli_agent_orchestrator.providers.base import BaseProvider
 
 logger = logging.getLogger(__name__)
 
 
 def generate_session_name() -> str:
     """Generate a unique session name with SESSION_PREFIX."""
-    session_uuid = uuid.uuid4().hex[:8]
-    return f"{SESSION_PREFIX}{session_uuid}"
+    return f"{SESSION_PREFIX}{uuid.uuid4().hex[:8]}"
 
 
 def generate_terminal_id() -> str:
@@ -33,48 +28,33 @@ def generate_window_name(agent_profile: str) -> str:
     return f"{agent_profile}-{uuid.uuid4().hex[:4]}"
 
 
-def wait_for_shell(
-    tmux_client: "TmuxClient",
-    session_name: str,
-    window_name: str,
-    timeout: float = 10.0,
-    polling_interval: float = 0.5,
-) -> bool:
-    """Wait for shell to be ready by checking if output is stable (2 consecutive reads are the same and non-empty)."""
-    logger.info(f"Waiting for shell to be ready in {session_name}:{window_name}...")
-    start_time = time.time()
-    previous_output = None
+def wait_for_shell(terminal_id: str, timeout: float = 10.0, polling_interval: float = 0.5) -> bool:
+    """Wait for shell to be ready by polling status_monitor."""
+    from cli_agent_orchestrator.services.status_monitor import status_monitor
 
-    while time.time() - start_time < timeout:
-        output = tmux_client.get_history(session_name, window_name)
-
-        if output and output.strip() and previous_output is not None and output == previous_output:
-            logger.info(f"Shell ready")
+    start = time.time()
+    while time.time() - start < timeout:
+        if status_monitor.get_status(terminal_id) == TerminalStatus.IDLE:
             return True
-
-        previous_output = output
         time.sleep(polling_interval)
-
-    logger.warning(f"Timeout waiting for shell to be ready")
+    logger.warning(f"Timeout waiting for shell to be ready for {terminal_id}")
     return False
 
 
 def wait_until_status(
-    provider_instance: "BaseProvider",
+    terminal_id: str,
     target_status: TerminalStatus,
     timeout: float = 30.0,
     polling_interval: float = 1.0,
 ) -> bool:
-    """Wait until provider reaches target status or timeout."""
-    start_time = time.time()
+    """Wait until terminal reaches target status by polling status_monitor."""
+    from cli_agent_orchestrator.services.status_monitor import status_monitor
 
-    while time.time() - start_time < timeout:
-        status = provider_instance.get_status()
-        logger.info(f"Waiting for {target_status}, current status: {status}")
-        if status == target_status:
+    start = time.time()
+    while time.time() - start < timeout:
+        if status_monitor.get_status(terminal_id) == target_status:
             return True
         time.sleep(polling_interval)
-
     return False
 
 
@@ -84,10 +64,10 @@ def wait_until_terminal_status(
     timeout: float = 30.0,
     polling_interval: float = 1.0,
 ) -> bool:
-    """Wait until terminal reaches target status using API endpoint.
+    """Wait until terminal reaches target status by polling GET /terminals/{id}.
 
     Args:
-        terminal_id: Terminal to poll.
+        terminal_id: Terminal to poll status for.
         target_status: A single TerminalStatus or a set of acceptable statuses.
         timeout: Maximum wait time in seconds.
         polling_interval: Seconds between polls.
@@ -103,11 +83,10 @@ def wait_until_terminal_status(
     start_time = time.time()
     while time.time() - start_time < timeout:
         try:
-            response = httpx.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=10.0)
-            logger.info(response)
+            response = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
             if response.status_code == 200:
-                terminal_data = response.json()
-                if terminal_data["status"] in target_values:
+                current_status = response.json().get("status")
+                if current_status in target_values:
                     return True
         except Exception:
             pass

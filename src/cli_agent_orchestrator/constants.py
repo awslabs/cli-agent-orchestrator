@@ -49,12 +49,19 @@ LOG_DIR = CAO_HOME_DIR / "logs"
 TERMINAL_LOG_DIR = LOG_DIR / "terminal"  # Per-terminal log files for pipe-pane output
 TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
+# FIFO directory for event-driven terminal output streaming
+FIFO_DIR = CAO_HOME_DIR / "fifos"  # Named pipes for tmux pipe-pane streaming
+FIFO_DIR.mkdir(parents=True, exist_ok=True)
+
 # =============================================================================
-# Inbox Service Configuration
+# Event-Driven State Detection Configuration
 # =============================================================================
-# Polling interval for detecting log file changes (seconds)
-# Lower values = faster response, higher CPU usage
-INBOX_POLLING_INTERVAL = 5
+# Generic shell prompt pattern for phase 1 detection (before provider init)
+SHELL_PROMPT_PATTERN = r"[$#%>]\s"
+
+# Rolling buffer size for state detection (8KB)
+# Keeps trailing 8KB of terminal output for pattern matching
+STATE_BUFFER_MAX = 8192
 
 # =============================================================================
 # Cleanup Service Configuration

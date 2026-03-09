@@ -7,7 +7,6 @@ from typing import Annotated, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Path, Query, status
 from pydantic import BaseModel, Field, field_validator
-from watchdog.observers.polling import PollingObserver
 
 from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
@@ -15,23 +14,23 @@ from cli_agent_orchestrator.clients.database import (
     init_db,
 )
 from cli_agent_orchestrator.constants import (
-    INBOX_POLLING_INTERVAL,
     SERVER_HOST,
     SERVER_PORT,
     SERVER_VERSION,
-    TERMINAL_LOG_DIR,
 )
 from cli_agent_orchestrator.models.inbox import MessageStatus
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalId
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services import (
     flow_service,
-    inbox_service,
     session_service,
     terminal_service,
 )
 from cli_agent_orchestrator.services.cleanup_service import cleanup_old_data
-from cli_agent_orchestrator.services.inbox_service import LogFileHandler
+from cli_agent_orchestrator.services.event_bus import bus
+from cli_agent_orchestrator.services.inbox_service import inbox_service
+from cli_agent_orchestrator.services.log_writer import log_writer
+from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.terminal_service import OutputMode
 from cli_agent_orchestrator.utils.logging import setup_logging
 from cli_agent_orchestrator.utils.terminal import generate_session_name
@@ -87,23 +86,32 @@ async def lifespan(app: FastAPI):
     # Start flow daemon as background task
     daemon_task = asyncio.create_task(flow_daemon())
 
-    # Start inbox watcher
-    inbox_observer = PollingObserver(timeout=INBOX_POLLING_INTERVAL)
-    inbox_observer.schedule(LogFileHandler(), str(TERMINAL_LOG_DIR), recursive=False)
-    inbox_observer.start()
-    logger.info("Inbox watcher started (PollingObserver)")
+    # Register event loop with event bus for thread-safe publishing
+    loop = asyncio.get_running_loop()
+    bus.set_loop(loop)
+
+    # Start event bus consumers as background tasks
+    status_monitor_task = asyncio.create_task(status_monitor.run())
+    log_writer_task = asyncio.create_task(log_writer.run())
+    inbox_service_task = asyncio.create_task(inbox_service.run())
+    logger.info("Event bus consumers started (StatusMonitor, LogWriter, InboxService)")
 
     yield
 
-    # Stop inbox observer
-    inbox_observer.stop()
-    inbox_observer.join()
-    logger.info("Inbox watcher stopped")
-
-    # Cancel daemon on shutdown
+    # Cancel consumer tasks on shutdown
+    status_monitor_task.cancel()
+    log_writer_task.cancel()
+    inbox_service_task.cancel()
     daemon_task.cancel()
+
     try:
-        await daemon_task
+        await asyncio.gather(
+            status_monitor_task,
+            log_writer_task,
+            inbox_service_task,
+            daemon_task,
+            return_exceptions=True,
+        )
     except asyncio.CancelledError:
         pass
 
@@ -119,7 +127,7 @@ app = FastAPI(
 
 
 @app.get("/health")
-async def health_check():
+def health_check():
     return {"status": "ok", "service": "cli-agent-orchestrator"}
 
 
@@ -151,7 +159,7 @@ async def create_session(
 
 
 @app.get("/sessions")
-async def list_sessions() -> List[Dict]:
+def list_sessions() -> List[Dict]:
     try:
         return session_service.list_sessions()
     except Exception as e:
@@ -162,7 +170,7 @@ async def list_sessions() -> List[Dict]:
 
 
 @app.get("/sessions/{session_name}")
-async def get_session(session_name: str) -> Dict:
+def get_session(session_name: str) -> Dict:
     try:
         return session_service.get_session(session_name)
     except ValueError as e:
@@ -175,7 +183,7 @@ async def get_session(session_name: str) -> Dict:
 
 
 @app.delete("/sessions/{session_name}")
-async def delete_session(session_name: str) -> Dict:
+def delete_session(session_name: str) -> Dict:
     try:
         success = session_service.delete_session(session_name)
         return {"success": success}
@@ -193,7 +201,7 @@ async def delete_session(session_name: str) -> Dict:
     response_model=Terminal,
     status_code=status.HTTP_201_CREATED,
 )
-async def create_terminal_in_session(
+def create_terminal_in_session(
     session_name: str,
     provider: str,
     agent_profile: str,
@@ -219,7 +227,7 @@ async def create_terminal_in_session(
 
 
 @app.get("/sessions/{session_name}/terminals")
-async def list_terminals_in_session(session_name: str) -> List[Dict]:
+def list_terminals_in_session(session_name: str) -> List[Dict]:
     """List all terminals in a session."""
     try:
         from cli_agent_orchestrator.clients.database import list_terminals_by_session
@@ -233,7 +241,7 @@ async def list_terminals_in_session(session_name: str) -> List[Dict]:
 
 
 @app.get("/terminals/{terminal_id}", response_model=Terminal)
-async def get_terminal(terminal_id: TerminalId) -> Terminal:
+def get_terminal(terminal_id: TerminalId) -> Terminal:
     try:
         terminal = terminal_service.get_terminal(terminal_id)
         return Terminal(**terminal)
@@ -247,7 +255,7 @@ async def get_terminal(terminal_id: TerminalId) -> Terminal:
 
 
 @app.get("/terminals/{terminal_id}/working-directory", response_model=WorkingDirectoryResponse)
-async def get_terminal_working_directory(terminal_id: TerminalId) -> WorkingDirectoryResponse:
+def get_terminal_working_directory(terminal_id: TerminalId) -> WorkingDirectoryResponse:
     """Get the current working directory of a terminal's pane."""
     try:
         working_directory = terminal_service.get_working_directory(terminal_id)
@@ -262,7 +270,7 @@ async def get_terminal_working_directory(terminal_id: TerminalId) -> WorkingDire
 
 
 @app.post("/terminals/{terminal_id}/input")
-async def send_terminal_input(terminal_id: TerminalId, message: str) -> Dict:
+def send_terminal_input(terminal_id: TerminalId, message: str) -> Dict:
     try:
         success = terminal_service.send_input(terminal_id, message)
         return {"success": success}
@@ -346,12 +354,10 @@ async def create_inbox_message_endpoint(
             detail=f"Failed to create inbox message: {str(e)}",
         )
 
-    # Best-effort immediate delivery. If the receiver terminal is idle, the
-    # message is delivered now; otherwise the watchdog will deliver it when
-    # the terminal becomes idle. Delivery failures must not cause the API
-    # to report an error — the message was already persisted above.
+    # Attempt immediate delivery if terminal is already IDLE.
+    # If not, InboxService will deliver on next IDLE status event.
     try:
-        inbox_service.check_and_send_pending_messages(receiver_id)
+        inbox_service.deliver_pending(receiver_id)
     except Exception as e:
         logger.warning(f"Immediate delivery attempt failed for {receiver_id}: {e}")
 

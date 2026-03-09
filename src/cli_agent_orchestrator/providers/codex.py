@@ -28,7 +28,6 @@ IDLE_PROMPT_TAIL_LINES = 5
 # is active.  This is intentionally permissive — _has_idle_pattern() is a
 # lightweight pre-check; the real status decision is made by get_status()
 # which uses capture-pane (rendered screen).
-IDLE_PROMPT_PATTERN_LOG = r"\? for shortcuts"
 # Match assistant response start: "assistant:/codex:/agent:" (label style from synthetic
 # test fixtures) or "•" bullet point (real Codex interactive output format).
 ASSISTANT_PREFIX_PATTERN = r"^(?:(?:assistant|codex|agent)\s*:|\s*•)"
@@ -185,7 +184,7 @@ class CodexProvider(BaseProvider):
 
     def initialize(self) -> bool:
         """Initialize Codex provider by starting codex command."""
-        if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
+        if not wait_for_shell(self.terminal_id, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
         # Send a warm-up command before launching codex.
@@ -205,18 +204,15 @@ class CodexProvider(BaseProvider):
         # Handle workspace trust prompt if it appears (new/untrusted directories)
         self._handle_trust_prompt(timeout=20.0)
 
-        if not wait_until_status(self, TerminalStatus.IDLE, timeout=60.0, polling_interval=1.0):
+        if not wait_until_status(self.terminal_id, TerminalStatus.IDLE, timeout=60.0):
             raise TimeoutError("Codex initialization timed out after 60 seconds")
 
         self._initialized = True
         return True
 
-    def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
-        """Get Codex status by analyzing terminal output."""
-        output = tmux_client.get_history(self.session_name, self.window_name, tail_lines=tail_lines)
-
+    def get_status(self, output: str) -> TerminalStatus:
         if not output:
-            return TerminalStatus.ERROR
+            return TerminalStatus.UNKNOWN
 
         clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
         tail_output = "\n".join(clean_output.splitlines()[-25:])
@@ -312,9 +308,6 @@ class CodexProvider(BaseProvider):
         # assume the CLI is still producing output.
         return TerminalStatus.PROCESSING
 
-    def get_idle_pattern_for_log(self) -> str:
-        """Return Codex IDLE prompt pattern for log files."""
-        return IDLE_PROMPT_PATTERN_LOG
 
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract Codex's final response from terminal output.

@@ -6,6 +6,8 @@ from pathlib import Path
 
 from cli_agent_orchestrator.clients.database import InboxModel, SessionLocal, TerminalModel
 from cli_agent_orchestrator.constants import LOG_DIR, RETENTION_DAYS, TERMINAL_LOG_DIR
+from cli_agent_orchestrator.services.fifo_reader import fifo_manager
+from cli_agent_orchestrator.services.status_monitor import status_monitor
 
 logger = logging.getLogger(__name__)
 
@@ -18,8 +20,14 @@ def cleanup_old_data():
             f"Starting cleanup of data older than {RETENTION_DAYS} days (before {cutoff_date})"
         )
 
-        # Clean up old terminals
+        # Clean up old terminals (stop FIFO readers and clear state first)
         with SessionLocal() as db:
+            old_terminals = (
+                db.query(TerminalModel).filter(TerminalModel.last_active < cutoff_date).all()
+            )
+            for terminal in old_terminals:
+                fifo_manager.stop_reader(terminal.id)
+                status_monitor.clear_terminal(terminal.id)
             deleted_terminals = (
                 db.query(TerminalModel).filter(TerminalModel.last_active < cutoff_date).delete()
             )
