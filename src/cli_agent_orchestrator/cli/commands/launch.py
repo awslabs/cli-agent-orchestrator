@@ -9,7 +9,12 @@ import requests
 from cli_agent_orchestrator.constants import DEFAULT_PROVIDER, PROVIDERS, SERVER_HOST, SERVER_PORT
 
 # Providers that require workspace folder access
-PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {"claude_code", "codex", "kiro_cli"}
+PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
+    "claude_code",
+    "codex",
+    "kiro_cli",
+    "gemini_cli",
+}
 
 
 @click.command()

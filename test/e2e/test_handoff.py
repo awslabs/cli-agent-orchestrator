@@ -10,13 +10,14 @@ Tests the worker side of the handoff flow — validates that each provider can:
 NOTE: These tests do NOT test a supervisor agent calling the handoff() MCP tool.
 For real supervisor→worker delegation tests, see test_supervisor_orchestration.py.
 
-Requires: running CAO server, authenticated CLI tools (codex, claude, kiro-cli), tmux.
+Requires: running CAO server, authenticated CLI tools (codex, claude, kiro-cli, gemini), tmux.
 
 Run:
     uv run pytest -m e2e test/e2e/test_handoff.py -v
     uv run pytest -m e2e test/e2e/test_handoff.py -v -k codex
     uv run pytest -m e2e test/e2e/test_handoff.py -v -k claude_code
     uv run pytest -m e2e test/e2e/test_handoff.py -v -k kiro_cli
+    uv run pytest -m e2e test/e2e/test_handoff.py -v -k gemini_cli
 """
 
 import time
@@ -41,7 +42,7 @@ def _run_handoff_test(provider: str, agent_profile: str, task_message: str, cont
     """Core handoff test logic shared across providers.
 
     Args:
-        provider: Provider name ("codex", "claude_code", "kiro_cli")
+        provider: Provider name ("codex", "claude_code", "kiro_cli", "gemini_cli")
         agent_profile: Agent profile name ("developer")
         task_message: The task to send to the agent
         content_keywords: Words expected in the output (at least one must match)
@@ -57,8 +58,8 @@ def _run_handoff_test(provider: str, agent_profile: str, task_message: str, cont
         assert terminal_id, "Terminal ID should not be empty"
 
         # Step 2: Wait for ready (idle or completed).
-        # Providers with initial prompts reach 'completed' after processing
-        # the system prompt; others reach 'idle'.
+        # Providers with initial prompts (Gemini CLI -i) reach 'completed'
+        # after processing the system prompt; others reach 'idle'.
         start = time.time()
         while time.time() - start < 90.0:
             s = get_terminal_status(terminal_id)
@@ -217,4 +218,38 @@ class TestKiroCliHandoff:
                 "a and b and returns a minus b. Output only the function code."
             ),
             content_keywords=["subtract", "return", "def"],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Gemini CLI provider tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestGeminiCliHandoff:
+    """E2E handoff tests for the Gemini CLI provider."""
+
+    def test_handoff_simple_function(self, require_gemini):
+        """Gemini CLI developer creates a simple Python function and returns output."""
+        _run_handoff_test(
+            provider="gemini_cli",
+            agent_profile="developer",
+            task_message=(
+                "Create a Python function called 'greet' that takes a name parameter "
+                "and returns 'Hello, {name}!'. Output only the function code."
+            ),
+            content_keywords=["greet", "hello", "def"],
+        )
+
+    def test_handoff_second_task(self, require_gemini):
+        """Gemini CLI developer handles a second independent task."""
+        _run_handoff_test(
+            provider="gemini_cli",
+            agent_profile="developer",
+            task_message=(
+                "Create a Python function called 'square' that takes a parameter n "
+                "and returns n squared. Output only the function code."
+            ),
+            content_keywords=["square", "return", "def"],
         )
