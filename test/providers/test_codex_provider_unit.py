@@ -877,6 +877,24 @@ class TestCodexV0111Extraction:
         assert "Second answer with details." in message
         assert "Write tests" not in message
 
+    def test_extract_double_blank_between_hint_and_status(self):
+        """Suggestion hint must not leak when 2 blank lines separate it from status bar."""
+        output = (
+            "› fix the bug\n"
+            "• I've fixed the issue in main.py by correcting the import.\n"
+            "\n"
+            "› Find and fix a bug in @filename\n"
+            "\n"
+            "\n"
+            "  gpt-5.3-codex high · 98% left · ~/project\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert "I've fixed the issue" in message
+        assert "Find and fix a bug" not in message
+
 
 class TestCodexProviderMisc:
     def test_get_idle_pattern_for_log(self):
