@@ -629,6 +629,92 @@ class TestCodexBulletFormatStatusDetection:
         assert status == TerminalStatus.PROCESSING
 
 
+class TestCodexV0111FooterFormat:
+    """Tests for Codex v0.111.0+ TUI footer format.
+
+    v0.111.0 (PR #13202 'tui: restore draft footer hints') changed the footer:
+    - Old: "› Use /skills to list available skills\\n  ? for shortcuts  100% context left"
+    - New: "› Find and fix a bug in @filename\\n  gpt-5.3-codex high · 100% left · ~/path"
+    The new format uses "N% left" instead of "N% context left" and removes "? for shortcuts".
+    """
+
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_get_status_idle_v0111_footer(self, mock_tmux):
+        """IDLE with v0.111.0 footer format (no '? for shortcuts')."""
+        mock_tmux.get_history.return_value = (
+            "╭───────────────────────────────────────────╮\n"
+            "│ >_ OpenAI Codex (v0.111.0)                │\n"
+            "│ model: gpt-5.3-codex high                 │\n"
+            "│ directory: ~/project                      │\n"
+            "╰───────────────────────────────────────────╯\n"
+            "  Tip: You can run any shell command from Codex using ! (e.g. !ls)\n"
+            "\n"
+            "› Find and fix a bug in @filename\n"
+            "\n"
+            "  gpt-5.3-codex high · 100% left · ~/project\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_get_status_completed_v0111_footer(self, mock_tmux):
+        """COMPLETED with v0.111.0 footer (suggestion hint must not be treated as user input)."""
+        mock_tmux.get_history.return_value = (
+            "› fix the bug\n"
+            "• I've fixed the issue in main.py by correcting the import.\n"
+            "\n"
+            "› Find and fix a bug in @filename\n"
+            "\n"
+            "  gpt-5.3-codex high · 98% left · ~/project\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_get_status_completed_v0111_multi_turn(self, mock_tmux):
+        """COMPLETED in multi-turn with v0.111.0 footer."""
+        mock_tmux.get_history.return_value = (
+            "› first question\n"
+            "• First answer.\n"
+            "\n"
+            "› second question\n"
+            "• Second answer with details.\n"
+            "\n"
+            "› Write tests for @main.py\n"
+            "\n"
+            "  gpt-5.3-codex high · 95% left · ~/project\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_get_status_processing_v0111_spinner(self, mock_tmux):
+        """PROCESSING when TUI shows spinner with v0.111.0 footer."""
+        mock_tmux.get_history.return_value = (
+            "› [CAO Handoff] Do the task.\n"
+            "\n"
+            "• Working (0s • esc to interrupt)\n"
+            "\n"
+            "› Find and fix a bug in @filename\n"
+            "\n"
+            "  gpt-5.3-codex high · 100% left · ~/project\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.PROCESSING
+
+
 class TestCodexProviderMessageExtraction:
     def test_extract_last_message_success(self):
         output = load_fixture("codex_completed_output.txt")
@@ -746,6 +832,68 @@ class TestCodexBulletFormatExtraction:
         message = provider.extract_last_message_from_script(output)
 
         assert "I've fixed the import issue" in message
+
+
+class TestCodexV0111Extraction:
+    """Extraction tests for Codex v0.111.0+ footer format."""
+
+    def test_extract_bullet_with_v0111_footer(self):
+        """Extract response when v0.111.0 footer (suggestion hint) is present."""
+        output = (
+            "› fix the bug\n"
+            "• I've fixed the issue in main.py by correcting the import.\n"
+            "\n"
+            "› Find and fix a bug in @filename\n"
+            "\n"
+            "  gpt-5.3-codex high · 98% left · ~/project\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert "I've fixed the issue" in message
+        # Suggestion hint should not leak into extracted output
+        assert "Find and fix a bug" not in message
+        assert "gpt-5.3-codex" not in message
+
+    def test_extract_multi_turn_with_v0111_footer(self):
+        """Extract last response from multi-turn with v0.111.0 footer."""
+        output = (
+            "› first question\n"
+            "• First answer.\n"
+            "\n"
+            "› second question\n"
+            "• Second answer with details.\n"
+            "\n"
+            "› Write tests for @main.py\n"
+            "\n"
+            "  gpt-5.3-codex high · 95% left · ~/project\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert "First answer" not in message
+        assert "Second answer with details." in message
+        assert "Write tests" not in message
+
+    def test_extract_double_blank_between_hint_and_status(self):
+        """Suggestion hint must not leak when 2 blank lines separate it from status bar."""
+        output = (
+            "› fix the bug\n"
+            "• I've fixed the issue in main.py by correcting the import.\n"
+            "\n"
+            "› Find and fix a bug in @filename\n"
+            "\n"
+            "\n"
+            "  gpt-5.3-codex high · 98% left · ~/project\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert "I've fixed the issue" in message
+        assert "Find and fix a bug" not in message
 
 
 class TestCodexProviderMisc:
