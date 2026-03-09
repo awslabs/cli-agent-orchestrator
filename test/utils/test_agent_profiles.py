@@ -127,9 +127,7 @@ class TestResolveProvider:
     @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
     def test_returns_fallback_when_no_provider_key(self, mock_load):
         """Profile without a provider key should fall back to the caller's provider."""
-        mock_load.return_value = AgentProfile(
-            name="reviewer", description="Reviewer agent"
-        )
+        mock_load.return_value = AgentProfile(name="reviewer", description="Reviewer agent")
 
         result = resolve_provider("reviewer", fallback_provider="kiro_cli")
 
@@ -180,4 +178,3 @@ class TestResolveProvider:
         result = resolve_provider("developer", fallback_provider="kiro_cli")
 
         assert result == "kiro_cli"
-
