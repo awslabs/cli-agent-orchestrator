@@ -455,8 +455,11 @@ class TestGeminiCliAssign:
             provider="gemini_cli",
             agent_profile="data_analyst",
             task_message=DATA_ANALYST_TASK,
-            content_keywords=DATA_ANALYST_KEYWORDS + [
-                "analysis", "send_message", "CAO_TERMINAL_ID",
+            content_keywords=DATA_ANALYST_KEYWORDS
+            + [
+                "analysis",
+                "send_message",
+                "CAO_TERMINAL_ID",
             ],
         )
 

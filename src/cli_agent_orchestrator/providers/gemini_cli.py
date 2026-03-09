@@ -244,11 +244,13 @@ class GeminiCliProvider(BaseProvider):
                     # Short -i prompt to adopt the role without triggering exploration.
                     # Gemini reads GEMINI.md automatically; -i just confirms adoption.
                     role_name = profile.name if profile.name else "agent"
-                    command_parts.extend([
-                        "-i",
-                        f"You are the {role_name}. Your instructions are in GEMINI.md. "
-                        "Acknowledge your role in one sentence, then wait for tasks.",
-                    ])
+                    command_parts.extend(
+                        [
+                            "-i",
+                            f"You are the {role_name}. Your instructions are in GEMINI.md. "
+                            "Acknowledge your role in one sentence, then wait for tasks.",
+                        ]
+                    )
                     self._uses_prompt_interactive = True
 
                 # Configure MCP servers by writing directly to ~/.gemini/settings.json.

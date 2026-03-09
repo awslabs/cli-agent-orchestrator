@@ -20,6 +20,7 @@ test/providers/
 ├── test_q_cli_unit.py          # Q CLI unit tests (fast, mocked)
 ├── test_claude_code_unit.py    # Claude Code unit tests (fast, mocked)
 ├── test_codex_provider_unit.py # Codex CLI unit tests (fast, mocked)
+├── test_gemini_cli_unit.py    # Gemini CLI unit tests (fast, mocked)
 ├── test_base_provider.py       # Base provider abstract interface tests
 ├── test_tmux_working_directory.py # TmuxClient working directory tests
 ├── test_q_cli_integration.py   # Q CLI integration tests (slow, real Q CLI)
@@ -27,6 +28,7 @@ test/providers/
 │   ├── kiro_cli_*.txt          # Kiro CLI fixtures (default provider)
 │   ├── q_cli_*.txt             # Q CLI fixtures
 │   ├── codex_*.txt             # Codex CLI fixtures
+│   ├── gemini_cli_*.txt        # Gemini CLI fixtures
 │   └── generate_fixtures.py    # Script to regenerate fixtures
 └── README.md
 ```
@@ -212,6 +214,7 @@ Each provider has a dedicated workflow that runs only when its files change:
 | `test-claude-code-provider.yml` | `test_claude_code_unit.py` | `providers/claude_code.py`, `test/providers/**` |
 | `test-kiro-cli-provider.yml` | `test_kiro_cli_unit.py` | `providers/kiro_cli.py`, `test/providers/**` |
 | `test-q-cli-provider.yml` | `test_q_cli_unit.py` | `providers/q_cli.py`, `test/providers/**` |
+| `test-gemini-cli-provider.yml` | `test_gemini_cli_unit.py` | `providers/gemini_cli.py`, `test/providers/**` |
 
 Each includes unit tests (Python 3.10/3.11/3.12) and code quality checks (black, isort, mypy).
 
@@ -474,6 +477,85 @@ uv run pytest test/providers/test_codex_provider_unit.py --cov=src/cli_agent_orc
 
 # Run specific test class
 uv run pytest test/providers/test_codex_provider_unit.py::TestCodexBuildCommand -v
+```
+
+## Gemini CLI Provider Tests
+
+### Test Coverage (`test_gemini_cli_unit.py`)
+
+**72 tests covering:**
+
+1. **Initialization (4 tests)**
+   - Successful initialization (GEMINI.md system prompt injection, `-i` flag)
+   - Shell timeout handling
+   - Gemini CLI timeout handling
+   - Initialization with agent profile
+
+2. **Command Building (8 tests)**
+   - Base command without agent profile
+   - Command with agent profile (GEMINI.md injection)
+   - MCP server configuration (`~/.gemini/settings.json`)
+   - MCP server with environment variables
+   - Empty/None system prompt handling
+   - Agent profile load failure
+   - Sandbox mode flags
+
+3. **Status Detection (16 tests)**
+   - IDLE status (input box visible, no response)
+   - COMPLETED status (response with input box)
+   - PROCESSING status (partial output, no input box)
+   - ERROR status (error messages)
+   - Empty output handling
+   - tail_lines parameter
+   - Notification spinner detection (background spinners)
+   - Ink TUI chrome filtering
+
+4. **Message Extraction (14 tests)**
+   - Single-line `✦` response extraction
+   - Multi-line response with multiple `✦` bullets
+   - Tool call box extraction
+   - Multi-line query box parsing (wrapped queries)
+   - Missing response pattern fallback
+   - Empty response error
+   - Multiple responses (uses last)
+   - TUI chrome filtering (horizontal rules, footer info, shortcut hints)
+
+5. **Cleanup (4 tests)**
+   - GEMINI.md file cleanup
+   - MCP server config cleanup (`~/.gemini/settings.json`)
+   - Cleanup when files don't exist
+   - Error handling during cleanup
+
+6. **Edge Cases (26 tests)**
+   - Unicode characters in responses
+   - ANSI escape sequence cleaning
+   - Notification spinner text filtering
+   - Model info line detection
+   - YOLO mode toggle line filtering
+   - Complex multi-turn conversations
+   - Code blocks within responses
+
+**Coverage:** 96% of gemini_cli.py
+
+### Fixture Files
+
+- **gemini_cli_idle_output.txt** - Gemini CLI waiting for input
+- **gemini_cli_completed_output.txt** - Complete response with `✦` prefix
+- **gemini_cli_processing_output.txt** - Partial output during processing
+- **gemini_cli_error_output.txt** - Error message output
+- **gemini_cli_complex_response.txt** - Multi-line response with tool calls
+
+### Running Gemini CLI Tests
+
+```bash
+# Run all Gemini CLI unit tests
+uv run pytest test/providers/test_gemini_cli_unit.py -v
+
+# Run with coverage
+uv run pytest test/providers/test_gemini_cli_unit.py --cov=src/cli_agent_orchestrator/providers/gemini_cli.py --cov-report=term-missing -v
+
+# Run specific test class
+uv run pytest test/providers/test_gemini_cli_unit.py::TestGeminiCliProviderStatusDetection -v
 ```
 
 ## Kiro CLI Provider Tests
