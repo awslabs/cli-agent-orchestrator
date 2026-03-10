@@ -130,7 +130,7 @@ class CodexProvider(BaseProvider):
         Returns properly escaped shell command string that can be safely sent via tmux.
         Uses codex's -c developer_instructions flag to inject agent system prompts.
         """
-        command_parts = ["codex", "--no-alt-screen", "--disable", "shell_snapshot"]
+        command_parts = ["codex", "--yolo", "--no-alt-screen", "--disable", "shell_snapshot"]
 
         if self._agent_profile is not None:
             try:
