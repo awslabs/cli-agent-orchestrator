@@ -382,6 +382,24 @@ All paths are canonicalized via `realpath` and validated against a security poli
 
 For configuration and usage details, see [docs/working-directory.md](docs/working-directory.md).
 
+## Cross-Provider Orchestration
+
+By default, worker agents inherit the provider of the terminal that spawned them. To run specific agents on different providers, add a `provider` key to the agent profile frontmatter:
+
+```markdown
+---
+name: developer
+description: Developer Agent
+provider: claude_code
+---
+```
+
+Valid values: `kiro_cli`, `claude_code`, `codex`, `q_cli`.
+
+When a supervisor calls `assign` or `handoff`, CAO reads the worker's agent profile and uses the declared provider if present. If the key is missing or invalid, the worker falls back to the supervisor's provider.
+
+The `cao launch --provider` flag always takes precedence — it is treated as an explicit override and the profile's `provider` key is not consulted for the initial session.
+
 ## Security
 
 See [SECURITY.md](SECURITY.md) for vulnerability reporting, security scanning, and best practices.
