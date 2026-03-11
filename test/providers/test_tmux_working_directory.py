@@ -181,9 +181,7 @@ class TestTmuxClientWorkingDirectory:
         client = TmuxClient()
         with patch("os.path.isdir", return_value=True):
             with patch("os.path.realpath", return_value="/opt/projects/my-app"):
-                result = client._resolve_and_validate_working_directory(
-                    "/opt/projects/my-app"
-                )
+                result = client._resolve_and_validate_working_directory("/opt/projects/my-app")
         assert result == "/opt/projects/my-app"
 
     def test_raises_for_blocked_system_directory(self):
