@@ -74,7 +74,7 @@ def create_terminal(
         agent_profile: Name of the agent profile to use
         session_name: Optional custom session name. If not provided, auto-generated.
         new_session: If True, creates a new tmux session. If False, adds to existing.
-        working_directory: Optional working directory for the terminal shell.
+        working_directory: Optional working directory for the terminal shell
 
     Returns:
         Terminal object with all metadata populated
@@ -307,19 +307,25 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
 
 
 def delete_terminal(terminal_id: str) -> bool:
-    """Delete terminal."""
+    """Delete terminal and kill its tmux window."""
     try:
         # Get metadata before deletion
         metadata = get_terminal_metadata(terminal_id)
 
-        # Stop pipe-pane
         if metadata:
+            # Stop pipe-pane logging
             try:
                 tmux_client.stop_pipe_pane(metadata["tmux_session"], metadata["tmux_window"])
             except Exception as e:
                 logger.warning(f"Failed to stop pipe-pane for {terminal_id}: {e}")
 
-        # Existing cleanup
+            # Kill the tmux window (this terminates the agent process)
+            try:
+                tmux_client.kill_window(metadata["tmux_session"], metadata["tmux_window"])
+            except Exception as e:
+                logger.warning(f"Failed to kill tmux window for {terminal_id}: {e}")
+
+        # Cleanup provider state and database record
         provider_manager.cleanup_provider(terminal_id)
         deleted = db_delete_terminal(terminal_id)
         logger.info(f"Deleted terminal: {terminal_id}")

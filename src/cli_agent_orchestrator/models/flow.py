@@ -20,3 +20,4 @@ class Flow(BaseModel):
     last_run: Optional[datetime] = Field(None, description="Last execution time")
     next_run: Optional[datetime] = Field(None, description="Next scheduled execution time")
     enabled: bool = Field(True, description="Whether flow is enabled")
+    prompt_template: Optional[str] = Field(None, description="Prompt template text")

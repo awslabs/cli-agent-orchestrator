@@ -19,7 +19,7 @@ class TestClaudeCodeProviderInitialization:
         """Test successful initialization."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
-        # _handle_trust_prompt needs get_history to return a string
+        # _handle_startup_prompts needs get_history to return a string
         mock_tmux.get_history.return_value = "Welcome to Claude Code v2.0"
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
@@ -124,9 +124,10 @@ class TestClaudeCodeProviderInitialization:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         provider.initialize()
 
-        mock_tmux.send_keys.assert_called_once_with(
-            "test-session", "window-0", "claude --dangerously-skip-permissions"
-        )
+        call_args = mock_tmux.send_keys.call_args
+        assert call_args[0][0] == "test-session"
+        assert call_args[0][1] == "window-0"
+        assert "claude --dangerously-skip-permissions" in call_args[0][2]
 
 
 class TestClaudeCodeProviderStatusDetection:
@@ -363,7 +364,7 @@ class TestClaudeCodeProviderMisc:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         command = provider._build_claude_command()
 
-        assert command == "claude --dangerously-skip-permissions"
+        assert "claude --dangerously-skip-permissions" in command
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     def test_build_claude_command_with_system_prompt(self, mock_load):
@@ -461,7 +462,7 @@ class TestClaudeCodeProviderTrustPrompt:
     """Tests for Claude Code workspace trust prompt handling."""
 
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_handle_trust_prompt_detected_and_accepted(self, mock_tmux):
+    def test_handle_startup_prompts_detected_and_accepted(self, mock_tmux):
         """Test that trust prompt is detected and auto-accepted."""
         # Simulate trust prompt appearing in terminal output
         mock_tmux.get_history.return_value = (
@@ -475,25 +476,25 @@ class TestClaudeCodeProviderTrustPrompt:
         mock_window.active_pane = mock_pane
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_trust_prompt(timeout=2.0)
+        provider._handle_startup_prompts(timeout=2.0)
 
         # Verify Enter was sent to accept the trust prompt
         mock_pane.send_keys.assert_called_once_with("", enter=True)
 
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_handle_trust_prompt_not_needed(self, mock_tmux):
+    def test_handle_startup_prompts_not_needed(self, mock_tmux):
         """Test early return when Claude Code starts without trust prompt."""
         mock_tmux.get_history.return_value = "Welcome to Claude Code v2.1.0"
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_trust_prompt(timeout=2.0)
+        provider._handle_startup_prompts(timeout=2.0)
 
         # No session/pane access should happen
         mock_tmux.server.sessions.get.assert_not_called()
 
     @patch("cli_agent_orchestrator.providers.claude_code.time")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_handle_trust_prompt_timeout(self, mock_tmux, mock_time):
+    def test_handle_startup_prompts_timeout(self, mock_tmux, mock_time):
         """Test trust prompt handler times out gracefully."""
         # Return output that doesn't match trust prompt or welcome banner
         mock_tmux.get_history.return_value = "Loading..."
@@ -503,12 +504,12 @@ class TestClaudeCodeProviderTrustPrompt:
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         # Should not raise, just log a warning and return
-        provider._handle_trust_prompt(timeout=20.0)
+        provider._handle_startup_prompts(timeout=20.0)
 
         mock_tmux.server.sessions.get.assert_not_called()
 
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_handle_trust_prompt_empty_output_then_detected(self, mock_tmux):
+    def test_handle_startup_prompts_empty_output_then_detected(self, mock_tmux):
         """Test trust prompt detection after initially empty output."""
         # First call returns empty, second returns trust prompt
         mock_tmux.get_history.side_effect = [
@@ -523,7 +524,7 @@ class TestClaudeCodeProviderTrustPrompt:
         mock_window.active_pane = mock_pane
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_trust_prompt(timeout=5.0)
+        provider._handle_startup_prompts(timeout=5.0)
 
         mock_pane.send_keys.assert_called_once_with("", enter=True)
 
@@ -544,10 +545,10 @@ class TestClaudeCodeProviderTrustPrompt:
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_initialize_calls_handle_trust_prompt(
+    def test_initialize_calls_handle_startup_prompts(
         self, mock_tmux, mock_wait_status, mock_wait_shell
     ):
-        """Test that initialize calls _handle_trust_prompt."""
+        """Test that initialize calls _handle_startup_prompts."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
         # Trust prompt appears, then gets auto-accepted
