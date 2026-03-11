@@ -72,7 +72,7 @@ Agent profiles can declare which provider they should run on via the `provider` 
 
 When the supervisor calls `assign` or `handoff`, CAO reads the worker's agent profile and uses the declared `provider` if it is a valid value. If the key is missing or the value is not recognized, the worker inherits the supervisor's provider.
 
-Valid values: `q_cli`, `kiro_cli`, `claude_code`, `codex`.
+Valid values: `q_cli`, `kiro_cli`, `claude_code`, `codex`, `gemini_cli`.
 
 ### Example
 
@@ -109,8 +109,6 @@ You review code for quality and correctness.
 ```
 
 > **Note:** The `cao launch --provider` CLI flag is an explicit override and always takes precedence over the profile's `provider` key for the initial session.
-
-For design details, see [cross-provider-workflow.md](cross-provider-workflow.md).
 
 ## Installation
 

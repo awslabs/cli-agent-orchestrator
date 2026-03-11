@@ -28,17 +28,17 @@ Run:
 
 import time
 import uuid
-
-import pytest
-import requests
-
-from cli_agent_orchestrator.constants import API_BASE_URL
 from test.e2e.conftest import (
     cleanup_terminal,
     extract_output,
     get_terminal_status,
     wait_for_status,
 )
+
+import pytest
+import requests
+
+from cli_agent_orchestrator.constants import API_BASE_URL
 
 COMPLETION_TIMEOUT = 180
 
