@@ -227,7 +227,7 @@ def _run_cross_provider_test(
 
         # Keyword check is lenient — the primary goal of this test is
         # verifying the cross-provider resolution, not output quality.
-        # At least 1 keywords match confirms the worker processed the task.
+        # At least 1 keyword match confirms the worker processed the task.
         output_lower = output.lower()
         matched = [kw for kw in DATA_ANALYST_KEYWORDS if kw.lower() in output_lower]
         assert len(matched) >= 1, (

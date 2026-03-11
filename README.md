@@ -394,11 +394,13 @@ provider: claude_code
 ---
 ```
 
-Valid values: `kiro_cli`, `claude_code`, `codex`, `q_cli`.
+Valid values: `kiro_cli`, `claude_code`, `codex`, `q_cli`, `gemini_cli`.
 
 When a supervisor calls `assign` or `handoff`, CAO reads the worker's agent profile and uses the declared provider if present. If the key is missing or invalid, the worker falls back to the supervisor's provider.
 
 The `cao launch --provider` flag always takes precedence — it is treated as an explicit override and the profile's `provider` key is not consulted for the initial session.
+
+For ready-to-use examples, see [`examples/cross-provider/`](examples/cross-provider/).
 
 ## Security
 
