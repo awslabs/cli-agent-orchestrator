@@ -400,6 +400,8 @@ When a supervisor calls `assign` or `handoff`, CAO reads the worker's agent prof
 
 The `cao launch --provider` flag always takes precedence — it is treated as an explicit override and the profile's `provider` key is not consulted for the initial session.
 
+For ready-to-use examples, see [`examples/cross-provider/`](examples/cross-provider/).
+
 ## Security
 
 See [SECURITY.md](SECURITY.md) for vulnerability reporting, security scanning, and best practices.
