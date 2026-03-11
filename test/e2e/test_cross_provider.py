@@ -49,8 +49,16 @@ DATA_ANALYST_TASK = (
 )
 
 DATA_ANALYST_KEYWORDS = [
-    "mean", "median", "standard deviation", "3.0", "1.41", "dataset",
-    "analysis", "calculate", "send_message", "CAO_TERMINAL_ID",
+    "mean",
+    "median",
+    "standard deviation",
+    "3.0",
+    "1.41",
+    "dataset",
+    "analysis",
+    "calculate",
+    "send_message",
+    "CAO_TERMINAL_ID",
 ]
 
 
@@ -64,9 +72,10 @@ def _create_session(provider: str, agent_profile: str, session_name: str):
             "session_name": session_name,
         },
     )
-    assert resp.status_code in (200, 201), (
-        f"Session creation failed: {resp.status_code} {resp.text}"
-    )
+    assert resp.status_code in (
+        200,
+        201,
+    ), f"Session creation failed: {resp.status_code} {resp.text}"
     data = resp.json()
     return data["id"], data["session_name"]
 
@@ -101,9 +110,10 @@ def _add_terminal_in_session(
         if resp.status_code != 500 or attempt >= retries:
             break
 
-    assert last_resp is not None and last_resp.status_code in (200, 201), (
-        f"Terminal creation failed: {last_resp.status_code} {last_resp.text}"
-    )
+    assert last_resp is not None and last_resp.status_code in (
+        200,
+        201,
+    ), f"Terminal creation failed: {last_resp.status_code} {last_resp.text}"
     data = last_resp.json()
     return data["id"], data.get("provider", provider)
 
@@ -121,7 +131,9 @@ def _run_cross_provider_test(
     4. Send task, wait for completion, validate output
     """
     session_suffix = uuid.uuid4().hex[:6]
-    session_name = f"e2e-xprov-{supervisor_provider[:4]}-{expected_worker_provider[:4]}-{session_suffix}"
+    session_name = (
+        f"e2e-xprov-{supervisor_provider[:4]}-{expected_worker_provider[:4]}-{session_suffix}"
+    )
     supervisor_id = None
     worker_id = None
     actual_session = None
@@ -141,8 +153,7 @@ def _run_cross_provider_test(
                 break
             time.sleep(3)
         assert s in ("idle", "completed"), (
-            f"Supervisor did not become ready within 90s "
-            f"(provider={supervisor_provider})"
+            f"Supervisor did not become ready within 90s " f"(provider={supervisor_provider})"
         )
         time.sleep(2)
 
@@ -189,9 +200,7 @@ def _run_cross_provider_test(
         assert resp.status_code == 200, f"Send message failed: {resp.status_code}"
 
         # Step 6: Wait for completion
-        assert wait_for_status(
-            worker_id, "completed", timeout=COMPLETION_TIMEOUT
-        ), (
+        assert wait_for_status(worker_id, "completed", timeout=COMPLETION_TIMEOUT), (
             f"Worker did not reach COMPLETED within {COMPLETION_TIMEOUT}s "
             f"(profile={worker_profile}, provider={expected_worker_provider})"
         )
