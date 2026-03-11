@@ -33,9 +33,9 @@ from cli_agent_orchestrator.services import (
 from cli_agent_orchestrator.services.cleanup_service import cleanup_old_data
 from cli_agent_orchestrator.services.inbox_service import LogFileHandler
 from cli_agent_orchestrator.services.terminal_service import OutputMode
+from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 from cli_agent_orchestrator.utils.logging import setup_logging
 from cli_agent_orchestrator.utils.terminal import generate_session_name
-from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 
 logger = logging.getLogger(__name__)
 

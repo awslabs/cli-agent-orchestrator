@@ -24,6 +24,7 @@ Define the agent's role, responsibilities, and behavior here.
 
 ## Optional Fields
 
+- `provider` (string): Provider to run this agent on (e.g., `"claude_code"`, `"kiro_cli"`). See [Cross-Provider Orchestration](#cross-provider-orchestration).
 - `mcpServers` (object): MCP server configurations for additional tools
 - `tools` (array): List of allowed tools, use `["*"]` for all
 - `allowedTools` (array): Whitelist of tools (e.g., `["@builtin", "@cao-mcp-server"]`)
@@ -64,6 +65,52 @@ You are the Developer Agent in a multi-agent system. Your primary responsibility
 2. **ALWAYS include comprehensive comments** in your code to explain complex logic.
 3. **ALWAYS consider edge cases** and handle exceptions appropriately.
 ```
+
+## Cross-Provider Orchestration
+
+Agent profiles can declare which provider they should run on via the `provider` key. This enables mixed-provider workflows where a supervisor on one provider delegates to workers on different providers.
+
+When the supervisor calls `assign` or `handoff`, CAO reads the worker's agent profile and uses the declared `provider` if it is a valid value. If the key is missing or the value is not recognized, the worker inherits the supervisor's provider.
+
+Valid values: `q_cli`, `kiro_cli`, `claude_code`, `codex`.
+
+### Example
+
+A Kiro CLI supervisor delegating to a Claude Code developer:
+
+```markdown
+---
+name: supervisor
+description: Code Supervisor
+provider: kiro_cli
+---
+
+You orchestrate tasks across developer and reviewer agents.
+```
+
+```markdown
+---
+name: developer
+description: Developer Agent
+provider: claude_code
+---
+
+You write code based on specifications.
+```
+
+```markdown
+---
+name: reviewer
+description: Code Reviewer
+# No provider key — inherits from supervisor (kiro_cli)
+---
+
+You review code for quality and correctness.
+```
+
+> **Note:** The `cao launch --provider` CLI flag is an explicit override and always takes precedence over the profile's `provider` key for the initial session.
+
+For design details, see [cross-provider-workflow.md](cross-provider-workflow.md).
 
 ## Installation
 
