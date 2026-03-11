@@ -427,6 +427,24 @@ class TestKiroCliSupervisorOrchestration:
 
 
 # ---------------------------------------------------------------------------
+# Kimi CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestKimiCliSupervisorOrchestration:
+    """E2E supervisor orchestration tests for the Kimi CLI provider."""
+
+    def test_supervisor_handoff(self, require_kimi):
+        """Supervisor uses handoff MCP tool to delegate to report_generator."""
+        _run_supervisor_handoff_test(provider="kimi_cli")
+
+    def test_supervisor_assign_and_handoff(self, require_kimi):
+        """Supervisor uses assign + handoff to orchestrate multi-agent workflow."""
+        _run_supervisor_assign_test(provider="kimi_cli")
+
+
+# ---------------------------------------------------------------------------
 # Gemini CLI provider
 # ---------------------------------------------------------------------------
 
