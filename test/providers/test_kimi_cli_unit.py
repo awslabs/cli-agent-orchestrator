@@ -148,13 +148,16 @@ class TestKimiCliProviderInitialization:
     @patch("cli_agent_orchestrator.providers.kimi_cli.wait_for_shell", return_value=True)
     @patch("cli_agent_orchestrator.providers.kimi_cli.tmux_client")
     def test_initialize_sends_kimi_command(self, mock_tmux, mock_wait_shell, mock_wait_status):
-        """Test that initialize sends the correct kimi --yolo command."""
+        """Test that initialize sends the kimi --yolo command with cd and TERM override."""
         provider = KimiCliProvider("term-1", "session-1", "window-1")
         provider.initialize()
 
         call_args = mock_tmux.send_keys.call_args
         command = call_args[0][2]
-        assert command == "kimi --yolo"
+        assert "cd " in command
+        assert "TERM=xterm-256color" in command
+        assert "kimi --yolo" in command
+        provider.cleanup()
 
 
 # =============================================================================
@@ -540,10 +543,14 @@ class TestKimiCliProviderBuildCommand:
     """Tests for KimiCliProvider._build_kimi_command()."""
 
     def test_build_command_no_profile(self):
-        """Test command without agent profile is just 'kimi --yolo'."""
+        """Test command without agent profile includes cd, TERM override, and kimi --yolo."""
         provider = KimiCliProvider("term-1", "session-1", "window-1")
         command = provider._build_kimi_command()
-        assert command == "kimi --yolo"
+        assert "cd " in command
+        assert "TERM=xterm-256color" in command
+        assert "kimi --yolo" in command
+        assert provider._temp_dir is not None
+        provider.cleanup()
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
     def test_build_command_with_system_prompt(self, mock_load):
@@ -830,7 +837,7 @@ class TestKimiCliProviderBuildCommand:
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
     def test_build_command_profile_no_system_prompt(self, mock_load):
-        """Test command with profile that has no system prompt (no temp files)."""
+        """Test command with profile that has no system prompt (no agent file, but temp dir exists)."""
         mock_profile = MagicMock()
         mock_profile.system_prompt = None
         mock_profile.mcpServers = None
@@ -839,8 +846,10 @@ class TestKimiCliProviderBuildCommand:
         provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
         command = provider._build_kimi_command()
 
-        assert command == "kimi --yolo"
-        assert provider._temp_dir is None
+        assert "kimi --yolo" in command
+        assert "--agent-file" not in command
+        assert provider._temp_dir is not None
+        provider.cleanup()
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
     def test_build_command_profile_empty_system_prompt(self, mock_load):
@@ -853,8 +862,10 @@ class TestKimiCliProviderBuildCommand:
         provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
         command = provider._build_kimi_command()
 
-        assert command == "kimi --yolo"
-        assert provider._temp_dir is None
+        assert "kimi --yolo" in command
+        assert "--agent-file" not in command
+        assert provider._temp_dir is not None
+        provider.cleanup()
 
 
 # =============================================================================
@@ -947,6 +958,11 @@ class TestKimiCliProviderPatterns:
         assert re.search(IDLE_PROMPT_PATTERN, "user@my-app💫")
         assert re.search(IDLE_PROMPT_PATTERN, "haofeif@cli-agent-orchestrator💫")
 
+    def test_idle_prompt_pattern_bare_emoji(self):
+        """Test idle prompt pattern matches bare emoji (Kimi v1.20.0+ format)."""
+        assert re.search(IDLE_PROMPT_PATTERN, "💫")
+        assert re.search(IDLE_PROMPT_PATTERN, "✨")
+
     def test_idle_prompt_pattern_no_thinking(self):
         """Test idle prompt pattern matches no-thinking mode prompt (✨)."""
         assert re.search(IDLE_PROMPT_PATTERN, "user@my-app✨")
@@ -960,7 +976,9 @@ class TestKimiCliProviderPatterns:
         """Test idle prompt pattern doesn't match arbitrary text."""
         assert not re.search(IDLE_PROMPT_PATTERN, "Hello world")
         assert not re.search(IDLE_PROMPT_PATTERN, "some random text")
-        assert not re.search(IDLE_PROMPT_PATTERN, "💫 alone")
+        # With EOL anchor (as used in get_status), emoji followed by text doesn't match
+        idle_prompt_eol = IDLE_PROMPT_PATTERN + r"\s*$"
+        assert not re.search(idle_prompt_eol, "💫 alone")
 
     def test_welcome_banner_pattern(self):
         """Test welcome banner detection."""

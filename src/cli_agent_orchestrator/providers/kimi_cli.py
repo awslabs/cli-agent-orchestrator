@@ -5,7 +5,7 @@ It runs as an interactive TUI using prompt_toolkit in the terminal.
 
 Key characteristics:
 - Command: ``kimi`` (installed via ``brew install kimi-cli`` or ``uv tool install kimi-cli``)
-- Idle prompt: ``username@dirname💫`` (thinking mode, default) or ``username@dirname✨``
+- Idle prompt: ``💫`` (thinking mode, default) or ``✨`` (optionally prefixed with ``username@dirname``)
 - Processing: No idle prompt visible at bottom while the response is streaming
 - Response format: Bullet points prefixed with ``•`` (U+2022)
 - Thinking output: Gray italic ``•`` bullets (ANSI color 38;5;244 + italic)
@@ -59,12 +59,12 @@ class ProviderError(Exception):
 # Matches sequences like \x1b[0m, \x1b[38;5;244m, \x1b[1m, etc.
 ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
 
-# Kimi idle prompt: ``username@dirname💫`` or ``username@dirname✨``.
+# Kimi idle prompt: ``💫`` or ``✨`` (optionally prefixed with ``username@dirname``).
 # ✨ appears in normal agent mode (--no-thinking).
 # 💫 appears when thinking mode is enabled (default behavior).
-# Username comes from getpass.getuser(), dirname is the last path component.
-# Rendered bold in terminal: \x1b[1m...prompt...\x1b[0m
-IDLE_PROMPT_PATTERN = r"\w+@[\w.-]+[✨💫]"
+# Kimi CLI v1.20.0+ renders just the emoji; earlier versions showed ``username@dirname💫``.
+# The prefix is made optional to support both formats.
+IDLE_PROMPT_PATTERN = r"(?:\w+@[\w.-]+)?[✨💫]"
 
 # Number of lines from bottom to scan for the idle prompt.
 # Kimi's TUI renders empty padding lines between the prompt and the status bar.
@@ -81,12 +81,19 @@ IDLE_PROMPT_PATTERN_LOG = r"[✨💫]"
 # Used to detect successful initialization without needing to wait for prompt.
 WELCOME_BANNER_PATTERN = r"Welcome to Kimi Code CLI!"
 
-# User input box boundaries. Kimi displays user messages in a bordered box:
+# User input box boundaries (pre-v1.20.0). Kimi displayed user messages in a bordered box:
 #   ╭──────────────────────────────╮
 #   │ user message text             │
 #   ╰──────────────────────────────╯
+# In v1.20.0+, user input appears on the prompt line: ``💫 user message``
 USER_INPUT_BOX_START_PATTERN = r"╭─"
 USER_INPUT_BOX_END_PATTERN = r"╰─"
+
+# Prompt line with user input (v1.20.0+ format).
+# Matches ``💫 some text`` or ``✨ some text`` — a prompt emoji followed by non-whitespace
+# on the SAME line. Uses [^\S\n]+ (horizontal whitespace only) to avoid matching
+# across newlines (a bare ``💫`` followed by blank lines then status bar).
+PROMPT_WITH_INPUT_PATTERN = r"(?:\w+@[\w.-]+)?[✨💫][^\S\n]+\S"
 
 # Response/thinking bullet pattern: ``•`` (U+2022) at the start of a line.
 # Both thinking (internal monologue) and response (final answer) use this marker.
@@ -160,12 +167,25 @@ class KimiCliProvider(BaseProvider):
         Uses shlex.join() for safe escaping of all arguments.
 
         Command structure:
-            kimi --yolo [--agent-file FILE] [--mcp-config JSON]
+            cd <temp_dir> && TERM=xterm-256color kimi --yolo [--agent-file FILE] [--mcp-config JSON]
+
+        The ``cd`` is required because Kimi CLI v1.20.0+ enforces a per-directory
+        single-instance lock — only one kimi process can run in a given directory.
+        Each provider instance gets its own temp directory to avoid conflicts.
+
+        The ``TERM=xterm-256color`` override is needed because Kimi CLI v1.20.0+
+        silently exits when TERM=tmux-256color (the tmux default).
 
         The --yolo flag auto-approves all tool actions, which is required for
         non-interactive operation in CAO-managed tmux sessions.
         """
         command_parts = ["kimi", "--yolo"]
+
+        # Always create a temp directory for this instance.
+        # Kimi CLI v1.20.0+ has a per-directory single-instance lock, so each
+        # provider instance needs its own working directory.
+        if not self._temp_dir:
+            self._temp_dir = tempfile.mkdtemp(prefix="cao_kimi_")
 
         if self._agent_profile is not None:
             try:
@@ -173,11 +193,9 @@ class KimiCliProvider(BaseProvider):
 
                 # Build agent file from profile's system prompt.
                 # Kimi uses YAML agent files with a system_prompt_path pointing
-                # to a markdown file. We create both in a temp directory.
+                # to a markdown file. We create both in the temp directory.
                 system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
                 if system_prompt:
-                    self._temp_dir = tempfile.mkdtemp(prefix="cao_kimi_")
-
                     # Write the system prompt as a markdown file
                     prompt_file = os.path.join(self._temp_dir, "system.md")
                     with open(prompt_file, "w") as f:
@@ -229,7 +247,9 @@ class KimiCliProvider(BaseProvider):
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
-        return shlex.join(command_parts)
+        # cd to unique temp dir (per-directory lock) + set TERM for tmux compatibility
+        kimi_cmd = shlex.join(command_parts)
+        return f"cd {shlex.quote(self._temp_dir)} && TERM=xterm-256color {kimi_cmd}"
 
     @classmethod
     def _ensure_mcp_timeout(cls) -> None:
@@ -305,11 +325,17 @@ class KimiCliProvider(BaseProvider):
         # Send Kimi command to the tmux window
         tmux_client.send_keys(self.session_name, self.window_name, command)
 
-        # Wait for Kimi CLI to reach IDLE state (prompt visible).
-        # Kimi takes a few seconds to load and display the welcome banner.
+        # Wait for Kimi CLI to reach IDLE or COMPLETED state (prompt visible).
+        # Accept both IDLE and COMPLETED — some CLI versions show a startup
+        # message that get_status() interprets as a completed response.
         # Longer timeout (120s) to account for first-run setup and when
         # multiple Kimi instances are starting concurrently (e.g. assign flow).
-        if not wait_until_status(self, TerminalStatus.IDLE, timeout=120.0, polling_interval=1.0):
+        if not wait_until_status(
+            self,
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+            timeout=120.0,
+            polling_interval=1.0,
+        ):
             raise TimeoutError("Kimi CLI initialization timed out after 120 seconds")
 
         self._initialized = True
@@ -360,22 +386,27 @@ class KimiCliProvider(BaseProvider):
         idle_prompt_eol = IDLE_PROMPT_PATTERN + r"\s*$"
         has_idle_prompt = any(re.search(idle_prompt_eol, line) for line in bottom_lines)
 
-        # Latch: detect user input box to distinguish IDLE from COMPLETED.
-        # The welcome banner also uses ╭─/╰─ box-drawing characters, so a single
-        # box-start match is ambiguous. We use two strategies:
+        # Latch: detect user input to distinguish IDLE from COMPLETED.
+        # Supports two formats:
         #
-        # 1. During PROCESSING (no idle prompt): the welcome banner may have scrolled
-        #    out, so any ╭─ match is from user input. Latch immediately.
-        # 2. During IDLE/COMPLETED (idle prompt visible): count ╰─ occurrences.
-        #    Welcome banner contributes exactly 1; each user input adds 1 more.
-        #    Two or more means a user message was submitted.
-        if not has_idle_prompt:
-            if re.search(USER_INPUT_BOX_START_PATTERN, clean_output):
+        # Pre-v1.20.0: User input in bordered box (╭─...╰─).
+        #   - During PROCESSING (no idle prompt): any ╭─ means user input
+        #   - During IDLE/COMPLETED: count ╰─ occurrences (welcome banner = 1, input = 2+)
+        #
+        # v1.20.0+: User input on prompt line (``💫 message text``).
+        #   - Detect prompt emoji followed by non-whitespace text
+        if not self._has_received_input:
+            # v1.20.0+: prompt line with text after the emoji
+            if re.search(PROMPT_WITH_INPUT_PATTERN, clean_output):
                 self._has_received_input = True
-        else:
-            box_end_count = len(re.findall(USER_INPUT_BOX_END_PATTERN, clean_output))
-            if box_end_count >= 2:
-                self._has_received_input = True
+            # Pre-v1.20.0: input box detection
+            elif not has_idle_prompt:
+                if re.search(USER_INPUT_BOX_START_PATTERN, clean_output):
+                    self._has_received_input = True
+            else:
+                box_end_count = len(re.findall(USER_INPUT_BOX_END_PATTERN, clean_output))
+                if box_end_count >= 2:
+                    self._has_received_input = True
 
         if has_idle_prompt:
             if self._has_received_input:
@@ -401,20 +432,21 @@ class KimiCliProvider(BaseProvider):
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract Kimi's final response from terminal output.
 
-        Extraction strategy:
+        Supports two formats:
+
+        Pre-v1.20.0 (input box format):
         1. Find the last user input box (╭─...╰─) in clean text
         2. Collect all content between the box end and the next prompt
         3. Filter out thinking bullets (gray ANSI-styled lines)
-        4. Return the cleaned response text
 
-        Fallback for long responses (user input box scrolled out of capture):
+        v1.20.0+ (inline prompt format):
+        1. Find the last prompt-with-input line (``💫 message text``)
+        2. Collect all content between that line and the next bare prompt
+        3. Filter out thinking bullets
+
+        Fallback for long responses (markers scrolled out of capture):
         - Extract all content from start of capture up to the idle prompt
         - Filter out thinking/status bar lines
-        - This captures the tail end of the response, which is typically
-          sufficient for handoff result delivery
-
-        The raw (ANSI-preserved) output is used to distinguish thinking
-        from response bullets, since both use the ``•`` prefix character.
 
         Args:
             script_output: Raw terminal output from tmux capture
@@ -431,29 +463,42 @@ class KimiCliProvider(BaseProvider):
         raw_lines = script_output.split("\n")
         clean_lines = clean_output.split("\n")
 
-        # Find the last user input box end line (╰─)
+        # Strategy 1: Find the last user input box end line (╰─) — pre-v1.20.0
         box_end_idx = None
+        # Only consider box-end lines that come AFTER the welcome banner.
+        # The welcome banner itself has ╰─, so we skip it by finding the
+        # welcome banner line first.
+        welcome_idx = 0
         for i, line in enumerate(clean_lines):
-            if re.search(USER_INPUT_BOX_END_PATTERN, line):
+            if re.search(WELCOME_BANNER_PATTERN, line):
+                welcome_idx = i
+        for i in range(welcome_idx + 1, len(clean_lines)):
+            if re.search(USER_INPUT_BOX_END_PATTERN, clean_lines[i]):
                 box_end_idx = i
 
-        if box_end_idx is None:
-            # User input box scrolled out of capture (response > 200 lines).
-            # Fall back to extracting everything before the last idle prompt,
-            # excluding status bar and welcome banner lines.
+        # Strategy 2: Find the last prompt-with-input line — v1.20.0+
+        prompt_input_idx = None
+        for i, line in enumerate(clean_lines):
+            if re.search(PROMPT_WITH_INPUT_PATTERN, line):
+                prompt_input_idx = i
+
+        # Choose the best anchor: prefer input box (more precise), fall back to prompt-with-input
+        if box_end_idx is not None:
+            response_start = box_end_idx + 1
+        elif prompt_input_idx is not None:
+            response_start = prompt_input_idx + 1
+        else:
+            # Neither marker found — long response scrolled everything out
             return self._extract_without_input_box(raw_lines, clean_lines)
 
-        # Find the next idle prompt line after the box end.
-        # Use the general pattern (not end-of-line anchored) since
-        # the prompt line may have trailing whitespace.
+        # Find the next idle prompt line (bare prompt, no text after it)
+        idle_prompt_eol = IDLE_PROMPT_PATTERN + r"\s*$"
         prompt_idx = len(clean_lines)  # default: end of output
-        for i in range(box_end_idx + 1, len(clean_lines)):
-            if re.search(IDLE_PROMPT_PATTERN, clean_lines[i]):
+        for i in range(response_start, len(clean_lines)):
+            if re.search(idle_prompt_eol, clean_lines[i]):
                 prompt_idx = i
                 break
 
-        # Response region: lines between box end and prompt (exclusive)
-        response_start = box_end_idx + 1
         response_end = prompt_idx
 
         # Collect all non-empty lines for the fallback response
@@ -464,7 +509,7 @@ class KimiCliProvider(BaseProvider):
         ]
 
         if not all_response_lines:
-            raise ValueError("Empty Kimi CLI response - no content found after input box")
+            raise ValueError("Empty Kimi CLI response - no content found after input")
 
         # Filter out thinking bullets and status bar lines.
         # Thinking bullets have gray ANSI color (38;5;244) in the raw output.

@@ -32,7 +32,7 @@ The provider detects Kimi CLI states by analyzing tmux terminal output:
 
 | Status | Pattern | Description |
 |--------|---------|-------------|
-| **IDLE** | `username@dirname💫` or `username@dirname✨` at bottom | Prompt visible, ready for input |
+| **IDLE** | `💫` or `✨` at bottom (optionally prefixed with `username@dirname`) | Prompt visible, ready for input |
 | **PROCESSING** | No prompt at bottom | Response is streaming |
 | **COMPLETED** | Prompt at bottom + latching flag (user input detected) | Task finished |
 | **ERROR** | `Error:`, `APIError:`, `ConnectionError:` patterns | Error detected |
@@ -42,16 +42,23 @@ The provider detects Kimi CLI states by analyzing tmux terminal output:
 - **💫** (dizzy): Thinking mode enabled (default behavior)
 - **✨** (sparkle): Thinking mode disabled (`--no-thinking` flag)
 
-The provider matches both symbols using the pattern `\w+@[\w.-]+[✨💫]`.
+The provider matches both symbols using the pattern `(?:\w+@[\w.-]+)?[✨💫]`. The `username@dirname` prefix is optional to support both v1.20.0+ (bare emoji) and earlier versions.
 
 ## Message Extraction
 
-Response extraction from terminal output:
+Response extraction from terminal output (supports two formats):
 
+**v1.20.0+ (inline prompt format):**
+1. Find the last prompt-with-input line (`💫 message text`)
+2. Collect all content between that line and the next bare prompt (`💫`)
+3. Filter out thinking bullets (gray ANSI-styled `•` lines)
+
+**Pre-v1.20.0 (input box format):**
 1. Find the last user input box (bordered with `╭─` / `╰─`)
 2. Collect all content between the box end and the next prompt
-3. Filter out thinking bullets (gray ANSI-styled `•` lines)
-4. Return the cleaned response text
+3. Filter out thinking bullets
+
+**Fallback** (long responses where markers scroll out of capture): Extract all content up to the last idle prompt, filtering out TUI chrome.
 
 ### Thinking vs Response Bullets
 
@@ -115,30 +122,36 @@ Kimi CLI does not automatically forward parent shell environment variables to MC
 
 ### Provider Lifecycle
 
-1. **Initialize**: Set MCP timeout in `~/.kimi/config.toml` (if MCP servers) → wait for shell → send `kimi --yolo` → wait for IDLE (up to 60s)
+1. **Initialize**: Create unique temp dir → set MCP timeout in `~/.kimi/config.toml` (if MCP servers) → wait for shell → send `cd <tempdir> && TERM=xterm-256color kimi --yolo` → wait for IDLE or COMPLETED (up to 120s)
 2. **Status Detection**: Check bottom 50 lines for idle prompt pattern (end-of-line anchored)
 3. **Message Extraction**: Line-based approach mapping raw and clean output for thinking filtering
 4. **Exit**: Send `/exit` command
 5. **Cleanup**: Remove temp agent files, restore MCP timeout in config.toml, reset state
 
-### Terminal Output Format
+### Terminal Output Format (v1.20.0+)
 
 ```
 ╭────────────────────────────────────────────────────────╮
 │ Welcome to Kimi Code CLI!                              │
 ╰────────────────────────────────────────────────────────╯
-user@project💫 create a function
-╭────────────────────────────────────────────────────────╮
-│ create a function                                      │
-╰────────────────────────────────────────────────────────╯
+💫 create a function
 • [thinking] Let me create the function...
 • Here is the function:
 
 def greet(name):
     return f"Hello, {name}!"
 
-user@project💫
+💫
 ```
+
+### Kimi CLI v1.20.0 Compatibility
+
+The provider handles several v1.20.0 behavioral changes:
+
+- **Prompt format**: Changed from `user@dirname💫` to bare `💫`. The idle pattern uses an optional prefix.
+- **Input display**: Removed bordered input boxes (`╭─...╰─`). User input now appears inline on the prompt line (`💫 message text`).
+- **TERM variable**: Kimi CLI silently exits when `TERM=tmux-256color` (the tmux default). The provider overrides with `TERM=xterm-256color`.
+- **Per-directory lock**: Only one Kimi instance can run in a given directory. Each provider instance uses its own temp directory via `cd`.
 
 ## E2E Testing
 
@@ -180,7 +193,7 @@ kimi login
 If Kimi CLI takes too long to start, check:
 - Network connectivity (Kimi requires API access)
 - Authentication status (`kimi login`)
-- The provider waits up to 60 seconds for initialization
+- The provider waits up to 120 seconds for initialization
 
 ### Status bar not detected
 
