@@ -32,6 +32,7 @@ from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.services.log_writer import log_writer
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.terminal_service import OutputMode
+from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 from cli_agent_orchestrator.utils.logging import setup_logging
 from cli_agent_orchestrator.utils.terminal import generate_session_name
 
@@ -209,8 +210,9 @@ async def create_terminal_in_session(
 ) -> Terminal:
     """Create additional terminal in existing session."""
     try:
+        resolved_provider = resolve_provider(agent_profile, fallback_provider=provider)
         result = await terminal_service.create_terminal(
-            provider=provider,
+            provider=resolved_provider,
             agent_profile=agent_profile,
             session_name=session_name,
             new_session=False,

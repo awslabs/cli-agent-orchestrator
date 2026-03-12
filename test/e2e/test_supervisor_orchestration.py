@@ -23,6 +23,7 @@ Requires:
 Run:
     uv run pytest -m e2e test/e2e/test_supervisor_orchestration.py -v -o "addopts="
     uv run pytest -m e2e test/e2e/test_supervisor_orchestration.py -v -o "addopts=" -k codex
+    uv run pytest -m e2e test/e2e/test_supervisor_orchestration.py -v -o "addopts=" -k gemini_cli
 """
 
 import time
@@ -86,9 +87,9 @@ def _wait_for_ready(terminal_id: str, timeout: float = 120.0, poll: float = 3.0)
     """Wait for provider to be ready (idle or completed).
 
     After initialization, most providers reach 'idle'. However, providers
-    that use an initial prompt reach 'completed' because the prompt
-    produces a response. Both states indicate the provider is ready to
-    accept input.
+    that use an initial prompt (e.g. Gemini CLI with -i flag) reach
+    'completed' because the prompt produces a response. Both states
+    indicate the provider is ready to accept input.
     """
     start = time.time()
     while time.time() - start < timeout:
@@ -111,9 +112,9 @@ def _wait_for_supervisor_done(
 ) -> tuple:
     """Wait for supervisor to reach COMPLETED AND spawn expected workers.
 
-    Some providers report COMPLETED after initial text output but before
-    MCP tool calls (handoff/assign) finish creating worker terminals.
-    TUI-based providers may keep the idle prompt visible at all times,
+    Some providers (notably Gemini CLI) report COMPLETED after initial text
+    output but before MCP tool calls (handoff/assign) finish creating worker
+    terminals. Gemini's Ink TUI keeps the idle prompt visible at all times,
     so the status detector sees "response + idle prompt" = COMPLETED even
     while the model is between text output and the first MCP tool call.
 
@@ -174,8 +175,8 @@ def _run_supervisor_handoff_test(provider: str):
         assert supervisor_id, "Supervisor terminal ID should not be empty"
 
         # Step 2: Wait for provider to be ready (idle or completed).
-        # Providers with initial prompts reach 'completed' after processing
-        # the system prompt; others reach 'idle'.
+        # Providers with initial prompts (Gemini CLI -i) reach 'completed'
+        # after processing the system prompt; others reach 'idle'.
         assert _wait_for_ready(
             supervisor_id, timeout=120.0
         ), f"Supervisor did not become ready within 120s (provider={provider})"
@@ -195,8 +196,8 @@ def _run_supervisor_handoff_test(provider: str):
         assert resp.status_code == 200, f"Send message failed: {resp.status_code}"
 
         # Step 4+5: Wait for supervisor to complete AND create worker terminal.
-        # Uses combined polling because some providers report COMPLETED from
-        # initial text output before MCP tool calls finish.
+        # Uses combined polling because some providers (Gemini CLI) report
+        # COMPLETED from initial text output before MCP tool calls finish.
         status, terminals = _wait_for_supervisor_done(
             supervisor_id, actual_session, min_terminals=2
         )
@@ -263,8 +264,8 @@ def _run_supervisor_assign_test(provider: str):
         assert supervisor_id, "Supervisor terminal ID should not be empty"
 
         # Step 2: Wait for provider to be ready (idle or completed).
-        # Providers with initial prompts reach 'completed' after processing
-        # the system prompt; others reach 'idle'.
+        # Providers with initial prompts (Gemini CLI -i) reach 'completed'
+        # after processing the system prompt; others reach 'idle'.
         assert _wait_for_ready(
             supervisor_id, timeout=120.0
         ), f"Supervisor did not become ready within 120s (provider={provider})"
@@ -287,8 +288,8 @@ def _run_supervisor_assign_test(provider: str):
 
         # Step 4+5: Wait for supervisor to complete AND create worker terminals.
         # assign(data_analyst) + handoff(report_generator) = at least 3 terminals.
-        # Uses combined polling because some providers report COMPLETED from
-        # initial text output before MCP tool calls finish.
+        # Uses combined polling because some providers (Gemini CLI) report
+        # COMPLETED from initial text output before MCP tool calls finish.
         status, terminals = _wait_for_supervisor_done(
             supervisor_id, actual_session, min_terminals=3
         )
@@ -423,3 +424,21 @@ class TestKiroCliSupervisorOrchestration:
     def test_supervisor_assign_and_handoff(self, require_kiro):
         """Supervisor uses assign + handoff to orchestrate multi-agent workflow."""
         _run_supervisor_assign_test(provider="kiro_cli")
+
+
+# ---------------------------------------------------------------------------
+# Gemini CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestGeminiCliSupervisorOrchestration:
+    """E2E supervisor orchestration tests for the Gemini CLI provider."""
+
+    def test_supervisor_handoff(self, require_gemini):
+        """Supervisor uses handoff MCP tool to delegate to report_generator."""
+        _run_supervisor_handoff_test(provider="gemini_cli")
+
+    def test_supervisor_assign_and_handoff(self, require_gemini):
+        """Supervisor uses assign + handoff to orchestrate multi-agent workflow."""
+        _run_supervisor_assign_test(provider="gemini_cli")

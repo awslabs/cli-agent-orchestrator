@@ -157,8 +157,15 @@ class ClaudeCodeProvider(BaseProvider):
         # Handle workspace trust prompt if it appears (new/untrusted directories)
         await self._handle_trust_prompt(timeout=20.0)
 
-        # Wait for Claude Code prompt to be ready
-        if not await wait_until_status(self.terminal_id, TerminalStatus.IDLE, timeout=30.0):
+        # Wait for Claude Code prompt to be ready.
+        # Accept both IDLE and COMPLETED — some CLI versions show a startup
+        # message that get_status() interprets as a completed response.
+        if not await wait_until_status(
+            self,
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+            timeout=30.0,
+            polling_interval=1.0,
+        ):
             raise TimeoutError("Claude Code initialization timed out after 30 seconds")
 
         self._initialized = True
