@@ -1,6 +1,5 @@
 """Claude Code provider implementation."""
 
-import json
 import logging
 import re
 import shlex
@@ -8,6 +7,7 @@ import time
 from typing import Optional
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.models.claude_agent import ClaudeAgentConfig
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -57,6 +57,7 @@ class ClaudeCodeProvider(BaseProvider):
     def _build_claude_command(self) -> str:
         """Build Claude Code command with agent profile if provided.
 
+        Loads agent profile from CAO agent store and converts to CLI flags.
         Returns properly escaped shell command string that can be safely sent via tmux.
         Uses shlex.join() to handle multiline strings and special characters correctly.
         """
@@ -69,38 +70,28 @@ class ClaudeCodeProvider(BaseProvider):
         if self._agent_profile is not None:
             try:
                 profile = load_agent_profile(self._agent_profile)
+            except RuntimeError:
+                raise ProviderError(
+                    f"Agent profile '{self._agent_profile}' not found in CAO agent store"
+                )
 
-                # Add system prompt - escape newlines to prevent tmux chunking issues
-                system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
-                if system_prompt:
-                    # Replace actual newlines with \n escape sequences
-                    # This prevents tmux send_keys chunking from breaking the command
-                    escaped_prompt = system_prompt.replace("\\", "\\\\").replace("\n", "\\n")
-                    command_parts.extend(["--append-system-prompt", escaped_prompt])
+            system_prompt = profile.system_prompt or ""
+            if system_prompt:
+                escaped = system_prompt.replace("\\", "\\\\").replace("\n", "\\n")
+                command_parts.extend(["--append-system-prompt", escaped])
 
-                # Add MCP config if present.
-                # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
-                # can identify the current terminal for handoff/assign operations.
-                # Claude Code does not automatically forward parent shell env vars
-                # to MCP subprocesses, so we inject it explicitly via the env field.
-                if profile.mcpServers:
-                    mcp_config = {}
-                    for server_name, server_config in profile.mcpServers.items():
-                        if isinstance(server_config, dict):
-                            mcp_config[server_name] = dict(server_config)
-                        else:
-                            mcp_config[server_name] = server_config.model_dump(exclude_none=True)
-
-                        env = mcp_config[server_name].get("env", {})
-                        if "CAO_TERMINAL_ID" not in env:
-                            env["CAO_TERMINAL_ID"] = self.terminal_id
-                            mcp_config[server_name]["env"] = env
-
-                    mcp_json = json.dumps({"mcpServers": mcp_config})
-                    command_parts.extend(["--mcp-config", mcp_json])
-
-            except Exception as e:
-                raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
+            # Build CLI flags from resolved profile (model, tools, hooks, MCP, etc.)
+            config = ClaudeAgentConfig(
+                name=profile.name,
+                description=profile.description,
+                model=profile.model,
+                allowedTools=profile.allowedTools,
+                disallowedTools=profile.disallowedTools,
+                tools=profile.tools,
+                mcpServers=profile.mcpServers,
+                hooks=profile.hooks,
+            )
+            command_parts.extend(config.to_cli_flags(terminal_id=self.terminal_id))
 
         # Use shlex.join() for proper shell escaping of all arguments
         # This correctly handles multiline strings, quotes, and special characters

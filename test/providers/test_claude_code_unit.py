@@ -9,6 +9,31 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider, ProviderError
 
 
+def _make_profile(
+    name="test-agent",
+    description="Test agent",
+    system_prompt=None,
+    model=None,
+    tools=None,
+    allowedTools=None,
+    disallowedTools=None,
+    mcpServers=None,
+    hooks=None,
+):
+    """Build a MagicMock that mimics an AgentProfile object."""
+    profile = MagicMock()
+    profile.name = name
+    profile.description = description
+    profile.system_prompt = system_prompt
+    profile.model = model
+    profile.tools = tools
+    profile.allowedTools = allowedTools
+    profile.disallowedTools = disallowedTools
+    profile.mcpServers = mcpServers
+    profile.hooks = hooks
+    return profile
+
+
 class TestClaudeCodeProviderInitialization:
     """Tests for ClaudeCodeProvider initialization."""
 
@@ -63,14 +88,11 @@ class TestClaudeCodeProviderInitialization:
     def test_initialize_with_agent_profile(
         self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load
     ):
-        """Test initialization with agent profile."""
+        """Test initialization with agent profile (found via CAO store fallback)."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
         mock_tmux.get_history.return_value = "Welcome to Claude Code v2.0"
-        mock_profile = MagicMock()
-        mock_profile.system_prompt = "Test system prompt"
-        mock_profile.mcpServers = None
-        mock_load.return_value = mock_profile
+        mock_load.return_value = _make_profile(system_prompt="Test system prompt")
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0", "test-agent")
         result = provider.initialize()
@@ -78,17 +100,17 @@ class TestClaudeCodeProviderInitialization:
         assert result is True
         mock_load.assert_called_once_with("test-agent")
 
-    @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_initialize_with_invalid_agent_profile(self, mock_tmux, mock_load, mock_wait_shell):
-        """Test initialization with invalid agent profile."""
+    def test_initialize_with_invalid_agent_profile(self, mock_tmux, mock_wait_shell, mock_load):
+        """Test initialization with invalid agent profile not found in CAO store."""
         mock_wait_shell.return_value = True
-        mock_load.side_effect = FileNotFoundError("Profile not found")
+        mock_load.side_effect = RuntimeError("Agent profile not found: invalid-agent")
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0", "invalid-agent")
 
-        with pytest.raises(ProviderError, match="Failed to load agent profile"):
+        with pytest.raises(ProviderError, match="not found in CAO agent store"):
             provider.initialize()
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
@@ -98,14 +120,13 @@ class TestClaudeCodeProviderInitialization:
     def test_initialize_with_mcp_servers(
         self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load
     ):
-        """Test initialization with MCP servers in profile."""
+        """Test initialization with MCP servers in profile (CAO store fallback)."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
         mock_tmux.get_history.return_value = "Welcome to Claude Code v2.0"
-        mock_profile = MagicMock()
-        mock_profile.system_prompt = None
-        mock_profile.mcpServers = {"server1": {"command": "test", "args": ["--flag"]}}
-        mock_load.return_value = mock_profile
+        mock_load.return_value = _make_profile(
+            mcpServers={"server1": {"command": "test", "args": ["--flag"]}}
+        )
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0", "test-agent")
         result = provider.initialize()
@@ -367,27 +388,25 @@ class TestClaudeCodeProviderMisc:
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     def test_build_claude_command_with_system_prompt(self, mock_load):
-        """Test building Claude command with system prompt."""
-        mock_profile = MagicMock()
-        mock_profile.system_prompt = "Test prompt\nwith newlines"
-        mock_profile.mcpServers = None
-        mock_load.return_value = mock_profile
+        """Test building Claude command with system prompt (CAO store fallback)."""
+        mock_load.return_value = _make_profile(system_prompt="Test prompt\nwith newlines")
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0", "test-agent")
         command = provider._build_claude_command()
 
         assert "claude" in command
+        # CAO store fallback uses --append-system-prompt, not --agent
         assert "--append-system-prompt" in command
+        assert "--agent" not in command
+        # Newlines should be escaped for tmux safety
+        assert "\\n" in command
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     def test_build_command_mcp_injects_terminal_id(self, mock_load):
         """Test that _build_claude_command injects CAO_TERMINAL_ID into MCP server env."""
-        mock_profile = MagicMock()
-        mock_profile.system_prompt = None
-        mock_profile.mcpServers = {
-            "cao-mcp-server": {"command": "cao-mcp-server", "args": ["--port", "8080"]}
-        }
-        mock_load.return_value = mock_profile
+        mock_load.return_value = _make_profile(
+            mcpServers={"cao-mcp-server": {"command": "cao-mcp-server", "args": ["--port", "8080"]}}
+        )
 
         provider = ClaudeCodeProvider("term-42", "test-session", "window-0", "test-agent")
         command = provider._build_claude_command()
@@ -406,15 +425,14 @@ class TestClaudeCodeProviderMisc:
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     def test_build_command_mcp_preserves_existing_env(self, mock_load):
         """Test that existing env vars in MCP config are preserved when injecting CAO_TERMINAL_ID."""
-        mock_profile = MagicMock()
-        mock_profile.system_prompt = None
-        mock_profile.mcpServers = {
-            "my-server": {
-                "command": "my-server",
-                "env": {"MY_VAR": "my_value", "OTHER": "other_value"},
+        mock_load.return_value = _make_profile(
+            mcpServers={
+                "my-server": {
+                    "command": "my-server",
+                    "env": {"MY_VAR": "my_value", "OTHER": "other_value"},
+                }
             }
-        }
-        mock_load.return_value = mock_profile
+        )
 
         provider = ClaudeCodeProvider("term-99", "test-session", "window-0", "test-agent")
         command = provider._build_claude_command()
@@ -434,15 +452,14 @@ class TestClaudeCodeProviderMisc:
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     def test_build_command_mcp_does_not_override_existing_terminal_id(self, mock_load):
         """Test that an existing CAO_TERMINAL_ID in MCP env is NOT overwritten."""
-        mock_profile = MagicMock()
-        mock_profile.system_prompt = None
-        mock_profile.mcpServers = {
-            "my-server": {
-                "command": "my-server",
-                "env": {"CAO_TERMINAL_ID": "user-provided-id"},
+        mock_load.return_value = _make_profile(
+            mcpServers={
+                "my-server": {
+                    "command": "my-server",
+                    "env": {"CAO_TERMINAL_ID": "user-provided-id"},
+                }
             }
-        }
-        mock_load.return_value = mock_profile
+        )
 
         provider = ClaudeCodeProvider("term-99", "test-session", "window-0", "test-agent")
         command = provider._build_claude_command()
@@ -565,3 +582,181 @@ class TestClaudeCodeProviderTrustPrompt:
         assert result is True
         # Verify trust prompt was auto-accepted (Enter sent)
         mock_pane.send_keys.assert_called_with("", enter=True)
+
+
+class TestBuildClaudeCommandResolutionOrder:
+    """Tests for agent resolution via CAO store."""
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_uses_append_system_prompt(self, mock_load):
+        """Agent profile uses --append-system-prompt."""
+        mock_load.return_value = _make_profile(
+            name="cao-agent",
+            description="CAO agent",
+            system_prompt="CAO system prompt",
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0", "cao-agent")
+        command = provider._build_claude_command()
+
+        assert "--append-system-prompt" in command
+        assert "--agent" not in command
+        mock_load.assert_called_once_with("cao-agent")
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_raises_provider_error_when_not_found(self, mock_load):
+        """Raises ProviderError when agent is not found in CAO store."""
+        mock_load.side_effect = RuntimeError("Agent profile not found: missing-agent")
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0", "missing-agent")
+
+        with pytest.raises(ProviderError, match="not found in CAO agent store"):
+            provider._build_claude_command()
+
+
+class TestBuildClaudeCommandCliFlags:
+    """Tests for CLI flag generation from AgentProfile fields via ClaudeAgentConfig."""
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_model_flag_in_command(self, mock_load):
+        """Test that --model flag is added when profile has model set."""
+        mock_load.return_value = _make_profile(
+            name="model-agent",
+            description="Model agent",
+            system_prompt="Be a model agent",
+            model="claude-sonnet-4-6",
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0", "model-agent")
+        command = provider._build_claude_command()
+
+        assert "--append-system-prompt" in command
+        assert "--model" in command
+        assert "claude-sonnet-4-6" in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_tools_flag_in_command(self, mock_load):
+        """Test that --tools flag is added when profile has tools set."""
+        mock_load.return_value = _make_profile(
+            name="tools-agent",
+            description="Tools agent",
+            system_prompt="Be a tools agent",
+            tools=["Bash", "Edit", "Read"],
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0", "tools-agent")
+        command = provider._build_claude_command()
+
+        assert "--tools" in command
+        assert "Bash,Edit,Read" in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_allowed_tools_flag_in_command(self, mock_load):
+        """Test --allowedTools is passed as space-separated args (not comma-joined)."""
+        import shlex as _shlex
+
+        mock_load.return_value = _make_profile(
+            name="allowed-agent",
+            description="Allowed agent",
+            system_prompt="Be an allowed agent",
+            allowedTools=["Read", "Bash(git log *)", "Bash(git diff *)"],
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0", "allowed-agent")
+        command = provider._build_claude_command()
+        parts = _shlex.split(command)
+
+        allowed_idx = parts.index("--allowedTools")
+        # Each tool must be a separate element, not comma-joined
+        assert parts[allowed_idx + 1] == "Read"
+        assert parts[allowed_idx + 2] == "Bash(git log *)"
+        assert parts[allowed_idx + 3] == "Bash(git diff *)"
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_disallowed_tools_flag_in_command(self, mock_load):
+        """Test --disallowedTools is passed as space-separated args (not comma-joined)."""
+        import shlex as _shlex
+
+        mock_load.return_value = _make_profile(
+            name="disallowed-agent",
+            description="Disallowed agent",
+            system_prompt="Be a disallowed agent",
+            disallowedTools=["Bash(git log *)", "Bash(git diff *)", "Edit"],
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0", "disallowed-agent")
+        command = provider._build_claude_command()
+        parts = _shlex.split(command)
+
+        disallowed_idx = parts.index("--disallowedTools")
+        # Each tool must be a separate element, not comma-joined
+        assert parts[disallowed_idx + 1] == "Bash(git log *)"
+        assert parts[disallowed_idx + 2] == "Bash(git diff *)"
+        assert parts[disallowed_idx + 3] == "Edit"
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_hooks_via_settings_flag(self, mock_load):
+        """Test that hooks are passed via --settings flag as JSON."""
+        mock_load.return_value = _make_profile(
+            name="hooks-agent",
+            description="Hooks agent",
+            system_prompt="Be a hooks agent",
+            hooks={
+                "PreToolUse": [
+                    {"matcher": "Edit", "hooks": [{"type": "command", "command": "echo pre"}]}
+                ]
+            },
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0", "hooks-agent")
+        command = provider._build_claude_command()
+
+        import shlex as _shlex
+
+        parts = _shlex.split(command)
+        assert "--settings" in parts
+        settings_json = parts[parts.index("--settings") + 1]
+        parsed = json.loads(settings_json)
+        assert "hooks" in parsed
+        assert "PreToolUse" in parsed["hooks"]
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_all_flags_combined_with_mcp(self, mock_load):
+        """Test command with all flags: --append-system-prompt, --model, --tools, --allowedTools, --settings, --mcp-config."""
+        mock_load.return_value = _make_profile(
+            name="full-agent",
+            description="Full agent",
+            system_prompt="Full system prompt",
+            model="opus",
+            mcpServers={"srv": {"command": "srv-cmd"}},
+            allowedTools=["Read"],
+            disallowedTools=["Edit"],
+            tools=["Bash"],
+            hooks={"PostToolUse": []},
+        )
+
+        provider = ClaudeCodeProvider("term-1", "test-session", "window-0", "full-agent")
+        command = provider._build_claude_command()
+
+        assert "--append-system-prompt" in command
+        assert "--agent" not in command
+        assert "--model" in command
+        assert "--tools" in command
+        assert "--allowedTools" in command
+        assert "--disallowedTools" in command
+        assert "--settings" in command
+        assert "--mcp-config" in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_no_extra_flags_when_profile_has_no_optionals(self, mock_load):
+        """Test that no extra flags are added when profile has no optional fields."""
+        mock_load.return_value = _make_profile(
+            name="basic-agent",
+            description="Basic agent",
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0", "basic-agent")
+        command = provider._build_claude_command()
+
+        # No system_prompt → no --append-system-prompt; no optional fields → no extra flags
+        assert command == "claude --dangerously-skip-permissions"
