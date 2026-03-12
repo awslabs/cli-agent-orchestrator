@@ -638,10 +638,9 @@ class TestCodexV0111FooterFormat:
     The new format uses "N% left" instead of "N% context left" and removes "? for shortcuts".
     """
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_idle_v0111_footer(self, mock_tmux):
+    def test_get_status_idle_v0111_footer(self):
         """IDLE with v0.111.0 footer format (no '? for shortcuts')."""
-        mock_tmux.get_history.return_value = (
+        output = (
             "╭───────────────────────────────────────────╮\n"
             "│ >_ OpenAI Codex (v0.111.0)                │\n"
             "│ model: gpt-5.3-codex high                 │\n"
@@ -655,14 +654,11 @@ class TestCodexV0111FooterFormat:
         )
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        assert provider.get_status(output) == TerminalStatus.IDLE
 
-        assert status == TerminalStatus.IDLE
-
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_completed_v0111_footer(self, mock_tmux):
+    def test_get_status_completed_v0111_footer(self):
         """COMPLETED with v0.111.0 footer (suggestion hint must not be treated as user input)."""
-        mock_tmux.get_history.return_value = (
+        output = (
             "› fix the bug\n"
             "• I've fixed the issue in main.py by correcting the import.\n"
             "\n"
@@ -672,14 +668,11 @@ class TestCodexV0111FooterFormat:
         )
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
 
-        assert status == TerminalStatus.COMPLETED
-
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_completed_v0111_multi_turn(self, mock_tmux):
+    def test_get_status_completed_v0111_multi_turn(self):
         """COMPLETED in multi-turn with v0.111.0 footer."""
-        mock_tmux.get_history.return_value = (
+        output = (
             "› first question\n"
             "• First answer.\n"
             "\n"
@@ -692,14 +685,11 @@ class TestCodexV0111FooterFormat:
         )
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
 
-        assert status == TerminalStatus.COMPLETED
-
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_processing_v0111_spinner(self, mock_tmux):
+    def test_get_status_processing_v0111_spinner(self):
         """PROCESSING when TUI shows spinner with v0.111.0 footer."""
-        mock_tmux.get_history.return_value = (
+        output = (
             "› [CAO Handoff] Do the task.\n"
             "\n"
             "• Working (0s • esc to interrupt)\n"
@@ -710,9 +700,7 @@ class TestCodexV0111FooterFormat:
         )
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
-
-        assert status == TerminalStatus.PROCESSING
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
 
 
 class TestCodexProviderMessageExtraction:
