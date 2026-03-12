@@ -122,8 +122,12 @@ class KiroCliProvider(BaseProvider):
         command = shlex.join(["kiro-cli", "chat", "--agent", self._agent_profile])
         tmux_client.send_keys(self.session_name, self.window_name, command)
 
-        # Step 3: Wait for Kiro CLI to fully initialize and show the agent prompt
-        if not wait_until_status(self, TerminalStatus.IDLE, timeout=30.0):
+        # Step 3: Wait for Kiro CLI to fully initialize and show the agent prompt.
+        # Accept both IDLE and COMPLETED — some CLI versions show a startup
+        # message that get_status() interprets as a completed response.
+        if not wait_until_status(
+            self, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=30.0
+        ):
             raise TimeoutError("Kiro CLI initialization timed out after 30 seconds")
 
         self._initialized = True
