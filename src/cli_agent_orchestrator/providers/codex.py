@@ -247,7 +247,10 @@ class CodexProvider(BaseProvider):
         self._handle_trust_prompt(timeout=20.0)
 
         if not wait_until_status(
-            self, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=60.0, polling_interval=1.0
+            self,
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+            timeout=60.0,
+            polling_interval=1.0,
         ):
             raise TimeoutError("Codex initialization timed out after 60 seconds")
 

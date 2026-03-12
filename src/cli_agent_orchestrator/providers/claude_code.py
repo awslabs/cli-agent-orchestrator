@@ -161,7 +161,10 @@ class ClaudeCodeProvider(BaseProvider):
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
         # message that get_status() interprets as a completed response.
         if not wait_until_status(
-            self, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=30.0, polling_interval=1.0
+            self,
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+            timeout=30.0,
+            polling_interval=1.0,
         ):
             raise TimeoutError("Claude Code initialization timed out after 30 seconds")
 
