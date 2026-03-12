@@ -247,8 +247,8 @@ class CodexProvider(BaseProvider):
         await self._handle_trust_prompt(timeout=20.0)
 
         if not await wait_until_status(
-            self,
-            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+            self.terminal_id,
+            TerminalStatus.IDLE,
             timeout=60.0,
             polling_interval=1.0,
         ):

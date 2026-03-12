@@ -161,8 +161,8 @@ class ClaudeCodeProvider(BaseProvider):
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
         # message that get_status() interprets as a completed response.
         if not await wait_until_status(
-            self,
-            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+            self.terminal_id,
+            TerminalStatus.IDLE,
             timeout=30.0,
             polling_interval=1.0,
         ):
