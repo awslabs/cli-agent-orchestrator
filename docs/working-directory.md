@@ -38,13 +38,14 @@ result = await assign(
 
 ## Path Validation and Security
 
-All working directory paths are canonicalized and validated before use. Both the working directory and the user's home directory are resolved via `os.path.realpath` to handle symlinked home directories (e.g., `/home/user` -> `/local/home/user` on AWS).
+All working directory paths are canonicalized and validated before use. Paths are resolved via `os.path.realpath` to normalize symlinks and `..` sequences.
 
-### Allowed (safe) directories
+### Allowed directories
 
-- The user's home directory itself (`~/`)
-- Any subdirectory under the home directory (`~/projects/foo`)
-- Paths that resolve to the home tree after symlink resolution
+- The user's home directory and any subdirectory (`~/projects/foo`)
+- External volumes and mount points (e.g., `/Volumes/workplace/project`)
+- Custom paths like `/opt/projects`, NFS mounts, corporate dev desktops
+- Any real directory that is **not** a blocked system path
 
 ### Blocked (unsafe) directories
 
@@ -52,11 +53,11 @@ The following system directories are explicitly blocked:
 
 `/`, `/bin`, `/sbin`, `/usr/bin`, `/usr/sbin`, `/etc`, `/var`, `/tmp`, `/dev`, `/proc`, `/sys`, `/root`, `/boot`, `/lib`, `/lib64`
 
-Any path outside the user's home directory tree is also rejected.
+On macOS, `/private/etc`, `/private/var`, and `/private/tmp` are also blocked (since `/etc` -> `/private/etc`, etc.).
 
 ### Symlink handling
 
-Symlinks are resolved at validation time to prevent escapes from the home directory. For example, a symlink at `~/escape` pointing to `/etc` would be rejected after resolution. This also ensures environments with symlinked home directories (common on AWS where `/home/user` symlinks to `/local/home/user`) work correctly.
+Symlinks are resolved at validation time. A symlink pointing to a blocked system path (e.g., `~/escape` -> `/etc`) is rejected after resolution.
 
 ## Why Disabled by Default?
 
