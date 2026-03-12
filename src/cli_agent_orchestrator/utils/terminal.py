@@ -71,7 +71,7 @@ def wait_until_status(
 
     while time.time() - start_time < timeout:
         status = provider_instance.get_status()
-        logger.info(f"Waiting for {targets}, current status: {status}")
+        logger.info(f"Waiting for {{{', '.join(s.value for s in targets)}}}, current status: {status}")
         if status in targets:
             return True
         time.sleep(polling_interval)
