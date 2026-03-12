@@ -50,7 +50,9 @@ class QCliProvider(BaseProvider):
         command = shlex.join(["q", "chat", "--agent", self._agent_profile])
         tmux_client.send_keys(self.session_name, self.window_name, command)
 
-        if not wait_until_status(self, TerminalStatus.IDLE, timeout=30.0):
+        if not wait_until_status(
+            self, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=30.0
+        ):
             raise TimeoutError("Q CLI initialization timed out after 30 seconds")
 
         self._initialized = True

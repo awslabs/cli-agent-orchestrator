@@ -379,10 +379,30 @@ CAO supports specifying working directories for agent handoff/delegation operati
 
 All paths are canonicalized via `realpath` and validated against a security policy:
 
-- **Allowed:** the user's home directory (`~/`) and any subdirectory under it, including paths through symlinks (e.g., `/home/user` -> `/local/home/user` on AWS)
-- **Blocked:** system directories (`/`, `/etc`, `/var`, `/tmp`, `/proc`, `/sys`, `/root`, `/boot`, `/bin`, `/sbin`, `/usr/bin`, `/usr/sbin`, `/lib`, `/lib64`, `/dev`) and any path outside the home directory tree
+- **Allowed:** any real directory that is not a blocked system path — including `~/`, external volumes (e.g., `/Volumes/workplace`), and custom paths like `/opt/projects`
+- **Blocked:** system directories (`/`, `/etc`, `/var`, `/tmp`, `/proc`, `/sys`, `/root`, `/boot`, `/bin`, `/sbin`, `/usr/bin`, `/usr/sbin`, `/lib`, `/lib64`, `/dev`)
 
 For configuration and usage details, see [docs/working-directory.md](docs/working-directory.md).
+
+## Cross-Provider Orchestration
+
+By default, worker agents inherit the provider of the terminal that spawned them. To run specific agents on different providers, add a `provider` key to the agent profile frontmatter:
+
+```markdown
+---
+name: developer
+description: Developer Agent
+provider: claude_code
+---
+```
+
+Valid values: `kiro_cli`, `claude_code`, `codex`, `q_cli`, `gemini_cli`.
+
+When a supervisor calls `assign` or `handoff`, CAO reads the worker's agent profile and uses the declared provider if present. If the key is missing or invalid, the worker falls back to the supervisor's provider.
+
+The `cao launch --provider` flag always takes precedence — it is treated as an explicit override and the profile's `provider` key is not consulted for the initial session.
+
+For ready-to-use examples, see [`examples/cross-provider/`](examples/cross-provider/).
 
 ## Security
 
