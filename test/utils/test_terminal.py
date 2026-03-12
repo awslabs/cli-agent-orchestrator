@@ -127,6 +127,20 @@ class TestWaitUntilStatus:
 
         assert result is False
 
+    def test_wait_until_status_with_set(self):
+        """Test status wait accepts a set of target statuses."""
+        mock_provider = MagicMock()
+        mock_provider.get_status.return_value = TerminalStatus.COMPLETED
+
+        result = wait_until_status(
+            mock_provider,
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+            timeout=1.0,
+            polling_interval=0.1,
+        )
+
+        assert result is True
+
     def test_wait_until_status_eventually_succeeds(self):
         """Test status wait that eventually succeeds."""
         mock_provider = MagicMock()
