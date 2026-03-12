@@ -1,11 +1,13 @@
 """Tests for agent profile utilities."""
 
+import logging
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
+from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 
 
 class TestLoadAgentProfile:
@@ -105,3 +107,74 @@ class TestLoadAgentProfile:
         # Execute and verify
         with pytest.raises(RuntimeError, match="Failed to load agent profile"):
             load_agent_profile("test-agent")
+
+
+class TestResolveProvider:
+    """Tests for resolve_provider function."""
+
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
+    def test_returns_profile_provider_when_valid(self, mock_load):
+        """Profile with a valid provider key should override the fallback."""
+        mock_load.return_value = AgentProfile(
+            name="developer", description="Dev agent", provider="claude_code"
+        )
+
+        result = resolve_provider("developer", fallback_provider="kiro_cli")
+
+        assert result == "claude_code"
+        mock_load.assert_called_once_with("developer")
+
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
+    def test_returns_fallback_when_no_provider_key(self, mock_load):
+        """Profile without a provider key should fall back to the caller's provider."""
+        mock_load.return_value = AgentProfile(name="reviewer", description="Reviewer agent")
+
+        result = resolve_provider("reviewer", fallback_provider="kiro_cli")
+
+        assert result == "kiro_cli"
+
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
+    def test_returns_fallback_when_provider_is_invalid(self, mock_load, caplog):
+        """Profile with an invalid provider value should fall back and log a warning."""
+        mock_load.return_value = AgentProfile(
+            name="developer", description="Dev agent", provider="claud_code"
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = resolve_provider("developer", fallback_provider="kiro_cli")
+
+        assert result == "kiro_cli"
+        assert "invalid provider" in caplog.text.lower()
+        assert "claud_code" in caplog.text
+
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
+    def test_returns_fallback_when_profile_not_found(self, mock_load):
+        """Missing profile should fall back without raising."""
+        mock_load.side_effect = RuntimeError("Failed to load agent profile 'ghost'")
+
+        result = resolve_provider("ghost", fallback_provider="q_cli")
+
+        assert result == "q_cli"
+
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
+    def test_all_valid_provider_types_accepted(self, mock_load):
+        """Each ProviderType enum value should be accepted as a valid provider."""
+        from cli_agent_orchestrator.constants import PROVIDERS
+
+        for provider_value in PROVIDERS:
+            mock_load.return_value = AgentProfile(
+                name="agent", description="test", provider=provider_value
+            )
+            result = resolve_provider("agent", fallback_provider="kiro_cli")
+            assert result == provider_value
+
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
+    def test_returns_fallback_when_provider_is_empty_string(self, mock_load):
+        """Empty string provider should be treated as absent and fall back."""
+        mock_load.return_value = AgentProfile(
+            name="developer", description="Dev agent", provider=""
+        )
+
+        result = resolve_provider("developer", fallback_provider="kiro_cli")
+
+        assert result == "kiro_cli"
