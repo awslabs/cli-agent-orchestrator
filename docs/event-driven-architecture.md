@@ -2,37 +2,37 @@
 
 ## Overview
 
-CAO uses an event-driven architecture for terminal output processing, status detection, and inbox message delivery. Terminal output streams through a pipeline of components connected by an in-process pub/sub event bus, replacing the previous watchdog-based file polling approach.
+CAO uses an event-driven architecture for terminal output processing, status detection, and inbox message delivery. Terminal output streams through a pipeline of components connected by an in-process pub/sub event bus.
 
 ## Architecture
 
 ```
-┌───────────────────┐  publish   ┌─────────────────────────┐  subscribe   ┌─────────────┐
-│ FifoReader        │───────────▶│       EVENT BUS          │─────────────▶│ LogWriter   │
-│ (thread)          │  terminal. │                          │  terminal.   │ (async)     │
-│                   │  {id}.     │  pub/sub with wildcard   │  {id}.       │             │
-│ tmux pipe-pane    │  output    │  topic matching          │  output      │ writes to   │
-│  ▼ Named FIFO    │            │                          │              │ log files   │
-│  ▼ os.read()     │            │                          │              └─────────────┘
-└───────────────────┘            │                          │
-                                 │                          │  subscribe   ┌───────────────┐
-                                 │                          │─────────────▶│ StatusMonitor │
-                                 │                          │  terminal.   │ (async)       │
-                                 │                          │  {id}.       │               │
-                                 │                          │  output      │ rolling buffer│
-                                 │                          │              │ + detection   │
-                                 │                          │◀─────────────│               │
-                                 │                          │  publish     └───────────────┘
-                                 │                          │  terminal.
-                                 │                          │  {id}.
-                                 │                          │  status
-                                 │                          │
-                                 │                          │  subscribe   ┌─────────────┐
-                                 │                          │─────────────▶│InboxService │
-                                 │                          │  terminal.   │ (async)     │
-                                 │                          │  {id}.       │             │
-                                 │                          │  status      │ delivers    │
-                                 └──────────────────────────┘              │ messages    │
+┌───────────────────┐  publish    ┌──────────────────────────┐  subscribe  ┌─────────────┐
+│ FifoReader        │────────────▶│        EVENT BUS         │────────────▶│ LogWriter   │
+│ (thread)          │  terminal.  │                          │  terminal.  │ (async)     │
+│                   │  {id}.      │  pub/sub with wildcard   │  {id}.      │             │
+│ tmux pipe-pane    │  output     │  topic matching          │  output     │ writes to   │
+│  ▼ Named FIFO     │             │                          │             │ log files   │
+│  ▼ os.read()      │             │                          │             └─────────────┘
+└───────────────────┘             │                          │
+                                  │                          │  subscribe  ┌───────────────┐
+                                  │                          │────────────▶│ StatusMonitor │
+                                  │                          │  terminal.  │ (async)       │
+                                  │                          │  {id}.      │               │
+                                  │                          │  output     │ rolling buffer│
+                                  │                          │             │ + detection   │
+                                  │                          │◀────────────│               │
+                                  │                          │  publish    └───────────────┘
+                                  │                          │  terminal.
+                                  │                          │  {id}.
+                                  │                          │  status
+                                  │                          │
+                                  │                          │  subscribe  ┌─────────────┐
+                                  │                          │────────────▶│InboxService │
+                                  │                          │  terminal.  │ (async)     │
+                                  │                          │  {id}.      │             │
+                                  │                          │  status     │ delivers    │
+                                  └──────────────────────────┘             │ messages    │
                                                                            └─────────────┘
 ```
 
@@ -77,51 +77,21 @@ Each service has a clearly defined role as a **publisher**, **consumer**, or **b
 
 ## Components
 
-### FIFO Reader (`services/fifo_reader.py`)
+### FIFO Reader (`services/fifo_reader.py`) — Publisher
 
-**Role:** Publisher
+Creates a named pipe (FIFO) per terminal and starts a daemon reader thread. tmux's `pipe-pane` writes terminal output to the FIFO; the reader reads 4KB chunks and publishes `terminal.{id}.output` events.
 
-Creates a named pipe (FIFO) per terminal and starts a daemon reader thread. tmux's `pipe-pane` writes terminal output to the FIFO; the reader thread reads 4KB chunks and publishes them to the event bus.
+### Status Monitor (`services/status_monitor.py`) — Publisher + Consumer
 
-- **Create:** `fifo_manager.create_reader(terminal_id)` — called during terminal creation
-- **Stop:** `fifo_manager.stop_reader(terminal_id)` — called during terminal deletion; unblocks the reader by briefly opening the write side, then joins the thread and deletes the FIFO file
-- **Reconnect:** On EOF (tmux closes the write side), the reader reopens the FIFO to handle tmux restarts
+Subscribes to `terminal.*.output`. Accumulates output into a rolling buffer (8KB) per terminal, detects status via the registered provider (or a generic shell prompt pattern before init), and publishes `terminal.{id}.status` on change. Also the source of truth for current terminal status.
 
-### Status Monitor (`services/status_monitor.py`)
+### Log Writer (`services/log_writer.py`) — Consumer
 
-**Role:** Publisher + Consumer
+Subscribes to `terminal.*.output`. Appends chunks to per-terminal log files (`~/.cao/logs/terminal/{id}.log`) for debugging.
 
-Accumulates terminal output into a rolling buffer (8KB max) per terminal and detects status changes. Two detection modes:
+### Inbox Service (`services/inbox_service.py`) — Consumer
 
-1. **Pre-init (no provider registered):** Matches a generic shell prompt pattern (`[$#%>]\s`) against the last 500 bytes
-2. **Post-init (provider registered):** Delegates to `provider.get_status(buffer)` for provider-specific detection
-
-Only publishes `terminal.{id}.status` events when the status actually changes, avoiding redundant notifications.
-
-Also serves as the source of truth for terminal status via `status_monitor.get_status(terminal_id)`.
-
-### Log Writer (`services/log_writer.py`)
-
-**Role:** Consumer
-
-Appends terminal output chunks to per-terminal log files (`~/.cao/logs/terminal/{id}.log`) for debugging. Runs as a simple async consumer with no state.
-
-### Inbox Service (`services/inbox_service.py`)
-
-**Role:** Consumer
-
-Delivers queued inbox messages when terminals become ready (IDLE or COMPLETED). One message is delivered per terminal per status change to avoid flooding an agent with multiple messages simultaneously.
-
-**Delivery flow:**
-
-1. Subscribes to `terminal.*.status` events
-2. On IDLE or COMPLETED status, calls `deliver_pending(terminal_id)`
-3. Queries the database for the oldest pending message for that terminal
-4. Double-checks the terminal's current status via `status_monitor.get_status()`
-5. Sends the message via `terminal_service.send_input()`
-6. Updates message status to DELIVERED (or FAILED on error)
-
-**Immediate delivery:** When a new inbox message is created via the API, the endpoint calls `inbox_service.deliver_pending()` for best-effort immediate delivery if the terminal is already idle.
+Subscribes to `terminal.*.status`. On IDLE or COMPLETED, delivers the oldest pending inbox message to the terminal via `send_input` and updates the message status in the database.
 
 ## Startup & Shutdown
 
@@ -136,19 +106,3 @@ During shutdown:
 2. `asyncio.gather()` with `return_exceptions=True` to wait for clean exit
 
 FIFO readers are started/stopped per-terminal by `terminal_service` during create/delete operations.
-
-## Previous Architecture (Watchdog)
-
-The previous implementation used:
-
-- **watchdog `PollingObserver`** to poll terminal log files for changes (5-second interval)
-- **`LogFileHandler`** to detect file modifications and trigger inbox message delivery
-- **`aiofiles`** for async file I/O
-
-Limitations of the watchdog approach:
-
-- **Latency:** 5-second polling interval meant messages could wait up to 5 seconds before delivery
-- **Coupling:** Status detection required reading and parsing the log file on every poll
-- **Dependencies:** Required `watchdog` and `aiofiles` packages
-
-The event-driven approach eliminates polling, delivers messages within milliseconds of status changes, and removes the `watchdog` and `aiofiles` dependencies.
