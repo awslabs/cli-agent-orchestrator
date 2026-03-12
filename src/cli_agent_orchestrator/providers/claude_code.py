@@ -180,8 +180,15 @@ class ClaudeCodeProvider(BaseProvider):
         # Handle startup prompts (trust dialog, bypass permissions warning)
         self._handle_startup_prompts(timeout=20.0)
 
-        # Wait for Claude Code prompt to be ready
-        if not wait_until_status(self, TerminalStatus.IDLE, timeout=30.0, polling_interval=1.0):
+        # Wait for Claude Code prompt to be ready.
+        # Accept both IDLE and COMPLETED — some CLI versions show a startup
+        # message that get_status() interprets as a completed response.
+        if not wait_until_status(
+            self,
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+            timeout=30.0,
+            polling_interval=1.0,
+        ):
             raise TimeoutError("Claude Code initialization timed out after 30 seconds")
 
         self._initialized = True

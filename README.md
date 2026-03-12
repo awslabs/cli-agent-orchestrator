@@ -450,8 +450,8 @@ CAO supports specifying working directories for agent handoff/delegation operati
 
 All paths are canonicalized via `realpath` and validated against a security policy:
 
-- **Allowed:** the user's home directory (`~/`) and any subdirectory under it, including paths through symlinks (e.g., `/home/user` -> `/local/home/user` on AWS)
-- **Blocked:** system directories (`/`, `/etc`, `/var`, `/tmp`, `/proc`, `/sys`, `/root`, `/boot`, `/bin`, `/sbin`, `/usr/bin`, `/usr/sbin`, `/lib`, `/lib64`, `/dev`) and any path outside the home directory tree
+- **Allowed:** any real directory that is not a blocked system path — including `~/`, external volumes (e.g., `/Volumes/workplace`), and custom paths like `/opt/projects`
+- **Blocked:** system directories (`/`, `/etc`, `/var`, `/tmp`, `/proc`, `/sys`, `/root`, `/boot`, `/bin`, `/sbin`, `/usr/bin`, `/usr/sbin`, `/lib`, `/lib64`, `/dev`)
 
 For configuration and usage details, see [docs/working-directory.md](docs/working-directory.md).
 
