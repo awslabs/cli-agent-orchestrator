@@ -98,7 +98,7 @@ class KiroCliProvider(BaseProvider):
         )
         self._permission_prompt_pattern = r"Allow this action\?.*?\[.*?y.*?/.*?n.*?/.*?t.*?\]:"
 
-    def initialize(self) -> bool:
+    async def initialize(self) -> bool:
         """Initialize Kiro CLI provider by starting kiro-cli chat command.
 
         This method:
@@ -114,7 +114,7 @@ class KiroCliProvider(BaseProvider):
         """
         # Step 1: Wait for shell prompt to appear in the tmux window
         # This ensures the terminal is ready before we send commands
-        if not wait_for_shell(self.terminal_id, timeout=10.0):
+        if not await wait_for_shell(self.terminal_id, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
         # Step 2: Start the Kiro CLI chat session with the specified agent profile
@@ -122,7 +122,7 @@ class KiroCliProvider(BaseProvider):
         tmux_client.send_keys(self.session_name, self.window_name, command)
 
         # Step 3: Wait for Kiro CLI to fully initialize and show the agent prompt
-        if not wait_until_status(self.terminal_id, TerminalStatus.IDLE, timeout=30.0):
+        if not await wait_until_status(self.terminal_id, TerminalStatus.IDLE, timeout=30.0):
             raise TimeoutError("Kiro CLI initialization timed out after 30 seconds")
 
         self._initialized = True

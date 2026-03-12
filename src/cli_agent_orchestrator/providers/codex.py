@@ -1,5 +1,6 @@
 """Codex CLI provider implementation."""
 
+import asyncio
 import logging
 import re
 import shlex
@@ -147,7 +148,7 @@ class CodexProvider(BaseProvider):
 
         return shlex.join(command_parts)
 
-    def _handle_trust_prompt(self, timeout: float = 20.0) -> None:
+    async def _handle_trust_prompt(self, timeout: float = 20.0) -> None:
         """Auto-accept the workspace trust prompt if it appears.
 
         Codex shows a folder approval dialog when opening a new directory.
@@ -159,7 +160,7 @@ class CodexProvider(BaseProvider):
         while time.time() - start_time < timeout:
             output = tmux_client.get_history(self.session_name, self.window_name)
             if not output:
-                time.sleep(1.0)
+                await asyncio.sleep(1.0)
                 continue
 
             # Clean ANSI codes for reliable text matching
@@ -179,19 +180,19 @@ class CodexProvider(BaseProvider):
                 logger.info("Codex started without trust prompt")
                 return
 
-            time.sleep(1.0)
+            await asyncio.sleep(1.0)
         logger.warning("Codex trust prompt handler timed out")
 
-    def initialize(self) -> bool:
+    async def initialize(self) -> bool:
         """Initialize Codex provider by starting codex command."""
-        if not wait_for_shell(self.terminal_id, timeout=10.0):
+        if not await wait_for_shell(self.terminal_id, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
         # Send a warm-up command before launching codex.
         # Codex exits immediately in freshly-created tmux sessions where the shell
         # has not yet processed a full interactive command cycle.
         tmux_client.send_keys(self.session_name, self.window_name, "echo ready")
-        time.sleep(2.0)
+        await asyncio.sleep(2.0)
 
         # Build command with flags and agent profile (developer_instructions).
         # --no-alt-screen: run in inline mode so output stays in normal scrollback,
@@ -202,9 +203,9 @@ class CodexProvider(BaseProvider):
         tmux_client.send_keys(self.session_name, self.window_name, command)
 
         # Handle workspace trust prompt if it appears (new/untrusted directories)
-        self._handle_trust_prompt(timeout=20.0)
+        await self._handle_trust_prompt(timeout=20.0)
 
-        if not wait_until_status(self.terminal_id, TerminalStatus.IDLE, timeout=60.0):
+        if not await wait_until_status(self.terminal_id, TerminalStatus.IDLE, timeout=60.0):
             raise TimeoutError("Codex initialization timed out after 60 seconds")
 
         self._initialized = True

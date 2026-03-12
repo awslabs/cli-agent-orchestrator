@@ -40,16 +40,16 @@ class QCliProvider(BaseProvider):
         )
         self._permission_prompt_pattern = r"Allow this action\?.*?\[.*?y.*?/.*?n.*?/.*?t.*?\]:"
 
-    def initialize(self) -> bool:
+    async def initialize(self) -> bool:
         """Initialize Q CLI provider by starting q chat command."""
         # Wait for shell to be ready first
-        if not wait_for_shell(self.terminal_id, timeout=10.0):
+        if not await wait_for_shell(self.terminal_id, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
         command = shlex.join(["q", "chat", "--agent", self._agent_profile])
         tmux_client.send_keys(self.session_name, self.window_name, command)
 
-        if not wait_until_status(self.terminal_id, TerminalStatus.IDLE, timeout=30.0):
+        if not await wait_until_status(self.terminal_id, TerminalStatus.IDLE, timeout=30.0):
             raise TimeoutError("Q CLI initialization timed out after 30 seconds")
 
         self._initialized = True

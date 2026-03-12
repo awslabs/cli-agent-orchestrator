@@ -55,7 +55,7 @@ class OutputMode(str, Enum):
     LAST = "last"
 
 
-def create_terminal(
+async def create_terminal(
     provider: str,
     agent_profile: str,
     session_name: Optional[str] = None,
@@ -131,7 +131,7 @@ def create_terminal(
         provider_instance = provider_manager.create_provider(
             provider, terminal_id, session_name, window_name, agent_profile
         )
-        provider_instance.initialize()
+        await provider_instance.initialize()
 
         # Build and return the Terminal object
         terminal = Terminal(

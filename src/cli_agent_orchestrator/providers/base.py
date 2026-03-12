@@ -58,7 +58,7 @@ class BaseProvider(ABC):
         return 2
 
     @abstractmethod
-    def initialize(self) -> bool:
+    async def initialize(self) -> bool:
         """Initialize the provider (e.g., start CLI tool, send setup commands).
 
         Returns:

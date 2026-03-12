@@ -46,7 +46,7 @@ async def flow_daemon():
             flows = flow_service.get_flows_to_run()
             for flow in flows:
                 try:
-                    executed = flow_service.execute_flow(flow.name)
+                    executed = await flow_service.execute_flow(flow.name)
                     if executed:
                         logger.info(f"Flow '{flow.name}' executed successfully")
                     else:
@@ -140,7 +140,7 @@ async def create_session(
 ) -> Terminal:
     """Create a new session with exactly one terminal."""
     try:
-        result = terminal_service.create_terminal(
+        result = await terminal_service.create_terminal(
             provider=provider,
             agent_profile=agent_profile,
             session_name=session_name,
@@ -201,7 +201,7 @@ def delete_session(session_name: str) -> Dict:
     response_model=Terminal,
     status_code=status.HTTP_201_CREATED,
 )
-def create_terminal_in_session(
+async def create_terminal_in_session(
     session_name: str,
     provider: str,
     agent_profile: str,
@@ -209,7 +209,7 @@ def create_terminal_in_session(
 ) -> Terminal:
     """Create additional terminal in existing session."""
     try:
-        result = terminal_service.create_terminal(
+        result = await terminal_service.create_terminal(
             provider=provider,
             agent_profile=agent_profile,
             session_name=session_name,

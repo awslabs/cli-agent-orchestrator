@@ -82,17 +82,22 @@ class FifoManager:
     def _reader_loop(terminal_id: str, fifo_path, stop_flag: threading.Event) -> None:
         """Read chunks from FIFO and publish to event bus. Reopens on EOF."""
         while not stop_flag.is_set():
+            fd = -1
             try:
-                with open(fifo_path, "r") as fifo:
-                    while not stop_flag.is_set():
-                        chunk = fifo.read(CHUNK_SIZE)
-                        if not chunk:
-                            break
-                        bus.publish(f"terminal.{terminal_id}.output", {"data": chunk})
+                fd = os.open(str(fifo_path), os.O_RDONLY)
+                while not stop_flag.is_set():
+                    raw = os.read(fd, CHUNK_SIZE)
+                    if not raw:
+                        break
+                    chunk = raw.decode("utf-8", errors="replace")
+                    bus.publish(f"terminal.{terminal_id}.output", {"data": chunk})
             except Exception as e:
                 if not stop_flag.is_set():
                     logger.error(f"FIFO read error for terminal {terminal_id}: {e}")
                     time.sleep(1.0)
+            finally:
+                if fd >= 0:
+                    os.close(fd)
 
 
 # Module-level singleton

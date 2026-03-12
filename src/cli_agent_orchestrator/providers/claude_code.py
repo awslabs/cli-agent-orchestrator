@@ -1,5 +1,6 @@
 """Claude Code provider implementation."""
 
+import asyncio
 import json
 import logging
 import re
@@ -105,7 +106,7 @@ class ClaudeCodeProvider(BaseProvider):
         # This correctly handles multiline strings, quotes, and special characters
         return shlex.join(command_parts)
 
-    def _handle_trust_prompt(self, timeout: float = 20.0) -> None:
+    async def _handle_trust_prompt(self, timeout: float = 20.0) -> None:
         """Auto-accept the workspace trust prompt if it appears.
 
         Claude Code shows a trust dialog when opening an untrusted directory.
@@ -117,7 +118,7 @@ class ClaudeCodeProvider(BaseProvider):
         while time.time() - start_time < timeout:
             output = tmux_client.get_history(self.session_name, self.window_name)
             if not output:
-                time.sleep(1.0)
+                await asyncio.sleep(1.0)
                 continue
 
             # Clean ANSI codes for reliable text matching
@@ -138,13 +139,13 @@ class ClaudeCodeProvider(BaseProvider):
                 logger.info("Claude Code started without trust prompt")
                 return
 
-            time.sleep(1.0)
+            await asyncio.sleep(1.0)
         logger.warning("Trust prompt handler timed out")
 
-    def initialize(self) -> bool:
+    async def initialize(self) -> bool:
         """Initialize Claude Code provider by starting claude command."""
         # Wait for shell prompt to appear in the tmux window
-        if not wait_for_shell(self.session_name, self.window_name, timeout=10.0):
+        if not await wait_for_shell(self.terminal_id, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
         # Build properly escaped command string
@@ -154,10 +155,10 @@ class ClaudeCodeProvider(BaseProvider):
         tmux_client.send_keys(self.session_name, self.window_name, command)
 
         # Handle workspace trust prompt if it appears (new/untrusted directories)
-        self._handle_trust_prompt(timeout=20.0)
+        await self._handle_trust_prompt(timeout=20.0)
 
         # Wait for Claude Code prompt to be ready
-        if not wait_until_status(self.terminal_id, TerminalStatus.IDLE, timeout=30.0):
+        if not await wait_until_status(self.terminal_id, TerminalStatus.IDLE, timeout=30.0):
             raise TimeoutError("Claude Code initialization timed out after 30 seconds")
 
         self._initialized = True

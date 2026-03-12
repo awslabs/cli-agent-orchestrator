@@ -1,5 +1,6 @@
 """Session utilities for CLI Agent Orchestrator."""
 
+import asyncio
 import logging
 import time
 import uuid
@@ -28,20 +29,50 @@ def generate_window_name(agent_profile: str) -> str:
     return f"{agent_profile}-{uuid.uuid4().hex[:4]}"
 
 
-def wait_for_shell(terminal_id: str, timeout: float = 10.0, polling_interval: float = 0.5) -> bool:
-    """Wait for shell to be ready by polling status_monitor."""
+async def wait_for_shell(
+    terminal_id: str,
+    timeout: float = 10.0,
+    stable_duration: float = 2.0,
+    polling_interval: float = 0.3,
+) -> bool:
+    """Wait for shell to be ready by checking if the output buffer is stable and non-empty.
+
+    Reads the StatusMonitor's in-memory buffer (populated by the FIFO reader
+    → event bus → StatusMonitor pipeline). Returns True when the buffer is
+    non-empty and has not changed for *stable_duration* seconds.
+
+    This does NOT use provider-specific status detection because the provider
+    is already registered before initialize() runs, and provider patterns
+    don't match raw shell output.
+    """
     from cli_agent_orchestrator.services.status_monitor import status_monitor
 
-    start = time.time()
-    while time.time() - start < timeout:
-        if status_monitor.get_status(terminal_id) == TerminalStatus.IDLE:
+    logger.info(f"Waiting for shell to be ready for terminal {terminal_id}...")
+
+    deadline = time.time() + timeout
+    previous_buffer = ""
+    last_change = time.time()
+
+    while time.time() < deadline:
+        buf = status_monitor.get_buffer(terminal_id)
+
+        if buf != previous_buffer:
+            previous_buffer = buf
+            last_change = time.time()
+
+        stable_elapsed = time.time() - last_change
+
+        if buf.strip() and stable_elapsed >= stable_duration:
+            logger.info(f"Shell ready for {terminal_id} (buffer stable, {len(buf)} bytes)")
             return True
-        time.sleep(polling_interval)
+
+        await asyncio.sleep(polling_interval)
+
     logger.warning(f"Timeout waiting for shell to be ready for {terminal_id}")
     return False
 
 
-def wait_until_status(
+async def wait_until_status(
     terminal_id: str,
     target_status: TerminalStatus,
     timeout: float = 30.0,
@@ -50,11 +81,19 @@ def wait_until_status(
     """Wait until terminal reaches target status by polling status_monitor."""
     from cli_agent_orchestrator.services.status_monitor import status_monitor
 
+    logger.info(
+        f"wait_until_status [{terminal_id}]: waiting for {target_status.value}, timeout={timeout}s"
+    )
     start = time.time()
     while time.time() - start < timeout:
-        if status_monitor.get_status(terminal_id) == target_status:
+        current = status_monitor.get_status(terminal_id)
+        if current == target_status:
+            logger.info(f"wait_until_status [{terminal_id}]: target {target_status.value} reached")
             return True
-        time.sleep(polling_interval)
+        await asyncio.sleep(polling_interval)
+    logger.warning(
+        f"wait_until_status [{terminal_id}]: timeout waiting for {target_status.value}"
+    )
     return False
 
 
