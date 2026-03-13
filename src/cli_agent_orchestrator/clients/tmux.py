@@ -331,22 +331,41 @@ class TmuxClient:
             logger.error(f"Failed to get history from {session_name}:{window_name}: {e}")
             raise
 
+    def window_exists(self, session_name: str, window_name: str) -> bool:
+        """Check if a window exists in a session by querying tmux.
+
+        Uses tmux list-windows command via libtmux for efficient checking.
+
+        Args:
+            session_name: Name of tmux session
+            window_name: Name of window in session
+
+        Returns:
+            True if window exists, False otherwise
+        """
+        try:
+            session = self.server.sessions.get(session_name=session_name)
+            if not session:
+                return False
+
+            for window in session.windows:
+                if window.name == window_name:
+                    return True
+
+            return False
+        except Exception as e:
+            logger.debug(f"Window check failed for {session_name}:{window_name}: {e}")
+            return False
+
     def list_sessions(self) -> List[Dict[str, str]]:
         """List all tmux sessions."""
         try:
             sessions: List[Dict[str, str]] = []
             for session in self.server.sessions:
-                # Check if session has attached clients
-                is_attached = len(getattr(session, "attached_sessions", [])) > 0
-
                 session_name = session.name if session.name is not None else ""
-                sessions.append(
-                    {
-                        "id": session_name,
-                        "name": session_name,
-                        "status": "active" if is_attached else "detached",
-                    }
-                )
+                session_data = self.get_session(session_name)
+                if session_data:
+                    sessions.append(session_data)
 
             return sessions
         except Exception as e:
@@ -383,6 +402,34 @@ class TmuxClient:
             logger.error(f"Failed to kill session {session_name}: {e}")
             return False
 
+    def kill_window(self, session_name: str, window_name: str) -> bool:
+        """Kill a specific tmux window.
+
+        Args:
+            session_name: Name of the tmux session
+            window_name: Name of the window to kill
+
+        Returns:
+            True if window was killed, False otherwise
+        """
+        try:
+            session = self.server.sessions.get(session_name=session_name)
+            if not session:
+                logger.warning(f"Session {session_name} not found")
+                return False
+
+            window = session.windows.get(window_name=window_name)
+            if not window:
+                logger.warning(f"Window {window_name} not found in session {session_name}")
+                return False
+
+            window.kill()
+            logger.info(f"Killed tmux window: {session_name}:{window_name}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to kill window {session_name}:{window_name}: {e}")
+            return False
+
     def session_exists(self, session_name: str) -> bool:
         """Check if session exists."""
         try:
@@ -390,6 +437,30 @@ class TmuxClient:
             return session is not None
         except Exception:
             return False
+
+    def get_session(self, session_name: str) -> Optional[Dict[str, str]]:
+        """Get session information.
+
+        Args:
+            session_name: Name of tmux session
+
+        Returns:
+            Session dict with id, name, and status, or None if not found
+        """
+        try:
+            session = self.server.sessions.get(session_name=session_name)
+            if not session:
+                return None
+
+            is_attached = len(getattr(session, "attached_sessions", [])) > 0
+            return {
+                "id": session.name if session.name is not None else "",
+                "name": session.name if session.name is not None else "",
+                "status": "active" if is_attached else "detached",
+            }
+        except Exception as e:
+            logger.debug(f"Failed to get session {session_name}: {e}")
+            return None
 
     def get_pane_working_directory(self, session_name: str, window_name: str) -> Optional[str]:
         """Get the current working directory of a pane."""

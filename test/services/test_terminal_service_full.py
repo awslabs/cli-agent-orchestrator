@@ -122,9 +122,10 @@ class TestCreateTerminal:
 class TestGetTerminal:
     """Tests for get_terminal function."""
 
+    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_get_terminal_success(self, mock_get_metadata, mock_provider_manager):
+    def test_get_terminal_success(self, mock_get_metadata, mock_provider_manager, mock_tmux):
         """Test getting terminal successfully."""
         mock_get_metadata.return_value = {
             "id": "test1234",
@@ -134,6 +135,7 @@ class TestGetTerminal:
             "agent_profile": "developer",
             "last_active": datetime.now(),
         }
+        mock_tmux.window_exists.return_value = True
         mock_provider = MagicMock()
         mock_provider.get_status.return_value = TerminalStatus.IDLE
         mock_provider_manager.get_provider.return_value = mock_provider
@@ -142,6 +144,7 @@ class TestGetTerminal:
 
         assert result["id"] == "test1234"
         assert result["status"] == TerminalStatus.IDLE.value
+        mock_tmux.window_exists.assert_called_once_with("cao-session", "developer-abcd")
 
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_get_terminal_not_found(self, mock_get_metadata):
@@ -151,9 +154,10 @@ class TestGetTerminal:
         with pytest.raises(ValueError, match="not found"):
             get_terminal("nonexistent")
 
+    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_get_terminal_no_provider(self, mock_get_metadata, mock_provider_manager):
+    def test_get_terminal_no_provider(self, mock_get_metadata, mock_provider_manager, mock_tmux):
         """Test getting terminal when provider not found."""
         mock_get_metadata.return_value = {
             "id": "test1234",
@@ -163,6 +167,7 @@ class TestGetTerminal:
             "agent_profile": "developer",
             "last_active": datetime.now(),
         }
+        mock_tmux.window_exists.return_value = True
         mock_provider_manager.get_provider.return_value = None
 
         with pytest.raises(ValueError, match="Provider not found"):
@@ -330,16 +335,16 @@ class TestDeleteTerminal:
 
         assert result is True
 
+    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
     @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_delete_terminal_no_metadata(
-        self, mock_get_metadata, mock_provider_manager, mock_db_delete
+        self, mock_get_metadata, mock_provider_manager, mock_db_delete, mock_tmux
     ):
         """Test deleting terminal when metadata not found."""
         mock_get_metadata.return_value = None
-        mock_db_delete.return_value = True
 
         result = delete_terminal("test1234")
 
-        assert result is True
+        assert result is False  # Returns False when terminal not found
