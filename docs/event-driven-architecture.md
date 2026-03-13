@@ -36,6 +36,36 @@ CAO uses an event-driven architecture for terminal output processing, status det
                                                                            └─────────────┘
 ```
 
+```mermaid
+graph LR
+    subgraph FifoReader ["FifoReader (thread)"]
+        FR1[tmux pipe-pane]
+        FR2[Named FIFO]
+        FR3[os.read]
+        FR1 --> FR2 --> FR3
+    end
+
+    EB["EVENT BUS — pub/sub with wildcard topic matching"]
+
+    subgraph LogWriter ["LogWriter (async)"]
+        LW[writes to log files]
+    end
+
+    subgraph StatusMonitor ["StatusMonitor (async)"]
+        SM[rolling buffer + detection]
+    end
+
+    subgraph InboxService ["InboxService (async)"]
+        IS[delivers messages]
+    end
+
+    FifoReader -- "terminal.{id}.output" --> EB
+    EB -- "terminal.{id}.output" --> LogWriter
+    EB -- "terminal.{id}.output" --> StatusMonitor
+    StatusMonitor -- "terminal.{id}.status" --> EB
+    EB -- "terminal.{id}.status" --> InboxService
+```
+
 All inter-service communication flows through the event bus. No service calls another service directly for event processing — the bus is the sole brokering mechanism.
 
 ## Event Bus (`services/event_bus.py`)

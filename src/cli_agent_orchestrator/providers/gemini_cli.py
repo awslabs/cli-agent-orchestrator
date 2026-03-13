@@ -342,7 +342,19 @@ class GeminiCliProvider(BaseProvider):
         self._mcp_server_names = []
 
     async def initialize(self) -> bool:
-        """Initialize Gemini CLI provider by starting the gemini command."""
+        """Initialize Gemini CLI provider by starting the gemini command.
+
+        Steps:
+        1. Wait for the shell prompt in the tmux window
+        2. Build and send the gemini command (may include MCP setup)
+        3. Wait for Gemini to reach IDLE state (welcome banner + input box)
+
+        Returns:
+            True if initialization completed successfully
+
+        Raises:
+            TimeoutError: If shell or Gemini CLI doesn't start within timeout
+        """
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
         if not await wait_for_shell(self.terminal_id, timeout=10.0):

@@ -2,7 +2,7 @@
 
 import re
 from pathlib import Path
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -22,16 +22,17 @@ def load_fixture(filename: str) -> str:
 class TestQCliProviderInitialization:
     """Test Q CLI provider initialization."""
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.q_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.q_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
-    def test_initialize_success(self, mock_tmux, mock_wait_status, mock_wait_shell):
+    async def test_initialize_success(self, mock_tmux, mock_wait_status, mock_wait_shell):
         """Test successful initialization."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
 
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
-        result = provider.initialize()
+        result = await provider.initialize()
 
         assert result is True
         mock_wait_shell.assert_called_once()
@@ -40,21 +41,23 @@ class TestQCliProviderInitialization:
         )
         mock_wait_status.assert_called_once()
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.q_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
-    def test_initialize_shell_timeout(self, mock_tmux, mock_wait_shell):
+    async def test_initialize_shell_timeout(self, mock_tmux, mock_wait_shell):
         """Test initialization with shell timeout."""
         mock_wait_shell.return_value = False
 
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
 
         with pytest.raises(TimeoutError, match="Shell initialization timed out"):
-            provider.initialize()
+            await provider.initialize()
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.q_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.q_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
-    def test_initialize_q_cli_timeout(self, mock_tmux, mock_wait_status, mock_wait_shell):
+    async def test_initialize_q_cli_timeout(self, mock_tmux, mock_wait_status, mock_wait_shell):
         """Test initialization with Q CLI timeout."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = False
@@ -62,7 +65,7 @@ class TestQCliProviderInitialization:
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
 
         with pytest.raises(TimeoutError, match="Q CLI initialization timed out"):
-            provider.initialize()
+            await provider.initialize()
 
     def test_initialization_with_different_agent_profiles(self):
         """Test initialization with various agent profile names."""
@@ -78,131 +81,109 @@ class TestQCliProviderInitialization:
 class TestQCliProviderStatusDetection:
     """Test status detection logic."""
 
-    @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
-    def test_get_status_idle(self, mock_tmux):
+    def test_get_status_idle(self):
         """Test IDLE status detection."""
-        mock_tmux.get_history.return_value = load_fixture("q_cli_idle_output.txt")
+        output = load_fixture("q_cli_idle_output.txt")
 
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
-    def test_get_status_completed(self, mock_tmux):
+    def test_get_status_completed(self):
         """Test COMPLETED status detection."""
-        mock_tmux.get_history.return_value = load_fixture("q_cli_completed_output.txt")
+        output = load_fixture("q_cli_completed_output.txt")
 
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
-    def test_get_status_processing(self, mock_tmux):
+    def test_get_status_processing(self):
         """Test PROCESSING status detection."""
-        mock_tmux.get_history.return_value = load_fixture("q_cli_processing_output.txt")
+        output = load_fixture("q_cli_processing_output.txt")
 
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
-    def test_get_status_waiting_user_answer(self, mock_tmux):
+    def test_get_status_waiting_user_answer(self):
         """Test WAITING_USER_ANSWER status detection."""
-        mock_tmux.get_history.return_value = load_fixture("q_cli_permission_output.txt")
+        output = load_fixture("q_cli_permission_output.txt")
 
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.WAITING_USER_ANSWER
 
-    @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
-    def test_get_status_error(self, mock_tmux):
+    def test_get_status_error(self):
         """Test ERROR status detection."""
-        mock_tmux.get_history.return_value = load_fixture("q_cli_error_output.txt")
+        output = load_fixture("q_cli_error_output.txt")
 
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.ERROR
 
-    @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
-    def test_get_status_with_empty_output(self, mock_tmux):
+    def test_get_status_with_empty_output(self):
         """Test status detection with empty output."""
-        mock_tmux.get_history.return_value = ""
+        output = ""
 
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
-        assert status == TerminalStatus.ERROR
+        assert status == TerminalStatus.UNKNOWN
 
-    @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
-    def test_get_status_with_tail_lines(self, mock_tmux):
-        """Test status detection with tail_lines parameter."""
-        mock_tmux.get_history.return_value = load_fixture("q_cli_idle_output.txt")
-
-        provider = QCliProvider("test1234", "test-session", "window-0", "developer")
-        status = provider.get_status(tail_lines=50)
-
-        assert status == TerminalStatus.IDLE
-        mock_tmux.get_history.assert_called_once_with("test-session", "window-0", tail_lines=50)
-
-    @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
-    def test_status_processing_response_started_no_final_prompt(self, mock_tmux):
+    def test_status_processing_response_started_no_final_prompt(self):
         """Test status returns PROCESSING when response started but no final prompt."""
         # Response started (green arrow) but no idle prompt after it
-        mock_tmux.get_history.return_value = (
+        output = (
             "\x1b[36m[developer]\x1b[35m>\x1b[39m user question\n"
             "\x1b[38;5;10m> \x1b[39mPartial response being generated..."
         )
 
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
-    def test_status_completed_prompt_after_response(self, mock_tmux):
+    def test_status_completed_prompt_after_response(self):
         """Test status returns COMPLETED when prompt appears after response."""
         # Complete response with idle prompt after green arrow
-        mock_tmux.get_history.return_value = (
+        output = (
             "\x1b[36m[developer]\x1b[35m>\x1b[39m user question\n"
             "\x1b[38;5;10m> \x1b[39mComplete response here\n"
             "\x1b[36m[developer]\x1b[35m>\x1b[39m"
         )
 
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
-    def test_extraction_succeeds_when_status_completed(self, mock_tmux):
+    def test_extraction_succeeds_when_status_completed(self):
         """Test extraction succeeds when status is COMPLETED."""
         output = (
             "\x1b[36m[developer]\x1b[35m>\x1b[39m user question\n"
             "\x1b[38;5;10m> \x1b[39mComplete response here\n"
             "\x1b[36m[developer]\x1b[35m>\x1b[39m"
         )
-        mock_tmux.get_history.return_value = output
 
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
 
         # Verify status is COMPLETED
-        status = provider.get_status()
+        status = provider.get_status(output)
         assert status == TerminalStatus.COMPLETED
 
         # Verify extraction succeeds
         message = provider.extract_last_message_from_script(output)
         assert "Complete response here" in message
 
-    @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
-    def test_multiple_prompts_in_buffer_edge_case(self, mock_tmux):
+    def test_multiple_prompts_in_buffer_edge_case(self):
         """Test with multiple prompts in buffer (edge case)."""
         # Multiple interactions in buffer - should use last response
-        mock_tmux.get_history.return_value = (
+        output = (
             "\x1b[36m[developer]\x1b[35m>\x1b[39m first question\n"
             "\x1b[38;5;10m> \x1b[39mFirst response\n"
             "\x1b[36m[developer]\x1b[35m>\x1b[39m second question\n"
@@ -211,43 +192,40 @@ class TestQCliProviderStatusDetection:
         )
 
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.COMPLETED
 
         # Verify extraction gets the last response
-        message = provider.extract_last_message_from_script(mock_tmux.get_history.return_value)
+        message = provider.extract_last_message_from_script(output)
         assert "Second response" in message
         assert "First response" not in message
 
-    @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
-    def test_status_processing_multiple_green_arrows_no_final_prompt(self, mock_tmux):
+    def test_status_processing_multiple_green_arrows_no_final_prompt(self):
         """Test PROCESSING status with multiple green arrows but no final prompt."""
         # Multiple responses but still processing (no final prompt after last arrow)
-        mock_tmux.get_history.return_value = (
+        output = (
             "\x1b[36m[developer]\x1b[35m>\x1b[39m question\n"
             "\x1b[38;5;10m> \x1b[39mFirst part of response\n"
             "\x1b[38;5;10m> \x1b[39mSecond part still generating..."
         )
 
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
-    def test_status_idle_only_prompt_no_response(self, mock_tmux):
+    def test_status_idle_only_prompt_no_response(self):
         """Test IDLE status when only prompt present, no response."""
         # Just the idle prompt, no green arrow response
-        mock_tmux.get_history.return_value = "\x1b[36m[developer]\x1b[35m>\x1b[39m"
+        output = "\x1b[36m[developer]\x1b[35m>\x1b[39m"
 
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
-    def test_status_synchronization_guarantee(self, mock_tmux):
+    def test_status_synchronization_guarantee(self):
         """Test that COMPLETED status guarantees extraction will succeed."""
         test_cases = [
             # Case 1: Simple complete response
@@ -276,10 +254,8 @@ class TestQCliProviderStatusDetection:
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
 
         for output, expected_content in test_cases:
-            mock_tmux.get_history.return_value = output
-
             # Status must be COMPLETED
-            status = provider.get_status()
+            status = provider.get_status(output)
             assert status == TerminalStatus.COMPLETED, f"Status not COMPLETED for: {output}"
 
             # Extraction must succeed
@@ -460,33 +436,30 @@ class TestQCliProviderRegexPatterns:
 class TestQCliProviderPromptPatterns:
     """Test various prompt pattern combinations."""
 
-    @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
-    def test_basic_prompt(self, mock_tmux):
+    def test_basic_prompt(self):
         """Test basic prompt without extras."""
-        mock_tmux.get_history.return_value = "\x1b[36m[developer]\x1b[35m>\x1b[39m "
+        output = "\x1b[36m[developer]\x1b[35m>\x1b[39m "
 
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
-    def test_prompt_with_percentage(self, mock_tmux):
+    def test_prompt_with_percentage(self):
         """Test prompt with usage percentage."""
-        mock_tmux.get_history.return_value = "\x1b[36m[developer] \x1b[32m75%\x1b[35m>\x1b[39m "
+        output = "\x1b[36m[developer] \x1b[32m75%\x1b[35m>\x1b[39m "
 
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
-    def test_prompt_with_special_profile_characters(self, mock_tmux):
+    def test_prompt_with_special_profile_characters(self):
         """Test prompt with special characters in profile name."""
-        mock_tmux.get_history.return_value = "\x1b[36m[code-reviewer_v2]\x1b[35m>\x1b[39m "
+        output = "\x1b[36m[code-reviewer_v2]\x1b[35m>\x1b[39m "
 
         provider = QCliProvider("test1234", "test-session", "window-0", "code-reviewer_v2")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.IDLE
 
@@ -494,21 +467,18 @@ class TestQCliProviderPromptPatterns:
 class TestQCliProviderHandoffScenarios:
     """Test handoff scenarios between agents."""
 
-    @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
-    def test_handoff_successful_status(self, mock_tmux):
+    def test_handoff_successful_status(self):
         """Test COMPLETED status detection with successful handoff."""
-        mock_tmux.get_history.return_value = load_fixture("q_cli_handoff_successful.txt")
+        output = load_fixture("q_cli_handoff_successful.txt")
 
         provider = QCliProvider("test1234", "test-session", "window-0", "supervisor")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
-    def test_handoff_successful_message_extraction(self, mock_tmux):
+    def test_handoff_successful_message_extraction(self):
         """Test message extraction from successful handoff output."""
         output = load_fixture("q_cli_handoff_successful.txt")
-        mock_tmux.get_history.return_value = output
 
         provider = QCliProvider("test1234", "test-session", "window-0", "supervisor")
         message = provider.extract_last_message_from_script(output)
@@ -520,21 +490,18 @@ class TestQCliProviderHandoffScenarios:
         assert "completed successfully" in message.lower()
         assert "developer agent" in message.lower()
 
-    @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
-    def test_handoff_error_status(self, mock_tmux):
+    def test_handoff_error_status(self):
         """Test ERROR status detection with failed handoff."""
-        mock_tmux.get_history.return_value = load_fixture("q_cli_handoff_error.txt")
+        output = load_fixture("q_cli_handoff_error.txt")
 
         provider = QCliProvider("test1234", "test-session", "window-0", "supervisor")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.ERROR
 
-    @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
-    def test_handoff_error_message_extraction(self, mock_tmux):
+    def test_handoff_error_message_extraction(self):
         """Test message extraction from failed handoff output."""
         output = load_fixture("q_cli_handoff_error.txt")
-        mock_tmux.get_history.return_value = output
 
         provider = QCliProvider("test1234", "test-session", "window-0", "supervisor")
 
@@ -545,18 +512,16 @@ class TestQCliProviderHandoffScenarios:
         assert "\x1b[" not in message
         assert "error" in message.lower() or "unable" in message.lower()
 
-    @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
-    def test_handoff_with_permission_prompt(self, mock_tmux):
+    def test_handoff_with_permission_prompt(self):
         """Test WAITING_USER_ANSWER status during handoff requiring permission."""
-        mock_tmux.get_history.return_value = load_fixture("q_cli_handoff_with_permission.txt")
+        output = load_fixture("q_cli_handoff_with_permission.txt")
 
         provider = QCliProvider("test1234", "test-session", "window-0", "supervisor")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.WAITING_USER_ANSWER
 
-    @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
-    def test_handoff_message_preserves_content(self, mock_tmux):
+    def test_handoff_message_preserves_content(self):
         """Test that handoff message extraction preserves all content without truncation."""
         output = load_fixture("q_cli_handoff_successful.txt")
 
@@ -570,8 +535,7 @@ class TestQCliProviderHandoffScenarios:
         # Verify it's not truncated or corrupted
         assert len(message.split()) >= 8  # Should have multiple words
 
-    @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
-    def test_handoff_indices_not_corrupted(self, mock_tmux):
+    def test_handoff_indices_not_corrupted(self):
         """Test that ANSI code cleaning doesn't corrupt index-based extraction."""
         output = load_fixture("q_cli_handoff_successful.txt")
 
@@ -598,15 +562,6 @@ class TestQCliProviderEdgeCases:
 
         assert exit_cmd == "/exit"
 
-    def test_get_idle_pattern_for_log(self):
-        """Test idle pattern for log files."""
-        provider = QCliProvider("test1234", "test-session", "window-0", "developer")
-        pattern = provider.get_idle_pattern_for_log()
-
-        from cli_agent_orchestrator.providers.q_cli import IDLE_PROMPT_PATTERN_LOG
-
-        assert pattern == IDLE_PROMPT_PATTERN_LOG
-
     def test_cleanup(self):
         """Test cleanup method."""
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
@@ -616,62 +571,58 @@ class TestQCliProviderEdgeCases:
 
         assert provider._initialized is False
 
-    @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
-    def test_long_agent_profile_name(self, mock_tmux):
+    def test_long_agent_profile_name(self):
         """Test with very long agent profile name."""
         long_profile = "very_long_agent_profile_name_that_exceeds_normal_length"
-        mock_tmux.get_history.return_value = f"\x1b[36m[{long_profile}]\x1b[35m>\x1b[39m "
+        output = f"\x1b[36m[{long_profile}]\x1b[35m>\x1b[39m "
 
         provider = QCliProvider("test1234", "test-session", "window-0", long_profile)
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
-    def test_output_with_unicode_characters(self, mock_tmux):
+    def test_output_with_unicode_characters(self):
         """Test handling of unicode characters in output."""
-        mock_tmux.get_history.return_value = (
+        output = (
             "\x1b[38;5;10m> \x1b[39mResponse with unicode: 日本語 café naïve 🚀\n"
             "\x1b[36m[developer]\x1b[35m>\x1b[39m"
         )
 
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.COMPLETED
 
         # Test message extraction
-        message = provider.extract_last_message_from_script(mock_tmux.get_history.return_value)
+        message = provider.extract_last_message_from_script(output)
         assert "日本語" in message
         assert "café" in message
         assert "🚀" in message
 
-    @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
-    def test_output_with_control_characters(self, mock_tmux):
+    def test_output_with_control_characters(self):
         """Test handling of control characters."""
-        mock_tmux.get_history.return_value = (
+        output = (
             "\x1b[38;5;10m> \x1b[39mResponse\x07with\x1bcontrol\x00chars\n"
             "\x1b[36m[developer]\x1b[35m>\x1b[39m"
         )
 
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
-        message = provider.extract_last_message_from_script(mock_tmux.get_history.return_value)
+        message = provider.extract_last_message_from_script(output)
 
         # Control characters should be cleaned
         assert "\x07" not in message  # Bell
         assert "\x00" not in message  # Null
 
-    @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
-    def test_multiple_error_indicators(self, mock_tmux):
+    def test_multiple_error_indicators(self):
         """Test detection with multiple error indicators."""
-        mock_tmux.get_history.return_value = (
+        output = (
             "Amazon Q is having trouble responding right now\n"
             "Amazon Q is having trouble responding right now\n"
             "\x1b[36m[developer]\x1b[35m>\x1b[39m"
         )
 
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.ERROR
 
@@ -684,8 +635,7 @@ class TestQCliProviderEdgeCases:
         assert provider.window_name == "window-0"
         assert provider._agent_profile == "developer"
 
-    @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
-    def test_whitespace_variations_in_prompt(self, mock_tmux):
+    def test_whitespace_variations_in_prompt(self):
         """Test various whitespace scenarios in prompts."""
         test_cases = [
             "\x1b[36m[developer]\x1b[35m>\x1b[39m",
@@ -697,6 +647,5 @@ class TestQCliProviderEdgeCases:
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
 
         for test_output in test_cases:
-            mock_tmux.get_history.return_value = test_output
-            status = provider.get_status()
+            status = provider.get_status(test_output)
             assert status == TerminalStatus.IDLE

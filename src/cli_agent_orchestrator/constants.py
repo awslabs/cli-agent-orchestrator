@@ -56,9 +56,6 @@ FIFO_DIR.mkdir(parents=True, exist_ok=True)
 # =============================================================================
 # Event-Driven State Detection Configuration
 # =============================================================================
-# Generic shell prompt pattern for phase 1 detection (before provider init)
-SHELL_PROMPT_PATTERN = r"[$#%>]\s"
-
 # Rolling buffer size for state detection (8KB)
 # Keeps trailing 8KB of terminal output for pattern matching
 STATE_BUFFER_MAX = 8192

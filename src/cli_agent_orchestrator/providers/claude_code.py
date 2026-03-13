@@ -162,7 +162,7 @@ class ClaudeCodeProvider(BaseProvider):
         # message that get_status() interprets as a completed response.
         if not await wait_until_status(
             self.terminal_id,
-            TerminalStatus.IDLE,
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
             timeout=30.0,
             polling_interval=1.0,
         ):

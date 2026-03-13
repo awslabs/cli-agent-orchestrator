@@ -1,7 +1,7 @@
 """Unit tests for Codex provider."""
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -17,16 +17,17 @@ def load_fixture(filename: str) -> str:
 
 
 class TestCodexProviderInitialization:
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_initialize_success(self, mock_tmux, mock_wait_shell, mock_wait_status):
+    async def test_initialize_success(self, mock_tmux, mock_wait_shell, mock_wait_status):
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
         mock_tmux.get_history.return_value = "OpenAI Codex (v0.98.0)"
 
         provider = CodexProvider("test1234", "test-session", "window-0", None)
-        result = provider.initialize()
+        result = await provider.initialize()
 
         assert result is True
         mock_wait_shell.assert_called_once()
@@ -40,20 +41,22 @@ class TestCodexProviderInitialization:
         )
         mock_wait_status.assert_called_once()
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_initialize_shell_timeout(self, mock_tmux, mock_wait_shell):
+    async def test_initialize_shell_timeout(self, mock_tmux, mock_wait_shell):
         mock_wait_shell.return_value = False
 
         provider = CodexProvider("test1234", "test-session", "window-0", None)
 
         with pytest.raises(TimeoutError, match="Shell initialization timed out"):
-            provider.initialize()
+            await provider.initialize()
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_initialize_codex_timeout(self, mock_tmux, mock_wait_shell, mock_wait_status):
+    async def test_initialize_codex_timeout(self, mock_tmux, mock_wait_shell, mock_wait_status):
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = False
         mock_tmux.get_history.return_value = "OpenAI Codex (v0.98.0)"
@@ -61,7 +64,7 @@ class TestCodexProviderInitialization:
         provider = CodexProvider("test1234", "test-session", "window-0", None)
 
         with pytest.raises(TimeoutError, match="Codex initialization timed out"):
-            provider.initialize()
+            await provider.initialize()
 
 
 class TestCodexBuildCommand:
@@ -217,11 +220,12 @@ class TestCodexBuildCommand:
         with pytest.raises(ProviderError, match="Failed to load agent profile"):
             provider._build_codex_command()
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_initialize_with_agent_profile(
+    async def test_initialize_with_agent_profile(
         self, mock_tmux, mock_load_profile, mock_wait_shell, mock_wait_status
     ):
         mock_wait_shell.return_value = True
@@ -233,7 +237,7 @@ class TestCodexBuildCommand:
         mock_load_profile.return_value = mock_profile
 
         provider = CodexProvider("test1234", "test-session", "window-0", "code_supervisor")
-        result = provider.initialize()
+        result = await provider.initialize()
 
         assert result is True
         # The second send_keys call should contain developer_instructions
@@ -866,8 +870,9 @@ class TestCodexProviderMisc:
 class TestCodexProviderTrustPrompt:
     """Tests for Codex workspace trust prompt handling."""
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_handle_trust_prompt_detected_and_accepted(self, mock_tmux):
+    async def test_handle_trust_prompt_detected_and_accepted(self, mock_tmux):
         """Test that trust prompt is detected and auto-accepted."""
         mock_tmux.get_history.return_value = (
             "> You are running Codex in /Users/test/project\n"
@@ -886,17 +891,18 @@ class TestCodexProviderTrustPrompt:
         mock_window.active_pane = mock_pane
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        provider._handle_trust_prompt(timeout=2.0)
+        await provider._handle_trust_prompt(timeout=2.0)
 
         mock_pane.send_keys.assert_called_once_with("", enter=True)
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_handle_trust_prompt_not_needed(self, mock_tmux):
+    async def test_handle_trust_prompt_not_needed(self, mock_tmux):
         """Test early return when Codex starts without trust prompt."""
         mock_tmux.get_history.return_value = "OpenAI Codex (v0.98.0)\n› "
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        provider._handle_trust_prompt(timeout=2.0)
+        await provider._handle_trust_prompt(timeout=2.0)
 
         mock_tmux.server.sessions.get.assert_not_called()
 
@@ -914,10 +920,11 @@ class TestCodexProviderTrustPrompt:
         # Should be WAITING_USER_ANSWER (not PROCESSING despite "running" in text)
         assert status == TerminalStatus.WAITING_USER_ANSWER
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_initialize_with_trust_prompt(self, mock_tmux, mock_wait_shell, mock_wait_status):
+    async def test_initialize_with_trust_prompt(self, mock_tmux, mock_wait_shell, mock_wait_status):
         """Test that initialize handles trust prompt during startup."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
@@ -932,7 +939,7 @@ class TestCodexProviderTrustPrompt:
         mock_window.active_pane = mock_pane
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        result = provider.initialize()
+        result = await provider.initialize()
 
         assert result is True
         mock_pane.send_keys.assert_called_with("", enter=True)

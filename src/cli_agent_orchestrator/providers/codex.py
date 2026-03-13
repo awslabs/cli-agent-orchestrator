@@ -248,7 +248,7 @@ class CodexProvider(BaseProvider):
 
         if not await wait_until_status(
             self.terminal_id,
-            TerminalStatus.IDLE,
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
             timeout=60.0,
             polling_interval=1.0,
         ):

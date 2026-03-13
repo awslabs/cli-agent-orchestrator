@@ -40,6 +40,13 @@ class BaseProvider(ABC):
     """
 
     def __init__(self, terminal_id: str, session_name: str, window_name: str):
+        """Initialize provider with terminal context.
+
+        Args:
+            terminal_id: Unique identifier for this terminal instance
+            session_name: Name of the tmux session
+            window_name: Name of the tmux window
+        """
         self.terminal_id = terminal_id
         self.session_name = session_name
         self.window_name = window_name

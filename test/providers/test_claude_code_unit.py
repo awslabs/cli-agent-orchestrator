@@ -1,7 +1,7 @@
 """Unit tests for Claude Code provider."""
 
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -12,10 +12,11 @@ from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider, Pro
 class TestClaudeCodeProviderInitialization:
     """Tests for ClaudeCodeProvider initialization."""
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_initialize_success(self, mock_tmux, mock_wait_status, mock_wait_shell):
+    async def test_initialize_success(self, mock_tmux, mock_wait_status, mock_wait_shell):
         """Test successful initialization."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
@@ -23,7 +24,7 @@ class TestClaudeCodeProviderInitialization:
         mock_tmux.get_history.return_value = "Welcome to Claude Code v2.0"
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        result = provider.initialize()
+        result = await provider.initialize()
 
         assert result is True
         assert provider._initialized is True
@@ -31,21 +32,23 @@ class TestClaudeCodeProviderInitialization:
         mock_tmux.send_keys.assert_called_once()
         mock_wait_status.assert_called_once()
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_initialize_shell_timeout(self, mock_tmux, mock_wait_shell):
+    async def test_initialize_shell_timeout(self, mock_tmux, mock_wait_shell):
         """Test initialization with shell timeout."""
         mock_wait_shell.return_value = False
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
 
         with pytest.raises(TimeoutError, match="Shell initialization timed out"):
-            provider.initialize()
+            await provider.initialize()
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_initialize_timeout(self, mock_tmux, mock_wait_status, mock_wait_shell):
+    async def test_initialize_timeout(self, mock_tmux, mock_wait_status, mock_wait_shell):
         """Test initialization timeout."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = False
@@ -54,13 +57,14 @@ class TestClaudeCodeProviderInitialization:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
 
         with pytest.raises(TimeoutError, match="Claude Code initialization timed out"):
-            provider.initialize()
+            await provider.initialize()
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_initialize_with_agent_profile(
+    async def test_initialize_with_agent_profile(
         self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load
     ):
         """Test initialization with agent profile."""
@@ -73,15 +77,16 @@ class TestClaudeCodeProviderInitialization:
         mock_load.return_value = mock_profile
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0", "test-agent")
-        result = provider.initialize()
+        result = await provider.initialize()
 
         assert result is True
         mock_load.assert_called_once_with("test-agent")
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_initialize_with_invalid_agent_profile(self, mock_tmux, mock_load, mock_wait_shell):
+    async def test_initialize_with_invalid_agent_profile(self, mock_tmux, mock_load, mock_wait_shell):
         """Test initialization with invalid agent profile."""
         mock_wait_shell.return_value = True
         mock_load.side_effect = FileNotFoundError("Profile not found")
@@ -89,13 +94,14 @@ class TestClaudeCodeProviderInitialization:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0", "invalid-agent")
 
         with pytest.raises(ProviderError, match="Failed to load agent profile"):
-            provider.initialize()
+            await provider.initialize()
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_initialize_with_mcp_servers(
+    async def test_initialize_with_mcp_servers(
         self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load
     ):
         """Test initialization with MCP servers in profile."""
@@ -108,21 +114,22 @@ class TestClaudeCodeProviderInitialization:
         mock_load.return_value = mock_profile
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0", "test-agent")
-        result = provider.initialize()
+        result = await provider.initialize()
 
         assert result is True
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_initialize_sends_claude_command(self, mock_tmux, mock_wait_status, mock_wait_shell):
+    async def test_initialize_sends_claude_command(self, mock_tmux, mock_wait_status, mock_wait_shell):
         """Test that initialize sends the 'claude' command to tmux."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
         mock_tmux.get_history.return_value = "Welcome to Claude Code v2.0"
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider.initialize()
+        await provider.initialize()
 
         mock_tmux.send_keys.assert_called_once_with(
             "test-session", "window-0", "claude --dangerously-skip-permissions"
@@ -132,84 +139,76 @@ class TestClaudeCodeProviderInitialization:
 class TestClaudeCodeProviderStatusDetection:
     """Tests for ClaudeCodeProvider status detection."""
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_idle_old_prompt(self, mock_tmux):
+    def test_get_status_idle_old_prompt(self):
         """Test IDLE status detection with old '>' prompt."""
-        mock_tmux.get_history.return_value = "> "
+        output = "> "
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_idle_new_prompt(self, mock_tmux):
+    def test_get_status_idle_new_prompt(self):
         """Test IDLE status detection with new '❯' prompt."""
-        mock_tmux.get_history.return_value = "❯ "
+        output = "❯ "
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_idle_with_ansi_codes(self, mock_tmux):
+    def test_get_status_idle_with_ansi_codes(self):
         """Test IDLE status detection with ANSI codes around prompt."""
-        mock_tmux.get_history.return_value = (
+        output = (
             "\x1b[2m\x1b[38;2;136;136;136m────────────\n"
             '\x1b[0m❯ \x1b[7mT\x1b[0;2mry\x1b[0m \x1b[2m"hello"\x1b[0m\n'
             "\x1b[2m\x1b[38;2;136;136;136m────────────\x1b[0m"
         )
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_completed(self, mock_tmux):
+    def test_get_status_completed(self):
         """Test COMPLETED status detection."""
-        mock_tmux.get_history.return_value = "⏺ Here is the response\n> "
+        output = "⏺ Here is the response\n> "
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_completed_with_new_prompt(self, mock_tmux):
+    def test_get_status_completed_with_new_prompt(self):
         """Test COMPLETED status detection with new '❯' prompt."""
-        mock_tmux.get_history.return_value = "⏺ Here is the response\n❯ "
+        output = "⏺ Here is the response\n❯ "
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_processing(self, mock_tmux):
+    def test_get_status_processing(self):
         """Test PROCESSING status detection."""
-        mock_tmux.get_history.return_value = "✶ Processing… (esc to interrupt)"
+        output = "✶ Processing… (esc to interrupt)"
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_processing_minimal_spinner(self, mock_tmux):
+    def test_get_status_processing_minimal_spinner(self):
         """Test PROCESSING detection with minimal spinner format (no parenthesized text)."""
-        mock_tmux.get_history.return_value = "✻ Orbiting…"
+        output = "✻ Orbiting…"
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_processing_beats_stale_completed(self, mock_tmux):
+    def test_get_status_processing_beats_stale_completed(self):
         """Test that PROCESSING is detected even when stale ⏺ and ❯ markers are in scrollback."""
-        mock_tmux.get_history.return_value = (
+        output = (
             "⏺ Previous response from init\n"
             "❯ user task message\n"
             "⏺ Let me read the file\n"
@@ -217,14 +216,13 @@ class TestClaudeCodeProviderStatusDetection:
         )
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_idle_not_false_processing_from_status_bar(self, mock_tmux):
+    def test_get_status_idle_not_false_processing_from_status_bar(self):
         """Status bar '· latest:…' must not false-positive as PROCESSING."""
-        mock_tmux.get_history.return_value = (
+        output = (
             "Claude Code v2.1.63\n"
             "────────────────────\n"
             "❯ \n"
@@ -232,48 +230,34 @@ class TestClaudeCodeProviderStatusDetection:
             "  current: 2.1.63 · latest:…"
         )
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        assert provider.get_status() == TerminalStatus.IDLE
+        assert provider.get_status(output) == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_waiting_user_answer(self, mock_tmux):
+    def test_get_status_waiting_user_answer(self):
         """Test WAITING_USER_ANSWER status detection."""
-        mock_tmux.get_history.return_value = "❯ 1. Option one\n  2. Option two"
+        output = "❯ 1. Option one\n  2. Option two"
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.WAITING_USER_ANSWER
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_error_empty(self, mock_tmux):
-        """Test ERROR status with empty output."""
-        mock_tmux.get_history.return_value = ""
+    def test_get_status_error_empty(self):
+        """Test UNKNOWN status with empty output."""
+        output = ""
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
-        assert status == TerminalStatus.ERROR
+        assert status == TerminalStatus.UNKNOWN
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_error_unrecognized(self, mock_tmux):
-        """Test ERROR status with unrecognized output."""
-        mock_tmux.get_history.return_value = "Some random output without patterns"
-
-        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        status = provider.get_status()
-
-        assert status == TerminalStatus.ERROR
-
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_with_tail_lines(self, mock_tmux):
-        """Test status detection with tail_lines parameter."""
-        mock_tmux.get_history.return_value = "> "
+    def test_get_status_error_unrecognized(self):
+        """Test UNKNOWN status with unrecognized output."""
+        output = "Some random output without patterns"
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider.get_status(tail_lines=50)
+        status = provider.get_status(output)
 
-        mock_tmux.get_history.assert_called_with("test-session", "window-0", tail_lines=50)
-
+        assert status == TerminalStatus.UNKNOWN
 
 class TestClaudeCodeProviderMessageExtraction:
     """Tests for ClaudeCodeProvider message extraction."""
@@ -339,15 +323,6 @@ class TestClaudeCodeProviderMisc:
         """Test exit command."""
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         assert provider.exit_cli() == "/exit"
-
-    def test_get_idle_pattern_for_log(self):
-        """Test idle pattern for log files."""
-        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        pattern = provider.get_idle_pattern_for_log()
-
-        assert pattern is not None
-        assert ">" in pattern
-        assert "❯" in pattern
 
     def test_cleanup(self):
         """Test cleanup resets initialized state."""
@@ -460,8 +435,9 @@ class TestClaudeCodeProviderMisc:
 class TestClaudeCodeProviderTrustPrompt:
     """Tests for Claude Code workspace trust prompt handling."""
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_handle_trust_prompt_detected_and_accepted(self, mock_tmux):
+    async def test_handle_trust_prompt_detected_and_accepted(self, mock_tmux):
         """Test that trust prompt is detected and auto-accepted."""
         # Simulate trust prompt appearing in terminal output
         mock_tmux.get_history.return_value = (
@@ -475,40 +451,40 @@ class TestClaudeCodeProviderTrustPrompt:
         mock_window.active_pane = mock_pane
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_trust_prompt(timeout=2.0)
+        await provider._handle_trust_prompt(timeout=2.0)
 
         # Verify Enter was sent to accept the trust prompt
         mock_pane.send_keys.assert_called_once_with("", enter=True)
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_handle_trust_prompt_not_needed(self, mock_tmux):
+    async def test_handle_trust_prompt_not_needed(self, mock_tmux):
         """Test early return when Claude Code starts without trust prompt."""
         mock_tmux.get_history.return_value = "Welcome to Claude Code v2.1.0"
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_trust_prompt(timeout=2.0)
+        await provider._handle_trust_prompt(timeout=2.0)
 
         # No session/pane access should happen
         mock_tmux.server.sessions.get.assert_not_called()
 
-    @patch("cli_agent_orchestrator.providers.claude_code.time")
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.claude_code.asyncio.sleep", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_handle_trust_prompt_timeout(self, mock_tmux, mock_time):
+    async def test_handle_trust_prompt_timeout(self, mock_tmux, mock_async_sleep):
         """Test trust prompt handler times out gracefully."""
         # Return output that doesn't match trust prompt or welcome banner
         mock_tmux.get_history.return_value = "Loading..."
-        # Simulate time passing past the timeout
-        mock_time.time.side_effect = [0.0, 0.0, 25.0]
-        mock_time.sleep = MagicMock()
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         # Should not raise, just log a warning and return
-        provider._handle_trust_prompt(timeout=20.0)
+        await provider._handle_trust_prompt(timeout=0.1)
 
         mock_tmux.server.sessions.get.assert_not_called()
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_handle_trust_prompt_empty_output_then_detected(self, mock_tmux):
+    async def test_handle_trust_prompt_empty_output_then_detected(self, mock_tmux):
         """Test trust prompt detection after initially empty output."""
         # First call returns empty, second returns trust prompt
         mock_tmux.get_history.side_effect = [
@@ -523,28 +499,28 @@ class TestClaudeCodeProviderTrustPrompt:
         mock_window.active_pane = mock_pane
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_trust_prompt(timeout=5.0)
+        await provider._handle_trust_prompt(timeout=5.0)
 
         mock_pane.send_keys.assert_called_once_with("", enter=True)
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_trust_prompt_not_waiting_user_answer(self, mock_tmux):
+    def test_get_status_trust_prompt_not_waiting_user_answer(self):
         """Test that trust prompt is NOT detected as WAITING_USER_ANSWER."""
         # This output has both WAITING_USER_ANSWER pattern AND trust prompt pattern
-        mock_tmux.get_history.return_value = (
+        output = (
             "❯ 1. Yes, I trust this folder\n" "  2. No, don't trust this folder"
         )
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         # Should NOT be WAITING_USER_ANSWER since trust prompt is excluded
         assert status != TerminalStatus.WAITING_USER_ANSWER
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_initialize_calls_handle_trust_prompt(
+    async def test_initialize_calls_handle_trust_prompt(
         self, mock_tmux, mock_wait_status, mock_wait_shell
     ):
         """Test that initialize calls _handle_trust_prompt."""
@@ -560,7 +536,7 @@ class TestClaudeCodeProviderTrustPrompt:
         mock_window.active_pane = mock_pane
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        result = provider.initialize()
+        result = await provider.initialize()
 
         assert result is True
         # Verify trust prompt was auto-accepted (Enter sent)

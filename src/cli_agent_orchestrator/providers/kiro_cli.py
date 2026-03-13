@@ -125,7 +125,7 @@ class KiroCliProvider(BaseProvider):
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
         # message that get_status() interprets as a completed response.
         if not await wait_until_status(
-            self.terminal_id, TerminalStatus.IDLE, timeout=30.0
+            self.terminal_id, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=30.0
         ):
             raise TimeoutError("Kiro CLI initialization timed out after 30 seconds")
 
@@ -133,6 +133,16 @@ class KiroCliProvider(BaseProvider):
         return True
 
     def get_status(self, output: str) -> TerminalStatus:
+        """Get Kiro CLI status by analyzing terminal output.
+
+        Status detection logic (in priority order):
+        1. No output → UNKNOWN
+        2. No IDLE prompt visible → PROCESSING (agent is generating response)
+        3. Error indicators present → ERROR
+        4. Permission prompt visible → WAITING_USER_ANSWER
+        5. Green arrow + prompt visible → COMPLETED (response ready)
+        6. Only prompt visible → IDLE (waiting for input)
+        """
         if not output:
             return TerminalStatus.UNKNOWN
 

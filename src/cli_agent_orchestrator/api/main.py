@@ -128,7 +128,7 @@ app = FastAPI(
 
 
 @app.get("/health")
-def health_check():
+async def health_check():
     return {"status": "ok", "service": "cli-agent-orchestrator"}
 
 
@@ -160,7 +160,7 @@ async def create_session(
 
 
 @app.get("/sessions")
-def list_sessions() -> List[Dict]:
+async def list_sessions() -> List[Dict]:
     try:
         return session_service.list_sessions()
     except Exception as e:
@@ -171,7 +171,7 @@ def list_sessions() -> List[Dict]:
 
 
 @app.get("/sessions/{session_name}")
-def get_session(session_name: str) -> Dict:
+async def get_session(session_name: str) -> Dict:
     try:
         return session_service.get_session(session_name)
     except ValueError as e:
@@ -184,7 +184,7 @@ def get_session(session_name: str) -> Dict:
 
 
 @app.delete("/sessions/{session_name}")
-def delete_session(session_name: str) -> Dict:
+async def delete_session(session_name: str) -> Dict:
     try:
         success = session_service.delete_session(session_name)
         return {"success": success}
@@ -229,7 +229,7 @@ async def create_terminal_in_session(
 
 
 @app.get("/sessions/{session_name}/terminals")
-def list_terminals_in_session(session_name: str) -> List[Dict]:
+async def list_terminals_in_session(session_name: str) -> List[Dict]:
     """List all terminals in a session."""
     try:
         from cli_agent_orchestrator.clients.database import list_terminals_by_session
@@ -243,7 +243,7 @@ def list_terminals_in_session(session_name: str) -> List[Dict]:
 
 
 @app.get("/terminals/{terminal_id}", response_model=Terminal)
-def get_terminal(terminal_id: TerminalId) -> Terminal:
+async def get_terminal(terminal_id: TerminalId) -> Terminal:
     try:
         terminal = terminal_service.get_terminal(terminal_id)
         return Terminal(**terminal)
@@ -257,7 +257,7 @@ def get_terminal(terminal_id: TerminalId) -> Terminal:
 
 
 @app.get("/terminals/{terminal_id}/working-directory", response_model=WorkingDirectoryResponse)
-def get_terminal_working_directory(terminal_id: TerminalId) -> WorkingDirectoryResponse:
+async def get_terminal_working_directory(terminal_id: TerminalId) -> WorkingDirectoryResponse:
     """Get the current working directory of a terminal's pane."""
     try:
         working_directory = terminal_service.get_working_directory(terminal_id)
@@ -272,7 +272,7 @@ def get_terminal_working_directory(terminal_id: TerminalId) -> WorkingDirectoryR
 
 
 @app.post("/terminals/{terminal_id}/input")
-def send_terminal_input(terminal_id: TerminalId, message: str) -> Dict:
+async def send_terminal_input(terminal_id: TerminalId, message: str) -> Dict:
     try:
         success = terminal_service.send_input(terminal_id, message)
         return {"success": success}

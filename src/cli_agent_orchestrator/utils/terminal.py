@@ -74,25 +74,27 @@ async def wait_for_shell(
 
 async def wait_until_status(
     terminal_id: str,
-    target_status: TerminalStatus,
+    target_status: "TerminalStatus | set[TerminalStatus]",
     timeout: float = 30.0,
     polling_interval: float = 1.0,
 ) -> bool:
     """Wait until terminal reaches target status by polling status_monitor."""
     from cli_agent_orchestrator.services.status_monitor import status_monitor
 
+    targets = target_status if isinstance(target_status, set) else {target_status}
+    target_str = ", ".join(s.value for s in targets)
     logger.info(
-        f"wait_until_status [{terminal_id}]: waiting for {target_status.value}, timeout={timeout}s"
+        f"wait_until_status [{terminal_id}]: waiting for {{{target_str}}}, timeout={timeout}s"
     )
     start = time.time()
     while time.time() - start < timeout:
         current = status_monitor.get_status(terminal_id)
-        if current == target_status:
-            logger.info(f"wait_until_status [{terminal_id}]: target {target_status.value} reached")
+        if current in targets:
+            logger.info(f"wait_until_status [{terminal_id}]: reached {current.value}")
             return True
         await asyncio.sleep(polling_interval)
     logger.warning(
-        f"wait_until_status [{terminal_id}]: timeout waiting for {target_status.value}"
+        f"wait_until_status [{terminal_id}]: timeout waiting for {{{target_str}}}"
     )
     return False
 

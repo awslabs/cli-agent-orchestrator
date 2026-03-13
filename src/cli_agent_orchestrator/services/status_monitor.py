@@ -5,10 +5,9 @@ Publisher: terminal.{id}.status
 """
 
 import logging
-import re
 from typing import Dict
 
-from cli_agent_orchestrator.constants import SHELL_PROMPT_PATTERN, STATE_BUFFER_MAX
+from cli_agent_orchestrator.constants import STATE_BUFFER_MAX
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.event_bus import bus
@@ -54,11 +53,9 @@ class StatusMonitor:
             self._last_status[terminal_id] = new_status
 
     def _detect_status(self, terminal_id: str, buffer: str) -> TerminalStatus:
-        """Detect status: generic shell prompt if no provider, else provider-specific."""
+        """Detect status: provider-specific patterns or UNKNOWN if no provider."""
         provider = provider_manager.get_provider(terminal_id)
         if provider is None:
-            if re.search(SHELL_PROMPT_PATTERN, buffer[-500:]):
-                return TerminalStatus.IDLE
             return TerminalStatus.UNKNOWN
 
         try:
