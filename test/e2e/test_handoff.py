@@ -93,8 +93,20 @@ def _run_handoff_test(provider: str, agent_profile: str, task_message: str, cont
                 f"(provider={provider}), status after stabilization: {recheck_status}"
             )
 
-        # Step 5: Extract output
-        output = extract_output(terminal_id)
+        # Step 5: Extract output.
+        # Gemini CLI's Ink TUI may show notification spinners for ~10-15s after
+        # completing a response. These spinners temporarily obscure the response
+        # text. Retry extraction with increasing delays to wait for spinners to
+        # clear and the response to become visible in the tmux capture.
+        output = ""
+        for extraction_attempt in range(4):
+            try:
+                output = extract_output(terminal_id)
+                if len(output.strip()) > 0:
+                    break
+            except (AssertionError, Exception):
+                pass
+            time.sleep(10)
 
         # Step 6: Validate output
         assert len(output.strip()) > 0, "Output should not be empty"
