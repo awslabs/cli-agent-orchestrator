@@ -221,7 +221,7 @@ node --version   # Should be 18 or higher
 # 1. Start the backend server (if not already running)
 cao-server
 # Or with custom host/port:
-cao-server --host 0.0.0.0 --port 9889
+cao-server --host 0.0.0.0 --port 9889  # ⚠️ Exposes server to network — see Security note below
 
 # 2. Start the frontend dev server
 cd web/
@@ -476,6 +476,8 @@ The `cao launch --provider` flag always takes precedence — it is treated as an
 For ready-to-use examples, see [`examples/cross-provider/`](examples/cross-provider/).
 
 ## Security
+
+The server is designed for **localhost-only use**. The WebSocket terminal endpoint (`/terminals/{id}/ws`) provides full PTY access and will reject connections from non-loopback addresses. Do not expose the server to untrusted networks without adding authentication.
 
 See [SECURITY.md](SECURITY.md) for vulnerability reporting, security scanning, and best practices.
 

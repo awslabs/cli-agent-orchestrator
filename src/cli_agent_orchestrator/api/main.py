@@ -98,6 +98,14 @@ class CreateFlowRequest(BaseModel):
     provider: str = "kiro_cli"
     prompt_template: str
 
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        """Prevent path traversal — flow name becomes a filename."""
+        if "/" in v or "\\" in v or ".." in v:
+            raise ValueError("Flow name must not contain '/', '\\', or '..'")
+        return v
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -531,7 +539,18 @@ async def get_inbox_messages_endpoint(
 
 @app.websocket("/terminals/{terminal_id}/ws")
 async def terminal_ws(websocket: WebSocket, terminal_id: str):
-    """WebSocket endpoint for live terminal streaming via tmux attach."""
+    """WebSocket endpoint for live terminal streaming via tmux attach.
+
+    Security: This endpoint provides full PTY access with no authentication.
+    It is intended for localhost-only use. Do NOT expose the server to
+    untrusted networks (e.g. --host 0.0.0.0) without adding authentication.
+    """
+    # Reject connections from non-loopback clients
+    client_host = websocket.client.host if websocket.client else None
+    if client_host not in (None, "127.0.0.1", "::1", "localhost"):
+        await websocket.close(code=4003, reason="WebSocket access is restricted to localhost")
+        return
+
     await websocket.accept()
 
     metadata = get_terminal_metadata(terminal_id)
