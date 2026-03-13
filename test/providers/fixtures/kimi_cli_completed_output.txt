@@ -1,0 +1,19 @@
+╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                                                                  │
+│   ▐█▛█▛█▌  Welcome to Kimi Code CLI!                                                             │
+│   ▐█████▌  Send /help for help information.                                                      │
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+💫 create a greet function
+• Let me think about what the user wants...
+• Here is a simple greet function:
+
+def greet(name):
+    return f"Hello, {name}!"
+
+• The function takes a name parameter and returns a greeting string.
+💫
+
+
+
+23:15  yolo  agent (kimi-for-coding, thinking)  ctrl-x: toggle mode                    context: 5.0%

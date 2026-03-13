@@ -1,0 +1,8 @@
+╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                                                                  │
+│   ▐█▛█▛█▌  Welcome to Kimi Code CLI!                                                             │
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+💫 analyze the codebase
+• I need to look at the project structure first...
+• Reading files to understand the codebase...
