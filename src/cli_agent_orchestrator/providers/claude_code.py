@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import shlex
+import subprocess
 import time
 from typing import Optional
 
@@ -104,15 +105,23 @@ class ClaudeCodeProvider(BaseProvider):
 
         # Use shlex.join() for proper shell escaping of all arguments
         # This correctly handles multiline strings, quotes, and special characters
-        return shlex.join(command_parts)
+        claude_cmd = shlex.join(command_parts)
 
-    def _handle_trust_prompt(self, timeout: float = 20.0) -> None:
-        """Auto-accept the workspace trust prompt if it appears.
+        # When cao-server runs inside a Claude Code session, CLAUDE* env vars
+        # leak into spawned tmux panes (via the tmux server's global env).
+        # Claude Code detects these and refuses to start ("nested session").
+        # Unset all matching vars in the shell before launching.
+        unset_cmd = "unset $(env | grep -oP '^CLAUDE[A-Z_]*(?==)') 2>/dev/null"
+        return f"{unset_cmd}; {claude_cmd}"
 
-        Claude Code shows a trust dialog when opening an untrusted directory.
-        This sends Enter to accept 'Yes, I trust this folder'.
-        CAO assumes the user trusts the working directory since they initiated
-        the launch command.
+    def _handle_startup_prompts(self, timeout: float = 20.0) -> None:
+        """Auto-accept startup prompts (trust dialog, bypass permissions warning).
+
+        Claude Code may show:
+        1. Workspace trust dialog: "Yes, I trust this folder"
+        2. Bypass permissions warning: "Yes, I accept" (when --dangerously-skip-permissions)
+        CAO assumes the user trusts the working directory and accepts bypass mode
+        since they explicitly initiated the launch.
         """
         start_time = time.time()
         while time.time() - start_time < timeout:
@@ -121,9 +130,21 @@ class ClaudeCodeProvider(BaseProvider):
                 time.sleep(1.0)
                 continue
 
-            # Clean ANSI codes for reliable text matching
             clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
 
+            # Bypass permissions warning: need to select "Yes, I accept" (option 2)
+            if re.search(r"Bypass Permissions mode|Yes, I accept", clean_output):
+                logger.info("Bypass permissions prompt detected, accepting")
+                target = f"{self.session_name}:{self.window_name}"
+                # Send raw Down arrow escape sequence (-l for literal) to move
+                # cursor to "Yes, I accept", then Enter to confirm.
+                # tmux send-keys "Down" doesn't work with Claude's Ink TUI.
+                subprocess.run(["tmux", "send-keys", "-t", target, "-l", "\x1b[B"], check=False)
+                time.sleep(0.5)
+                subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], check=False)
+                return
+
+            # Workspace trust dialog
             if re.search(TRUST_PROMPT_PATTERN, clean_output):
                 logger.info("Workspace trust prompt detected, auto-accepting")
                 session = tmux_client.server.sessions.get(session_name=self.session_name)
@@ -133,14 +154,16 @@ class ClaudeCodeProvider(BaseProvider):
                     pane.send_keys("", enter=True)
                 return
 
-            # Check if Claude Code has fully started (welcome banner visible)
-            # Use a specific pattern that only appears in the welcome screen
+            # Check if Claude Code has fully started (welcome banner or prompt visible)
             if re.search(r"Welcome to|Claude Code v\d+", clean_output):
-                logger.info("Claude Code started without trust prompt")
+                logger.info("Claude Code started without prompts")
+                return
+            if re.search(IDLE_PROMPT_PATTERN, clean_output):
+                logger.info("Claude Code idle prompt detected, no prompts needed")
                 return
 
             time.sleep(1.0)
-        logger.warning("Trust prompt handler timed out")
+        logger.warning("Startup prompt handler timed out")
 
     def initialize(self) -> bool:
         """Initialize Claude Code provider by starting claude command."""
@@ -154,8 +177,8 @@ class ClaudeCodeProvider(BaseProvider):
         # Send Claude Code command using tmux client
         tmux_client.send_keys(self.session_name, self.window_name, command)
 
-        # Handle workspace trust prompt if it appears (new/untrusted directories)
-        self._handle_trust_prompt(timeout=20.0)
+        # Handle startup prompts (trust dialog, bypass permissions warning)
+        self._handle_startup_prompts(timeout=20.0)
 
         # Wait for Claude Code prompt to be ready.
         # Accept both IDLE and COMPLETED — some CLI versions show a startup

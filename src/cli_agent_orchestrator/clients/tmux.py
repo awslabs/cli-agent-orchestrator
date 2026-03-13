@@ -109,7 +109,14 @@ class TmuxClient:
         try:
             working_directory = self._resolve_and_validate_working_directory(working_directory)
 
-            environment = os.environ.copy()
+            # Filter out provider env vars that would cause "nested session"
+            # errors when CAO itself runs inside a provider (e.g. Claude Code).
+            blocked_prefixes = ("CLAUDE", "CODEX_")
+            environment = {
+                k: v
+                for k, v in os.environ.items()
+                if not any(k.startswith(p) for p in blocked_prefixes)
+            }
             environment["CAO_TERMINAL_ID"] = terminal_id
 
             session = self.server.new_session(
@@ -381,6 +388,22 @@ class TmuxClient:
             return False
         except Exception as e:
             logger.error(f"Failed to kill session {session_name}: {e}")
+            return False
+
+    def kill_window(self, session_name: str, window_name: str) -> bool:
+        """Kill a specific tmux window within a session."""
+        try:
+            session = self.server.sessions.get(session_name=session_name)
+            if not session:
+                return False
+            window = session.windows.get(window_name=window_name)
+            if window:
+                window.kill()
+                logger.info(f"Killed tmux window: {session_name}:{window_name}")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Failed to kill window {session_name}:{window_name}: {e}")
             return False
 
     def session_exists(self, session_name: str) -> bool:

@@ -144,6 +144,23 @@ def update_last_active(terminal_id: str) -> bool:
         return False
 
 
+def list_all_terminals() -> List[Dict[str, Any]]:
+    """List all terminals."""
+    with SessionLocal() as db:
+        terminals = db.query(TerminalModel).all()
+        return [
+            {
+                "id": t.id,
+                "tmux_session": t.tmux_session,
+                "tmux_window": t.tmux_window,
+                "provider": t.provider,
+                "agent_profile": t.agent_profile,
+                "last_active": t.last_active,
+            }
+            for t in terminals
+        ]
+
+
 def delete_terminal(terminal_id: str) -> bool:
     """Delete terminal metadata."""
     with SessionLocal() as db:

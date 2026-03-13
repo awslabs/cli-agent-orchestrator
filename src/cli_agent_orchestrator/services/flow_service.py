@@ -99,9 +99,19 @@ def add_flow(file_path: str) -> Flow:
         raise
 
 
+def _enrich_flow_with_prompt(flow: Flow) -> Flow:
+    """Read the prompt template from the flow file and attach it."""
+    try:
+        _, prompt = _parse_flow_file(Path(flow.file_path))
+        flow.prompt_template = prompt.strip()
+    except Exception:
+        flow.prompt_template = None
+    return flow
+
+
 def list_flows() -> List[Flow]:
     """List all flows."""
-    return db_list_flows()
+    return [_enrich_flow_with_prompt(f) for f in db_list_flows()]
 
 
 def get_flow(name: str) -> Flow:
@@ -109,7 +119,7 @@ def get_flow(name: str) -> Flow:
     flow = db_get_flow(name)
     if not flow:
         raise ValueError(f"Flow '{name}' not found")
-    return flow
+    return _enrich_flow_with_prompt(flow)
 
 
 def remove_flow(name: str) -> bool:
