@@ -243,76 +243,57 @@ class TestCodexBuildCommand:
 
 
 class TestCodexProviderStatusDetection:
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_idle(self, mock_tmux):
-        mock_tmux.get_history.return_value = load_fixture("codex_idle_output.txt")
+    def test_get_status_idle(self):
+        output = load_fixture("codex_idle_output.txt")
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_completed(self, mock_tmux):
-        mock_tmux.get_history.return_value = load_fixture("codex_completed_output.txt")
+    def test_get_status_completed(self):
+        output = load_fixture("codex_completed_output.txt")
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_processing(self, mock_tmux):
-        mock_tmux.get_history.return_value = load_fixture("codex_processing_output.txt")
+    def test_get_status_processing(self):
+        output = load_fixture("codex_processing_output.txt")
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_waiting_user_answer(self, mock_tmux):
-        mock_tmux.get_history.return_value = load_fixture("codex_permission_output.txt")
+    def test_get_status_waiting_user_answer(self):
+        output = load_fixture("codex_permission_output.txt")
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.WAITING_USER_ANSWER
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_error(self, mock_tmux):
-        mock_tmux.get_history.return_value = load_fixture("codex_error_output.txt")
+    def test_get_status_error(self):
+        output = load_fixture("codex_error_output.txt")
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.ERROR
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_empty_output(self, mock_tmux):
-        mock_tmux.get_history.return_value = ""
-
+    def test_get_status_empty_output(self):
         provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status("")
 
-        assert status == TerminalStatus.ERROR
+        assert status == TerminalStatus.UNKNOWN
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_with_tail_lines(self, mock_tmux):
-        mock_tmux.get_history.return_value = load_fixture("codex_idle_output.txt")
-
-        provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status(tail_lines=50)
-
-        assert status == TerminalStatus.IDLE
-        mock_tmux.get_history.assert_called_once_with("test-session", "window-0", tail_lines=50)
-
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_processing_when_old_prompt_present(self, mock_tmux):
+    def test_get_status_processing_when_old_prompt_present(self):
         # If the captured history contains an earlier prompt but the *latest* output is processing,
         # we should report PROCESSING. The old prompt should be far enough from the bottom
         # (more than IDLE_PROMPT_TAIL_LINES) to avoid false idle detection.
-        mock_tmux.get_history.return_value = (
+        output = (
             "Welcome to Codex\n"
             "❯ \n"
             "You Fix the failing tests\n"
@@ -324,15 +305,14 @@ class TestCodexProviderStatusDetection:
         )
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_not_error_on_failed_in_message(self, mock_tmux):
+    def test_get_status_not_error_on_failed_in_message(self):
         # "failed" is commonly used in normal assistant output; it should not automatically
         # force ERROR.
-        mock_tmux.get_history.return_value = (
+        output = (
             "You Explain why the test failed\n"
             "assistant: The test failed because the assertion is incorrect.\n"
             "\n"
@@ -340,35 +320,32 @@ class TestCodexProviderStatusDetection:
         )
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_idle_if_no_assistant_after_last_user(self, mock_tmux):
+    def test_get_status_idle_if_no_assistant_after_last_user(self):
         # If there is a user message but no assistant response after it, we should not
         # treat the session as COMPLETED.
-        mock_tmux.get_history.return_value = "assistant: Welcome\n" "You Do the thing\n" "\n" "❯ \n"
+        output = "assistant: Welcome\n" "You Do the thing\n" "\n" "❯ \n"
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_processing_when_no_prompt_and_no_keywords(self, mock_tmux):
+    def test_get_status_processing_when_no_prompt_and_no_keywords(self):
         # Codex output may not always include explicit "thinking/processing" keywords.
         # Without an idle prompt at the end, we should assume it's still processing.
-        mock_tmux.get_history.return_value = "You Run the command\nWorking...\n"
+        output = "You Run the command\nWorking...\n"
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_not_error_when_assistant_mentions_error_text(self, mock_tmux):
-        mock_tmux.get_history.return_value = (
+    def test_get_status_not_error_when_assistant_mentions_error_text(self):
+        output = (
             "You Explain the failure\n"
             "assistant: Here's an example error:\n"
             "Error: example only\n"
@@ -377,13 +354,12 @@ class TestCodexProviderStatusDetection:
         )
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_not_waiting_when_assistant_mentions_approval_text(self, mock_tmux):
-        mock_tmux.get_history.return_value = (
+    def test_get_status_not_waiting_when_assistant_mentions_approval_text(self):
+        output = (
             "You Explain approvals\n"
             "assistant: You might see this prompt:\n"
             "Approve this command? [y/n]\n"
@@ -392,41 +368,37 @@ class TestCodexProviderStatusDetection:
         )
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_error_when_error_after_user_and_prompt(self, mock_tmux):
-        mock_tmux.get_history.return_value = "You Run thing\nError: failed\n\n❯ \n"
+    def test_get_status_error_when_error_after_user_and_prompt(self):
+        output = "You Run thing\nError: failed\n\n❯ \n"
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.ERROR
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_waiting_user_answer_when_no_user_prefix(self, mock_tmux):
-        mock_tmux.get_history.return_value = "Approve this command? [y/n]\n"
+    def test_get_status_waiting_user_answer_when_no_user_prefix(self):
+        output = "Approve this command? [y/n]\n"
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.WAITING_USER_ANSWER
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_error_when_no_user_prefix(self, mock_tmux):
-        mock_tmux.get_history.return_value = "Error: something failed\n"
+    def test_get_status_error_when_no_user_prefix(self):
+        output = "Error: something failed\n"
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.ERROR
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_idle_tui_with_status_bar(self, mock_tmux):
+    def test_get_status_idle_tui_with_status_bar(self):
         """Test IDLE detection with realistic TUI output (status bar after prompt)."""
-        mock_tmux.get_history.return_value = (
+        output = (
             "╭───────────────────────────────────────────╮\n"
             "│ >_ OpenAI Codex (v0.98.0)                 │\n"
             "│ model: gpt-5.3-codex high                 │\n"
@@ -438,14 +410,13 @@ class TestCodexProviderStatusDetection:
         )
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_completed_tui_with_status_bar(self, mock_tmux):
+    def test_get_status_completed_tui_with_status_bar(self):
         """Test COMPLETED detection with TUI output (status bar after prompt)."""
-        mock_tmux.get_history.return_value = (
+        output = (
             "You Fix the bug\n"
             "assistant: I've fixed the issue in main.py.\n"
             "\n"
@@ -454,7 +425,7 @@ class TestCodexProviderStatusDetection:
         )
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.COMPLETED
 
@@ -462,10 +433,9 @@ class TestCodexProviderStatusDetection:
 class TestCodexBulletFormatStatusDetection:
     """Tests for Codex's real interactive output format using › prompt and • bullets."""
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_completed_bullet_format(self, mock_tmux):
+    def test_get_status_completed_bullet_format(self):
         """COMPLETED when › user message followed by • response and idle prompt."""
-        mock_tmux.get_history.return_value = (
+        output = (
             "› what is your role?\n"
             "• I am the Coding Supervisor Agent.\n"
             "• I coordinate tasks between developer and reviewer agents.\n"
@@ -474,14 +444,13 @@ class TestCodexBulletFormatStatusDetection:
         )
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_processing_bullet_format(self, mock_tmux):
+    def test_get_status_processing_bullet_format(self):
         """PROCESSING when • response started but no idle prompt at bottom."""
-        mock_tmux.get_history.return_value = (
+        output = (
             "› fix the failing tests\n"
             "• Let me look at the test files.\n"
             "Reading src/test_main.py...\n"
@@ -492,24 +461,22 @@ class TestCodexBulletFormatStatusDetection:
         )
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_idle_bullet_format_no_response(self, mock_tmux):
+    def test_get_status_idle_bullet_format_no_response(self):
         """IDLE when › user message but no • response yet and idle prompt at bottom."""
-        mock_tmux.get_history.return_value = "› hello\n\n› \n"
+        output = "› hello\n\n› \n"
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_completed_bullet_with_code_block(self, mock_tmux):
+    def test_get_status_completed_bullet_with_code_block(self):
         """COMPLETED with • response containing code blocks."""
-        mock_tmux.get_history.return_value = (
+        output = (
             "› show me a function\n"
             "• Here's the function:\n"
             "\n"
@@ -524,24 +491,22 @@ class TestCodexBulletFormatStatusDetection:
         )
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_error_not_masked_by_bullet_pattern(self, mock_tmux):
+    def test_get_status_error_not_masked_by_bullet_pattern(self):
         """ERROR still detected when no • response and error after › user message."""
-        mock_tmux.get_history.return_value = "› do something\nError: connection refused\n"
+        output = "› do something\nError: connection refused\n"
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.ERROR
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_completed_multi_turn_bullet(self, mock_tmux):
+    def test_get_status_completed_multi_turn_bullet(self):
         """COMPLETED uses last user message in multi-turn bullet format."""
-        mock_tmux.get_history.return_value = (
+        output = (
             "› first question\n"
             "• First answer.\n"
             "\n"
@@ -552,14 +517,13 @@ class TestCodexBulletFormatStatusDetection:
         )
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_completed_bullet_with_tui_status_bar(self, mock_tmux):
+    def test_get_status_completed_bullet_with_tui_status_bar(self):
         """COMPLETED with bullet format and TUI status bar after prompt."""
-        mock_tmux.get_history.return_value = (
+        output = (
             "› fix the bug\n"
             "• I've fixed the issue in main.py by correcting the import.\n"
             "\n"
@@ -568,14 +532,13 @@ class TestCodexBulletFormatStatusDetection:
         )
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_processing_tui_spinner(self, mock_tmux):
+    def test_get_status_processing_tui_spinner(self):
         """PROCESSING when TUI shows • Working spinner, not false COMPLETED."""
-        mock_tmux.get_history.return_value = (
+        output = (
             "› [CAO Handoff] Supervisor terminal ID: sup-123. Do the task.\n"
             "\n"
             "• Working (0s • esc to interrupt)\n"
@@ -586,14 +549,13 @@ class TestCodexBulletFormatStatusDetection:
         )
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_processing_tui_thinking_spinner(self, mock_tmux):
+    def test_get_status_processing_tui_thinking_spinner(self):
         """PROCESSING when TUI shows • Thinking spinner."""
-        mock_tmux.get_history.return_value = (
+        output = (
             "› Implement feature X\n"
             "\n"
             "• Thinking (3s • esc to interrupt)\n"
@@ -604,14 +566,13 @@ class TestCodexBulletFormatStatusDetection:
         )
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_processing_dynamic_spinner_text(self, mock_tmux):
+    def test_get_status_processing_dynamic_spinner_text(self):
         """PROCESSING when TUI shows spinner with dynamic prefix text."""
-        mock_tmux.get_history.return_value = (
+        output = (
             "› [CAO Handoff] Do the task.\n"
             "\n"
             "• Creating /tmp/file.py\n"
@@ -624,7 +585,7 @@ class TestCodexBulletFormatStatusDetection:
         )
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         assert status == TerminalStatus.PROCESSING
 
@@ -885,16 +846,6 @@ class TestCodexV0111Extraction:
 
 
 class TestCodexProviderMisc:
-    def test_get_idle_pattern_for_log(self):
-        provider = CodexProvider("test1234", "test-session", "window-0")
-        pattern = provider.get_idle_pattern_for_log()
-        # Codex TUI renders ❯ via cursor positioning (capture-pane only).
-        # The pipe-pane log contains "? for shortcuts" from the TUI footer.
-        assert pattern == r"\? for shortcuts"
-        import re
-
-        assert re.search(pattern, "? for shortcuts")
-
     def test_exit_cli(self):
         provider = CodexProvider("test1234", "test-session", "window-0")
         assert provider.exit_cli() == "/exit"
@@ -949,17 +900,16 @@ class TestCodexProviderTrustPrompt:
 
         mock_tmux.server.sessions.get.assert_not_called()
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_trust_prompt_is_waiting_user_answer(self, mock_tmux):
+    def test_get_status_trust_prompt_is_waiting_user_answer(self):
         """Test that trust prompt reports WAITING_USER_ANSWER, not PROCESSING."""
-        mock_tmux.get_history.return_value = (
+        output = (
             "> You are running Codex in /Users/test/project\n"
             "allow Codex to work in this folder without asking for approval.\n"
             "› 1. Yes\n"
         )
 
         provider = CodexProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(output)
 
         # Should be WAITING_USER_ANSWER (not PROCESSING despite "running" in text)
         assert status == TerminalStatus.WAITING_USER_ANSWER
