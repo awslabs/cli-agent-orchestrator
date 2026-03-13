@@ -202,6 +202,56 @@ class TestCreateFlow:
 
                 assert response.status_code == 500
 
+    def test_create_flow_path_traversal_rejected(self, client):
+        """POST /flows rejects names with path traversal characters."""
+        for bad_name in ["../../etc/cron", "../evil", "foo/bar", "a\\b"]:
+            response = client.post(
+                "/flows",
+                json={
+                    "name": bad_name,
+                    "schedule": "0 * * * *",
+                    "agent_profile": "developer",
+                    "provider": "kiro_cli",
+                    "prompt_template": "Do work.",
+                },
+            )
+            assert response.status_code == 422, f"Expected 422 for name={bad_name!r}"
+
+    def test_create_flow_value_error(self, client):
+        """POST /flows returns 404 when add_flow raises ValueError."""
+        with (
+            patch("cli_agent_orchestrator.api.main.flow_service") as mock_svc,
+            patch("cli_agent_orchestrator.api.main.CAO_HOME_DIR") as mock_home,
+        ):
+            mock_home.__truediv__ = lambda self, x: type(
+                "FakePath",
+                (),
+                {
+                    "mkdir": lambda self, **kw: None,
+                    "__truediv__": lambda self, x: type(
+                        "FakeFile",
+                        (),
+                        {"write_text": lambda self, t: None},
+                    )(),
+                },
+            )()
+
+            mock_svc.add_flow.side_effect = ValueError("Invalid flow file")
+
+            response = client.post(
+                "/flows",
+                json={
+                    "name": "bad-flow",
+                    "schedule": "0 * * * *",
+                    "agent_profile": "developer",
+                    "provider": "kiro_cli",
+                    "prompt_template": "Do work.",
+                },
+            )
+
+            assert response.status_code == 404
+            assert "Invalid flow file" in response.json()["detail"]
+
 
 class TestDeleteFlow:
     """Tests for DELETE /flows/{name} endpoint."""

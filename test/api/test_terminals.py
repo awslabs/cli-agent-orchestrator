@@ -274,6 +274,138 @@ class TestExitTerminalEndpoint:
             assert response.status_code == 500
             assert "Failed to exit terminal" in response.json()["detail"]
 
+    def test_exit_terminal_provider_returns_none(self, client):
+        """Should return 404 when get_provider returns None (not ValueError)."""
+        with patch("cli_agent_orchestrator.api.main.provider_manager") as mock_pm:
+            mock_pm.get_provider.return_value = None
+
+            response = client.post("/terminals/deadbeef/exit")
+
+            assert response.status_code == 404
+            assert "Provider not found" in response.json()["detail"]
+
+
+class TestDeleteTerminalEndpoint:
+    """Test DELETE /terminals/{terminal_id} endpoint."""
+
+    def test_delete_terminal_success(self, client):
+        """DELETE /terminals/{terminal_id} deletes and returns success."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.delete_terminal.return_value = True
+
+            response = client.delete("/terminals/abcd1234")
+
+            assert response.status_code == 200
+            assert response.json() == {"success": True}
+            mock_svc.delete_terminal.assert_called_once_with("abcd1234")
+
+    def test_delete_terminal_not_found(self, client):
+        """DELETE /terminals/{terminal_id} returns 404 for missing terminal."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.delete_terminal.side_effect = ValueError("Terminal not found")
+
+            response = client.delete("/terminals/deadbeef")
+
+            assert response.status_code == 404
+
+    def test_delete_terminal_server_error(self, client):
+        """DELETE /terminals/{terminal_id} returns 500 on internal error."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.delete_terminal.side_effect = Exception("TMux error")
+
+            response = client.delete("/terminals/abcd1234")
+
+            assert response.status_code == 500
+            assert "Failed to delete terminal" in response.json()["detail"]
+
+
+class TestCreateInboxMessageEndpoint:
+    """Test POST /terminals/{receiver_id}/inbox/messages endpoint."""
+
+    def test_create_inbox_message_success(self, client):
+        """POST creates an inbox message and returns success."""
+        mock_msg = MagicMock()
+        mock_msg.id = 1
+        mock_msg.sender_id = "sender1"
+        mock_msg.receiver_id = "abcd1234"
+        mock_msg.created_at.isoformat.return_value = "2026-03-13T12:00:00"
+
+        with (
+            patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create,
+            patch("cli_agent_orchestrator.api.main.inbox_service") as mock_inbox,
+        ):
+            mock_create.return_value = mock_msg
+
+            response = client.post(
+                "/terminals/abcd1234/inbox/messages",
+                params={"sender_id": "sender1", "message": "hello"},
+            )
+
+            assert response.status_code == 200
+            data = response.json()
+            assert data["success"] is True
+            assert data["message_id"] == 1
+            assert data["sender_id"] == "sender1"
+
+    def test_create_inbox_message_delivery_failure_still_succeeds(self, client):
+        """Immediate delivery failure should not fail the API response."""
+        mock_msg = MagicMock()
+        mock_msg.id = 2
+        mock_msg.sender_id = "sender1"
+        mock_msg.receiver_id = "abcd1234"
+        mock_msg.created_at.isoformat.return_value = "2026-03-13T12:00:00"
+
+        with (
+            patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create,
+            patch("cli_agent_orchestrator.api.main.inbox_service") as mock_inbox,
+        ):
+            mock_create.return_value = mock_msg
+            mock_inbox.check_and_send_pending_messages.side_effect = Exception("TMux busy")
+
+            response = client.post(
+                "/terminals/abcd1234/inbox/messages",
+                params={"sender_id": "sender1", "message": "hello"},
+            )
+
+            assert response.status_code == 200
+            assert response.json()["success"] is True
+
+    def test_create_inbox_message_not_found(self, client):
+        """POST returns 404 when terminal not found."""
+        with patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create:
+            mock_create.side_effect = ValueError("Terminal not found")
+
+            response = client.post(
+                "/terminals/deadbeef/inbox/messages",
+                params={"sender_id": "sender1", "message": "hello"},
+            )
+
+            assert response.status_code == 404
+
+    def test_create_inbox_message_server_error(self, client):
+        """POST returns 500 on internal error."""
+        with patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create:
+            mock_create.side_effect = Exception("DB error")
+
+            response = client.post(
+                "/terminals/abcd1234/inbox/messages",
+                params={"sender_id": "sender1", "message": "hello"},
+            )
+
+            assert response.status_code == 500
+            assert "Failed to create inbox message" in response.json()["detail"]
+
+
+class TestWebSocketLocalhostRestriction:
+    """Test that WebSocket endpoint rejects non-loopback clients."""
+
+    def test_websocket_rejects_non_loopback(self, client):
+        """WebSocket should close with 4003 for non-localhost clients."""
+        # TestClient uses "testclient" as host, which is not in the allowlist
+        with pytest.raises(Exception):
+            with client.websocket_connect("/terminals/abcd1234/ws"):
+                pass
+
 
 class TestCrossProviderResolution:
     """Test that create_terminal_in_session resolves provider from agent profile

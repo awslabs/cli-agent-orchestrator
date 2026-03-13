@@ -819,6 +819,7 @@ def main():
     args = parser.parse_args()
 
     if args.agents_dir:
+        os.environ["CAO_AGENTS_DIR"] = args.agents_dir
         import cli_agent_orchestrator.constants as constants
 
         constants.KIRO_AGENTS_DIR = Path(args.agents_dir)
