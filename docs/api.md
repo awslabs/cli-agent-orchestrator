@@ -23,7 +23,7 @@ Check if the server is running.
 Create a new session with one terminal.
 
 **Parameters:**
-- `provider` (string, required): Provider type ("kiro_cli", "claude_code", "codex", "gemini_cli", "kimi_cli", or "q_cli")
+- `provider` (string, required): Provider type ("kiro_cli", "claude_code", "codex", "gemini_cli", "kimi_cli", "copilot_cli", or "q_cli")
 - `agent_profile` (string, required): Agent profile name
 - `session_name` (string, optional): Custom session name
 - `working_directory` (string, optional): Working directory for the agent session
@@ -79,7 +79,7 @@ Get terminal details.
 {
   "id": "string",
   "name": "string",
-  "provider": "kiro_cli|claude_code|codex|gemini_cli|kimi_cli|q_cli",
+  "provider": "kiro_cli|claude_code|codex|gemini_cli|kimi_cli|copilot_cli|q_cli",
   "session_name": "string",
   "agent_profile": "string",
   "status": "idle|processing|completed|waiting_user_answer|error",
@@ -141,6 +141,7 @@ Send provider-specific exit command to terminal.
 | codex | `/exit` | Text |
 | gemini_cli | `/exit` | Text |
 | kimi_cli | `/exit` | Text |
+| copilot_cli | `/exit` | Text |
 | q_cli | `/exit` | Text |
 
 **Response:**
@@ -207,4 +208,3 @@ Error response format:
 ```
 
 ---
-

@@ -6,6 +6,7 @@ import pytest
 
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.providers.codex import CodexProvider
+from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
 from cli_agent_orchestrator.providers.manager import ProviderManager
 
 
@@ -20,6 +21,20 @@ def test_create_provider_codex_stores_mapping():
     )
 
     assert isinstance(provider, CodexProvider)
+    assert manager.get_provider("t1") is provider
+
+
+def test_create_provider_copilot_stores_mapping():
+    manager = ProviderManager()
+    provider = manager.create_provider(
+        ProviderType.COPILOT_CLI.value,
+        terminal_id="t1",
+        tmux_session="s1",
+        tmux_window="w1",
+        agent_profile=None,
+    )
+
+    assert isinstance(provider, CopilotCliProvider)
     assert manager.get_provider("t1") is provider
 
 
@@ -50,6 +65,24 @@ def test_get_provider_creates_on_demand_from_metadata():
         provider = manager.get_provider("t1")
 
     assert isinstance(provider, CodexProvider)
+    assert manager.get_provider("t1") is provider
+
+
+def test_get_provider_creates_copilot_on_demand_from_metadata():
+    manager = ProviderManager()
+
+    with patch(
+        "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
+        return_value={
+            "provider": ProviderType.COPILOT_CLI.value,
+            "tmux_session": "s1",
+            "tmux_window": "w1",
+            "agent_profile": None,
+        },
+    ):
+        provider = manager.get_provider("t1")
+
+    assert isinstance(provider, CopilotCliProvider)
     assert manager.get_provider("t1") is provider
 
 
