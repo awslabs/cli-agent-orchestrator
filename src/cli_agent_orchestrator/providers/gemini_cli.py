@@ -539,6 +539,14 @@ class GeminiCliProvider(BaseProvider):
         """
         return IDLE_PROMPT_PATTERN_LOG
 
+    @property
+    def extraction_retries(self) -> int:
+        """Gemini CLI's Ink TUI may show notification spinners for ~10-15s
+        after completing a response, temporarily obscuring the response text
+        in the tmux capture buffer.  Retry extraction to wait for spinners
+        to clear."""
+        return 3
+
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract Gemini's final response from terminal output.
 
