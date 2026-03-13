@@ -62,6 +62,13 @@ def require_kiro():
 
 
 @pytest.fixture()
+def require_kimi():
+    """Skip test if kimi CLI is not available."""
+    if not _cli_available("kimi"):
+        pytest.skip("kimi CLI not installed")
+
+
+@pytest.fixture()
 def require_gemini():
     """Skip test if gemini CLI is not available.
 
