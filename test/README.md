@@ -108,6 +108,7 @@ test/
 │   ├── test_base_provider.py
 │   ├── test_claude_code_unit.py
 │   ├── test_codex_provider_unit.py
+│   ├── test_gemini_cli_unit.py
 │   ├── test_kiro_cli_unit.py
 │   ├── test_provider_manager_unit.py
 │   └── test_q_cli_unit.py
@@ -135,7 +136,7 @@ The project aims for >90% test coverage for core modules.
 - `constants.py` - Configuration constants
 - `mcp_server/models.py`, `mcp_server/utils.py` - MCP models and utilities
 - `models/` - All Pydantic models
-- `providers/` - All provider implementations (claude_code, codex, kiro_cli, q_cli)
+- `providers/` - All provider implementations (claude_code, codex, gemini_cli, kiro_cli, q_cli)
 - `services/inbox_service.py`, `services/session_service.py` - Core services
 - `utils/` - All utility modules (agent_profiles, logging, template, terminal)
 
