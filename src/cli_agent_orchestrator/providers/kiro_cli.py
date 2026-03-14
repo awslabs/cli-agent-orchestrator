@@ -49,7 +49,6 @@ CONTROL_CHAR_PATTERN = r"[\x00-\x1f\x7f-\x9f]"
 
 # Bell character (audible alert)
 BELL_CHAR = "\x07"
-IDLE_PROMPT_PATTERN_LOG = r"\x1b\[38;5;\d+m\[.+?\].*\x1b\[38;5;\d+m>\s*\x1b\[\d*m"
 
 # =============================================================================
 # Error Detection
@@ -99,7 +98,7 @@ class KiroCliProvider(BaseProvider):
         )
         self._permission_prompt_pattern = r"Allow this action\?.*?\[.*?y.*?/.*?n.*?/.*?t.*?\]:"
 
-    def initialize(self) -> bool:
+    async def initialize(self) -> bool:
         """Initialize Kiro CLI provider by starting kiro-cli chat command.
 
         This method:
@@ -115,7 +114,7 @@ class KiroCliProvider(BaseProvider):
         """
         # Step 1: Wait for shell prompt to appear in the tmux window
         # This ensures the terminal is ready before we send commands
-        if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
+        if not await wait_for_shell(self.terminal_id, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
         # Step 2: Start the Kiro CLI chat session with the specified agent profile
@@ -125,38 +124,27 @@ class KiroCliProvider(BaseProvider):
         # Step 3: Wait for Kiro CLI to fully initialize and show the agent prompt.
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
         # message that get_status() interprets as a completed response.
-        if not wait_until_status(
-            self, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=30.0
+        if not await wait_until_status(
+            self.terminal_id, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=30.0
         ):
             raise TimeoutError("Kiro CLI initialization timed out after 30 seconds")
 
         self._initialized = True
         return True
 
-    def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
+    def get_status(self, output: str) -> TerminalStatus:
         """Get Kiro CLI status by analyzing terminal output.
 
         Status detection logic (in priority order):
-        1. No output → ERROR
+        1. No output → UNKNOWN
         2. No IDLE prompt visible → PROCESSING (agent is generating response)
         3. Error indicators present → ERROR
         4. Permission prompt visible → WAITING_USER_ANSWER
         5. Green arrow + prompt visible → COMPLETED (response ready)
         6. Only prompt visible → IDLE (waiting for input)
-
-        Args:
-            tail_lines: Number of lines to capture from terminal history.
-                        If None, uses default from tmux_client.
-
-        Returns:
-            Current TerminalStatus enum value
         """
-        logger.debug(f"get_status: tail_lines={tail_lines}")
-        output = tmux_client.get_history(self.session_name, self.window_name, tail_lines=tail_lines)
-
-        # No output indicates a terminal error
         if not output:
-            return TerminalStatus.ERROR
+            return TerminalStatus.UNKNOWN
 
         # Strip ANSI codes once for all pattern matching
         # This simplifies regex patterns and improves reliability
@@ -250,10 +238,6 @@ class KiroCliProvider(BaseProvider):
         final_answer = re.sub(ESCAPE_SEQUENCE_PATTERN, "", final_answer)
         final_answer = re.sub(CONTROL_CHAR_PATTERN, "", final_answer)
         return final_answer.strip()
-
-    def get_idle_pattern_for_log(self) -> str:
-        """Return Kiro CLI IDLE prompt pattern for log files."""
-        return IDLE_PROMPT_PATTERN_LOG
 
     def exit_cli(self) -> str:
         """Get the command to exit Kiro CLI."""

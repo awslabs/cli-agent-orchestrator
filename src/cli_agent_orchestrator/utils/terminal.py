@@ -1,26 +1,22 @@
 """Session utilities for CLI Agent Orchestrator."""
 
+import asyncio
 import logging
 import time
 import uuid
-from typing import TYPE_CHECKING, Union
+from typing import Union
 
-import httpx
+import requests
 
 from cli_agent_orchestrator.constants import API_BASE_URL, SESSION_PREFIX
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-
-if TYPE_CHECKING:
-    from cli_agent_orchestrator.clients.tmux import TmuxClient
-    from cli_agent_orchestrator.providers.base import BaseProvider
 
 logger = logging.getLogger(__name__)
 
 
 def generate_session_name() -> str:
     """Generate a unique session name with SESSION_PREFIX."""
-    session_uuid = uuid.uuid4().hex[:8]
-    return f"{SESSION_PREFIX}{session_uuid}"
+    return f"{SESSION_PREFIX}{uuid.uuid4().hex[:8]}"
 
 
 def generate_terminal_id() -> str:
@@ -33,50 +29,71 @@ def generate_window_name(agent_profile: str) -> str:
     return f"{agent_profile}-{uuid.uuid4().hex[:4]}"
 
 
-def wait_for_shell(
-    tmux_client: "TmuxClient",
-    session_name: str,
-    window_name: str,
+async def wait_for_shell(
+    terminal_id: str,
     timeout: float = 10.0,
-    polling_interval: float = 0.5,
+    stable_duration: float = 2.0,
+    polling_interval: float = 0.3,
 ) -> bool:
-    """Wait for shell to be ready by checking if output is stable (2 consecutive reads are the same and non-empty)."""
-    logger.info(f"Waiting for shell to be ready in {session_name}:{window_name}...")
-    start_time = time.time()
-    previous_output = None
+    """Wait for shell to be ready by checking if the output buffer is stable and non-empty.
 
-    while time.time() - start_time < timeout:
-        output = tmux_client.get_history(session_name, window_name)
+    Reads the StatusMonitor's in-memory buffer (populated by the FIFO reader
+    → event bus → StatusMonitor pipeline). Returns True when the buffer is
+    non-empty and has not changed for *stable_duration* seconds.
 
-        if output and output.strip() and previous_output is not None and output == previous_output:
-            logger.info(f"Shell ready")
+    This does NOT use provider-specific status detection because the provider
+    is already registered before initialize() runs, and provider patterns
+    don't match raw shell output.
+    """
+    from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+    logger.info(f"Waiting for shell to be ready for terminal {terminal_id}...")
+
+    deadline = time.time() + timeout
+    previous_buffer = ""
+    last_change = time.time()
+
+    while time.time() < deadline:
+        buf = status_monitor.get_buffer(terminal_id)
+
+        if buf != previous_buffer:
+            previous_buffer = buf
+            last_change = time.time()
+
+        stable_elapsed = time.time() - last_change
+
+        if buf.strip() and stable_elapsed >= stable_duration:
+            logger.info(f"Shell ready for {terminal_id} (buffer stable, {len(buf)} bytes)")
             return True
 
-        previous_output = output
-        time.sleep(polling_interval)
+        await asyncio.sleep(polling_interval)
 
-    logger.warning(f"Timeout waiting for shell to be ready")
+    logger.warning(f"Timeout waiting for shell to be ready for {terminal_id}")
     return False
 
 
-def wait_until_status(
-    provider_instance: "BaseProvider",
+async def wait_until_status(
+    terminal_id: str,
     target_status: "TerminalStatus | set[TerminalStatus]",
     timeout: float = 30.0,
     polling_interval: float = 1.0,
 ) -> bool:
-    """Wait until provider reaches target status or timeout."""
+    """Wait until terminal reaches target status by polling status_monitor."""
+    from cli_agent_orchestrator.services.status_monitor import status_monitor
+
     targets = target_status if isinstance(target_status, set) else {target_status}
-    start_time = time.time()
-
-    while time.time() - start_time < timeout:
-        status = provider_instance.get_status()
-        target_str = ", ".join(s.value for s in targets)
-        logger.info(f"Waiting for {{{target_str}}}, current status: {status}")
-        if status in targets:
+    target_str = ", ".join(s.value for s in targets)
+    logger.info(
+        f"wait_until_status [{terminal_id}]: waiting for {{{target_str}}}, timeout={timeout}s"
+    )
+    start = time.time()
+    while time.time() - start < timeout:
+        current = status_monitor.get_status(terminal_id)
+        if current in targets:
+            logger.info(f"wait_until_status [{terminal_id}]: reached {current.value}")
             return True
-        time.sleep(polling_interval)
-
+        await asyncio.sleep(polling_interval)
+    logger.warning(f"wait_until_status [{terminal_id}]: timeout waiting for {{{target_str}}}")
     return False
 
 
@@ -86,10 +103,10 @@ def wait_until_terminal_status(
     timeout: float = 30.0,
     polling_interval: float = 1.0,
 ) -> bool:
-    """Wait until terminal reaches target status using API endpoint.
+    """Wait until terminal reaches target status by polling GET /terminals/{id}.
 
     Args:
-        terminal_id: Terminal to poll.
+        terminal_id: Terminal to poll status for.
         target_status: A single TerminalStatus or a set of acceptable statuses.
         timeout: Maximum wait time in seconds.
         polling_interval: Seconds between polls.
@@ -105,11 +122,10 @@ def wait_until_terminal_status(
     start_time = time.time()
     while time.time() - start_time < timeout:
         try:
-            response = httpx.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=10.0)
-            logger.info(response)
+            response = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
             if response.status_code == 200:
-                terminal_data = response.json()
-                if terminal_data["status"] in target_values:
+                current_status = response.json().get("status")
+                if current_status in target_values:
                     return True
         except Exception:
             pass

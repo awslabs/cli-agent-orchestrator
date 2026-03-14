@@ -353,12 +353,13 @@ class TestEnableFlow:
 class TestExecuteFlow:
     """Tests for execute_flow function."""
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
     @patch("cli_agent_orchestrator.services.flow_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
     @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
-    def test_execute_flow_without_script(
+    async def test_execute_flow_without_script(
         self,
         mock_db_get,
         mock_update_times,
@@ -397,19 +398,20 @@ Simple prompt without variables.
         mock_terminal.id = "terminal-123"
         mock_create_terminal.return_value = mock_terminal
 
-        result = execute_flow("simple-flow")
+        result = await execute_flow("simple-flow")
 
         assert result is True
         mock_create_terminal.assert_called_once()
         mock_send_input.assert_called_once()
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.flow_service.subprocess.run")
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
     @patch("cli_agent_orchestrator.services.flow_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
     @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
-    def test_execute_flow_with_script_execute_true(
+    async def test_execute_flow_with_script_execute_true(
         self,
         mock_db_get,
         mock_update_times,
@@ -460,7 +462,7 @@ Value is [[value]].
             mock_terminal.id = "terminal-123"
             mock_create_terminal.return_value = mock_terminal
 
-            result = execute_flow("scripted-flow")
+            result = await execute_flow("scripted-flow")
 
             assert result is True
             mock_subprocess.assert_called_once()
@@ -469,10 +471,11 @@ Value is [[value]].
             call_args = mock_send_input.call_args
             assert "42" in call_args[0][1]
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.flow_service.subprocess.run")
     @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
     @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
-    def test_execute_flow_with_script_execute_false(
+    async def test_execute_flow_with_script_execute_false(
         self, mock_db_get, mock_update_times, mock_subprocess
     ):
         """Test executing a flow with script that returns execute=false."""
@@ -511,21 +514,23 @@ Prompt.
                 stderr="",
             )
 
-            result = execute_flow("skip-flow")
+            result = await execute_flow("skip-flow")
 
             assert result is False  # Flow was skipped
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
-    def test_execute_flow_not_found(self, mock_db_get):
+    async def test_execute_flow_not_found(self, mock_db_get):
         """Test executing a non-existent flow raises error."""
         mock_db_get.return_value = None
 
         with pytest.raises(ValueError, match="Flow 'nonexistent' not found"):
-            execute_flow("nonexistent")
+            await execute_flow("nonexistent")
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.flow_service.subprocess.run")
     @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
-    def test_execute_flow_script_fails(self, mock_db_get, mock_subprocess):
+    async def test_execute_flow_script_fails(self, mock_db_get, mock_subprocess):
         """Test that script failure raises error."""
         with tempfile.TemporaryDirectory() as tmpdir:
             flow_path = Path(tmpdir) / "flow.md"
@@ -558,11 +563,12 @@ Prompt.
             mock_subprocess.return_value = MagicMock(returncode=1, stdout="", stderr="Script error")
 
             with pytest.raises(ValueError, match="Script failed"):
-                execute_flow("fail-flow")
+                await execute_flow("fail-flow")
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.flow_service.subprocess.run")
     @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
-    def test_execute_flow_script_invalid_json(self, mock_db_get, mock_subprocess):
+    async def test_execute_flow_script_invalid_json(self, mock_db_get, mock_subprocess):
         """Test that invalid JSON from script raises error."""
         with tempfile.TemporaryDirectory() as tmpdir:
             flow_path = Path(tmpdir) / "flow.md"
@@ -597,7 +603,7 @@ Prompt.
             )
 
             with pytest.raises(ValueError, match="not valid JSON"):
-                execute_flow("bad-json-flow")
+                await execute_flow("bad-json-flow")
 
 
 class TestGetFlowsToRun:

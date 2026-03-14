@@ -22,13 +22,9 @@ Session Lifecycle:
 import logging
 from typing import Dict, List
 
-from cli_agent_orchestrator.clients.database import (
-    delete_terminals_by_session,
-    list_terminals_by_session,
-)
+from cli_agent_orchestrator.clients.database import list_terminals_by_session
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.constants import SESSION_PREFIX
-from cli_agent_orchestrator.providers.manager import provider_manager
 
 logger = logging.getLogger(__name__)
 
@@ -69,17 +65,19 @@ def delete_session(session_name: str) -> bool:
         if not tmux_client.session_exists(session_name):
             raise ValueError(f"Session '{session_name}' not found")
 
+        from cli_agent_orchestrator.services import terminal_service
+
         terminals = list_terminals_by_session(session_name)
 
-        # Cleanup providers
+        # Clean up each terminal (FIFO, state detector, provider, DB)
         for terminal in terminals:
-            provider_manager.cleanup_provider(terminal["id"])
+            try:
+                terminal_service.delete_terminal(terminal["id"])
+            except Exception as e:
+                logger.warning(f"Failed to cleanup terminal {terminal['id']}: {e}")
 
         # Kill tmux session
         tmux_client.kill_session(session_name)
-
-        # Delete terminal metadata
-        delete_terminals_by_session(session_name)
 
         logger.info(f"Deleted session: {session_name}")
         return True

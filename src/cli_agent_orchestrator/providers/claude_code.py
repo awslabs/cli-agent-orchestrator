@@ -1,5 +1,6 @@
 """Claude Code provider implementation."""
 
+import asyncio
 import json
 import logging
 import re
@@ -37,7 +38,6 @@ WAITING_USER_ANSWER_PATTERN = (
     r"❯.*\d+\."  # Pattern for Claude showing selection options with arrow cursor
 )
 TRUST_PROMPT_PATTERN = r"Yes, I trust this folder"  # Workspace trust dialog
-IDLE_PROMPT_PATTERN_LOG = r"[>❯][\s\xa0]"  # Same pattern for log files
 
 
 class ClaudeCodeProvider(BaseProvider):
@@ -106,7 +106,7 @@ class ClaudeCodeProvider(BaseProvider):
         # This correctly handles multiline strings, quotes, and special characters
         return shlex.join(command_parts)
 
-    def _handle_trust_prompt(self, timeout: float = 20.0) -> None:
+    async def _handle_trust_prompt(self, timeout: float = 20.0) -> None:
         """Auto-accept the workspace trust prompt if it appears.
 
         Claude Code shows a trust dialog when opening an untrusted directory.
@@ -118,7 +118,7 @@ class ClaudeCodeProvider(BaseProvider):
         while time.time() - start_time < timeout:
             output = tmux_client.get_history(self.session_name, self.window_name)
             if not output:
-                time.sleep(1.0)
+                await asyncio.sleep(1.0)
                 continue
 
             # Clean ANSI codes for reliable text matching
@@ -139,13 +139,13 @@ class ClaudeCodeProvider(BaseProvider):
                 logger.info("Claude Code started without trust prompt")
                 return
 
-            time.sleep(1.0)
+            await asyncio.sleep(1.0)
         logger.warning("Trust prompt handler timed out")
 
-    def initialize(self) -> bool:
+    async def initialize(self) -> bool:
         """Initialize Claude Code provider by starting claude command."""
         # Wait for shell prompt to appear in the tmux window
-        if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
+        if not await wait_for_shell(self.terminal_id, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
         # Build properly escaped command string
@@ -155,13 +155,13 @@ class ClaudeCodeProvider(BaseProvider):
         tmux_client.send_keys(self.session_name, self.window_name, command)
 
         # Handle workspace trust prompt if it appears (new/untrusted directories)
-        self._handle_trust_prompt(timeout=20.0)
+        await self._handle_trust_prompt(timeout=20.0)
 
         # Wait for Claude Code prompt to be ready.
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
         # message that get_status() interprets as a completed response.
-        if not wait_until_status(
-            self,
+        if not await wait_until_status(
+            self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
             timeout=30.0,
             polling_interval=1.0,
@@ -171,14 +171,9 @@ class ClaudeCodeProvider(BaseProvider):
         self._initialized = True
         return True
 
-    def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
-        """Get Claude Code status by analyzing terminal output."""
-
-        # Use tmux client singleton to get window history
-        output = tmux_client.get_history(self.session_name, self.window_name, tail_lines=tail_lines)
-
+    def get_status(self, output: str) -> TerminalStatus:
         if not output:
-            return TerminalStatus.ERROR
+            return TerminalStatus.UNKNOWN
 
         # Check for processing state first
         if re.search(PROCESSING_PATTERN, output):
@@ -199,12 +194,7 @@ class ClaudeCodeProvider(BaseProvider):
         if re.search(IDLE_PROMPT_PATTERN, output):
             return TerminalStatus.IDLE
 
-        # If no recognizable state, return ERROR
-        return TerminalStatus.ERROR
-
-    def get_idle_pattern_for_log(self) -> str:
-        """Return Claude Code IDLE prompt pattern for log files."""
-        return IDLE_PROMPT_PATTERN_LOG
+        return TerminalStatus.UNKNOWN
 
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract Claude's final response message using ⏺ indicator."""

@@ -18,7 +18,6 @@ ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
 ESCAPE_SEQUENCE_PATTERN = r"\[[?0-9;]*[a-zA-Z]"
 CONTROL_CHAR_PATTERN = r"[\x00-\x1f\x7f-\x9f]"
 BELL_CHAR = "\x07"
-IDLE_PROMPT_PATTERN_LOG = r"\x1b\[38;5;13m>\s*\x1b\[39m"
 
 # Error indicators
 ERROR_INDICATORS = ["Amazon Q is having trouble responding right now"]
@@ -41,30 +40,26 @@ class QCliProvider(BaseProvider):
         )
         self._permission_prompt_pattern = r"Allow this action\?.*?\[.*?y.*?/.*?n.*?/.*?t.*?\]:"
 
-    def initialize(self) -> bool:
+    async def initialize(self) -> bool:
         """Initialize Q CLI provider by starting q chat command."""
         # Wait for shell to be ready first
-        if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
+        if not await wait_for_shell(self.terminal_id, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
         command = shlex.join(["q", "chat", "--agent", self._agent_profile])
         tmux_client.send_keys(self.session_name, self.window_name, command)
 
-        if not wait_until_status(
-            self, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=30.0
+        if not await wait_until_status(
+            self.terminal_id, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=30.0
         ):
             raise TimeoutError("Q CLI initialization timed out after 30 seconds")
 
         self._initialized = True
         return True
 
-    def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
-        """Get Q CLI status by analyzing terminal output."""
-        logger.debug(f"get_status: tail_lines={tail_lines}")
-        output = tmux_client.get_history(self.session_name, self.window_name, tail_lines=tail_lines)
-
+    def get_status(self, output: str) -> TerminalStatus:
         if not output:
-            return TerminalStatus.ERROR
+            return TerminalStatus.UNKNOWN
 
         # Strip ANSI codes once for all pattern matching
         clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
@@ -153,10 +148,6 @@ class QCliProvider(BaseProvider):
         final_answer = re.sub(ESCAPE_SEQUENCE_PATTERN, "", final_answer)
         final_answer = re.sub(CONTROL_CHAR_PATTERN, "", final_answer)
         return final_answer.strip()
-
-    def get_idle_pattern_for_log(self) -> str:
-        """Return Q CLI IDLE prompt pattern for log files."""
-        return IDLE_PROMPT_PATTERN_LOG
 
     # TODO: exit_cli should run the tmux.send_keys directly with /exit or ctrl-c twice
     def exit_cli(self) -> str:

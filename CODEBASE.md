@@ -69,9 +69,13 @@ src/cli_agent_orchestrator/
 ├── api/                   # Entry Point: HTTP API
 │   └── main.py            # FastAPI endpoints (port 9889)
 ├── services/              # Service Layer: Business logic
+│   ├── event_bus.py       # Pub/sub event routing with wildcard topic matching
+│   ├── fifo_reader.py     # Publisher: terminal.{id}.output (FIFO → event bus)
+│   ├── status_monitor.py  # Consumer: terminal.{id}.output → Publisher: terminal.{id}.status
+│   ├── log_writer.py      # Consumer: terminal.{id}.output (writes debug logs)
+│   ├── inbox_service.py   # Consumer: terminal.{id}.status (delivers queued messages)
 │   ├── session_service.py # List, get, delete sessions
-│   ├── terminal_service.py# Create, get, send input (+ mark_input_received), get output, delete terminals
-│   ├── inbox_service.py   # Terminal-to-terminal messaging with watchdog
+│   ├── terminal_service.py# Create, get, send input, get output, delete terminals
 │   └── flow_service.py    # Scheduled flow execution
 ├── clients/               # Client Layer: External systems
 │   ├── tmux.py            # Tmux operations (sets CAO_TERMINAL_ID, send_keys, send_keys_via_paste for bracketed paste)
@@ -117,7 +121,7 @@ provider_manager.create_provider()
   ↓
 provider.initialize()  # Waits for shell (all providers), sends command, waits for IDLE
   ↓
-inbox_service.register_terminal()  # Starts watchdog observer
+fifo_manager.create_reader(terminal_id)  # Starts FIFO reader thread
   ↓
 Returns Terminal model
 ```
@@ -133,9 +137,9 @@ database.create_inbox_message()  # Status: PENDING
 inbox_service.check_and_send_pending_messages()
   ↓
 If receiver IDLE → send immediately
-If receiver PROCESSING → watchdog monitors log file
+If receiver PROCESSING → DeliveryConsumer waits for status event
   ↓
-On log change → detect IDLE pattern → send message
+On status change to IDLE → DeliveryConsumer delivers message
   ↓
 Update message status: DELIVERED
 ```

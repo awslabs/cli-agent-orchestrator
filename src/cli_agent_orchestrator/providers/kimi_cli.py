@@ -301,7 +301,7 @@ class KimiCliProvider(BaseProvider):
 
         cls._mcp_timeout_configured = True
 
-    def initialize(self) -> bool:
+    async def initialize(self) -> bool:
         """Initialize Kimi CLI provider by starting the kimi command.
 
         Steps:
@@ -316,7 +316,7 @@ class KimiCliProvider(BaseProvider):
             TimeoutError: If shell or Kimi CLI doesn't start within timeout
         """
         # Wait for shell prompt to appear in the tmux window
-        if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
+        if not await wait_for_shell(self.terminal_id, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
         # Build properly escaped command string
@@ -330,8 +330,8 @@ class KimiCliProvider(BaseProvider):
         # message that get_status() interprets as a completed response.
         # Longer timeout (120s) to account for first-run setup and when
         # multiple Kimi instances are starting concurrently (e.g. assign flow).
-        if not wait_until_status(
-            self,
+        if not await wait_until_status(
+            self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
             timeout=120.0,
             polling_interval=1.0,
@@ -341,18 +341,17 @@ class KimiCliProvider(BaseProvider):
         self._initialized = True
         return True
 
-    def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
+    def get_status(self, output: str) -> TerminalStatus:
         """Get Kimi CLI status by analyzing terminal output.
 
         Status detection logic:
-        1. Capture tmux pane output (full or tail)
-        2. Strip ANSI codes for reliable text matching
-        3. Latch ``_has_received_input`` when user input box (╭─) is detected
-        4. Check bottom N lines for the idle prompt pattern
-        5. If prompt found + input was received → COMPLETED
-        6. If prompt found + no input yet → IDLE
-        7. If no prompt: agent is PROCESSING (streaming response)
-        8. Check for ERROR patterns as fallback
+        1. Strip ANSI codes for reliable text matching
+        2. Latch ``_has_received_input`` when user input box (╭─) is detected
+        3. Check bottom N lines for the idle prompt pattern
+        4. If prompt found + input was received → COMPLETED
+        5. If prompt found + no input yet → IDLE
+        6. If no prompt: agent is PROCESSING (streaming response)
+        7. Check for ERROR patterns as fallback
 
         The latching flag approach is necessary because:
         - Long responses (>200 lines) push the user input box out of the
@@ -363,15 +362,13 @@ class KimiCliProvider(BaseProvider):
           IS still visible in the capture, and persists through completion
 
         Args:
-            tail_lines: Optional number of lines to capture from bottom
+            output: Terminal output buffer (up to ~8KB rolling buffer)
 
         Returns:
             TerminalStatus indicating current state
         """
-        output = tmux_client.get_history(self.session_name, self.window_name, tail_lines=tail_lines)
-
         if not output:
-            return TerminalStatus.ERROR
+            return TerminalStatus.UNKNOWN
 
         # Strip ANSI codes for reliable pattern matching
         clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
@@ -420,14 +417,6 @@ class KimiCliProvider(BaseProvider):
 
         # No prompt visible and no error: Kimi is actively processing/streaming
         return TerminalStatus.PROCESSING
-
-    def get_idle_pattern_for_log(self) -> str:
-        """Return Kimi CLI idle prompt pattern for log file monitoring.
-
-        Used by the inbox service for quick IDLE state detection in pipe-pane
-        log files before calling the full get_status() method.
-        """
-        return IDLE_PROMPT_PATTERN_LOG
 
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract Kimi's final response from terminal output.

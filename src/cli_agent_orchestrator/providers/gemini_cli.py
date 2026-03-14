@@ -27,6 +27,7 @@ Status Detection Strategy:
     - ERROR: Error message patterns or empty output
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -70,10 +71,6 @@ IDLE_PROMPT_PATTERN = r"\*\s+Type your message"
 # at the bottom. The idle prompt is typically within the last 10 lines, but
 # use 50 to account for tall terminals and additional TUI padding.
 IDLE_PROMPT_TAIL_LINES = 50
-
-# Simplified idle pattern for log file monitoring.
-# Just looks for the asterisk + "Type your message" text for quick detection.
-IDLE_PROMPT_PATTERN_LOG = r"\*.*Type your message"
 
 # Gemini welcome banner, shown once during startup as ASCII art.
 # The banner includes the word "GEMINI" in block characters using █ and ░.
@@ -344,7 +341,7 @@ class GeminiCliProvider(BaseProvider):
 
         self._mcp_server_names = []
 
-    def initialize(self) -> bool:
+    async def initialize(self) -> bool:
         """Initialize Gemini CLI provider by starting the gemini command.
 
         Steps:
@@ -358,17 +355,14 @@ class GeminiCliProvider(BaseProvider):
         Raises:
             TimeoutError: If shell or Gemini CLI doesn't start within timeout
         """
-        # Wait for shell prompt to appear in the tmux window
-        if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        if not await wait_for_shell(self.terminal_id, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
-        # Send a warm-up command before launching Gemini.
-        # Gemini's Ink TUI exits silently in freshly-created tmux sessions where
-        # the shell environment (PATH, node, nvm, homebrew) is not fully loaded.
-        # wait_for_shell() returns when the prompt text stabilizes, but slow
-        # shell init scripts (.zshrc, brew shellenv) may still be running.
-        # An echo round-trip with output verification ensures the shell has
-        # fully processed its init before we launch gemini.
+        # Shell warm-up: Gemini's Ink TUI exits silently in freshly-created
+        # tmux sessions where the shell environment is not fully loaded.
+        # An echo round-trip ensures the shell has fully processed its init.
         warmup_marker = "CAO_SHELL_READY"
         tmux_client.send_keys(self.session_name, self.window_name, f"echo {warmup_marker}")
         warmup_start = time.time()
@@ -377,37 +371,23 @@ class GeminiCliProvider(BaseProvider):
             output = tmux_client.get_history(self.session_name, self.window_name)
             if output and warmup_marker in output:
                 break
-            time.sleep(0.5)
+            await asyncio.sleep(0.5)
         else:
             logger.warning("Shell warm-up marker not detected within timeout, proceeding anyway")
 
         # Allow the shell to fully render the post-echo prompt before sending
         # the next paste. Without this delay, zsh may still be processing the
         # previous command's output when the bracketed paste arrives, causing
-        # the gemini command to be silently dropped. 2 seconds is sufficient
-        # for prompt rendering + any .zshrc hooks.
-        time.sleep(2)
+        # the gemini command to be silently dropped.
+        await asyncio.sleep(2)
 
-        # Build properly escaped command string
         command = self._build_gemini_command()
-
-        # Send Gemini command to the tmux window
         tmux_client.send_keys(self.session_name, self.window_name, command)
 
         # Wait for Gemini CLI to finish initialization.
-        # Gemini takes 10-15+ seconds to load due to Node.js/Ink startup.
-        #
-        # IMPORTANT: Gemini's Ink TUI shows the idle prompt ("* Type your
-        # message") immediately on startup, BEFORE the -i prompt is processed
-        # and BEFORE MCP servers are connected. If we accept IDLE too early,
-        # messages sent to the terminal are lost because Gemini is still
-        # processing the -i system prompt (lesson #13c).
-        #
         # When -i is used: wait for COMPLETED specifically. The -i flag always
-        # produces a response (query + ✦ response + idle prompt), so COMPLETED
-        # means the system prompt has been fully processed and Gemini is ready.
-        #
-        # Without -i: accept IDLE (just the idle prompt, no prior interaction).
+        # produces a response, so COMPLETED means the system prompt has been
+        # fully processed. Without -i: accept IDLE or COMPLETED.
         init_start = time.time()
         init_timeout = 240.0  # MCP server download (uvx from git) + -i prompt processing
         if self._uses_prompt_interactive:
@@ -416,14 +396,13 @@ class GeminiCliProvider(BaseProvider):
             target_states = (TerminalStatus.IDLE, TerminalStatus.COMPLETED)
 
         while time.time() - init_start < init_timeout:
-            status = self.get_status()
+            status = status_monitor.get_status(self.terminal_id)
             if status in target_states:
                 break
-            time.sleep(1.0)
+            await asyncio.sleep(1.0)
         else:
-            # Capture diagnostic info for debugging initialization failures.
-            diag_output = tmux_client.get_history(self.session_name, self.window_name)
-            diag_last_50 = "\n".join((diag_output or "").splitlines()[-50:])
+            buf = status_monitor.get_buffer(self.terminal_id)
+            diag_last_50 = "\n".join((buf or "").splitlines()[-50:])
             logger.error(
                 f"Gemini CLI init timeout diagnostic — terminal {self.terminal_id}, "
                 f"uses_prompt_interactive={self._uses_prompt_interactive}, "
@@ -432,7 +411,7 @@ class GeminiCliProvider(BaseProvider):
             )
             raise TimeoutError(
                 f"Gemini CLI initialization timed out after {init_timeout}s. "
-                f"Last status: {self.get_status()}"
+                f"Last status: {status_monitor.get_status(self.terminal_id)}"
             )
 
         self._initialized = True
@@ -447,27 +426,9 @@ class GeminiCliProvider(BaseProvider):
         """
         self._received_input_after_init = True
 
-    def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
-        """Get Gemini CLI status by analyzing terminal output.
-
-        Status detection logic:
-        1. Capture tmux pane output (full or tail)
-        2. Strip ANSI codes for reliable text matching
-        3. Check bottom N lines for the idle prompt pattern (* + placeholder text)
-        4. If idle prompt found: distinguish IDLE vs COMPLETED by checking for ✦ response
-        5. If no idle prompt: check for processing indicators or errors
-        6. Check for ERROR patterns as fallback
-
-        Args:
-            tail_lines: Optional number of lines to capture from bottom
-
-        Returns:
-            TerminalStatus indicating current state
-        """
-        output = tmux_client.get_history(self.session_name, self.window_name, tail_lines=tail_lines)
-
+    def get_status(self, output: str) -> TerminalStatus:
         if not output:
-            return TerminalStatus.ERROR
+            return TerminalStatus.UNKNOWN
 
         # Strip ANSI codes for reliable pattern matching
         clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
@@ -530,14 +491,6 @@ class GeminiCliProvider(BaseProvider):
 
         # No idle prompt visible and no error: Gemini is actively processing
         return TerminalStatus.PROCESSING
-
-    def get_idle_pattern_for_log(self) -> str:
-        """Return Gemini CLI idle prompt pattern for log file monitoring.
-
-        Used by the inbox service for quick IDLE state detection in pipe-pane
-        log files before calling the full get_status() method.
-        """
-        return IDLE_PROMPT_PATTERN_LOG
 
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract Gemini's final response from terminal output.
