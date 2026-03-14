@@ -150,8 +150,16 @@ async def create_terminal(
         return terminal
 
     except Exception as e:
-        # Cleanup on failure: clean up provider resources and kill session
+        # Cleanup on failure: clean up FIFO reader, status monitor, provider, and session
         logger.error(f"Failed to create terminal: {e}")
+        try:
+            fifo_manager.stop_reader(terminal_id)
+        except Exception:
+            pass  # Ignore cleanup errors
+        try:
+            status_monitor.clear_terminal(terminal_id)
+        except Exception:
+            pass  # Ignore cleanup errors
         try:
             provider_manager.cleanup_provider(terminal_id)
         except Exception:
