@@ -1,7 +1,7 @@
 """Full tests for terminal service."""
 
 from datetime import datetime
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -20,14 +20,17 @@ from cli_agent_orchestrator.services.terminal_service import (
 class TestCreateTerminal:
     """Tests for create_terminal function."""
 
-    @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    def test_create_terminal_new_session(
+    async def test_create_terminal_new_session(
         self,
         mock_gen_id,
         mock_gen_session,
@@ -35,32 +38,37 @@ class TestCreateTerminal:
         mock_tmux,
         mock_db_create,
         mock_provider_manager,
-        mock_log_dir,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
     ):
         """Test creating terminal with new session."""
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "developer-abcd"
         mock_tmux.session_exists.return_value = False
-        mock_provider = MagicMock()
+        mock_provider = AsyncMock()
+        mock_provider.initialize.return_value = True
         mock_provider_manager.create_provider.return_value = mock_provider
-        mock_log_path = MagicMock()
-        mock_log_dir.__truediv__.return_value = mock_log_path
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
 
-        result = create_terminal("kiro_cli", "developer", new_session=True)
+        result = await create_terminal("kiro_cli", "developer", new_session=True)
 
         assert result.id == "test1234"
         mock_tmux.create_session.assert_called_once()
         mock_provider.initialize.assert_called_once()
 
-    @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    def test_create_terminal_existing_session(
+    async def test_create_terminal_existing_session(
         self,
         mock_gen_id,
         mock_gen_session,
@@ -68,7 +76,9 @@ class TestCreateTerminal:
         mock_tmux,
         mock_db_create,
         mock_provider_manager,
-        mock_log_dir,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
     ):
         """Test creating terminal in existing session."""
         mock_gen_id.return_value = "test1234"
@@ -76,21 +86,22 @@ class TestCreateTerminal:
         mock_gen_window.return_value = "developer-abcd"
         mock_tmux.session_exists.return_value = True
         mock_tmux.create_window.return_value = "developer-abcd"
-        mock_provider = MagicMock()
+        mock_provider = AsyncMock()
+        mock_provider.initialize.return_value = True
         mock_provider_manager.create_provider.return_value = mock_provider
-        mock_log_path = MagicMock()
-        mock_log_dir.__truediv__.return_value = mock_log_path
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
 
-        result = create_terminal("kiro_cli", "developer", session_name="cao-existing")
+        result = await create_terminal("kiro_cli", "developer", session_name="cao-existing")
 
         assert result.id == "test1234"
         mock_tmux.create_window.assert_called_once()
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    def test_create_terminal_session_not_found(
+    async def test_create_terminal_session_not_found(
         self, mock_gen_id, mock_gen_session, mock_gen_window, mock_tmux
     ):
         """Test creating terminal when session not found."""
@@ -100,13 +111,14 @@ class TestCreateTerminal:
         mock_tmux.session_exists.return_value = False
 
         with pytest.raises(ValueError, match="not found"):
-            create_terminal("kiro_cli", "developer", session_name="cao-nonexistent")
+            await create_terminal("kiro_cli", "developer", session_name="cao-nonexistent")
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    def test_create_terminal_session_already_exists(
+    async def test_create_terminal_session_already_exists(
         self, mock_gen_id, mock_gen_session, mock_gen_window, mock_tmux
     ):
         """Test creating terminal when session already exists."""
@@ -116,15 +128,17 @@ class TestCreateTerminal:
         mock_tmux.session_exists.return_value = True
 
         with pytest.raises(ValueError, match="already exists"):
-            create_terminal("kiro_cli", "developer", session_name="cao-existing", new_session=True)
+            await create_terminal(
+                "kiro_cli", "developer", session_name="cao-existing", new_session=True
+            )
 
 
 class TestGetTerminal:
     """Tests for get_terminal function."""
 
-    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_get_terminal_success(self, mock_get_metadata, mock_provider_manager):
+    def test_get_terminal_success(self, mock_get_metadata, mock_status_monitor):
         """Test getting terminal successfully."""
         mock_get_metadata.return_value = {
             "id": "test1234",
@@ -134,9 +148,7 @@ class TestGetTerminal:
             "agent_profile": "developer",
             "last_active": datetime.now(),
         }
-        mock_provider = MagicMock()
-        mock_provider.get_status.return_value = TerminalStatus.IDLE
-        mock_provider_manager.get_provider.return_value = mock_provider
+        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
 
         result = get_terminal("test1234")
 
@@ -151,10 +163,10 @@ class TestGetTerminal:
         with pytest.raises(ValueError, match="not found"):
             get_terminal("nonexistent")
 
-    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_get_terminal_no_provider(self, mock_get_metadata, mock_provider_manager):
-        """Test getting terminal when provider not found."""
+    def test_get_terminal_no_provider(self, mock_get_metadata, mock_status_monitor):
+        """Test getting terminal returns status from status_monitor."""
         mock_get_metadata.return_value = {
             "id": "test1234",
             "tmux_window": "developer-abcd",
@@ -163,10 +175,11 @@ class TestGetTerminal:
             "agent_profile": "developer",
             "last_active": datetime.now(),
         }
-        mock_provider_manager.get_provider.return_value = None
+        mock_status_monitor.get_status.return_value = TerminalStatus.UNKNOWN
 
-        with pytest.raises(ValueError, match="Provider not found"):
-            get_terminal("test1234")
+        result = get_terminal("test1234")
+
+        assert result["status"] == TerminalStatus.UNKNOWN.value
 
 
 class TestGetWorkingDirectory:
@@ -231,33 +244,35 @@ class TestSendInput:
 class TestGetOutput:
     """Tests for get_output function."""
 
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_get_output_full(self, mock_get_metadata, mock_tmux):
+    def test_get_output_full(self, mock_get_metadata, mock_tmux, mock_status_monitor):
         """Test getting full output."""
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
             "tmux_window": "developer-abcd",
         }
-        mock_tmux.get_history.return_value = "full terminal output"
+        mock_status_monitor.get_buffer.return_value = "full terminal output"
 
         result = get_output("test1234", OutputMode.FULL)
 
         assert result == "full terminal output"
 
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_get_output_last(self, mock_get_metadata, mock_tmux, mock_provider_manager):
+    def test_get_output_last(self, mock_get_metadata, mock_tmux, mock_status_monitor, mock_pm):
         """Test getting last message."""
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
             "tmux_window": "developer-abcd",
         }
-        mock_tmux.get_history.return_value = "full terminal output"
+        mock_status_monitor.get_buffer.return_value = "full terminal output"
         mock_provider = MagicMock()
         mock_provider.extract_last_message_from_script.return_value = "last message"
-        mock_provider_manager.get_provider.return_value = mock_provider
+        mock_pm.get_provider.return_value = mock_provider
 
         result = get_output("test1234", OutputMode.LAST)
 
@@ -272,16 +287,17 @@ class TestGetOutput:
             get_output("nonexistent")
 
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_get_output_last_no_provider(self, mock_get_metadata, mock_tmux, mock_provider_manager):
+    def test_get_output_last_no_provider(self, mock_get_metadata, mock_tmux, mock_status_monitor, mock_pm):
         """Test getting last message when provider not found."""
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
             "tmux_window": "developer-abcd",
         }
-        mock_tmux.get_history.return_value = "full output"
-        mock_provider_manager.get_provider.return_value = None
+        mock_status_monitor.get_buffer.return_value = "full output"
+        mock_pm.get_provider.return_value = None
 
         with pytest.raises(ValueError, match="Provider not found"):
             get_output("test1234", OutputMode.LAST)
@@ -290,12 +306,15 @@ class TestGetOutput:
 class TestDeleteTerminal:
     """Tests for delete_terminal function."""
 
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_delete_terminal_success(
-        self, mock_get_metadata, mock_tmux, mock_provider_manager, mock_db_delete
+        self, mock_get_metadata, mock_tmux, mock_provider_manager, mock_db_delete,
+        mock_fifo_manager, mock_status_monitor
     ):
         """Test deleting terminal successfully."""
         mock_get_metadata.return_value = {
@@ -310,12 +329,15 @@ class TestDeleteTerminal:
         mock_tmux.stop_pipe_pane.assert_called_once()
         mock_provider_manager.cleanup_provider.assert_called_once_with("test1234")
 
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_delete_terminal_pipe_pane_error(
-        self, mock_get_metadata, mock_tmux, mock_provider_manager, mock_db_delete
+        self, mock_get_metadata, mock_tmux, mock_provider_manager, mock_db_delete,
+        mock_fifo_manager, mock_status_monitor
     ):
         """Test deleting terminal when stop_pipe_pane fails."""
         mock_get_metadata.return_value = {
@@ -330,11 +352,14 @@ class TestDeleteTerminal:
 
         assert result is True
 
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_delete_terminal_no_metadata(
-        self, mock_get_metadata, mock_provider_manager, mock_db_delete
+        self, mock_get_metadata, mock_provider_manager, mock_db_delete,
+        mock_fifo_manager, mock_status_monitor
     ):
         """Test deleting terminal when metadata not found."""
         mock_get_metadata.return_value = None

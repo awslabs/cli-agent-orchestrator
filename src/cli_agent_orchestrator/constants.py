@@ -60,6 +60,9 @@ FIFO_DIR.mkdir(parents=True, exist_ok=True)
 # Keeps trailing 8KB of terminal output for pattern matching
 STATE_BUFFER_MAX = 8192
 
+# Max events buffered per subscriber queue before dropping
+EVENT_BUS_MAX_QUEUE_SIZE = 1024
+
 # =============================================================================
 # Cleanup Service Configuration
 # =============================================================================

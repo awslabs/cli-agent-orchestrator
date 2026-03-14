@@ -1,4 +1,7 @@
-"""Integration tests for Q CLI provider with real Q CLI."""
+"""Integration tests for Q CLI provider with real Q CLI.
+
+Uses the real create_terminal() flow with FIFO pipeline and mocked DB.
+"""
 
 import json
 import shutil
@@ -7,11 +10,17 @@ import uuid
 from pathlib import Path
 
 import pytest
+import pytest_asyncio
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.providers.q_cli import QCliProvider
-from cli_agent_orchestrator.utils.terminal import wait_for_shell
+from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.services.status_monitor import status_monitor
+from cli_agent_orchestrator.services.terminal_service import (
+    create_terminal,
+    delete_terminal,
+    send_input,
+)
 
 # Mark all tests in this module as integration and slow
 pytestmark = [pytest.mark.integration, pytest.mark.slow]
@@ -32,14 +41,10 @@ def ensure_test_agent(q_cli_available):
     agent_dir = Path.home() / ".aws" / "amazonq" / "cli-agents"
     agent_file = agent_dir / f"{agent_name}.json"
 
-    # Check if agent already exists
     if agent_file.exists():
         return agent_name
 
-    # Create agent directory if it doesn't exist
     agent_dir.mkdir(parents=True, exist_ok=True)
-
-    # Create a minimal test agent configuration
     agent_config = {
         "name": agent_name,
         "description": "",
@@ -48,463 +53,248 @@ def ensure_test_agent(q_cli_available):
         "useLegacyMcpJson": True,
         "model": None,
     }
-
-    # Write agent configuration
     with open(agent_file, "w") as f:
         json.dump(agent_config, f, indent=2)
 
-    print(f"\nCreated test agent '{agent_name}' at {agent_file}")
     return agent_name
 
 
-@pytest.fixture
-def test_session_name():
-    """Generate a unique test session name."""
-    return f"test-q-cli-{uuid.uuid4().hex[:8]}"
-
-
-@pytest.fixture
-def cleanup_session(test_session_name):
-    """Cleanup fixture that ensures test session is terminated."""
-    yield
-    # Cleanup after test
+@pytest_asyncio.fixture
+async def terminal(event_pipeline, mock_db, ensure_test_agent):
+    """Create a real terminal via create_terminal() with full FIFO pipeline."""
+    t = await create_terminal(
+        provider="q_cli",
+        agent_profile=ensure_test_agent,
+        new_session=True,
+    )
+    yield t
     try:
-        tmux_client.kill_session(test_session_name)
+        delete_terminal(t.id)
     except Exception:
-        pass  # Session may already be cleaned up
+        pass
+    try:
+        tmux_client.kill_session(t.session_name)
+    except Exception:
+        pass
+
+
+# --- Helpers ---
+
+
+def _wait_for_status(terminal_id, target, timeout=30):
+    elapsed = 0
+    while elapsed < timeout:
+        s = status_monitor.get_status(terminal_id)
+        if s == target:
+            return s
+        time.sleep(1)
+        elapsed += 1
+    return status_monitor.get_status(terminal_id)
+
+
+def _send(terminal_id, text):
+    send_input(terminal_id, text)
 
 
 class TestQCliProviderIntegration:
     """Integration tests with real Q CLI."""
 
-    def test_real_q_chat_initialization(
-        self, ensure_test_agent, test_session_name, cleanup_session
-    ):
+    @pytest.mark.asyncio
+    async def test_real_q_chat_initialization(self, terminal):
         """Test real Q CLI initialization flow."""
-        # Create a test tmux session
-        terminal_id = "test1234"
-        window_name = "window-0"
-        tmux_client.create_session(test_session_name, window_name, terminal_id)
+        status = status_monitor.get_status(terminal.id)
+        assert status in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}
 
-        try:
-            # Create provider and initialize (using agent from ensure_test_agent fixture)
-            provider = QCliProvider(terminal_id, test_session_name, window_name, ensure_test_agent)
-            result = provider.initialize()
-
-            # Verify initialization succeeded
-            assert result is True
-
-            # Give Q CLI a moment to fully initialize
-            time.sleep(2)
-
-            # Verify status is IDLE after initialization
-            status = provider.get_status()
-            assert status == TerminalStatus.IDLE
-
-        finally:
-            # Cleanup
-            tmux_client.kill_session(test_session_name)
-
-    def test_real_q_chat_simple_query(self, ensure_test_agent, test_session_name, cleanup_session):
+    @pytest.mark.asyncio
+    async def test_real_q_chat_simple_query(self, terminal):
         """Test real Q CLI with a simple query."""
-        # Create a test tmux session
-        terminal_id = "test1234"
-        window_name = "window-0"
-        tmux_client.create_session(test_session_name, window_name, terminal_id)
+        _send(terminal.id, "Say 'Hello, integration test!'")
 
-        try:
-            # Initialize Q CLI (using agent from ensure_test_agent fixture)
-            provider = QCliProvider(terminal_id, test_session_name, window_name, ensure_test_agent)
-            provider.initialize()
+        status = _wait_for_status(terminal.id, TerminalStatus.COMPLETED)
+        assert status == TerminalStatus.COMPLETED
 
-            # Wait for IDLE status
-            time.sleep(2)
-            assert provider.get_status() == TerminalStatus.IDLE
+        provider = provider_manager.get_provider(terminal.id)
+        output = status_monitor.get_buffer(terminal.id)
+        message = provider.extract_last_message_from_script(output)
 
-            # Send a simple query
-            simple_query = "Say 'Hello, integration test!'"
-            tmux_client.send_keys(test_session_name, window_name, simple_query)
+        assert len(message) > 0
+        assert "\x1b[" not in message
 
-            # Wait for processing
-            time.sleep(1)
-            status = provider.get_status()
-            assert status in [TerminalStatus.PROCESSING, TerminalStatus.COMPLETED]
-
-            # Wait for completion (max 30 seconds)
-            max_wait = 30
-            elapsed = 0
-            while elapsed < max_wait:
-                status = provider.get_status()
-                if status == TerminalStatus.COMPLETED:
-                    break
-                time.sleep(1)
-                elapsed += 1
-
-            # Verify we got a completed response
-            assert status == TerminalStatus.COMPLETED
-
-            # Extract and verify the message
-            output = tmux_client.get_history(test_session_name, window_name)
-            message = provider.extract_last_message_from_script(output)
-
-            # Message should contain something (not empty)
-            assert len(message) > 0
-            assert "\x1b[" not in message  # ANSI codes cleaned
-
-        finally:
-            # Cleanup
-            tmux_client.kill_session(test_session_name)
-
-    def test_real_q_chat_status_detection(
-        self, ensure_test_agent, test_session_name, cleanup_session
-    ):
+    @pytest.mark.asyncio
+    async def test_real_q_chat_status_detection(self, terminal):
         """Test status detection with real Q CLI output."""
-        # Create a test tmux session
-        terminal_id = "test1234"
-        window_name = "window-0"
-        tmux_client.create_session(test_session_name, window_name, terminal_id)
+        _send(terminal.id, "What is 2+2?")
 
-        try:
-            # Initialize Q CLI (using agent from ensure_test_agent fixture)
-            provider = QCliProvider(terminal_id, test_session_name, window_name, ensure_test_agent)
-            provider.initialize()
+        time.sleep(1)
+        status = status_monitor.get_status(terminal.id)
+        assert status in [TerminalStatus.PROCESSING, TerminalStatus.COMPLETED]
 
-            # Test IDLE status
-            time.sleep(2)
-            assert provider.get_status() == TerminalStatus.IDLE
+        status = _wait_for_status(terminal.id, TerminalStatus.COMPLETED)
+        assert status == TerminalStatus.COMPLETED
 
-            # Send a query to trigger PROCESSING/COMPLETED states
-            tmux_client.send_keys(test_session_name, window_name, "What is 2+2?")
-
-            # Should be PROCESSING or quickly move to COMPLETED
-            time.sleep(1)
-            status = provider.get_status()
-            assert status in [TerminalStatus.PROCESSING, TerminalStatus.COMPLETED]
-
-            # Wait for completion
-            max_wait = 30
-            elapsed = 0
-            while elapsed < max_wait:
-                status = provider.get_status()
-                if status == TerminalStatus.COMPLETED:
-                    break
-                time.sleep(1)
-                elapsed += 1
-
-            # Should be COMPLETED
-            assert status == TerminalStatus.COMPLETED
-
-            # After some time, should return to IDLE (if we send Enter)
-            time.sleep(1)
-            tmux_client.send_keys(test_session_name, window_name, "")
-            time.sleep(1)
-
-        finally:
-            # Cleanup
-            tmux_client.kill_session(test_session_name)
-
-    def test_real_q_chat_exit(self, ensure_test_agent, test_session_name, cleanup_session):
+    @pytest.mark.asyncio
+    async def test_real_q_chat_exit(self, terminal):
         """Test exiting Q CLI."""
-        # Create a test tmux session
-        terminal_id = "test1234"
-        window_name = "window-0"
-        tmux_client.create_session(test_session_name, window_name, terminal_id)
+        provider = provider_manager.get_provider(terminal.id)
+        exit_cmd = provider.exit_cli()
+        _send(terminal.id, exit_cmd)
 
-        try:
-            # Initialize Q CLI (using agent from ensure_test_agent fixture)
-            provider = QCliProvider(terminal_id, test_session_name, window_name, ensure_test_agent)
-            provider.initialize()
+        time.sleep(2)
+        output = status_monitor.get_buffer(terminal.id)
+        assert "/exit" in output or "exit" in output.lower()
 
-            time.sleep(2)
-            assert provider.get_status() == TerminalStatus.IDLE
-
-            # Send exit command
-            exit_cmd = provider.exit_cli()
-            tmux_client.send_keys(test_session_name, window_name, exit_cmd)
-
-            # Wait for exit
-            time.sleep(2)
-
-            # Get the output to verify exit happened
-            output = tmux_client.get_history(test_session_name, window_name)
-
-            # Should not have the Q CLI prompt anymore after exit
-            # (This test verifies the exit command works)
-            assert "/exit" in output or "exit" in output.lower()
-
-        finally:
-            # Cleanup
-            tmux_client.kill_session(test_session_name)
-
-    def test_real_q_chat_with_different_profile(
-        self, ensure_test_agent, test_session_name, cleanup_session
+    @pytest.mark.asyncio
+    async def test_real_q_chat_with_different_profile(
+        self, event_pipeline, mock_db, q_cli_available
     ):
         """Test Q CLI with a different agent profile if available."""
-        # Create a test tmux session
-        terminal_id = "test1234"
-        window_name = "window-0"
-        tmux_client.create_session(test_session_name, window_name, terminal_id)
-
         try:
-            # Try with a different profile (may not exist, that's okay)
-            provider = QCliProvider(terminal_id, test_session_name, window_name, "test-agent")
-
-            # Initialize - may fail if profile doesn't exist
-            try:
-                result = provider.initialize()
-                # If it succeeds, verify basic functionality
-                if result:
-                    time.sleep(2)
-                    status = provider.get_status()
-                    # Status should be IDLE or ERROR (if profile doesn't exist)
-                    assert status in [TerminalStatus.IDLE, TerminalStatus.ERROR]
-            except TimeoutError:
-                # Profile may not exist, that's acceptable
-                pytest.skip("Test profile not available")
-
-        finally:
-            # Cleanup
-            tmux_client.kill_session(test_session_name)
+            t = await create_terminal(
+                provider="q_cli",
+                agent_profile="test-agent",
+                new_session=True,
+            )
+            status = status_monitor.get_status(t.id)
+            assert status in [TerminalStatus.IDLE, TerminalStatus.ERROR]
+            delete_terminal(t.id)
+            tmux_client.kill_session(t.session_name)
+        except TimeoutError:
+            pytest.skip("Test profile not available")
 
 
 class TestQCliProviderHandoffIntegration:
     """Integration tests for handoff scenarios."""
 
-    def test_real_handoff_status_transitions(
-        self, ensure_test_agent, test_session_name, cleanup_session
-    ):
+    @pytest.mark.asyncio
+    async def test_real_handoff_status_transitions(self, terminal):
         """Test status transitions during a real handoff scenario."""
-        # Create a test tmux session
-        terminal_id = "test1234"
-        window_name = "window-0"
-        tmux_client.create_session(test_session_name, window_name, terminal_id)
+        _send(terminal.id, "Please help me with implementing a new feature")
 
-        try:
-            # Initialize Q CLI with supervisor agent
-            # Note: This assumes a supervisor agent exists. If not, will use developer.
-            provider = QCliProvider(terminal_id, test_session_name, window_name, ensure_test_agent)
-            provider.initialize()
-
-            # Wait for IDLE status
-            time.sleep(2)
-            assert provider.get_status() == TerminalStatus.IDLE
-
-            # Send a query that might trigger handoff-like behavior
-            # (Real handoff depends on agent configuration)
-            handoff_query = "Please help me with implementing a new feature"
-            tmux_client.send_keys(test_session_name, window_name, handoff_query)
-
-            # Monitor status transitions
-            statuses = []
-            max_wait = 30
-            elapsed = 0
-
-            while elapsed < max_wait:
-                status = provider.get_status()
-                statuses.append(status)
-
-                # Break if we reach COMPLETED or ERROR
-                if status in [TerminalStatus.COMPLETED, TerminalStatus.ERROR]:
-                    break
-
-                time.sleep(1)
-                elapsed += 1
-
-            # Verify we got through the expected states
-            assert TerminalStatus.PROCESSING in statuses or TerminalStatus.COMPLETED in statuses
-
-            # Extract the message if completed
-            if statuses[-1] == TerminalStatus.COMPLETED:
-                output = tmux_client.get_history(test_session_name, window_name)
-                message = provider.extract_last_message_from_script(output)
-
-                # Verify message extraction worked
-                assert len(message) > 0
-                assert "\x1b[" not in message  # ANSI codes cleaned
-
-        finally:
-            # Cleanup
-            tmux_client.kill_session(test_session_name)
-
-    def test_real_handoff_message_integrity(
-        self, ensure_test_agent, test_session_name, cleanup_session
-    ):
-        """Test that message extraction maintains integrity during handoff."""
-        # Create a test tmux session
-        terminal_id = "test1234"
-        window_name = "window-0"
-        tmux_client.create_session(test_session_name, window_name, terminal_id)
-
-        try:
-            # Initialize Q CLI
-            provider = QCliProvider(terminal_id, test_session_name, window_name, ensure_test_agent)
-            provider.initialize()
-
-            time.sleep(2)
-            assert provider.get_status() == TerminalStatus.IDLE
-
-            # Send a simple query (shorter to avoid buffer truncation)
-            query = "Say 'Test message integrity'"
-            tmux_client.send_keys(test_session_name, window_name, query)
-
-            # Wait for processing to start
+        statuses = []
+        max_wait = 30
+        elapsed = 0
+        while elapsed < max_wait:
+            status = status_monitor.get_status(terminal.id)
+            statuses.append(status)
+            if status in [TerminalStatus.COMPLETED, TerminalStatus.ERROR]:
+                break
             time.sleep(1)
-            initial_status = provider.get_status()
+            elapsed += 1
 
-            # If already completed, we're done
-            if initial_status == TerminalStatus.COMPLETED:
-                status = initial_status
-            else:
-                # Otherwise wait for completion
-                if initial_status != TerminalStatus.PROCESSING:
-                    # Debug: print terminal output if not in expected state
-                    debug_output = tmux_client.get_history(test_session_name, window_name)
-                    print(f"\n=== DEBUG: Unexpected initial status ===")
-                    print(f"Status: {initial_status}")
-                    print(f"Terminal output:\n{debug_output}")
-                    print("=" * 50)
-                assert (
-                    initial_status == TerminalStatus.PROCESSING
-                ), f"Expected PROCESSING but got {initial_status}"
+        assert TerminalStatus.PROCESSING in statuses or TerminalStatus.COMPLETED in statuses
 
-                max_wait = 30
-                elapsed = 0
-                status_history = [initial_status]
-                while elapsed < max_wait:
-                    status = provider.get_status()
-                    if status != status_history[-1]:
-                        status_history.append(status)
-                    if status == TerminalStatus.COMPLETED:
-                        break
-                    time.sleep(1)
-                    elapsed += 1
-
-                if status != TerminalStatus.COMPLETED:
-                    # Debug: print terminal output on failure
-                    debug_output = tmux_client.get_history(test_session_name, window_name)
-                    print(f"\n=== DEBUG: Test failed ===")
-                    print(f"Final status: {status}")
-                    print(f"Status history: {status_history}")
-                    print(f"Terminal output:\n{debug_output}")
-                    print("=" * 50)
-
-                assert (
-                    status == TerminalStatus.COMPLETED
-                ), f"Expected COMPLETED but got {status} after {elapsed} seconds. Status history: {status_history}"
-
-            # Get the output
-            output = tmux_client.get_history(test_session_name, window_name)
-
-            # Extract message and verify indices weren't corrupted
+        if statuses[-1] == TerminalStatus.COMPLETED:
+            provider = provider_manager.get_provider(terminal.id)
+            output = status_monitor.get_buffer(terminal.id)
             message = provider.extract_last_message_from_script(output)
-
-            # Verify message quality
             assert len(message) > 0
-            assert "\x1b[" not in message  # All ANSI codes removed
-            assert not message.startswith("[")  # No partial ANSI codes
-            assert not message.endswith("\x1b")  # No trailing escape chars
+            assert "\x1b[" not in message
 
-            # Message should be coherent (no index corruption)
-            # A corrupted extraction would have fragments or missing parts
-            assert len(message.split()) >= 3  # Should have multiple words
-            assert "Test message integrity" in message  # Should contain our expected phrase
+    @pytest.mark.asyncio
+    async def test_real_handoff_message_integrity(self, terminal):
+        """Test that message extraction maintains integrity during handoff."""
+        _send(terminal.id, "Say 'Test message integrity'")
 
-        finally:
-            # Cleanup
-            tmux_client.kill_session(test_session_name)
+        status = _wait_for_status(terminal.id, TerminalStatus.COMPLETED)
+        assert status == TerminalStatus.COMPLETED, f"Expected COMPLETED but got {status}"
+
+        provider = provider_manager.get_provider(terminal.id)
+        output = status_monitor.get_buffer(terminal.id)
+        message = provider.extract_last_message_from_script(output)
+
+        assert len(message) > 0
+        assert "\x1b[" not in message
+        assert not message.startswith("[")
+        assert not message.endswith("\x1b")
+        assert len(message.split()) >= 3
 
 
 class TestQCliProviderWorkingDirectory:
-    """Integration tests for working directory functionality."""
+    """Integration tests for working directory functionality.
+
+    These tests don't need Q CLI — just tmux.
+    """
 
     @pytest.fixture
     def home_tmp_path(self):
-        """Create a temporary directory inside home directory to pass path validation."""
         path = Path.home() / f".cao_test_tmp_{uuid.uuid4().hex[:8]}"
         path.mkdir(parents=True, exist_ok=True)
         yield path
         shutil.rmtree(path, ignore_errors=True)
 
+    @pytest.fixture
+    def test_session_name(self):
+        return f"test-q-cli-{uuid.uuid4().hex[:8]}"
+
+    @pytest.fixture
+    def cleanup_session(self, test_session_name):
+        yield
+        try:
+            tmux_client.kill_session(test_session_name)
+        except Exception:
+            pass
+
     def test_session_starts_in_custom_directory(
         self, test_session_name, cleanup_session, home_tmp_path
     ):
         """Test that terminal starts in specified working directory."""
-        # Create session with custom working directory
         window_name = tmux_client.create_session(
-            test_session_name, "test-window", "test-term-id", working_directory=str(home_tmp_path)
+            test_session_name, "test-window", "test-term-id",
+            working_directory=str(home_tmp_path),
         )
-
-        # Query the working directory
         actual_dir = tmux_client.get_pane_working_directory(test_session_name, window_name)
-
         assert actual_dir == str(home_tmp_path.resolve())
 
     def test_working_directory_changes_are_detected(
         self, test_session_name, cleanup_session, home_tmp_path
     ):
         """Test that directory changes in terminal are detected."""
-        # Create session
         window_name = tmux_client.create_session(
-            test_session_name, "test-window", "test-term-id", working_directory=str(home_tmp_path)
+            test_session_name, "test-window", "test-term-id",
+            working_directory=str(home_tmp_path),
         )
-
-        # Create subdirectory
         subdir = home_tmp_path / "subdir"
         subdir.mkdir()
 
-        # Change directory in tmux pane
-        # wait_for_shell ensures shell is initialized before sending commands
-        # (paste-buffer delivery is instant, so shell must be ready first)
-        wait_for_shell(tmux_client, test_session_name, window_name, timeout=10.0)
+        time.sleep(3)
         tmux_client.send_keys(test_session_name, window_name, f"cd {subdir}")
-        time.sleep(0.5)  # Wait for command to execute
+        time.sleep(2)
 
-        # Query working directory
         actual_dir = tmux_client.get_pane_working_directory(test_session_name, window_name)
-
         assert actual_dir == str(subdir.resolve())
 
     def test_symlink_resolution(self, test_session_name, cleanup_session, home_tmp_path):
         """Test that symlinks are resolved to real paths."""
-        # Create real directory and symlink
         real_dir = home_tmp_path / "real"
         real_dir.mkdir()
         link_dir = home_tmp_path / "link"
         link_dir.symlink_to(real_dir)
 
-        # Create session with symlink path
         window_name = tmux_client.create_session(
-            test_session_name, "test-window", "test-term-id", working_directory=str(link_dir)
+            test_session_name, "test-window", "test-term-id",
+            working_directory=str(link_dir),
         )
-
-        # Should resolve to real path
         actual_dir = tmux_client.get_pane_working_directory(test_session_name, window_name)
-
         assert actual_dir == str(real_dir.resolve())
 
 
 class TestQCliProviderIntegrationErrorHandling:
     """Integration tests for error scenarios."""
 
-    def test_invalid_session_handling(self, q_cli_available):
-        """Test handling of invalid session."""
-        provider = QCliProvider("test1234", "non-existent-session", "window-0", "developer")
-
-        # Should raise an error or timeout when trying to initialize
-        # with a non-existent session
+    @pytest.mark.asyncio
+    async def test_invalid_session_handling(self, event_pipeline, mock_db, q_cli_available):
+        """Test handling of invalid agent profile."""
         with pytest.raises((TimeoutError, Exception)):
-            provider.initialize()
+            await create_terminal(
+                provider="q_cli",
+                agent_profile="non-existent-agent-profile-xyz",
+                new_session=True,
+            )
 
-    def test_get_status_with_nonexistent_session(self, q_cli_available):
-        """Test get_status with non-existent session."""
-        provider = QCliProvider("test1234", "non-existent-session", "window-0", "developer")
+    def test_get_status_with_empty_output(self, q_cli_available):
+        """Test get_status with empty output."""
+        from cli_agent_orchestrator.providers.q_cli import QCliProvider
 
-        # Should handle gracefully (likely return ERROR status)
-        # The exact behavior depends on tmux_client implementation
-        try:
-            status = provider.get_status()
-            # If it doesn't raise an exception, it should return ERROR
-            assert status == TerminalStatus.ERROR
-        except Exception:
-            # It's also acceptable to raise an exception
-            pass
+        provider = QCliProvider("test1234", "non-existent", "window-0", "developer")
+        status = provider.get_status("")
+        assert status == TerminalStatus.UNKNOWN

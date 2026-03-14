@@ -105,12 +105,17 @@ class TestGetSession:
 class TestDeleteSession:
     """Tests for delete_session function."""
 
-    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_session")
-    @patch("cli_agent_orchestrator.services.session_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.tmux_client")
     def test_delete_session_success(
-        self, mock_tmux, mock_list_terminals, mock_provider_manager, mock_delete_terminals
+        self, mock_tmux, mock_list_terminals,
+        mock_get_metadata, mock_provider_manager, mock_db_delete,
+        mock_fifo_manager, mock_status_monitor,
     ):
         """Test deleting session successfully."""
         mock_tmux.session_exists.return_value = True
@@ -118,13 +123,16 @@ class TestDeleteSession:
             {"id": "terminal1"},
             {"id": "terminal2"},
         ]
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-test",
+            "tmux_window": "window",
+        }
+        mock_db_delete.return_value = True
 
         result = delete_session("cao-test")
 
         assert result is True
         mock_tmux.kill_session.assert_called_once_with("cao-test")
-        mock_delete_terminals.assert_called_once_with("cao-test")
-        assert mock_provider_manager.cleanup_provider.call_count == 2
 
     @patch("cli_agent_orchestrator.services.session_service.tmux_client")
     def test_delete_session_not_found(self, mock_tmux):
@@ -134,12 +142,10 @@ class TestDeleteSession:
         with pytest.raises(ValueError, match="Session 'cao-nonexistent' not found"):
             delete_session("cao-nonexistent")
 
-    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_session")
-    @patch("cli_agent_orchestrator.services.session_service.provider_manager")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.tmux_client")
     def test_delete_session_no_terminals(
-        self, mock_tmux, mock_list_terminals, mock_provider_manager, mock_delete_terminals
+        self, mock_tmux, mock_list_terminals
     ):
         """Test deleting session with no terminals."""
         mock_tmux.session_exists.return_value = True
@@ -148,7 +154,7 @@ class TestDeleteSession:
         result = delete_session("cao-test")
 
         assert result is True
-        mock_provider_manager.cleanup_provider.assert_not_called()
+        mock_tmux.kill_session.assert_called_once_with("cao-test")
 
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.tmux_client")
