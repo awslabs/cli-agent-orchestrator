@@ -86,7 +86,9 @@ class TestClaudeCodeProviderInitialization:
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    async def test_initialize_with_invalid_agent_profile(self, mock_tmux, mock_load, mock_wait_shell):
+    async def test_initialize_with_invalid_agent_profile(
+        self, mock_tmux, mock_load, mock_wait_shell
+    ):
         """Test initialization with invalid agent profile."""
         mock_wait_shell.return_value = True
         mock_load.side_effect = FileNotFoundError("Profile not found")
@@ -122,7 +124,9 @@ class TestClaudeCodeProviderInitialization:
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    async def test_initialize_sends_claude_command(self, mock_tmux, mock_wait_status, mock_wait_shell):
+    async def test_initialize_sends_claude_command(
+        self, mock_tmux, mock_wait_status, mock_wait_shell
+    ):
         """Test that initialize sends the 'claude' command to tmux."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
@@ -258,6 +262,7 @@ class TestClaudeCodeProviderStatusDetection:
         status = provider.get_status(output)
 
         assert status == TerminalStatus.UNKNOWN
+
 
 class TestClaudeCodeProviderMessageExtraction:
     """Tests for ClaudeCodeProvider message extraction."""
@@ -506,9 +511,7 @@ class TestClaudeCodeProviderTrustPrompt:
     def test_get_status_trust_prompt_not_waiting_user_answer(self):
         """Test that trust prompt is NOT detected as WAITING_USER_ANSWER."""
         # This output has both WAITING_USER_ANSWER pattern AND trust prompt pattern
-        output = (
-            "❯ 1. Yes, I trust this folder\n" "  2. No, don't trust this folder"
-        )
+        output = "❯ 1. Yes, I trust this folder\n" "  2. No, don't trust this folder"
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         status = provider.get_status(output)

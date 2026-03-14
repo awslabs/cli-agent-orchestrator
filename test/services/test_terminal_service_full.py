@@ -290,7 +290,9 @@ class TestGetOutput:
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_get_output_last_no_provider(self, mock_get_metadata, mock_tmux, mock_status_monitor, mock_pm):
+    def test_get_output_last_no_provider(
+        self, mock_get_metadata, mock_tmux, mock_status_monitor, mock_pm
+    ):
         """Test getting last message when provider not found."""
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
@@ -313,8 +315,13 @@ class TestDeleteTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_delete_terminal_success(
-        self, mock_get_metadata, mock_tmux, mock_provider_manager, mock_db_delete,
-        mock_fifo_manager, mock_status_monitor
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_provider_manager,
+        mock_db_delete,
+        mock_fifo_manager,
+        mock_status_monitor,
     ):
         """Test deleting terminal successfully."""
         mock_get_metadata.return_value = {
@@ -336,8 +343,13 @@ class TestDeleteTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_delete_terminal_pipe_pane_error(
-        self, mock_get_metadata, mock_tmux, mock_provider_manager, mock_db_delete,
-        mock_fifo_manager, mock_status_monitor
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_provider_manager,
+        mock_db_delete,
+        mock_fifo_manager,
+        mock_status_monitor,
     ):
         """Test deleting terminal when stop_pipe_pane fails."""
         mock_get_metadata.return_value = {
@@ -358,8 +370,12 @@ class TestDeleteTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_delete_terminal_no_metadata(
-        self, mock_get_metadata, mock_provider_manager, mock_db_delete,
-        mock_fifo_manager, mock_status_monitor
+        self,
+        mock_get_metadata,
+        mock_provider_manager,
+        mock_db_delete,
+        mock_fifo_manager,
+        mock_status_monitor,
     ):
         """Test deleting terminal when metadata not found."""
         mock_get_metadata.return_value = None

@@ -49,7 +49,9 @@ class QCliProvider(BaseProvider):
         command = shlex.join(["q", "chat", "--agent", self._agent_profile])
         tmux_client.send_keys(self.session_name, self.window_name, command)
 
-        if not await wait_until_status(self.terminal_id, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=30.0):
+        if not await wait_until_status(
+            self.terminal_id, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=30.0
+        ):
             raise TimeoutError("Q CLI initialization timed out after 30 seconds")
 
         self._initialized = True
@@ -146,7 +148,6 @@ class QCliProvider(BaseProvider):
         final_answer = re.sub(ESCAPE_SEQUENCE_PATTERN, "", final_answer)
         final_answer = re.sub(CONTROL_CHAR_PATTERN, "", final_answer)
         return final_answer.strip()
-
 
     # TODO: exit_cli should run the tmux.send_keys directly with /exit or ctrl-c twice
     def exit_cli(self) -> str:

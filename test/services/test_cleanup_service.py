@@ -44,8 +44,12 @@ class TestCleanupOldData:
     @patch("cli_agent_orchestrator.services.cleanup_service.LOG_DIR")
     @patch("cli_agent_orchestrator.services.cleanup_service.RETENTION_DAYS", 7)
     def test_cleanup_old_data_deletes_old_inbox_messages(
-        self, mock_log_dir, mock_terminal_log_dir, mock_session_local,
-        mock_fifo_manager, mock_status_monitor
+        self,
+        mock_log_dir,
+        mock_terminal_log_dir,
+        mock_session_local,
+        mock_fifo_manager,
+        mock_status_monitor,
     ):
         """Test that cleanup deletes old inbox messages from database."""
         # Setup mock database session
@@ -192,8 +196,9 @@ class TestCleanupOldData:
     @patch("cli_agent_orchestrator.services.cleanup_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.cleanup_service.SessionLocal")
     @patch("cli_agent_orchestrator.services.cleanup_service.RETENTION_DAYS", 30)
-    def test_cleanup_uses_correct_retention_period(self, mock_session_local,
-                                                    mock_fifo_manager, mock_status_monitor):
+    def test_cleanup_uses_correct_retention_period(
+        self, mock_session_local, mock_fifo_manager, mock_status_monitor
+    ):
         """Test that cleanup uses the configured retention period."""
         mock_db = MagicMock()
         mock_session_local.return_value.__enter__.return_value = mock_db

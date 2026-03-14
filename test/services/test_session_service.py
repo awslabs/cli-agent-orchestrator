@@ -113,9 +113,14 @@ class TestDeleteSession:
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.tmux_client")
     def test_delete_session_success(
-        self, mock_tmux, mock_list_terminals,
-        mock_get_metadata, mock_provider_manager, mock_db_delete,
-        mock_fifo_manager, mock_status_monitor,
+        self,
+        mock_tmux,
+        mock_list_terminals,
+        mock_get_metadata,
+        mock_provider_manager,
+        mock_db_delete,
+        mock_fifo_manager,
+        mock_status_monitor,
     ):
         """Test deleting session successfully."""
         mock_tmux.session_exists.return_value = True
@@ -144,9 +149,7 @@ class TestDeleteSession:
 
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.tmux_client")
-    def test_delete_session_no_terminals(
-        self, mock_tmux, mock_list_terminals
-    ):
+    def test_delete_session_no_terminals(self, mock_tmux, mock_list_terminals):
         """Test deleting session with no terminals."""
         mock_tmux.session_exists.return_value = True
         mock_list_terminals.return_value = []

@@ -239,7 +239,9 @@ class TestQCliProviderWorkingDirectory:
     ):
         """Test that terminal starts in specified working directory."""
         window_name = tmux_client.create_session(
-            test_session_name, "test-window", "test-term-id",
+            test_session_name,
+            "test-window",
+            "test-term-id",
             working_directory=str(home_tmp_path),
         )
         actual_dir = tmux_client.get_pane_working_directory(test_session_name, window_name)
@@ -250,7 +252,9 @@ class TestQCliProviderWorkingDirectory:
     ):
         """Test that directory changes in terminal are detected."""
         window_name = tmux_client.create_session(
-            test_session_name, "test-window", "test-term-id",
+            test_session_name,
+            "test-window",
+            "test-term-id",
             working_directory=str(home_tmp_path),
         )
         subdir = home_tmp_path / "subdir"
@@ -271,7 +275,9 @@ class TestQCliProviderWorkingDirectory:
         link_dir.symlink_to(real_dir)
 
         window_name = tmux_client.create_session(
-            test_session_name, "test-window", "test-term-id",
+            test_session_name,
+            "test-window",
+            "test-term-id",
             working_directory=str(link_dir),
         )
         actual_dir = tmux_client.get_pane_working_directory(test_session_name, window_name)

@@ -55,9 +55,14 @@ class TestGeminiCliProviderInitialization:
 
         mock_monitor = MagicMock()
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
-        with patch(
-            "cli_agent_orchestrator.providers.gemini_cli.status_monitor", mock_monitor, create=True
-        ), patch("cli_agent_orchestrator.services.status_monitor.status_monitor", mock_monitor):
+        with (
+            patch(
+                "cli_agent_orchestrator.providers.gemini_cli.status_monitor",
+                mock_monitor,
+                create=True,
+            ),
+            patch("cli_agent_orchestrator.services.status_monitor.status_monitor", mock_monitor),
+        ):
             result = await provider.initialize()
 
         assert result is True
@@ -97,9 +102,7 @@ class TestGeminiCliProviderInitialization:
         mock_monitor = MagicMock()
         mock_monitor.get_status.return_value = TerminalStatus.UNKNOWN
         mock_monitor.get_buffer.return_value = ""
-        with patch(
-            "cli_agent_orchestrator.services.status_monitor.status_monitor", mock_monitor
-        ):
+        with patch("cli_agent_orchestrator.services.status_monitor.status_monitor", mock_monitor):
             with pytest.raises(TimeoutError, match="Gemini CLI initialization timed out"):
                 await provider.initialize()
 
@@ -163,9 +166,7 @@ class TestGeminiCliProviderInitialization:
 
         mock_monitor = MagicMock()
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
-        with patch(
-            "cli_agent_orchestrator.services.status_monitor.status_monitor", mock_monitor
-        ):
+        with patch("cli_agent_orchestrator.services.status_monitor.status_monitor", mock_monitor):
             await provider.initialize()
 
         assert mock_tmux.send_keys.call_args_list[0][0][2] == "echo CAO_SHELL_READY"
@@ -199,9 +200,7 @@ class TestGeminiCliProviderInitialization:
         # First status check returns IDLE (should be skipped for -i), then COMPLETED
         mock_monitor = MagicMock()
         mock_monitor.get_status.side_effect = [TerminalStatus.IDLE, TerminalStatus.COMPLETED]
-        with patch(
-            "cli_agent_orchestrator.services.status_monitor.status_monitor", mock_monitor
-        ):
+        with patch("cli_agent_orchestrator.services.status_monitor.status_monitor", mock_monitor):
             provider = GeminiCliProvider(
                 "term-1", "session-1", "window-1", agent_profile="supervisor"
             )
@@ -260,22 +259,33 @@ class TestGeminiCliProviderStatusDetection:
     def test_get_status_idle(self):
         """Test IDLE detection from fresh startup output."""
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status(_read_fixture("gemini_cli_idle_output.txt")) == TerminalStatus.IDLE
+        assert (
+            provider.get_status(_read_fixture("gemini_cli_idle_output.txt")) == TerminalStatus.IDLE
+        )
 
     def test_get_status_completed(self):
         """Test COMPLETED detection when response is present with prompt."""
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status(_read_fixture("gemini_cli_completed_output.txt")) == TerminalStatus.COMPLETED
+        assert (
+            provider.get_status(_read_fixture("gemini_cli_completed_output.txt"))
+            == TerminalStatus.COMPLETED
+        )
 
     def test_get_status_completed_complex(self):
         """Test COMPLETED detection with tool call response."""
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status(_read_fixture("gemini_cli_complex_response.txt")) == TerminalStatus.COMPLETED
+        assert (
+            provider.get_status(_read_fixture("gemini_cli_complex_response.txt"))
+            == TerminalStatus.COMPLETED
+        )
 
     def test_get_status_processing(self):
         """Test PROCESSING detection when user query is in input box."""
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status(_read_fixture("gemini_cli_processing_output.txt")) == TerminalStatus.PROCESSING
+        assert (
+            provider.get_status(_read_fixture("gemini_cli_processing_output.txt"))
+            == TerminalStatus.PROCESSING
+        )
 
     def test_get_status_unknown_empty(self):
         """Test UNKNOWN on empty output."""
@@ -285,7 +295,10 @@ class TestGeminiCliProviderStatusDetection:
     def test_get_status_error_pattern(self):
         """Test ERROR detection from error output fixture."""
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status(_read_fixture("gemini_cli_error_output.txt")) == TerminalStatus.ERROR
+        assert (
+            provider.get_status(_read_fixture("gemini_cli_error_output.txt"))
+            == TerminalStatus.ERROR
+        )
 
     def test_get_status_idle_with_ansi_codes(self):
         """Test IDLE detection with ANSI escape codes in output."""

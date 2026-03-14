@@ -196,7 +196,6 @@ class ClaudeCodeProvider(BaseProvider):
 
         return TerminalStatus.UNKNOWN
 
-
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract Claude's final response message using ⏺ indicator."""
         # Find all matches of response pattern

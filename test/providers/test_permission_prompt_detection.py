@@ -55,17 +55,13 @@ class TestPermissionPromptActive:
 
     def test_p2_active_trailing_text(self):
         """P2: Permission prompt + idle prompt with trailing text, unanswered."""
-        output = load_fixture(
-            "kiro_cli_permission_active_trailing_text.txt"
-        )
+        output = load_fixture("kiro_cli_permission_active_trailing_text.txt")
         provider = make_provider("cao-jira-expert")
         assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
 
     def test_p3_active_injection_delivered(self):
         """P3: Permission prompt + CAO injection message delivered during prompt."""
-        output = load_fixture(
-            "kiro_cli_permission_active_injection.txt"
-        )
+        output = load_fixture("kiro_cli_permission_active_injection.txt")
         provider = make_provider("cao-code-explorer-expert")
         assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
 
@@ -81,9 +77,7 @@ class TestPermissionPromptActive:
 
     def test_p8_active_partial_typing(self):
         """P8: User typing partial text during permission prompt, no enter."""
-        output = load_fixture(
-            "kiro_cli_permission_active_partial_typing.txt"
-        )
+        output = load_fixture("kiro_cli_permission_active_partial_typing.txt")
         provider = make_provider("cao-internal-docs-expert")
         assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
 
@@ -110,9 +104,7 @@ class TestPermissionPromptStale:
 
     def test_p6_long_response_instead_of_ynt(self):
         """P6: User typed long response instead of y/n/t, agent continued."""
-        output = load_fixture(
-            "kiro_cli_permission_stale_long_response.txt"
-        )
+        output = load_fixture("kiro_cli_permission_stale_long_response.txt")
         provider = make_provider("cao-query-decomposer-supervisor")
         status = provider.get_status(output)
         assert status != TerminalStatus.WAITING_USER_ANSWER
@@ -171,9 +163,7 @@ class TestNonPermissionCases:
 
     def test_n4_running_tool(self):
         """N4: Tool is executing, no idle prompt."""
-        output = (
-            "Searching for: system-privileges (*.toml) (using tool: grep)"
-        )
+        output = "Searching for: system-privileges (*.toml) (using tool: grep)"
         provider = make_provider("developer")
         assert provider.get_status(output) == TerminalStatus.PROCESSING
 
@@ -189,9 +179,7 @@ class TestNonPermissionCases:
 
     def test_n9_message_received(self):
         """N9: Inbox message delivered, agent idle."""
-        output = (
-            "[developer] 12% > [Message from terminal 9445aa60] " "Hello from supervisor"
-        )
+        output = "[developer] 12% > [Message from terminal 9445aa60] " "Hello from supervisor"
         provider = make_provider("developer")
         assert provider.get_status(output) == TerminalStatus.IDLE
 

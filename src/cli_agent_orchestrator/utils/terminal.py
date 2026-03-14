@@ -93,9 +93,7 @@ async def wait_until_status(
             logger.info(f"wait_until_status [{terminal_id}]: reached {current.value}")
             return True
         await asyncio.sleep(polling_interval)
-    logger.warning(
-        f"wait_until_status [{terminal_id}]: timeout waiting for {{{target_str}}}"
-    )
+    logger.warning(f"wait_until_status [{terminal_id}]: timeout waiting for {{{target_str}}}")
     return False
 
 

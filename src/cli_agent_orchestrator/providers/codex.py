@@ -355,7 +355,6 @@ class CodexProvider(BaseProvider):
         # assume the CLI is still producing output.
         return TerminalStatus.PROCESSING
 
-
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract Codex's final response from terminal output.
 

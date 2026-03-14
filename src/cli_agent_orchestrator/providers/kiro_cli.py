@@ -239,7 +239,6 @@ class KiroCliProvider(BaseProvider):
         final_answer = re.sub(CONTROL_CHAR_PATTERN, "", final_answer)
         return final_answer.strip()
 
-
     def exit_cli(self) -> str:
         """Get the command to exit Kiro CLI."""
         return "/exit"
