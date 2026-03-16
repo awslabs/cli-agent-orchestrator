@@ -492,6 +492,22 @@ class GeminiCliProvider(BaseProvider):
         # No idle prompt visible and no error: Gemini is actively processing
         return TerminalStatus.PROCESSING
 
+    def get_idle_pattern_for_log(self) -> str:
+        """Return Gemini CLI idle prompt pattern for log file monitoring.
+
+        Used by the inbox service for quick IDLE state detection in pipe-pane
+        log files before calling the full get_status() method.
+        """
+        return IDLE_PROMPT_PATTERN_LOG
+
+    @property
+    def extraction_retries(self) -> int:
+        """Gemini CLI's Ink TUI may show notification spinners for ~10-15s
+        after completing a response, temporarily obscuring the response text
+        in the tmux capture buffer.  Retry extraction to wait for spinners
+        to clear."""
+        return 3
+
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract Gemini's final response from terminal output.
 

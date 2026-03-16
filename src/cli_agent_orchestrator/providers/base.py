@@ -88,6 +88,17 @@ class BaseProvider(ABC):
         """
         pass
 
+    @property
+    def extraction_retries(self) -> int:
+        """Number of extraction retries for transient TUI rendering issues.
+
+        TUI-based providers (e.g. Gemini CLI's Ink renderer) may show
+        notification spinners that temporarily obscure response text in
+        the tmux capture buffer.  Override this to enable automatic retries
+        with re-capture between attempts.  Default is 0 (no retries).
+        """
+        return 0
+
     @abstractmethod
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract the last message from terminal script output.

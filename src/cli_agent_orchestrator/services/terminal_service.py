@@ -18,6 +18,7 @@ Terminal Workflow:
 """
 
 import logging
+import time
 from datetime import datetime
 from enum import Enum
 from typing import Dict, Optional
@@ -294,7 +295,13 @@ def send_special_key(terminal_id: str, key: str) -> bool:
 
 
 def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
-    """Get terminal output."""
+    """Get terminal output.
+
+    For ``LAST`` mode, if the provider declares ``extraction_retries > 0``,
+    retries extraction with 10 s delays between attempts.  This handles
+    TUI-based providers (e.g. Gemini CLI's Ink renderer) whose notification
+    spinners can temporarily obscure response text in the tmux capture buffer.
+    """
     try:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
@@ -312,7 +319,27 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
             provider = provider_manager.get_provider(terminal_id)
             if provider is None:
                 raise ValueError(f"Provider not found for terminal {terminal_id}")
-            return provider.extract_last_message_from_script(full_output)
+
+            retries = provider.extraction_retries
+            last_err: Exception | None = None
+            for attempt in range(1 + retries):
+                try:
+                    if attempt > 0:
+                        time.sleep(10.0)
+                        full_output = tmux_client.get_history(
+                            metadata["tmux_session"], metadata["tmux_window"]
+                        )
+                    return provider.extract_last_message_from_script(full_output)
+                except ValueError as exc:
+                    last_err = exc
+                    logger.debug(
+                        "Output extraction attempt %d/%d for %s failed: %s",
+                        attempt + 1,
+                        1 + retries,
+                        terminal_id,
+                        exc,
+                    )
+            raise last_err  # type: ignore[misc]
 
     except Exception as e:
         logger.error(f"Failed to get output from terminal {terminal_id}: {e}")
