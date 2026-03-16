@@ -9,7 +9,6 @@ import pytest
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider, ProviderError
 
-
 # All initialization tests need to patch _ensure_skip_bypass_prompt_setting
 # to avoid writing to the real ~/.claude/settings.json.
 _PATCH_SETTINGS = patch.object(ClaudeCodeProvider, "_ensure_skip_bypass_prompt_setting")
@@ -91,9 +90,7 @@ class TestClaudeCodeProviderInitialization:
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_initialize_with_invalid_agent_profile(
-        self, mock_tmux, mock_load, mock_wait_shell, _
-    ):
+    def test_initialize_with_invalid_agent_profile(self, mock_tmux, mock_load, mock_wait_shell, _):
         """Test initialization with invalid agent profile."""
         mock_wait_shell.return_value = True
         mock_load.side_effect = FileNotFoundError("Profile not found")
@@ -602,8 +599,7 @@ class TestClaudeCodeProviderStartupPrompts:
     def test_get_status_bypass_prompt_not_waiting_user_answer(self, mock_tmux):
         """Test that bypass prompt is NOT detected as WAITING_USER_ANSWER."""
         mock_tmux.get_history.return_value = (
-            "WARNING: Bypass Permissions mode\n"
-            "❯ 1. No, exit\n  2. Yes, I accept\n"
+            "WARNING: Bypass Permissions mode\n" "❯ 1. No, exit\n  2. Yes, I accept\n"
         )
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
@@ -667,9 +663,7 @@ class TestClaudeCodeProviderSettings:
         settings_file.parent.mkdir(parents=True)
         settings_file.write_text(json.dumps({"permissions": {"allow": []}}))
 
-        with patch(
-            "cli_agent_orchestrator.providers.claude_code.Path"
-        ) as mock_path_cls:
+        with patch("cli_agent_orchestrator.providers.claude_code.Path") as mock_path_cls:
             mock_home = MagicMock()
             mock_path_cls.home.return_value = mock_home
             mock_home.__truediv__ = MagicMock(
@@ -687,9 +681,7 @@ class TestClaudeCodeProviderSettings:
         """Test that settings file is created when it doesn't exist."""
         settings_file = tmp_path / ".claude" / "settings.json"
 
-        with patch(
-            "cli_agent_orchestrator.providers.claude_code.Path"
-        ) as mock_path_cls:
+        with patch("cli_agent_orchestrator.providers.claude_code.Path") as mock_path_cls:
             mock_home = MagicMock()
             mock_path_cls.home.return_value = mock_home
             mock_home.__truediv__ = MagicMock(
