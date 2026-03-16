@@ -21,6 +21,10 @@ dist/
 # OS
 .DS_Store
 
+# Node / Web UI
+node_modules/
+web/dist/
+
 # Project specific
 *.log
 *.db
