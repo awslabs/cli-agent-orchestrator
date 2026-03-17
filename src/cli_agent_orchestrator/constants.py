@@ -94,3 +94,13 @@ API_BASE_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
 
 # CORS allowed origins for web-based clients
 CORS_ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"]
+
+# Allowed Host headers for DNS rebinding protection (CVE mitigation)
+# Only localhost connections permitted - CAO is a local-only service
+# These hosts are validated by TrustedHostMiddleware to prevent DNS rebinding attacks
+ALLOWED_HOSTS = [
+    "localhost",
+    "127.0.0.1",
+    "[::1]",  # IPv6 localhost with brackets (RFC 3986 format)
+    "::1",    # IPv6 localhost without brackets (some clients omit brackets)
+]
