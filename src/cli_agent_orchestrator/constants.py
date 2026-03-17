@@ -94,3 +94,14 @@ API_BASE_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
 
 # CORS allowed origins for web-based clients
 CORS_ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"]
+
+# Allowed Host headers for DNS rebinding protection (CVE mitigation)
+# Only localhost connections permitted - CAO is a local-only service
+# These hosts are validated by TrustedHostMiddleware to prevent DNS rebinding attacks
+# Note: IPv6 (::1) is not included as CAO is accessed via IPv4 localhost in practice
+# Future extension point: To allow additional hosts, add --allowed-hosts CLI flag
+# or CAO_ALLOWED_HOSTS env var (comma-separated) that modifies this list
+ALLOWED_HOSTS = [
+    "localhost",
+    "127.0.0.1",
+]
