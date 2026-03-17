@@ -32,17 +32,15 @@ class TestDNSRebindingProtection:
         response = client.get("/health", headers={"Host": "127.0.0.1:9889"})
         assert response.status_code == 200
 
-    @pytest.mark.skip(reason="IPv6 support is optional - CAO primarily uses IPv4 localhost")
-    def test_ipv6_loopback_with_brackets_allowed(self):
-        """IPv6 loopback '[::1]' with brackets should be allowed."""
+    def test_ipv6_loopback_with_brackets_blocked(self):
+        """IPv6 loopback '[::1]' should be blocked (not in ALLOWED_HOSTS)."""
         response = client.get("/health", headers={"Host": "[::1]"})
-        assert response.status_code == 200
+        assert response.status_code == 400
 
-    @pytest.mark.skip(reason="IPv6 support is optional - CAO primarily uses IPv4 localhost")
-    def test_ipv6_loopback_without_brackets_allowed(self):
-        """IPv6 loopback '::1' without brackets should be allowed."""
+    def test_ipv6_loopback_without_brackets_blocked(self):
+        """IPv6 loopback '::1' should be blocked (not in ALLOWED_HOSTS)."""
         response = client.get("/health", headers={"Host": "::1"})
-        assert response.status_code == 200
+        assert response.status_code == 400
 
     def test_arbitrary_domain_rejected(self):
         """Requests with arbitrary domain Host header should be blocked."""

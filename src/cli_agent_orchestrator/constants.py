@@ -98,9 +98,8 @@ CORS_ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"]
 # Allowed Host headers for DNS rebinding protection (CVE mitigation)
 # Only localhost connections permitted - CAO is a local-only service
 # These hosts are validated by TrustedHostMiddleware to prevent DNS rebinding attacks
+# Note: IPv6 (::1) is not included as CAO is accessed via IPv4 localhost in practice
 ALLOWED_HOSTS = [
     "localhost",
     "127.0.0.1",
-    "[::1]",  # IPv6 localhost with brackets (RFC 3986 format)
-    "::1",  # IPv6 localhost without brackets (some clients omit brackets)
 ]
