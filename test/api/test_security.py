@@ -125,9 +125,7 @@ class TestCriticalEndpointProtection:
 
     def test_delete_session_protected(self):
         """DELETE /sessions/{name} should reject malicious Host headers."""
-        response = client.delete(
-            "/sessions/fake-session", headers={"Host": "attacker.com"}
-        )
+        response = client.delete("/sessions/fake-session", headers={"Host": "attacker.com"})
         assert response.status_code == 400
 
 

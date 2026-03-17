@@ -102,5 +102,5 @@ ALLOWED_HOSTS = [
     "localhost",
     "127.0.0.1",
     "[::1]",  # IPv6 localhost with brackets (RFC 3986 format)
-    "::1",    # IPv6 localhost without brackets (some clients omit brackets)
+    "::1",  # IPv6 localhost without brackets (some clients omit brackets)
 ]
