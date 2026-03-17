@@ -408,7 +408,13 @@ For ready-to-use examples, see [`examples/cross-provider/`](examples/cross-provi
 
 ## Security
 
-See [SECURITY.md](SECURITY.md) for vulnerability reporting, security scanning, and best practices.
+### DNS Rebinding Protection
+
+The CAO server validates HTTP `Host` headers to prevent [DNS rebinding attacks](https://owasp.org/www-community/attacks/DNS_Rebinding). Only `localhost` and `127.0.0.1` are accepted by default — requests with other hostnames are rejected with `400 Bad Request`.
+
+**Note:** If you need to expose the server on a network (not recommended for development use), be aware that the Host header validation will reject requests unless the hostname matches the allowed list.
+
+For more details, see [SECURITY.md](SECURITY.md) for vulnerability reporting, security scanning, and best practices.
 
 ## Contributing
 
