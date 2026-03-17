@@ -12,7 +12,7 @@ NOTE: These tests send messages via the CAO API, not via an agent calling
 the send_message() MCP tool. For real agent-to-agent communication via
 MCP tools, see test_supervisor_orchestration.py.
 
-Requires: running CAO server, authenticated CLI tools (codex, claude, kiro-cli, gemini), tmux.
+Requires: running CAO server, authenticated CLI tools (codex, claude, kiro-cli, gemini, copilot), tmux.
 
 Run:
     uv run pytest -m e2e test/e2e/test_send_message.py -v
@@ -20,6 +20,7 @@ Run:
     uv run pytest -m e2e test/e2e/test_send_message.py -v -k claude_code
     uv run pytest -m e2e test/e2e/test_send_message.py -v -k kiro_cli
     uv run pytest -m e2e test/e2e/test_send_message.py -v -k gemini_cli
+    uv run pytest -m e2e test/e2e/test_send_message.py -v -k copilot
 """
 
 import time
@@ -243,6 +244,20 @@ class TestKiroCliSendMessage:
 
 
 # ---------------------------------------------------------------------------
+# Kimi CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestKimiCliSendMessage:
+    """E2E send_message tests for the Kimi CLI provider."""
+
+    def test_send_message_to_inbox(self, require_kimi):
+        """Send a message to another Kimi CLI terminal's inbox and verify delivery."""
+        _run_send_message_test(provider="kimi_cli", agent_profile="developer")
+
+
+# ---------------------------------------------------------------------------
 # Gemini CLI provider
 # ---------------------------------------------------------------------------
 
@@ -254,3 +269,17 @@ class TestGeminiCliSendMessage:
     def test_send_message_to_inbox(self, require_gemini):
         """Send a message to another Gemini CLI terminal's inbox and verify delivery."""
         _run_send_message_test(provider="gemini_cli", agent_profile="developer")
+
+
+# ---------------------------------------------------------------------------
+# Copilot CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestCopilotCliSendMessage:
+    """E2E send_message tests for the Copilot CLI provider."""
+
+    def test_send_message_to_inbox(self, require_copilot):
+        """Send a message to another Copilot CLI terminal's inbox and verify delivery."""
+        _run_send_message_test(provider="copilot_cli", agent_profile="developer")

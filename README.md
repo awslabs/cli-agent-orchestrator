@@ -98,6 +98,8 @@ Before using CAO, install at least one supported CLI agent tool:
 | **Claude Code** | [Provider docs](docs/claude-code.md) · [Installation](https://docs.anthropic.com/en/docs/claude-code/getting-started) | Anthropic API key |
 | **Codex CLI** | [Provider docs](docs/codex-cli.md) · [Installation](https://github.com/openai/codex) | OpenAI API key |
 | **Gemini CLI** | [Provider docs](docs/gemini-cli.md) · [Installation](https://github.com/google-gemini/gemini-cli) | Google AI API key |
+| **Kimi CLI** | [Provider docs](docs/kimi-cli.md) · [Installation](https://platform.moonshot.cn/docs/kimi-cli) | Moonshot API key |
+| **GitHub Copilot CLI** | [Provider docs](docs/copilot-cli.md) · [Installation](https://github.com/features/copilot/cli) | GitHub auth |
 | **Q CLI** | [Installation](https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/command-line.html) | AWS credentials |
 
 ## Quick Start
@@ -144,6 +146,8 @@ cao launch --agents code_supervisor --provider kiro_cli
 cao launch --agents code_supervisor --provider claude_code
 cao launch --agents code_supervisor --provider codex
 cao launch --agents code_supervisor --provider gemini_cli
+cao launch --agents code_supervisor --provider kimi_cli
+cao launch --agents code_supervisor --provider copilot_cli
 # Skip workspace trust confirmation
 cao launch --agents code_supervisor --yolo
 ```
@@ -377,8 +381,8 @@ CAO supports specifying working directories for agent handoff/delegation operati
 
 All paths are canonicalized via `realpath` and validated against a security policy:
 
-- **Allowed:** the user's home directory (`~/`) and any subdirectory under it, including paths through symlinks (e.g., `/home/user` -> `/local/home/user` on AWS)
-- **Blocked:** system directories (`/`, `/etc`, `/var`, `/tmp`, `/proc`, `/sys`, `/root`, `/boot`, `/bin`, `/sbin`, `/usr/bin`, `/usr/sbin`, `/lib`, `/lib64`, `/dev`) and any path outside the home directory tree
+- **Allowed:** any real directory that is not a blocked system path — including `~/`, external volumes (e.g., `/Volumes/workplace`), and custom paths like `/opt/projects`
+- **Blocked:** system directories (`/`, `/etc`, `/var`, `/tmp`, `/proc`, `/sys`, `/root`, `/boot`, `/bin`, `/sbin`, `/usr/bin`, `/usr/sbin`, `/lib`, `/lib64`, `/dev`)
 
 For configuration and usage details, see [docs/working-directory.md](docs/working-directory.md).
 

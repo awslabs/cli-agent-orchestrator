@@ -10,7 +10,7 @@ Tests the worker side of the handoff flow — validates that each provider can:
 NOTE: These tests do NOT test a supervisor agent calling the handoff() MCP tool.
 For real supervisor→worker delegation tests, see test_supervisor_orchestration.py.
 
-Requires: running CAO server, authenticated CLI tools (codex, claude, kiro-cli, gemini), tmux.
+Requires: running CAO server, authenticated CLI tools (codex, claude, kiro-cli, gemini, copilot), tmux.
 
 Run:
     uv run pytest -m e2e test/e2e/test_handoff.py -v
@@ -18,6 +18,7 @@ Run:
     uv run pytest -m e2e test/e2e/test_handoff.py -v -k claude_code
     uv run pytest -m e2e test/e2e/test_handoff.py -v -k kiro_cli
     uv run pytest -m e2e test/e2e/test_handoff.py -v -k gemini_cli
+    uv run pytest -m e2e test/e2e/test_handoff.py -v -k copilot
 """
 
 import time
@@ -222,6 +223,40 @@ class TestKiroCliHandoff:
 
 
 # ---------------------------------------------------------------------------
+# Kimi CLI provider tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestKimiCliHandoff:
+    """E2E handoff tests for the Kimi CLI provider."""
+
+    def test_handoff_simple_function(self, require_kimi):
+        """Kimi CLI developer creates a simple Python function and returns output."""
+        _run_handoff_test(
+            provider="kimi_cli",
+            agent_profile="developer",
+            task_message=(
+                "Create a Python function called 'greet' that takes a name parameter "
+                "and returns 'Hello, {name}!'. Output only the function code."
+            ),
+            content_keywords=["greet", "hello", "def"],
+        )
+
+    def test_handoff_second_task(self, require_kimi):
+        """Kimi CLI developer handles a second independent task."""
+        _run_handoff_test(
+            provider="kimi_cli",
+            agent_profile="developer",
+            task_message=(
+                "Create a Python function called 'subtract' that takes two parameters "
+                "a and b and returns a minus b. Output only the function code."
+            ),
+            content_keywords=["subtract", "return", "def"],
+        )
+
+
+# ---------------------------------------------------------------------------
 # Gemini CLI provider tests
 # ---------------------------------------------------------------------------
 
@@ -252,4 +287,38 @@ class TestGeminiCliHandoff:
                 "and returns n squared. Output only the function code."
             ),
             content_keywords=["square", "return", "def"],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Copilot CLI provider tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestCopilotCliHandoff:
+    """E2E handoff tests for the Copilot CLI provider."""
+
+    def test_handoff_simple_function(self, require_copilot):
+        """Copilot CLI developer creates a simple Python function and returns output."""
+        _run_handoff_test(
+            provider="copilot_cli",
+            agent_profile="developer",
+            task_message=(
+                "Create a Python function called 'greet' that takes a name parameter "
+                "and returns 'Hello, {name}!'. Output only the function code."
+            ),
+            content_keywords=["greet", "hello", "def"],
+        )
+
+    def test_handoff_second_task(self, require_copilot):
+        """Copilot CLI developer handles a second independent task."""
+        _run_handoff_test(
+            provider="copilot_cli",
+            agent_profile="developer",
+            task_message=(
+                "Create a Python function called 'multiply' that takes two parameters "
+                "a and b and returns their product. Output only the function code."
+            ),
+            content_keywords=["multiply", "product", "return", "def"],
         )

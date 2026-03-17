@@ -4,7 +4,7 @@ This module defines all configuration constants used throughout the CAO applicat
 including directory paths, server settings, and provider configurations.
 
 The CAO application orchestrates multiple CLI-based AI agents (Kiro CLI, Claude Code,
-Codex, Q CLI) through tmux sessions, providing a unified interface
+Codex, Kimi CLI, Q CLI) through tmux sessions, providing a unified interface
 for agent management.
 """
 
@@ -74,6 +74,7 @@ LOCAL_AGENT_STORE_DIR = CAO_HOME_DIR / "agent-store"
 # Provider-specific agent directories
 Q_AGENTS_DIR = Path.home() / ".aws" / "amazonq" / "cli-agents"  # Q CLI agents
 KIRO_AGENTS_DIR = Path.home() / ".kiro" / "agents"  # Kiro CLI agents
+COPILOT_AGENTS_DIR = Path.home() / ".copilot" / "agents"  # Copilot custom agents
 
 # =============================================================================
 # Database Configuration
