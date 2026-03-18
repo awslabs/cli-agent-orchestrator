@@ -3,6 +3,7 @@
 Consumer: terminal.{id}.output
 """
 
+import asyncio
 import logging
 
 from cli_agent_orchestrator.constants import TERMINAL_LOG_DIR
@@ -24,10 +25,14 @@ class LogWriter:
                 event = await queue.get()
                 terminal_id = terminal_id_from_topic(event["topic"])
                 log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
-                with open(log_path, "a") as f:
-                    f.write(event["data"]["data"])
+                await asyncio.to_thread(self._write, log_path, event["data"]["data"])
             except Exception as e:
                 logger.error(f"Failed to write log: {e}")
+
+    @staticmethod
+    def _write(path, data: str) -> None:
+        with open(path, "a") as f:
+            f.write(data)
 
 
 log_writer = LogWriter()

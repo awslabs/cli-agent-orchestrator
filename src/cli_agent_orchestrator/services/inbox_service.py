@@ -33,25 +33,27 @@ class InboxService:
             except Exception as e:
                 logger.error(f"Error in InboxService: {e}")
 
-    def deliver_pending(self, terminal_id: str) -> None:
-        """Deliver oldest pending message to terminal if it's ready."""
-        messages = get_pending_messages(terminal_id, limit=1)
+    def deliver_pending(self, terminal_id: str, num_messages: int = 1) -> None:
+        """Deliver pending messages to terminal. Use num_messages=0 for all."""
+        limit = num_messages if num_messages > 0 else 100
+        messages = get_pending_messages(terminal_id, limit=limit)
         if not messages:
             return
 
-        message = messages[0]
         status = status_monitor.get_status(terminal_id)
-
         if status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
             return
 
+        combined = "\n".join(m.message for m in messages)
         try:
-            terminal_service.send_input(terminal_id, message.message)
-            update_message_status(message.id, MessageStatus.DELIVERED)
-            logger.info(f"Delivered message {message.id} to terminal {terminal_id}")
+            terminal_service.send_input(terminal_id, combined)
+            for message in messages:
+                update_message_status(message.id, MessageStatus.DELIVERED)
+            logger.info(f"Delivered {len(messages)} message(s) to terminal {terminal_id}")
         except Exception as e:
-            logger.error(f"Failed to deliver message {message.id} to {terminal_id}: {e}")
-            update_message_status(message.id, MessageStatus.FAILED)
+            for message in messages:
+                logger.error(f"Failed to deliver message {message.id} to {terminal_id}: {e}")
+                update_message_status(message.id, MessageStatus.FAILED)
 
 
 inbox_service = InboxService()

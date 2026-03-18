@@ -439,10 +439,10 @@ class TestKiroCliProviderRegexPatterns:
 
     def test_ansi_code_cleaning(self):
         """Test ANSI code pattern cleaning."""
-        from cli_agent_orchestrator.providers.kiro_cli import ANSI_CODE_PATTERN
+        from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
         text = "\x1b[36mColored text\x1b[39m normal text"
-        cleaned = re.sub(ANSI_CODE_PATTERN, "", text)
+        cleaned = strip_terminal_escapes(text)
 
         assert cleaned == "Colored text normal text"
         assert "\x1b[" not in cleaned

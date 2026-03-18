@@ -26,6 +26,7 @@ from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
+from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
 
@@ -33,22 +34,9 @@ logger = logging.getLogger(__name__)
 # Regex Patterns for Kiro CLI Output Analysis
 # =============================================================================
 
-# Green arrow pattern indicates the start of an agent response (ANSI-stripped)
+# Green arrow pattern indicates the start of an agent response (escape-stripped)
 # Example: "> Here is the code you requested..."
 GREEN_ARROW_PATTERN = r"^>\s*"
-
-# ANSI escape code pattern for stripping terminal colors
-# Matches sequences like \x1b[32m (green), \x1b[0m (reset), etc.
-ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
-
-# Additional escape sequences that may appear in terminal output
-ESCAPE_SEQUENCE_PATTERN = r"\[[?0-9;]*[a-zA-Z]"
-
-# Control characters to strip from final output
-CONTROL_CHAR_PATTERN = r"[\x00-\x1f\x7f-\x9f]"
-
-# Bell character (audible alert)
-BELL_CHAR = "\x07"
 
 # =============================================================================
 # Error Detection
@@ -148,7 +136,7 @@ class KiroCliProvider(BaseProvider):
 
         # Strip ANSI codes once for all pattern matching
         # This simplifies regex patterns and improves reliability
-        clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
+        clean_output = strip_terminal_escapes(output)
 
         # Check 1: Look for the agent's IDLE prompt pattern
         # If not found, the agent is still processing a response
@@ -197,7 +185,7 @@ class KiroCliProvider(BaseProvider):
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract agent's final response message using green arrow indicator."""
         # Strip ANSI codes for pattern matching
-        clean_output = re.sub(ANSI_CODE_PATTERN, "", script_output)
+        clean_output = strip_terminal_escapes(script_output)
 
         # Find patterns in clean output
         green_arrows = list(re.finditer(GREEN_ARROW_PATTERN, clean_output, re.MULTILINE))
@@ -233,10 +221,6 @@ class KiroCliProvider(BaseProvider):
         if not final_answer:
             raise ValueError("Empty Kiro CLI response - no content found")
 
-        # Clean up the message
-        final_answer = re.sub(ANSI_CODE_PATTERN, "", final_answer)
-        final_answer = re.sub(ESCAPE_SEQUENCE_PATTERN, "", final_answer)
-        final_answer = re.sub(CONTROL_CHAR_PATTERN, "", final_answer)
         return final_answer.strip()
 
     def exit_cli(self) -> str:

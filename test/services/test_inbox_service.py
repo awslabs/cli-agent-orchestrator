@@ -102,6 +102,42 @@ class TestDeliverPending:
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_delivers_multiple_messages_concatenated(
+        self, mock_get, mock_monitor, mock_term_svc, mock_update
+    ):
+        msgs = [_make_message(id=1, message="hello"), _make_message(id=2, message="world")]
+        mock_get.return_value = msgs
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+
+        svc = InboxService()
+        svc.deliver_pending("term-1", num_messages=2)
+
+        mock_get.assert_called_once_with("term-1", limit=2)
+        mock_term_svc.send_input.assert_called_once_with("term-1", "hello\nworld")
+        assert mock_update.call_count == 2
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_delivers_all_when_num_messages_zero(
+        self, mock_get, mock_monitor, mock_term_svc, mock_update
+    ):
+        msgs = [_make_message(id=i, message=f"msg{i}") for i in range(3)]
+        mock_get.return_value = msgs
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+
+        svc = InboxService()
+        svc.deliver_pending("term-1", num_messages=0)
+
+        mock_get.assert_called_once_with("term-1", limit=100)
+        mock_term_svc.send_input.assert_called_once_with("term-1", "msg0\nmsg1\nmsg2")
+        assert mock_update.call_count == 3
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_marks_failed_on_send_error(self, mock_get, mock_monitor, mock_term_svc, mock_update):
         mock_get.return_value = [_make_message()]
         mock_monitor.get_status.return_value = TerminalStatus.IDLE
