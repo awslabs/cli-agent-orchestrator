@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from typing import Annotated, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Path, Query, status
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field, field_validator
 
 from cli_agent_orchestrator.clients.database import (
@@ -14,6 +15,8 @@ from cli_agent_orchestrator.clients.database import (
     init_db,
 )
 from cli_agent_orchestrator.constants import (
+    ALLOWED_HOSTS,
+    INBOX_POLLING_INTERVAL,
     SERVER_HOST,
     SERVER_PORT,
     SERVER_VERSION,
@@ -124,6 +127,14 @@ app = FastAPI(
     description="Simplified CLI Agent Orchestrator API",
     version=SERVER_VERSION,
     lifespan=lifespan,
+)
+
+# Security: DNS Rebinding Protection
+# Validate Host header to prevent DNS rebinding attacks (CVE mitigation)
+# Only allow requests with localhost Host headers
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=ALLOWED_HOSTS,
 )
 
 

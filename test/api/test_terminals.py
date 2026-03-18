@@ -9,12 +9,6 @@ from cli_agent_orchestrator.api.main import app
 from cli_agent_orchestrator.models.terminal import Terminal
 
 
-@pytest.fixture
-def client():
-    """Create a test client."""
-    return TestClient(app)
-
-
 class TestWorkingDirectoryEndpoint:
     """Test GET /terminals/{terminal_id}/working-directory endpoint."""
 
