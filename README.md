@@ -148,7 +148,7 @@ cao launch --agents code_supervisor --provider codex
 cao launch --agents code_supervisor --provider gemini_cli
 cao launch --agents code_supervisor --provider kimi_cli
 cao launch --agents code_supervisor --provider copilot_cli
-# Skip workspace trust confirmation
+# Unrestricted access + skip confirmation (DANGEROUS)
 cao launch --agents code_supervisor --yolo
 ```
 
@@ -398,13 +398,65 @@ provider: claude_code
 ---
 ```
 
-Valid values: `kiro_cli`, `claude_code`, `codex`, `q_cli`, `gemini_cli`.
+Valid values: `kiro_cli`, `claude_code`, `codex`, `q_cli`, `gemini_cli`, `kimi_cli`, `copilot_cli`.
 
 When a supervisor calls `assign` or `handoff`, CAO reads the worker's agent profile and uses the declared provider if present. If the key is missing or invalid, the worker falls back to the supervisor's provider.
 
 The `cao launch --provider` flag always takes precedence — it is treated as an explicit override and the profile's `provider` key is not consulted for the initial session.
 
 For ready-to-use examples, see [`examples/cross-provider/`](examples/cross-provider/).
+
+## Tool Restrictions (allowedTools)
+
+CAO enforces tool restrictions through `allowedTools` — a unified vocabulary that gets translated to each provider's native restriction mechanism. This ensures agents only have access to the tools their role requires.
+
+### Role-Based Defaults
+
+When a profile doesn't explicitly set `allowedTools`, defaults are based on `role`:
+
+| Role | Default Tools | Use Case |
+|------|--------------|----------|
+| `supervisor` | `@cao-mcp-server` | Orchestration only — no code execution |
+| `developer` | `@builtin, fs_*, execute_bash, @cao-mcp-server` | Full access for coding/testing |
+| `reviewer` | `@builtin, fs_read, fs_list, @cao-mcp-server` | Read-only code review |
+
+### Usage
+
+```bash
+# Use profile/role defaults (supervisor gets restricted tools automatically)
+cao launch --agents code_supervisor
+
+# Override with specific tools
+cao launch --agents developer --allowed-tools @cao-mcp-server --allowed-tools fs_read
+
+# Unrestricted access — skips all restrictions AND confirmation prompts
+cao launch --agents developer --yolo
+```
+
+Add `role` and optionally `allowedTools` to your profile frontmatter:
+
+```yaml
+---
+name: my_agent
+description: My custom agent
+role: reviewer
+allowedTools: ["@builtin", "fs_read", "fs_list", "@cao-mcp-server"]
+---
+```
+
+### Provider Enforcement
+
+| Provider | Enforcement | Mechanism |
+|----------|------------|-----------|
+| Kiro CLI | Hard | `allowedTools` in agent JSON (at install time) |
+| Claude Code | Hard | `--disallowedTools` flags block specific tools |
+| Copilot CLI | Hard | `--deny-tool` flags override `--allow-all` |
+| Gemini CLI | Hard | Policy Engine TOML deny rules in `~/.gemini/policies/` |
+| Q CLI | Hard | `allowedTools` in agent JSON (at install time) |
+| Kimi CLI | Soft | Security system prompt (no native mechanism) |
+| Codex | Soft | Security system prompt (no native mechanism) |
+
+For the full tool vocabulary, resolution order, provider enforcement details, and cross-provider inheritance, see [docs/tool-restrictions.md](docs/tool-restrictions.md). For vulnerability reporting and security scanning, see [SECURITY.md](SECURITY.md).
 
 ## Security
 
