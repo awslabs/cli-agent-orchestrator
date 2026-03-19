@@ -140,15 +140,20 @@ async def create_session(
     agent_profile: str,
     session_name: Optional[str] = None,
     working_directory: Optional[str] = None,
+    allowed_tools: Optional[str] = None,
 ) -> Terminal:
     """Create a new session with exactly one terminal."""
     try:
+        # Parse comma-separated allowed_tools string into list
+        allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
+
         result = terminal_service.create_terminal(
             provider=provider,
             agent_profile=agent_profile,
             session_name=session_name,
             new_session=True,
             working_directory=working_directory,
+            allowed_tools=allowed_tools_list,
         )
         return result
 
@@ -209,10 +214,14 @@ async def create_terminal_in_session(
     provider: str,
     agent_profile: str,
     working_directory: Optional[str] = None,
+    allowed_tools: Optional[str] = None,
 ) -> Terminal:
     """Create additional terminal in existing session."""
     try:
         resolved_provider = resolve_provider(agent_profile, fallback_provider=provider)
+
+        # Parse comma-separated allowed_tools string into list
+        allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
         result = terminal_service.create_terminal(
             provider=resolved_provider,
@@ -220,6 +229,7 @@ async def create_terminal_in_session(
             session_name=session_name,
             new_session=False,
             working_directory=working_directory,
+            allowed_tools=allowed_tools_list,
         )
         return result
     except ValueError as e:

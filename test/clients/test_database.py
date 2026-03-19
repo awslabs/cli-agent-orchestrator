@@ -74,6 +74,7 @@ class TestTerminalOperations:
         mock_terminal.tmux_window = "window-0"
         mock_terminal.provider = "kiro_cli"
         mock_terminal.agent_profile = "developer"
+        mock_terminal.allowed_tools = None
         mock_terminal.last_active = datetime.now()
 
         mock_query = MagicMock()

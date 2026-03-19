@@ -26,8 +26,18 @@ PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
 @click.option(
     "--provider", default=DEFAULT_PROVIDER, help=f"Provider to use (default: {DEFAULT_PROVIDER})"
 )
-@click.option("--yolo", is_flag=True, help="Skip workspace trust confirmation")
-def launch(agents, session_name, headless, provider, yolo):
+@click.option(
+    "--allowed-tools",
+    multiple=True,
+    help="Override allowedTools (CAO format: execute_bash, fs_read, @cao-mcp-server). Repeatable.",
+)
+@click.option(
+    "--yolo",
+    is_flag=True,
+    help="[DANGEROUS] Unrestricted tool access AND skip confirmation prompts. "
+    "Agent can execute ANY command including aws, rm, curl.",
+)
+def launch(agents, session_name, headless, provider, allowed_tools, yolo):
     """Launch cao session with specified agent profile."""
     try:
         # Validate provider
@@ -37,18 +47,49 @@ def launch(agents, session_name, headless, provider, yolo):
             )
         working_directory = os.path.realpath(os.getcwd())
 
-        # Ask for workspace trust confirmation for providers that need it.
-        # Note: CAO itself does not access the workspace — it is the underlying
-        # provider (e.g. claude_code, codex, copilot_cli) that reads, writes, and executes
-        # commands in the workspace directory.
+        # Resolve allowedTools: --yolo > --allowed-tools CLI > profile/role defaults
+        from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+        from cli_agent_orchestrator.utils.tool_mapping import (
+            format_tool_summary,
+            get_disallowed_tools,
+            resolve_allowed_tools,
+        )
+
+        resolved_allowed_tools = None
+        if yolo:
+            resolved_allowed_tools = ["*"]
+        elif allowed_tools:
+            resolved_allowed_tools = list(allowed_tools)
+        else:
+            # Load profile to get role-based defaults
+            try:
+                profile = load_agent_profile(agents)
+                mcp_server_names = (
+                    list(profile.mcpServers.keys()) if profile.mcpServers else None
+                )
+                resolved_allowed_tools = resolve_allowed_tools(
+                    profile.allowedTools, profile.role, mcp_server_names
+                )
+            except (FileNotFoundError, RuntimeError):
+                # Profile not found — use developer defaults (backward compatible)
+                resolved_allowed_tools = resolve_allowed_tools(None, None, None)
+
+        # Confirmation prompt (--yolo skips all confirmation)
         if provider in PROVIDERS_REQUIRING_WORKSPACE_ACCESS and not yolo:
+            # Informative tool summary prompt
+            tool_summary = format_tool_summary(resolved_allowed_tools)
+            blocked = get_disallowed_tools(provider, resolved_allowed_tools)
+            blocked_summary = ", ".join(blocked) if blocked else "(none)"
+
             click.echo(
-                f"The underlying provider ({provider}) will be trusted to perform all actions "
-                f"(read, write, and execute) in:\n"
-                f"  {working_directory}\n\n"
-                f"To skip this confirmation, use: cao launch --yolo\n"
+                f"\nAgent '{agents}' launching on {provider}:\n"
+                f"  Allowed:  {tool_summary}\n"
+                f"  Blocked:  {blocked_summary}\n"
+                f"  Directory: {working_directory}\n"
             )
-            if not click.confirm("Do you trust all the actions in this folder?", default=True):
+            if not click.confirm(
+                "Do you trust all the actions in this folder?", default=True
+            ):
                 raise click.ClickException("Launch cancelled by user")
 
         # Call API to create session
@@ -60,6 +101,9 @@ def launch(agents, session_name, headless, provider, yolo):
         }
         if session_name:
             params["session_name"] = session_name
+        if resolved_allowed_tools:
+            # Pass as comma-separated string for query param
+            params["allowed_tools"] = ",".join(resolved_allowed_tools)
 
         response = requests.post(url, params=params)
         response.raise_for_status()
@@ -75,5 +119,7 @@ def launch(agents, session_name, headless, provider, yolo):
 
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"Failed to connect to cao-server: {str(e)}")
+    except click.ClickException:
+        raise
     except Exception as e:
         raise click.ClickException(str(e))

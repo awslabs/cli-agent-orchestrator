@@ -119,8 +119,9 @@ class CodexProvider(BaseProvider):
         session_name: str,
         window_name: str,
         agent_profile: Optional[str] = None,
+        allowed_tools: Optional[list] = None,
     ):
-        super().__init__(terminal_id, session_name, window_name)
+        super().__init__(terminal_id, session_name, window_name, allowed_tools)
         self._initialized = False
         self._agent_profile = agent_profile
 
@@ -137,6 +138,19 @@ class CodexProvider(BaseProvider):
                 profile = load_agent_profile(self._agent_profile)
 
                 system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
+
+                # Prepend security constraints for soft enforcement (Codex has no
+                # native tool restriction mechanism). Only applied when tool
+                # restrictions are active (not unrestricted "*").
+                if self._allowed_tools and "*" not in self._allowed_tools:
+                    from cli_agent_orchestrator.constants import SECURITY_PROMPT
+
+                    tools_list = ", ".join(self._allowed_tools)
+                    tool_constraint = (
+                        f"\nYou only have access to these tools: {tools_list}\n"
+                    )
+                    system_prompt = SECURITY_PROMPT + tool_constraint + system_prompt
+
                 if system_prompt:
                     # Codex accepts developer_instructions via -c config override.
                     # This is injected as a developer role message before AGENTS.md content.

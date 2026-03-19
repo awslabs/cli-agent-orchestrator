@@ -38,20 +38,29 @@ class BaseProvider(ABC):
         session_name: Name of the tmux session containing the terminal
         window_name: Name of the tmux window containing the terminal
         _status: Internal status cache (use get_status() for current status)
+        _allowed_tools: CAO-vocabulary tool names this agent is allowed to use
     """
 
-    def __init__(self, terminal_id: str, session_name: str, window_name: str):
+    def __init__(
+        self,
+        terminal_id: str,
+        session_name: str,
+        window_name: str,
+        allowed_tools: Optional[List[str]] = None,
+    ):
         """Initialize provider with terminal context.
 
         Args:
             terminal_id: Unique identifier for this terminal instance
             session_name: Name of the tmux session
             window_name: Name of the tmux window
+            allowed_tools: Optional list of CAO tool names the agent is allowed to use
         """
         self.terminal_id = terminal_id
         self.session_name = session_name
         self.window_name = window_name
         self._status = TerminalStatus.IDLE
+        self._allowed_tools: Optional[List[str]] = allowed_tools
 
     @property
     def status(self) -> TerminalStatus:

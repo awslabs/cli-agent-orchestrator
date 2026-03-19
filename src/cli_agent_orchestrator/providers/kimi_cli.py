@@ -140,8 +140,9 @@ class KimiCliProvider(BaseProvider):
         session_name: str,
         window_name: str,
         agent_profile: Optional[str] = None,
+        allowed_tools: Optional[list] = None,
     ):
-        super().__init__(terminal_id, session_name, window_name)
+        super().__init__(terminal_id, session_name, window_name, allowed_tools)
         self._initialized = False
         self._agent_profile = agent_profile
         # Track temp directory for cleanup (created when agent profile needs temp files)
@@ -195,6 +196,19 @@ class KimiCliProvider(BaseProvider):
                 # Kimi uses YAML agent files with a system_prompt_path pointing
                 # to a markdown file. We create both in the temp directory.
                 system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
+
+                # Prepend security constraints for soft enforcement (Kimi CLI has no
+                # native tool restriction mechanism). Only applied when tool
+                # restrictions are active (not unrestricted "*").
+                if self._allowed_tools and "*" not in self._allowed_tools:
+                    from cli_agent_orchestrator.constants import SECURITY_PROMPT
+
+                    tools_list = ", ".join(self._allowed_tools)
+                    tool_constraint = (
+                        f"\nYou only have access to these tools: {tools_list}\n"
+                    )
+                    system_prompt = SECURITY_PROMPT + tool_constraint + system_prompt
+
                 if system_prompt:
                     # Write the system prompt as a markdown file
                     prompt_file = os.path.join(self._temp_dir, "system.md")
@@ -410,6 +424,19 @@ class KimiCliProvider(BaseProvider):
 
         if has_idle_prompt:
             if self._has_received_input:
+                # Guard against premature COMPLETED: if processing indicators are
+                # visible in the bottom lines, Kimi is still working even though
+                # the idle prompt is present. This happens when get_status() is
+                # polled in the brief window between task submission and Kimi
+                # clearing the prompt to start streaming.
+                for line in bottom_lines:
+                    stripped = line.strip()
+                    # Braille spinner with tool name: "⠼ Using Shell (...)"
+                    if re.search(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+Using\s", stripped):
+                        return TerminalStatus.PROCESSING
+                    # Moon phase emoji alone on a line = thinking indicator
+                    if stripped in {"🌑", "🌒", "🌓", "🌔", "🌕", "🌖", "🌗", "🌘"}:
+                        return TerminalStatus.PROCESSING
                 return TerminalStatus.COMPLETED
 
             return TerminalStatus.IDLE

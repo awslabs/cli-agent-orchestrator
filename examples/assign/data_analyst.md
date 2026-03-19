@@ -1,6 +1,8 @@
 ---
 name: data_analyst
 description: Data analyst agent that performs statistical analysis and sends results back
+role: developer
+allowedTools: ["@builtin", "fs_*", "execute_bash", "@cao-mcp-server"]
 mcpServers:
   cao-mcp-server:
     type: stdio

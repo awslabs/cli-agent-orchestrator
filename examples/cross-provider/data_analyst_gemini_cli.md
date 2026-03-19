@@ -2,6 +2,8 @@
 name: data_analyst_gemini_cli
 description: Data analyst agent that runs on Gemini CLI (cross-provider override)
 provider: gemini_cli
+role: developer
+allowedTools: ["@builtin", "fs_*", "execute_bash", "@cao-mcp-server"]
 mcpServers:
   cao-mcp-server:
     type: stdio
