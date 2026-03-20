@@ -64,9 +64,7 @@ def launch(agents, session_name, headless, provider, allowed_tools, yolo):
             # Load profile to get role-based defaults
             try:
                 profile = load_agent_profile(agents)
-                mcp_server_names = (
-                    list(profile.mcpServers.keys()) if profile.mcpServers else None
-                )
+                mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
                 resolved_allowed_tools = resolve_allowed_tools(
                     profile.allowedTools, profile.role, mcp_server_names
                 )
@@ -87,9 +85,7 @@ def launch(agents, session_name, headless, provider, allowed_tools, yolo):
                 f"  Blocked:  {blocked_summary}\n"
                 f"  Directory: {working_directory}\n"
             )
-            if not click.confirm(
-                "Do you trust all the actions in this folder?", default=True
-            ):
+            if not click.confirm("Do you trust all the actions in this folder?", default=True):
                 raise click.ClickException("Launch cancelled by user")
 
         # Call API to create session

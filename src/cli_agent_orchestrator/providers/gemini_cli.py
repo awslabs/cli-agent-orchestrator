@@ -305,14 +305,16 @@ class GeminiCliProvider(BaseProvider):
             "",
         ]
         for tool_name in excluded:
-            lines.extend([
-                "[[rule]]",
-                f'toolName = "{tool_name}"',
-                'decision = "deny"',
-                "priority = 900",
-                f'deny_message = "Blocked by CAO policy (terminal {self.terminal_id})"',
-                "",
-            ])
+            lines.extend(
+                [
+                    "[[rule]]",
+                    f'toolName = "{tool_name}"',
+                    'decision = "deny"',
+                    "priority = 900",
+                    f'deny_message = "Blocked by CAO policy (terminal {self.terminal_id})"',
+                    "",
+                ]
+            )
 
         policy_path.write_text("\n".join(lines))
         self._policy_path = str(policy_path)

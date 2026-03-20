@@ -61,8 +61,7 @@ COMPLETION_TIMEOUT = 180
 _RANDOM_TOKEN = uuid.uuid4().hex
 BASH_MARKER_FILE = f"/tmp/cao_e2e_bash_test_{_RANDOM_TOKEN}.txt"
 BASH_TASK = (
-    f"Run this exact shell command: echo SUCCESS > {BASH_MARKER_FILE} "
-    f"&& cat {BASH_MARKER_FILE}"
+    f"Run this exact shell command: echo SUCCESS > {BASH_MARKER_FILE} " f"&& cat {BASH_MARKER_FILE}"
 )
 
 # Keywords indicating the agent was blocked from using bash
@@ -188,9 +187,10 @@ def _run_restricted_tool_test(provider: str, agent_profile: str, allowed_tools: 
         assert terminal_id, "Terminal ID should not be empty"
 
         s = _wait_for_ready(terminal_id)
-        assert s in ("idle", "completed"), (
-            f"Terminal did not become ready within 90s (provider={provider})"
-        )
+        assert s in (
+            "idle",
+            "completed",
+        ), f"Terminal did not become ready within 90s (provider={provider})"
         time.sleep(2)
 
         # Clean up any leftover marker file from previous test runs
@@ -207,9 +207,7 @@ def _run_restricted_tool_test(provider: str, agent_profile: str, allowed_tools: 
         )
         assert resp.status_code == 200, f"Send message failed: {resp.status_code}"
 
-        completed = wait_for_status(
-            terminal_id, "completed", timeout=COMPLETION_TIMEOUT
-        )
+        completed = wait_for_status(terminal_id, "completed", timeout=COMPLETION_TIMEOUT)
 
         if not completed:
             # Agent timed out — it couldn't execute bash, which is the desired outcome.
@@ -249,9 +247,10 @@ def _run_unrestricted_tool_test(provider: str, agent_profile: str):
         assert terminal_id, "Terminal ID should not be empty"
 
         s = _wait_for_ready(terminal_id)
-        assert s in ("idle", "completed"), (
-            f"Terminal did not become ready within 90s (provider={provider})"
-        )
+        assert s in (
+            "idle",
+            "completed",
+        ), f"Terminal did not become ready within 90s (provider={provider})"
         time.sleep(2)
 
         # Clean up any leftover marker file
@@ -290,9 +289,10 @@ def _run_allowed_tools_stored_test(provider: str, agent_profile: str, allowed_to
         assert terminal_id, "Terminal ID should not be empty"
 
         s = _wait_for_ready(terminal_id)
-        assert s in ("idle", "completed"), (
-            f"Terminal did not become ready within 90s (provider={provider})"
-        )
+        assert s in (
+            "idle",
+            "completed",
+        ), f"Terminal did not become ready within 90s (provider={provider})"
 
         # Query the terminal metadata via API
         resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}")
@@ -302,8 +302,7 @@ def _run_allowed_tools_stored_test(provider: str, agent_profile: str, allowed_to
         # Verify allowed_tools is stored and returned
         stored_tools = terminal_data.get("allowed_tools")
         assert stored_tools is not None, (
-            f"allowed_tools should be stored in terminal metadata. "
-            f"Got: {terminal_data}"
+            f"allowed_tools should be stored in terminal metadata. " f"Got: {terminal_data}"
         )
 
         # Verify the stored tools match what we sent
@@ -429,9 +428,7 @@ class TestClaudeCodeAllowedTools:
             # Agent should not have written the file
             assert "WRITE_TEST_MARKER" not in output or any(
                 kw in output_lower for kw in REFUSAL_KEYWORDS
-            ), (
-                f"Reviewer should not be able to write files. Output: {output[:500]}"
-            )
+            ), f"Reviewer should not be able to write files. Output: {output[:500]}"
 
         finally:
             if terminal_id and actual_session:

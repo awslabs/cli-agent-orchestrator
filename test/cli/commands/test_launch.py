@@ -251,9 +251,12 @@ def test_launch_allowed_tools_override():
         result = runner.invoke(
             launch,
             [
-                "--agents", "test-agent",
-                "--allowed-tools", "@cao-mcp-server",
-                "--allowed-tools", "fs_read",
+                "--agents",
+                "test-agent",
+                "--allowed-tools",
+                "@cao-mcp-server",
+                "--allowed-tools",
+                "fs_read",
                 "--headless",
             ],
             input="y\n",

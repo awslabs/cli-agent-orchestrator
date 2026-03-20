@@ -30,7 +30,14 @@ TOOL_MAPPING: Dict[str, Dict[str, List[str]]] = {
         "fs_read": ["read_file", "list_directory", "search_file_content", "glob"],
         "fs_write": ["write_file", "replace"],
         "fs_list": ["list_directory", "glob", "search_file_content"],
-        "fs_*": ["read_file", "write_file", "replace", "list_directory", "search_file_content", "glob"],
+        "fs_*": [
+            "read_file",
+            "write_file",
+            "replace",
+            "list_directory",
+            "search_file_content",
+            "glob",
+        ],
     },
 }
 

@@ -113,9 +113,7 @@ def install(agent_source: str, provider: str):
         from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
 
         mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
-        allowed_tools = resolve_allowed_tools(
-            profile.allowedTools, profile.role, mcp_server_names
-        )
+        allowed_tools = resolve_allowed_tools(profile.allowedTools, profile.role, mcp_server_names)
 
         # Create agent config based on provider
         agent_file = None

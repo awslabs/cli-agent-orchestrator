@@ -146,9 +146,7 @@ class CodexProvider(BaseProvider):
                     from cli_agent_orchestrator.constants import SECURITY_PROMPT
 
                     tools_list = ", ".join(self._allowed_tools)
-                    tool_constraint = (
-                        f"\nYou only have access to these tools: {tools_list}\n"
-                    )
+                    tool_constraint = f"\nYou only have access to these tools: {tools_list}\n"
                     system_prompt = SECURITY_PROMPT + tool_constraint + system_prompt
 
                 if system_prompt:

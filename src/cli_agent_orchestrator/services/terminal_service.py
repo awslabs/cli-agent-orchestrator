@@ -127,9 +127,7 @@ def create_terminal(
                 from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
 
                 profile = load_agent_profile(agent_profile)
-                mcp_server_names = (
-                    list(profile.mcpServers.keys()) if profile.mcpServers else None
-                )
+                mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
                 allowed_tools = resolve_allowed_tools(
                     profile.allowedTools, profile.role, mcp_server_names
                 )

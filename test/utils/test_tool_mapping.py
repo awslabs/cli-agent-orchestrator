@@ -47,9 +47,7 @@ class TestResolveAllowedTools:
 
     def test_mcp_servers_not_duplicated(self):
         """Already present MCP server refs not duplicated."""
-        result = resolve_allowed_tools(
-            ["@cao-mcp-server"], "supervisor", ["cao-mcp-server"]
-        )
+        result = resolve_allowed_tools(["@cao-mcp-server"], "supervisor", ["cao-mcp-server"])
         assert result.count("@cao-mcp-server") == 1
 
     def test_wildcard_preserved(self):
@@ -105,9 +103,7 @@ class TestGetDisallowedTools:
 
     def test_gemini_cli_reviewer(self):
         """Gemini reviewer blocks write tools."""
-        result = get_disallowed_tools(
-            "gemini_cli", ["@builtin", "fs_read", "fs_list"]
-        )
+        result = get_disallowed_tools("gemini_cli", ["@builtin", "fs_read", "fs_list"])
         assert "run_shell_command" in result
         assert "write_file" in result
         assert "replace" in result
