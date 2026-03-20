@@ -38,6 +38,7 @@ Run:
 
 import time
 import uuid
+from pathlib import Path
 from test.e2e.conftest import (
     cleanup_terminal,
     create_terminal,
@@ -45,8 +46,6 @@ from test.e2e.conftest import (
     get_terminal_status,
     wait_for_status,
 )
-
-from pathlib import Path
 
 import pytest
 import requests
