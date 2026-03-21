@@ -131,7 +131,12 @@ class CodexProvider(BaseProvider):
         Returns properly escaped shell command string that can be safely sent via tmux.
         Uses codex's -c developer_instructions flag to inject agent system prompts.
         """
-        command_parts = ["codex", "--no-alt-screen", "--disable", "shell_snapshot"]
+        # --yolo (alias for --dangerously-bypass-approvals-and-sandbox):
+        # bypass approval prompts and sandboxing. CAO agents run in
+        # non-interactive tmux sessions where interactive approval prompts
+        # block handoff/assign flows. This mirrors Claude Code's
+        # --dangerously-skip-permissions and Gemini CLI's --yolo flags.
+        command_parts = ["codex", "--yolo", "--no-alt-screen", "--disable", "shell_snapshot"]
 
         if self._agent_profile is not None:
             try:
