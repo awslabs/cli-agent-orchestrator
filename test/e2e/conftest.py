@@ -9,6 +9,7 @@ Run with: uv run pytest -m e2e test/e2e/ -v
 """
 
 import shutil
+import subprocess
 import time
 
 import pytest
@@ -26,6 +27,32 @@ def require_cao_server():
             pytest.skip("CAO server not healthy")
     except requests.ConnectionError:
         pytest.skip("CAO server not running — start with: uv run cao-server")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def warmup_mcp_server_cache():
+    """Pre-warm the uvx cache for cao-mcp-server.
+
+    Agent profiles launch cao-mcp-server via ``uvx --from git+...``. On a cold
+    cache uvx must download and install ~80 packages, which takes ~20s and
+    exceeds Codex's default 10s MCP startup timeout. Running uvx once here
+    populates the cache so that all subsequent provider launches resolve
+    instantly (<3s).
+    """
+    try:
+        subprocess.run(
+            [
+                "uvx",
+                "--from",
+                "git+https://github.com/awslabs/cli-agent-orchestrator.git@main",
+                "cao-mcp-server",
+                "--help",
+            ],
+            capture_output=True,
+            timeout=120,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass  # Best-effort; tests may still work if cao-mcp-server is installed locally
 
 
 @pytest.fixture(scope="session", autouse=True)
