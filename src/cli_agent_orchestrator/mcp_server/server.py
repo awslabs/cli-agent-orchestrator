@@ -129,6 +129,40 @@ def _send_direct_input(terminal_id: str, message: str) -> None:
     response.raise_for_status()
 
 
+def _send_direct_input_handoff(terminal_id: str, provider: str, message: str) -> None:
+    """Send handoff payload to an agent, prepending orchestrator instructions if needed."""
+    # For Codex provider: prepend handoff context so the worker agent knows
+    # this is a blocking handoff and should simply output results rather than
+    # attempting to call send_message back to the supervisor.
+    if provider == "codex":
+        supervisor_id = os.environ.get("CAO_TERMINAL_ID", "unknown")
+        handoff_message = (
+            f"[CAO Handoff] Supervisor terminal ID: {supervisor_id}. "
+            "This is a blocking handoff — the orchestrator will automatically "
+            "capture your response when you finish. Complete the task and output "
+            "your results directly. Do NOT use send_message to notify the supervisor "
+            "unless explicitly needed — just do the work and present your deliverables.\n\n"
+            f"{message}"
+        )
+    else:
+        handoff_message = message
+
+    _send_direct_input(terminal_id, handoff_message)
+
+
+def _send_direct_input_assign(terminal_id: str, message: str) -> None:
+    """Send assign payload to a worker agent, appending callback instructions."""
+    # Auto-inject sender terminal ID suffix when enabled
+    if ENABLE_SENDER_ID_INJECTION:
+        sender_id = os.environ.get("CAO_TERMINAL_ID", "unknown")
+        message += (
+            f"\n\n[Assigned by terminal {sender_id}. "
+            f"When done, send results back to terminal {sender_id} using send_message]"
+        )
+
+    _send_direct_input(terminal_id, message)
+
+
 def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
     """Send message to another terminal's inbox (queued delivery when IDLE).
 
@@ -193,28 +227,8 @@ async def _handoff_impl(
 
         await asyncio.sleep(2)  # wait another 2s
 
-        # For Codex provider: prepend handoff context so the worker agent knows
-        # this is a blocking handoff and should simply output results rather than
-        # attempting to call send_message back to the supervisor.
-        # Includes the supervisor's terminal ID (from CAO_TERMINAL_ID env var in
-        # the MCP server process) so the worker can call back if needed.
-        # Other providers (Claude Code, Kiro CLI) naturally complete and return
-        # to idle without this hint, so the message is left unchanged for them.
-        if provider == "codex":
-            supervisor_id = os.environ.get("CAO_TERMINAL_ID", "unknown")
-            handoff_message = (
-                f"[CAO Handoff] Supervisor terminal ID: {supervisor_id}. "
-                "This is a blocking handoff — the orchestrator will automatically "
-                "capture your response when you finish. Complete the task and output "
-                "your results directly. Do NOT use send_message to notify the supervisor "
-                "unless explicitly needed — just do the work and present your deliverables.\n\n"
-                f"{message}"
-            )
-        else:
-            handoff_message = message
-
-        # Send message to terminal
-        _send_direct_input(terminal_id, handoff_message)
+        # Send message to terminal (injects handoff instructions for codex if needed)
+        _send_direct_input_handoff(terminal_id, provider, message)
 
         # Monitor until completion with timeout
         if not wait_until_terminal_status(
@@ -368,16 +382,8 @@ def _assign_impl(
         # Create terminal
         terminal_id, _ = _create_terminal(agent_profile, working_directory)
 
-        # Auto-inject sender terminal ID suffix when enabled
-        if ENABLE_SENDER_ID_INJECTION:
-            sender_id = os.environ.get("CAO_TERMINAL_ID", "unknown")
-            message += (
-                f"\n\n[Assigned by terminal {sender_id}. "
-                f"When done, send results back to terminal {sender_id} using send_message]"
-            )
-
-        # Send message immediately
-        _send_direct_input(terminal_id, message)
+        # Send message immediately (auto-injects sender terminal ID suffix when enabled)
+        _send_direct_input_assign(terminal_id, message)
 
         return {
             "success": True,
