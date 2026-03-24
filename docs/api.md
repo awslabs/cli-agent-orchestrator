@@ -186,7 +186,7 @@ Send a message to another terminal's inbox.
 **Behavior:**
 - Messages are queued and delivered when the receiver terminal is IDLE
 - Messages are delivered in order (oldest first)
-- Delivery is automatic via watchdog file monitoring
+- Delivery is automatic via event-driven status detection
 
 ---
 

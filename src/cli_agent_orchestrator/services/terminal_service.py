@@ -30,10 +30,12 @@ from cli_agent_orchestrator.clients.database import (
     update_last_active,
 )
 from cli_agent_orchestrator.clients.tmux import tmux_client
-from cli_agent_orchestrator.constants import SESSION_PREFIX, TERMINAL_LOG_DIR
+from cli_agent_orchestrator.constants import FIFO_DIR, SESSION_PREFIX
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
 from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.services.fifo_reader import fifo_manager
+from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
     generate_terminal_id,
@@ -54,7 +56,7 @@ class OutputMode(str, Enum):
     LAST = "last"
 
 
-def create_terminal(
+async def create_terminal(
     provider: str,
     agent_profile: str,
     session_name: Optional[str] = None,
@@ -116,18 +118,21 @@ def create_terminal(
         # Step 3: Persist terminal metadata to database
         db_create_terminal(terminal_id, session_name, window_name, provider, agent_profile)
 
-        # Step 4: Create and initialize the CLI provider
+        # Step 4: Set up FIFO reader for event-driven output streaming
+        # Must happen BEFORE provider.initialize() so reader is ready when pipe-pane starts
+        fifo_manager.create_reader(terminal_id)
+
+        # Step 5: Configure tmux pipe-pane to stream output to FIFO
+        # This enables real-time event-driven processing via StatusMonitor and LogWriter
+        fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
+        tmux_client.pipe_pane(session_name, window_name, str(fifo_path))
+
+        # Step 6: Create and initialize the CLI provider
         # This starts the agent (e.g., runs "kiro-cli chat --agent developer")
         provider_instance = provider_manager.create_provider(
             provider, terminal_id, session_name, window_name, agent_profile
         )
-        provider_instance.initialize()
-
-        # Step 5: Set up terminal logging via tmux pipe-pane
-        # This captures all terminal output to a log file for inbox monitoring
-        log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
-        log_path.touch()  # Ensure file exists before watching
-        tmux_client.pipe_pane(session_name, window_name, str(log_path))
+        await provider_instance.initialize()
 
         # Build and return the Terminal object
         terminal = Terminal(
@@ -146,8 +151,16 @@ def create_terminal(
         return terminal
 
     except Exception as e:
-        # Cleanup on failure: clean up provider resources and kill session
+        # Cleanup on failure: clean up FIFO reader, status monitor, provider, and session
         logger.error(f"Failed to create terminal: {e}")
+        try:
+            fifo_manager.stop_reader(terminal_id)
+        except Exception:
+            pass  # Ignore cleanup errors
+        try:
+            status_monitor.clear_terminal(terminal_id)
+        except Exception:
+            pass  # Ignore cleanup errors
         try:
             provider_manager.cleanup_provider(terminal_id)
         except Exception:
@@ -167,11 +180,7 @@ def get_terminal(terminal_id: str) -> Dict:
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        # Get status from provider
-        provider = provider_manager.get_provider(terminal_id)
-        if provider is None:
-            raise ValueError(f"Provider not found for terminal {terminal_id}")
-        status = provider.get_status().value
+        status = status_monitor.get_status(terminal_id).value
 
         return {
             "id": metadata["id"],
@@ -298,7 +307,11 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        full_output = tmux_client.get_history(metadata["tmux_session"], metadata["tmux_window"])
+        # Get output from StatusMonitor buffer (instant, no tmux call)
+        full_output = status_monitor.get_buffer(terminal_id)
+        if not full_output:
+            # Fallback to tmux only if buffer not available (edge case)
+            full_output = tmux_client.get_history(metadata["tmux_session"], metadata["tmux_window"])
 
         if mode == OutputMode.FULL:
             return full_output
@@ -345,6 +358,18 @@ def delete_terminal(terminal_id: str) -> bool:
                 tmux_client.stop_pipe_pane(metadata["tmux_session"], metadata["tmux_window"])
             except Exception as e:
                 logger.warning(f"Failed to stop pipe-pane for {terminal_id}: {e}")
+
+        # Stop FIFO reader and cleanup FIFO file
+        try:
+            fifo_manager.stop_reader(terminal_id)
+        except Exception as e:
+            logger.warning(f"Failed to stop FIFO reader for {terminal_id}: {e}")
+
+        # Clear state detector buffers for this terminal
+        try:
+            status_monitor.clear_terminal(terminal_id)
+        except Exception as e:
+            logger.warning(f"Failed to clear state detector for {terminal_id}: {e}")
 
         # Existing cleanup
         provider_manager.cleanup_provider(terminal_id)

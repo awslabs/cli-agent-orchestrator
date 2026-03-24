@@ -142,7 +142,7 @@ def enable_flow(name: str) -> bool:
     return True
 
 
-def execute_flow(name: str) -> bool:
+async def execute_flow(name: str) -> bool:
     """Execute flow: run script, render prompt, launch session."""
     try:
         logger.info(f"Executing flow: {name}")
@@ -202,7 +202,7 @@ def execute_flow(name: str) -> bool:
 
         # Launch session
         session_name = generate_session_name()
-        terminal = create_terminal(
+        terminal = await create_terminal(
             session_name=session_name,
             provider=flow.provider,
             agent_profile=flow.agent_profile,

@@ -37,7 +37,6 @@ class BaseProvider(ABC):
         terminal_id: Unique identifier for the terminal this provider manages
         session_name: Name of the tmux session containing the terminal
         window_name: Name of the tmux window containing the terminal
-        _status: Internal status cache (use get_status() for current status)
     """
 
     def __init__(self, terminal_id: str, session_name: str, window_name: str):
@@ -51,12 +50,6 @@ class BaseProvider(ABC):
         self.terminal_id = terminal_id
         self.session_name = session_name
         self.window_name = window_name
-        self._status = TerminalStatus.IDLE
-
-    @property
-    def status(self) -> TerminalStatus:
-        """Get current provider status."""
-        return self._status
 
     @property
     def paste_enter_count(self) -> int:
@@ -72,7 +65,7 @@ class BaseProvider(ABC):
         return 2
 
     @abstractmethod
-    def initialize(self) -> bool:
+    async def initialize(self) -> bool:
         """Initialize the provider (e.g., start CLI tool, send setup commands).
 
         Returns:
@@ -81,26 +74,17 @@ class BaseProvider(ABC):
         pass
 
     @abstractmethod
-    def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
-        """Get current provider status by analyzing terminal output.
+    def get_status(self, buffer: str) -> TerminalStatus:
+        """Detect terminal status from output buffer using provider-specific patterns.
+
+        Called by StatusMonitor with accumulated terminal output.
 
         Args:
-            tail_lines: Number of lines to capture from terminal (default: provider-specific)
+            buffer: Terminal output (up to ~8KB rolling buffer)
 
         Returns:
-            TerminalStatus: Current status of the provider
-        """
-        pass
-
-    @abstractmethod
-    def get_idle_pattern_for_log(self) -> str:
-        """Get pattern that indicates IDLE state in log file output.
-
-        Used for quick detection in file watcher before calling full get_status().
-        Should return a simple pattern that appears in the IDLE prompt.
-
-        Returns:
-            str: Pattern to search for in log file tail
+            TerminalStatus - always returns a valid status.
+            UNKNOWN if no pattern matched, ERROR only for matched error patterns.
         """
         pass
 
@@ -146,12 +130,5 @@ class BaseProvider(ABC):
 
         Called by the terminal service after send_input() delivers a message.
         Providers can override this to adjust status detection behavior.
-        For example, providers with initial prompts can use this to
-        distinguish post-init idle (ready for first input) from
-        post-task completed.
         """
         pass
-
-    def _update_status(self, status: TerminalStatus) -> None:
-        """Update internal status."""
-        self._status = status

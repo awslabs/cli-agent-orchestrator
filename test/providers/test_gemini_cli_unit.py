@@ -1,9 +1,6 @@
-"""Tests for Gemini CLI provider.
+"""Tests for Gemini CLI provider."""
 
-Covers initialization, status detection, message extraction, command building,
-pattern matching, and cleanup — targeting >90% code coverage.
-"""
-
+import asyncio
 import re
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -15,7 +12,6 @@ from cli_agent_orchestrator.providers.gemini_cli import (
     ANSI_CODE_PATTERN,
     ERROR_PATTERN,
     IDLE_PROMPT_PATTERN,
-    IDLE_PROMPT_PATTERN_LOG,
     IDLE_PROMPT_TAIL_LINES,
     INPUT_BOX_BOTTOM_PATTERN,
     INPUT_BOX_TOP_PATTERN,
@@ -48,20 +44,26 @@ def _read_fixture(name: str) -> str:
 class TestGeminiCliProviderInitialization:
     """Tests for GeminiCliProvider initialization flow."""
 
-    @patch("cli_agent_orchestrator.providers.gemini_cli.time")
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.gemini_cli.asyncio.sleep", return_value=None)
     @patch("cli_agent_orchestrator.providers.gemini_cli.wait_for_shell", return_value=True)
     @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
-    def test_initialize_success(self, mock_tmux, mock_wait_shell, mock_time):
+    async def test_initialize_success(self, mock_tmux, mock_wait_shell, mock_async_sleep):
         """Test successful initialization sends warm-up + gemini command and reaches IDLE."""
-        # Configure time mock: first call returns 0 (warm-up start), subsequent calls
-        # for the init loop need to return 0 then trigger the IDLE status check.
-        mock_time.time.side_effect = [0, 0, 0, 0, 0]
-        mock_time.sleep = MagicMock()
-        # Simulate warm-up marker appearing in shell output, then IDLE status
-        idle_output = " *   Type your message or @path/to/file\n"
-        mock_tmux.get_history.side_effect = ["CAO_SHELL_READY", idle_output]
+        mock_tmux.get_history.return_value = "CAO_SHELL_READY"
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
-        result = provider.initialize()
+
+        mock_monitor = MagicMock()
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        with (
+            patch(
+                "cli_agent_orchestrator.providers.gemini_cli.status_monitor",
+                mock_monitor,
+                create=True,
+            ),
+            patch("cli_agent_orchestrator.services.status_monitor.status_monitor", mock_monitor),
+        ):
+            result = await provider.initialize()
 
         assert result is True
         assert provider._initialized is True
@@ -69,46 +71,51 @@ class TestGeminiCliProviderInitialization:
         mock_tmux.send_keys.assert_any_call("session-1", "window-1", "echo CAO_SHELL_READY")
         mock_wait_shell.assert_called_once()
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.gemini_cli.wait_for_shell", return_value=False)
     @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
-    def test_initialize_shell_timeout(self, mock_tmux, mock_wait_shell):
+    async def test_initialize_shell_timeout(self, mock_tmux, mock_wait_shell):
         """Test shell init timeout raises TimeoutError."""
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
         with pytest.raises(TimeoutError, match="Shell initialization"):
-            provider.initialize()
+            await provider.initialize()
 
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.gemini_cli.asyncio.sleep", return_value=None)
     @patch("cli_agent_orchestrator.providers.gemini_cli.time")
     @patch("cli_agent_orchestrator.providers.gemini_cli.wait_for_shell", return_value=True)
     @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
-    def test_initialize_gemini_timeout(self, mock_tmux, mock_wait_shell, mock_time):
+    async def test_initialize_gemini_timeout(
+        self, mock_tmux, mock_wait_shell, mock_time, mock_async_sleep
+    ):
         """Test Gemini CLI init timeout raises TimeoutError."""
-        # Simulate time progressing past timeout (120s)
         call_count = [0]
 
         def advancing_time():
             call_count[0] += 1
-            return call_count[0] * 10.0  # each call advances 10s
+            return call_count[0] * 10.0
 
         mock_time.time.side_effect = advancing_time
-        mock_time.sleep = MagicMock()
-        # Warm-up succeeds, but CLI never reaches IDLE (always returns PROCESSING)
         mock_tmux.get_history.return_value = "CAO_SHELL_READY"
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
-        with pytest.raises(TimeoutError, match="Gemini CLI initialization timed out"):
-            provider.initialize()
 
-    @patch("cli_agent_orchestrator.providers.gemini_cli.time")
+        mock_monitor = MagicMock()
+        mock_monitor.get_status.return_value = TerminalStatus.UNKNOWN
+        mock_monitor.get_buffer.return_value = ""
+        with patch("cli_agent_orchestrator.services.status_monitor.status_monitor", mock_monitor):
+            with pytest.raises(TimeoutError, match="Gemini CLI initialization timed out"):
+                await provider.initialize()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.gemini_cli.asyncio.sleep", return_value=None)
     @patch("cli_agent_orchestrator.providers.gemini_cli.wait_for_shell", return_value=True)
     @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
-    def test_initialize_with_mcp_servers(
-        self, mock_load, mock_tmux, mock_wait_shell, mock_time, tmp_path
+    async def test_initialize_with_mcp_servers(
+        self, mock_load, mock_tmux, mock_wait_shell, mock_async_sleep, tmp_path
     ):
         """Test initialization with MCP servers writes to settings.json."""
-        mock_time.time.side_effect = [0, 0, 0, 0, 0]
-        mock_time.sleep = MagicMock()
-        idle_output = " *   Type your message or @path/to/file\n"
-        mock_tmux.get_history.side_effect = ["CAO_SHELL_READY", idle_output]
+        mock_tmux.get_history.return_value = "CAO_SHELL_READY"
         mock_profile = MagicMock()
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {
@@ -119,46 +126,50 @@ class TestGeminiCliProviderInitialization:
         }
         mock_load.return_value = mock_profile
 
-        # Use tmp_path as fake home so we don't touch real ~/.gemini/settings.json
         settings_dir = tmp_path / ".gemini"
         settings_dir.mkdir()
         settings_file = settings_dir / "settings.json"
 
-        with patch("cli_agent_orchestrator.providers.gemini_cli.Path.home", return_value=tmp_path):
+        mock_monitor = MagicMock()
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        with (
+            patch("cli_agent_orchestrator.providers.gemini_cli.Path.home", return_value=tmp_path),
+            patch("cli_agent_orchestrator.services.status_monitor.status_monitor", mock_monitor),
+        ):
             provider = GeminiCliProvider(
                 "term-1", "session-1", "window-1", agent_profile="developer"
             )
-            result = provider.initialize()
+            result = await provider.initialize()
 
         assert result is True
-        # MCP server should be registered in settings.json, not via gemini mcp add
         import json
 
         settings = json.loads(settings_file.read_text())
         assert "cao-mcp-server" in settings["mcpServers"]
         assert settings["mcpServers"]["cao-mcp-server"]["command"] == "npx"
         assert settings["mcpServers"]["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"] == "term-1"
-        # Command should be plain gemini launch (no chained mcp add)
         call_args = mock_tmux.send_keys.call_args_list[1]
         command = call_args[0][2]
         assert command == "gemini --yolo --sandbox false"
         assert "cao-mcp-server" in provider._mcp_server_names
 
-    @patch("cli_agent_orchestrator.providers.gemini_cli.time")
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.gemini_cli.asyncio.sleep", return_value=None)
     @patch("cli_agent_orchestrator.providers.gemini_cli.wait_for_shell", return_value=True)
     @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
-    def test_initialize_sends_gemini_command(self, mock_tmux, mock_wait_shell, mock_time):
+    async def test_initialize_sends_gemini_command(
+        self, mock_tmux, mock_wait_shell, mock_async_sleep
+    ):
         """Test that initialize sends warm-up echo then the correct gemini --yolo command."""
-        mock_time.time.side_effect = [0, 0, 0, 0, 0]
-        mock_time.sleep = MagicMock()
-        idle_output = " *   Type your message or @path/to/file\n"
-        mock_tmux.get_history.side_effect = ["CAO_SHELL_READY", idle_output]
+        mock_tmux.get_history.return_value = "CAO_SHELL_READY"
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
-        provider.initialize()
 
-        # First call: warm-up echo
+        mock_monitor = MagicMock()
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        with patch("cli_agent_orchestrator.services.status_monitor.status_monitor", mock_monitor):
+            await provider.initialize()
+
         assert mock_tmux.send_keys.call_args_list[0][0][2] == "echo CAO_SHELL_READY"
-        # Second call: gemini command
         assert mock_tmux.send_keys.call_args_list[1][0][2] == "gemini --yolo --sandbox false"
 
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
@@ -170,48 +181,34 @@ class TestGeminiCliProviderInitialization:
         with pytest.raises(ProviderError, match="Failed to load agent profile"):
             provider._build_gemini_command()
 
-    @patch("cli_agent_orchestrator.providers.gemini_cli.time")
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.gemini_cli.asyncio.sleep", return_value=None)
     @patch("cli_agent_orchestrator.providers.gemini_cli.wait_for_shell", return_value=True)
     @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
-    def test_initialize_with_prompt_interactive_waits_for_completed(
-        self, mock_load, mock_tmux, mock_wait_shell, mock_time
+    async def test_initialize_with_prompt_interactive_waits_for_completed(
+        self, mock_load, mock_tmux, mock_wait_shell, mock_async_sleep
     ):
-        """Test that -i flag makes initialize() wait for COMPLETED, not IDLE.
-
-        When -i is used, Gemini processes the system prompt as the first user
-        message and produces a response. IDLE alone is premature because the
-        Ink TUI shows the idle prompt before -i processing finishes (lesson #18).
-        """
-        mock_time.time.side_effect = [0, 0, 0, 0, 0, 0, 0]
-        mock_time.sleep = MagicMock()
+        """Test that -i flag makes initialize() wait for COMPLETED, not IDLE."""
         mock_profile = MagicMock()
         mock_profile.system_prompt = "You are a supervisor."
         mock_profile.mcpServers = {}
         mock_load.return_value = mock_profile
-
-        # First get_history: warm-up marker. Second: idle prompt (should NOT
-        # be accepted when -i is used). Third: completed state (response + idle).
-        idle_output = " *   Type your message or @path/to/file\n"
-        completed_output = (
-            "> You are a supervisor.\n"
-            "✦ I understand. I am a supervisor.\n"
-            " *   Type your message or @path/to/file\n"
-        )
-        mock_tmux.get_history.side_effect = [
-            "CAO_SHELL_READY",
-            idle_output,  # 1st status check: IDLE — skipped because -i requires COMPLETED
-            completed_output,  # 2nd status check: COMPLETED — accepted
-        ]
+        mock_tmux.get_history.return_value = "CAO_SHELL_READY"
         mock_tmux.get_pane_working_directory.return_value = None
 
-        provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="supervisor")
-        result = provider.initialize()
+        # First status check returns IDLE (should be skipped for -i), then COMPLETED
+        mock_monitor = MagicMock()
+        mock_monitor.get_status.side_effect = [TerminalStatus.IDLE, TerminalStatus.COMPLETED]
+        with patch("cli_agent_orchestrator.services.status_monitor.status_monitor", mock_monitor):
+            provider = GeminiCliProvider(
+                "term-1", "session-1", "window-1", agent_profile="supervisor"
+            )
+            result = await provider.initialize()
 
         assert result is True
         assert provider._uses_prompt_interactive is True
         assert provider._initialized is True
-        # After init, no external input received yet
         assert provider._received_input_after_init is False
 
     def test_uses_prompt_interactive_flag_default(self):
@@ -259,57 +256,51 @@ class TestGeminiCliProviderInitialization:
 class TestGeminiCliProviderStatusDetection:
     """Tests for GeminiCliProvider.get_status()."""
 
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
-    def test_get_status_idle(self, mock_tmux):
+    def test_get_status_idle(self):
         """Test IDLE detection from fresh startup output."""
-        mock_tmux.get_history.return_value = _read_fixture("gemini_cli_idle_output.txt")
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status() == TerminalStatus.IDLE
+        assert (
+            provider.get_status(_read_fixture("gemini_cli_idle_output.txt")) == TerminalStatus.IDLE
+        )
 
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
-    def test_get_status_completed(self, mock_tmux):
+    def test_get_status_completed(self):
         """Test COMPLETED detection when response is present with prompt."""
-        mock_tmux.get_history.return_value = _read_fixture("gemini_cli_completed_output.txt")
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status() == TerminalStatus.COMPLETED
+        assert (
+            provider.get_status(_read_fixture("gemini_cli_completed_output.txt"))
+            == TerminalStatus.COMPLETED
+        )
 
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
-    def test_get_status_completed_complex(self, mock_tmux):
+    def test_get_status_completed_complex(self):
         """Test COMPLETED detection with tool call response."""
-        mock_tmux.get_history.return_value = _read_fixture("gemini_cli_complex_response.txt")
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status() == TerminalStatus.COMPLETED
+        assert (
+            provider.get_status(_read_fixture("gemini_cli_complex_response.txt"))
+            == TerminalStatus.COMPLETED
+        )
 
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
-    def test_get_status_processing(self, mock_tmux):
+    def test_get_status_processing(self):
         """Test PROCESSING detection when user query is in input box."""
-        mock_tmux.get_history.return_value = _read_fixture("gemini_cli_processing_output.txt")
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status() == TerminalStatus.PROCESSING
+        assert (
+            provider.get_status(_read_fixture("gemini_cli_processing_output.txt"))
+            == TerminalStatus.PROCESSING
+        )
 
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
-    def test_get_status_error_empty(self, mock_tmux):
-        """Test ERROR on empty output."""
-        mock_tmux.get_history.return_value = ""
+    def test_get_status_unknown_empty(self):
+        """Test UNKNOWN on empty output."""
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status() == TerminalStatus.ERROR
+        assert provider.get_status("") == TerminalStatus.UNKNOWN
 
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
-    def test_get_status_error_none(self, mock_tmux):
-        """Test ERROR on None output."""
-        mock_tmux.get_history.return_value = None
-        provider = GeminiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status() == TerminalStatus.ERROR
-
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
-    def test_get_status_error_pattern(self, mock_tmux):
+    def test_get_status_error_pattern(self):
         """Test ERROR detection from error output fixture."""
-        mock_tmux.get_history.return_value = _read_fixture("gemini_cli_error_output.txt")
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status() == TerminalStatus.ERROR
+        assert (
+            provider.get_status(_read_fixture("gemini_cli_error_output.txt"))
+            == TerminalStatus.ERROR
+        )
 
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
-    def test_get_status_idle_with_ansi_codes(self, mock_tmux):
+    def test_get_status_idle_with_ansi_codes(self):
         """Test IDLE detection with ANSI escape codes in output."""
         output = (
             "\x1b[38;2;71;150;228m ███ GEMINI BANNER \x1b[0m\n"
@@ -319,41 +310,24 @@ class TestGeminiCliProviderStatusDetection:
             "\x1b[30m▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n"
             "\x1b[39m ~/dir (main)   sandbox   Auto\n"
         )
-        mock_tmux.get_history.return_value = output
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status() == TerminalStatus.IDLE
+        assert provider.get_status(output) == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
-    def test_get_status_with_tail_lines(self, mock_tmux):
-        """Test status detection with tail_lines parameter passed through."""
-        mock_tmux.get_history.return_value = _read_fixture("gemini_cli_idle_output.txt")
-        provider = GeminiCliProvider("term-1", "session-1", "window-1")
-        provider.get_status(tail_lines=20)
-        mock_tmux.get_history.assert_called_once_with("session-1", "window-1", tail_lines=20)
-
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
-    def test_get_status_idle_tall_terminal(self, mock_tmux):
-        """Test IDLE detection in tall terminals (46+ rows) where prompt is far from bottom.
-
-        In a tall terminal, the welcome banner and input box may be far from the
-        bottom due to Ink's cursor-based rendering and empty padding lines.
-        IDLE_PROMPT_TAIL_LINES must be large enough to reach the prompt.
-        """
+    def test_get_status_idle_tall_terminal(self):
+        """Test IDLE detection in tall terminals where prompt is far from bottom."""
         output = (
             " ███ GEMINI BANNER\n"
             "\n"
             "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
             " *   Type your message or @path/to/file\n"
             "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n"
-            + "\n" * 32  # 32 empty padding lines (typical for tall terminal)
+            + "\n" * 32
             + " .../project (main*)   sandbox   Auto (Gemini 3) /model | 200 MB\n"
         )
-        mock_tmux.get_history.return_value = output
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status() == TerminalStatus.IDLE
+        assert provider.get_status(output) == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
-    def test_get_status_processing_no_idle_prompt(self, mock_tmux):
+    def test_get_status_processing_no_idle_prompt(self):
         """Test PROCESSING when response is mid-stream (no idle prompt, no error)."""
         output = (
             "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
@@ -363,18 +337,11 @@ class TestGeminiCliProviderStatusDetection:
             "✦ Here's the function:\n"
             "\n"
         )
-        mock_tmux.get_history.return_value = output
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status() == TerminalStatus.PROCESSING
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
-    def test_get_status_not_error_when_response_mentions_error(self, mock_tmux):
-        """Test COMPLETED (not ERROR) when response text discusses errors.
-
-        The ✦ response may contain text like 'Error: you need to fix...' which
-        matches ERROR_PATTERN. Since the idle prompt is visible, the error check
-        is never reached — idle prompt detection takes priority.
-        """
+    def test_get_status_not_error_when_response_mentions_error(self):
+        """Test COMPLETED (not ERROR) when response text discusses errors."""
         output = (
             "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
             " > how to fix this error\n"
@@ -389,20 +356,11 @@ class TestGeminiCliProviderStatusDetection:
             "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n"
             " .../dir (main)   no sandbox   Auto (Gemini 3) /model | 100 MB\n"
         )
-        mock_tmux.get_history.return_value = output
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status() == TerminalStatus.COMPLETED
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
-    def test_get_status_processing_spinner_with_idle_prompt(self, mock_tmux):
-        """Test PROCESSING when spinner is visible despite idle prompt being shown.
-
-        Gemini's Ink TUI keeps the idle input box visible at the bottom at ALL
-        times, even during active processing (tool calls, model thinking).
-        The processing spinner (Braille dots + 'esc to cancel') appears above
-        the idle prompt. Without spinner detection, get_status() would return
-        COMPLETED prematurely (lesson #16).
-        """
+    def test_get_status_processing_spinner_with_idle_prompt(self):
+        """Test PROCESSING when spinner is visible despite idle prompt being shown."""
         output = (
             "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
             " > Use the handoff tool to delegate this task\n"
@@ -419,13 +377,11 @@ class TestGeminiCliProviderStatusDetection:
             "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n"
             " .../dir (main)   no sandbox   Auto (Gemini 3) /model | 234 MB\n"
         )
-        mock_tmux.get_history.return_value = output
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status() == TerminalStatus.PROCESSING
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
-    def test_get_status_processing_spinner_retry(self, mock_tmux):
-        """Test PROCESSING when model is retrying API call (Attempt N/M spinner)."""
+    def test_get_status_processing_spinner_retry(self):
+        """Test PROCESSING when model is retrying API call."""
         output = (
             "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
             " > create a report\n"
@@ -438,17 +394,11 @@ class TestGeminiCliProviderStatusDetection:
             "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n"
             " .../dir (main)   no sandbox   Auto (Gemini 3) /model | 100 MB\n"
         )
-        mock_tmux.get_history.return_value = output
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status() == TerminalStatus.PROCESSING
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
-    def test_get_status_completed_no_spinner(self, mock_tmux):
-        """Test COMPLETED when response finished and no spinner is present.
-
-        After the model finishes processing (no spinner), idle prompt visible,
-        and response with ✦ prefix visible → COMPLETED.
-        """
+    def test_get_status_completed_no_spinner(self):
+        """Test COMPLETED when response finished and no spinner is present."""
         output = (
             "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
             " > Use the handoff tool to delegate this task\n"
@@ -465,18 +415,11 @@ class TestGeminiCliProviderStatusDetection:
             "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n"
             " .../dir (main)   no sandbox   Auto (Gemini 3) /model | 234 MB\n"
         )
-        mock_tmux.get_history.return_value = output
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status() == TerminalStatus.COMPLETED
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
-    def test_get_status_processing_multi_turn_old_response(self, mock_tmux):
-        """Test PROCESSING on second query when old ✦ response is in scrollback.
-
-        In a multi-turn conversation, the scrollback contains ✦ from the first
-        response. When the second query is processing (no idle prompt at bottom),
-        the status should be PROCESSING despite the old ✦ in scrollback.
-        """
+    def test_get_status_processing_multi_turn_old_response(self):
+        """Test PROCESSING on second query when old response is in scrollback."""
         output = (
             "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
             " > first question\n"
@@ -489,9 +432,8 @@ class TestGeminiCliProviderStatusDetection:
             "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n"
             "  Responding with gemini-3-flash-preview\n"
         )
-        mock_tmux.get_history.return_value = output
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status() == TerminalStatus.PROCESSING
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
 
 
 # =============================================================================
@@ -885,13 +827,6 @@ class TestGeminiCliProviderMisc:
         """Test exit command returns C-d (Ctrl+D)."""
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
         assert provider.exit_cli() == "C-d"
-
-    def test_get_idle_pattern_for_log(self):
-        """Test idle pattern for log monitoring matches idle prompt."""
-        provider = GeminiCliProvider("term-1", "session-1", "window-1")
-        pattern = provider.get_idle_pattern_for_log()
-        assert pattern == IDLE_PROMPT_PATTERN_LOG
-        assert re.search(pattern, " *   Type your message or @path/to/file")
 
     def test_cleanup(self):
         """Test cleanup resets initialized state."""
