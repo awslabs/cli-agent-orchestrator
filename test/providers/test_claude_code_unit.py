@@ -549,7 +549,14 @@ class TestClaudeCodeProviderStartupPrompts:
         # Verify raw Down arrow escape sequence + Enter was sent via subprocess
         calls = mock_subprocess.run.call_args_list
         assert len(calls) == 2
-        assert calls[0].args[0] == ["tmux", "send-keys", "-t", "test-session:window-0", "-l", "\x1b[B"]
+        assert calls[0].args[0] == [
+            "tmux",
+            "send-keys",
+            "-t",
+            "test-session:window-0",
+            "-l",
+            "\x1b[B",
+        ]
         assert calls[1].args[0] == ["tmux", "send-keys", "-t", "test-session:window-0", "Enter"]
 
     @patch("cli_agent_orchestrator.providers.claude_code.subprocess")
@@ -574,7 +581,14 @@ class TestClaudeCodeProviderStartupPrompts:
         # Bypass: 2 subprocess calls (Down + Enter), then trust: 1 pane.send_keys call
         sub_calls = mock_subprocess.run.call_args_list
         assert len(sub_calls) == 2
-        assert sub_calls[0].args[0] == ["tmux", "send-keys", "-t", "test-session:window-0", "-l", "\x1b[B"]
+        assert sub_calls[0].args[0] == [
+            "tmux",
+            "send-keys",
+            "-t",
+            "test-session:window-0",
+            "-l",
+            "\x1b[B",
+        ]
         pane_calls = mock_pane.send_keys.call_args_list
         assert len(pane_calls) == 1
         assert pane_calls[0].args == ("",)
