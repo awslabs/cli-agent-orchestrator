@@ -13,6 +13,12 @@ from cli_agent_orchestrator.models.agent_profile import AgentProfile
 logger = logging.getLogger(__name__)
 
 
+def _validate_agent_name(agent_name: str) -> None:
+    """Reject agent names that could cause path traversal."""
+    if "/" in agent_name or "\\" in agent_name or ".." in agent_name:
+        raise ValueError(f"Invalid agent name '{agent_name}': must not contain '/', '\\', or '..'")
+
+
 def _scan_directory(directory: Path, source_label: str, profiles: Dict[str, Dict]) -> None:
     """Scan a directory for agent profiles (.md files, .json files, or subdirectories)."""
     if not directory.exists():
@@ -135,6 +141,8 @@ def load_agent_profile(agent_name: str) -> AgentProfile:
     3. Extra user-added directories
     4. Built-in store (packaged with CAO)
     """
+    _validate_agent_name(agent_name)
+
     from cli_agent_orchestrator.services.settings_service import (
         get_agent_dirs,
         get_extra_agent_dirs,
