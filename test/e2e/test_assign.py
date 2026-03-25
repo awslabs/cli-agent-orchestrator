@@ -23,7 +23,7 @@ For real supervisor→worker delegation tests, see test_supervisor_orchestration
 
 Requires:
 - Running CAO server
-- Authenticated CLI tools (codex, claude, kiro-cli, gemini)
+- Authenticated CLI tools (codex, claude, kiro-cli, gemini, copilot)
 - tmux
 - Agent profiles installed: data_analyst, report_generator
   (install with: cao install examples/assign/data_analyst.md)
@@ -34,6 +34,7 @@ Run:
     uv run pytest -m e2e test/e2e/test_assign.py -v -k claude_code
     uv run pytest -m e2e test/e2e/test_assign.py -v -k kiro_cli
     uv run pytest -m e2e test/e2e/test_assign.py -v -k gemini_cli
+    uv run pytest -m e2e test/e2e/test_assign.py -v -k copilot
 """
 
 import time
@@ -162,19 +163,7 @@ def _run_assign_test(provider: str, agent_profile: str, task_message: str, conte
             )
 
         # Step 5: Validate output.
-        # Gemini CLI's Ink TUI may show notification spinners for ~10-15s after
-        # completing a response. These spinners temporarily obscure the response
-        # text. Retry extraction with increasing delays to wait for spinners to
-        # clear and the response to become visible in the tmux capture.
-        output = ""
-        for extraction_attempt in range(4):
-            try:
-                output = extract_output(terminal_id)
-                if len(output.strip()) > 0:
-                    break
-            except (AssertionError, Exception):
-                pass
-            time.sleep(10)
+        output = extract_output(terminal_id)
         assert len(output.strip()) > 0, "Output should not be empty"
 
         # No TUI chrome leaking
@@ -479,7 +468,7 @@ class TestGeminiCliAssign:
         """Gemini CLI data_analyst receives dataset, performs statistical analysis.
 
         Gemini CLI's data_analyst profile heavily prioritises calling send_message
-        over printing results directly.  The response often contains tool-call
+        over printing results directly. The response often contains tool-call
         references (e.g. ``CAO_TERMINAL_ID``, ``send_message``) rather than raw
         statistical numbers, so we accept broader keywords.
         """
@@ -507,3 +496,35 @@ class TestGeminiCliAssign:
     def test_assign_with_callback(self, require_gemini):
         """Gemini CLI full round-trip: worker completes → sends result → supervisor receives."""
         _run_assign_with_callback_test(provider="gemini_cli")
+
+
+# ---------------------------------------------------------------------------
+# Copilot CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestCopilotCliAssign:
+    """E2E assign tests for the Copilot CLI provider using examples/assign/ profiles."""
+
+    def test_assign_data_analyst(self, require_copilot):
+        """Copilot CLI data_analyst receives dataset, performs statistical analysis."""
+        _run_assign_test(
+            provider="copilot_cli",
+            agent_profile="data_analyst",
+            task_message=DATA_ANALYST_TASK,
+            content_keywords=DATA_ANALYST_KEYWORDS,
+        )
+
+    def test_assign_report_generator(self, require_copilot):
+        """Copilot CLI report_generator creates a report template."""
+        _run_assign_test(
+            provider="copilot_cli",
+            agent_profile="report_generator",
+            task_message=REPORT_GENERATOR_TASK,
+            content_keywords=REPORT_GENERATOR_KEYWORDS,
+        )
+
+    def test_assign_with_callback(self, require_copilot):
+        """Copilot CLI full round-trip: worker completes → sends result → supervisor receives."""
+        _run_assign_with_callback_test(provider="copilot_cli")

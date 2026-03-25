@@ -12,12 +12,6 @@ from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 
 
 @pytest.fixture
-def client():
-    """Create a test client."""
-    return TestClient(app)
-
-
-@pytest.fixture
 def sample_inbox_messages():
     """Create sample inbox messages for testing."""
     return [

@@ -41,6 +41,24 @@ uv run cao --help
 uv run pytest test/providers/test_q_cli_unit.py -v -k "test_initialization"
 ```
 
+## Web UI Development
+
+The web UI is a React + Vite + Tailwind app in `web/`.
+
+```bash
+# Install frontend dependencies
+cd web/
+npm install
+
+# Start dev server (hot-reloads on file changes)
+npm run dev        # http://localhost:5173
+
+# Build for production
+npm run build      # Outputs to web/dist/
+```
+
+The Vite dev server proxies API calls to the backend at `localhost:9889`. Make sure `cao-server` is running before starting the frontend.
+
 ## Running Tests
 
 ### Unit Tests

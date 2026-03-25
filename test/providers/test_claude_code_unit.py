@@ -1,25 +1,31 @@
 """Unit tests for Claude Code provider."""
 
 import json
-from unittest.mock import MagicMock, patch
+from pathlib import Path
+from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider, ProviderError
 
+# All initialization tests need to patch _ensure_skip_bypass_prompt_setting
+# to avoid writing to the real ~/.claude/settings.json.
+_PATCH_SETTINGS = patch.object(ClaudeCodeProvider, "_ensure_skip_bypass_prompt_setting")
+
 
 class TestClaudeCodeProviderInitialization:
     """Tests for ClaudeCodeProvider initialization."""
 
+    @_PATCH_SETTINGS
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_initialize_success(self, mock_tmux, mock_wait_status, mock_wait_shell):
+    def test_initialize_success(self, mock_tmux, mock_wait_status, mock_wait_shell, _):
         """Test successful initialization."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
-        # _handle_trust_prompt needs get_history to return a string
+        # _handle_startup_prompts needs get_history to return a string
         mock_tmux.get_history.return_value = "Welcome to Claude Code v2.0"
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
@@ -42,10 +48,11 @@ class TestClaudeCodeProviderInitialization:
         with pytest.raises(TimeoutError, match="Shell initialization timed out"):
             provider.initialize()
 
+    @_PATCH_SETTINGS
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_initialize_timeout(self, mock_tmux, mock_wait_status, mock_wait_shell):
+    def test_initialize_timeout(self, mock_tmux, mock_wait_status, mock_wait_shell, _):
         """Test initialization timeout."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = False
@@ -56,12 +63,13 @@ class TestClaudeCodeProviderInitialization:
         with pytest.raises(TimeoutError, match="Claude Code initialization timed out"):
             provider.initialize()
 
+    @_PATCH_SETTINGS
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
     def test_initialize_with_agent_profile(
-        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load, _
     ):
         """Test initialization with agent profile."""
         mock_wait_shell.return_value = True
@@ -78,10 +86,11 @@ class TestClaudeCodeProviderInitialization:
         assert result is True
         mock_load.assert_called_once_with("test-agent")
 
+    @_PATCH_SETTINGS
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_initialize_with_invalid_agent_profile(self, mock_tmux, mock_load, mock_wait_shell):
+    def test_initialize_with_invalid_agent_profile(self, mock_tmux, mock_load, mock_wait_shell, _):
         """Test initialization with invalid agent profile."""
         mock_wait_shell.return_value = True
         mock_load.side_effect = FileNotFoundError("Profile not found")
@@ -91,12 +100,13 @@ class TestClaudeCodeProviderInitialization:
         with pytest.raises(ProviderError, match="Failed to load agent profile"):
             provider.initialize()
 
+    @_PATCH_SETTINGS
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
     def test_initialize_with_mcp_servers(
-        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load, _
     ):
         """Test initialization with MCP servers in profile."""
         mock_wait_shell.return_value = True
@@ -112,10 +122,11 @@ class TestClaudeCodeProviderInitialization:
 
         assert result is True
 
+    @_PATCH_SETTINGS
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_initialize_sends_claude_command(self, mock_tmux, mock_wait_status, mock_wait_shell):
+    def test_initialize_sends_claude_command(self, mock_tmux, mock_wait_status, mock_wait_shell, _):
         """Test that initialize sends the 'claude' command to tmux."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
@@ -124,9 +135,10 @@ class TestClaudeCodeProviderInitialization:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         provider.initialize()
 
-        mock_tmux.send_keys.assert_called_once_with(
-            "test-session", "window-0", "claude --dangerously-skip-permissions"
-        )
+        call_args = mock_tmux.send_keys.call_args
+        assert call_args[0][0] == "test-session"
+        assert call_args[0][1] == "window-0"
+        assert "claude --dangerously-skip-permissions" in call_args[0][2]
 
 
 class TestClaudeCodeProviderStatusDetection:
@@ -363,7 +375,7 @@ class TestClaudeCodeProviderMisc:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         command = provider._build_claude_command()
 
-        assert command == "claude --dangerously-skip-permissions"
+        assert "claude --dangerously-skip-permissions" in command
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     def test_build_claude_command_with_system_prompt(self, mock_load):
@@ -457,15 +469,14 @@ class TestClaudeCodeProviderMisc:
         assert server_env["CAO_TERMINAL_ID"] == "user-provided-id"
 
 
-class TestClaudeCodeProviderTrustPrompt:
-    """Tests for Claude Code workspace trust prompt handling."""
+class TestClaudeCodeProviderStartupPrompts:
+    """Tests for Claude Code startup prompt handling (trust + bypass)."""
 
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_handle_trust_prompt_detected_and_accepted(self, mock_tmux):
+    def test_handle_startup_prompts_detected_and_accepted(self, mock_tmux):
         """Test that trust prompt is detected and auto-accepted."""
-        # Simulate trust prompt appearing in terminal output
         mock_tmux.get_history.return_value = (
-            "\x1b[1m❯\x1b[0m 1. Yes, I trust this folder\n" "  2. No, don't trust\n"
+            "\x1b[1m❯\x1b[0m 1. Yes, I trust this folder\n  2. No, don't trust\n"
         )
         mock_session = MagicMock()
         mock_window = MagicMock()
@@ -475,42 +486,36 @@ class TestClaudeCodeProviderTrustPrompt:
         mock_window.active_pane = mock_pane
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_trust_prompt(timeout=2.0)
+        provider._handle_startup_prompts(timeout=2.0)
 
-        # Verify Enter was sent to accept the trust prompt
         mock_pane.send_keys.assert_called_once_with("", enter=True)
 
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_handle_trust_prompt_not_needed(self, mock_tmux):
-        """Test early return when Claude Code starts without trust prompt."""
+    def test_handle_startup_prompts_not_needed(self, mock_tmux):
+        """Test early return when Claude Code starts without prompts."""
         mock_tmux.get_history.return_value = "Welcome to Claude Code v2.1.0"
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_trust_prompt(timeout=2.0)
+        provider._handle_startup_prompts(timeout=2.0)
 
-        # No session/pane access should happen
         mock_tmux.server.sessions.get.assert_not_called()
 
     @patch("cli_agent_orchestrator.providers.claude_code.time")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_handle_trust_prompt_timeout(self, mock_tmux, mock_time):
-        """Test trust prompt handler times out gracefully."""
-        # Return output that doesn't match trust prompt or welcome banner
+    def test_handle_startup_prompts_timeout(self, mock_tmux, mock_time):
+        """Test startup prompt handler times out gracefully."""
         mock_tmux.get_history.return_value = "Loading..."
-        # Simulate time passing past the timeout
         mock_time.time.side_effect = [0.0, 0.0, 25.0]
         mock_time.sleep = MagicMock()
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        # Should not raise, just log a warning and return
-        provider._handle_trust_prompt(timeout=20.0)
+        provider._handle_startup_prompts(timeout=20.0)
 
         mock_tmux.server.sessions.get.assert_not_called()
 
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_handle_trust_prompt_empty_output_then_detected(self, mock_tmux):
+    def test_handle_startup_prompts_empty_output_then_detected(self, mock_tmux):
         """Test trust prompt detection after initially empty output."""
-        # First call returns empty, second returns trust prompt
         mock_tmux.get_history.side_effect = [
             "",
             "❯ 1. Yes, I trust this folder\n  2. No",
@@ -523,34 +528,106 @@ class TestClaudeCodeProviderTrustPrompt:
         mock_window.active_pane = mock_pane
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_trust_prompt(timeout=5.0)
+        provider._handle_startup_prompts(timeout=5.0)
 
         mock_pane.send_keys.assert_called_once_with("", enter=True)
+
+    @patch("cli_agent_orchestrator.providers.claude_code.subprocess")
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_handle_bypass_prompt_detected_and_accepted(self, mock_tmux, mock_subprocess):
+        """Test that bypass permissions prompt is detected and auto-accepted."""
+        # First poll: bypass prompt; second poll: welcome banner (after dismissal)
+        mock_tmux.get_history.side_effect = [
+            "WARNING: Claude Code running in Bypass Permissions mode\n"
+            "❯ 1. No, exit\n  2. Yes, I accept\n",
+            "Welcome to Claude Code v2.1.74",
+        ]
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        provider._handle_startup_prompts(timeout=5.0)
+
+        # Verify raw Down arrow escape sequence + Enter was sent via subprocess
+        calls = mock_subprocess.run.call_args_list
+        assert len(calls) == 2
+        assert calls[0].args[0] == [
+            "tmux",
+            "send-keys",
+            "-t",
+            "test-session:window-0",
+            "-l",
+            "\x1b[B",
+        ]
+        assert calls[1].args[0] == ["tmux", "send-keys", "-t", "test-session:window-0", "Enter"]
+
+    @patch("cli_agent_orchestrator.providers.claude_code.subprocess")
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_handle_bypass_then_trust_prompt(self, mock_tmux, mock_subprocess):
+        """Test that bypass prompt is handled, then trust prompt follows."""
+        # Poll 1: bypass prompt; Poll 2: trust prompt (after bypass dismissed)
+        mock_tmux.get_history.side_effect = [
+            "WARNING: Bypass Permissions mode\n❯ 1. No, exit\n  2. Yes, I accept\n",
+            "❯ 1. Yes, I trust this folder\n  2. No",
+        ]
+        mock_session = MagicMock()
+        mock_window = MagicMock()
+        mock_pane = MagicMock()
+        mock_tmux.server.sessions.get.return_value = mock_session
+        mock_session.windows.get.return_value = mock_window
+        mock_window.active_pane = mock_pane
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        provider._handle_startup_prompts(timeout=5.0)
+
+        # Bypass: 2 subprocess calls (Down + Enter), then trust: 1 pane.send_keys call
+        sub_calls = mock_subprocess.run.call_args_list
+        assert len(sub_calls) == 2
+        assert sub_calls[0].args[0] == [
+            "tmux",
+            "send-keys",
+            "-t",
+            "test-session:window-0",
+            "-l",
+            "\x1b[B",
+        ]
+        pane_calls = mock_pane.send_keys.call_args_list
+        assert len(pane_calls) == 1
+        assert pane_calls[0].args == ("",)
+        assert pane_calls[0].kwargs == {"enter": True}
 
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
     def test_get_status_trust_prompt_not_waiting_user_answer(self, mock_tmux):
         """Test that trust prompt is NOT detected as WAITING_USER_ANSWER."""
-        # This output has both WAITING_USER_ANSWER pattern AND trust prompt pattern
         mock_tmux.get_history.return_value = (
-            "❯ 1. Yes, I trust this folder\n" "  2. No, don't trust this folder"
+            "❯ 1. Yes, I trust this folder\n  2. No, don't trust this folder"
         )
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         status = provider.get_status()
 
-        # Should NOT be WAITING_USER_ANSWER since trust prompt is excluded
         assert status != TerminalStatus.WAITING_USER_ANSWER
 
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_get_status_bypass_prompt_not_waiting_user_answer(self, mock_tmux):
+        """Test that bypass prompt is NOT detected as WAITING_USER_ANSWER."""
+        mock_tmux.get_history.return_value = (
+            "WARNING: Bypass Permissions mode\n" "❯ 1. No, exit\n  2. Yes, I accept\n"
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status()
+
+        assert status != TerminalStatus.WAITING_USER_ANSWER
+
+    @_PATCH_SETTINGS
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_initialize_calls_handle_trust_prompt(
-        self, mock_tmux, mock_wait_status, mock_wait_shell
+    def test_initialize_calls_handle_startup_prompts(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, _
     ):
-        """Test that initialize calls _handle_trust_prompt."""
+        """Test that initialize calls _handle_startup_prompts."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
-        # Trust prompt appears, then gets auto-accepted
         mock_tmux.get_history.return_value = "❯ 1. Yes, I trust this folder\n  2. No"
         mock_session = MagicMock()
         mock_window = MagicMock()
@@ -563,5 +640,66 @@ class TestClaudeCodeProviderTrustPrompt:
         result = provider.initialize()
 
         assert result is True
-        # Verify trust prompt was auto-accepted (Enter sent)
         mock_pane.send_keys.assert_called_with("", enter=True)
+
+
+class TestClaudeCodeProviderSettings:
+    """Tests for Claude Code settings management."""
+
+    @patch("cli_agent_orchestrator.providers.claude_code.Path")
+    def test_ensure_skip_bypass_prompt_already_set(self, mock_path_cls):
+        """Test no-op when setting is already present."""
+        mock_settings_path = MagicMock()
+        mock_settings_path.exists.return_value = True
+        mock_path_cls.home.return_value.__truediv__ = MagicMock(
+            side_effect=lambda _: mock_settings_path
+        )
+        # Chain .home() / ".claude" / "settings.json"
+        mock_home = MagicMock()
+        mock_claude_dir = MagicMock()
+        mock_path_cls.home.return_value = mock_home
+        mock_home.__truediv__ = MagicMock(return_value=mock_claude_dir)
+        mock_claude_dir.__truediv__ = MagicMock(return_value=mock_settings_path)
+
+        existing = json.dumps({"skipDangerousModePermissionPrompt": True})
+        with patch("builtins.open", mock_open(read_data=existing)):
+            ClaudeCodeProvider._ensure_skip_bypass_prompt_setting()
+
+        # Should not write (file handle's write not called)
+        mock_settings_path.parent.mkdir.assert_not_called()
+
+    def test_ensure_skip_bypass_prompt_writes_setting(self, tmp_path):
+        """Test that setting is written when missing."""
+        settings_file = tmp_path / ".claude" / "settings.json"
+        settings_file.parent.mkdir(parents=True)
+        settings_file.write_text(json.dumps({"permissions": {"allow": []}}))
+
+        with patch("cli_agent_orchestrator.providers.claude_code.Path") as mock_path_cls:
+            mock_home = MagicMock()
+            mock_path_cls.home.return_value = mock_home
+            mock_home.__truediv__ = MagicMock(
+                return_value=MagicMock(__truediv__=MagicMock(return_value=settings_file))
+            )
+
+            ClaudeCodeProvider._ensure_skip_bypass_prompt_setting()
+
+        result = json.loads(settings_file.read_text())
+        assert result["skipDangerousModePermissionPrompt"] is True
+        # Original settings preserved
+        assert result["permissions"] == {"allow": []}
+
+    def test_ensure_skip_bypass_prompt_creates_file(self, tmp_path):
+        """Test that settings file is created when it doesn't exist."""
+        settings_file = tmp_path / ".claude" / "settings.json"
+
+        with patch("cli_agent_orchestrator.providers.claude_code.Path") as mock_path_cls:
+            mock_home = MagicMock()
+            mock_path_cls.home.return_value = mock_home
+            mock_home.__truediv__ = MagicMock(
+                return_value=MagicMock(__truediv__=MagicMock(return_value=settings_file))
+            )
+
+            ClaudeCodeProvider._ensure_skip_bypass_prompt_setting()
+
+        result = json.loads(settings_file.read_text())
+        assert result["skipDangerousModePermissionPrompt"] is True

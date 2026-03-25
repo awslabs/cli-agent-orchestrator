@@ -4,7 +4,9 @@ import json
 import logging
 import re
 import shlex
+import subprocess
 import time
+from pathlib import Path
 from typing import Optional
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
@@ -37,6 +39,7 @@ WAITING_USER_ANSWER_PATTERN = (
     r"❯.*\d+\."  # Pattern for Claude showing selection options with arrow cursor
 )
 TRUST_PROMPT_PATTERN = r"Yes, I trust this folder"  # Workspace trust dialog
+BYPASS_PROMPT_PATTERN = r"Yes, I accept"  # Bypass permissions confirmation dialog
 IDLE_PROMPT_PATTERN_LOG = r"[>❯][\s\xa0]"  # Same pattern for log files
 
 
@@ -104,26 +107,81 @@ class ClaudeCodeProvider(BaseProvider):
 
         # Use shlex.join() for proper shell escaping of all arguments
         # This correctly handles multiline strings, quotes, and special characters
-        return shlex.join(command_parts)
+        claude_cmd = shlex.join(command_parts)
 
-    def _handle_trust_prompt(self, timeout: float = 20.0) -> None:
-        """Auto-accept the workspace trust prompt if it appears.
+        # When cao-server runs inside a Claude Code session, CLAUDE* env vars
+        # leak into spawned tmux panes (via the tmux server's global env).
+        # Claude Code detects these and refuses to start ("nested session").
+        # Unset all matching vars in the shell before launching.
+        unset_cmd = "unset $(env | sed -n 's/^\\(CLAUDE[A-Z_]*\\)=.*/\\1/p') 2>/dev/null"
+        return f"{unset_cmd}; {claude_cmd}"
 
-        Claude Code shows a trust dialog when opening an untrusted directory.
-        This sends Enter to accept 'Yes, I trust this folder'.
-        CAO assumes the user trusts the working directory since they initiated
-        the launch command.
+    @staticmethod
+    def _ensure_skip_bypass_prompt_setting() -> None:
+        """Ensure ``skipDangerousModePermissionPrompt`` is set in settings.
+
+        Claude Code (v2.1.41+) shows a bypass permissions confirmation dialog
+        on every launch with ``--dangerously-skip-permissions`` unless
+        ``skipDangerousModePermissionPrompt: true`` is persisted in
+        ``~/.claude/settings.json``.  CAO already uses the flag intentionally,
+        so the confirmation is redundant and blocks initialization.
+        """
+        settings_path = Path.home() / ".claude" / "settings.json"
+        settings: dict = {}
+        if settings_path.exists():
+            try:
+                with open(settings_path) as f:
+                    settings = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        if settings.get("skipDangerousModePermissionPrompt") is True:
+            return
+
+        settings["skipDangerousModePermissionPrompt"] = True
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(settings_path, "w") as f:
+            json.dump(settings, f, indent=2)
+        logger.info("Set skipDangerousModePermissionPrompt in ~/.claude/settings.json")
+
+    def _handle_startup_prompts(self, timeout: float = 20.0) -> None:
+        """Auto-accept startup prompts that may appear before the REPL is ready.
+
+        Claude Code may show up to two prompts during startup:
+
+        1. **Bypass permissions confirmation** (``--dangerously-skip-permissions``)
+           – shows "Yes, I accept" as option 2; requires ``Down`` + ``Enter``.
+           The settings-based fix (``_ensure_skip_bypass_prompt_setting``) prevents
+           this in most cases; this handler is a defensive fallback.
+        2. **Workspace trust dialog** – shows "Yes, I trust this folder";
+           requires ``Enter``.
         """
         start_time = time.time()
+        bypass_accepted = False
         while time.time() - start_time < timeout:
             output = tmux_client.get_history(self.session_name, self.window_name)
             if not output:
                 time.sleep(1.0)
                 continue
 
-            # Clean ANSI codes for reliable text matching
             clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
 
+            # 1) Handle bypass permissions prompt (appears before trust prompt).
+            #    Only act once — the text stays in the buffer after dismissal.
+            if not bypass_accepted and re.search(BYPASS_PROMPT_PATTERN, clean_output):
+                logger.info("Bypass permissions prompt detected, auto-accepting")
+                target = f"{self.session_name}:{self.window_name}"
+                # Send raw Down arrow escape sequence (-l for literal) to move
+                # cursor to "Yes, I accept", then Enter to confirm.
+                # tmux send-keys "Down" doesn't work with Claude's Ink TUI.
+                subprocess.run(["tmux", "send-keys", "-t", target, "-l", "\x1b[B"], check=False)
+                time.sleep(0.5)
+                subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], check=False)
+                bypass_accepted = True
+                time.sleep(1.0)
+                continue  # Trust prompt may follow
+
+            # 2) Handle workspace trust prompt
             if re.search(TRUST_PROMPT_PATTERN, clean_output):
                 logger.info("Workspace trust prompt detected, auto-accepting")
                 session = tmux_client.server.sessions.get(session_name=self.session_name)
@@ -133,14 +191,16 @@ class ClaudeCodeProvider(BaseProvider):
                     pane.send_keys("", enter=True)
                 return
 
-            # Check if Claude Code has fully started (welcome banner visible)
-            # Use a specific pattern that only appears in the welcome screen
+            # 3) Claude Code fully started — no prompts needed
             if re.search(r"Welcome to|Claude Code v\d+", clean_output):
-                logger.info("Claude Code started without trust prompt")
+                logger.info("Claude Code started without prompts")
+                return
+            if re.search(IDLE_PROMPT_PATTERN, clean_output):
+                logger.info("Claude Code idle prompt detected, no prompts needed")
                 return
 
             time.sleep(1.0)
-        logger.warning("Trust prompt handler timed out")
+        logger.warning("Startup prompt handler timed out")
 
     def initialize(self) -> bool:
         """Initialize Claude Code provider by starting claude command."""
@@ -148,14 +208,17 @@ class ClaudeCodeProvider(BaseProvider):
         if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
+        # Prevent bypass permissions dialog from appearing (settings-based fix).
+        self._ensure_skip_bypass_prompt_setting()
+
         # Build properly escaped command string
         command = self._build_claude_command()
 
         # Send Claude Code command using tmux client
         tmux_client.send_keys(self.session_name, self.window_name, command)
 
-        # Handle workspace trust prompt if it appears (new/untrusted directories)
-        self._handle_trust_prompt(timeout=20.0)
+        # Handle startup prompts (bypass permissions + workspace trust)
+        self._handle_startup_prompts(timeout=20.0)
 
         # Wait for Claude Code prompt to be ready.
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
@@ -185,9 +248,11 @@ class ClaudeCodeProvider(BaseProvider):
             return TerminalStatus.PROCESSING
 
         # Check for waiting user answer (Claude asking for user selection)
-        # Exclude the workspace trust prompt which also matches the pattern
-        if re.search(WAITING_USER_ANSWER_PATTERN, output) and not re.search(
-            TRUST_PROMPT_PATTERN, output
+        # Exclude startup prompts (trust + bypass) which also match the pattern
+        if (
+            re.search(WAITING_USER_ANSWER_PATTERN, output)
+            and not re.search(TRUST_PROMPT_PATTERN, output)
+            and not re.search(BYPASS_PROMPT_PATTERN, output)
         ):
             return TerminalStatus.WAITING_USER_ANSWER
 
