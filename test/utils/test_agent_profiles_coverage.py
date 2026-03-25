@@ -299,11 +299,15 @@ class TestListAgentProfilesEdgeCases:
 
         mock_resources.files.return_value = MagicMock(iterdir=MagicMock(return_value=[]))
 
+        # Use a real, resolved path so Path(dir_path).resolve() matches
+        # the mock's resolve() return value (avoids macOS symlink issues
+        # where e.g. /home -> /System/Volumes/Data/home).
+        resolved_path = Path(__file__).resolve().parent
         mock_local_dir.exists.return_value = True
-        mock_local_dir.resolve.return_value = Path("/home/user/local-store")
+        mock_local_dir.resolve.return_value = resolved_path
 
         # Provider dir resolves to same as local
-        mock_get_dirs.return_value = {"kiro_cli": "/home/user/local-store"}
+        mock_get_dirs.return_value = {"kiro_cli": str(resolved_path)}
 
         list_agent_profiles()
 
