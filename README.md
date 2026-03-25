@@ -30,6 +30,7 @@ For detailed project structure and architecture, see [CODEBASE.md](CODEBASE.md).
 
 ### Requirements
 
+- **curl** and **git** — For downloading installers and cloning the repo
 - **Python 3.10 or higher** — CAO requires Python >=3.10 (see [pyproject.toml](pyproject.toml))
 - **tmux 3.3+** — Used for agent session isolation
 - **[uv](https://docs.astral.sh/uv/)** — Fast Python package installer and virtual environment manager
@@ -67,6 +68,7 @@ bash <(curl -s https://raw.githubusercontent.com/awslabs/cli-agent-orchestrator/
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.local/bin/env   # Add uv to PATH (or restart your shell)
 ```
 
 ### 4. Install CLI Agent Orchestrator
@@ -191,6 +193,77 @@ cao shutdown --session <session-name>
 **List all windows (Ctrl+b, w):**
 
 ![Tmux Window Selector](./docs/assets/tmux_all_windows.png)
+
+## Web UI
+
+CAO includes a web dashboard for managing agents, terminals, and flows from the browser.
+
+![CAO Web UI](https://github.com/user-attachments/assets/e7db9261-62b1-4422-b9f5-6fe5f65bdea4)
+
+### Additional Requirements
+
+- **Node.js 18+** — Required for the frontend dev server and Codex CLI
+
+```bash
+# macOS (Homebrew)
+brew install node
+
+# Ubuntu/Debian
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo bash -
+sudo apt-get install -y nodejs
+
+# Amazon Linux 2023 / Fedora
+sudo dnf install nodejs20
+
+# Verify
+node --version   # Should be 18 or higher
+```
+
+### Starting the Web UI
+
+```bash
+# 1. Start the backend server (if not already running)
+cao-server
+# Or with custom host/port:
+cao-server --host 0.0.0.0 --port 9889  # ⚠️ Exposes server to network — see Security note below
+
+# 2. Start the frontend dev server
+cd web/
+npm install        # First time only
+npm run dev        # Starts on http://localhost:5173
+```
+
+**Alternative: production mode** — Build the frontend once and let the backend serve it (no Vite dev server needed):
+
+```bash
+cd web/
+npm install && npm run build   # Outputs to web/dist/
+cao-server                     # Serves UI at http://localhost:9889
+```
+
+If you're on a remote machine (e.g. dev desktop), set up an SSH tunnel to access the UI locally:
+
+```bash
+# From your local machine (dev server mode)
+ssh -L 5173:localhost:5173 -L 9889:localhost:9889 your-remote-host
+# Or production mode (backend serves UI directly)
+ssh -L 9889:localhost:9889 your-remote-host
+```
+
+Then open http://localhost:5173 (dev) or http://localhost:9889 (production) in your browser.
+
+### Features
+
+Manage sessions, spawn agents, create scheduled flows, configure agent directories, and interact with live terminals — all from the browser. Includes live status badges, an inbox for agent-to-agent messaging, output viewer, and provider auto-detection.
+
+### Building for Production
+
+```bash
+cd web/
+npm run build      # Outputs to web/dist/
+```
+
+When `web/dist/` exists, the backend serves it automatically at the server root — no separate frontend server needed.
 
 ## MCP Server Tools and Orchestration Modes
 
@@ -408,13 +481,15 @@ For ready-to-use examples, see [`examples/cross-provider/`](examples/cross-provi
 
 ## Security
 
+The server is designed for **localhost-only use**. The WebSocket terminal endpoint (`/terminals/{id}/ws`) provides full PTY access and will reject connections from non-loopback addresses. Do not expose the server to untrusted networks without adding authentication.
+
 ### DNS Rebinding Protection
 
 The CAO server validates HTTP `Host` headers to prevent [DNS rebinding attacks](https://owasp.org/www-community/attacks/DNS_Rebinding). Only `localhost` and `127.0.0.1` are accepted by default — requests with other hostnames are rejected with `400 Bad Request`.
 
 **Note:** If you need to expose the server on a network (not recommended for development use), be aware that the Host header validation will reject requests unless the hostname matches the allowed list.
 
-For more details, see [SECURITY.md](SECURITY.md) for vulnerability reporting, security scanning, and best practices.
+See [SECURITY.md](SECURITY.md) for vulnerability reporting, security scanning, and best practices.
 
 ## Contributing
 

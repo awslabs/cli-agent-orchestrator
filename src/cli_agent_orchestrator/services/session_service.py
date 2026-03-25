@@ -63,17 +63,25 @@ def get_session(session_name: str) -> Dict:
         raise
 
 
-def delete_session(session_name: str) -> bool:
-    """Delete session and cleanup."""
+def delete_session(session_name: str) -> Dict:
+    """Delete session and cleanup.
+
+    Returns:
+        Dict with 'deleted' (list of deleted session names) and 'errors' (list of error dicts).
+    """
+    result: Dict = {"deleted": [], "errors": []}
     try:
         if not tmux_client.session_exists(session_name):
             raise ValueError(f"Session '{session_name}' not found")
 
         terminals = list_terminals_by_session(session_name)
 
-        # Cleanup providers
+        # Cleanup providers (non-blocking — don't let failures stop deletion)
         for terminal in terminals:
-            provider_manager.cleanup_provider(terminal["id"])
+            try:
+                provider_manager.cleanup_provider(terminal["id"])
+            except Exception as e:
+                logger.warning(f"Provider cleanup failed for {terminal['id']}: {e}")
 
         # Kill tmux session
         tmux_client.kill_session(session_name)
@@ -81,8 +89,9 @@ def delete_session(session_name: str) -> bool:
         # Delete terminal metadata
         delete_terminals_by_session(session_name)
 
+        result["deleted"].append(session_name)
         logger.info(f"Deleted session: {session_name}")
-        return True
+        return result
 
     except Exception as e:
         logger.error(f"Failed to delete session {session_name}: {e}")
