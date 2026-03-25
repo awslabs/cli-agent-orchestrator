@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import shlex
+import subprocess
 import time
 from pathlib import Path
 from typing import Optional
@@ -106,7 +107,14 @@ class ClaudeCodeProvider(BaseProvider):
 
         # Use shlex.join() for proper shell escaping of all arguments
         # This correctly handles multiline strings, quotes, and special characters
-        return shlex.join(command_parts)
+        claude_cmd = shlex.join(command_parts)
+
+        # When cao-server runs inside a Claude Code session, CLAUDE* env vars
+        # leak into spawned tmux panes (via the tmux server's global env).
+        # Claude Code detects these and refuses to start ("nested session").
+        # Unset all matching vars in the shell before launching.
+        unset_cmd = "unset $(env | sed -n 's/^\\(CLAUDE[A-Z_]*\\)=.*/\\1/p') 2>/dev/null"
+        return f"{unset_cmd}; {claude_cmd}"
 
     @staticmethod
     def _ensure_skip_bypass_prompt_setting() -> None:
@@ -147,10 +155,6 @@ class ClaudeCodeProvider(BaseProvider):
            this in most cases; this handler is a defensive fallback.
         2. **Workspace trust dialog** – shows "Yes, I trust this folder";
            requires ``Enter``.
-
-        The method polls the tmux buffer until Claude Code is fully started
-        (welcome banner visible) or the timeout expires, handling any prompts
-        that appear along the way.
         """
         start_time = time.time()
         bypass_accepted = False
@@ -160,20 +164,19 @@ class ClaudeCodeProvider(BaseProvider):
                 time.sleep(1.0)
                 continue
 
-            # Clean ANSI codes for reliable text matching
             clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
 
             # 1) Handle bypass permissions prompt (appears before trust prompt).
             #    Only act once — the text stays in the buffer after dismissal.
             if not bypass_accepted and re.search(BYPASS_PROMPT_PATTERN, clean_output):
                 logger.info("Bypass permissions prompt detected, auto-accepting")
-                session = tmux_client.server.sessions.get(session_name=self.session_name)
-                window = session.windows.get(window_name=self.window_name)
-                pane = window.active_pane
-                if pane:
-                    pane.send_keys("Down", enter=False)
-                    time.sleep(0.5)
-                    pane.send_keys("", enter=True)
+                target = f"{self.session_name}:{self.window_name}"
+                # Send raw Down arrow escape sequence (-l for literal) to move
+                # cursor to "Yes, I accept", then Enter to confirm.
+                # tmux send-keys "Down" doesn't work with Claude's Ink TUI.
+                subprocess.run(["tmux", "send-keys", "-t", target, "-l", "\x1b[B"], check=False)
+                time.sleep(0.5)
+                subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], check=False)
                 bypass_accepted = True
                 time.sleep(1.0)
                 continue  # Trust prompt may follow
@@ -191,6 +194,9 @@ class ClaudeCodeProvider(BaseProvider):
             # 3) Claude Code fully started — no prompts needed
             if re.search(r"Welcome to|Claude Code v\d+", clean_output):
                 logger.info("Claude Code started without prompts")
+                return
+            if re.search(IDLE_PROMPT_PATTERN, clean_output):
+                logger.info("Claude Code idle prompt detected, no prompts needed")
                 return
 
             time.sleep(1.0)

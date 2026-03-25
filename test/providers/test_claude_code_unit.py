@@ -135,9 +135,10 @@ class TestClaudeCodeProviderInitialization:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         provider.initialize()
 
-        mock_tmux.send_keys.assert_called_once_with(
-            "test-session", "window-0", "claude --dangerously-skip-permissions"
-        )
+        call_args = mock_tmux.send_keys.call_args
+        assert call_args[0][0] == "test-session"
+        assert call_args[0][1] == "window-0"
+        assert "claude --dangerously-skip-permissions" in call_args[0][2]
 
 
 class TestClaudeCodeProviderStatusDetection:
@@ -374,7 +375,7 @@ class TestClaudeCodeProviderMisc:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         command = provider._build_claude_command()
 
-        assert command == "claude --dangerously-skip-permissions"
+        assert "claude --dangerously-skip-permissions" in command
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     def test_build_claude_command_with_system_prompt(self, mock_load):
@@ -472,7 +473,7 @@ class TestClaudeCodeProviderStartupPrompts:
     """Tests for Claude Code startup prompt handling (trust + bypass)."""
 
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_handle_trust_prompt_detected_and_accepted(self, mock_tmux):
+    def test_handle_startup_prompts_detected_and_accepted(self, mock_tmux):
         """Test that trust prompt is detected and auto-accepted."""
         mock_tmux.get_history.return_value = (
             "\x1b[1m❯\x1b[0m 1. Yes, I trust this folder\n  2. No, don't trust\n"
@@ -513,7 +514,7 @@ class TestClaudeCodeProviderStartupPrompts:
         mock_tmux.server.sessions.get.assert_not_called()
 
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_handle_trust_prompt_empty_output_then_detected(self, mock_tmux):
+    def test_handle_startup_prompts_empty_output_then_detected(self, mock_tmux):
         """Test trust prompt detection after initially empty output."""
         mock_tmux.get_history.side_effect = [
             "",
@@ -531,8 +532,9 @@ class TestClaudeCodeProviderStartupPrompts:
 
         mock_pane.send_keys.assert_called_once_with("", enter=True)
 
+    @patch("cli_agent_orchestrator.providers.claude_code.subprocess")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_handle_bypass_prompt_detected_and_accepted(self, mock_tmux):
+    def test_handle_bypass_prompt_detected_and_accepted(self, mock_tmux, mock_subprocess):
         """Test that bypass permissions prompt is detected and auto-accepted."""
         # First poll: bypass prompt; second poll: welcome banner (after dismissal)
         mock_tmux.get_history.side_effect = [
@@ -540,26 +542,19 @@ class TestClaudeCodeProviderStartupPrompts:
             "❯ 1. No, exit\n  2. Yes, I accept\n",
             "Welcome to Claude Code v2.1.74",
         ]
-        mock_session = MagicMock()
-        mock_window = MagicMock()
-        mock_pane = MagicMock()
-        mock_tmux.server.sessions.get.return_value = mock_session
-        mock_session.windows.get.return_value = mock_window
-        mock_window.active_pane = mock_pane
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         provider._handle_startup_prompts(timeout=5.0)
 
-        # Verify Down+Enter was sent (select option 2)
-        calls = mock_pane.send_keys.call_args_list
+        # Verify raw Down arrow escape sequence + Enter was sent via subprocess
+        calls = mock_subprocess.run.call_args_list
         assert len(calls) == 2
-        assert calls[0].args == ("Down",)
-        assert calls[0].kwargs == {"enter": False}
-        assert calls[1].args == ("",)
-        assert calls[1].kwargs == {"enter": True}
+        assert calls[0].args[0] == ["tmux", "send-keys", "-t", "test-session:window-0", "-l", "\x1b[B"]
+        assert calls[1].args[0] == ["tmux", "send-keys", "-t", "test-session:window-0", "Enter"]
 
+    @patch("cli_agent_orchestrator.providers.claude_code.subprocess")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_handle_bypass_then_trust_prompt(self, mock_tmux):
+    def test_handle_bypass_then_trust_prompt(self, mock_tmux, mock_subprocess):
         """Test that bypass prompt is handled, then trust prompt follows."""
         # Poll 1: bypass prompt; Poll 2: trust prompt (after bypass dismissed)
         mock_tmux.get_history.side_effect = [
@@ -576,12 +571,14 @@ class TestClaudeCodeProviderStartupPrompts:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         provider._handle_startup_prompts(timeout=5.0)
 
-        # 3 calls: Down (bypass), Enter (bypass), Enter (trust)
-        calls = mock_pane.send_keys.call_args_list
-        assert len(calls) == 3
-        assert calls[0].args == ("Down",)
-        assert calls[2].args == ("",)
-        assert calls[2].kwargs == {"enter": True}
+        # Bypass: 2 subprocess calls (Down + Enter), then trust: 1 pane.send_keys call
+        sub_calls = mock_subprocess.run.call_args_list
+        assert len(sub_calls) == 2
+        assert sub_calls[0].args[0] == ["tmux", "send-keys", "-t", "test-session:window-0", "-l", "\x1b[B"]
+        pane_calls = mock_pane.send_keys.call_args_list
+        assert len(pane_calls) == 1
+        assert pane_calls[0].args == ("",)
+        assert pane_calls[0].kwargs == {"enter": True}
 
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
     def test_get_status_trust_prompt_not_waiting_user_answer(self, mock_tmux):
