@@ -17,48 +17,43 @@ regardless of which provider the supervisor is running on.
 
 | Profile | Description |
 |---------|-------------|
-| `cross_provider_supervisor.md` | Supervisor that delegates to cross-provider workers. Runs on whichever provider you launch it with. |
+| `cross_provider_supervisor.md` | Supervisor that delegates to cross-provider workers |
 
-### Data Analysts (use with assign)
-
-Pick the ones that match the providers you have installed. You do NOT need all of them.
+### Data Analysts (assign — parallel)
 
 | Profile | Provider Override |
 |---------|------------------|
 | `data_analyst_claude_code.md` | `claude_code` |
-| `data_analyst_codex.md` | `codex` |
-| `data_analyst_copilot_cli.md` | `copilot_cli` |
 | `data_analyst_gemini_cli.md` | `gemini_cli` |
 | `data_analyst_kiro_cli.md` | `kiro_cli` |
 
-### Report Generator (use with handoff)
+### Additional Data Analysts
+
+These are not referenced by the default supervisor profile but are available
+if you want to use other providers:
+
+| Profile | Provider Override |
+|---------|------------------|
+| `data_analyst_codex.md` | `codex` |
+| `data_analyst_copilot_cli.md` | `copilot_cli` |
+
+### Report Generator (handoff — sequential)
 
 | Profile | Provider Override |
 |---------|------------------|
 | `report_generator_codex.md` | `codex` |
 
-You can also use the base `report_generator` from `examples/assign/` if you want the
-report generator to run on the same provider as the supervisor.
-
 ## Installation
 
-Install the supervisor and whichever worker profiles match your installed providers:
-
 ```bash
-# Required: supervisor
+# Supervisor
 cao install examples/cross-provider/cross_provider_supervisor.md
 
-# Pick the data analysts for providers you have installed:
+# Default worker profiles (used by the supervisor)
 cao install examples/cross-provider/data_analyst_claude_code.md
-cao install examples/cross-provider/data_analyst_codex.md
-# cao install examples/cross-provider/data_analyst_copilot_cli.md
-# cao install examples/cross-provider/data_analyst_gemini_cli.md
-# cao install examples/cross-provider/data_analyst_kiro_cli.md
-
-# Report generator (pick one):
+cao install examples/cross-provider/data_analyst_gemini_cli.md
+cao install examples/cross-provider/data_analyst_kiro_cli.md
 cao install examples/cross-provider/report_generator_codex.md
-# Or use the base one from examples/assign/:
-# cao install examples/assign/report_generator.md
 ```
 
 ## Usage
@@ -67,16 +62,72 @@ Start the supervisor on any provider — it will delegate to workers on the prov
 specified in their profiles:
 
 ```bash
-# Example: supervisor on Kiro CLI, workers on Claude Code + Codex
+# Supervisor on Kiro CLI, workers on Claude Code + Gemini CLI + Kiro CLI + Codex
 cao launch --provider kiro_cli --agent-profile cross_provider_supervisor --session-name my-session
 
-# Example: supervisor on Claude Code
+# Supervisor on Claude Code
 cao launch --provider claude_code --agent-profile cross_provider_supervisor --session-name my-session
 ```
 
-The supervisor's system prompt lists all available worker profiles. When the user gives
-a task, the supervisor picks which workers to use based on what's installed. If a worker
-profile isn't installed, the assign/handoff call will fail with a clear error.
+## Customizing the Supervisor
+
+The default supervisor uses `data_analyst_claude_code`, `data_analyst_gemini_cli`,
+and `data_analyst_kiro_cli` for data analysis, and `report_generator_codex` for
+report generation. To use different providers:
+
+1. Install the additional worker profiles you need:
+
+```bash
+cao install examples/cross-provider/data_analyst_codex.md
+cao install examples/cross-provider/data_analyst_copilot_cli.md
+```
+
+2. Copy and edit the supervisor profile to reference the profiles you want:
+
+```bash
+cp examples/cross-provider/cross_provider_supervisor.md my_supervisor.md
+```
+
+3. In `my_supervisor.md`, update the **Worker Profiles** table and the **Example**
+   section to use your preferred profiles. For example, to use Codex and Copilot CLI
+   instead of Gemini CLI and Kiro CLI:
+
+```markdown
+| `data_analyst_claude_code` | Claude Code |
+| `data_analyst_codex` | Codex |
+| `data_analyst_copilot_cli` | Copilot CLI |
+```
+
+4. Install and launch your custom supervisor:
+
+```bash
+cao install my_supervisor.md
+cao launch --provider kiro_cli --agent-profile my_supervisor --session-name my-session
+```
+
+## Creating Your Own Cross-Provider Profile
+
+To create a cross-provider version of any agent profile, add a `provider` field to
+the frontmatter:
+
+```yaml
+---
+name: my_agent_codex
+description: My agent that runs on Codex
+provider: codex
+mcpServers:
+  cao-mcp-server:
+    type: stdio
+    command: uvx
+    args:
+      - "--from"
+      - "git+https://github.com/awslabs/cli-agent-orchestrator.git@main"
+      - "cao-mcp-server"
+---
+```
+
+Valid provider values: `kiro_cli`, `claude_code`, `codex`, `q_cli`, `gemini_cli`,
+`kimi_cli`, `copilot_cli`.
 
 ## E2E Tests
 
