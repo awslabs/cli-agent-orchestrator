@@ -221,49 +221,61 @@ node --version   # Should be 18 or higher
 
 ### Starting the Web UI
 
-```bash
-# 1. Start the backend server (if not already running)
-cao-server
-# Or with custom host/port:
-cao-server --host 0.0.0.0 --port 9889  # ⚠️ Exposes server to network — see Security note below
+> **Note:** The Web UI requires a cloned copy of the repository (the `web/` directory is not included in the `uv tool install` package). If you installed CAO via `uv tool install`, clone the repo first:
+> ```bash
+> git clone https://github.com/awslabs/cli-agent-orchestrator.git
+> cd cli-agent-orchestrator/
+> ```
 
-# 2. Start the frontend dev server
+All commands below assume you are in the **project root** directory (`cli-agent-orchestrator/`).
+
+**Option A: Development mode** (hot-reload, two terminals needed)
+
+```bash
+# Terminal 1 — start the backend server
+cao-server
+
+# Terminal 2 — start the frontend dev server
 cd web/
 npm install        # First time only
 npm run dev        # Starts on http://localhost:5173
 ```
 
-**Alternative: production mode** — Build the frontend once and let the backend serve it (no Vite dev server needed):
+Open http://localhost:5173 in your browser.
+
+**Option B: Production mode** (single server, no Vite needed)
 
 ```bash
+# Build the frontend once
 cd web/
 npm install && npm run build   # Outputs to web/dist/
-cao-server                     # Serves UI at http://localhost:9889
+
+# Start the backend — it serves the built frontend automatically
+cd ..
+cao-server
 ```
 
-If you're on a remote machine (e.g. dev desktop), set up an SSH tunnel to access the UI locally:
+Open http://localhost:9889 in your browser.
+
+> **Custom host/port:** `cao-server --host 0.0.0.0 --port 9889` exposes the server to the network — see Security note below.
+
+**Remote machine access** — If you're running CAO on a remote host (e.g. dev desktop), set up an SSH tunnel:
 
 ```bash
-# From your local machine (dev server mode)
+# Dev mode (proxy both frontend and backend)
 ssh -L 5173:localhost:5173 -L 9889:localhost:9889 your-remote-host
-# Or production mode (backend serves UI directly)
+
+# Production mode (backend serves UI directly)
 ssh -L 9889:localhost:9889 your-remote-host
 ```
 
-Then open http://localhost:5173 (dev) or http://localhost:9889 (production) in your browser.
+Then open the same URLs (localhost:5173 or localhost:9889) in your local browser.
 
 ### Features
 
 Manage sessions, spawn agents, create scheduled flows, configure agent directories, and interact with live terminals — all from the browser. Includes live status badges, an inbox for agent-to-agent messaging, output viewer, and provider auto-detection.
 
-### Building for Production
-
-```bash
-cd web/
-npm run build      # Outputs to web/dist/
-```
-
-When `web/dist/` exists, the backend serves it automatically at the server root — no separate frontend server needed.
+For frontend architecture and component details, see [web/README.md](web/README.md). For agent directory configuration, see [docs/settings.md](docs/settings.md).
 
 ## MCP Server Tools and Orchestration Modes
 
@@ -471,7 +483,7 @@ provider: claude_code
 ---
 ```
 
-Valid values: `kiro_cli`, `claude_code`, `codex`, `q_cli`, `gemini_cli`.
+Valid values: `kiro_cli`, `claude_code`, `codex`, `q_cli`, `gemini_cli`, `kimi_cli`, `copilot_cli`.
 
 When a supervisor calls `assign` or `handoff`, CAO reads the worker's agent profile and uses the declared provider if present. If the key is missing or invalid, the worker falls back to the supervisor's provider.
 
