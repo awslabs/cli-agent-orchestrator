@@ -275,6 +275,8 @@ Then open the same URLs (localhost:5173 or localhost:9889) in your local browser
 
 Manage sessions, spawn agents, create scheduled flows, configure agent directories, and interact with live terminals — all from the browser. Includes live status badges, an inbox for agent-to-agent messaging, output viewer, and provider auto-detection.
 
+For frontend architecture and component details, see [web/README.md](web/README.md). For agent directory configuration, see [docs/settings.md](docs/settings.md).
+
 ## MCP Server Tools and Orchestration Modes
 
 CAO provides a local HTTP server that processes orchestration requests. CLI agents can interact with this server through MCP tools to coordinate multi-agent workflows.
