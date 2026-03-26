@@ -103,6 +103,7 @@ def list_agent_profiles() -> List[Dict]:
         "q_cli": "q_cli",
         "claude_code": "claude_code",
         "codex": "codex",
+        "cao_installed": "installed",
     }
     for provider, dir_path in agent_dirs.items():
         label = provider_source_labels.get(provider, provider)
