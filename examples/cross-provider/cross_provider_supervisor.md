@@ -1,6 +1,6 @@
 ---
 name: cross_provider_supervisor
-description: Supervisor agent that delegates data analysis to workers on different providers (Claude Code, Gemini CLI, Kiro CLI)
+description: Supervisor agent that delegates data analysis to workers on different providers (Claude Code, Gemini CLI, Kiro CLI, Codex)
 mcpServers:
   cao-mcp-server:
     type: stdio
