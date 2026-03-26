@@ -221,6 +221,12 @@ node --version   # Should be 18 or higher
 
 ### Starting the Web UI
 
+> **Note:** The Web UI requires a cloned copy of the repository (the `web/` directory is not included in the `uv tool install` package). If you installed CAO via `uv tool install`, clone the repo first:
+> ```bash
+> git clone https://github.com/awslabs/cli-agent-orchestrator.git
+> cd cli-agent-orchestrator/
+> ```
+
 All commands below assume you are in the **project root** directory (`cli-agent-orchestrator/`).
 
 **Option A: Development mode** (hot-reload, two terminals needed)
