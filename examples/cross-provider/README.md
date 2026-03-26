@@ -1,23 +1,26 @@
 # Cross-Provider Examples
 
-Agent profiles that declare a `provider` key in their frontmatter, enabling
-cross-provider workflows where a supervisor on one provider delegates to workers
-on different providers.
+Agent profiles that demonstrate cross-provider workflows where a supervisor on one
+provider delegates to workers on different providers via the `provider` key in
+their frontmatter.
 
 ## Profiles
 
-| Profile | Provider Override | Description |
-|---------|------------------|-------------|
+| Profile | Provider Override | Role |
+|---------|------------------|------|
+| `cross_provider_supervisor.md` | *(none — uses launch provider)* | Supervisor that delegates to cross-provider workers |
 | `data_analyst_claude_code.md` | `claude_code` | Data analyst that runs on Claude Code |
 | `data_analyst_gemini_cli.md` | `gemini_cli` | Data analyst that runs on Gemini CLI |
 | `data_analyst_kiro_cli.md` | `kiro_cli` | Data analyst that runs on Kiro CLI |
 
-Each profile is identical to `examples/assign/data_analyst.md` except for the
-added `provider` field in the frontmatter.
+The worker profiles are identical to `examples/assign/data_analyst.md` except for the
+added `provider` field in the frontmatter. The supervisor profile references the
+cross-provider worker names so CAO launches each worker on the correct provider.
 
 ## Installation
 
 ```bash
+cao install examples/cross-provider/cross_provider_supervisor.md
 cao install examples/cross-provider/data_analyst_claude_code.md
 cao install examples/cross-provider/data_analyst_gemini_cli.md
 cao install examples/cross-provider/data_analyst_kiro_cli.md
@@ -25,15 +28,23 @@ cao install examples/cross-provider/data_analyst_kiro_cli.md
 
 ## Usage
 
-Start a session on one provider and assign a worker using a cross-provider profile:
+Start the supervisor on any provider — it will delegate to workers on different providers:
 
 ```bash
-# Start a Kiro CLI supervisor session
-cao launch --provider kiro_cli --agent-profile data_analyst --session-name my-session
+# Start a Kiro CLI supervisor session with the cross-provider supervisor profile
+cao launch --provider kiro_cli --agent-profile cross_provider_supervisor --session-name my-session
 
-# The supervisor can then assign tasks to workers on different providers.
-# When it calls assign() with data_analyst_gemini_cli, CAO reads the profile's
-# provider key and launches the worker on Gemini CLI instead of Kiro CLI.
+# The supervisor assigns tasks using cross-provider worker profiles.
+# When it calls assign(agent_profile="data_analyst_claude_code", ...),
+# CAO reads the profile's provider key and launches the worker on Claude Code
+# instead of Kiro CLI.
+```
+
+You can also run the supervisor on Claude Code or Gemini CLI — the workers will
+still launch on their respective providers:
+
+```bash
+cao launch --provider claude_code --agent-profile cross_provider_supervisor --session-name my-session
 ```
 
 ## E2E Tests
