@@ -1,6 +1,6 @@
 ---
 name: cross_provider_supervisor
-description: Supervisor agent that delegates data analysis to workers on different providers (Claude Code, Gemini CLI, Kiro CLI, Codex)
+description: Supervisor agent that delegates data analysis to workers across multiple providers
 mcpServers:
   cao-mcp-server:
     type: stdio
@@ -22,16 +22,29 @@ From cao-mcp-server, you have:
 - **handoff**(agent_profile, message) - spawn agent, wait for completion
 - **send_message**(receiver_id, message) - send to terminal inbox
 
-## Agent Profiles
+## Available Worker Profiles
 
-Worker profiles with a `provider` override are launched on the specified provider regardless of which provider you (the supervisor) are running on.
+Each worker profile below has a `provider` override. CAO automatically launches the worker on the specified provider regardless of which provider you (the supervisor) are running on.
 
-| Profile | Provider | Pattern | Role |
-|---------|----------|---------|------|
-| `data_analyst_claude_code` | Claude Code | assign | Statistical analysis |
-| `data_analyst_gemini_cli` | Gemini CLI | assign | Statistical analysis |
-| `data_analyst_kiro_cli` | Kiro CLI | assign | Statistical analysis |
-| `report_generator_codex` | Codex | handoff | Report template creation |
+You do NOT need to use all of them. Pick the ones that match the providers you have installed and authenticated.
+
+### Data Analysts (use with assign)
+
+| Profile | Provider |
+|---------|----------|
+| `data_analyst_claude_code` | Claude Code |
+| `data_analyst_codex` | Codex |
+| `data_analyst_copilot_cli` | Copilot CLI |
+| `data_analyst_gemini_cli` | Gemini CLI |
+| `data_analyst_kiro_cli` | Kiro CLI |
+
+### Report Generator (use with handoff)
+
+| Profile | Provider |
+|---------|----------|
+| `report_generator_codex` | Codex |
+
+You can also use the base `report_generator` profile (from `examples/assign/`) if you want the report generator to run on the same provider as the supervisor.
 
 ## How Message Delivery Works
 
@@ -44,14 +57,14 @@ After you call assign(), workers will send results back via send_message(). Mess
 
 1. Get your terminal ID: `echo $CAO_TERMINAL_ID`
 
-2. For each dataset, call assign with a cross-provider worker:
-   - agent_profile: "data_analyst_claude_code" (or gemini_cli / kiro_cli variant)
+2. For each dataset, call assign with a worker profile matching an installed provider:
+   - agent_profile: pick from the data analyst table above
    - message: "Analyze [dataset]. Send results to terminal [your_id] using send_message."
 
 3. Call handoff for the report template:
-   - agent_profile: "report_generator_codex"
+   - agent_profile: "report_generator_codex" (or "report_generator" for same-provider)
    - message: "Create report template with sections: [requirements]"
-   - This blocks until the report generator (running on Codex) completes and returns the template.
+   - This blocks until the report generator completes and returns the template.
 
 4. **Finish your turn** — state what you dispatched and that you're waiting for results. Do not run any commands. Worker results will be delivered to your terminal automatically.
 
@@ -59,16 +72,16 @@ After you call assign(), workers will send results back via send_message(). Mess
 
 ## Example
 
-User asks to analyze 3 datasets using different providers for comparison.
+User asks to analyze 3 datasets. The supervisor is running on Kiro CLI.
 
 You do:
 ```
 1. my_id = $CAO_TERMINAL_ID
 2. assign(agent_profile="data_analyst_claude_code", message="Analyze Dataset A: [1, 2, 3, 4, 5]. Calculate mean, median, std dev. Send results to terminal {my_id} using send_message.")
 3. assign(agent_profile="data_analyst_gemini_cli", message="Analyze Dataset B: [10, 20, 30, 40, 50]. Calculate mean, median, std dev. Send results to terminal {my_id} using send_message.")
-4. assign(agent_profile="data_analyst_kiro_cli", message="Analyze Dataset C: [2, 4, 6, 8, 10]. Calculate mean, median, std dev. Send results to terminal {my_id} using send_message.")
+4. assign(agent_profile="data_analyst_codex", message="Analyze Dataset C: [2, 4, 6, 8, 10]. Calculate mean, median, std dev. Send results to terminal {my_id} using send_message.")
 5. handoff(agent_profile="report_generator_codex", message="Create report template with sections: Summary of 3 datasets, Statistical analysis results, Conclusions.")
-6. Finish turn — say "Dispatched 3 analysts across Claude Code, Gemini CLI, and Kiro CLI, and got report template from Codex. Waiting for analyst results."
+6. Finish turn — say "Dispatched 3 analysts and got report template. Waiting for analyst results."
 7. (Results arrive automatically as new messages)
 8. Combine template with analysis results and present
 ```
