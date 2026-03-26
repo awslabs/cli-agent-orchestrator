@@ -43,8 +43,14 @@ if you want to use other providers:
 |---------|------------------|
 | `report_generator_codex.md` | `codex` |
 
-## Installation
+## Setup
 
+1. Start the CAO server:
+```bash
+cao-server
+```
+
+2. Install the agent profiles:
 ```bash
 # Supervisor
 cao install examples/cross-provider/cross_provider_supervisor.md
@@ -56,17 +62,31 @@ cao install examples/cross-provider/data_analyst_kiro_cli.md
 cao install examples/cross-provider/report_generator_codex.md
 ```
 
+3. Launch the supervisor:
+```bash
+# Using Kiro CLI (workers on Claude Code + Gemini CLI + Kiro CLI + Codex)
+cao launch --agent-profile cross_provider_supervisor --provider kiro_cli
+
+# Or specify a different provider for the supervisor
+cao launch --agent-profile cross_provider_supervisor --provider claude_code
+cao launch --agent-profile cross_provider_supervisor --provider codex
+cao launch --agent-profile cross_provider_supervisor --provider gemini_cli
+cao launch --agent-profile cross_provider_supervisor --provider kimi_cli
+cao launch --agent-profile cross_provider_supervisor --provider copilot_cli
+```
+
 ## Usage
 
-Start the supervisor on any provider — it will delegate to workers on the providers
-specified in their profiles:
+In the supervisor terminal, try this example task:
 
-```bash
-# Supervisor on Kiro CLI, workers on Claude Code + Gemini CLI + Kiro CLI + Codex
-cao launch --provider kiro_cli --agent-profile cross_provider_supervisor --session-name my-session
+```
+Analyze these datasets and create a comprehensive report:
+- Dataset A: [1, 2, 3, 4, 5]
+- Dataset B: [10, 20, 30, 40, 50]
+- Dataset C: [5, 15, 25, 35, 45]
 
-# Supervisor on Claude Code
-cao launch --provider claude_code --agent-profile cross_provider_supervisor --session-name my-session
+Calculate mean, median, and standard deviation for each dataset.
+Generate a professional report with the analysis results.
 ```
 
 ## Customizing the Supervisor
