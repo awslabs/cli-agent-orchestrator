@@ -122,11 +122,13 @@ class TmuxClient:
 
             # Filter out provider env vars that would cause "nested session"
             # errors when CAO itself runs inside a provider (e.g. Claude Code).
+            # Preserve CLAUDE_CODE_USE_BEDROCK which is needed for Bedrock auth.
             blocked_prefixes = ("CLAUDE", "CODEX_")
+            allowed_vars = {"CLAUDE_CODE_USE_BEDROCK"}
             environment = {
                 k: v
                 for k, v in os.environ.items()
-                if not any(k.startswith(p) for p in blocked_prefixes)
+                if k in allowed_vars or not any(k.startswith(p) for p in blocked_prefixes)
             }
             environment["CAO_TERMINAL_ID"] = terminal_id
 
