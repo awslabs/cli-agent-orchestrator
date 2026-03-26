@@ -112,7 +112,8 @@ class ClaudeCodeProvider(BaseProvider):
         # When cao-server runs inside a Claude Code session, CLAUDE* env vars
         # leak into spawned tmux panes (via the tmux server's global env).
         # Claude Code detects these and refuses to start ("nested session").
-        # Unset all matching vars except CLAUDE_CODE_USE_BEDROCK (needed for auth).
+        # Unset all matching vars except CLAUDE_CODE_USE_BEDROCK (needed for
+        # authentication — Bedrock, custom models, and default credentials).
         unset_cmd = "unset $(env | sed -n 's/^\\(CLAUDE[A-Z_]*\\)=.*/\\1/p' | grep -v CLAUDE_CODE_USE_BEDROCK) 2>/dev/null"
         return f"{unset_cmd}; {claude_cmd}"
 
