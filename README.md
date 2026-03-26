@@ -221,13 +221,15 @@ node --version   # Should be 18 or higher
 
 ### Starting the Web UI
 
+All commands below assume you are in the **project root** directory (`cli-agent-orchestrator/`).
+
 ```bash
 # 1. Start the backend server (if not already running)
 cao-server
 # Or with custom host/port:
 cao-server --host 0.0.0.0 --port 9889  # ⚠️ Exposes server to network — see Security note below
 
-# 2. Start the frontend dev server
+# 2. In a new terminal, start the frontend dev server
 cd web/
 npm install        # First time only
 npm run dev        # Starts on http://localhost:5173
