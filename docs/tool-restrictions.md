@@ -294,9 +294,9 @@ Each agent is restricted based on its own profile, not its parent's permissions.
 
 ## Known Limitations
 
-1. **Claude Code tool mapping is incomplete.** The current mapping covers `Bash`, `Read`, `Edit`, `Write`, `Glob`, and `Grep`. Claude Code also has `WebFetch`, `Agent` (subagent), and MCP tools that are not yet mapped to CAO vocabulary. These tools remain unrestricted even when `allowedTools` is set. Future versions will add `web_fetch` and `subagent` to the CAO vocabulary.
+1. **Claude Code tool mapping is incomplete.** The current mapping covers `Bash`, `Read`, `Edit`, `Write`, `Glob`, and `Grep`. Claude Code also has [`WebFetch`](https://code.claude.com/docs/en/permissions#webfetch), `Agent` (subagent), and MCP tools that are not yet mapped to CAO vocabulary. These tools remain **unrestricted** even when `allowedTools` is set — they cannot be blocked via `--disallowedTools`. Future versions will add `web_fetch` and `subagent` to the CAO vocabulary.
 
-2. **MCP tool control is coarse-grained.** `@cao-mcp-server` allows all tools from that server (`handoff`, `assign`, `send_message`, `list_terminals`, etc.). There is no way to allow only `send_message` while blocking `assign`. Future versions may support `@cao-mcp-server:send_message` syntax for per-tool MCP control.
+2. **`@cao-mcp-server` is a pass-through marker, not enforced at the provider level.** Including `@cao-mcp-server` in `allowedTools` signals intent (this agent should have orchestration tools), but it does **not** translate to any native `--disallowedTools` flag. MCP tools (`handoff`, `assign`, `send_message`) are always available to the agent regardless of `allowedTools` — providers do not currently support blocking individual MCP tools. Additionally, `@cao-mcp-server` is all-or-nothing: there is no way to allow only `send_message` while blocking `assign`. Future versions may support `@cao-mcp-server:send_message` syntax for per-tool MCP control.
 
 3. **Soft enforcement is best-effort.** Kimi CLI and Codex rely on system prompt instructions to restrict tools. The agent may ignore these restrictions. Do not rely on soft enforcement for security-critical workloads.
 
