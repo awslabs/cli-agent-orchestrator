@@ -20,7 +20,7 @@ class TestResolveAllowedTools:
     def test_role_defaults_when_no_profile_tools(self):
         """Role-based defaults used when profile has no allowedTools."""
         result = resolve_allowed_tools(None, "supervisor")
-        assert result == ["@cao-mcp-server"]
+        assert result == ["@cao-mcp-server", "fs_read", "fs_list"]
 
     def test_reviewer_role_defaults(self):
         result = resolve_allowed_tools(None, "reviewer")
@@ -34,10 +34,10 @@ class TestResolveAllowedTools:
         assert "execute_bash" in result
         assert "fs_*" in result
 
-    def test_default_role_when_none(self):
-        """None role defaults to developer."""
+    def test_unrestricted_when_no_role_no_tools(self):
+        """No role + no allowedTools = unrestricted (backward compatible)."""
         result = resolve_allowed_tools(None, None)
-        assert "execute_bash" in result
+        assert result == ["*"]
 
     def test_mcp_servers_appended(self):
         """MCP server names appended as @server_name."""

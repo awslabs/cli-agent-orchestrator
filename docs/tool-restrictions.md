@@ -1,249 +1,228 @@
-# Tool Restrictions (allowedTools)
+# Tool Restrictions
 
-CAO enforces tool restrictions through `allowedTools` — a unified vocabulary that gets translated to each provider's native restriction mechanism. This ensures agents only have access to the tools their role requires, regardless of which CLI provider runs them.
+## Concept Overview
 
-## How It Works
+CAO controls what tools an agent can use through a two-layer system:
 
 ```
-Agent profile markdown (or --allowed-tools CLI flag)
-  └→ CAO vocabulary: execute_bash, fs_read, fs_write, fs_*, @cao-mcp-server, @builtin
-     └→ Translated per provider:
-          Kiro CLI / Q CLI:   allowedTools in agent JSON config (install time)
-          Claude Code:        --disallowedTools CLI flags
-          Copilot CLI:        --deny-tool flags (overrides --allow-all)
-          Gemini CLI:         Policy Engine TOML deny rules (~/.gemini/policies/)
-          Kimi CLI:           Security system prompt (soft enforcement)
-          Codex:              Security system prompt (soft enforcement)
+                ┌─────────────────────────────────┐
+  High-level    │           role                   │  "What kind of agent is this?"
+                │   supervisor, developer, ...     │  A named bundle of allowedTools
+                └──────────────┬──────────────────┘
+                               │ maps to
+                ┌──────────────▼──────────────────┐
+  Low-level     │        allowedTools              │  "What tools can this agent use?"
+                │  execute_bash, fs_read, ...      │  Fine-grained tool list
+                └─────────────────────────────────┘
 ```
 
-## Provider Behavior Summary
+- **`role`** — High-level abstraction. A named preset that maps to a default set of `allowedTools`. Think of it as "what kind of agent is this?" Built-in roles ship with CAO; users can define custom roles.
+- **`allowedTools`** — Low-level control. An explicit list of tools the agent can use. Always overrides `role` when set.
+- **`--yolo`** — Escape hatch. Bypasses ALL restrictions and skips confirmation prompts. The agent can do anything.
 
-The table below shows what happens for each provider when a `supervisor` role (restricted) and `developer` role (unrestricted) agent is launched, with and without `--yolo`:
+## Default Behavior (Backward Compatible)
 
-| Provider | Enforcement | `supervisor` (no `--yolo`) | `developer` (no `--yolo`) | Any role + `--yolo` |
-|----------|------------|--------------------------|--------------------------|---------------------|
-| **Kiro CLI** | Hard | `allowedTools: ["@cao-mcp-server"]` in agent JSON — no bash, no file write | `allowedTools: ["@builtin", "fs_*", "execute_bash", "@cao-mcp-server"]` in agent JSON | `allowedTools: ["*"]` — unrestricted |
-| **Q CLI** | Hard | Same as Kiro CLI (agent JSON) | Same as Kiro CLI (agent JSON) | `allowedTools: ["*"]` — unrestricted |
-| **Claude Code** | Hard | `--disallowedTools Bash Edit Write Glob Grep` blocks shell + file tools | No `--disallowedTools` flags — all tools available | No `--disallowedTools` — unrestricted |
-| **Copilot CLI** | Hard | `--deny-tool shell --deny-tool write ...` blocks shell + file write | No `--deny-tool` flags — all tools available | No `--deny-tool` — unrestricted |
-| **Gemini CLI** | Hard | TOML deny rules: `run_shell_command`, `write_file`, `replace`, etc. excluded from model memory | No TOML deny rules — all tools available | No policy file written — unrestricted |
-| **Kimi CLI** | Soft | Security system prompt: "You may ONLY use: @cao-mcp-server" | No restriction prompt — full access | No restriction prompt — unrestricted |
-| **Codex** | Soft | Security system prompt: "You may ONLY use: @cao-mcp-server" | No restriction prompt — full access | No restriction prompt — unrestricted |
+**If you don't set `role` or `allowedTools`, the agent is unrestricted.** This preserves backward compatibility — existing profiles and workflows continue to work exactly as before. Tool restrictions are entirely opt-in.
 
-**Key**: Hard enforcement = agent physically cannot execute denied tools. Soft enforcement = prompt-based, agent may still attempt restricted actions.
+## The Three Controls
 
-## CAO Tool Vocabulary
+### 1. `role` — The Simple Way
 
-| CAO Tool | Description | Example Native Mapping |
-|----------|-------------|----------------------|
-| `execute_bash` | Shell/terminal command execution | Claude: `Bash`, Gemini: `run_shell_command`, Copilot: `shell` |
-| `fs_read` | Read files | Claude: `Read`, Gemini: `read_file` |
-| `fs_write` | Write/edit files | Claude: `Edit, Write`, Gemini: `write_file, replace` |
-| `fs_list` | List/search files (glob, grep) | Claude: `Glob, Grep`, Gemini: `list_directory, glob` |
-| `fs_*` | All filesystem operations (read + write + list) | Expands to all fs_ tools |
-| `@builtin` | Provider's built-in non-tool capabilities | Not mapped (provider-internal) |
-| `@cao-mcp-server` | CAO MCP server tools (assign, handoff, send_message) | Not restricted (always allowed) |
-
-## Roles and Defaults
-
-When a profile doesn't explicitly set `allowedTools`, defaults are based on the `role` field:
-
-| Role | Default `allowedTools` | Use Case |
-|------|----------------------|----------|
-| `supervisor` | `["@cao-mcp-server"]` | Orchestration only — no code execution, no file access |
-| `developer` | `["@builtin", "fs_*", "execute_bash", "@cao-mcp-server"]` | Full access for coding and testing |
-| `reviewer` | `["@builtin", "fs_read", "fs_list", "@cao-mcp-server"]` | Read-only code review |
-| *(unset)* | Same as `developer` | Backward compatible |
-
-### Setting Role in Profile
+Set `role` in your agent profile frontmatter. CAO maps it to a sensible set of `allowedTools` automatically.
 
 ```yaml
 ---
 name: code_supervisor
-description: Code Supervisor
+description: Orchestrates worker agents
 role: supervisor
 ---
 ```
 
-The `role` field determines default tool access. You can override with explicit `allowedTools`:
+#### Built-in Roles
+
+| Role | Default `allowedTools` | What the agent can do |
+|------|----------------------|----------------------|
+| `supervisor` | `@cao-mcp-server`, `fs_read`, `fs_list` | Orchestrate workers + read files for context |
+| `developer` | `@builtin`, `fs_*`, `execute_bash`, `@cao-mcp-server` | Full access: read, write, execute, orchestrate |
+| `reviewer` | `@builtin`, `fs_read`, `fs_list`, `@cao-mcp-server` | Read-only: review code, no writes or execution |
+
+#### Custom Roles
+
+Define your own roles in `~/.aws/cli-agent-orchestrator/settings.json`:
+
+```json
+{
+  "roles": {
+    "data_analyst": ["fs_read", "execute_bash", "@cao-mcp-server"],
+    "secure_dev": ["fs_read", "fs_write", "@cao-mcp-server"]
+  }
+}
+```
+
+Then use them in any profile:
+
+```yaml
+---
+name: my_analyst
+role: data_analyst
+---
+```
+
+Custom roles follow the same rules as built-in roles — they're just a named `allowedTools` list.
+
+### 2. `allowedTools` — The Precise Way
+
+Set `allowedTools` directly in the profile frontmatter for fine-grained control. This always overrides `role`.
 
 ```yaml
 ---
 name: restricted_developer
-description: Developer with no bash
+description: Developer with no bash access
 role: developer
 allowedTools: ["@builtin", "fs_*", "@cao-mcp-server"]
 ---
 ```
 
-## Resolution Order
+In this example, `role: developer` would normally include `execute_bash`, but `allowedTools` explicitly excludes it. The explicit list wins.
 
-Tool permissions are resolved in this priority order (highest wins):
+#### Tool Vocabulary
 
-| Priority | Source | Example |
-|----------|--------|---------|
-| 1 (highest) | `--yolo` flag | Sets `["*"]` — unrestricted, skips confirmation |
-| 2 | `--allowed-tools` CLI flag | `--allowed-tools @cao-mcp-server --allowed-tools fs_read` |
-| 3 | Profile `allowedTools` | `allowedTools: ["@builtin", "fs_read"]` in frontmatter |
-| 4 | Role defaults | Based on `role: supervisor` → `["@cao-mcp-server"]` |
-| 5 (lowest) | Developer defaults | Fallback if nothing else is set |
+| Tool | What it allows | Example: Claude Code | Example: Gemini CLI |
+|------|---------------|---------------------|-------------------|
+| `execute_bash` | Run shell commands | `Bash` | `run_shell_command` |
+| `fs_read` | Read files | `Read` | `read_file` |
+| `fs_write` | Write/edit files | `Edit`, `Write` | `write_file`, `replace` |
+| `fs_list` | Search/list files | `Glob`, `Grep` | `list_directory`, `glob` |
+| `fs_*` | All filesystem ops | All of the above | All of the above |
+| `@builtin` | Provider built-in capabilities | (internal) | (internal) |
+| `@cao-mcp-server` | CAO orchestration tools | `handoff`, `assign`, `send_message` | Same |
+| `*` | Everything (unrestricted) | All tools | All tools |
 
-## The `--yolo` Flag
+CAO translates these to each provider's native tool names automatically. You write one vocabulary; it works across all 7 providers.
 
-`--yolo` is the escape hatch — it sets `allowedTools: ["*"]` (unrestricted) AND skips the confirmation prompt.
+### 3. `--yolo` — The Escape Hatch
 
 ```bash
-# With --yolo: agent can execute ANY command (aws, rm, curl, etc.)
 cao launch --agents code_supervisor --yolo
+```
 
-# Without --yolo: shows confirmation prompt with tool summary
+`--yolo` does two things:
+1. Sets `allowedTools: ["*"]` — the agent can use ALL tools
+2. Skips the confirmation prompt — no "do you trust this folder?" question
+
+**Use `--yolo` when you want zero restrictions and zero prompts.** This overrides everything — role, allowedTools, CLI flags. The agent can execute any command: `aws`, `rm -rf`, `curl`, read credentials, anything.
+
+## How Overrides Work
+
+When multiple controls are set, the highest priority wins:
+
+```
+Priority (highest to lowest):
+
+  1. --yolo                    → ["*"] (unrestricted, no prompts)
+  2. --allowed-tools CLI flag  → explicit list at launch time
+  3. allowedTools in profile   → explicit list in frontmatter
+  4. role in profile           → maps to built-in/custom role defaults
+  5. (nothing set)             → unrestricted (backward compatible)
+```
+
+Examples:
+
+```bash
+# Profile has role: supervisor → restricted to @cao-mcp-server + fs_read + fs_list
 cao launch --agents code_supervisor
-# Output:
-#   Agent 'code_supervisor' launching on kiro_cli:
-#     Allowed:  @cao-mcp-server
-#     Blocked:  run_shell_command, write_file, replace, ...
-#     Directory: /home/user/project
-#
-#   Do you trust all the actions in this folder? [Y/n]
+
+# CLI flag overrides the role
+cao launch --agents code_supervisor --allowed-tools execute_bash --allowed-tools fs_read
+
+# --yolo overrides everything
+cao launch --agents code_supervisor --yolo
 ```
 
-**When `--yolo` is set, ALL provider restrictions are bypassed** — no policy files, no `--disallowedTools`, no deny rules. This is the current behavior and is by design.
+## Provider Enforcement
 
-## Provider Enforcement Details
+CAO translates `allowedTools` to each provider's native restriction mechanism:
 
-### Hard Enforcement (5/7 providers)
+| Provider | Enforcement | How it works |
+|----------|------------|-------------|
+| **Claude Code** | Hard | `--disallowedTools` flags block specific tools |
+| **Kiro CLI** | Hard | `allowedTools` in agent JSON at install time |
+| **Q CLI** | Hard | `allowedTools` in agent JSON at install time |
+| **Copilot CLI** | Hard | `--deny-tool` flags override `--allow-all` |
+| **Gemini CLI** | Hard | Policy Engine TOML deny rules in `~/.gemini/policies/` |
+| **Kimi CLI** | Soft | Security system prompt only |
+| **Codex** | Soft | Security system prompt only |
 
-These providers block tools at the runtime level — the agent physically cannot execute denied tools.
+**Hard enforcement** = the agent physically cannot use denied tools, enforced by the provider runtime.
 
-#### Kiro CLI / Q CLI
+**Soft enforcement** = a system prompt tells the agent not to use certain tools. The agent may still attempt them. Use hard-enforcement providers for security-critical work.
 
-Tool restrictions are baked into the agent JSON at **install time**:
+### What "hard" looks like per provider
 
+**Claude Code** — Adds `--disallowedTools` flags to the launch command:
 ```bash
-cao install code_supervisor --provider kiro_cli
-# Writes allowedTools: ["@cao-mcp-server"] to ~/.kiro/agents/code_supervisor.json
+claude --dangerously-skip-permissions --disallowedTools Bash --disallowedTools Edit --disallowedTools Write
 ```
 
-Runtime `allowed_tools` API parameters are stored in the database for auditing/inheritance but don't change Kiro/Q CLI's behavior. To update restrictions, reinstall the profile.
+**Kiro CLI / Q CLI** — Writes `allowedTools` into the agent JSON at install time:
+```json
+{ "allowedTools": ["@cao-mcp-server", "fs_read", "fs_list"] }
+```
 
-#### Claude Code
-
-Restrictions via `--disallowedTools` flags alongside `--dangerously-skip-permissions`:
-
+**Copilot CLI** — Adds `--deny-tool` flags that override `--allow-all`:
 ```bash
-claude --dangerously-skip-permissions --disallowedTools Bash --disallowedTools Edit --disallowedTools Write ...
+copilot --allow-all --deny-tool shell --deny-tool write
 ```
 
-Applied at runtime per-session. The `--dangerously-skip-permissions` flag auto-approves allowed tools while `--disallowedTools` blocks specific ones.
-
-#### Copilot CLI
-
-Restrictions via `--deny-tool` flags that override `--allow-all`:
-
-```bash
-copilot --allow-all --deny-tool shell --deny-tool write ...
-```
-
-`--deny-tool` takes precedence over `--allow-all`, providing hard enforcement.
-
-#### Gemini CLI
-
-Restrictions via **Policy Engine TOML deny rules** in `~/.gemini/policies/`:
-
+**Gemini CLI** — Writes per-session TOML deny rules to `~/.gemini/policies/`:
 ```toml
-# Auto-generated by CAO — tool restriction policy
-# Terminal: abc12345
-
 [[rule]]
 toolName = "run_shell_command"
 decision = "deny"
 priority = 900
-deny_message = "Blocked by CAO policy (terminal abc12345)"
-
-[[rule]]
-toolName = "write_file"
-decision = "deny"
-priority = 900
-deny_message = "Blocked by CAO policy (terminal abc12345)"
 ```
 
-Policy Engine deny rules completely **exclude tools from the model's memory** — the model doesn't even see them as options. This works even in `--yolo` mode (unlike the deprecated `excludeTools` in settings.json).
-
-Each terminal gets its own policy file (`cao-{terminal_id}.toml`), so concurrent sessions don't conflict. Files are cleaned up when sessions end.
-
-### Soft Enforcement (2/7 providers)
-
-These providers lack native tool restriction mechanisms. CAO injects a security system prompt.
-
-#### Kimi CLI / Codex
-
-A security prompt is prepended to the agent's instructions:
-
+**Kimi CLI / Codex** — Prepends to the system prompt:
 ```
-## SECURITY CONSTRAINTS — TOOL RESTRICTIONS
-You are operating under restricted tool access. You may ONLY use these tools: @cao-mcp-server
-Do NOT attempt to use: execute_bash, fs_read, fs_write, fs_list
-If a task requires a restricted tool, explain that you cannot perform it due to policy restrictions.
+You may ONLY use these tools: @cao-mcp-server, fs_read, fs_list
+Do NOT attempt to use: execute_bash, fs_write
 ```
-
-This is best-effort — the model may still attempt restricted actions. For security-critical workloads, use a hard-enforcement provider.
 
 ## Cross-Provider Inheritance
 
-When a supervisor delegates via `handoff()` or `assign()`, the child terminal inherits allowed tools:
-
-1. Read parent's `allowed_tools` from database
-2. Load child profile's `allowedTools` / role defaults
-3. Pass the child's resolved `allowed_tools` to the new terminal
+When a supervisor delegates work via `handoff()` or `assign()`, the child agent gets its own `allowedTools` resolved from its profile — not inherited from the parent.
 
 ```
-Example: Kiro supervisor (allowedTools=@cao-mcp-server)
-  → assign("developer")
-  → Developer profile: allowedTools=[execute_bash, fs_*, @cao-mcp-server]
-  → Child on Claude Code gets: [execute_bash, fs_*, @cao-mcp-server]
-  → Translated: --disallowedTools (none blocked — developer has full access)
+Supervisor (role: supervisor → @cao-mcp-server, fs_read, fs_list)
+  │
+  ├─ assign("developer")
+  │    → Developer profile: role: developer → full access
+  │    → Claude Code launched with no --disallowedTools
+  │
+  └─ handoff("reviewer")
+       → Reviewer profile: role: reviewer → read-only
+       → Claude Code launched with --disallowedTools Bash Edit Write
 ```
 
-## CLI Usage Examples
+Each agent is restricted based on its own profile, not its parent's permissions.
 
-```bash
-# Use profile/role defaults
-cao launch --agents code_supervisor
-# supervisor role → allowed: @cao-mcp-server only
+## Quick Reference
 
-# Override with specific tools
-cao launch --agents developer --allowed-tools @cao-mcp-server --allowed-tools fs_read
-# Developer restricted to orchestration + file reading
-
-# Unrestricted (DANGEROUS)
-cao launch --agents code_supervisor --yolo
-# All tools allowed, no confirmation prompt
-
-# Cross-provider with tool restrictions
-cao launch --agents code_supervisor --provider gemini_cli
-# supervisor role → Policy Engine deny rules block shell/write tools
-```
-
-## API Usage
-
-The `allowed_tools` parameter can be passed when creating sessions via the API:
-
-```bash
-# Restricted session
-curl -X POST "http://localhost:9889/sessions?provider=claude_code&agent_profile=developer&allowed_tools=@cao-mcp-server,fs_read"
-
-# Unrestricted session
-curl -X POST "http://localhost:9889/sessions?provider=claude_code&agent_profile=developer&allowed_tools=*"
-```
-
-The `allowed_tools` value is stored in the database and returned by `GET /terminals/{id}`.
+| I want to... | Do this |
+|-------------|---------|
+| Restrict a supervisor to orchestration + reading | `role: supervisor` |
+| Give full access to a developer | `role: developer` (or set nothing) |
+| Read-only reviewer | `role: reviewer` |
+| Custom tool set | `allowedTools: ["fs_read", "execute_bash"]` |
+| Reusable custom preset | Define in `settings.json` `roles`, use `role: my_preset` |
+| Override role at launch | `--allowed-tools fs_read --allowed-tools @cao-mcp-server` |
+| No restrictions at all | `--yolo` or don't set role/allowedTools |
+| Check what's allowed before launch | Launch without `--yolo` — the confirmation prompt shows the summary |
 
 ## Security Recommendations
 
-1. **Use the most restrictive role possible.** Supervisors should use `role: supervisor` — they only need MCP tools to orchestrate.
+1. **Use `role: supervisor` for orchestrators.** They only need MCP tools + file reading for context.
 2. **Don't use `--yolo` in production.** It grants unrestricted access and skips all safety prompts.
-3. **Review tool summaries.** The confirmation prompt shows exactly what tools are allowed and blocked — read it before confirming.
-4. **Prefer hard-enforcement providers** (Kiro CLI, Claude Code, Copilot CLI, Gemini CLI, Q CLI) for sensitive workloads.
-5. **Kimi CLI and Codex use soft enforcement** — the agent may still attempt restricted actions. Use these only for non-critical tasks or combine with other safeguards.
-
-For vulnerability reporting and additional security details, see [SECURITY.md](../SECURITY.md).
+3. **Prefer hard-enforcement providers** (Claude Code, Kiro CLI, Q CLI, Copilot CLI, Gemini CLI) for sensitive workloads.
+4. **Review the confirmation prompt.** It shows exactly what tools are allowed and blocked before you proceed.
+5. **Kimi CLI and Codex use soft enforcement** — use these only for non-critical tasks.

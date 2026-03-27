@@ -42,6 +42,7 @@ class TestCreateTerminalCleanup:
                 agent_profile="dev",
                 session_name="test-ses",
                 new_session=True,
+                allowed_tools=["*"],
             )
 
         mock_pm.cleanup_provider.assert_called_once_with("tid1")
@@ -77,6 +78,7 @@ class TestCreateTerminalCleanup:
                 agent_profile="dev",
                 session_name="cao-existing",
                 new_session=False,
+                allowed_tools=["*"],
             )
 
         mock_pm.cleanup_provider.assert_called_once()
@@ -114,6 +116,7 @@ class TestCreateTerminalCleanup:
                 agent_profile="dev",
                 session_name="test-ses",
                 new_session=True,
+                allowed_tools=["*"],
             )
 
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
@@ -144,6 +147,7 @@ class TestCreateTerminalCleanup:
             agent_profile="dev",
             session_name="myses",
             new_session=True,
+            allowed_tools=["*"],
         )
 
         # session_name should have been prefixed with "cao-"

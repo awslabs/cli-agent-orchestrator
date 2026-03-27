@@ -6,7 +6,10 @@ This module provides the mapping and a function to compute which native tools to
 given a set of allowed CAO tools.
 """
 
+import logging
 from typing import Dict, List, Set
+
+logger = logging.getLogger(__name__)
 
 # All CAO tool categories and what they map to in each provider.
 # Keys are provider names, values map CAO tool names to lists of native tool names.
@@ -50,6 +53,25 @@ for _provider, _mapping in TOOL_MAPPING.items():
     ALL_NATIVE_TOOLS[_provider] = tools
 
 
+def _get_role_defaults(role: str) -> List[str] | None:
+    """Look up allowedTools for a role (built-in or custom from settings)."""
+    from cli_agent_orchestrator.constants import ROLE_TOOL_DEFAULTS
+
+    # Check built-in roles first
+    if role in ROLE_TOOL_DEFAULTS:
+        return list(ROLE_TOOL_DEFAULTS[role])
+
+    # Check custom roles from settings.json
+    from cli_agent_orchestrator.services.settings_service import _load
+
+    settings = _load()
+    custom_roles = settings.get("roles", {})
+    if role in custom_roles:
+        return list(custom_roles[role])
+
+    return None
+
+
 def resolve_allowed_tools(
     profile_allowed_tools: List[str] | None,
     role: str | None,
@@ -59,21 +81,30 @@ def resolve_allowed_tools(
 
     Resolution order:
     1. profile_allowed_tools (explicit in profile or --allowed-tools CLI)
-    2. Role-based defaults from ROLE_TOOL_DEFAULTS
-    3. Default to developer role
+    2. Role-based defaults (built-in or custom from settings.json)
+    3. Unrestricted ["*"] (backward compatible — no role/allowedTools = no restrictions)
 
     MCP server names from the profile are appended as @server_name.
     """
-    from cli_agent_orchestrator.constants import DEFAULT_ROLE, ROLE_TOOL_DEFAULTS
-
     if profile_allowed_tools is not None:
         allowed = list(profile_allowed_tools)
+    elif role:
+        role_defaults = _get_role_defaults(role)
+        if role_defaults is not None:
+            allowed = role_defaults
+        else:
+            logger.warning(
+                "Unknown role '%s' — falling back to unrestricted. "
+                "Define custom roles in settings.json under 'roles'.",
+                role,
+            )
+            allowed = ["*"]
     else:
-        effective_role = role or DEFAULT_ROLE
-        allowed = list(ROLE_TOOL_DEFAULTS.get(effective_role, ROLE_TOOL_DEFAULTS[DEFAULT_ROLE]))
+        # No role, no allowedTools — unrestricted (backward compatible)
+        allowed = ["*"]
 
     # Append MCP server tools if not already present
-    if mcp_server_names:
+    if mcp_server_names and "*" not in allowed:
         for server_name in mcp_server_names:
             tool_ref = f"@{server_name}"
             if tool_ref not in allowed:

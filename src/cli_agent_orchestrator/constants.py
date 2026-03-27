@@ -117,14 +117,14 @@ ALLOWED_HOSTS = [
 # =============================================================================
 # Tool Restriction Configuration
 # =============================================================================
-# Role-based default allowedTools when profile doesn't specify them.
+# Built-in role defaults. A role is a named bundle of allowedTools.
+# Users can define custom roles in settings.json under "roles".
 # CAO vocabulary: execute_bash, fs_read, fs_write, fs_list, fs_*, @builtin, @cao-mcp-server
 ROLE_TOOL_DEFAULTS = {
-    "supervisor": ["@cao-mcp-server"],
+    "supervisor": ["@cao-mcp-server", "fs_read", "fs_list"],
     "reviewer": ["@builtin", "fs_read", "fs_list", "@cao-mcp-server"],
     "developer": ["@builtin", "fs_*", "execute_bash", "@cao-mcp-server"],
 }
-DEFAULT_ROLE = "developer"
 
 # Security constraints prepended to system prompts for providers without
 # native tool restriction mechanisms (kimi_cli, codex).
