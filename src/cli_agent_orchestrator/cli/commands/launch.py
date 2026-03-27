@@ -56,6 +56,7 @@ def launch(agents, session_name, headless, provider, allowed_tools, yolo):
         )
 
         resolved_allowed_tools = None
+        no_role_set = False
         if yolo:
             resolved_allowed_tools = ["*"]
         elif allowed_tools:
@@ -65,28 +66,50 @@ def launch(agents, session_name, headless, provider, allowed_tools, yolo):
             try:
                 profile = load_agent_profile(agents)
                 mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
+                no_role_set = not profile.role and not profile.allowedTools
                 resolved_allowed_tools = resolve_allowed_tools(
                     profile.allowedTools, profile.role, mcp_server_names
                 )
             except (FileNotFoundError, RuntimeError):
                 # Profile not found — use developer defaults (backward compatible)
+                no_role_set = True
                 resolved_allowed_tools = resolve_allowed_tools(None, None, None)
 
-        # Confirmation prompt (--yolo skips all confirmation)
-        if provider in PROVIDERS_REQUIRING_WORKSPACE_ACCESS and not yolo:
-            # Informative tool summary prompt
-            tool_summary = format_tool_summary(resolved_allowed_tools)
-            blocked = get_disallowed_tools(provider, resolved_allowed_tools)
-            blocked_summary = ", ".join(blocked) if blocked else "(none)"
+        # Confirmation / warning prompts
+        if provider in PROVIDERS_REQUIRING_WORKSPACE_ACCESS:
+            if yolo:
+                # --yolo: warn but don't block
+                click.echo(
+                    click.style("\n[WARNING] --yolo mode enabled", fg="yellow", bold=True)
+                )
+                click.echo(
+                    f"  Agent '{agents}' launching UNRESTRICTED on {provider}.\n"
+                    f"  Agent can execute ANY command (aws, rm, curl, read credentials).\n"
+                    f"  Directory: {working_directory}\n"
+                )
+            else:
+                # Normal launch: show tool summary and confirm
+                tool_summary = format_tool_summary(resolved_allowed_tools)
+                blocked = get_disallowed_tools(provider, resolved_allowed_tools)
+                blocked_summary = ", ".join(blocked) if blocked else "(none)"
 
-            click.echo(
-                f"\nAgent '{agents}' launching on {provider}:\n"
-                f"  Allowed:  {tool_summary}\n"
-                f"  Blocked:  {blocked_summary}\n"
-                f"  Directory: {working_directory}\n"
-            )
-            if not click.confirm("Do you trust all the actions in this folder?", default=True):
-                raise click.ClickException("Launch cancelled by user")
+                click.echo(
+                    f"\nAgent '{agents}' launching on {provider}:\n"
+                    f"  Allowed:  {tool_summary}\n"
+                    f"  Blocked:  {blocked_summary}\n"
+                    f"  Directory: {working_directory}\n"
+                )
+                if no_role_set:
+                    click.echo(
+                        "  Note: No role or allowedTools set — defaulting to 'developer'.\n"
+                        "  Add 'role' or 'allowedTools' to your agent profile to control tool access.\n"
+                        "  Docs: https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/tool-restrictions.md\n"
+                    )
+                click.echo(
+                    "  To grant all permissions, re-run with --yolo.\n"
+                )
+                if not click.confirm("Proceed?", default=True):
+                    raise click.ClickException("Launch cancelled by user")
 
         # Call API to create session
         url = f"http://{SERVER_HOST}:{SERVER_PORT}/sessions"

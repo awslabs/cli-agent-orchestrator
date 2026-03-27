@@ -100,8 +100,10 @@ def resolve_allowed_tools(
             )
             allowed = ["*"]
     else:
-        # No role, no allowedTools — unrestricted (backward compatible)
-        allowed = ["*"]
+        # No role, no allowedTools — default to developer (secure default)
+        from cli_agent_orchestrator.constants import ROLE_TOOL_DEFAULTS
+
+        allowed = list(ROLE_TOOL_DEFAULTS["developer"])
 
     # Append MCP server tools if not already present
     if mcp_server_names and "*" not in allowed:

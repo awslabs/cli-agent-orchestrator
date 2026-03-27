@@ -22,6 +22,7 @@ CLI Agent Orchestrator (CAO) implements a hierarchical multi-agent system that e
 * **Flow - Scheduled runs** – Automated execution of workflows at specified intervals using cron-like scheduling, enabling routine tasks and monitoring workflows to run unattended.
 * **Context preservation** – The supervisor agent provides only necessary context to each worker agent, avoiding context pollution while maintaining workflow coherence.
 * **Direct worker interaction and steering** – Users can interact directly with worker agents to provide additional steering, distinguishing from sub-agents features by allowing real-time guidance and course correction.
+* **Tool restrictions** – Control what each agent can do through `role` and `allowedTools`. Built-in roles (`supervisor`, `developer`, `reviewer`) provide sensible defaults, while `allowedTools` gives fine-grained control. CAO translates restrictions to each provider's native enforcement mechanism. See [Tool Restrictions](#tool-restrictions-allowedtools).
 * **Advanced CLI integration** – CAO agents have full access to advanced features of the developer CLI, such as the [sub-agents](https://docs.claude.com/en/docs/claude-code/sub-agents) feature of Claude Code, [Custom Agent](https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/command-line-custom-agents.html) of Amazon Q Developer for CLI and so on.
 
 For detailed project structure and architecture, see [CODEBASE.md](CODEBASE.md).
@@ -501,7 +502,7 @@ When a profile doesn't explicitly set `allowedTools`, defaults are based on `rol
 
 | Role | Default Tools | Use Case |
 |------|--------------|----------|
-| `supervisor` | `@cao-mcp-server` | Orchestration only — no code execution |
+| `supervisor` | `@cao-mcp-server, fs_read, fs_list` | Orchestration + read files for context |
 | `developer` | `@builtin, fs_*, execute_bash, @cao-mcp-server` | Full access for coding/testing |
 | `reviewer` | `@builtin, fs_read, fs_list, @cao-mcp-server` | Read-only code review |
 

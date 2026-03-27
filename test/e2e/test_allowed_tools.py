@@ -19,6 +19,8 @@ Provider coverage:
   Tests pass allowed_tools=@cao-mcp-server to trigger Bash blocking.
 - Gemini CLI: Hard enforcement via Policy Engine TOML deny rules.
   Tests pass allowed_tools=@cao-mcp-server to trigger run_shell_command deny policy.
+- Codex: Soft enforcement via security system prompt.
+  Tests verify the prompt-based restriction is present (best-effort).
 - Kimi CLI: Soft enforcement via security system prompt.
   Tests verify the prompt-based restriction is present (best-effort).
 
@@ -443,6 +445,57 @@ class TestClaudeCodeAllowedTools:
 
 
 # ---------------------------------------------------------------------------
+# Codex provider — soft enforcement via security system prompt
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestCodexAllowedTools:
+    """E2E allowedTools tests for the Codex provider.
+
+    Codex has no native tool restriction mechanism. Enforcement is via
+    security system prompt prepended to the agent's instructions. This is
+    soft enforcement — the agent may still attempt restricted actions.
+
+    Tests verify that:
+    1. The security prompt is effective (agent acknowledges restrictions)
+    2. Unrestricted mode works normally
+    """
+
+    @pytest.mark.xfail(
+        reason="Soft enforcement — Codex may ignore prompt-based restrictions",
+        strict=False,
+    )
+    def test_restricted_supervisor_refuses_bash(self, require_codex):
+        """Supervisor with only @cao-mcp-server should refuse bash (soft enforcement).
+
+        Codex's enforcement is prompt-based. The agent should acknowledge it
+        cannot run shell commands, though this is not a hard guarantee.
+        Marked xfail because soft enforcement may be bypassed.
+        """
+        _run_restricted_tool_test(
+            provider="codex",
+            agent_profile="code_supervisor",
+            allowed_tools="@cao-mcp-server",
+        )
+
+    def test_unrestricted_developer_can_bash(self, require_codex):
+        """Developer with wildcard allowedTools can execute bash."""
+        _run_unrestricted_tool_test(
+            provider="codex",
+            agent_profile="developer",
+        )
+
+    def test_allowed_tools_stored_in_metadata(self, require_codex):
+        """allowed_tools is persisted and returned by GET /terminals."""
+        _run_allowed_tools_stored_test(
+            provider="codex",
+            agent_profile="developer",
+            allowed_tools="@cao-mcp-server",
+        )
+
+
+# ---------------------------------------------------------------------------
 # Kimi CLI provider — soft enforcement via security system prompt
 # ---------------------------------------------------------------------------
 
@@ -460,11 +513,16 @@ class TestKimiCliAllowedTools:
     2. Unrestricted mode works normally
     """
 
+    @pytest.mark.xfail(
+        reason="Soft enforcement — Kimi CLI may ignore prompt-based restrictions",
+        strict=False,
+    )
     def test_restricted_supervisor_refuses_bash(self, require_kimi):
         """Supervisor with only @cao-mcp-server should refuse bash (soft enforcement).
 
         Kimi's enforcement is prompt-based. The agent should acknowledge it
         cannot run shell commands, though this is not a hard guarantee.
+        Marked xfail because soft enforcement may be bypassed.
         """
         _run_restricted_tool_test(
             provider="kimi_cli",

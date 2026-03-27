@@ -34,10 +34,13 @@ class TestResolveAllowedTools:
         assert "execute_bash" in result
         assert "fs_*" in result
 
-    def test_unrestricted_when_no_role_no_tools(self):
-        """No role + no allowedTools = unrestricted (backward compatible)."""
+    def test_developer_default_when_no_role_no_tools(self):
+        """No role + no allowedTools = developer defaults (secure default)."""
         result = resolve_allowed_tools(None, None)
-        assert result == ["*"]
+        assert "execute_bash" in result
+        assert "fs_*" in result
+        assert "@cao-mcp-server" in result
+        assert "*" not in result
 
     def test_mcp_servers_appended(self):
         """MCP server names appended as @server_name."""

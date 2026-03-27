@@ -2,6 +2,8 @@
 name: data_analyst_codex
 description: Data analyst agent that runs on Codex (cross-provider override)
 provider: codex
+role: developer
+allowedTools: ["@builtin", "fs_*", "execute_bash", "@cao-mcp-server"]
 mcpServers:
   cao-mcp-server:
     type: stdio

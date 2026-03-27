@@ -1,6 +1,8 @@
 ---
 name: cross_provider_supervisor
 description: Supervisor agent that delegates data analysis to workers across multiple providers
+role: supervisor
+allowedTools: ["@cao-mcp-server", "fs_read", "fs_list"]
 mcpServers:
   cao-mcp-server:
     type: stdio

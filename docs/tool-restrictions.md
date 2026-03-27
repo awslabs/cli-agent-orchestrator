@@ -20,9 +20,9 @@ CAO controls what tools an agent can use through a two-layer system:
 - **`allowedTools`** — Low-level control. An explicit list of tools the agent can use. Always overrides `role` when set.
 - **`--yolo`** — Escape hatch. Bypasses ALL restrictions and skips confirmation prompts. The agent can do anything.
 
-## Default Behavior (Backward Compatible)
+## Default Behavior
 
-**If you don't set `role` or `allowedTools`, the agent is unrestricted.** This preserves backward compatibility — existing profiles and workflows continue to work exactly as before. Tool restrictions are entirely opt-in.
+**If you don't set `role` or `allowedTools`, the agent defaults to `developer` role permissions** (`@builtin`, `fs_*`, `execute_bash`, `@cao-mcp-server`). This gives full coding access while still going through the restriction system. The launch confirmation prompt will remind you to add `role` or `allowedTools` to your profile.
 
 ## The Three Controls
 
@@ -72,7 +72,7 @@ Custom roles follow the same rules as built-in roles — they're just a named `a
 
 ### 2. `allowedTools` — The Precise Way
 
-Set `allowedTools` directly in the profile frontmatter for fine-grained control. This always overrides `role`.
+Set `allowedTools` directly in the profile frontmatter for fine-grained control. This always overrides `role`, and **can be used without `role`**.
 
 ```yaml
 ---
@@ -84,6 +84,18 @@ allowedTools: ["@builtin", "fs_*", "@cao-mcp-server"]
 ```
 
 In this example, `role: developer` would normally include `execute_bash`, but `allowedTools` explicitly excludes it. The explicit list wins.
+
+You can also use `allowedTools` without `role`:
+
+```yaml
+---
+name: read_only_agent
+description: Agent with only read and bash access
+allowedTools: ["fs_read", "fs_list", "execute_bash"]
+---
+```
+
+No `role` is needed — `allowedTools` is the full specification of what tools the agent can use.
 
 #### Tool Vocabulary
 
@@ -108,9 +120,62 @@ cao launch --agents code_supervisor --yolo
 
 `--yolo` does two things:
 1. Sets `allowedTools: ["*"]` — the agent can use ALL tools
-2. Skips the confirmation prompt — no "do you trust this folder?" question
+2. Skips the confirmation prompt — launches immediately after showing a warning
 
-**Use `--yolo` when you want zero restrictions and zero prompts.** This overrides everything — role, allowedTools, CLI flags. The agent can execute any command: `aws`, `rm -rf`, `curl`, read credentials, anything.
+**Use `--yolo` when you want zero restrictions.** This overrides everything — role, allowedTools, CLI flags. The agent can execute any command: `aws`, `rm -rf`, `curl`, read credentials, anything.
+
+A warning is still displayed so you know what's happening:
+
+```
+[WARNING] --yolo mode enabled
+  Agent 'code_supervisor' launching UNRESTRICTED on claude_code.
+  Agent can execute ANY command (aws, rm, curl, read credentials).
+  Directory: /home/user/my-project
+```
+
+## Launch Confirmation Prompt
+
+When you run `cao launch` without `--yolo`, CAO shows a summary of the resolved tool restrictions and asks for confirmation:
+
+```
+Agent 'code_supervisor' launching on kiro_cli:
+  Allowed:  @cao-mcp-server, fs_read, fs_list
+  Blocked:  Bash, Edit, Write
+  Directory: /home/user/my-project
+
+  To grant all permissions, re-run with --yolo.
+
+Proceed? [Y/n]
+```
+
+If no `role` or `allowedTools` is set in the profile, the prompt includes an additional reminder:
+
+```
+Agent 'my_agent' launching on claude_code:
+  Allowed:  @builtin, fs_*, execute_bash, @cao-mcp-server
+  Blocked:  (none)
+  Directory: /home/user/my-project
+
+  Note: No role or allowedTools set — defaulting to 'developer'.
+  Add 'role' or 'allowedTools' to your agent profile to control tool access.
+  Docs: https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/tool-restrictions.md
+
+  To grant all permissions, re-run with --yolo.
+
+Proceed? [Y/n]
+```
+
+### Confirmation vs `--yolo`
+
+Answering **Y** to the confirmation prompt is **not** the same as `--yolo`:
+
+| | Confirmation → Y | `--yolo` |
+|---|---|---|
+| **Tool restrictions** | Still enforced — agent is limited to the tools shown in "Allowed" | Removed — agent gets `["*"]` (all tools) |
+| **Blocked tools** | Still blocked — agent cannot use tools shown in "Blocked" | Nothing is blocked |
+| **What it means** | "I've reviewed these restrictions and want to proceed" | "Give the agent unrestricted access, no questions asked" |
+
+The confirmation prompt is a **review gate** — it shows you exactly what the agent can and cannot do, then lets you proceed or cancel. The restrictions listed in the summary are still enforced after you confirm. `--yolo` both **removes all restrictions** and **skips the review gate entirely**.
 
 ## How Overrides Work
 
@@ -123,7 +188,7 @@ Priority (highest to lowest):
   2. --allowed-tools CLI flag  → explicit list at launch time
   3. allowedTools in profile   → explicit list in frontmatter
   4. role in profile           → maps to built-in/custom role defaults
-  5. (nothing set)             → unrestricted (backward compatible)
+  5. (nothing set)             → developer defaults
 ```
 
 Examples:
@@ -226,3 +291,19 @@ Each agent is restricted based on its own profile, not its parent's permissions.
 3. **Prefer hard-enforcement providers** (Claude Code, Kiro CLI, Q CLI, Copilot CLI, Gemini CLI) for sensitive workloads.
 4. **Review the confirmation prompt.** It shows exactly what tools are allowed and blocked before you proceed.
 5. **Kimi CLI and Codex use soft enforcement** — use these only for non-critical tasks.
+
+## Known Limitations
+
+1. **Claude Code tool mapping is incomplete.** The current mapping covers `Bash`, `Read`, `Edit`, `Write`, `Glob`, and `Grep`. Claude Code also has `WebFetch`, `Agent` (subagent), and MCP tools that are not yet mapped to CAO vocabulary. These tools remain unrestricted even when `allowedTools` is set. Future versions will add `web_fetch` and `subagent` to the CAO vocabulary.
+
+2. **MCP tool control is coarse-grained.** `@cao-mcp-server` allows all tools from that server (`handoff`, `assign`, `send_message`, `list_terminals`, etc.). There is no way to allow only `send_message` while blocking `assign`. Future versions may support `@cao-mcp-server:send_message` syntax for per-tool MCP control.
+
+3. **Soft enforcement is best-effort.** Kimi CLI and Codex rely on system prompt instructions to restrict tools. The agent may ignore these restrictions. Do not rely on soft enforcement for security-critical workloads.
+
+## Example Profiles
+
+For complete working examples with `role` and `allowedTools`, see the [examples directory](../examples/):
+
+- **[assign/](../examples/assign/)** — Supervisor + worker agents with role-based restrictions
+- **[cross-provider/](../examples/cross-provider/)** — Mixed-provider workflows with per-agent tool restrictions
+- **[codex-basic/](../examples/codex-basic/)** — Codex agents with soft enforcement

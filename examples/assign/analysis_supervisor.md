@@ -2,7 +2,7 @@
 name: analysis_supervisor
 description: Supervisor agent that orchestrates parallel data analysis using assign and sequential report generation using handoff
 role: supervisor
-allowedTools: ["@cao-mcp-server"]
+allowedTools: ["@cao-mcp-server", "fs_read", "fs_list"]
 mcpServers:
   cao-mcp-server:
     type: stdio
