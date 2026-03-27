@@ -121,7 +121,7 @@ class TestDeleteSession:
 
         result = delete_session("cao-test")
 
-        assert result is True
+        assert result == {"deleted": ["cao-test"], "errors": []}
         mock_tmux.kill_session.assert_called_once_with("cao-test")
         mock_delete_terminals.assert_called_once_with("cao-test")
         assert mock_provider_manager.cleanup_provider.call_count == 2
@@ -147,7 +147,7 @@ class TestDeleteSession:
 
         result = delete_session("cao-test")
 
-        assert result is True
+        assert result == {"deleted": ["cao-test"], "errors": []}
         mock_provider_manager.cleanup_provider.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
@@ -159,3 +159,66 @@ class TestDeleteSession:
 
         with pytest.raises(Exception, match="Database error"):
             delete_session("cao-test")
+
+    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
+    def test_delete_session_continues_when_provider_cleanup_fails(
+        self, mock_tmux, mock_list_terminals, mock_provider_manager, mock_delete_terminals
+    ):
+        """Test that delete_session continues even when provider cleanup fails for some terminals."""
+        mock_tmux.session_exists.return_value = True
+        mock_list_terminals.return_value = [
+            {"id": "terminal1"},
+            {"id": "terminal2"},
+            {"id": "terminal3"},
+        ]
+
+        # First terminal cleanup fails, others succeed
+        mock_provider_manager.cleanup_provider.side_effect = [
+            Exception("Provider cleanup error for terminal1"),
+            None,  # terminal2 succeeds
+            None,  # terminal3 succeeds
+        ]
+
+        result = delete_session("cao-test")
+
+        # Session should still be deleted despite provider cleanup failure
+        assert result == {"deleted": ["cao-test"], "errors": []}
+        mock_tmux.kill_session.assert_called_once_with("cao-test")
+        mock_delete_terminals.assert_called_once_with("cao-test")
+        # All three provider cleanups were attempted
+        assert mock_provider_manager.cleanup_provider.call_count == 3
+
+    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
+    def test_delete_session_cleans_up_provider_for_each_terminal(
+        self, mock_tmux, mock_list_terminals, mock_provider_manager, mock_delete_terminals
+    ):
+        """Test that delete_session calls cleanup_provider for every terminal in the session."""
+        mock_tmux.session_exists.return_value = True
+        mock_list_terminals.return_value = [
+            {"id": "term-aaa"},
+            {"id": "term-bbb"},
+            {"id": "term-ccc"},
+            {"id": "term-ddd"},
+        ]
+
+        result = delete_session("cao-multi-terminal")
+
+        assert result == {"deleted": ["cao-multi-terminal"], "errors": []}
+        # Verify cleanup_provider was called for each terminal with the correct ID
+        expected_calls = [
+            (("term-aaa",),),
+            (("term-bbb",),),
+            (("term-ccc",),),
+            (("term-ddd",),),
+        ]
+        assert mock_provider_manager.cleanup_provider.call_count == 4
+        mock_provider_manager.cleanup_provider.assert_any_call("term-aaa")
+        mock_provider_manager.cleanup_provider.assert_any_call("term-bbb")
+        mock_provider_manager.cleanup_provider.assert_any_call("term-ccc")
+        mock_provider_manager.cleanup_provider.assert_any_call("term-ddd")

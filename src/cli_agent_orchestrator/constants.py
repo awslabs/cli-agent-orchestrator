@@ -8,6 +8,7 @@ Codex, Kimi CLI, Q CLI) through tmux sessions, providing a unified interface
 for agent management.
 """
 
+import os
 from pathlib import Path
 
 from cli_agent_orchestrator.models.provider import ProviderType
@@ -73,7 +74,7 @@ LOCAL_AGENT_STORE_DIR = CAO_HOME_DIR / "agent-store"
 
 # Provider-specific agent directories
 Q_AGENTS_DIR = Path.home() / ".aws" / "amazonq" / "cli-agents"  # Q CLI agents
-KIRO_AGENTS_DIR = Path.home() / ".kiro" / "agents"  # Kiro CLI agents
+KIRO_AGENTS_DIR = Path(os.environ.get("CAO_AGENTS_DIR", str(Path.home() / ".kiro" / "agents")))
 COPILOT_AGENTS_DIR = Path.home() / ".copilot" / "agents"  # Copilot custom agents
 
 # =============================================================================
@@ -87,13 +88,20 @@ DATABASE_URL = f"sqlite:///{DATABASE_FILE}"
 # Server Configuration
 # =============================================================================
 # FastAPI server settings for the CAO API
-SERVER_HOST = "localhost"
-SERVER_PORT = 9889
+SERVER_HOST = os.environ.get("CAO_API_HOST", "127.0.0.1")
+SERVER_PORT = int(os.environ.get("CAO_API_PORT", "9889"))
 SERVER_VERSION = "0.1.0"
+
+
 API_BASE_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
 
 # CORS allowed origins for web-based clients
-CORS_ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"]
+CORS_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
 
 # Allowed Host headers for DNS rebinding protection (CVE mitigation)
 # Only localhost connections permitted - CAO is a local-only service
