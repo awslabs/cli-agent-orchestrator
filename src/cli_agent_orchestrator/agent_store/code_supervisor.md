@@ -1,9 +1,7 @@
 ---
 name: code_supervisor
 description: Coding Supervisor Agent in a multi-agent system
-role: supervisor
-allowedTools:
-  - "@cao-mcp-server"
+role: supervisor  # @cao-mcp-server, fs_read, fs_list. For fine-grained control, see docs/tool-restrictions.md
 mcpServers:
   cao-mcp-server:
     type: stdio
