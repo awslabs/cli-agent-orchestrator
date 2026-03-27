@@ -2,8 +2,7 @@
 name: data_analyst_claude_code
 description: Data analyst agent that runs on Claude Code (cross-provider override)
 provider: claude_code
-role: developer
-allowedTools: ["@builtin", "fs_*", "execute_bash", "@cao-mcp-server"]
+role: developer  # @builtin, fs_*, execute_bash, @cao-mcp-server. For fine-grained control, see docs/tool-restrictions.md
 mcpServers:
   cao-mcp-server:
     type: stdio

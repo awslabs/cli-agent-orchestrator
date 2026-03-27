@@ -1,8 +1,7 @@
 ---
 name: report_generator
 description: Agent that creates report templates and structures
-role: developer
-allowedTools: ["@builtin", "fs_*", "execute_bash", "@cao-mcp-server"]
+role: developer  # @builtin, fs_*, execute_bash, @cao-mcp-server. For fine-grained control, see docs/tool-restrictions.md
 mcpServers:
   cao-mcp-server:
     type: stdio
