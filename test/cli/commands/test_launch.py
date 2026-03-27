@@ -149,7 +149,7 @@ def test_launch_workspace_confirmation_accepted():
         # New prompt format shows tool summary
         assert "launching on claude_code" in result.output
         assert "Allowed:" in result.output
-        assert "Do you trust all the actions in this folder?" in result.output
+        assert "Proceed?" in result.output
         mock_post.assert_called_once()
 
 
@@ -185,8 +185,9 @@ def test_launch_workspace_confirmation_skipped_with_yolo_flag():
         )
 
         assert result.exit_code == 0
-        # No confirmation prompt should appear
-        assert "Do you trust all the actions in this folder?" not in result.output
+        # --yolo shows warning but no confirmation prompt
+        assert "Proceed?" not in result.output
+        assert "WARNING" in result.output
         mock_post.assert_called_once()
 
 
@@ -209,7 +210,7 @@ def test_launch_workspace_confirmation_for_default_provider():
 
         assert result.exit_code == 0
         assert "launching on kiro_cli" in result.output
-        assert "Do you trust all the actions in this folder?" in result.output
+        assert "Proceed?" in result.output
 
 
 def test_launch_yolo_sets_unrestricted_allowed_tools():

@@ -79,9 +79,7 @@ def launch(agents, session_name, headless, provider, allowed_tools, yolo):
         if provider in PROVIDERS_REQUIRING_WORKSPACE_ACCESS:
             if yolo:
                 # --yolo: warn but don't block
-                click.echo(
-                    click.style("\n[WARNING] --yolo mode enabled", fg="yellow", bold=True)
-                )
+                click.echo(click.style("\n[WARNING] --yolo mode enabled", fg="yellow", bold=True))
                 click.echo(
                     f"  Agent '{agents}' launching UNRESTRICTED on {provider}.\n"
                     f"  Agent can execute ANY command (aws, rm, curl, read credentials).\n"
@@ -105,9 +103,7 @@ def launch(agents, session_name, headless, provider, allowed_tools, yolo):
                         "  Add 'role' or 'allowedTools' to your agent profile to control tool access.\n"
                         "  Docs: https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/tool-restrictions.md\n"
                     )
-                click.echo(
-                    "  To grant all permissions, re-run with --yolo.\n"
-                )
+                click.echo("  To grant all permissions, re-run with --yolo.\n")
                 if not click.confirm("Proceed?", default=True):
                     raise click.ClickException("Launch cancelled by user")
 
