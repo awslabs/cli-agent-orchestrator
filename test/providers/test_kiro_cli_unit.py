@@ -36,7 +36,7 @@ class TestKiroCliProviderInitialization:
         assert result is True
         mock_wait_shell.assert_called_once()
         mock_tmux.send_keys.assert_called_once_with(
-            "test-session", "window-0", "kiro-cli chat --agent developer"
+            "test-session", "window-0", "kiro-cli chat --legacy-ui --agent developer"
         )
         mock_wait_status.assert_called_once()
 
