@@ -60,6 +60,7 @@ def create_terminal(
     session_name: Optional[str] = None,
     new_session: bool = False,
     working_directory: Optional[str] = None,
+    allowed_tools: Optional[list] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -114,12 +115,28 @@ def create_terminal(
             )
 
         # Step 3: Persist terminal metadata to database
-        db_create_terminal(terminal_id, session_name, window_name, provider, agent_profile)
+        db_create_terminal(
+            terminal_id, session_name, window_name, provider, agent_profile, allowed_tools
+        )
+
+        # Step 3b: Resolve allowed_tools from profile if not explicitly provided
+        if allowed_tools is None:
+            try:
+                from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+                from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
+
+                profile = load_agent_profile(agent_profile)
+                mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
+                allowed_tools = resolve_allowed_tools(
+                    profile.allowedTools, profile.role, mcp_server_names
+                )
+            except FileNotFoundError:
+                pass  # Profile not found; no tool restrictions
 
         # Step 4: Create and initialize the CLI provider
         # This starts the agent (e.g., runs "kiro-cli chat --agent developer")
         provider_instance = provider_manager.create_provider(
-            provider, terminal_id, session_name, window_name, agent_profile
+            provider, terminal_id, session_name, window_name, agent_profile, allowed_tools
         )
         provider_instance.initialize()
 
@@ -179,6 +196,7 @@ def get_terminal(terminal_id: str) -> Dict:
             "provider": metadata["provider"],
             "session_name": metadata["tmux_session"],
             "agent_profile": metadata["agent_profile"],
+            "allowed_tools": metadata.get("allowed_tools"),
             "status": status,
             "last_active": metadata["last_active"],
         }

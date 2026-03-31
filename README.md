@@ -22,6 +22,7 @@ CLI Agent Orchestrator (CAO) implements a hierarchical multi-agent system that e
 * **Flow - Scheduled runs** – Automated execution of workflows at specified intervals using cron-like scheduling, enabling routine tasks and monitoring workflows to run unattended.
 * **Context preservation** – The supervisor agent provides only necessary context to each worker agent, avoiding context pollution while maintaining workflow coherence.
 * **Direct worker interaction and steering** – Users can interact directly with worker agents to provide additional steering, distinguishing from sub-agents features by allowing real-time guidance and course correction.
+* **Tool restrictions** – Control what each agent can do through `role` and `allowedTools`. Built-in roles (`supervisor`, `developer`, `reviewer`) provide sensible defaults, while `allowedTools` gives fine-grained control. CAO translates restrictions to each provider's native enforcement mechanism. See [Tool Restrictions](#tool-restrictions-allowedtools).
 * **Advanced CLI integration** – CAO agents have full access to advanced features of the developer CLI, such as the [sub-agents](https://docs.claude.com/en/docs/claude-code/sub-agents) feature of Claude Code, [Custom Agent](https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/command-line-custom-agents.html) of Amazon Q Developer for CLI and so on.
 
 For detailed project structure and architecture, see [CODEBASE.md](CODEBASE.md).
@@ -150,7 +151,7 @@ cao launch --agents code_supervisor --provider codex
 cao launch --agents code_supervisor --provider gemini_cli
 cao launch --agents code_supervisor --provider kimi_cli
 cao launch --agents code_supervisor --provider copilot_cli
-# Skip workspace trust confirmation
+# Unrestricted access + skip confirmation (DANGEROUS)
 cao launch --agents code_supervisor --yolo
 ```
 
@@ -490,6 +491,24 @@ When a supervisor calls `assign` or `handoff`, CAO reads the worker's agent prof
 The `cao launch --provider` flag always takes precedence — it is treated as an explicit override and the profile's `provider` key is not consulted for the initial session.
 
 For ready-to-use examples, see [`examples/cross-provider/`](examples/cross-provider/).
+
+## Tool Restrictions
+
+CAO controls what tools each agent can use through `role` in the agent profile. Built-in roles (`supervisor`, `developer`, `reviewer`) map to sensible defaults, and `allowedTools` provides fine-grained override when needed. CAO translates restrictions to each provider's native enforcement mechanism — 5 of 7 providers support hard enforcement.
+
+```yaml
+---
+name: my_agent
+role: supervisor  # @cao-mcp-server, fs_read, fs_list
+---
+```
+
+```bash
+cao launch --agents code_supervisor              # Uses role defaults
+cao launch --agents code_supervisor --yolo       # Unrestricted access (WARNING shown)
+```
+
+For the full reference — roles, tool vocabulary, custom roles, launch prompts, provider enforcement, and known limitations — see [docs/tool-restrictions.md](docs/tool-restrictions.md).
 
 ## Security
 

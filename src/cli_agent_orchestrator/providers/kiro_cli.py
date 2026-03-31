@@ -74,7 +74,14 @@ class KiroCliProvider(BaseProvider):
         _permission_prompt_pattern: Regex pattern for detecting permission prompts
     """
 
-    def __init__(self, terminal_id: str, session_name: str, window_name: str, agent_profile: str):
+    def __init__(
+        self,
+        terminal_id: str,
+        session_name: str,
+        window_name: str,
+        agent_profile: str,
+        allowed_tools: Optional[list] = None,
+    ):
         """Initialize Kiro CLI provider with terminal context.
 
         Args:
@@ -82,8 +89,9 @@ class KiroCliProvider(BaseProvider):
             session_name: Name of the tmux session
             window_name: Name of the tmux window
             agent_profile: Name of the Kiro agent profile to use (e.g., "developer")
+            allowed_tools: Optional list of CAO tool names the agent is allowed to use
         """
-        super().__init__(terminal_id, session_name, window_name)
+        super().__init__(terminal_id, session_name, window_name, allowed_tools)
         self._initialized = False
         self._agent_profile = agent_profile
 

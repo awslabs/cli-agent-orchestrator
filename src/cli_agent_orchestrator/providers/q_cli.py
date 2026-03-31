@@ -27,8 +27,15 @@ ERROR_INDICATORS = ["Amazon Q is having trouble responding right now"]
 class QCliProvider(BaseProvider):
     """Provider for Q CLI tool integration."""
 
-    def __init__(self, terminal_id: str, session_name: str, window_name: str, agent_profile: str):
-        super().__init__(terminal_id, session_name, window_name)
+    def __init__(
+        self,
+        terminal_id: str,
+        session_name: str,
+        window_name: str,
+        agent_profile: str,
+        allowed_tools: Optional[list] = None,
+    ):
+        super().__init__(terminal_id, session_name, window_name, allowed_tools)
         # TODO: remove the ._initialized if it's not referenced anywhere
         self._initialized = False
         self._agent_profile = agent_profile

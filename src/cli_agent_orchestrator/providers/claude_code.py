@@ -52,8 +52,9 @@ class ClaudeCodeProvider(BaseProvider):
         session_name: str,
         window_name: str,
         agent_profile: Optional[str] = None,
+        allowed_tools: Optional[list] = None,
     ):
-        super().__init__(terminal_id, session_name, window_name)
+        super().__init__(terminal_id, session_name, window_name, allowed_tools)
         self._initialized = False
         self._agent_profile = agent_profile
 
@@ -104,6 +105,16 @@ class ClaudeCodeProvider(BaseProvider):
 
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
+
+        # Apply tool restrictions via --disallowedTools flags.
+        # --dangerously-skip-permissions bypasses prompts but --disallowedTools
+        # still prevents the agent from using the blocked tools entirely.
+        if self._allowed_tools and "*" not in self._allowed_tools:
+            from cli_agent_orchestrator.utils.tool_mapping import get_disallowed_tools
+
+            disallowed = get_disallowed_tools("claude_code", self._allowed_tools)
+            for tool in disallowed:
+                command_parts.extend(["--disallowedTools", tool])
 
         # Use shlex.join() for proper shell escaping of all arguments
         # This correctly handles multiline strings, quotes, and special characters

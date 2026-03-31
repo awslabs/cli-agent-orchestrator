@@ -2,6 +2,7 @@
 name: data_analyst_copilot_cli
 description: Data analyst agent that runs on Copilot CLI (cross-provider override)
 provider: copilot_cli
+role: developer  # @builtin, fs_*, execute_bash, @cao-mcp-server. For fine-grained control, see docs/tool-restrictions.md
 mcpServers:
   cao-mcp-server:
     type: stdio

@@ -50,8 +50,9 @@ class CopilotCliProvider(BaseProvider):
         session_name: str,
         window_name: str,
         agent_profile: Optional[str] = None,
+        allowed_tools: Optional[list] = None,
     ):
-        super().__init__(terminal_id, session_name, window_name)
+        super().__init__(terminal_id, session_name, window_name, allowed_tools)
         self._initialized = False
         self._agent_profile = agent_profile
         self._copilot_help_text_cache: Optional[str] = None
@@ -147,6 +148,15 @@ class CopilotCliProvider(BaseProvider):
             runtime_mcp_config = self._build_runtime_mcp_config()
             if runtime_mcp_config:
                 command_parts.extend(["--additional-mcp-config", runtime_mcp_config])
+
+        # Apply tool restrictions via --deny-tool flags.
+        # --deny-tool takes precedence over --allow-all.
+        if self._allowed_tools and "*" not in self._allowed_tools:
+            from cli_agent_orchestrator.utils.tool_mapping import get_disallowed_tools
+
+            disallowed = get_disallowed_tools("copilot_cli", self._allowed_tools)
+            for tool in disallowed:
+                command_parts.extend(["--deny-tool", tool])
 
         command_parts.append("--autopilot")
 
@@ -301,9 +311,7 @@ class CopilotCliProvider(BaseProvider):
             return True
         if re.search(r"\(\d+x\)", stripped):
             return True
-        if "shift+tab switch mode" in stripped and (
-            "remaining reqs" in stripped or "enqueue" in stripped
-        ):
+        if "shift+tab switch mode" in stripped:
             return True
         if "type @ to mention files" in stripped:
             return True
@@ -324,7 +332,15 @@ class CopilotCliProvider(BaseProvider):
         if not lines:
             return False
 
-        tail = lines[-25:]
+        # Strip trailing empty lines — TUI providers (like Copilot) render in
+        # a fixed viewport at the top of the pane, leaving the bottom blank.
+        stripped = list(lines)
+        while stripped and not stripped[-1].strip():
+            stripped.pop()
+        if not stripped:
+            return False
+
+        tail = stripped[-25:]
         last_prompt_idx = -1
         for idx, line in enumerate(tail):
             if re.match(IDLE_PROMPT_LINE_PATTERN, line):

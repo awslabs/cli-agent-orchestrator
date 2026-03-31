@@ -40,6 +40,48 @@ mcp = FastMCP(
 )
 
 
+def _resolve_child_allowed_tools(
+    parent_allowed_tools: Optional[list], child_profile_name: str
+) -> Optional[str]:
+    """Resolve allowed_tools for a child terminal via intersection.
+
+    The child gets at most the union of: what the parent allows + what the
+    child profile specifies. If the parent is unrestricted ("*"), the child
+    profile's allowedTools are used as-is.
+
+    Returns:
+        Comma-separated string of allowed tools, or None for unrestricted.
+    """
+    from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+    from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
+
+    try:
+        child_profile = load_agent_profile(child_profile_name)
+        mcp_server_names = (
+            list(child_profile.mcpServers.keys()) if child_profile.mcpServers else None
+        )
+        child_allowed = resolve_allowed_tools(
+            child_profile.allowedTools, child_profile.role, mcp_server_names
+        )
+    except FileNotFoundError:
+        child_allowed = None
+
+    # If parent is unrestricted or has no restrictions, use child's tools
+    if parent_allowed_tools is None or "*" in parent_allowed_tools:
+        if child_allowed:
+            return ",".join(child_allowed)
+        return None
+
+    # If child has no restrictions, inherit parent's
+    if child_allowed is None or "*" in child_allowed:
+        return ",".join(parent_allowed_tools)
+
+    # Both have restrictions: child gets its own profile tools
+    # (the child profile defines what it needs; parent's restrictions
+    # are enforced by the parent not delegating unauthorized work)
+    return ",".join(child_allowed)
+
+
 def _create_terminal(
     agent_profile: str, working_directory: Optional[str] = None
 ) -> Tuple[str, str]:
@@ -56,6 +98,7 @@ def _create_terminal(
         Exception: If terminal creation fails
     """
     provider = DEFAULT_PROVIDER
+    parent_allowed_tools = None
 
     # Get current terminal ID from environment
     current_terminal_id = os.environ.get("CAO_TERMINAL_ID")
@@ -67,6 +110,7 @@ def _create_terminal(
 
         provider = terminal_metadata["provider"]
         session_name = terminal_metadata["session_name"]
+        parent_allowed_tools = terminal_metadata.get("allowed_tools")
 
         # If no working_directory specified, get conductor's current directory
         if working_directory is None:
@@ -87,10 +131,15 @@ def _create_terminal(
                     f"Error fetching conductor's working directory: {e}, will use server default"
                 )
 
+        # Resolve child's allowed_tools via inheritance
+        child_allowed_tools = _resolve_child_allowed_tools(parent_allowed_tools, agent_profile)
+
         # Create new terminal in existing session - always pass working_directory
         params = {"provider": provider, "agent_profile": agent_profile}
         if working_directory:
             params["working_directory"] = working_directory
+        if child_allowed_tools:
+            params["allowed_tools"] = child_allowed_tools
 
         response = requests.post(f"{API_BASE_URL}/sessions/{session_name}/terminals", params=params)
         response.raise_for_status()

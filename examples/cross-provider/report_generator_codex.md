@@ -2,6 +2,7 @@
 name: report_generator_codex
 description: Report generator agent that runs on Codex (cross-provider override)
 provider: codex
+role: developer  # @builtin, fs_*, execute_bash, @cao-mcp-server. For fine-grained control, see docs/tool-restrictions.md
 mcpServers:
   cao-mcp-server:
     type: stdio

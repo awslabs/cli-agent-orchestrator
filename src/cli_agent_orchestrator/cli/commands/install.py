@@ -109,14 +109,11 @@ def install(agent_source: str, provider: str):
         with open(source_file, "r") as src:
             dest_file.write_text(src.read())
 
-        # Build allowedTools default if not specified
-        allowed_tools = profile.allowedTools
-        if allowed_tools is None:
-            # Default: allow all built-in tools and all MCP server tools
-            allowed_tools = ["@builtin", "fs_*", "execute_bash"]
-            if profile.mcpServers:
-                for server_name in profile.mcpServers.keys():
-                    allowed_tools.append(f"@{server_name}")
+        # Resolve allowedTools from profile → role defaults → developer defaults
+        from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
+
+        mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
+        allowed_tools = resolve_allowed_tools(profile.allowedTools, profile.role, mcp_server_names)
 
         # Create agent config based on provider
         agent_file = None
