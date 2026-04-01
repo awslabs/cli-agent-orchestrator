@@ -197,6 +197,8 @@ def load_agent_profile(agent_name: str) -> AgentProfile:
             meta["description"] = ""
         return AgentProfile(**meta)
 
+    except FileNotFoundError:
+        raise
     except Exception as e:
         raise RuntimeError(f"Failed to load agent profile '{agent_name}': {e}")
 
@@ -219,9 +221,9 @@ def resolve_provider(agent_profile_name: str, fallback_provider: str) -> str:
     """
     try:
         profile = load_agent_profile(agent_profile_name)
-    except RuntimeError:
-        # Profile not found — provider.initialize() will surface
-        # a clear error later.  Fall back for now.
+    except (FileNotFoundError, RuntimeError):
+        # Profile not found or failed to load — provider.initialize()
+        # will surface a clear error later.  Fall back for now.
         return fallback_provider
 
     if profile.provider:

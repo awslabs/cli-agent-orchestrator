@@ -92,8 +92,8 @@ class TestLoadAgentProfile:
         mock_agent_store.__truediv__.return_value = mock_profile_file
         mock_resources.files.return_value = mock_agent_store
 
-        # Execute and verify
-        with pytest.raises(RuntimeError, match="Failed to load agent profile"):
+        # Execute and verify — FileNotFoundError passes through directly
+        with pytest.raises(FileNotFoundError, match="Agent profile not found"):
             load_agent_profile("nonexistent")
 
     @patch("cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR")
