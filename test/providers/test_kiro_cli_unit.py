@@ -731,8 +731,7 @@ class TestKiroCliNewTuiSupport:
     def test_new_tui_idle_detection(self, mock_tmux):
         """Test IDLE detection with new TUI prompt format."""
         mock_tmux.get_history.return_value = (
-            "code_supervisor · claude-opus-4.6-1m · ◔ 1%\n"
-            " ask a question, or describe a task ↵"
+            "code_supervisor · claude-opus-4.6-1m · ◔ 1%\n" " ask a question, or describe a task ↵"
         )
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "code_supervisor")
@@ -759,8 +758,7 @@ class TestKiroCliNewTuiSupport:
     def test_new_tui_processing_detection(self, mock_tmux):
         """Test PROCESSING when new TUI idle prompt is absent."""
         mock_tmux.get_history.return_value = (
-            "code_supervisor · claude-opus-4.6-1m · ◔ 1%\n"
-            "Generating response..."
+            "code_supervisor · claude-opus-4.6-1m · ◔ 1%\n" "Generating response..."
         )
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "code_supervisor")
