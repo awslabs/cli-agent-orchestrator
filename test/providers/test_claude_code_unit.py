@@ -264,10 +264,7 @@ class TestClaudeCodeProviderStatusDetection:
     def test_get_status_stale_scrollback_not_waiting_user_answer(self, mock_tmux):
         """Stale numbered scrollback without the active footer must not block input."""
         mock_tmux.get_history.return_value = (
-            "❯ 1. Option one\n"
-            "  2. Option two\n"
-            "⏺ Selection handled earlier\n"
-            "❯ "
+            "❯ 1. Option one\n" "  2. Option two\n" "⏺ Selection handled earlier\n" "❯ "
         )
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
