@@ -14,8 +14,9 @@ logger = logging.getLogger(__name__)
 from pydantic import BaseModel
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
-from cli_agent_orchestrator.clients.beads_real import BeadsClient
+from cli_agent_orchestrator.clients.beads_real import BeadsClient, resolve_workspace, resolve_context_files
 from cli_agent_orchestrator.clients.database import get_inbox_messages, get_terminal_by_bead, set_terminal_bead
+from cli_agent_orchestrator.utils.context import inject_context_files
 from cli_agent_orchestrator.constants import KIRO_AGENTS_DIR, SESSION_PREFIX
 from cli_agent_orchestrator.services import terminal_service, session_service, flow_service
 from cli_agent_orchestrator.providers.manager import provider_manager
@@ -842,6 +843,11 @@ async def assign_bead_to_agent(bead_id: str, req: BeadAssignAgent):
 
         # Update bead assignee
         task = beads.wip(bead_id, session_id)
+
+        # Inject context files from bead labels (walks parent chain)
+        context_files = resolve_context_files(task, beads)
+        if context_files:
+            inject_context_files(terminal.id, context_files)
 
         # Send task to agent
         prompt = f"Work on this task: {task.title}\n\n{task.description}" if task.description else f"Work on this task: {task.title}"
