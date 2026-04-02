@@ -863,6 +863,34 @@ async def assign_bead_to_agent(bead_id: str, req: BeadAssignAgent):
         return {"task": task.__dict__, "session_id": session_id, "terminal_id": terminal.id}
 
 
+# --- Master Orchestrator ---
+class OrchestratorLaunch(BaseModel):
+    provider: str = "claude_code"
+    agent_profile: str = "master_orchestrator"
+
+
+@router.post("/orchestrator/launch", status_code=201)
+async def launch_master_orchestrator(req: OrchestratorLaunch):
+    """Launch the master orchestrator as a persistent session."""
+    terminal = terminal_service.create_terminal(
+        provider=req.provider,
+        agent_profile=req.agent_profile,
+        new_session=True,
+    )
+    await broadcast_activity({
+        "type": "orchestrator_launched",
+        "session_id": terminal.session_name,
+        "provider": req.provider,
+        "timestamp": datetime.now().isoformat()
+    })
+    return {
+        "session_id": terminal.session_name,
+        "terminal_id": terminal.id,
+        "agent_profile": req.agent_profile,
+        "provider": req.provider,
+    }
+
+
 # --- Auto-mode (stored per-session in memory) ---
 auto_mode_sessions: Set[str] = set()
 
