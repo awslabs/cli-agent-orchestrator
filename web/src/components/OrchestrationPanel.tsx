@@ -46,6 +46,19 @@ export function OrchestrationPanel() {
     await api.sessions.delete(orch.supervisor.id)
   }
 
+  const [launching, setLaunching] = useState(false)
+  const [provider, setProvider] = useState('claude_code')
+
+  const handleLaunchOrchestrator = async () => {
+    setLaunching(true)
+    try {
+      await api.orchestrator.launch({ provider })
+    } catch (e) {
+      console.error('Failed to launch orchestrator:', e)
+    }
+    setLaunching(false)
+  }
+
   if (orchestrations.length === 0) {
     return (
       <div className="text-center py-12">
@@ -53,7 +66,25 @@ export function OrchestrationPanel() {
           <GitBranch size={32} />
         </div>
         <p className="text-gray-400">No active orchestrations</p>
-        <p className="text-xs text-gray-500 mt-1">Orchestrations appear when a supervisor spawns workers</p>
+        <p className="text-xs text-gray-500 mt-1 mb-4">Launch a master orchestrator to manage work through beads</p>
+        <div className="flex items-center gap-2 justify-center">
+          <select
+            value={provider}
+            onChange={e => setProvider(e.target.value)}
+            className="px-3 py-2 rounded text-sm bg-gray-800 border border-gray-700 text-gray-300"
+          >
+            <option value="claude_code">Claude Code</option>
+            <option value="kiro_cli">Kiro CLI</option>
+            <option value="q_cli">Q CLI</option>
+          </select>
+          <button
+            onClick={handleLaunchOrchestrator}
+            disabled={launching}
+            className="px-4 py-2 rounded text-sm bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 hover:bg-emerald-500/30 disabled:opacity-50"
+          >
+            {launching ? 'Launching...' : 'Launch Orchestrator'}
+          </button>
+        </div>
       </div>
     )
   }

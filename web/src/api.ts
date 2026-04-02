@@ -81,6 +81,20 @@ export const api = {
       fetchWithResilience(`${API}/v2/beads/${id}/position`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ x, y }) }).then(jsonOr({}))
   },
 
+  // Epics
+  epics: {
+    create: (data: { title: string; steps: string[]; description?: string; priority?: number; sequential?: boolean; max_concurrent?: number; labels?: string[] }) =>
+      fetchWithResilience(`${API}/v2/epics`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(jsonOr({})),
+    get: (id: string) => fetchWithResilience(`${API}/v2/epics/${id}`).then(jsonOr({})),
+    getReady: (id: string) => fetchWithResilience(`${API}/v2/epics/${id}/ready`).then(jsonOr([])),
+  },
+
+  // Orchestrator
+  orchestrator: {
+    launch: (data?: { provider?: string; agent_profile?: string }) =>
+      fetchWithResilience(`${API}/v2/orchestrator/launch`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data || {}) }).then(jsonOr({})),
+  },
+
   // Context Learning
   learn: {
     trigger: (sessionId: string) => fetchWithResilience(`${API}/v2/learn/sessions/${sessionId}`, { method: 'POST' }).then(jsonOr({})),

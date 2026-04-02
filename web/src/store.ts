@@ -4,6 +4,7 @@ export interface Task {
   id: string; title: string; description: string; priority: number;
   status: string; assignee?: string; created_at?: string
   parent_id?: string; blocked_by?: string[]
+  labels?: string[]; type?: string
 }
 
 export interface Agent {

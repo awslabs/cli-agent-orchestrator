@@ -588,7 +588,12 @@ export function BeadsPanel() {
                         <span className={`text-xs font-medium ${priority.text}`}>P{bead.priority || 3}</span>
                         {hasChildren && (
                           <span className="px-2 py-0.5 text-xs rounded bg-cyan-500/10 text-cyan-400">
-                            {children.length} sub-bead{children.length > 1 ? 's' : ''}
+                            {children.filter(c => c.status === 'closed').length}/{children.length} done
+                          </span>
+                        )}
+                        {(bead as any).type === 'epic' && (
+                          <span className="px-2 py-0.5 text-xs rounded bg-violet-500/10 text-violet-400 font-medium">
+                            Epic
                           </span>
                         )}
                         {bead.blocked_by && bead.blocked_by.length > 0 && (
@@ -674,6 +679,22 @@ export function BeadsPanel() {
                     </div>
                   )}
                 </div>
+
+                {/* Epic progress bar */}
+                {hasChildren && isExpanded && (
+                  <div className="mx-4 mb-2">
+                    <div className="flex items-center gap-2 text-xs text-gray-400 mb-1">
+                      <span>Progress</span>
+                      <span>{children.filter(c => c.status === 'closed').length}/{children.length}</span>
+                    </div>
+                    <div className="w-full bg-gray-800 rounded-full h-1.5">
+                      <div
+                        className="bg-emerald-500 h-1.5 rounded-full transition-all"
+                        style={{ width: `${children.length > 0 ? (children.filter(c => c.status === 'closed').length / children.length) * 100 : 0}%` }}
+                      />
+                    </div>
+                  </div>
+                )}
 
                 {/* Child beads */}
                 {hasChildren && (
