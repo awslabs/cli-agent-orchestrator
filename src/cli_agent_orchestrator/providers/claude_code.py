@@ -36,7 +36,7 @@ RESPONSE_PATTERN = r"⏺(?:\x1b\[[0-9;]*m)*\s+"  # Handle any ANSI codes between
 PROCESSING_PATTERN = r"[✶✢✽✻✳].*…"
 IDLE_PROMPT_PATTERN = r"[>❯][\s\xa0]"  # Handle both old ">" and new "❯" prompt styles
 WAITING_USER_ANSWER_PATTERN = (
-    r"❯.*\d+\."  # Pattern for Claude showing selection options with arrow cursor
+    r"↑/↓ to navigate"  # Ink TUI footer shown only while a selection widget is active
 )
 TRUST_PROMPT_PATTERN = r"Yes, I trust this folder"  # Workspace trust dialog
 BYPASS_PROMPT_PATTERN = r"Yes, I accept"  # Bypass permissions confirmation dialog
@@ -265,8 +265,8 @@ class ClaudeCodeProvider(BaseProvider):
         if re.search(PROCESSING_PATTERN, output):
             return TerminalStatus.PROCESSING
 
-        # Check for waiting user answer (Claude asking for user selection)
-        # Exclude startup prompts (trust + bypass) which also match the pattern
+        # Check for waiting user answer via the active Ink selection footer.
+        # Exclude startup prompts (trust + bypass), which also render the footer.
         if (
             re.search(WAITING_USER_ANSWER_PATTERN, output)
             and not re.search(TRUST_PROMPT_PATTERN, output)
