@@ -24,6 +24,8 @@ class Task:
     metadata: str = "{}"
     parent_id: Optional[str] = None
     blocked_by: Optional[List[str]] = None
+    labels: Optional[List[str]] = None
+    type: Optional[str] = None  # "epic", "task", "bug", etc. (from bd issue_type)
 
 
 class BeadsClient:
@@ -49,8 +51,12 @@ class BeadsClient:
         """Parse JSON output from bd commands."""
         if not output:
             return []
+        # Strip non-JSON lines (e.g., "Note: ..." warnings)
+        lines = output.split('\n')
+        json_start = next((i for i, l in enumerate(lines) if l.strip().startswith(('[', '{'))), 0)
+        json_str = '\n'.join(lines[json_start:])
         try:
-            result = json.loads(output)
+            result = json.loads(json_str)
             return result if isinstance(result, (list, dict)) else []
         except json.JSONDecodeError:
             return []
@@ -103,8 +109,10 @@ class BeadsClient:
             created_at=issue.get("created_at"),
             updated_at=issue.get("updated_at"),
             closed_at=issue.get("closed_at"),
-            parent_id=issue.get("parent_id"),
+            parent_id=issue.get("parent") or issue.get("parent_id"),
             blocked_by=blocked_by if blocked_by else None,
+            labels=issue.get("labels") or None,
+            type=issue.get("issue_type") or None,
         )
 
     def list(self, status: Optional[str] = None, priority: Optional[int] = None) -> list[Task]:
@@ -210,4 +218,20 @@ class BeadsClient:
     def get_children(self, parent_id: str) -> List[Task]:
         """Get child tasks of a parent."""
         all_tasks = self.list()
-        return [t for t in all_tasks if t.parent_id == parent_id]
+        # Match by parent_id or by ID prefix (e.g., parent-id.1 is child of parent-id)
+        return [t for t in all_tasks if t.parent_id == parent_id or t.id.startswith(f"{parent_id}.")]
+
+    def get_comments(self, task_id: str) -> List[dict]:
+        """Get comments on a bead (used for agent findings/notes)."""
+        result = self._run_bd_json("comments", task_id)
+        if not isinstance(result, list):
+            return []
+        return result
+
+    def add_comment(self, task_id: str, comment: str) -> bool:
+        """Add a comment to a bead."""
+        try:
+            self._run_bd("comments", "add", task_id, comment)
+            return True
+        except Exception:
+            return False

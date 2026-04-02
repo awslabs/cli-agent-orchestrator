@@ -551,3 +551,99 @@ class TestListWithHierarchy:
             result = client.list()
             child = next(t for t in result if t.id == "parent-1.1")
             assert child.parent_id == "parent-1"
+
+
+class TestTaskLabelsAndType:
+    """Tests for labels and type fields on Task dataclass."""
+
+    def test_issue_to_task_includes_labels(self, client):
+        """_issue_to_task populates labels from bd JSON."""
+        issue = [{"id": "x", "title": "T", "priority": 2, "status": "open",
+                  "labels": ["auto_orchestrate", "queue:support"]}]
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(issue), stderr="")
+            task = client.get("x")
+            assert task.labels == ["auto_orchestrate", "queue:support"]
+
+    def test_issue_to_task_includes_type_from_issue_type(self, client):
+        """_issue_to_task maps bd's issue_type field to Task.type."""
+        issue = [{"id": "x", "title": "T", "priority": 2, "status": "open",
+                  "issue_type": "epic"}]
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(issue), stderr="")
+            task = client.get("x")
+            assert task.type == "epic"
+
+    def test_issue_to_task_missing_labels_defaults_none(self, client):
+        """Missing labels field defaults to None."""
+        issue = [{"id": "x", "title": "T", "priority": 2, "status": "open"}]
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(issue), stderr="")
+            task = client.get("x")
+            assert task.labels is None
+
+    def test_issue_to_task_missing_type_defaults_none(self, client):
+        """Missing issue_type field defaults to None."""
+        issue = [{"id": "x", "title": "T", "priority": 2, "status": "open"}]
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(issue), stderr="")
+            task = client.get("x")
+            assert task.type is None
+
+    def test_issue_to_task_empty_labels_becomes_none(self, client):
+        """Empty labels list becomes None."""
+        issue = [{"id": "x", "title": "T", "priority": 2, "status": "open", "labels": []}]
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(issue), stderr="")
+            task = client.get("x")
+            assert task.labels is None
+
+    def test_task_dict_includes_new_fields(self, client):
+        """Task.__dict__ includes labels and type for API serialization."""
+        issue = [{"id": "x", "title": "T", "priority": 2, "status": "open",
+                  "labels": ["type:epic"], "issue_type": "epic"}]
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(issue), stderr="")
+            task = client.get("x")
+            d = task.__dict__
+            assert "labels" in d
+            assert "type" in d
+            assert d["labels"] == ["type:epic"]
+            assert d["type"] == "epic"
+
+
+class TestComments:
+    """Tests for get_comments() and add_comment() methods."""
+
+    def test_get_comments_returns_list(self, client):
+        """get_comments() returns parsed JSON comment list."""
+        comments = [{"id": 1, "body": "Found the root cause", "created_at": "2026-04-02"}]
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(comments), stderr="")
+            result = client.get_comments("task-1")
+            assert len(result) == 1
+            assert result[0]["body"] == "Found the root cause"
+
+    def test_get_comments_empty(self, client):
+        """get_comments() returns empty list when no comments."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="[]", stderr="")
+            result = client.get_comments("task-1")
+            assert result == []
+
+    def test_add_comment_calls_bd_comments_add(self, client):
+        """add_comment() calls bd comments add."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            assert client.add_comment("task-1", "Agent findings here")
+            args = mock_run.call_args[0][0]
+            assert "comments" in args
+            assert "add" in args
+            assert "task-1" in args
+            assert "Agent findings here" in args
+
+    def test_add_comment_returns_false_on_error(self, client):
+        """add_comment() returns False on failure."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="error")
+            assert not client.add_comment("bad-id", "text")

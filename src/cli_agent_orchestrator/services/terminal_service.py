@@ -33,7 +33,8 @@ class OutputMode(str, Enum):
 
 
 def create_terminal(
-    provider: str, agent_profile: str, session_name: Optional[str] = None, new_session: bool = False
+    provider: str, agent_profile: str, session_name: Optional[str] = None, new_session: bool = False,
+    parent_terminal_id: Optional[str] = None, bead_id: Optional[str] = None
 ) -> Terminal:
     """Create terminal, optionally creating new session with it."""
     try:
@@ -63,7 +64,7 @@ def create_terminal(
             window_name = tmux_client.create_window(session_name, window_name, terminal_id)
 
         # Save terminal metadata to database
-        db_create_terminal(terminal_id, session_name, window_name, provider, agent_profile)
+        db_create_terminal(terminal_id, session_name, window_name, provider, agent_profile, parent_terminal_id, bead_id)
 
         # Initialize provider
         provider_instance = provider_manager.create_provider(

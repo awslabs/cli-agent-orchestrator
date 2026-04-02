@@ -4,7 +4,7 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import Boolean, Column, DateTime, Integer, String, create_engine
+from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text, create_engine
 from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
 
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
@@ -26,6 +26,8 @@ class TerminalModel(Base):
     tmux_window = Column(String, nullable=False)  # "window-name"
     provider = Column(String, nullable=False)  # "q_cli", "claude_code"
     agent_profile = Column(String)  # "developer", "reviewer" (optional)
+    parent_terminal_id = Column(String, nullable=True)  # Terminal that spawned this one
+    bead_id = Column(String, nullable=True)  # Bead being worked on by this terminal
     last_active = Column(DateTime, default=datetime.now)
 
 
@@ -56,6 +58,22 @@ class FlowModel(Base):
     last_run = Column(DateTime, nullable=True)
     next_run = Column(DateTime, nullable=True)
     enabled = Column(Boolean, default=True)
+    flow_type = Column(String, default="agent")  # agent or orchestrator
+
+
+class FlowExecutionModel(Base):
+    """SQLAlchemy model for flow execution history."""
+
+    __tablename__ = "flow_executions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    flow_name = Column(String, nullable=False, index=True)
+    session_id = Column(String, nullable=True)
+    started_at = Column(DateTime, nullable=False)
+    ended_at = Column(DateTime, nullable=True)
+    status = Column(String, default="running")  # running, completed, failed
+    error = Column(String, nullable=True)
+    output_log = Column(Text, nullable=True)  # Captured terminal output
 
 
 # Module-level singletons
@@ -67,6 +85,14 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 def init_db() -> None:
     """Initialize database tables."""
     Base.metadata.create_all(bind=engine)
+    # Migrate: add bead_id column if missing (no Alembic in this project)
+    from sqlalchemy import text
+    with engine.connect() as conn:
+        try:
+            conn.execute(text("ALTER TABLE terminals ADD COLUMN bead_id TEXT"))
+            conn.commit()
+        except Exception:
+            pass  # Column already exists
 
 
 def create_terminal(
@@ -75,6 +101,8 @@ def create_terminal(
     tmux_window: str,
     provider: str,
     agent_profile: Optional[str] = None,
+    parent_terminal_id: Optional[str] = None,
+    bead_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record."""
     with SessionLocal() as db:
@@ -84,6 +112,8 @@ def create_terminal(
             tmux_window=tmux_window,
             provider=provider,
             agent_profile=agent_profile,
+            parent_terminal_id=parent_terminal_id,
+            bead_id=bead_id,
         )
         db.add(terminal)
         db.commit()
@@ -93,6 +123,8 @@ def create_terminal(
             "tmux_window": terminal.tmux_window,
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
+            "parent_terminal_id": terminal.parent_terminal_id,
+            "bead_id": terminal.bead_id,
         }
 
 
@@ -112,6 +144,8 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "tmux_window": terminal.tmux_window,
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
+            "parent_terminal_id": terminal.parent_terminal_id,
+            "bead_id": terminal.bead_id,
             "last_active": terminal.last_active,
         }
 
@@ -127,6 +161,8 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 "tmux_window": t.tmux_window,
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
+                "parent_terminal_id": t.parent_terminal_id,
+                "bead_id": t.bead_id,
                 "last_active": t.last_active,
             }
             for t in terminals
@@ -144,12 +180,102 @@ def update_last_active(terminal_id: str) -> bool:
         return False
 
 
+def list_all_terminals() -> List[Dict[str, Any]]:
+    """List all terminals with parent relationships."""
+    with SessionLocal() as db:
+        terminals = db.query(TerminalModel).all()
+        return [
+            {
+                "id": t.id,
+                "tmux_session": t.tmux_session,
+                "tmux_window": t.tmux_window,
+                "provider": t.provider,
+                "agent_profile": t.agent_profile,
+                "parent_terminal_id": t.parent_terminal_id,
+                "bead_id": t.bead_id,
+                "last_active": t.last_active,
+            }
+            for t in terminals
+        ]
+
+
 def delete_terminal(terminal_id: str) -> bool:
     """Delete terminal metadata."""
     with SessionLocal() as db:
         deleted = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).delete()
         db.commit()
         return deleted > 0
+
+
+def set_terminal_bead(terminal_id: str, bead_id: Optional[str]) -> bool:
+    """Set or clear the bead_id on a terminal."""
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if terminal:
+            terminal.bead_id = bead_id
+            db.commit()
+            return True
+        return False
+
+
+def get_terminal_by_bead(bead_id: str) -> Optional[Dict[str, Any]]:
+    """Find terminal working on a specific bead."""
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.bead_id == bead_id).first()
+        if not terminal:
+            return None
+        return {
+            "id": terminal.id,
+            "tmux_session": terminal.tmux_session,
+            "tmux_window": terminal.tmux_window,
+            "provider": terminal.provider,
+            "agent_profile": terminal.agent_profile,
+            "parent_terminal_id": terminal.parent_terminal_id,
+            "bead_id": terminal.bead_id,
+            "last_active": terminal.last_active,
+        }
+
+
+def get_children_terminals(parent_terminal_id: str) -> List[Dict[str, Any]]:
+    """Get all terminals that have this terminal as parent."""
+    with SessionLocal() as db:
+        terminals = db.query(TerminalModel).filter(
+            TerminalModel.parent_terminal_id == parent_terminal_id
+        ).all()
+        return [
+            {
+                "id": t.id,
+                "tmux_session": t.tmux_session,
+                "tmux_window": t.tmux_window,
+                "provider": t.provider,
+                "agent_profile": t.agent_profile,
+                "parent_terminal_id": t.parent_terminal_id,
+                "bead_id": t.bead_id,
+                "last_active": t.last_active,
+            }
+            for t in terminals
+        ]
+
+
+def get_children_sessions(session_name: str) -> List[str]:
+    """Get all session names that have terminals parented to terminals in this session."""
+    with SessionLocal() as db:
+        # Get terminal IDs in this session
+        parent_terminals = db.query(TerminalModel).filter(
+            TerminalModel.tmux_session == session_name
+        ).all()
+        parent_ids = [t.id for t in parent_terminals]
+        
+        if not parent_ids:
+            return []
+        
+        # Find children terminals
+        children = db.query(TerminalModel).filter(
+            TerminalModel.parent_terminal_id.in_(parent_ids)
+        ).all()
+        
+        # Return unique session names
+        return list(set(t.tmux_session for t in children))
 
 
 def delete_terminals_by_session(tmux_session: str) -> int:
@@ -245,6 +371,7 @@ def create_flow(
     provider: str,
     script: str,
     next_run: datetime,
+    flow_type: str = "agent",
 ) -> Flow:
     """Create flow record."""
     with SessionLocal() as db:
@@ -256,6 +383,7 @@ def create_flow(
             provider=provider,
             script=script,
             next_run=next_run,
+            flow_type=flow_type,
         )
         db.add(flow)
         db.commit()
@@ -270,6 +398,7 @@ def create_flow(
             last_run=flow.last_run,
             next_run=flow.next_run,
             enabled=flow.enabled,
+            flow_type=flow.flow_type,
         )
 
 
@@ -307,6 +436,7 @@ def list_flows() -> List[Flow]:
                 last_run=f.last_run,
                 next_run=f.next_run,
                 enabled=f.enabled,
+                flow_type=f.flow_type or 'agent',
             )
             for f in flows
         ]
@@ -366,3 +496,82 @@ def get_flows_to_run() -> List[Flow]:
             )
             for f in flows
         ]
+
+
+
+def create_flow_execution(flow_name: str, session_id: Optional[str] = None) -> int:
+    """Create flow execution record. Returns execution id."""
+    with SessionLocal() as db:
+        execution = FlowExecutionModel(
+            flow_name=flow_name,
+            session_id=session_id,
+            started_at=datetime.now(),
+            status="running"
+        )
+        db.add(execution)
+        db.commit()
+        db.refresh(execution)
+        return execution.id
+
+
+def update_flow_execution(execution_id: int, status: str, error: Optional[str] = None, output_log: Optional[str] = None) -> bool:
+    """Update flow execution status."""
+    with SessionLocal() as db:
+        execution = db.query(FlowExecutionModel).filter(FlowExecutionModel.id == execution_id).first()
+        if not execution:
+            return False
+        execution.status = status
+        execution.ended_at = datetime.now()
+        if error:
+            execution.error = error
+        if output_log:
+            execution.output_log = output_log
+        db.commit()
+        return True
+
+
+def get_flow_execution(execution_id: int) -> Optional[Dict]:
+    """Get single flow execution by ID."""
+    with SessionLocal() as db:
+        e = db.query(FlowExecutionModel).filter(FlowExecutionModel.id == execution_id).first()
+        if not e:
+            return None
+        return {
+            "id": e.id,
+            "flow_name": e.flow_name,
+            "session_id": e.session_id,
+            "started_at": e.started_at.isoformat() if e.started_at else None,
+            "status": e.status,
+        }
+
+
+def get_flow_executions(flow_name: str, limit: int = 20) -> List[Dict]:
+    """Get flow execution history."""
+    with SessionLocal() as db:
+        executions = (
+            db.query(FlowExecutionModel)
+            .filter(FlowExecutionModel.flow_name == flow_name)
+            .order_by(FlowExecutionModel.started_at.desc())
+            .limit(limit)
+            .all()
+        )
+        return [
+            {
+                "id": e.id,
+                "flow_name": e.flow_name,
+                "session_id": e.session_id,
+                "started_at": e.started_at.isoformat() if e.started_at else None,
+                "ended_at": e.ended_at.isoformat() if e.ended_at else None,
+                "status": e.status,
+                "error": e.error,
+                "has_log": bool(e.output_log)
+            }
+            for e in executions
+        ]
+
+
+def get_flow_execution_log(execution_id: int) -> Optional[str]:
+    """Get execution output log."""
+    with SessionLocal() as db:
+        execution = db.query(FlowExecutionModel).filter(FlowExecutionModel.id == execution_id).first()
+        return execution.output_log if execution else None
