@@ -62,14 +62,16 @@ Agent profiles should define who the agent is — its role, personality, MCP ser
 
 Consider a team of CAO agents working on a Python project: a developer, a reviewer, and a supervisor. The developer and reviewer both need knowledge of the project's testing conventions and code style, but they use that knowledge differently. With skills, both profiles reference the same `python-testing` and `code-style` skills, while their profile bodies define how each role applies that knowledge. Adding a new `security-review` skill later doesn't require rewriting any profiles — just adding the skill name to the relevant frontmatter lists.
 
+### User-extensible without forking
+
+Users can author custom skills in `~/.aws/cli-agent-orchestrator/skills/` tailored to their organization's standards, internal tooling, or domain-specific workflows. These skills work alongside built-in skills with no additional configuration.
+
+## Example Use Case
+
 ### Packaging multi-agent communication primitives
 
 CAO's multi-agent orchestration relies on agents understanding communication protocols — how `assign` and `handoff` differ, when to use `send_message`, how message delivery works with idle detection, and how to parse callback terminal IDs from task messages. Today, this knowledge is duplicated across every agent profile that participates in multi-agent workflows.
 
-For example, the existing `examples/assign/` profiles illustrate this: `analysis_supervisor.md` dedicates a full section to explaining how `assign`, `handoff`, and `send_message` work, plus a "How Message Delivery Works" section on idle-based delivery. `data_analyst.md` repeats the `send_message` tool description and callback workflow. `report_generator.md` explains handoff return semantics. The built-in `developer.md` profile has its own "Multi-Agent Communication" section covering the same handoff vs. assign distinction. Each profile re-teaches the same communication patterns in slightly different words.
+The existing `examples/assign/` profiles illustrate this: `analysis_supervisor.md` dedicates a full section to explaining how `assign`, `handoff`, and `send_message` work, plus a "How Message Delivery Works" section on idle-based delivery. `data_analyst.md` repeats the `send_message` tool description and callback workflow. `report_generator.md` explains handoff return semantics. The built-in `developer.md` profile has its own "Multi-Agent Communication" section covering the same handoff vs. assign distinction. Each profile re-teaches the same communication patterns in slightly different words.
 
 With skills, these primitives become shared skills — e.g., a `cao-supervisor-protocols` skill covering assign/handoff orchestration and idle-based message delivery, and a `cao-worker-protocols` skill covering callback patterns and send_message usage. Domain-specific profiles like `data_analyst` or `report_generator` would then focus purely on their domain (statistical analysis, report formatting) and declare the appropriate communication skill in their frontmatter. When CAO's communication semantics evolve — say, a new orchestration mode is added — the skill is updated once rather than patching every agent profile that participates in multi-agent workflows.
-
-### User-extensible without forking
-
-Users can author custom skills in `~/.aws/cli-agent-orchestrator/skills/` tailored to their organization's standards, internal tooling, or domain-specific workflows. These skills work alongside built-in skills with no additional configuration.
