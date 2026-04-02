@@ -206,8 +206,8 @@ class TestLoadAgentProfileFromProviderDirs:
         # Extra dir also doesn't exist
         mock_extra.return_value = ["/also/nonexistent"]
 
-        # Should fall through to built-in store and fail
-        with pytest.raises(RuntimeError, match="Failed to load"):
+        # Should fall through to built-in store and raise FileNotFoundError
+        with pytest.raises(FileNotFoundError, match="Agent profile not found"):
             load_agent_profile("missing-agent")
 
     @patch("cli_agent_orchestrator.utils.agent_profiles.resources")
