@@ -14,7 +14,8 @@ logger = logging.getLogger(__name__)
 from pydantic import BaseModel
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
-from cli_agent_orchestrator.clients.beads import BeadsClient
+from cli_agent_orchestrator.clients.beads_real import BeadsClient
+from cli_agent_orchestrator.clients.database import get_inbox_messages, get_terminal_by_bead, set_terminal_bead
 from cli_agent_orchestrator.constants import KIRO_AGENTS_DIR, SESSION_PREFIX
 from cli_agent_orchestrator.services import terminal_service, session_service, flow_service
 from cli_agent_orchestrator.providers.manager import provider_manager
@@ -54,6 +55,10 @@ class AutoModeToggle(BaseModel):
     enabled: bool
 
 
+class TerminalInput(BaseModel):
+    text: str
+
+
 class ContextProposal(BaseModel):
     agent_name: str
     changes: str
@@ -62,6 +67,30 @@ class ContextProposal(BaseModel):
 
 class ChatDecompose(BaseModel):
     text: str
+
+
+class EpicCreate(BaseModel):
+    title: str
+    steps: List[str]
+    description: str = ""
+    priority: int = 2
+    sequential: bool = True
+    max_concurrent: int = 3
+    labels: Optional[List[str]] = None
+
+
+class DependencyAdd(BaseModel):
+    depends_on: str
+
+
+# Per-bead locks to prevent concurrent assignment races
+_assign_locks: Dict[str, asyncio.Lock] = {}
+
+
+def _get_assign_lock(bead_id: str) -> asyncio.Lock:
+    if bead_id not in _assign_locks:
+        _assign_locks[bead_id] = asyncio.Lock()
+    return _assign_locks[bead_id]
 
 
 # --- Agent Discovery ---
@@ -246,17 +275,32 @@ async def list_sessions():
             data = session_service.get_session(s["id"])
             status = "IDLE"
             agent_name = "unknown"
+            parent_session = None
             if data.get("terminals"):
                 term = data["terminals"][0]
                 agent_name = term.get("agent_profile", "unknown")
+                parent_terminal_id = term.get("parent_terminal_id")
+                if parent_terminal_id:
+                    # Find parent session from parent terminal
+                    from cli_agent_orchestrator.clients.database import list_all_terminals
+                    all_terms = list_all_terminals()
+                    parent_term = next((t for t in all_terms if t["id"] == parent_terminal_id), None)
+                    if parent_term:
+                        parent_session = parent_term.get("tmux_session")
                 try:
                     output = terminal_service.get_output(term["id"])
                     status = detect_session_status(output)
                 except:
                     pass
-            result.append({**s, "status": status, "agent_name": agent_name, "terminals": data.get("terminals", [])})
+            result.append({
+                **s, 
+                "status": status, 
+                "agent_name": agent_name, 
+                "terminals": data.get("terminals", []),
+                "parent_session": parent_session
+            })
         except:
-            result.append({**s, "status": "ERROR", "agent_name": "unknown", "terminals": []})
+            result.append({**s, "status": "ERROR", "agent_name": "unknown", "terminals": [], "parent_session": None})
     return result
 
 
@@ -300,19 +344,52 @@ async def get_session(session_id: str):
         raise HTTPException(404, str(e))
 
 
+@router.get("/sessions/{session_id}/children")
+async def get_session_children(session_id: str):
+    """Get child sessions (subagents) of a session."""
+    children = session_service.get_session_children(session_id)
+    return {"children": children}
+
+
 @router.delete("/sessions/{session_id}")
 async def delete_session(session_id: str):
-    """Terminate session."""
+    """Terminate session and all child sessions (subagents)."""
     try:
-        session_service.delete_session(session_id)
-        # Clear assignee from any beads assigned to this session
-        beads.clear_assignee_by_session(session_id)
-        await broadcast_activity({
-            "type": "session_ended",
-            "session_id": session_id,
-            "timestamp": datetime.now().isoformat()
-        })
-        return {"success": True}
+        # Get children first for UI feedback
+        children = session_service.get_session_children(session_id)
+        
+        # Broadcast that we're starting cascade delete
+        if children:
+            await broadcast_activity({
+                "type": "session_delete_started",
+                "session_id": session_id,
+                "children": children,
+                "timestamp": datetime.now().isoformat()
+            })
+        
+        # Delete with progress callback
+        async def on_progress(action: str, target: str):
+            await broadcast_activity({
+                "type": "session_delete_progress",
+                "action": action,
+                "target": target,
+                "parent": session_id,
+                "timestamp": datetime.now().isoformat()
+            })
+        
+        # Note: Can't use async callback directly, so we'll broadcast after
+        result = session_service.delete_session(session_id)
+        
+        # Clear assignee from any beads assigned to deleted sessions
+        for deleted_id in result["deleted"]:
+            beads.clear_assignee_by_session(deleted_id)
+            await broadcast_activity({
+                "type": "session_ended",
+                "session_id": deleted_id,
+                "timestamp": datetime.now().isoformat()
+            })
+        
+        return {"success": True, "deleted": result["deleted"], "errors": result["errors"]}
     except ValueError as e:
         raise HTTPException(404, str(e))
 
@@ -349,6 +426,31 @@ async def send_input(session_id: str, message: str, raw: bool = False):
         term_id = data["terminals"][0]["id"]
         terminal_service.send_input(term_id, message, add_enter=not raw)
         return {"success": True}
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@router.get("/sessions/{session_id}/inbox")
+async def get_session_inbox(session_id: str):
+    """Get pending messages for a session."""
+    try:
+        data = session_service.get_session(session_id)
+        if not data.get("terminals"):
+            return {"messages": []}
+        
+        messages = []
+        for term in data["terminals"]:
+            term_messages = get_inbox_messages(term["id"], limit=100)
+            for msg in term_messages:
+                messages.append({
+                    "id": msg.id,
+                    "from_session": msg.sender_id,
+                    "to_session": msg.receiver_id,
+                    "content": msg.message,
+                    "status": msg.status.value,
+                    "timestamp": msg.created_at.isoformat()
+                })
+        return {"messages": messages}
     except ValueError as e:
         raise HTTPException(404, str(e))
 
@@ -424,8 +526,15 @@ async def stream_terminal(ws: WebSocket, session_id: str):
         target = f"{tmux_session}:{tmux_window}"
         
         import subprocess
-        last_output = ""
-        
+
+        # Initialize last_output to current state so we only send NEW content
+        # (the frontend already loaded full history via HTTP GET)
+        init_result = subprocess.run(
+            ["/usr/local/bin/tmux", "capture-pane", "-t", target, "-p", "-S", "-500"],
+            capture_output=True, text=True, timeout=1
+        )
+        last_output = init_result.stdout or ''
+
         while True:
             try:
                 result = subprocess.run(
@@ -458,6 +567,64 @@ async def stream_terminal(ws: WebSocket, session_id: str):
         pass
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
+
+
+# --- Terminal (Sub-agent) Endpoints ---
+@router.get("/terminals/{terminal_id}/output")
+async def get_terminal_output(terminal_id: str):
+    """Get terminal output directly by terminal ID."""
+    try:
+        output = terminal_service.get_output(terminal_id)
+        return {"output": output, "status": "IDLE"}
+    except Exception as e:
+        raise HTTPException(404, f"Terminal not found: {e}")
+
+
+@router.post("/terminals/{terminal_id}/input")
+async def send_terminal_input(terminal_id: str, req: TerminalInput):
+    """Send input to terminal directly by terminal ID."""
+    try:
+        terminal_service.send_input(terminal_id, req.text)
+        return {"status": "sent"}
+    except Exception as e:
+        raise HTTPException(404, f"Terminal not found: {e}")
+
+
+@router.websocket("/terminals/{terminal_id}/stream")
+async def stream_terminal_direct(ws: WebSocket, terminal_id: str):
+    """WebSocket for live terminal output by terminal ID."""
+    await ws.accept()
+    
+    try:
+        # Initialize to current state so we only send NEW content
+        # (the frontend already loaded full history via HTTP GET)
+        initial_output = terminal_service.get_output(terminal_id)
+        last_output = initial_output
+        last_len = len(initial_output)
+
+        while True:
+            try:
+                output = terminal_service.get_output(terminal_id)
+
+                if len(output) > last_len:
+                    new_data = output[last_len:]
+                    await ws.send_json({"type": "output", "data": new_data, "status": "IDLE"})
+                    last_len = len(output)
+                    last_output = output
+                elif output != last_output:
+                    # Content changed but length didn't (e.g. screen redraw) — update tracking only
+                    last_output = output
+                    last_len = len(output)
+                    
+                await asyncio.sleep(0.05)
+            except Exception as e:
+                logger.error(f"Terminal stream error: {e}")
+                await asyncio.sleep(0.2)
+                
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.error(f"Terminal WebSocket error: {e}")
 
 
 # --- Activity Feed ---
@@ -496,6 +663,84 @@ async def stream_activity(ws: WebSocket):
         activity_streams.discard(ws)
 
 
+# --- Epic Endpoints ---
+@router.post("/epics", status_code=201)
+async def create_epic(req: EpicCreate):
+    """Create an epic with child beads."""
+    if not req.steps:
+        raise HTTPException(400, "At least one step is required")
+    epic = beads.create_epic(
+        title=req.title, steps=req.steps, description=req.description,
+        priority=req.priority, sequential=req.sequential,
+        max_concurrent=req.max_concurrent, labels=req.labels
+    )
+    children = beads.get_children(epic.id)
+    await broadcast_activity({
+        "type": "epic_created", "epic_id": epic.id,
+        "children_count": len(children),
+        "timestamp": datetime.now().isoformat()
+    })
+    return {"epic": epic.__dict__, "children": [c.__dict__ for c in children]}
+
+
+@router.get("/epics/{epic_id}")
+async def get_epic(epic_id: str):
+    """Get epic with children and progress."""
+    epic = beads.get(epic_id)
+    if not epic:
+        raise HTTPException(404, "Epic not found")
+    children = beads.get_children(epic_id)
+    completed = sum(1 for c in children if c.status == "closed")
+    wip = sum(1 for c in children if c.status == "wip")
+    return {
+        "epic": epic.__dict__,
+        "children": [c.__dict__ for c in children],
+        "progress": {
+            "total": len(children),
+            "completed": completed,
+            "wip": wip,
+            "open": len(children) - completed - wip,
+        }
+    }
+
+
+@router.get("/epics/{epic_id}/ready")
+async def get_epic_ready(epic_id: str):
+    """Get unblocked children ready for assignment."""
+    epic = beads.get(epic_id)
+    if not epic:
+        raise HTTPException(404, "Epic not found")
+    ready_tasks = beads.ready(parent_id=epic_id)
+    return [t.__dict__ for t in ready_tasks]
+
+
+@router.post("/beads/{bead_id}/dep", status_code=201)
+async def add_dependency(bead_id: str, req: DependencyAdd):
+    """Add dependency: bead_id is blocked by req.depends_on."""
+    success = beads.add_dependency(bead_id, req.depends_on)
+    if not success:
+        raise HTTPException(400, "Failed to add dependency")
+    return {"success": True, "bead_id": bead_id, "depends_on": req.depends_on}
+
+
+@router.delete("/beads/{bead_id}/dep/{dep_id}")
+async def remove_dependency(bead_id: str, dep_id: str):
+    """Remove dependency."""
+    success = beads.remove_dependency(bead_id, dep_id)
+    if not success:
+        raise HTTPException(400, "Failed to remove dependency")
+    return {"success": True}
+
+
+@router.get("/beads/{bead_id}/session")
+async def get_bead_session(bead_id: str):
+    """Find which session/terminal is working on a bead."""
+    terminal = get_terminal_by_bead(bead_id)
+    if not terminal:
+        raise HTTPException(404, "No session assigned to this bead")
+    return terminal
+
+
 # --- Beads with Assignment ---
 @router.post("/beads/{bead_id}/assign")
 async def assign_bead(bead_id: str, req: BeadAssign):
@@ -503,20 +748,21 @@ async def assign_bead(bead_id: str, req: BeadAssign):
     task = beads.get(bead_id)
     if not task:
         raise HTTPException(404, "Bead not found")
-    
+
     # Update assignee
     task = beads.wip(bead_id, req.session_id)
-    
-    # Send task to session
+
+    # Store bead_id binding on the session's terminal
     try:
         data = session_service.get_session(req.session_id)
         if data.get("terminals"):
             term_id = data["terminals"][0]["id"]
+            set_terminal_bead(term_id, bead_id)
             prompt = f"Work on this task: {task.title}\n\n{task.description}"
             terminal_service.send_input(term_id, prompt)
     except:
         pass
-    
+
     await broadcast_activity({
         "type": "bead_assigned",
         "bead_id": bead_id,
@@ -524,6 +770,13 @@ async def assign_bead(bead_id: str, req: BeadAssign):
         "timestamp": datetime.now().isoformat()
     })
     return task.__dict__
+
+
+@router.post("/tasks/unassign-session/{session_id}")
+async def unassign_session_tasks(session_id: str):
+    """Unassign all tasks from a session."""
+    count = beads.clear_assignee_by_session(session_id)
+    return {"unassigned": count}
 
 
 class ChildBeadCreate(BaseModel):
@@ -571,33 +824,37 @@ async def list_agents():
 @router.post("/beads/{bead_id}/assign-agent")
 async def assign_bead_to_agent(bead_id: str, req: BeadAssignAgent):
     """Assign bead to agent profile - spawns new session and starts working."""
-    task = beads.get(bead_id)
-    if not task:
-        raise HTTPException(404, "Bead not found")
-    
-    # Spawn new session with agent
-    terminal = terminal_service.create_terminal(
-        provider=req.provider,
-        agent_profile=req.agent_name,
-        new_session=True
-    )
-    session_id = terminal.session_name
-    
-    # Update bead assignee
-    task = beads.wip(bead_id, session_id)
-    
-    # Send task to agent
-    prompt = f"Work on this task: {task.title}\n\n{task.description}" if task.description else f"Work on this task: {task.title}"
-    terminal_service.send_input(terminal.id, prompt)
-    
-    await broadcast_activity({
-        "type": "bead_assigned",
-        "bead_id": bead_id,
-        "session_id": session_id,
-        "agent": req.agent_name,
-        "timestamp": datetime.now().isoformat()
-    })
-    return {"task": task.__dict__, "session_id": session_id, "terminal_id": terminal.id}
+    async with _get_assign_lock(bead_id):
+        task = beads.get(bead_id)
+        if not task:
+            raise HTTPException(404, "Bead not found")
+        if task.assignee:
+            raise HTTPException(409, f"Bead already assigned to {task.assignee}")
+
+        # Spawn new session with agent + bead_id binding
+        terminal = terminal_service.create_terminal(
+            provider=req.provider,
+            agent_profile=req.agent_name,
+            new_session=True,
+            bead_id=bead_id,
+        )
+        session_id = terminal.session_name
+
+        # Update bead assignee
+        task = beads.wip(bead_id, session_id)
+
+        # Send task to agent
+        prompt = f"Work on this task: {task.title}\n\n{task.description}" if task.description else f"Work on this task: {task.title}"
+        terminal_service.send_input(terminal.id, prompt)
+
+        await broadcast_activity({
+            "type": "bead_assigned",
+            "bead_id": bead_id,
+            "session_id": session_id,
+            "agent": req.agent_name,
+            "timestamp": datetime.now().isoformat()
+        })
+        return {"task": task.__dict__, "session_id": session_id, "terminal_id": terminal.id}
 
 
 # --- Auto-mode (stored per-session in memory) ---
@@ -727,9 +984,33 @@ async def edit_proposal(delta_id: str, bullets: list[str]):
     return result
 
 
+@router.post("/learn/terminals/{terminal_id}")
+async def learn_from_terminal(terminal_id: str, outcome: str = "neutral"):
+    """Analyze terminal for mistakes/corrections and suggest agent.md diff."""
+    try:
+        output = terminal_service.get_output(terminal_id)
+        if not output:
+            raise HTTPException(404, "No output in terminal")
+        
+        term_data = terminal_service.get_terminal(terminal_id)
+        agent_name = term_data.get("agent_profile", "unknown")
+        
+        # Create diff proposal instead of simple extraction
+        proposal = learning_system.create_diff_proposal(
+            session_id=terminal_id,
+            output=output,
+            agent_name=agent_name
+        )
+        proposal["source"] = "live_capture"
+        
+        return proposal
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
 @router.post("/learn/sessions/{session_id}")
 async def trigger_learning(session_id: str, outcome: str = "neutral"):
-    """Trigger context learning for completed session."""
+    """Analyze session for mistakes/corrections and suggest agent.md diff."""
     try:
         data = session_service.get_session(session_id)
         if not data.get("terminals"):
@@ -739,13 +1020,40 @@ async def trigger_learning(session_id: str, outcome: str = "neutral"):
         output = terminal_service.get_output(term_id)
         agent_name = data["terminals"][0].get("agent_profile", "unknown")
         
-        # Use new learning system
-        proposal = learning_system.create_proposal(session_id, output, outcome)
-        proposal["agent_name"] = agent_name
+        # Create diff proposal
+        proposal = learning_system.create_diff_proposal(
+            session_id=session_id,
+            output=output,
+            agent_name=agent_name
+        )
         
         return proposal
     except ValueError as e:
         raise HTTPException(404, str(e))
+
+
+@router.get("/learn/diff-proposals")
+async def list_diff_proposals(status: Optional[str] = None):
+    """List agent.md diff proposals."""
+    return learning_system.get_proposals(status)
+
+
+@router.post("/learn/diff-proposals/{proposal_id}/approve")
+async def approve_diff_proposal(proposal_id: str):
+    """Approve and apply a diff proposal to agent.md."""
+    result = learning_system.approve_proposal(proposal_id)
+    if not result:
+        raise HTTPException(404, "Proposal not found")
+    return result
+
+
+@router.post("/learn/diff-proposals/{proposal_id}/reject")
+async def reject_diff_proposal(proposal_id: str, feedback: str = None):
+    """Reject a diff proposal."""
+    result = learning_system.reject_proposal(proposal_id, feedback)
+    if not result:
+        raise HTTPException(404, "Proposal not found")
+    return result
 
 
 # --- Chat Bar / Task Decomposition ---
@@ -911,13 +1219,9 @@ class FlowCreate(BaseModel):
     schedule: str
     agent_profile: str
     prompt: str
-class FlowCreate(BaseModel):
-    name: str
-    schedule: str
-    agent_profile: str
-    prompt: str
-    provider: str = "kiro_cli"
+    provider: str = "q_cli"
     script: Optional[str] = None
+    flow_type: str = "agent"  # agent or orchestrator
 
 
 @router.get("/flows")
@@ -933,6 +1237,7 @@ async def list_flows():
             "enabled": f.enabled,
             "next_run": f.next_run.isoformat() if f.next_run else None,
             "last_run": f.last_run.isoformat() if f.last_run else None,
+            "flow_type": getattr(f, 'flow_type', 'agent'),
         }
         for f in flows
     ]
@@ -956,6 +1261,7 @@ name: {req.name}
 schedule: "{req.schedule}"
 agent_profile: {req.agent_profile}
 provider: {req.provider}
+flow_type: {req.flow_type}
 """
         if req.script:
             content += f"script: {req.script}\n"
@@ -979,6 +1285,7 @@ provider: {req.provider}
             "schedule": flow.schedule,
             "agent_profile": flow.agent_profile,
             "provider": flow.provider,
+            "flow_type": req.flow_type,
             "enabled": flow.enabled,
             "next_run": flow.next_run.isoformat() if flow.next_run else None,
         }
@@ -993,6 +1300,18 @@ async def get_flow(name: str):
     """Get flow details."""
     try:
         f = flow_service.get_flow(name)
+        # Read prompt and metadata from file
+        prompt = ""
+        metadata = {}
+        if f.file_path:
+            try:
+                import frontmatter
+                with open(f.file_path) as fp:
+                    post = frontmatter.load(fp)
+                    prompt = post.content
+                    metadata = post.metadata
+            except:
+                pass
         return {
             "name": f.name,
             "schedule": f.schedule,
@@ -1001,8 +1320,12 @@ async def get_flow(name: str):
             "enabled": f.enabled,
             "next_run": f.next_run.isoformat() if f.next_run else None,
             "last_run": f.last_run.isoformat() if f.last_run else None,
-            "file_path": f.file_path,
+            "prompt": prompt,
             "script": f.script,
+            "flow_type": getattr(f, 'flow_type', metadata.get('flow_type', 'agent')),
+            "worker_count": metadata.get('worker_count', 3),
+            "supervisor_agent": metadata.get('supervisor_agent', 'code_supervisor'),
+            "worker_agents": metadata.get('worker_agents', ['developer', 'reviewer', 'tester']),
         }
     except ValueError as e:
         raise HTTPException(404, str(e))
@@ -1016,10 +1339,97 @@ async def run_flow(name: str):
         await broadcast_activity({
             "type": "flow_executed",
             "flow_name": name,
+            "session_id": result.get("session_id"),
             "timestamp": datetime.now().isoformat()
         })
-        return {"success": True, "executed": result}
+        return {"success": True, **result}
     except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@router.get("/flows/{name}/executions")
+async def get_flow_executions(name: str, limit: int = 20):
+    """Get flow execution history."""
+    try:
+        executions = flow_service.get_execution_history(name, limit)
+        return {"executions": executions}
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@router.get("/flows/executions/{execution_id}/log")
+async def get_execution_log(execution_id: int):
+    """Get execution output log."""
+    from cli_agent_orchestrator.clients.database import get_flow_execution_log
+    log = get_flow_execution_log(execution_id)
+    if log is None:
+        raise HTTPException(404, "Execution not found")
+    return {"log": log}
+
+
+@router.post("/flows/executions/{execution_id}/complete")
+async def complete_execution(execution_id: int):
+    """Manually mark execution as completed and capture logs."""
+    from cli_agent_orchestrator.clients.database import get_flow_execution, update_flow_execution
+    from cli_agent_orchestrator.clients.tmux import TmuxClient
+    
+    ex = get_flow_execution(execution_id)
+    if not ex:
+        raise HTTPException(404, "Execution not found")
+    
+    if ex['status'] != 'running':
+        return {"success": True, "message": "Already completed"}
+    
+    # Capture logs
+    output_log = None
+    if ex.get('session_id'):
+        try:
+            session_data = session_service.get_session(ex['session_id'])
+            tmux = TmuxClient()
+            logs = []
+            for term in session_data.get('terminals', []):
+                agent = term.get('agent_profile', 'agent')
+                history = tmux.get_history(term.get('tmux_session'), term.get('tmux_window'), tail_lines=2000) or ''
+                logs.append(f"=== [{agent}] ===\n{history}")
+            output_log = "\n\n".join(logs) if logs else None
+        except:
+            pass
+    
+    update_flow_execution(execution_id, 'completed', output_log=output_log)
+    return {"success": True, "has_log": bool(output_log)}
+
+
+@router.get("/sessions/{session_id}/history")
+async def get_session_history(session_id: str, lines: int = 500):
+    """Get full terminal history for a session (all agents)."""
+    try:
+        data = session_service.get_session(session_id)
+        if not data.get("terminals"):
+            return {"history": "", "terminals": []}
+        
+        # Get history from ALL terminals in the session
+        all_history = []
+        for term in data["terminals"]:
+            agent = term.get("agent_profile", "agent")
+            history = tmux_client.get_history(term["tmux_session"], term["tmux_window"], tail_lines=lines)
+            all_history.append({
+                "agent": agent,
+                "terminal_id": term["id"],
+                "history": history
+            })
+        
+        # Combine into single view with agent headers
+        combined = []
+        for h in all_history:
+            combined.append(f"\n{'='*60}\n[{h['agent']}] Terminal: {h['terminal_id']}\n{'='*60}\n")
+            combined.append(h["history"])
+        
+        return {
+            "history": "\n".join(combined),
+            "session_id": session_id,
+            "terminals": all_history
+        }
+    except Exception as e:
         raise HTTPException(404, str(e))
 
 
