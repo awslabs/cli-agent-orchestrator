@@ -52,6 +52,16 @@ BELL_CHAR = "\x07"
 IDLE_PROMPT_PATTERN_LOG = r"\x1b\[38;5;\d+m\[.+?\].*\x1b\[38;5;\d+m>\s*\x1b\[\d*m"
 
 # =============================================================================
+# New TUI Patterns (Kiro CLI without --legacy-ui)
+# =============================================================================
+
+# New TUI idle prompt: "ask a question, or describe a task ↵"
+NEW_TUI_IDLE_PATTERN = r"ask a question, or describe a task"
+
+# New TUI IDLE prompt pattern for log files (with ANSI codes)
+NEW_TUI_IDLE_PATTERN_LOG = r"ask a question, or describe a task"
+
+# =============================================================================
 # Error Detection
 # =============================================================================
 
@@ -106,6 +116,9 @@ class KiroCliProvider(BaseProvider):
             rf"\[{re.escape(self._agent_profile)}\]\s*(?:\d+%\s*)?(?:\u03bb\s*)?!?>\s*"
         )
         self._permission_prompt_pattern = r"Allow this action\?.*?\[.*?y.*?/.*?n.*?/.*?t.*?\]:"
+
+        # New TUI header pattern: "agent_name · model · ◔ N%"
+        self._new_tui_header_pattern = rf"{re.escape(self._agent_profile)}\s+·\s+.*·\s+◔\s*\d+%"
 
     def initialize(self) -> bool:
         """Initialize Kiro CLI provider by starting kiro-cli chat command.
@@ -170,11 +183,12 @@ class KiroCliProvider(BaseProvider):
         # This simplifies regex patterns and improves reliability
         clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
 
-        # Check 1: Look for the agent's IDLE prompt pattern
+        # Check 1: Look for the agent's IDLE prompt pattern (old or new TUI)
         # If not found, the agent is still processing a response
         has_idle_prompt = re.search(self._idle_prompt_pattern, clean_output)
+        has_new_tui_idle = re.search(NEW_TUI_IDLE_PATTERN, clean_output)
 
-        if not has_idle_prompt:
+        if not has_idle_prompt and not has_new_tui_idle:
             return TerminalStatus.PROCESSING
 
         # Check 2: Look for known error messages in the output
@@ -190,7 +204,10 @@ class KiroCliProvider(BaseProvider):
             after_last_perm = clean_output[perm_matches[-1].end() :]
             lines_after = after_last_perm.split("\n")
             idle_lines = sum(
-                1 for line in lines_after if re.search(self._idle_prompt_pattern, line)
+                1
+                for line in lines_after
+                if re.search(self._idle_prompt_pattern, line)
+                or re.search(NEW_TUI_IDLE_PATTERN, line)
             )
             if idle_lines <= 1:
                 return TerminalStatus.WAITING_USER_ANSWER
@@ -208,6 +225,13 @@ class KiroCliProvider(BaseProvider):
                     logger.debug(f"get_status: returning COMPLETED")
                     return TerminalStatus.COMPLETED
 
+            # Also check new TUI idle pattern after the last green arrow
+            new_tui_idles = list(re.finditer(NEW_TUI_IDLE_PATTERN, clean_output))
+            for prompt in new_tui_idles:
+                if prompt.start() > last_arrow_pos:
+                    logger.debug("get_status: returning COMPLETED (new TUI)")
+                    return TerminalStatus.COMPLETED
+
             # Has green arrow but no prompt after it - still processing
             return TerminalStatus.PROCESSING
 
@@ -222,22 +246,28 @@ class KiroCliProvider(BaseProvider):
         # Find patterns in clean output
         green_arrows = list(re.finditer(GREEN_ARROW_PATTERN, clean_output, re.MULTILINE))
         idle_prompts = list(re.finditer(self._idle_prompt_pattern, clean_output))
+        new_tui_idles = list(re.finditer(NEW_TUI_IDLE_PATTERN, clean_output))
 
         if not green_arrows:
             raise ValueError("No Kiro CLI response found - no green arrow pattern detected")
 
-        if not idle_prompts:
+        if not idle_prompts and not new_tui_idles:
             raise ValueError("Incomplete Kiro CLI response - no final prompt detected")
 
         # Find the last green arrow (response start)
         last_arrow_pos = green_arrows[-1].end()
 
-        # Find idle prompt that comes AFTER the last green arrow
+        # Find idle prompt that comes AFTER the last green arrow (old or new TUI)
         final_prompt = None
         for prompt in idle_prompts:
             if prompt.start() > last_arrow_pos:
                 final_prompt = prompt
                 break
+        if not final_prompt:
+            for prompt in new_tui_idles:
+                if prompt.start() > last_arrow_pos:
+                    final_prompt = prompt
+                    break
 
         if not final_prompt:
             raise ValueError(
@@ -260,8 +290,12 @@ class KiroCliProvider(BaseProvider):
         return final_answer.strip()
 
     def get_idle_pattern_for_log(self) -> str:
-        """Return Kiro CLI IDLE prompt pattern for log files."""
-        return IDLE_PROMPT_PATTERN_LOG
+        """Return Kiro CLI IDLE prompt pattern for log files.
+
+        Returns a pattern that matches either the legacy UI format
+        or the new TUI format.
+        """
+        return rf"(?:{IDLE_PROMPT_PATTERN_LOG}|{NEW_TUI_IDLE_PATTERN_LOG})"
 
     def exit_cli(self) -> str:
         """Get the command to exit Kiro CLI."""

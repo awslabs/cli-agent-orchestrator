@@ -616,13 +616,18 @@ class TestKiroCliProviderEdgeCases:
         assert exit_cmd == "/exit"
 
     def test_get_idle_pattern_for_log(self):
-        """Test idle pattern for log files."""
+        """Test idle pattern for log files matches both old and new TUI."""
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         pattern = provider.get_idle_pattern_for_log()
 
-        from cli_agent_orchestrator.providers.kiro_cli import IDLE_PROMPT_PATTERN_LOG
+        from cli_agent_orchestrator.providers.kiro_cli import (
+            IDLE_PROMPT_PATTERN_LOG,
+            NEW_TUI_IDLE_PATTERN_LOG,
+        )
 
-        assert pattern == IDLE_PROMPT_PATTERN_LOG
+        # Pattern should match both old and new TUI formats
+        assert IDLE_PROMPT_PATTERN_LOG in pattern
+        assert NEW_TUI_IDLE_PATTERN_LOG in pattern
 
     def test_cleanup(self):
         """Test cleanup method."""
@@ -717,3 +722,94 @@ class TestKiroCliProviderEdgeCases:
             mock_tmux.get_history.return_value = test_output
             status = provider.get_status()
             assert status == TerminalStatus.IDLE
+
+
+class TestKiroCliNewTuiSupport:
+    """Test new Kiro CLI TUI format detection (without --legacy-ui)."""
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_new_tui_idle_detection(self, mock_tmux):
+        """Test IDLE detection with new TUI prompt format."""
+        mock_tmux.get_history.return_value = (
+            "code_supervisor · claude-opus-4.6-1m · ◔ 1%\n" " ask a question, or describe a task ↵"
+        )
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "code_supervisor")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_new_tui_completed_detection(self, mock_tmux):
+        """Test COMPLETED detection with new TUI: green arrow + new idle prompt."""
+        mock_tmux.get_history.return_value = (
+            "> Here is the response to your question.\n"
+            "Some more response text.\n"
+            "code_supervisor · claude-opus-4.6-1m · ◔ 2%\n"
+            " ask a question, or describe a task ↵"
+        )
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "code_supervisor")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_new_tui_processing_detection(self, mock_tmux):
+        """Test PROCESSING when new TUI idle prompt is absent."""
+        mock_tmux.get_history.return_value = (
+            "code_supervisor · claude-opus-4.6-1m · ◔ 1%\n" "Generating response..."
+        )
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "code_supervisor")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_new_tui_extraction(self, mock_tmux):
+        """Test message extraction with new TUI idle prompt as boundary."""
+        output = (
+            "> Complete response here\n"
+            "With multiple lines of content.\n"
+            "code_supervisor · claude-opus-4.6-1m · ◔ 2%\n"
+            " ask a question, or describe a task ↵"
+        )
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "code_supervisor")
+        message = provider.extract_last_message_from_script(output)
+
+        assert "Complete response here" in message
+        assert "multiple lines" in message
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_new_tui_permission_prompt(self, mock_tmux):
+        """Test WAITING_USER_ANSWER with new TUI and permission prompt."""
+        mock_tmux.get_history.return_value = (
+            "Allow this action? [y/n/t]:\n"
+            "code_supervisor · claude-opus-4.6-1m · ◔ 1%\n"
+            " ask a question, or describe a task ↵"
+        )
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "code_supervisor")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_new_tui_header_pattern(self):
+        """Test new TUI header pattern matches expected format."""
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "code_supervisor")
+
+        assert re.search(
+            provider._new_tui_header_pattern,
+            "code_supervisor · claude-opus-4.6-1m · ◔ 1%",
+        )
+        assert re.search(
+            provider._new_tui_header_pattern,
+            "code_supervisor · some-model · ◔ 50%",
+        )
+        # Should not match different agent
+        assert not re.search(
+            provider._new_tui_header_pattern,
+            "other_agent · claude-opus-4.6-1m · ◔ 1%",
+        )
