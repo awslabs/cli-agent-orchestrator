@@ -5,7 +5,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from cli_agent_orchestrator.clients.beads_real import BeadsClient
+from cli_agent_orchestrator.clients.beads_real import (
+    BeadsClient, Task, extract_label_value, extract_context_files,
+    resolve_workspace, resolve_context_files,
+)
 
 
 @pytest.fixture
@@ -647,3 +650,331 @@ class TestComments:
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="error")
             assert not client.add_comment("bad-id", "text")
+
+
+# ==================== Phase 2: Epic + Dependency + Label Tests ====================
+
+
+class TestAddDependency:
+    """Tests for add_dependency() method."""
+
+    def test_calls_bd_dep_add(self, client):
+        """add_dependency() calls bd dep add with correct args."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            assert client.add_dependency("task-2", "task-1")
+            args = mock_run.call_args[0][0]
+            assert "dep" in args
+            assert "add" in args
+            assert "task-2" in args
+            assert "task-1" in args
+
+    def test_returns_false_on_error(self, client):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="error")
+            assert not client.add_dependency("bad", "bad")
+
+
+class TestRemoveDependency:
+    """Tests for remove_dependency() method."""
+
+    def test_calls_bd_dep_remove(self, client):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            assert client.remove_dependency("task-2", "task-1")
+            args = mock_run.call_args[0][0]
+            assert "dep" in args
+            assert "remove" in args
+
+    def test_returns_false_on_error(self, client):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="error")
+            assert not client.remove_dependency("bad", "bad")
+
+
+class TestUpdateNotes:
+    """Tests for update_notes() method."""
+
+    def test_calls_bd_update_with_notes(self, client):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout=json.dumps([{"id": "x", "title": "T", "priority": 2, "status": "open"}]),
+                stderr=""
+            )
+            client.update_notes("x", "Schema uses 5 tables")
+            update_call = [c for c in mock_run.call_args_list if "--notes" in " ".join(c[0][0])]
+            assert len(update_call) == 1
+            assert "Schema uses 5 tables" in update_call[0][0][0]
+
+
+class TestAddRemoveLabel:
+    """Tests for add_label() and remove_label() methods."""
+
+    def test_add_label(self, client):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            assert client.add_label("x", "priority:high")
+            args = mock_run.call_args[0][0]
+            assert "label" in args and "add" in args and "priority:high" in args
+
+    def test_remove_label(self, client):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            assert client.remove_label("x", "priority:high")
+            args = mock_run.call_args[0][0]
+            assert "label" in args and "remove" in args
+
+    def test_add_label_returns_false_on_error(self, client):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="error")
+            assert not client.add_label("bad", "label")
+
+
+class TestIsEpic:
+    """Tests for is_epic() method."""
+
+    def test_true_for_parent_with_children(self, client):
+        tasks = [
+            {"id": "p.1", "title": "Child", "priority": 2, "status": "open", "parent_id": "p"},
+        ]
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(tasks), stderr="")
+            assert client.is_epic("p")
+
+    def test_false_for_leaf_task(self, client):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="[]", stderr="")
+            assert not client.is_epic("leaf")
+
+
+class TestReady:
+    """Tests for ready() method."""
+
+    def test_returns_all_ready_tasks(self, client):
+        issues = [
+            {"id": "a", "title": "Ready A", "priority": 2, "status": "open"},
+            {"id": "b", "title": "Ready B", "priority": 2, "status": "open"},
+        ]
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(issues), stderr="")
+            tasks = client.ready()
+            assert len(tasks) == 2
+
+    def test_filters_by_parent_id(self, client):
+        issues = [
+            {"id": "epic.1", "title": "Step 1", "priority": 2, "status": "open", "parent_id": "epic"},
+            {"id": "other", "title": "Other", "priority": 2, "status": "open"},
+        ]
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(issues), stderr="")
+            tasks = client.ready(parent_id="epic")
+            assert len(tasks) == 1
+            assert tasks[0].id == "epic.1"
+
+    def test_filters_by_parent_id_prefix(self, client):
+        """ready() also matches children by ID prefix (e.g., epic.1 is child of epic)."""
+        issues = [
+            {"id": "epic.1", "title": "Step 1", "priority": 2, "status": "open"},
+        ]
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=json.dumps(issues), stderr="")
+            tasks = client.ready(parent_id="epic")
+            assert len(tasks) == 1
+
+    def test_returns_empty_when_none_ready(self, client):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="[]", stderr="")
+            assert client.ready() == []
+
+
+class TestCreateEpic:
+    """Tests for create_epic() method."""
+
+    def test_creates_parent_and_children(self, client):
+        """create_epic creates parent + N children."""
+        call_log = []
+
+        def mock_run(cmd, **kw):
+            cmd_str = " ".join(cmd)
+            call_log.append(cmd_str)
+            if "create" in cmd_str and "--parent" not in cmd_str:
+                return MagicMock(returncode=0, stdout="Created issue: epic-1", stderr="")
+            if "create" in cmd_str and "--parent" in cmd_str:
+                idx = len([c for c in call_log if "--parent" in c])
+                return MagicMock(returncode=0, stdout=f"Created issue: epic-1.{idx}", stderr="")
+            if "show" in cmd_str or "list" in cmd_str:
+                return MagicMock(returncode=0, stdout=json.dumps([{
+                    "id": "epic-1", "title": "My Epic", "priority": 2, "status": "open"
+                }]), stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("subprocess.run", side_effect=mock_run):
+            epic = client.create_epic("My Epic", ["Step A", "Step B", "Step C"])
+            assert epic.id == "epic-1"
+
+            # Should have 3 create calls with --parent
+            parent_creates = [c for c in call_log if "--parent" in c and "create" in c]
+            assert len(parent_creates) == 3
+
+    def test_sequential_adds_dependencies(self, client):
+        """create_epic with sequential=True chains deps."""
+        dep_calls = []
+
+        def mock_run(cmd, **kw):
+            cmd_str = " ".join(cmd)
+            if "dep add" in cmd_str:
+                dep_calls.append(cmd_str)
+            if "create" in cmd_str and "--parent" not in cmd_str:
+                return MagicMock(returncode=0, stdout="Created issue: e", stderr="")
+            if "create" in cmd_str:
+                idx = len([c for c in dep_calls]) + 1  # rough child index
+                return MagicMock(returncode=0, stdout=f"Created issue: e.{len(dep_calls) + 1}", stderr="")
+            if "show" in cmd_str:
+                return MagicMock(returncode=0, stdout=json.dumps([{
+                    "id": "e", "title": "E", "priority": 2, "status": "open"
+                }]), stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("subprocess.run", side_effect=mock_run):
+            client.create_epic("E", ["A", "B", "C"], sequential=True)
+            # Should have 2 dep add calls: B depends on A, C depends on B
+            assert len(dep_calls) == 2
+
+    def test_non_sequential_no_deps(self, client):
+        """create_epic with sequential=False creates no deps."""
+        dep_calls = []
+
+        def mock_run(cmd, **kw):
+            if "dep add" in " ".join(cmd):
+                dep_calls.append(True)
+            if "create" in " ".join(cmd):
+                return MagicMock(returncode=0, stdout="Created issue: x", stderr="")
+            if "show" in " ".join(cmd):
+                return MagicMock(returncode=0, stdout=json.dumps([{
+                    "id": "x", "title": "X", "priority": 2, "status": "open"
+                }]), stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("subprocess.run", side_effect=mock_run):
+            client.create_epic("X", ["A", "B", "C"], sequential=False)
+            assert len(dep_calls) == 0
+
+    def test_adds_type_epic_label(self, client):
+        """create_epic adds type:epic label to parent."""
+        label_calls = []
+
+        def mock_run(cmd, **kw):
+            cmd_str = " ".join(cmd)
+            if "label" in cmd_str and "add" in cmd_str:
+                label_calls.append(cmd_str)
+            if "create" in cmd_str:
+                return MagicMock(returncode=0, stdout="Created issue: e", stderr="")
+            if "show" in cmd_str:
+                return MagicMock(returncode=0, stdout=json.dumps([{
+                    "id": "e", "title": "E", "priority": 2, "status": "open"
+                }]), stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("subprocess.run", side_effect=mock_run):
+            client.create_epic("E", ["A"], labels=["custom:tag"])
+            type_labels = [c for c in label_calls if "type:epic" in c]
+            assert len(type_labels) == 1
+            max_labels = [c for c in label_calls if "max_concurrent:" in c]
+            assert len(max_labels) == 1
+            custom_labels = [c for c in label_calls if "custom:tag" in c]
+            assert len(custom_labels) == 1
+
+
+# ==================== Label Utility Functions ====================
+
+
+class TestExtractLabelValue:
+    """Tests for extract_label_value()."""
+
+    def test_finds_matching_prefix(self):
+        assert extract_label_value(["workspace:/foo", "type:epic"], "workspace") == "/foo"
+
+    def test_returns_none_when_not_found(self):
+        assert extract_label_value(["type:epic"], "workspace") is None
+
+    def test_handles_none_labels(self):
+        assert extract_label_value(None, "workspace") is None
+
+    def test_handles_empty_list(self):
+        assert extract_label_value([], "workspace") is None
+
+    def test_returns_first_match(self):
+        assert extract_label_value(["workspace:/a", "workspace:/b"], "workspace") == "/a"
+
+
+class TestExtractContextFiles:
+    """Tests for extract_context_files()."""
+
+    def test_extracts_context_labels(self):
+        labels = ["context:/tmp/file.md", "type:epic", "context:/tmp/other.md"]
+        assert extract_context_files(labels) == ["/tmp/file.md", "/tmp/other.md"]
+
+    def test_empty_labels(self):
+        assert extract_context_files([]) == []
+
+    def test_none_labels(self):
+        assert extract_context_files(None) == []
+
+    def test_no_context_labels(self):
+        assert extract_context_files(["type:epic", "workspace:/foo"]) == []
+
+
+class TestResolveWorkspace:
+    """Tests for resolve_workspace()."""
+
+    def test_from_task_label(self):
+        task = Task(id="t", title="T", labels=["workspace:/my/dir"])
+        assert resolve_workspace(task, None, "/default") == "/my/dir"
+
+    def test_inherits_from_parent(self):
+        child = Task(id="c", title="Child", parent_id="p")
+        parent = Task(id="p", title="Parent", labels=["workspace:/parent/dir"])
+        mock_client = MagicMock()
+        mock_client.get.return_value = parent
+        assert resolve_workspace(child, mock_client, "/default") == "/parent/dir"
+
+    def test_falls_back_to_default(self):
+        task = Task(id="t", title="T")
+        assert resolve_workspace(task, None, "/default") == "/default"
+
+    def test_returns_none_when_no_default(self):
+        task = Task(id="t", title="T")
+        assert resolve_workspace(task, None) is None
+
+
+class TestResolveContextFiles:
+    """Tests for resolve_context_files()."""
+
+    def test_from_task_labels(self):
+        task = Task(id="t", title="T", labels=["context:/a.md", "context:/b.md"])
+        assert resolve_context_files(task, None) == ["/a.md", "/b.md"]
+
+    def test_inherits_from_parent(self):
+        child = Task(id="c", title="C", parent_id="p", labels=["context:/child.md"])
+        parent = Task(id="p", title="P", labels=["context:/parent.md"])
+        mock_client = MagicMock()
+        mock_client.get.return_value = parent
+        result = resolve_context_files(child, mock_client)
+        assert result == ["/child.md", "/parent.md"]
+
+    def test_deduplicates(self):
+        child = Task(id="c", title="C", parent_id="p", labels=["context:/shared.md"])
+        parent = Task(id="p", title="P", labels=["context:/shared.md", "context:/extra.md"])
+        mock_client = MagicMock()
+        mock_client.get.return_value = parent
+        result = resolve_context_files(child, mock_client)
+        assert result == ["/shared.md", "/extra.md"]
+
+    def test_no_context(self):
+        task = Task(id="t", title="T", labels=["type:epic"])
+        assert resolve_context_files(task, None) == []
+
+    def test_none_labels(self):
+        task = Task(id="t", title="T")
+        assert resolve_context_files(task, None) == []

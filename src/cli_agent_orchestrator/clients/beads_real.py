@@ -4,7 +4,68 @@ import json
 import re
 import subprocess
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional, List
+
+
+# --- Label utility functions ---
+
+def extract_label_value(labels: Optional[List[str]], prefix: str) -> Optional[str]:
+    """Extract value from a label with format 'prefix:value'.
+
+    Example: extract_label_value(["workspace:/foo", "type:epic"], "workspace") -> "/foo"
+    """
+    if not labels:
+        return None
+    for label in labels:
+        if label.startswith(f"{prefix}:"):
+            return label[len(prefix) + 1:]
+    return None
+
+
+def extract_context_files(labels: Optional[List[str]]) -> List[str]:
+    """Extract all context file paths from labels.
+
+    Labels like 'context:/path/to/file.md' -> ['/path/to/file.md']
+    """
+    if not labels:
+        return []
+    return [label.split(":", 1)[1] for label in labels if label.startswith("context:")]
+
+
+def resolve_workspace(task: "Task", beads_client: Optional["BeadsClient"], default: Optional[str] = None) -> Optional[str]:
+    """Resolve workspace for a task by walking parent chain.
+
+    Checks task's own labels first, then parent's, then default.
+    """
+    workspace = extract_label_value(task.labels, "workspace")
+    if workspace:
+        return workspace
+    if task.parent_id and beads_client:
+        parent = beads_client.get(task.parent_id)
+        if parent:
+            return resolve_workspace(parent, beads_client, default)
+    return default
+
+
+def resolve_context_files(task: "Task", beads_client: Optional["BeadsClient"]) -> List[str]:
+    """Collect context file paths from task + parent chain, deduplicated.
+
+    Walks up the parent_id chain, collecting context: labels from each level.
+    Task's own files come first, then parent's.
+    """
+    files = extract_context_files(task.labels)
+    if task.parent_id and beads_client:
+        parent = beads_client.get(task.parent_id)
+        if parent:
+            parent_files = resolve_context_files(parent, beads_client)
+            # Dedupe: parent files after task files, preserving order
+            seen = set(files)
+            for f in parent_files:
+                if f not in seen:
+                    seen.add(f)
+                    files.append(f)
+    return files
 
 
 @dataclass
@@ -235,3 +296,86 @@ class BeadsClient:
             return True
         except Exception:
             return False
+
+    def add_dependency(self, task_id: str, depends_on_id: str) -> bool:
+        """Add a dependency: task_id is blocked by depends_on_id."""
+        try:
+            self._run_bd("dep", "add", task_id, depends_on_id)
+            return True
+        except Exception:
+            return False
+
+    def remove_dependency(self, task_id: str, depends_on_id: str) -> bool:
+        """Remove a dependency."""
+        try:
+            self._run_bd("dep", "remove", task_id, depends_on_id)
+            return True
+        except Exception:
+            return False
+
+    def update_notes(self, task_id: str, notes: str) -> Optional[Task]:
+        """Update notes on a bead."""
+        self._run_bd("update", task_id, "--notes", notes)
+        return self.get(task_id)
+
+    def add_label(self, task_id: str, label: str) -> bool:
+        """Add a label to a bead."""
+        try:
+            self._run_bd("label", "add", task_id, label)
+            return True
+        except Exception:
+            return False
+
+    def remove_label(self, task_id: str, label: str) -> bool:
+        """Remove a label from a bead."""
+        try:
+            self._run_bd("label", "remove", task_id, label)
+            return True
+        except Exception:
+            return False
+
+    def is_epic(self, task_id: str) -> bool:
+        """Check if a task is an epic (has children)."""
+        children = self.get_children(task_id)
+        return len(children) > 0
+
+    def ready(self, parent_id: Optional[str] = None) -> List[Task]:
+        """Get ready (unblocked, open) tasks. If parent_id given, only children of that parent."""
+        issues = self._run_bd_json("ready")
+        if not isinstance(issues, list):
+            return []
+        tasks = [self._issue_to_task(i) for i in issues]
+        if parent_id:
+            tasks = [t for t in tasks if t.parent_id == parent_id or t.id.startswith(f"{parent_id}.")]
+        return tasks
+
+    def create_epic(
+        self, title: str, steps: List[str], priority: int = 2,
+        sequential: bool = True, max_concurrent: int = 3,
+        labels: Optional[List[str]] = None, description: str = ""
+    ) -> Task:
+        """Create an epic (parent bead) with child beads for each step.
+
+        If sequential=True, each child after the first is blocked_by the previous one.
+        Adds type:epic and max_concurrent labels to parent.
+        Returns the parent Task.
+        """
+        # Create parent
+        parent = self.add(title, description=description, priority=priority)
+
+        # Add labels to parent
+        self.add_label(parent.id, "type:epic")
+        if max_concurrent > 0:
+            self.add_label(parent.id, f"max_concurrent:{max_concurrent}")
+        for label in (labels or []):
+            self.add_label(parent.id, label)
+
+        # Create children with sequential deps
+        prev_child_id = None
+        for step in steps:
+            child = self.create_child(parent.id, step, priority=priority)
+            if sequential and prev_child_id:
+                self.add_dependency(child.id, prev_child_id)
+            prev_child_id = child.id
+
+        return self.get(parent.id) or parent
