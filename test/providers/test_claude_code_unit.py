@@ -249,12 +249,29 @@ class TestClaudeCodeProviderStatusDetection:
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
     def test_get_status_waiting_user_answer(self, mock_tmux):
         """Test WAITING_USER_ANSWER status detection."""
-        mock_tmux.get_history.return_value = "❯ 1. Option one\n  2. Option two"
+        mock_tmux.get_history.return_value = (
+            "❯ 1. Option one\n"
+            "  2. Option two\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel"
+        )
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         status = provider.get_status()
 
         assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_get_status_stale_scrollback_not_waiting_user_answer(self, mock_tmux):
+        """Stale numbered scrollback without the active footer must not block input."""
+        mock_tmux.get_history.return_value = (
+            "❯ 1. Option one\n" "  2. Option two\n" "⏺ Selection handled earlier\n" "❯ "
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        status = provider.get_status()
+
+        assert status != TerminalStatus.WAITING_USER_ANSWER
+        assert status == TerminalStatus.COMPLETED
 
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
     def test_get_status_error_empty(self, mock_tmux):
@@ -598,7 +615,9 @@ class TestClaudeCodeProviderStartupPrompts:
     def test_get_status_trust_prompt_not_waiting_user_answer(self, mock_tmux):
         """Test that trust prompt is NOT detected as WAITING_USER_ANSWER."""
         mock_tmux.get_history.return_value = (
-            "❯ 1. Yes, I trust this folder\n  2. No, don't trust this folder"
+            "❯ 1. Yes, I trust this folder\n"
+            "  2. No, don't trust this folder\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel"
         )
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
@@ -610,7 +629,10 @@ class TestClaudeCodeProviderStartupPrompts:
     def test_get_status_bypass_prompt_not_waiting_user_answer(self, mock_tmux):
         """Test that bypass prompt is NOT detected as WAITING_USER_ANSWER."""
         mock_tmux.get_history.return_value = (
-            "WARNING: Bypass Permissions mode\n" "❯ 1. No, exit\n  2. Yes, I accept\n"
+            "WARNING: Bypass Permissions mode\n"
+            "❯ 1. No, exit\n"
+            "  2. Yes, I accept\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel"
         )
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
