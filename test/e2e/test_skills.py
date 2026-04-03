@@ -196,9 +196,9 @@ class TestSkillApi:
         data = resp.json()
         assert data["name"] == "cao-worker-protocols"
         # The skill body should contain content about worker protocols
-        assert "send_message" in data["content"], (
-            f"Skill content should mention send_message. Got: {data['content'][:200]}"
-        )
+        assert (
+            "send_message" in data["content"]
+        ), f"Skill content should mention send_message. Got: {data['content'][:200]}"
 
     def test_get_skill_missing_returns_404(self):
         """GET /skills/{name} returns 404 for a nonexistent skill."""

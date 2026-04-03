@@ -40,14 +40,22 @@ class ProviderManager:
                 if not agent_profile:
                     raise ValueError("Q CLI provider requires agent_profile parameter")
                 provider = QCliProvider(
-                    terminal_id, tmux_session, tmux_window, agent_profile, allowed_tools,
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
                     skill_prompt=skill_prompt,
                 )
             elif provider_type == ProviderType.KIRO_CLI.value:
                 if not agent_profile:
                     raise ValueError("Kiro CLI provider requires agent_profile parameter")
                 provider = KiroCliProvider(
-                    terminal_id, tmux_session, tmux_window, agent_profile, allowed_tools,
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
                     skill_prompt=skill_prompt,
                 )
             elif provider_type == ProviderType.CLAUDE_CODE.value:
@@ -70,7 +78,11 @@ class ProviderManager:
                 )
             elif provider_type == ProviderType.COPILOT_CLI.value:
                 provider = CopilotCliProvider(
-                    terminal_id, tmux_session, tmux_window, agent_profile, allowed_tools,
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
                     skill_prompt=skill_prompt,
                 )
             elif provider_type == ProviderType.GEMINI_CLI.value:

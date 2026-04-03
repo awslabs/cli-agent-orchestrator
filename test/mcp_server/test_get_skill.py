@@ -106,8 +106,14 @@ class TestGetSkillTool:
         """The MCP server should expose a get_skill tool with descriptive text."""
         tools = _run_coroutine(mcp.get_tools())
 
-        assert "get_skill" in tools
-        description = tools["get_skill"].description
+        # FastMCP 2.x returns dict, 3.x returns list of FunctionTool objects
+        if isinstance(tools, dict):
+            assert "get_skill" in tools
+            description = tools["get_skill"].description
+        else:
+            tool_map = {t.name: t for t in tools}
+            assert "get_skill" in tool_map
+            description = tool_map["get_skill"].description
         assert "full Markdown body of an available skill" in description
         assert "need its full instructions at runtime" in description
 
@@ -116,7 +122,9 @@ class TestGetSkillTool:
     )
     def test_tool_delegates_to_impl(self, mock_get_skill_impl):
         """The public MCP tool should delegate to the helper implementation."""
-        result = _run_coroutine(get_skill.fn(name="python-testing"))
+        # FastMCP 2.x exposes .fn, 3.x the decorated function is directly callable
+        fn = get_skill.fn if hasattr(get_skill, "fn") else get_skill
+        result = _run_coroutine(fn(name="python-testing"))
 
         assert result == "# Loaded skill"
         mock_get_skill_impl.assert_called_once_with("python-testing")

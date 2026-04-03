@@ -81,9 +81,7 @@ class TestBaseProvider:
 
     def test_apply_skill_prompt_empty_base(self):
         """Test _apply_skill_prompt with empty base and skill_prompt present."""
-        provider = ConcreteProvider(
-            "term-123", "session-1", "window-0", skill_prompt="## Skills"
-        )
+        provider = ConcreteProvider("term-123", "session-1", "window-0", skill_prompt="## Skills")
         result = provider._apply_skill_prompt("")
         assert result == "## Skills"
 
