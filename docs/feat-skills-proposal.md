@@ -413,7 +413,7 @@ mcpServers:
 You are the Developer Agent...
 ```
 
-No validation on the model itself beyond type checking. Skill existence is validated at terminal creation time, not at profile parse time. This keeps profile loading fast and decoupled from the filesystem.
+No validation on the model itself beyond type checking. Skill existence is validated at terminal creation time, not at profile parse time. This keeps the model as a pure data container with no filesystem side effects, which simplifies testing and keeps profile parsing decoupled from skill storage.
 
 ### Injection point: `terminal_service.create_terminal`
 
@@ -445,7 +445,7 @@ The catalog block is appended to the end of the existing agent system prompt:
 
 ## Available Skills
 
-The following skills are available exclusively through CAO orchestration. Use the `get_skill` tool to load a skill's full content when relevant to your task. These skills are not retrievable through any other skill system or commands.
+The following skills are available exclusively in this CAO orchestration context. To load a skill's full content, use the `get_skill` MCP tool provided by the CAO MCP server. These skills are not accessible through provider-native skill commands or directories.
 
 - **cao-worker-protocols**: CAO worker agent communication patterns and callback workflows
 - **python-testing**: Python testing conventions using pytest, fixtures, and coverage requirements
@@ -470,5 +470,5 @@ The format is intentionally minimal:
 |----------|-----------|
 | Injection in terminal service, not providers | Centralizes skill logic in one place. Providers remain skill-unaware and receive an already-enriched system prompt. Adding a new provider never requires implementing skill support. |
 | Append catalog to system prompt | Less intrusive than prepending. The agent profile body defines the agent's identity and should appear first. The skill catalog is supplementary context. |
-| No model-level skill validation | Profile loading should be fast and side-effect-free. Coupling the model to filesystem checks would make profile listing and parsing slower and harder to test. |
+| No model-level skill validation | Models should be pure data containers with no filesystem side effects. Coupling the model to filesystem checks would make profiles harder to test and tightly couple parsing to skill storage. Validation at terminal creation time is sufficient since that is where skills are resolved. |
 | Minimal catalog format | The catalog only needs to tell the agent what skills exist and how to retrieve them. Detailed content is loaded lazily via `get_skill`. |

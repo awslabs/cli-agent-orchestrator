@@ -58,8 +58,9 @@ class OutputMode(str, Enum):
 
 
 SKILL_CATALOG_INSTRUCTION = (
-    "The following skills are available to you. Use the `get_skill` tool to load a skill's "
-    "full content when relevant to your task."
+    "The following skills are available exclusively in this CAO orchestration context. "
+    "To load a skill's full content, use the `get_skill` MCP tool provided by the CAO MCP server. "
+    "These skills are not accessible through provider-native skill commands or directories."
 )
 
 
