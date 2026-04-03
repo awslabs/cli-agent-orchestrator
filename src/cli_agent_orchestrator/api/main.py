@@ -803,6 +803,93 @@ async def run_flow(name: str) -> Dict:
         )
 
 
+# =============================================================================
+# Master Orchestrator
+# =============================================================================
+
+# Track the active orchestrator session (in-memory, one per server)
+_orchestrator_session_id: Optional[str] = None
+
+
+@app.post("/orchestrator/launch", status_code=status.HTTP_201_CREATED)
+async def launch_orchestrator(
+    provider: str = "claude_code",
+    agent_profile: str = "master_orchestrator",
+) -> Dict:
+    """Launch the master orchestrator as a persistent session.
+
+    The orchestrator is a CLI agent with full CAO MCP tools that can manage
+    sessions, flows, agents, and coordinate work. Only one can run at a time.
+    """
+    global _orchestrator_session_id
+
+    # Check if already running
+    if _orchestrator_session_id:
+        try:
+            session_service.get_session(_orchestrator_session_id)
+            return {
+                "session_id": _orchestrator_session_id,
+                "status": "already_running",
+                "message": "Orchestrator is already running",
+            }
+        except (ValueError, Exception):
+            _orchestrator_session_id = None  # stale reference
+
+    try:
+        result = terminal_service.create_terminal(
+            provider=provider,
+            agent_profile=agent_profile,
+            new_session=True,
+        )
+        _orchestrator_session_id = result.session_name
+        return {
+            "session_id": result.session_name,
+            "terminal_id": result.id,
+            "agent_profile": agent_profile,
+            "provider": provider,
+            "status": "launched",
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to launch orchestrator: {str(e)}",
+        )
+
+
+@app.get("/orchestrator/status")
+async def orchestrator_status() -> Dict:
+    """Check if the master orchestrator is running."""
+    global _orchestrator_session_id
+
+    if not _orchestrator_session_id:
+        return {"running": False, "session_id": None}
+
+    try:
+        session_service.get_session(_orchestrator_session_id)
+        return {"running": True, "session_id": _orchestrator_session_id}
+    except (ValueError, Exception):
+        _orchestrator_session_id = None
+        return {"running": False, "session_id": None}
+
+
+@app.delete("/orchestrator/stop")
+async def stop_orchestrator() -> Dict:
+    """Stop the master orchestrator session."""
+    global _orchestrator_session_id
+
+    if not _orchestrator_session_id:
+        return {"success": True, "message": "No orchestrator running"}
+
+    try:
+        session_service.delete_session(_orchestrator_session_id)
+        old_id = _orchestrator_session_id
+        _orchestrator_session_id = None
+        return {"success": True, "session_id": old_id}
+    except Exception as e:
+        _orchestrator_session_id = None
+        return {"success": False, "error": str(e)}
+
+
 # Static file serving for built web UI
 WEB_DIST = Path(__file__).parent.parent.parent.parent / "web" / "dist"
 if WEB_DIST.exists():

@@ -467,6 +467,296 @@ async def send_message(
         return {"success": False, "error": str(e)}
 
 
+# =============================================================================
+# Orchestration Tools — comprehensive CAO operations for the master orchestrator
+# =============================================================================
+
+def _api_get(path: str, params: dict = None) -> Any:
+    """GET request to CAO API. Returns parsed JSON."""
+    res = requests.get(f"{API_BASE_URL}{path}", params=params, timeout=10)
+    res.raise_for_status()
+    return res.json()
+
+
+def _api_post(path: str, json: dict = None, params: dict = None) -> Any:
+    """POST request to CAO API. Returns parsed JSON."""
+    res = requests.post(f"{API_BASE_URL}{path}", json=json, params=params, timeout=10)
+    res.raise_for_status()
+    return res.json()
+
+
+def _api_delete(path: str) -> Any:
+    """DELETE request to CAO API. Returns parsed JSON."""
+    res = requests.delete(f"{API_BASE_URL}{path}", timeout=10)
+    res.raise_for_status()
+    return res.json()
+
+
+# --- Session Management ---
+
+@mcp.tool()
+async def list_sessions() -> Any:
+    """List all active CAO sessions with their terminals."""
+    try:
+        return _api_get("/sessions")
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def get_session(
+    session_name: str = Field(description="Session name (e.g., 'cao-abc123')"),
+) -> Any:
+    """Get detailed information about a specific session including its terminals."""
+    try:
+        return _api_get(f"/sessions/{session_name}")
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def create_session(
+    provider: str = Field(description="CLI provider: kiro_cli, claude_code, q_cli, codex, etc."),
+    agent_profile: str = Field(description="Agent profile name (e.g., 'developer', 'analyst')"),
+) -> Any:
+    """Create a new agent session. Returns session details with terminal ID."""
+    try:
+        return _api_post("/sessions", params={"provider": provider, "agent_profile": agent_profile})
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def delete_session(
+    session_name: str = Field(description="Session name to delete"),
+) -> Any:
+    """Delete a session and all its terminals. Cleans up tmux session and provider state."""
+    try:
+        return _api_delete(f"/sessions/{session_name}")
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def send_input_to_session(
+    session_name: str = Field(description="Session name"),
+    message: str = Field(description="Message/command to send"),
+) -> Any:
+    """Send input to the first terminal in a session. Use for chatting with agents."""
+    try:
+        session = _api_get(f"/sessions/{session_name}")
+        terminals = session.get("terminals", [])
+        if not terminals:
+            return {"error": "No terminals in session"}
+        terminal_id = terminals[0]["id"]
+        _send_direct_input(terminal_id, message)
+        return {"success": True, "terminal_id": terminal_id}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def get_session_output(
+    session_name: str = Field(description="Session name"),
+    mode: str = Field(default="full", description="Output mode: 'full' (all history) or 'last' (last response only)"),
+) -> Any:
+    """Read terminal output from a session. Use 'last' mode to get just the agent's latest response."""
+    try:
+        session = _api_get(f"/sessions/{session_name}")
+        terminals = session.get("terminals", [])
+        if not terminals:
+            return {"error": "No terminals in session"}
+        terminal_id = terminals[0]["id"]
+        return _api_get(f"/terminals/{terminal_id}/output", params={"mode": mode})
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# --- Terminal Operations ---
+
+@mcp.tool()
+async def list_terminals(
+    session_name: str = Field(description="Session name"),
+) -> Any:
+    """List all terminals in a session."""
+    try:
+        return _api_get(f"/sessions/{session_name}/terminals")
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def get_terminal_output(
+    terminal_id: str = Field(description="Terminal ID (8-char hex)"),
+    mode: str = Field(default="full", description="'full' or 'last'"),
+) -> Any:
+    """Read output from a specific terminal."""
+    try:
+        return _api_get(f"/terminals/{terminal_id}/output", params={"mode": mode})
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def send_terminal_input(
+    terminal_id: str = Field(description="Terminal ID"),
+    message: str = Field(description="Message to send"),
+) -> Any:
+    """Send input directly to a specific terminal."""
+    try:
+        _send_direct_input(terminal_id, message)
+        return {"success": True}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def exit_terminal(
+    terminal_id: str = Field(description="Terminal ID to exit"),
+) -> Any:
+    """Send provider-specific exit command to a terminal."""
+    try:
+        res = requests.post(f"{API_BASE_URL}/terminals/{terminal_id}/exit")
+        res.raise_for_status()
+        return {"success": True}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# --- Agent Discovery ---
+
+@mcp.tool()
+async def list_agent_profiles() -> Any:
+    """List all available agent profiles from all configured sources."""
+    try:
+        return _api_get("/agents/profiles")
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def list_providers() -> Any:
+    """List all available CLI providers with their installation status."""
+    try:
+        return _api_get("/agents/providers")
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# --- Flow Management ---
+
+@mcp.tool()
+async def list_flows() -> Any:
+    """List all scheduled flows with their status and next run time."""
+    try:
+        return _api_get("/flows")
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def get_flow(
+    name: str = Field(description="Flow name"),
+) -> Any:
+    """Get details of a specific flow including schedule and prompt."""
+    try:
+        return _api_get(f"/flows/{name}")
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def create_flow(
+    name: str = Field(description="Flow name (unique identifier)"),
+    schedule: str = Field(description="Cron expression (e.g., '0 */6 * * *' for every 6 hours)"),
+    agent_profile: str = Field(description="Agent profile to run the flow"),
+    prompt: str = Field(description="The prompt/task for the agent"),
+    provider: str = Field(default="kiro_cli", description="CLI provider to use"),
+) -> Any:
+    """Create a new scheduled flow. The flow will run the prompt on the specified schedule."""
+    try:
+        return _api_post("/flows", json={
+            "name": name, "schedule": schedule, "agent_profile": agent_profile,
+            "prompt": prompt, "provider": provider
+        })
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def run_flow(
+    name: str = Field(description="Flow name to execute"),
+) -> Any:
+    """Manually trigger a flow to run immediately."""
+    try:
+        return _api_post(f"/flows/{name}/run")
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def enable_flow(
+    name: str = Field(description="Flow name to enable"),
+) -> Any:
+    """Enable a disabled flow so it runs on schedule."""
+    try:
+        return _api_post(f"/flows/{name}/enable")
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def disable_flow(
+    name: str = Field(description="Flow name to disable"),
+) -> Any:
+    """Disable a flow so it stops running on schedule."""
+    try:
+        return _api_post(f"/flows/{name}/disable")
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def delete_flow(
+    name: str = Field(description="Flow name to delete"),
+) -> Any:
+    """Delete a flow permanently."""
+    try:
+        return _api_delete(f"/flows/{name}")
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# --- Inbox ---
+
+@mcp.tool()
+async def send_inbox_message(
+    receiver_id: str = Field(description="Target terminal ID"),
+    message: str = Field(description="Message content"),
+) -> Any:
+    """Send a message to a terminal's inbox. Delivered when the terminal becomes IDLE."""
+    try:
+        return _send_to_inbox(receiver_id, message)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def get_inbox_messages(
+    terminal_id: str = Field(description="Terminal ID"),
+    limit: int = Field(default=10, description="Max messages to return"),
+    status_filter: Optional[str] = Field(default=None, description="Filter: 'pending', 'delivered', 'failed'"),
+) -> Any:
+    """Get inbox messages for a terminal."""
+    try:
+        params = {"limit": limit}
+        if status_filter:
+            params["status"] = status_filter
+        return _api_get(f"/terminals/{terminal_id}/inbox/messages", params=params)
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def main():
     """Main entry point for the MCP server."""
     mcp.run()

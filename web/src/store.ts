@@ -18,6 +18,9 @@ interface Store {
   connected: boolean
   snackbar: Snackbar | null
   terminalStatuses: Record<string, string>
+  orchestratorSessionId: string | null
+  orchestratorRunning: boolean
+  orchestratorExpanded: boolean
 
   fetchSessions: () => Promise<void>
   selectSession: (name: string | null) => Promise<void>
@@ -28,6 +31,10 @@ interface Store {
   setConnected: (connected: boolean) => void
   setTerminalStatus: (id: string, status: string) => void
   clearTerminalStatuses: (ids: string[]) => void
+  checkOrchestrator: () => Promise<void>
+  launchOrchestrator: (provider: string) => Promise<void>
+  stopOrchestrator: () => Promise<void>
+  toggleOrchestratorSidebar: () => void
 }
 
 export const useStore = create<Store>((set, get) => ({
@@ -37,6 +44,9 @@ export const useStore = create<Store>((set, get) => ({
   connected: false,
   snackbar: null,
   terminalStatuses: {},
+  orchestratorSessionId: null,
+  orchestratorRunning: false,
+  orchestratorExpanded: false,
 
   fetchSessions: async () => {
     try {
@@ -106,4 +116,37 @@ export const useStore = create<Store>((set, get) => ({
       if (Object.keys(next).length === Object.keys(state.terminalStatuses).length) return state
       return { terminalStatuses: next }
     }),
+
+  checkOrchestrator: async () => {
+    try {
+      const status = await api.orchestratorStatus()
+      set({ orchestratorRunning: status.running, orchestratorSessionId: status.session_id })
+    } catch {
+      set({ orchestratorRunning: false, orchestratorSessionId: null })
+    }
+  },
+
+  launchOrchestrator: async (provider) => {
+    try {
+      const result = await api.launchOrchestrator(provider)
+      set({ orchestratorRunning: true, orchestratorSessionId: result.session_id, orchestratorExpanded: true })
+      get().showSnackbar({ type: 'success', message: 'Orchestrator launched' })
+      await get().fetchSessions()
+    } catch (e: any) {
+      get().showSnackbar({ type: 'error', message: e.message || 'Failed to launch orchestrator' })
+    }
+  },
+
+  stopOrchestrator: async () => {
+    try {
+      await api.stopOrchestrator()
+      set({ orchestratorRunning: false, orchestratorSessionId: null })
+      get().showSnackbar({ type: 'success', message: 'Orchestrator stopped' })
+      await get().fetchSessions()
+    } catch (e: any) {
+      get().showSnackbar({ type: 'error', message: e.message || 'Failed to stop orchestrator' })
+    }
+  },
+
+  toggleOrchestratorSidebar: () => set(s => ({ orchestratorExpanded: !s.orchestratorExpanded })),
 }))

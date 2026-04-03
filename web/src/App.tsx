@@ -5,6 +5,7 @@ import { DashboardHome } from './components/DashboardHome'
 import { AgentPanel } from './components/AgentPanel'
 import { FlowsPanel } from './components/FlowsPanel'
 import { SettingsPanel } from './components/SettingsPanel'
+import { OrchestratorSidebar } from './components/OrchestratorSidebar'
 import { Bot, Home, Clock, Settings, CheckCircle, XCircle, Info, Wifi, WifiOff } from 'lucide-react'
 
 type TabKey = 'home' | 'agents' | 'flows' | 'settings'
@@ -139,6 +140,7 @@ export default function App() {
       </main>
 
       <Snackbar />
+      <OrchestratorSidebar />
     </div>
   )
 }

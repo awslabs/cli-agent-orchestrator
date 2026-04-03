@@ -136,4 +136,14 @@ export const api = {
   enableFlow: (name: string) => fetchJSON<{ success: boolean }>(`/flows/${name}/enable`, { method: 'POST' }),
   disableFlow: (name: string) => fetchJSON<{ success: boolean }>(`/flows/${name}/disable`, { method: 'POST' }),
   runFlow: (name: string) => fetchJSON<{ executed: boolean }>(`/flows/${name}/run`, { method: 'POST', timeoutMs: 90000 }),
+
+  // Orchestrator
+  launchOrchestrator: (provider: string = 'claude_code') =>
+    fetchJSON<{ session_id: string; terminal_id: string; agent_profile: string; provider: string; status: string }>(
+      `/orchestrator/launch?provider=${provider}`, { method: 'POST', timeoutMs: 90000 }
+    ),
+  orchestratorStatus: () =>
+    fetchJSON<{ running: boolean; session_id: string | null }>('/orchestrator/status'),
+  stopOrchestrator: () =>
+    fetchJSON<{ success: boolean; session_id?: string }>('/orchestrator/stop', { method: 'DELETE' }),
 }
