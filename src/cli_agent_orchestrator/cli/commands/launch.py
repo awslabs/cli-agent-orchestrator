@@ -51,12 +51,12 @@ def launch(agents, session_name, headless, provider, allowed_tools, yolo):
         from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
         from cli_agent_orchestrator.utils.tool_mapping import (
             format_tool_summary,
-            get_disallowed_tools,
             resolve_allowed_tools,
         )
 
         resolved_allowed_tools = None
         no_role_set = False
+        resolved_role = None
         if yolo:
             resolved_allowed_tools = ["*"]
         elif allowed_tools:
@@ -67,6 +67,7 @@ def launch(agents, session_name, headless, provider, allowed_tools, yolo):
                 profile = load_agent_profile(agents)
                 mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
                 no_role_set = not profile.role and not profile.allowedTools
+                resolved_role = profile.role
                 resolved_allowed_tools = resolve_allowed_tools(
                     profile.allowedTools, profile.role, mcp_server_names
                 )
@@ -88,13 +89,14 @@ def launch(agents, session_name, headless, provider, allowed_tools, yolo):
             else:
                 # Normal launch: show tool summary and confirm
                 tool_summary = format_tool_summary(resolved_allowed_tools)
-                blocked = get_disallowed_tools(provider, resolved_allowed_tools)
-                blocked_summary = ", ".join(blocked) if blocked else "(none)"
+                role_display = (
+                    resolved_role if resolved_role else "(not set — using developer defaults)"
+                )
 
                 click.echo(
                     f"\nAgent '{agents}' launching on {provider}:\n"
-                    f"  Allowed:  {tool_summary}\n"
-                    f"  Blocked:  {blocked_summary}\n"
+                    f"  Role:      {role_display}\n"
+                    f"  Allowed:   {tool_summary}\n"
                     f"  Directory: {working_directory}\n"
                 )
                 if no_role_set:
@@ -103,7 +105,11 @@ def launch(agents, session_name, headless, provider, allowed_tools, yolo):
                         "  Add 'role' or 'allowedTools' to your agent profile to control tool access.\n"
                         "  Docs: https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/tool-restrictions.md\n"
                     )
-                click.echo("  To grant all permissions, re-run with --yolo.\n")
+                click.echo(
+                    "  [Y] launches with the above restrictions.\n"
+                    "  [--yolo] overrides role and allowedTools — grants unrestricted access.\n"
+                    "          Exit and re-run with: cao launch --agents <profile> --yolo\n"
+                )
                 if not click.confirm("Proceed?", default=True):
                     raise click.ClickException("Launch cancelled by user")
 

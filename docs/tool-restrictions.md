@@ -139,11 +139,13 @@ When you run `cao launch` without `--yolo`, CAO shows a summary of the resolved 
 
 ```
 Agent 'code_supervisor' launching on kiro_cli:
-  Allowed:  @cao-mcp-server, fs_read, fs_list
-  Blocked:  Bash, Edit, Write
+  Role:      supervisor
+  Allowed:   @cao-mcp-server, fs_read, fs_list
   Directory: /home/user/my-project
 
-  To grant all permissions, re-run with --yolo.
+  [Y] launches with the above restrictions.
+  [--yolo] overrides role and allowedTools — grants unrestricted access.
+          Exit and re-run with: cao launch --agents <profile> --yolo
 
 Proceed? [Y/n]
 ```
@@ -152,15 +154,17 @@ If no `role` or `allowedTools` is set in the profile, the prompt includes an add
 
 ```
 Agent 'my_agent' launching on claude_code:
-  Allowed:  @builtin, fs_*, execute_bash, @cao-mcp-server
-  Blocked:  (none)
+  Role:      (not set — using developer defaults)
+  Allowed:   @builtin, fs_*, execute_bash, @cao-mcp-server
   Directory: /home/user/my-project
 
   Note: No role or allowedTools set — defaulting to 'developer'.
   Add 'role' or 'allowedTools' to your agent profile to control tool access.
   Docs: https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/tool-restrictions.md
 
-  To grant all permissions, re-run with --yolo.
+  [Y] launches with the above restrictions.
+  [--yolo] overrides role and allowedTools — grants unrestricted access.
+          Exit and re-run with: cao launch --agents <profile> --yolo
 
 Proceed? [Y/n]
 ```
@@ -172,10 +176,25 @@ Answering **Y** to the confirmation prompt is **not** the same as `--yolo`:
 | | Confirmation → Y | `--yolo` |
 |---|---|---|
 | **Tool restrictions** | Still enforced — agent is limited to the tools shown in "Allowed" | Removed — agent gets `["*"]` (all tools) |
-| **Blocked tools** | Still blocked — agent cannot use tools shown in "Blocked" | Nothing is blocked |
-| **What it means** | "I've reviewed these restrictions and want to proceed" | "Give the agent unrestricted access, no questions asked" |
+| **What it means** | "I've reviewed the role and allowedTools and want to proceed" | "Override role and allowedTools — grant unrestricted access" |
+| **How to use** | Answer Y at the prompt | Exit and re-run with `cao launch --agents <profile> --yolo` |
 
-The confirmation prompt is a **review gate** — it shows you exactly what the agent can and cannot do, then lets you proceed or cancel. The restrictions listed in the summary are still enforced after you confirm. `--yolo` both **removes all restrictions** and **skips the review gate entirely**.
+The confirmation prompt is a **review gate** — it shows the resolved role and allowed tools, then lets you proceed or cancel. The restrictions are still enforced after you confirm. `--yolo` sits at the top of the override hierarchy — it **overrides both role and allowedTools**, grants unrestricted access (`["*"]`), and **skips the review gate entirely**.
+
+### How Tool Restrictions Are Enforced (Implementation Detail)
+
+CAO translates `allowedTools` to each provider's native restriction mechanism. This translation is handled by an internal `TOOL_MAPPING` that maps CAO's universal vocabulary to provider-native tool names:
+
+| CAO Tool | Claude Code | Copilot CLI | Gemini CLI |
+|----------|-------------|-------------|------------|
+| `execute_bash` | `Bash` | `shell` | `run_shell_command` |
+| `fs_read` | `Read` | `read` | `read_file`, `list_directory`, `search_file_content`, `glob` |
+| `fs_write` | `Edit`, `Write` | `write` | `write_file`, `replace` |
+| `fs_list` | `Glob`, `Grep` | `list`, `grep` | `list_directory`, `glob`, `search_file_content` |
+
+For providers with a tool mapping (Claude Code, Copilot CLI, Gemini CLI), CAO computes the set of native tools to **block** based on what is not in `allowedTools`, and passes them as CLI flags (e.g., `--disallowedTools Bash` for Claude Code, `--deny-tool shell` for Copilot CLI).
+
+For providers without a tool mapping (Kiro CLI, Q CLI, Kimi CLI, Codex), restrictions are enforced natively by the provider — either via `allowedTools` in the agent JSON at install time (Kiro CLI, Q CLI) or via system prompt instructions (Kimi CLI, Codex). CAO passes the `allowedTools` list to these providers directly without translation.
 
 ## How Overrides Work
 
