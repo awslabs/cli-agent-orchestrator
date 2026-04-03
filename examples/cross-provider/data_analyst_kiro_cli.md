@@ -3,8 +3,6 @@ name: data_analyst_kiro_cli
 description: Data analyst agent that runs on Kiro CLI (cross-provider override)
 provider: kiro_cli
 role: developer  # @builtin, fs_*, execute_bash, @cao-mcp-server. For fine-grained control, see docs/tool-restrictions.md
-skills:
-  - cao-worker-protocols
 mcpServers:
   cao-mcp-server:
     type: stdio
