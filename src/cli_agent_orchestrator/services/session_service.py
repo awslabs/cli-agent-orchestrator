@@ -25,6 +25,7 @@ from typing import Dict, List
 from cli_agent_orchestrator.clients.database import (
     delete_terminals_by_session,
     list_terminals_by_session,
+    set_terminal_bead,
 )
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.constants import SESSION_PREFIX
@@ -75,6 +76,11 @@ def delete_session(session_name: str) -> Dict:
             raise ValueError(f"Session '{session_name}' not found")
 
         terminals = list_terminals_by_session(session_name)
+
+        # Clear bead_id on terminals (release beads back to unassigned)
+        for terminal in terminals:
+            if terminal.get("bead_id"):
+                set_terminal_bead(terminal["id"], None)
 
         # Cleanup providers (non-blocking — don't let failures stop deletion)
         for terminal in terminals:

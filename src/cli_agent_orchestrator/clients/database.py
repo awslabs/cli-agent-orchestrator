@@ -26,6 +26,8 @@ class TerminalModel(Base):
     tmux_window = Column(String, nullable=False)  # "window-name"
     provider = Column(String, nullable=False)  # "q_cli", "claude_code"
     agent_profile = Column(String)  # "developer", "reviewer" (optional)
+    parent_terminal_id = Column(String, nullable=True)  # Terminal that spawned this one
+    bead_id = Column(String, nullable=True)  # Bead being worked on by this terminal
     last_active = Column(DateTime, default=datetime.now)
 
 
@@ -67,6 +69,15 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 def init_db() -> None:
     """Initialize database tables."""
     Base.metadata.create_all(bind=engine)
+    # Migrate: add columns if missing (no Alembic in this project)
+    from sqlalchemy import text
+    with engine.connect() as conn:
+        for col in ("parent_terminal_id TEXT", "bead_id TEXT"):
+            try:
+                conn.execute(text(f"ALTER TABLE terminals ADD COLUMN {col}"))
+                conn.commit()
+            except Exception:
+                pass
 
 
 def create_terminal(
@@ -75,6 +86,8 @@ def create_terminal(
     tmux_window: str,
     provider: str,
     agent_profile: Optional[str] = None,
+    parent_terminal_id: Optional[str] = None,
+    bead_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record."""
     with SessionLocal() as db:
@@ -84,6 +97,8 @@ def create_terminal(
             tmux_window=tmux_window,
             provider=provider,
             agent_profile=agent_profile,
+            parent_terminal_id=parent_terminal_id,
+            bead_id=bead_id,
         )
         db.add(terminal)
         db.commit()
@@ -93,6 +108,8 @@ def create_terminal(
             "tmux_window": terminal.tmux_window,
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
+            "parent_terminal_id": terminal.parent_terminal_id,
+            "bead_id": terminal.bead_id,
         }
 
 
@@ -112,6 +129,8 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "tmux_window": terminal.tmux_window,
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
+            "parent_terminal_id": terminal.parent_terminal_id,
+            "bead_id": terminal.bead_id,
             "last_active": terminal.last_active,
         }
 
@@ -127,6 +146,8 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 "tmux_window": t.tmux_window,
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
+                "parent_terminal_id": t.parent_terminal_id,
+                "bead_id": t.bead_id,
                 "last_active": t.last_active,
             }
             for t in terminals
@@ -155,10 +176,56 @@ def list_all_terminals() -> List[Dict[str, Any]]:
                 "tmux_window": t.tmux_window,
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
+                "parent_terminal_id": t.parent_terminal_id,
+                "bead_id": t.bead_id,
                 "last_active": t.last_active,
             }
             for t in terminals
         ]
+
+
+def set_terminal_bead(terminal_id: str, bead_id: Optional[str]) -> bool:
+    """Set or clear the bead_id on a terminal."""
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if terminal:
+            terminal.bead_id = bead_id
+            db.commit()
+            return True
+        return False
+
+
+def get_terminal_by_bead(bead_id: str) -> Optional[Dict[str, Any]]:
+    """Find terminal working on a specific bead."""
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.bead_id == bead_id).first()
+        if not terminal:
+            return None
+        return {
+            "id": terminal.id,
+            "tmux_session": terminal.tmux_session,
+            "tmux_window": terminal.tmux_window,
+            "provider": terminal.provider,
+            "agent_profile": terminal.agent_profile,
+            "parent_terminal_id": terminal.parent_terminal_id,
+            "bead_id": terminal.bead_id,
+            "last_active": terminal.last_active,
+        }
+
+
+def get_children_sessions(session_name: str) -> List[str]:
+    """Get session names that have terminals parented to terminals in this session."""
+    with SessionLocal() as db:
+        parent_terminals = db.query(TerminalModel).filter(
+            TerminalModel.tmux_session == session_name
+        ).all()
+        parent_ids = [t.id for t in parent_terminals]
+        if not parent_ids:
+            return []
+        children = db.query(TerminalModel).filter(
+            TerminalModel.parent_terminal_id.in_(parent_ids)
+        ).all()
+        return list(set(t.tmux_session for t in children))
 
 
 def delete_terminal(terminal_id: str) -> bool:
