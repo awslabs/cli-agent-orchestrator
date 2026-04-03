@@ -187,7 +187,9 @@ The confirmation prompt is a **review gate** — it shows the resolved role and 
 
 ### How Tool Restrictions Are Enforced (Implementation Detail)
 
-CAO translates `allowedTools` to each provider's native restriction mechanism. This translation is handled by an internal `TOOL_MAPPING` that maps CAO's universal vocabulary to provider-native tool names:
+CAO defines a universal tool vocabulary (`execute_bash`, `fs_read`, `fs_write`, `fs_list`). However, not all providers understand this vocabulary natively. There are two categories:
+
+**Providers that need translation** — Claude Code, Copilot CLI, and Gemini CLI each have their own native tool names (e.g., Claude Code calls bash execution `Bash`, Copilot calls it `shell`). CAO uses an internal `TOOL_MAPPING` to translate the CAO vocabulary to provider-native names, then computes which native tools to block and passes them as CLI flags (e.g., `--disallowedTools Bash`, `--deny-tool shell`).
 
 | CAO Tool | Claude Code | Copilot CLI | Gemini CLI |
 |----------|-------------|-------------|------------|
@@ -196,9 +198,7 @@ CAO translates `allowedTools` to each provider's native restriction mechanism. T
 | `fs_write` | `Edit`, `Write` | `write` | `write_file`, `replace` |
 | `fs_list` | `Glob`, `Grep` | `list`, `grep` | `list_directory`, `glob`, `search_file_content` |
 
-For providers with a tool mapping (Claude Code, Copilot CLI, Gemini CLI), CAO computes the set of native tools to **block** based on what is not in `allowedTools`, and passes them as CLI flags (e.g., `--disallowedTools Bash` for Claude Code, `--deny-tool shell` for Copilot CLI).
-
-For providers without a tool mapping (Kiro CLI, Q CLI, Kimi CLI, Codex), restrictions are enforced natively by the provider — either via `allowedTools` in the agent JSON at install time (Kiro CLI, Q CLI) or via system prompt instructions (Kimi CLI, Codex). CAO passes the `allowedTools` list to these providers directly without translation.
+**Providers that accept CAO vocabulary directly** — Kiro CLI and Q CLI accept `allowedTools` in the agent JSON at install time, using the same vocabulary as CAO. No translation needed. Kimi CLI and Codex use system prompt instructions to enforce restrictions. For all four, CAO passes the `allowedTools` list directly without translation — so no `TOOL_MAPPING` entry exists for them, and none is needed.
 
 ## How Overrides Work
 
@@ -234,7 +234,7 @@ cao launch --agents code_supervisor --yolo
 
 ## Provider Enforcement
 
-CAO translates `allowedTools` to each provider's native restriction mechanism:
+As described in [How Tool Restrictions Are Enforced](#how-tool-restrictions-are-enforced-implementation-detail), some providers require CAO to translate `allowedTools` to native tool names (via `TOOL_MAPPING`), while others accept the CAO vocabulary directly. The table below shows how each provider enforces restrictions:
 
 | Provider | Enforcement | How it works |
 |----------|------------|-------------|
