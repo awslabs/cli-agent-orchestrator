@@ -137,6 +137,22 @@ export const api = {
   disableFlow: (name: string) => fetchJSON<{ success: boolean }>(`/flows/${name}/disable`, { method: 'POST' }),
   runFlow: (name: string) => fetchJSON<{ executed: boolean }>(`/flows/${name}/run`, { method: 'POST', timeoutMs: 90000 }),
 
+  // Beads / Tasks
+  listTasks: (statusFilter?: string) =>
+    fetchJSON<any[]>(`/tasks${statusFilter ? `?status_filter=${statusFilter}` : ''}`),
+  getTask: (id: string) => fetchJSON<any>(`/tasks/${id}`),
+  createTask: (title: string, description?: string, priority?: number) =>
+    fetchJSON<any>(`/tasks?title=${encodeURIComponent(title)}${description ? `&description=${encodeURIComponent(description)}` : ''}${priority ? `&priority=${priority}` : ''}`, { method: 'POST' }),
+  closeTask: (id: string) => fetchJSON<any>(`/tasks/${id}/close`, { method: 'POST' }),
+  deleteTask: (id: string) => fetchJSON<any>(`/tasks/${id}`, { method: 'DELETE' }),
+
+  // Epics
+  createEpic: (title: string, steps: string, sequential?: boolean) =>
+    fetchJSON<any>(`/epics?title=${encodeURIComponent(title)}&steps=${encodeURIComponent(steps)}${sequential !== undefined ? `&sequential=${sequential}` : ''}`, { method: 'POST' }),
+  getEpic: (id: string) => fetchJSON<any>(`/epics/${id}`),
+  getEpicReady: (id: string) => fetchJSON<any[]>(`/epics/${id}/ready`),
+  getBeadChildren: (id: string) => fetchJSON<any[]>(`/beads/${id}/children`),
+
   // Orchestrator
   launchOrchestrator: (provider: string = 'claude_code') =>
     fetchJSON<{ session_id: string; terminal_id: string; agent_profile: string; provider: string; status: string }>(

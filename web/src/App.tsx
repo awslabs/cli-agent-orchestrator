@@ -6,13 +6,15 @@ import { AgentPanel } from './components/AgentPanel'
 import { FlowsPanel } from './components/FlowsPanel'
 import { SettingsPanel } from './components/SettingsPanel'
 import { OrchestratorSidebar } from './components/OrchestratorSidebar'
-import { Bot, Home, Clock, Settings, CheckCircle, XCircle, Info, Wifi, WifiOff } from 'lucide-react'
+import { BeadsTab } from './components/BeadsTab'
+import { Bot, Home, Clock, Settings, CheckCircle, XCircle, Info, Wifi, WifiOff, Layers } from 'lucide-react'
 
-type TabKey = 'home' | 'agents' | 'flows' | 'settings'
+type TabKey = 'home' | 'agents' | 'beads' | 'flows' | 'settings'
 
 const TABS: { key: TabKey; label: string; icon: React.ReactNode }[] = [
   { key: 'home', label: 'Home', icon: <Home size={16} /> },
   { key: 'agents', label: 'Agents', icon: <Bot size={16} /> },
+  { key: 'beads', label: 'Beads', icon: <Layers size={16} /> },
   { key: 'flows', label: 'Flows', icon: <Clock size={16} /> },
   { key: 'settings', label: 'Settings', icon: <Settings size={16} /> },
 ]
@@ -133,6 +135,7 @@ export default function App() {
           <Suspense fallback={<div className="text-gray-500 text-sm py-12 text-center">Loading...</div>}>
             {tab === 'home' && <DashboardHome onNavigate={(t) => setTab(t as TabKey)} />}
             {tab === 'agents' && <AgentPanel />}
+            {tab === 'beads' && <BeadsTab />}
             {tab === 'flows' && <FlowsPanel />}
             {tab === 'settings' && <SettingsPanel />}
           </Suspense>
