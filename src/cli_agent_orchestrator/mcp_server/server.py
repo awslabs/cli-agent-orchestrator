@@ -83,9 +83,13 @@ def _resolve_child_allowed_tools(
             return ",".join(child_allowed)
         return None
 
-    # If child has no restrictions, inherit parent's
-    if child_allowed is None or "*" in child_allowed:
+    # If child has no opinion (None), inherit parent's restrictions
+    if child_allowed is None:
         return ",".join(parent_allowed_tools)
+
+    # If child explicitly requests unrestricted ("*"), honor it
+    if "*" in child_allowed:
+        return None
 
     # Both have restrictions: child gets its own profile tools
     # (the child profile defines what it needs; parent's restrictions
