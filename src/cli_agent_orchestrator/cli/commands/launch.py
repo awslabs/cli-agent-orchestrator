@@ -32,12 +32,17 @@ PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
     help="Override allowedTools (CAO format: execute_bash, fs_read, @cao-mcp-server). Repeatable.",
 )
 @click.option(
+    "--auto-approve",
+    is_flag=True,
+    help="Skip confirmation prompt (restrictions still enforced).",
+)
+@click.option(
     "--yolo",
     is_flag=True,
     help="[DANGEROUS] Unrestricted tool access AND skip confirmation prompts. "
     "Agent can execute ANY command including aws, rm, curl.",
 )
-def launch(agents, session_name, headless, provider, allowed_tools, yolo):
+def launch(agents, session_name, headless, provider, allowed_tools, auto_approve, yolo):
     """Launch cao session with specified agent profile."""
     try:
         # Validate provider
@@ -107,10 +112,10 @@ def launch(agents, session_name, headless, provider, allowed_tools, yolo):
                     )
                 click.echo(
                     "  [Y] launches with the above restrictions.\n"
+                    "  [--auto-approve] skips this prompt (restrictions still enforced).\n"
                     "  [--yolo] overrides role and allowedTools — grants unrestricted access.\n"
-                    "          Exit and re-run with: cao launch --agents <profile> --yolo\n"
                 )
-                if not click.confirm("Proceed?", default=True):
+                if not auto_approve and not click.confirm("Proceed?", default=True):
                     raise click.ClickException("Launch cancelled by user")
 
         # Call API to create session

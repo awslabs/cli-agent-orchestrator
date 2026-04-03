@@ -135,7 +135,7 @@ A warning is still displayed so you know what's happening:
 
 ## Launch Confirmation Prompt
 
-When you run `cao launch` without `--yolo`, CAO shows a summary of the resolved tool restrictions and asks for confirmation:
+When you run `cao launch` without `--yolo` or `--auto-approve`, CAO shows a summary of the resolved tool restrictions and asks for confirmation:
 
 ```
 Agent 'code_supervisor' launching on kiro_cli:
@@ -144,8 +144,8 @@ Agent 'code_supervisor' launching on kiro_cli:
   Directory: /home/user/my-project
 
   [Y] launches with the above restrictions.
+  [--auto-approve] skips this prompt (restrictions still enforced).
   [--yolo] overrides role and allowedTools — grants unrestricted access.
-          Exit and re-run with: cao launch --agents <profile> --yolo
 
 Proceed? [Y/n]
 ```
@@ -163,23 +163,27 @@ Agent 'my_agent' launching on claude_code:
   Docs: https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/tool-restrictions.md
 
   [Y] launches with the above restrictions.
+  [--auto-approve] skips this prompt (restrictions still enforced).
   [--yolo] overrides role and allowedTools — grants unrestricted access.
-          Exit and re-run with: cao launch --agents <profile> --yolo
 
 Proceed? [Y/n]
 ```
 
-### Confirmation vs `--yolo`
+### `--auto-approve` vs `--yolo`
 
-Answering **Y** to the confirmation prompt is **not** the same as `--yolo`:
+| | `Y` at prompt | `--auto-approve` | `--yolo` |
+|---|---|---|---|
+| **Confirmation prompt** | Shown | Skipped | Skipped |
+| **Tool restrictions** | Enforced | Enforced | Removed — `["*"]` |
+| **Use case** | Interactive launch | Automated flows, scripts, agent-to-agent | Unrestricted access |
 
-| | Confirmation → Y | `--yolo` |
-|---|---|---|
-| **Tool restrictions** | Still enforced — agent is limited to the tools shown in "Allowed" | Removed — agent gets `["*"]` (all tools) |
-| **What it means** | "I've reviewed the role and allowedTools and want to proceed" | "Override role and allowedTools — grant unrestricted access" |
-| **How to use** | Answer Y at the prompt | Exit and re-run with `cao launch --agents <profile> --yolo` |
+```bash
+cao launch --agents my_agent                  # interactive — shows prompt
+cao launch --agents my_agent --auto-approve   # automated — skips prompt, keeps restrictions
+cao launch --agents my_agent --yolo           # unrestricted — skips prompt AND removes restrictions
+```
 
-The confirmation prompt is a **review gate** — it shows the resolved role and allowed tools, then lets you proceed or cancel. The restrictions are still enforced after you confirm. `--yolo` sits at the top of the override hierarchy — it **overrides both role and allowedTools**, grants unrestricted access (`["*"]`), and **skips the review gate entirely**.
+The confirmation prompt is a **review gate** — it shows the resolved role and allowed tools, then lets you proceed or cancel. `--auto-approve` skips this gate while keeping all restrictions enforced — useful for CAO flows, scripted launches, and agent-to-agent workflows. `--yolo` sits at the top of the override hierarchy — it **overrides both role and allowedTools**, grants unrestricted access (`["*"]`), and skips the prompt entirely.
 
 ### How Tool Restrictions Are Enforced (Implementation Detail)
 
@@ -210,11 +214,16 @@ Priority (highest to lowest):
   5. (nothing set)             → developer defaults
 ```
 
+Note: `--auto-approve` is **not** in this priority chain — it only controls whether the confirmation prompt is shown, not what restrictions are applied.
+
 Examples:
 
 ```bash
 # Profile has role: supervisor → restricted to @cao-mcp-server + fs_read + fs_list
 cao launch --agents code_supervisor
+
+# Same, but skip the confirmation prompt (restrictions still enforced)
+cao launch --agents code_supervisor --auto-approve
 
 # CLI flag overrides the role
 cao launch --agents code_supervisor --allowed-tools execute_bash --allowed-tools fs_read
@@ -300,8 +309,9 @@ Each agent is restricted based on its own profile, not its parent's permissions.
 | Custom tool set | `allowedTools: ["fs_read", "execute_bash"]` |
 | Reusable custom preset | Define in `settings.json` `roles`, use `role: my_preset` |
 | Override role at launch | `--allowed-tools fs_read --allowed-tools @cao-mcp-server` |
-| No restrictions at all | `--yolo` or don't set role/allowedTools |
-| Check what's allowed before launch | Launch without `--yolo` — the confirmation prompt shows the summary |
+| Skip confirmation in scripts/automation | `--auto-approve` (restrictions still enforced) |
+| No restrictions at all | `--yolo` |
+| Check what's allowed before launch | Launch without `--yolo` or `--auto-approve` — the prompt shows the summary |
 
 ## Security Recommendations
 

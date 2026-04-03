@@ -504,8 +504,9 @@ role: supervisor  # @cao-mcp-server, fs_read, fs_list
 ```
 
 ```bash
-cao launch --agents code_supervisor              # Uses role defaults
-cao launch --agents code_supervisor --yolo       # Unrestricted access (WARNING shown)
+cao launch --agents code_supervisor                  # Uses role defaults (confirmation prompt shown)
+cao launch --agents code_supervisor --auto-approve   # Skip prompt (restrictions still enforced)
+cao launch --agents code_supervisor --yolo           # Unrestricted access (WARNING shown)
 ```
 
 For the full reference — roles, tool vocabulary, custom roles, launch prompts, provider enforcement, and known limitations — see [docs/tool-restrictions.md](docs/tool-restrictions.md).
