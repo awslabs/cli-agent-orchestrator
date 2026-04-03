@@ -1,7 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
 import { useStore } from '../store'
 import { api } from '../api'
-import { Bot, ChevronLeft, ChevronRight, Send, Square, Play, Loader2 } from 'lucide-react'
+import { Terminal } from '@xterm/xterm'
+import { FitAddon } from '@xterm/addon-fit'
+import '@xterm/xterm/css/xterm.css'
+import { Bot, ChevronLeft, ChevronRight, Square, Play, Loader2, Maximize2, Minimize2 } from 'lucide-react'
 
 const PROVIDERS = [
   { value: 'claude_code', label: 'Claude Code' },
@@ -10,6 +13,114 @@ const PROVIDERS = [
   { value: 'codex', label: 'Codex' },
 ]
 
+function OrchestratorTerminal({ terminalId, isFullScreen }: { terminalId: string; isFullScreen: boolean }) {
+  const containerRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el) return
+
+    const term = new Terminal({
+      cursorBlink: true,
+      fontSize: isFullScreen ? 14 : 13,
+      fontFamily: 'JetBrains Mono, Menlo, Monaco, Consolas, monospace',
+      theme: {
+        background: '#0d1117',
+        foreground: '#c9d1d9',
+        cursor: '#58a6ff',
+        selectionBackground: '#264f78',
+        black: '#0d1117',
+        red: '#ff7b72',
+        green: '#3fb950',
+        yellow: '#d29922',
+        blue: '#58a6ff',
+        magenta: '#bc8cff',
+        cyan: '#39d353',
+        white: '#c9d1d9',
+      },
+    })
+
+    const fitAddon = new FitAddon()
+    term.loadAddon(fitAddon)
+    term.open(el)
+
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
+    const ws = new WebSocket(`${protocol}//${location.host}/terminals/${terminalId}/ws`)
+    ws.binaryType = 'arraybuffer'
+
+    ws.onopen = () => {
+      fitAddon.fit()
+      ws.send(JSON.stringify({ type: 'resize', rows: term.rows, cols: term.cols }))
+    }
+
+    ws.onmessage = (e) => {
+      if (e.data instanceof ArrayBuffer) {
+        term.write(new Uint8Array(e.data))
+      }
+    }
+
+    ws.onclose = () => {
+      term.write('\r\n\x1b[33m[Connection closed]\x1b[0m\r\n')
+    }
+
+    term.onSelectionChange(() => {
+      const selection = term.getSelection()
+      if (selection) navigator.clipboard.writeText(selection).catch(() => {})
+    })
+
+    term.attachCustomKeyEventHandler((e) => {
+      if (e.ctrlKey && e.shiftKey && e.key === 'C') {
+        const selection = term.getSelection()
+        if (selection) navigator.clipboard.writeText(selection).catch(() => {})
+        return false
+      }
+      if (e.ctrlKey && e.shiftKey && e.key === 'V') {
+        navigator.clipboard.readText().then(text => {
+          if (text && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'input', data: text }))
+          }
+        }).catch(() => {})
+        return false
+      }
+      return true
+    })
+
+    term.onData((data) => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'input', data }))
+      }
+    })
+
+    let resizeTimer: ReturnType<typeof setTimeout>
+    const resizeObserver = new ResizeObserver(() => {
+      clearTimeout(resizeTimer)
+      resizeTimer = setTimeout(() => {
+        fitAddon.fit()
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'resize', rows: term.rows, cols: term.cols }))
+        }
+      }, 50)
+    })
+    resizeObserver.observe(el)
+
+    requestAnimationFrame(() => fitAddon.fit())
+    term.focus()
+
+    return () => {
+      clearTimeout(resizeTimer)
+      resizeObserver.disconnect()
+      ws.close()
+      term.dispose()
+    }
+  }, [terminalId, isFullScreen])
+
+  return (
+    <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
+      <div ref={containerRef} style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 }} />
+    </div>
+  )
+}
+
 export function OrchestratorSidebar() {
   const {
     orchestratorRunning, orchestratorSessionId, orchestratorExpanded,
@@ -17,47 +128,26 @@ export function OrchestratorSidebar() {
   } = useStore()
 
   const [provider, setProvider] = useState('claude_code')
-  const [input, setInput] = useState('')
-  const [output, setOutput] = useState('')
-  const [sending, setSending] = useState(false)
   const [launching, setLaunching] = useState(false)
-  const outputRef = useRef<HTMLPreElement>(null)
-  const pollRef = useRef<ReturnType<typeof setInterval>>()
+  const [terminalId, setTerminalId] = useState<string | null>(null)
+  const [isFullScreen, setIsFullScreen] = useState(false)
 
-  // Check orchestrator status on mount
   useEffect(() => {
     checkOrchestrator()
   }, [])
 
-  // Poll for output when running + expanded
+  // Resolve terminal ID when orchestrator is running
   useEffect(() => {
-    if (!orchestratorRunning || !orchestratorSessionId || !orchestratorExpanded) {
-      if (pollRef.current) clearInterval(pollRef.current)
+    if (!orchestratorRunning || !orchestratorSessionId) {
+      setTerminalId(null)
       return
     }
-
-    const fetchOutput = async () => {
-      try {
-        const session = await api.getSession(orchestratorSessionId)
-        if (session.terminals?.length > 0) {
-          const termId = session.terminals[0].id
-          const result = await api.getTerminalOutput(termId)
-          setOutput(result.output || '')
-        }
-      } catch { /* session may have been deleted */ }
-    }
-
-    fetchOutput()
-    pollRef.current = setInterval(fetchOutput, 2000)
-    return () => { if (pollRef.current) clearInterval(pollRef.current) }
-  }, [orchestratorRunning, orchestratorSessionId, orchestratorExpanded])
-
-  // Auto-scroll output
-  useEffect(() => {
-    if (outputRef.current) {
-      outputRef.current.scrollTop = outputRef.current.scrollHeight
-    }
-  }, [output])
+    api.getSession(orchestratorSessionId).then(session => {
+      if (session.terminals?.length > 0) {
+        setTerminalId(session.terminals[0].id)
+      }
+    }).catch(() => {})
+  }, [orchestratorRunning, orchestratorSessionId])
 
   const handleLaunch = async () => {
     setLaunching(true)
@@ -65,29 +155,34 @@ export function OrchestratorSidebar() {
     setLaunching(false)
   }
 
-  const handleSend = async () => {
-    if (!input.trim() || !orchestratorSessionId || sending) return
-    setSending(true)
-    try {
-      const session = await api.getSession(orchestratorSessionId)
-      if (session.terminals?.length > 0) {
-        await api.sendInput(session.terminals[0].id, input.trim())
-        setInput('')
-      }
-    } catch (e) {
-      console.error('Failed to send:', e)
-    }
-    setSending(false)
+  // Full-screen mode
+  if (isFullScreen && orchestratorRunning && terminalId) {
+    return (
+      <div className="fixed inset-0 z-50 flex flex-col" style={{ background: '#0d1117' }}>
+        <div className="flex items-center justify-between px-4 py-2 bg-gray-900 border-b border-gray-700/50 shrink-0">
+          <div className="flex items-center gap-3">
+            <Bot size={16} className="text-emerald-400" />
+            <span className="text-sm font-semibold text-white">AI Orchestrator</span>
+            <span className="px-2 py-0.5 text-[10px] rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
+              Running
+            </span>
+            <span className="text-xs text-gray-500 bg-gray-800 px-2 py-0.5 rounded">{provider}</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <button onClick={stopOrchestrator} className="p-1.5 rounded hover:bg-red-500/20 text-red-400" title="Stop">
+              <Square size={14} />
+            </button>
+            <button onClick={() => setIsFullScreen(false)} className="p-1.5 rounded hover:bg-gray-700 text-gray-400" title="Exit full screen">
+              <Minimize2 size={14} />
+            </button>
+          </div>
+        </div>
+        <OrchestratorTerminal terminalId={terminalId} isFullScreen={true} />
+      </div>
+    )
   }
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault()
-      handleSend()
-    }
-  }
-
-  // Collapsed state — thin strip on right edge
+  // Collapsed state
   if (!orchestratorExpanded) {
     return (
       <button
@@ -107,11 +202,11 @@ export function OrchestratorSidebar() {
     )
   }
 
-  // Expanded state
+  // Expanded sidebar
   return (
-    <div className="fixed right-0 top-0 bottom-0 w-[420px] z-50 flex flex-col bg-[#0f0f14] border-l border-gray-800 shadow-2xl">
+    <div className="fixed right-0 top-0 bottom-0 w-[480px] z-50 flex flex-col bg-[#0d1117] border-l border-gray-800 shadow-2xl">
       {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-gray-800 bg-gray-900/50">
+      <div className="flex items-center justify-between px-4 py-3 border-b border-gray-800 bg-gray-900/50 shrink-0">
         <div className="flex items-center gap-2">
           <Bot size={18} className={orchestratorRunning ? 'text-emerald-400' : 'text-gray-500'} />
           <span className="text-sm font-semibold text-white">AI Orchestrator</span>
@@ -122,20 +217,21 @@ export function OrchestratorSidebar() {
           )}
         </div>
         <div className="flex items-center gap-1">
-          {orchestratorRunning && (
+          {orchestratorRunning && terminalId && (
             <button
-              onClick={stopOrchestrator}
-              className="p-1.5 rounded hover:bg-red-500/20 text-red-400"
-              title="Stop orchestrator"
+              onClick={() => setIsFullScreen(true)}
+              className="p-1.5 rounded hover:bg-gray-700 text-gray-400"
+              title="Full screen"
             >
+              <Maximize2 size={14} />
+            </button>
+          )}
+          {orchestratorRunning && (
+            <button onClick={stopOrchestrator} className="p-1.5 rounded hover:bg-red-500/20 text-red-400" title="Stop">
               <Square size={14} />
             </button>
           )}
-          <button
-            onClick={toggleOrchestratorSidebar}
-            className="p-1.5 rounded hover:bg-gray-700 text-gray-400"
-            title="Collapse"
-          >
+          <button onClick={toggleOrchestratorSidebar} className="p-1.5 rounded hover:bg-gray-700 text-gray-400" title="Collapse">
             <ChevronRight size={14} />
           </button>
         </div>
@@ -143,7 +239,6 @@ export function OrchestratorSidebar() {
 
       {/* Content */}
       {!orchestratorRunning ? (
-        // Launch screen
         <div className="flex-1 flex flex-col items-center justify-center gap-4 px-6">
           <div className="w-16 h-16 rounded-full bg-gray-800 flex items-center justify-center">
             <Bot size={32} className="text-gray-500" />
@@ -177,39 +272,12 @@ export function OrchestratorSidebar() {
             </button>
           </div>
         </div>
+      ) : terminalId ? (
+        <OrchestratorTerminal terminalId={terminalId} isFullScreen={false} />
       ) : (
-        // Running — terminal output + input
-        <>
-          {/* Output area */}
-          <pre
-            ref={outputRef}
-            className="flex-1 overflow-y-auto p-3 text-xs font-mono text-gray-300 bg-[#0a0a0f] whitespace-pre-wrap break-words leading-relaxed"
-          >
-            {output || 'Waiting for output...'}
-          </pre>
-
-          {/* Input area */}
-          <div className="border-t border-gray-800 p-3 bg-gray-900/50">
-            <div className="flex gap-2">
-              <input
-                type="text"
-                value={input}
-                onChange={e => setInput(e.target.value)}
-                onKeyDown={handleKeyDown}
-                placeholder="Chat with the orchestrator..."
-                className="flex-1 px-3 py-2 rounded-lg text-sm bg-gray-800 border border-gray-700 text-gray-200 placeholder-gray-500 focus:border-emerald-500 focus:outline-none"
-                disabled={sending}
-              />
-              <button
-                onClick={handleSend}
-                disabled={sending || !input.trim()}
-                className="px-3 py-2 rounded-lg bg-emerald-600 text-white hover:bg-emerald-500 disabled:opacity-50 disabled:hover:bg-emerald-600"
-              >
-                <Send size={16} />
-              </button>
-            </div>
-          </div>
-        </>
+        <div className="flex-1 flex items-center justify-center">
+          <Loader2 size={24} className="animate-spin text-gray-500" />
+        </div>
       )}
     </div>
   )
