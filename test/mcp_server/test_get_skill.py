@@ -104,16 +104,17 @@ class TestGetSkillTool:
 
     def test_tool_is_registered_with_clear_description(self):
         """The MCP server should expose a get_skill tool with descriptive text."""
-        tools = _run_coroutine(mcp.get_tools())
-
-        # FastMCP 2.x returns dict, 3.x returns list of FunctionTool objects
-        if isinstance(tools, dict):
-            assert "get_skill" in tools
-            description = tools["get_skill"].description
+        # FastMCP 2.x: mcp.get_tools() returns dict
+        # FastMCP 3.x: get_tools() removed, use mcp.get_tool("get_skill")
+        if hasattr(mcp, "get_tools"):
+            tools = _run_coroutine(mcp.get_tools())
+            if isinstance(tools, dict):
+                tool = tools["get_skill"]
+            else:
+                tool = {t.name: t for t in tools}["get_skill"]
         else:
-            tool_map = {t.name: t for t in tools}
-            assert "get_skill" in tool_map
-            description = tool_map["get_skill"].description
+            tool = _run_coroutine(mcp.get_tool("get_skill"))
+        description = tool.description
         assert "full Markdown body of an available skill" in description
         assert "need its full instructions at runtime" in description
 

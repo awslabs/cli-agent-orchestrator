@@ -13,6 +13,7 @@ Run:
     uv run pytest -m e2e test/e2e/test_skills.py -v -k ClaudeCode
 """
 
+import subprocess
 import time
 import uuid
 from test.e2e.conftest import (
@@ -20,8 +21,6 @@ from test.e2e.conftest import (
     create_terminal,
     get_terminal_status,
 )
-
-import subprocess
 
 import pytest
 import requests
