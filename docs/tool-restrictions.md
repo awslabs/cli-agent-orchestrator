@@ -143,9 +143,8 @@ Agent 'code_supervisor' launching on kiro_cli:
   Allowed:   @cao-mcp-server, fs_read, fs_list
   Directory: /home/user/my-project
 
-  [Y] launches with the above restrictions.
-  [--auto-approve] skips this prompt (restrictions still enforced).
-  [--yolo] overrides role and allowedTools — grants unrestricted access.
+  To skip this prompt next time, relaunch with --auto-approve
+  To remove all restrictions, relaunch with --yolo
 
 Proceed? [Y/n]
 ```
@@ -162,9 +161,8 @@ Agent 'my_agent' launching on claude_code:
   Add 'role' or 'allowedTools' to your agent profile to control tool access.
   Docs: https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/tool-restrictions.md
 
-  [Y] launches with the above restrictions.
-  [--auto-approve] skips this prompt (restrictions still enforced).
-  [--yolo] overrides role and allowedTools — grants unrestricted access.
+  To skip this prompt next time, relaunch with --auto-approve
+  To remove all restrictions, relaunch with --yolo
 
 Proceed? [Y/n]
 ```

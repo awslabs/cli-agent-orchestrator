@@ -111,9 +111,8 @@ def launch(agents, session_name, headless, provider, allowed_tools, auto_approve
                         "  Docs: https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/tool-restrictions.md\n"
                     )
                 click.echo(
-                    "  [Y] launches with the above restrictions.\n"
-                    "  [--auto-approve] skips this prompt (restrictions still enforced).\n"
-                    "  [--yolo] overrides role and allowedTools — grants unrestricted access.\n"
+                    "  To skip this prompt next time, relaunch with --auto-approve\n"
+                    "  To remove all restrictions, relaunch with --yolo\n"
                 )
                 if not auto_approve and not click.confirm("Proceed?", default=True):
                     raise click.ClickException("Launch cancelled by user")
