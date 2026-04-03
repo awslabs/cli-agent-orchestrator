@@ -47,6 +47,7 @@ class BaseProvider(ABC):
         session_name: str,
         window_name: str,
         allowed_tools: Optional[List[str]] = None,
+        skill_prompt: Optional[str] = None,
     ):
         """Initialize provider with terminal context.
 
@@ -55,12 +56,15 @@ class BaseProvider(ABC):
             session_name: Name of the tmux session
             window_name: Name of the tmux window
             allowed_tools: Optional list of CAO tool names the agent is allowed to use
+            skill_prompt: Optional skill catalog text built by the service layer.
+                Providers append this to the system prompt when building their CLI command.
         """
         self.terminal_id = terminal_id
         self.session_name = session_name
         self.window_name = window_name
         self._status = TerminalStatus.IDLE
         self._allowed_tools: Optional[List[str]] = allowed_tools
+        self._skill_prompt: Optional[str] = skill_prompt
 
     @property
     def status(self) -> TerminalStatus:
@@ -160,6 +164,22 @@ class BaseProvider(ABC):
         post-task completed.
         """
         pass
+
+    def _apply_skill_prompt(self, system_prompt: str) -> str:
+        """Append skill catalog text to a system prompt if available.
+
+        Args:
+            system_prompt: The base system prompt string.
+
+        Returns:
+            The system prompt with skill catalog appended, or unchanged if
+            no skill_prompt was provided.
+        """
+        if not self._skill_prompt:
+            return system_prompt
+        if system_prompt:
+            return f"{system_prompt}\n\n{self._skill_prompt}"
+        return self._skill_prompt
 
     def _update_status(self, status: TerminalStatus) -> None:
         """Update internal status."""

@@ -34,8 +34,9 @@ class QCliProvider(BaseProvider):
         window_name: str,
         agent_profile: str,
         allowed_tools: Optional[list] = None,
+        skill_prompt: Optional[str] = None,
     ):
-        super().__init__(terminal_id, session_name, window_name, allowed_tools)
+        super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         # TODO: remove the ._initialized if it's not referenced anywhere
         self._initialized = False
         self._agent_profile = agent_profile

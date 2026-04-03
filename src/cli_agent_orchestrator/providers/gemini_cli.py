@@ -37,7 +37,6 @@ from pathlib import Path
 from typing import Optional
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
-from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -155,18 +154,12 @@ class GeminiCliProvider(BaseProvider):
         window_name: str,
         agent_profile: Optional[str] = None,
         allowed_tools: Optional[list] = None,
-        loaded_profile: Optional[AgentProfile] = None,
+        skill_prompt: Optional[str] = None,
     ):
-        """Initialize provider state.
-
-        ``loaded_profile`` lets terminal_service pass a pre-enriched profile
-        so providers reuse injected skill catalog content instead of reloading
-        the profile from disk.
-        """
-        super().__init__(terminal_id, session_name, window_name, allowed_tools)
+        """Initialize provider state."""
+        super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
-        self._loaded_profile = loaded_profile
         # Track whether -i (prompt-interactive) flag is used so initialize()
         # can wait for COMPLETED instead of IDLE. When -i is used, Gemini
         # processes the system prompt as the first user message and produces
@@ -223,7 +216,7 @@ class GeminiCliProvider(BaseProvider):
 
         if self._agent_profile is not None:
             try:
-                profile = self._loaded_profile or load_agent_profile(self._agent_profile)
+                profile = load_agent_profile(self._agent_profile)
 
                 # System prompt injection: write to GEMINI.md so Gemini loads it
                 # as persistent project context on startup.
@@ -238,6 +231,7 @@ class GeminiCliProvider(BaseProvider):
                 # A short ``-i`` role acknowledgment ensures the model adopts the role
                 # strongly without triggering exploration behavior.
                 system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
+                system_prompt = self._apply_skill_prompt(system_prompt)
                 if system_prompt:
                     # Write full system prompt to GEMINI.md for persistent context.
                     working_dir = tmux_client.get_pane_working_directory(

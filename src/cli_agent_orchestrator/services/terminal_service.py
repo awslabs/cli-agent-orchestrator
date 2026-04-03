@@ -91,20 +91,6 @@ def _build_skill_catalog(profile: AgentProfile) -> str:
     )
 
 
-def _enrich_profile_with_skills(profile: AgentProfile) -> AgentProfile:
-    """Append the declared skill catalog to the profile system prompt."""
-    skill_catalog = _build_skill_catalog(profile)
-    if not skill_catalog:
-        return profile
-
-    enriched_profile = profile.model_copy(deep=True)
-    base_prompt = enriched_profile.system_prompt or ""
-    enriched_profile.system_prompt = (
-        f"{base_prompt}\n\n{skill_catalog}" if base_prompt else skill_catalog
-    )
-    return enriched_profile
-
-
 def create_terminal(
     provider: str,
     agent_profile: str,
@@ -171,10 +157,10 @@ def create_terminal(
             terminal_id, session_name, window_name, provider, agent_profile, allowed_tools
         )
 
-        # Step 3b: Load the profile once for allowed tool resolution and optional
-        # skill catalog injection before provider initialization.
+        # Step 3b: Load the profile once for allowed tool resolution and
+        # skill catalog generation before provider initialization.
         profile = load_agent_profile(agent_profile)
-        enriched_profile = _enrich_profile_with_skills(profile)
+        skill_prompt = _build_skill_catalog(profile)
 
         # Step 3c: Resolve allowed_tools from profile if not explicitly provided
         if allowed_tools is None:
@@ -194,7 +180,7 @@ def create_terminal(
             window_name,
             agent_profile,
             allowed_tools,
-            loaded_profile=enriched_profile,
+            skill_prompt=skill_prompt,
         )
         provider_instance.initialize()
 

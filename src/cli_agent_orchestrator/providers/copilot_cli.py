@@ -51,8 +51,9 @@ class CopilotCliProvider(BaseProvider):
         window_name: str,
         agent_profile: Optional[str] = None,
         allowed_tools: Optional[list] = None,
+        skill_prompt: Optional[str] = None,
     ):
-        super().__init__(terminal_id, session_name, window_name, allowed_tools)
+        super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
         self._copilot_help_text_cache: Optional[str] = None

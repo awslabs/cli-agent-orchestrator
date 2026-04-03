@@ -4,7 +4,6 @@ import logging
 from typing import Dict, List, Optional
 
 from cli_agent_orchestrator.clients.database import get_terminal_metadata
-from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
@@ -32,7 +31,7 @@ class ProviderManager:
         tmux_window: str,
         agent_profile: Optional[str] = None,
         allowed_tools: Optional[List[str]] = None,
-        loaded_profile: Optional[AgentProfile] = None,
+        skill_prompt: Optional[str] = None,
     ) -> BaseProvider:
         """Create and store provider instance."""
         try:
@@ -41,13 +40,15 @@ class ProviderManager:
                 if not agent_profile:
                     raise ValueError("Q CLI provider requires agent_profile parameter")
                 provider = QCliProvider(
-                    terminal_id, tmux_session, tmux_window, agent_profile, allowed_tools
+                    terminal_id, tmux_session, tmux_window, agent_profile, allowed_tools,
+                    skill_prompt=skill_prompt,
                 )
             elif provider_type == ProviderType.KIRO_CLI.value:
                 if not agent_profile:
                     raise ValueError("Kiro CLI provider requires agent_profile parameter")
                 provider = KiroCliProvider(
-                    terminal_id, tmux_session, tmux_window, agent_profile, allowed_tools
+                    terminal_id, tmux_session, tmux_window, agent_profile, allowed_tools,
+                    skill_prompt=skill_prompt,
                 )
             elif provider_type == ProviderType.CLAUDE_CODE.value:
                 provider = ClaudeCodeProvider(
@@ -56,7 +57,7 @@ class ProviderManager:
                     tmux_window,
                     agent_profile,
                     allowed_tools,
-                    loaded_profile,
+                    skill_prompt=skill_prompt,
                 )
             elif provider_type == ProviderType.CODEX.value:
                 provider = CodexProvider(
@@ -65,11 +66,12 @@ class ProviderManager:
                     tmux_window,
                     agent_profile,
                     allowed_tools,
-                    loaded_profile,
+                    skill_prompt=skill_prompt,
                 )
             elif provider_type == ProviderType.COPILOT_CLI.value:
                 provider = CopilotCliProvider(
-                    terminal_id, tmux_session, tmux_window, agent_profile, allowed_tools
+                    terminal_id, tmux_session, tmux_window, agent_profile, allowed_tools,
+                    skill_prompt=skill_prompt,
                 )
             elif provider_type == ProviderType.GEMINI_CLI.value:
                 provider = GeminiCliProvider(
@@ -78,7 +80,7 @@ class ProviderManager:
                     tmux_window,
                     agent_profile,
                     allowed_tools,
-                    loaded_profile,
+                    skill_prompt=skill_prompt,
                 )
             elif provider_type == ProviderType.KIMI_CLI.value:
                 provider = KimiCliProvider(
@@ -87,7 +89,7 @@ class ProviderManager:
                     tmux_window,
                     agent_profile,
                     allowed_tools,
-                    loaded_profile,
+                    skill_prompt=skill_prompt,
                 )
             else:
                 raise ValueError(f"Unknown provider type: {provider_type}")

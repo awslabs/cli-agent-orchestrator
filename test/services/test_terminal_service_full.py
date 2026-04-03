@@ -173,9 +173,8 @@ class TestCreateTerminal:
 
         create_terminal("codex", "developer", new_session=True)
 
-        loaded_profile = mock_provider_manager.create_provider.call_args.kwargs["loaded_profile"]
-        assert loaded_profile.system_prompt == (
-            "You are the developer.\n\n"
+        skill_prompt = mock_provider_manager.create_provider.call_args.kwargs["skill_prompt"]
+        assert skill_prompt == (
             "## Available Skills\n\n"
             "The following skills are available exclusively in this CAO orchestration context. "
             "To load a skill's full content, use the `get_skill` MCP tool provided by the "
@@ -227,9 +226,8 @@ class TestCreateTerminal:
 
         create_terminal("codex", "developer", new_session=True)
 
-        loaded_profile = mock_provider_manager.create_provider.call_args.kwargs["loaded_profile"]
-        assert loaded_profile.system_prompt == (
-            "You are the developer.\n\n"
+        skill_prompt = mock_provider_manager.create_provider.call_args.kwargs["skill_prompt"]
+        assert skill_prompt == (
             "## Available Skills\n\n"
             "The following skills are available exclusively in this CAO orchestration context. "
             "To load a skill's full content, use the `get_skill` MCP tool provided by the "
@@ -277,8 +275,8 @@ class TestCreateTerminal:
 
         create_terminal("codex", "developer", new_session=True)
 
-        loaded_profile = mock_provider_manager.create_provider.call_args.kwargs["loaded_profile"]
-        assert loaded_profile.system_prompt == "Base prompt"
+        skill_prompt = mock_provider_manager.create_provider.call_args.kwargs["skill_prompt"]
+        assert skill_prompt == ""
         mock_load_skill.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")

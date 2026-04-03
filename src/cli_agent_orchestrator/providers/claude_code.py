@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Optional
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
-from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -54,18 +53,12 @@ class ClaudeCodeProvider(BaseProvider):
         window_name: str,
         agent_profile: Optional[str] = None,
         allowed_tools: Optional[list] = None,
-        loaded_profile: Optional[AgentProfile] = None,
+        skill_prompt: Optional[str] = None,
     ):
-        """Initialize provider state.
-
-        ``loaded_profile`` lets terminal_service pass a pre-enriched profile
-        so providers reuse injected skill catalog content instead of reloading
-        the profile from disk.
-        """
-        super().__init__(terminal_id, session_name, window_name, allowed_tools)
+        """Initialize provider state."""
+        super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
-        self._loaded_profile = loaded_profile
 
     def _build_claude_command(self) -> str:
         """Build Claude Code command with agent profile if provided.
@@ -81,10 +74,11 @@ class ClaudeCodeProvider(BaseProvider):
 
         if self._agent_profile is not None:
             try:
-                profile = self._loaded_profile or load_agent_profile(self._agent_profile)
+                profile = load_agent_profile(self._agent_profile)
 
                 # Add system prompt - escape newlines to prevent tmux chunking issues
                 system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
+                system_prompt = self._apply_skill_prompt(system_prompt)
                 if system_prompt:
                     # Replace actual newlines with \n escape sequences
                     # This prevents tmux send_keys chunking from breaking the command
