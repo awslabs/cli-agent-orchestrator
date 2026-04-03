@@ -115,7 +115,7 @@ class DevinCliProvider(BaseProvider):
                     tmp.close()
                     self._temp_prompt_file = tmp.name
                     command_parts.extend(["--prompt-file", tmp.name])
-            except Exception:
+            except (FileNotFoundError, RuntimeError, OSError):
                 logger.debug("Could not load agent profile '%s' for Devin CLI", self._agent_profile)
 
         # Build MCP config
@@ -312,7 +312,7 @@ class DevinCliProvider(BaseProvider):
             if tmp_path:
                 try:
                     Path(tmp_path).unlink(missing_ok=True)
-                except Exception:
-                    pass
+                except OSError as exc:
+                    logger.debug("Failed to remove temp file '%s': %s", tmp_path, exc)
         self._temp_prompt_file = None
         self._temp_config_file = None

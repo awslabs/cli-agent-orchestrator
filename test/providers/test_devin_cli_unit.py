@@ -67,6 +67,7 @@ class TestDevinCliProviderInitialization:
         assert provider.paste_enter_count == 1
 
     def test_exit_cli_returns_slash_exit(self):
+        """Verify exit_cli() returns the correct exit command for Devin CLI."""
         provider = DevinCliProvider("test1234", "test-session", "window-0")
         assert provider.exit_cli() == "/exit"
 
