@@ -17,6 +17,7 @@ _DEFAULTS = {
     "kiro_cli": str(Path.home() / ".kiro" / "agents"),
     "claude_code": str(Path.home() / ".aws" / "cli-agent-orchestrator" / "agent-store"),
     "codex": str(Path.home() / ".aws" / "cli-agent-orchestrator" / "agent-store"),
+    "devin_cli": str(Path.home() / ".aws" / "cli-agent-orchestrator" / "agent-store"),
     "cao_installed": str(Path.home() / ".aws" / "cli-agent-orchestrator" / "agent-context"),
 }
 

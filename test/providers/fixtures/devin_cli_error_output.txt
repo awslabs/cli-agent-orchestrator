@@ -1,0 +1,10 @@
+Welcome to Devin CLI
+
+> run an invalid command
+
+Error: command not found: invalidcmd
+
+────────────────────────────────────────
+#
+────────────────────────────────────────
+Mode: chat  Model: devin-v1

@@ -29,6 +29,8 @@ PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
     "codex",
     "copilot_cli",
     "cursor_cli",
+    "devin_cli",
+    "gemini_cli",
     "hermes",
     "kimi_cli",
     "kiro_cli",
