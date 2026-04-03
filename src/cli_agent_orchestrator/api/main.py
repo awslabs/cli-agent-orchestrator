@@ -804,6 +804,214 @@ async def run_flow(name: str) -> Dict:
 
 
 # =============================================================================
+# Beads (Tasks) & Epics
+# =============================================================================
+
+from cli_agent_orchestrator.clients.beads_real import BeadsClient, resolve_context_files
+from cli_agent_orchestrator.clients.database import set_terminal_bead, get_terminal_by_bead
+import asyncio
+
+beads = BeadsClient(working_dir=str(Path.home() / ".beads-planning"))
+_assign_locks: Dict[str, asyncio.Lock] = {}
+
+
+def _get_assign_lock(bead_id: str) -> asyncio.Lock:
+    if bead_id not in _assign_locks:
+        _assign_locks[bead_id] = asyncio.Lock()
+    return _assign_locks[bead_id]
+
+
+# --- Task CRUD ---
+
+@app.get("/tasks")
+async def list_tasks(status_filter: Optional[str] = None, priority: Optional[int] = None) -> List[Dict]:
+    tasks = beads.list(status=status_filter, priority=priority)
+    return [t.__dict__ for t in tasks]
+
+
+@app.get("/tasks/next")
+async def next_task(priority: Optional[int] = None) -> Dict:
+    task = beads.next(priority=priority)
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No open tasks")
+    return task.__dict__
+
+
+@app.get("/tasks/{task_id}")
+async def get_task(task_id: str) -> Dict:
+    task = beads.get(task_id)
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+    return task.__dict__
+
+
+@app.post("/tasks", status_code=status.HTTP_201_CREATED)
+async def create_task(title: str, description: str = "", priority: int = 2) -> Dict:
+    task = beads.add(title, description, priority)
+    return task.__dict__
+
+
+@app.patch("/tasks/{task_id}")
+async def update_task(task_id: str, title: Optional[str] = None, description: Optional[str] = None,
+                      priority: Optional[int] = None, assignee: Optional[str] = None) -> Dict:
+    updates = {}
+    if title is not None: updates["title"] = title
+    if description is not None: updates["description"] = description
+    if priority is not None: updates["priority"] = priority
+    if assignee is not None: updates["assignee"] = assignee
+    task = beads.update(task_id, **updates)
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+    return task.__dict__
+
+
+@app.post("/tasks/{task_id}/wip")
+async def mark_wip(task_id: str, assignee: Optional[str] = None) -> Dict:
+    task = beads.wip(task_id, assignee)
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+    return task.__dict__
+
+
+@app.post("/tasks/{task_id}/close")
+async def close_task(task_id: str) -> Dict:
+    task = beads.close(task_id)
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+    return task.__dict__
+
+
+@app.delete("/tasks/{task_id}")
+async def delete_task(task_id: str) -> Dict:
+    success = beads.delete(task_id)
+    return {"success": success}
+
+
+# --- Epics ---
+
+@app.post("/epics", status_code=status.HTTP_201_CREATED)
+async def create_epic(title: str, steps: str, description: str = "",
+                      priority: int = 2, sequential: bool = True,
+                      max_concurrent: int = 3, labels: Optional[str] = None) -> Dict:
+    """Create an epic with child beads. Steps is a comma-separated list."""
+    step_list = [s.strip() for s in steps.split(",") if s.strip()]
+    if not step_list:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="At least one step required")
+    label_list = [l.strip() for l in labels.split(",") if l.strip()] if labels else None
+    epic = beads.create_epic(title=title, steps=step_list, description=description,
+                             priority=priority, sequential=sequential,
+                             max_concurrent=max_concurrent, labels=label_list)
+    children = beads.get_children(epic.id)
+    return {"epic": epic.__dict__, "children": [c.__dict__ for c in children]}
+
+
+@app.get("/epics/{epic_id}")
+async def get_epic(epic_id: str) -> Dict:
+    epic = beads.get(epic_id)
+    if not epic:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Epic not found")
+    children = beads.get_children(epic_id)
+    completed = sum(1 for c in children if c.status == "closed")
+    wip = sum(1 for c in children if c.status == "wip")
+    return {
+        "epic": epic.__dict__,
+        "children": [c.__dict__ for c in children],
+        "progress": {"total": len(children), "completed": completed, "wip": wip,
+                     "open": len(children) - completed - wip},
+    }
+
+
+@app.get("/epics/{epic_id}/ready")
+async def get_epic_ready(epic_id: str) -> List[Dict]:
+    epic = beads.get(epic_id)
+    if not epic:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Epic not found")
+    return [t.__dict__ for t in beads.ready(parent_id=epic_id)]
+
+
+# --- Dependencies ---
+
+@app.post("/beads/{bead_id}/dep", status_code=status.HTTP_201_CREATED)
+async def add_dependency(bead_id: str, depends_on: str) -> Dict:
+    if not beads.add_dependency(bead_id, depends_on):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Failed to add dependency")
+    return {"success": True, "bead_id": bead_id, "depends_on": depends_on}
+
+
+@app.delete("/beads/{bead_id}/dep/{dep_id}")
+async def remove_dependency(bead_id: str, dep_id: str) -> Dict:
+    if not beads.remove_dependency(bead_id, dep_id):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Failed to remove dependency")
+    return {"success": True}
+
+
+# --- Children ---
+
+@app.post("/beads/{bead_id}/children", status_code=status.HTTP_201_CREATED)
+async def create_child_bead(bead_id: str, title: str, description: str = "", priority: int = 2) -> Dict:
+    parent = beads.get(bead_id)
+    if not parent:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Parent not found")
+    child = beads.create_child(bead_id, title, description, priority)
+    return child.__dict__
+
+
+@app.get("/beads/{bead_id}/children")
+async def get_child_beads(bead_id: str) -> List[Dict]:
+    return [c.__dict__ for c in beads.get_children(bead_id)]
+
+
+# --- Bead-Session Wiring ---
+
+@app.get("/beads/{bead_id}/session")
+async def get_bead_session(bead_id: str) -> Dict:
+    terminal = get_terminal_by_bead(bead_id)
+    if not terminal:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No session for this bead")
+    return terminal
+
+
+@app.post("/beads/{bead_id}/assign")
+async def assign_bead(bead_id: str, session_id: str) -> Dict:
+    task = beads.get(bead_id)
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bead not found")
+    task = beads.wip(bead_id, session_id)
+    try:
+        detail = session_service.get_session(session_id)
+        if detail.get("terminals"):
+            tid = detail["terminals"][0]["id"]
+            set_terminal_bead(tid, bead_id)
+            terminal_service.send_input(tid, f"Work on this task: {task.title}\n\n{task.description}")
+    except Exception:
+        pass
+    return task.__dict__
+
+
+@app.post("/beads/{bead_id}/assign-agent")
+async def assign_bead_to_agent(bead_id: str, agent_name: str, provider: str = "claude_code") -> Dict:
+    async with _get_assign_lock(bead_id):
+        task = beads.get(bead_id)
+        if not task:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bead not found")
+        if task.assignee:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                                detail=f"Bead already assigned to {task.assignee}")
+        try:
+            terminal = terminal_service.create_terminal(
+                provider=provider, agent_profile=agent_name, new_session=True, bead_id=bead_id,
+            )
+            session_id = terminal.session_name
+            task = beads.wip(bead_id, session_id)
+            prompt = f"Work on this task: {task.title}\n\n{task.description}" if task.description else f"Work on this task: {task.title}"
+            terminal_service.send_input(terminal.id, prompt)
+            return {"task": task.__dict__, "session_id": session_id, "terminal_id": terminal.id}
+        except Exception as e:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                                detail=f"Failed to assign: {str(e)}")
+
+
+# =============================================================================
 # Master Orchestrator
 # =============================================================================
 

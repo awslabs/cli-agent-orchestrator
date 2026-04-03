@@ -60,6 +60,8 @@ def create_terminal(
     session_name: Optional[str] = None,
     new_session: bool = False,
     working_directory: Optional[str] = None,
+    parent_terminal_id: Optional[str] = None,
+    bead_id: Optional[str] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -114,7 +116,8 @@ def create_terminal(
             )
 
         # Step 3: Persist terminal metadata to database
-        db_create_terminal(terminal_id, session_name, window_name, provider, agent_profile)
+        db_create_terminal(terminal_id, session_name, window_name, provider, agent_profile,
+                           parent_terminal_id=parent_terminal_id, bead_id=bead_id)
 
         # Step 4: Create and initialize the CLI provider
         # This starts the agent (e.g., runs "kiro-cli chat --agent developer")
