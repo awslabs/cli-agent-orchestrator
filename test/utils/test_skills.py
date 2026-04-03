@@ -26,6 +26,13 @@ def _write_skill(folder: Path, name: str, description: str, body: str = "# Title
 class TestLoadSkillMetadata:
     """Tests for load_skill_metadata."""
 
+    @pytest.mark.parametrize("skill_name", ["", "   "])
+    def test_rejects_empty_skill_name(self, tmp_path, monkeypatch, skill_name):
+        monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", tmp_path)
+
+        with pytest.raises(ValueError, match="Skill name must not be empty"):
+            load_skill_metadata(skill_name)
+
     def test_loads_metadata_from_skill_store(self, tmp_path, monkeypatch):
         monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", tmp_path)
         _write_skill(tmp_path / "python-testing", "python-testing", "Pytest conventions")
@@ -77,6 +84,15 @@ class TestLoadSkillMetadata:
         with pytest.raises(ValueError, match="Invalid skill metadata"):
             load_skill_metadata("python-testing")
 
+    def test_raises_for_malformed_frontmatter(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", tmp_path)
+        skill_dir = tmp_path / "python-testing"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text("---\nname: [python-testing\n---\n\nBody\n")
+
+        with pytest.raises(ValueError, match="Failed to parse skill file"):
+            load_skill_metadata("python-testing")
+
     def test_raises_for_folder_name_mismatch(self, tmp_path, monkeypatch):
         monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", tmp_path)
         _write_skill(tmp_path / "wrong-folder", "python-testing", "Pytest conventions")
@@ -87,6 +103,13 @@ class TestLoadSkillMetadata:
 
 class TestLoadSkillContent:
     """Tests for load_skill_content."""
+
+    @pytest.mark.parametrize("skill_name", ["", "   "])
+    def test_rejects_empty_skill_name(self, tmp_path, monkeypatch, skill_name):
+        monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", tmp_path)
+
+        with pytest.raises(ValueError, match="Skill name must not be empty"):
+            load_skill_content(skill_name)
 
     def test_returns_markdown_body_without_frontmatter(self, tmp_path, monkeypatch):
         monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", tmp_path)
@@ -108,6 +131,12 @@ class TestLoadSkillContent:
         with pytest.raises(ValueError, match="Invalid skill name"):
             load_skill_content(skill_name)
 
+    def test_raises_for_missing_skill_folder(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", tmp_path)
+
+        with pytest.raises(FileNotFoundError, match="Skill folder does not exist"):
+            load_skill_content("missing-skill")
+
 
 class TestListSkills:
     """Tests for list_skills."""
@@ -126,6 +155,15 @@ class TestListSkills:
         monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", missing_dir)
 
         assert list_skills() == []
+
+    def test_ignores_plain_files_in_skill_store(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", tmp_path)
+        _write_skill(tmp_path / "alpha", "alpha", "First skill")
+        (tmp_path / "README.md").write_text("not a skill folder")
+
+        skills = list_skills()
+
+        assert [skill.name for skill in skills] == ["alpha"]
 
     def test_skips_invalid_skill_folders_with_warning(self, tmp_path, monkeypatch, caplog):
         monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", tmp_path)
@@ -167,6 +205,13 @@ class TestValidateSkillFolder:
         skill_dir.mkdir()
 
         with pytest.raises(FileNotFoundError, match="Missing SKILL.md"):
+            validate_skill_folder(skill_dir)
+
+    def test_raises_when_folder_name_does_not_match_declared_name(self, tmp_path):
+        skill_dir = tmp_path / "code-style"
+        _write_skill(skill_dir, "python-testing", "Shared coding conventions")
+
+        with pytest.raises(ValueError, match="does not match skill name"):
             validate_skill_folder(skill_dir)
 
 

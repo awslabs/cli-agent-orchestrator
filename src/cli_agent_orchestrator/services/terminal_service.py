@@ -31,9 +31,12 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.constants import SESSION_PREFIX, TERMINAL_LOG_DIR
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
 from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.skills import load_skill_metadata
 from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
     generate_terminal_id,
@@ -52,6 +55,53 @@ class OutputMode(str, Enum):
 
     FULL = "full"
     LAST = "last"
+
+
+SKILL_CATALOG_INSTRUCTION = (
+    "The following skills are available to you. Use the `get_skill` tool to load a skill's "
+    "full content when relevant to your task."
+)
+
+
+def _build_skill_catalog(profile: AgentProfile) -> str:
+    """Build the injected skill catalog block for an agent profile."""
+    if not profile.skills:
+        return ""
+
+    skill_lines = []
+    for skill_name in profile.skills:
+        try:
+            skill = load_skill_metadata(skill_name)
+        except Exception as exc:
+            raise ValueError(
+                f"Failed to load declared skill '{skill_name}' for agent profile '{profile.name}': "
+                f"{exc}"
+            ) from exc
+        skill_lines.append(f"- **{skill.name}**: {skill.description}")
+
+    return "\n".join(
+        [
+            "## Available Skills",
+            "",
+            SKILL_CATALOG_INSTRUCTION,
+            "",
+            *skill_lines,
+        ]
+    )
+
+
+def _enrich_profile_with_skills(profile: AgentProfile) -> AgentProfile:
+    """Append the declared skill catalog to the profile system prompt."""
+    skill_catalog = _build_skill_catalog(profile)
+    if not skill_catalog:
+        return profile
+
+    enriched_profile = profile.model_copy(deep=True)
+    base_prompt = enriched_profile.system_prompt or ""
+    enriched_profile.system_prompt = (
+        f"{base_prompt}\n\n{skill_catalog}" if base_prompt else skill_catalog
+    )
+    return enriched_profile
 
 
 def create_terminal(
@@ -85,6 +135,7 @@ def create_terminal(
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
         TimeoutError: If provider initialization times out
     """
+    terminal_id: Optional[str] = None
     try:
         # Step 1: Generate unique identifiers
         terminal_id = generate_terminal_id()
@@ -119,24 +170,30 @@ def create_terminal(
             terminal_id, session_name, window_name, provider, agent_profile, allowed_tools
         )
 
-        # Step 3b: Resolve allowed_tools from profile if not explicitly provided
-        if allowed_tools is None:
-            try:
-                from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
-                from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
+        # Step 3b: Load the profile once for allowed tool resolution and optional
+        # skill catalog injection before provider initialization.
+        profile = load_agent_profile(agent_profile)
+        enriched_profile = _enrich_profile_with_skills(profile)
 
-                profile = load_agent_profile(agent_profile)
-                mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
-                allowed_tools = resolve_allowed_tools(
-                    profile.allowedTools, profile.role, mcp_server_names
-                )
-            except FileNotFoundError:
-                pass  # Profile not found; no tool restrictions
+        # Step 3c: Resolve allowed_tools from profile if not explicitly provided
+        if allowed_tools is None:
+            from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
+
+            mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
+            allowed_tools = resolve_allowed_tools(
+                profile.allowedTools, profile.role, mcp_server_names
+            )
 
         # Step 4: Create and initialize the CLI provider
         # This starts the agent (e.g., runs "kiro-cli chat --agent developer")
         provider_instance = provider_manager.create_provider(
-            provider, terminal_id, session_name, window_name, agent_profile, allowed_tools
+            provider,
+            terminal_id,
+            session_name,
+            window_name,
+            agent_profile,
+            allowed_tools,
+            loaded_profile=enriched_profile,
         )
         provider_instance.initialize()
 
@@ -166,7 +223,8 @@ def create_terminal(
         # Cleanup on failure: clean up provider resources and kill session
         logger.error(f"Failed to create terminal: {e}")
         try:
-            provider_manager.cleanup_provider(terminal_id)
+            if terminal_id:
+                provider_manager.cleanup_provider(terminal_id)
         except Exception:
             pass  # Ignore cleanup errors
         if new_session and session_name:

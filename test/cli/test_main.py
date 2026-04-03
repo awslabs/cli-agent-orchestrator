@@ -52,6 +52,34 @@ class TestCliMain:
 
         assert result.exit_code == 0
 
+    def test_cli_has_skills_command(self):
+        """Test CLI has skills command group."""
+        runner = CliRunner()
+        result = runner.invoke(cli, ["skills", "--help"])
+
+        assert result.exit_code == 0
+
+    def test_cli_has_skills_add_help(self):
+        """Test CLI has skills add subcommand help."""
+        runner = CliRunner()
+        result = runner.invoke(cli, ["skills", "add", "--help"])
+
+        assert result.exit_code == 0
+
+    def test_cli_has_skills_remove_help(self):
+        """Test CLI has skills remove subcommand help."""
+        runner = CliRunner()
+        result = runner.invoke(cli, ["skills", "remove", "--help"])
+
+        assert result.exit_code == 0
+
+    def test_cli_has_skills_list_help(self):
+        """Test CLI has skills list subcommand help."""
+        runner = CliRunner()
+        result = runner.invoke(cli, ["skills", "list", "--help"])
+
+        assert result.exit_code == 0
+
     def test_cli_unknown_command(self):
         """Test CLI with unknown command."""
         runner = CliRunner()

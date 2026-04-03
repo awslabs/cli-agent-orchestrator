@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.codex import CodexProvider, ProviderError
 
@@ -69,6 +70,28 @@ class TestCodexBuildCommand:
         provider = CodexProvider("test1234", "test-session", "window-0", None)
         command = provider._build_codex_command()
         assert command == "codex --yolo --no-alt-screen --disable shell_snapshot"
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_build_command_uses_preloaded_profile(self, mock_load_profile):
+        loaded_profile = AgentProfile(
+            name="code_supervisor",
+            description="Supervisor",
+            system_prompt="You are a supervisor.\n\n## Available Skills\n- **python-testing**: Pytest",
+        )
+
+        provider = CodexProvider(
+            "test1234",
+            "test-session",
+            "window-0",
+            "code_supervisor",
+            loaded_profile=loaded_profile,
+        )
+        command = provider._build_codex_command()
+
+        mock_load_profile.assert_not_called()
+        assert "developer_instructions=" in command
+        assert "## Available Skills" in command
+        assert "python-testing" in command
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_build_command_with_agent_profile(self, mock_load_profile):

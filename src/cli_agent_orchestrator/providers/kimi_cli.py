@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Optional
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -141,10 +142,18 @@ class KimiCliProvider(BaseProvider):
         window_name: str,
         agent_profile: Optional[str] = None,
         allowed_tools: Optional[list] = None,
+        loaded_profile: Optional[AgentProfile] = None,
     ):
+        """Initialize provider state.
+
+        ``loaded_profile`` lets terminal_service pass a pre-enriched profile
+        so providers reuse injected skill catalog content instead of reloading
+        the profile from disk.
+        """
         super().__init__(terminal_id, session_name, window_name, allowed_tools)
         self._initialized = False
         self._agent_profile = agent_profile
+        self._loaded_profile = loaded_profile
         # Track temp directory for cleanup (created when agent profile needs temp files)
         self._temp_dir: Optional[str] = None
         # Latching flag: set True when user input box (╭─) is detected in ANY
@@ -190,7 +199,7 @@ class KimiCliProvider(BaseProvider):
 
         if self._agent_profile is not None:
             try:
-                profile = load_agent_profile(self._agent_profile)
+                profile = self._loaded_profile or load_agent_profile(self._agent_profile)
 
                 # Build agent file from profile's system prompt.
                 # Kimi uses YAML agent files with a system_prompt_path pointing

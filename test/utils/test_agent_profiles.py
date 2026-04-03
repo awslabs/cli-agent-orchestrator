@@ -40,6 +40,32 @@ class TestLoadAgentProfile:
         assert result.system_prompt == "System prompt content"
         mock_local_path.exists.assert_called_once()
 
+    @patch("cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR")
+    @patch("cli_agent_orchestrator.utils.agent_profiles.frontmatter")
+    def test_load_agent_profile_parses_skills_field(self, mock_frontmatter, mock_local_dir):
+        """Profiles with a skills list should parse it as a list of strings."""
+        mock_local_path = MagicMock(spec=Path)
+        mock_local_path.exists.return_value = True
+        mock_local_path.read_text.return_value = (
+            "---\nname: test-agent\ndescription: Test agent\nskills:\n  - python-testing\n---\n"
+            "System prompt content"
+        )
+        mock_local_dir.__truediv__.return_value = mock_local_path
+
+        mock_parsed = MagicMock()
+        mock_parsed.metadata = {
+            "name": "test-agent",
+            "description": "Test agent",
+            "skills": ["python-testing", "cao-worker-protocols"],
+        }
+        mock_parsed.content = "System prompt content"
+        mock_frontmatter.loads.return_value = mock_parsed
+
+        result = load_agent_profile("test-agent")
+
+        assert result.skills == ["python-testing", "cao-worker-protocols"]
+        assert result.system_prompt == "System prompt content"
+
     @patch("cli_agent_orchestrator.utils.agent_profiles.resources")
     @patch("cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR")
     @patch("cli_agent_orchestrator.utils.agent_profiles.frontmatter")
@@ -178,6 +204,16 @@ class TestResolveProvider:
         result = resolve_provider("developer", fallback_provider="kiro_cli")
 
         assert result == "kiro_cli"
+
+
+class TestAgentProfileModel:
+    """Tests for AgentProfile skills field behavior."""
+
+    def test_skills_field_defaults_to_none(self):
+        """Profiles without a skills field should continue to parse correctly."""
+        profile = AgentProfile(name="developer", description="Developer")
+
+        assert profile.skills is None
 
 
 class TestListAgentProfiles:

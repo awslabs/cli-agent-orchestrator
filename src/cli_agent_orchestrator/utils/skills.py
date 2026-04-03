@@ -13,13 +13,19 @@ from cli_agent_orchestrator.models.skill import SkillMetadata
 logger = logging.getLogger(__name__)
 
 
-def _validate_skill_name(skill_name: str) -> str:
+class SkillNameError(ValueError):
+    """Raised when a skill name is empty or unsafe to resolve on disk."""
+
+
+def validate_skill_name(skill_name: str) -> str:
     """Reject skill names that could cause path traversal."""
     normalized_name = skill_name.strip()
     if not normalized_name:
-        raise ValueError("Skill name must not be empty")
+        raise SkillNameError("Skill name must not be empty")
     if "/" in normalized_name or "\\" in normalized_name or ".." in normalized_name:
-        raise ValueError(f"Invalid skill name '{skill_name}': must not contain '/', '\\', or '..'")
+        raise SkillNameError(
+            f"Invalid skill name '{skill_name}': must not contain '/', '\\', or '..'"
+        )
     return normalized_name
 
 
@@ -60,7 +66,7 @@ def _load_skill_folder(skill_path: Path) -> Tuple[SkillMetadata, str]:
 
 def load_skill_metadata(name: str) -> SkillMetadata:
     """Load validated metadata for a single installed skill."""
-    skill_name = _validate_skill_name(name)
+    skill_name = validate_skill_name(name)
     skill_path = SKILLS_DIR / skill_name
     metadata, _ = _load_skill_folder(skill_path)
     return metadata
@@ -68,7 +74,7 @@ def load_skill_metadata(name: str) -> SkillMetadata:
 
 def load_skill_content(name: str) -> str:
     """Load the Markdown body content for a single installed skill."""
-    skill_name = _validate_skill_name(name)
+    skill_name = validate_skill_name(name)
     skill_path = SKILLS_DIR / skill_name
     _, content = _load_skill_folder(skill_path)
     return content
