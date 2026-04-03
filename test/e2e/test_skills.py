@@ -107,25 +107,14 @@ def _run_skill_injection_test(provider: str, agent_profile: str):
         # The developer profile declares skills: [cao-worker-protocols].
         # After injection, the command string should contain the catalog.
         #
-        # NOTE: Providers with full-screen TUI modes (e.g. Claude Code) may
-        # clear the visible screen on startup, wiping the tail end of long
-        # commands from the scrollback. For those providers, we assert the
-        # system prompt injection flag is present (confirming the pipeline
-        # ran) and rely on the Codex test + unit tests for full catalog
-        # content verification.
-        if "Available Skills" in scrollback:
-            # Full catalog is visible — verify skill name too (Codex, etc.)
-            assert "cao-worker-protocols" in scrollback, (
-                f"Skill name 'cao-worker-protocols' not found in scrollback "
-                f"(provider={provider}). First 500 chars: {scrollback[:500]}"
-            )
-        else:
-            # TUI provider cleared the screen — verify system prompt injection
-            # was at least attempted (the flag + profile heading are visible).
-            assert "DEVELOPER AGENT" in scrollback, (
-                f"System prompt content not found in scrollback "
-                f"(provider={provider}). First 500 chars: {scrollback[:500]}"
-            )
+        assert "Available Skills" in scrollback, (
+            f"Skill catalog heading 'Available Skills' not found in scrollback "
+            f"(provider={provider}). First 500 chars: {scrollback[:500]}"
+        )
+        assert "cao-worker-protocols" in scrollback, (
+            f"Skill name 'cao-worker-protocols' not found in scrollback "
+            f"(provider={provider}). First 500 chars: {scrollback[:500]}"
+        )
 
     finally:
         if terminal_id and actual_session:
@@ -146,13 +135,12 @@ class TestCodexSkills:
         _run_skill_injection_test(provider="codex", agent_profile="developer")
 
 
-@pytest.mark.e2e
-class TestClaudeCodeSkills:
-    """E2E skill injection tests for the Claude Code provider."""
-
-    def test_skill_catalog_injected(self, require_claude):
-        """Claude Code terminal command contains the injected skill catalog."""
-        _run_skill_injection_test(provider="claude_code", agent_profile="developer")
+# NOTE: Claude Code is excluded from injection tests because its full-screen
+# TUI clears the visible screen on startup, wiping the tail of the long
+# command (where the skill catalog lives) from the tmux scrollback. Skill
+# injection for Claude Code is covered by unit tests (_apply_skill_prompt,
+# skill_prompt kwarg passing) and validated indirectly via the Codex test
+# which exercises the same service-layer code path.
 
 
 @pytest.mark.e2e
