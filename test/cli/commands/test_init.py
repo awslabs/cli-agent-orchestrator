@@ -38,7 +38,7 @@ class TestInitCommand:
 
         assert result.exit_code == 0
         assert "CLI Agent Orchestrator initialized successfully" in result.output
-        assert "Seeded 2 default skills." in result.output
+        assert "Seeded 2 builtin skills." in result.output
         mock_init_db.assert_called_once()
         mock_seed.assert_called_once()
 
