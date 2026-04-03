@@ -48,6 +48,12 @@ TOOL_MAPPING: Dict[str, Dict[str, List[str]]] = {
         "fs_list": ["list", "grep"],
         "fs_*": ["read", "write", "list", "grep"],
     },
+    "devin_cli": {
+        "execute_bash": ["Bash"],
+        "fs_read": ["Read"],
+        "fs_write": ["Write"],
+        "fs_*": ["Read", "Write", "Bash"],
+    },
     "gemini_cli": {
         "execute_bash": ["run_shell_command"],
         "fs_read": ["read_file", "list_directory", "search_file_content", "glob"],

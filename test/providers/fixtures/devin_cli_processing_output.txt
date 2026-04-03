@@ -1,0 +1,9 @@
+Welcome to Devin CLI
+
+> list files in the current directory
+
+Running tools
+────────────────────────────────────────
+#
+────────────────────────────────────────
+Mode: chat  Model: devin-v1
