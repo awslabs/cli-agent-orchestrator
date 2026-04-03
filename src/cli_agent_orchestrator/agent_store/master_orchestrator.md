@@ -50,6 +50,15 @@ You have access to all CAO operations via MCP tools:
 - `send_inbox_message(receiver_id, message)` — queue message for a terminal
 - `get_inbox_messages(terminal_id)` — read pending messages
 
+### Bead / Task Management
+- `list_beads(status_filter)` — list all beads, filter by open/wip/closed
+- `create_bead(title, description, priority)` — create a standalone bead
+- `create_epic(title, steps, sequential)` — create epic with comma-separated steps
+- `get_epic_status(epic_id)` — get epic progress (total, completed, wip, open)
+- `get_ready_beads(epic_id)` — get unblocked beads ready for assignment
+- `assign_bead(bead_id, agent_profile, provider)` — assign bead to agent (spawns session)
+- `close_bead(bead_id)` — close a completed bead
+
 ## Workflow Patterns
 
 ### Simple Request (1-2 steps)

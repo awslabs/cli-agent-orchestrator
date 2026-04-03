@@ -757,6 +757,97 @@ async def get_inbox_messages(
         return {"error": str(e)}
 
 
+# --- Bead / Task Management ---
+
+@mcp.tool()
+async def list_beads(
+    status_filter: Optional[str] = Field(default=None, description="Filter: open, wip, closed"),
+) -> Any:
+    """List all beads/tasks, optionally filtered by status."""
+    try:
+        params = {}
+        if status_filter:
+            params["status_filter"] = status_filter
+        return _api_get("/tasks", params=params)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def create_bead(
+    title: str = Field(description="Bead title"),
+    description: str = Field(default="", description="Bead description"),
+    priority: int = Field(default=2, description="Priority 1-3"),
+) -> Any:
+    """Create a new bead (task)."""
+    try:
+        return _api_post("/tasks", params={"title": title, "description": description, "priority": priority})
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def create_epic(
+    title: str = Field(description="Epic title"),
+    steps: str = Field(description="Comma-separated list of step titles"),
+    sequential: bool = Field(default=True, description="If true, each step depends on the previous"),
+) -> Any:
+    """Create an epic with child beads."""
+    try:
+        return _api_post("/epics", params={"title": title, "steps": steps, "sequential": sequential})
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def get_epic_status(
+    epic_id: str = Field(description="Epic bead ID"),
+) -> Any:
+    """Get epic progress: children, completion count, ready tasks."""
+    try:
+        return _api_get(f"/epics/{epic_id}")
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def get_ready_beads(
+    epic_id: Optional[str] = Field(default=None, description="Scope to an epic's children"),
+) -> Any:
+    """Get beads ready for assignment (no blockers)."""
+    try:
+        if epic_id:
+            return _api_get(f"/epics/{epic_id}/ready")
+        return _api_get("/tasks/next")
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def assign_bead(
+    bead_id: str = Field(description="Bead ID to assign"),
+    agent_profile: str = Field(description="Agent profile for the worker"),
+    provider: str = Field(default="claude_code", description="CLI provider"),
+) -> Any:
+    """Assign a bead to an agent — spawns a new session."""
+    try:
+        return _api_post(f"/beads/{bead_id}/assign-agent",
+                         params={"agent_name": agent_profile, "provider": provider})
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def close_bead(
+    bead_id: str = Field(description="Bead ID to close"),
+) -> Any:
+    """Close a completed bead."""
+    try:
+        return _api_post(f"/tasks/{bead_id}/close")
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def main():
     """Main entry point for the MCP server."""
     mcp.run()

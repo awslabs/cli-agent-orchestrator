@@ -53,6 +53,9 @@ class TestToolRegistration:
             "enable_flow", "disable_flow", "delete_flow",
             # Inbox
             "send_inbox_message", "get_inbox_messages",
+            # Beads
+            "list_beads", "create_bead", "create_epic", "get_epic_status",
+            "get_ready_beads", "assign_bead", "close_bead",
         ]
         for name in expected:
             assert name in tool_names, f"MCP tool '{name}' not registered"
@@ -60,8 +63,8 @@ class TestToolRegistration:
     def test_tool_count(self):
         from cli_agent_orchestrator.mcp_server.server import mcp
         tools = list(mcp._tool_manager._tools.values())
-        # 3 original + 20 new = 23
-        assert len(tools) >= 23, f"Expected >=23 tools, got {len(tools)}"
+        # 3 original + 20 session/flow + 7 bead = 30
+        assert len(tools) >= 30, f"Expected >=30 tools, got {len(tools)}"
 
 
 class TestOrchestratorProfile:
@@ -95,6 +98,8 @@ class TestOrchestratorProfile:
         tools = [
             "list_sessions", "create_session", "delete_session", "handoff", "assign",
             "send_message", "list_flows", "create_flow", "run_flow", "list_agent_profiles",
+            "list_beads", "create_bead", "create_epic", "get_epic_status",
+            "get_ready_beads", "assign_bead", "close_bead",
         ]
         for tool in tools:
             assert tool in content, f"Tool '{tool}' not documented in profile"
