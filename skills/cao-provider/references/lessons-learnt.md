@@ -221,11 +221,64 @@ command = f"cd {self._work_dir} && {base_command}"
 ```
 Clean up the temp directory in `cleanup()`.
 
-## 20. E2E Validation: Assign + Handoff Orchestration
+## 20. E2E Validation: All 11 Tests Must Pass (Minimum Success Criteria)
 
-**Problem:** Unit tests and basic e2e tests pass, but the provider fails in real orchestration scenarios — supervisor assigns to 3 parallel workers + handoff to 1 report agent. This is the canonical multi-agent flow that exercises assign (non-blocking), handoff (blocking), send_message (async inbox), and status detection under concurrent load.
+**Problem:** Unit tests and basic e2e tests pass, but the provider fails in real orchestration scenarios. Common failure modes: supervisor doesn't receive worker callbacks so it does the work itself, handoff times out so the supervisor falls back to doing everything inline, or tool restrictions aren't enforced so the reviewer writes files it shouldn't. These failures are only caught by the full e2e suite — passing all 11 tests is the **minimum success criteria** before declaring a provider ready.
 
-**Fix:** Before declaring a provider ready, test with the `examples/assign/` profiles:
+**The 11 core e2e tests per provider:**
+
+### Handoff tests (2 tests) — `test/e2e/test_handoff.py`
+
+| Test | What it validates | Why it matters |
+|------|-------------------|----------------|
+| `test_handoff_simple_function` | Create terminal → send task ("write a Python greet function") → wait for COMPLETED → extract output containing the function | Validates the full lifecycle: initialization, idle detection, message sending, processing detection, completion detection, and message extraction. If this fails, nothing else will work. |
+| `test_handoff_second_task` | Send a second independent task to the same terminal → verify it produces correct output with no state leakage from the first task | Validates that the provider correctly resets between tasks. If COMPLETED detection is latching or stale buffer matching isn't handled, the second task will return the first task's output. |
+
+### Assign tests (3 tests) — `test/e2e/test_assign.py`
+
+| Test | What it validates | Why it matters |
+|------|-------------------|----------------|
+| `test_assign_data_analyst` | Worker terminal with `data_analyst` profile analyzes dataset [1,2,3,4,5] and produces statistical output (mean, median, stdev) | Validates that agent profiles with system prompts load correctly and the provider can handle domain-specific tasks. If `load_agent_profile()` fails or system prompt injection is broken, the worker produces generic output instead of statistical analysis. |
+| `test_assign_report_generator` | Worker terminal with `report_generator` profile creates a structured report template with sections (Executive Summary, Analysis, Conclusions) | Validates that a different agent profile produces structurally different output. Catches cases where profiles are silently ignored or swapped. |
+| `test_assign_with_callback` | Full round-trip: create supervisor terminal → create worker terminal → worker completes task → worker calls `send_message()` back to supervisor → verify supervisor inbox receives the result | **The most critical assign test.** Validates the complete assign flow including MCP tool usage (`send_message`), inbox delivery, and cross-terminal communication. If this fails, the supervisor never receives worker results and falls back to doing everything itself. |
+
+### Send Message test (1 test) — `test/e2e/test_send_message.py`
+
+| Test | What it validates | Why it matters |
+|------|-------------------|----------------|
+| `test_send_message_to_inbox` | Create two terminals → send a message from terminal A to terminal B's inbox → verify terminal B receives and processes the message | Validates inbox delivery mechanics: message queuing, idle detection (messages only deliver when receiver is IDLE), and the provider's ability to process injected messages. If idle detection is broken, messages queue forever and are never delivered. |
+
+### Allowed Tools tests (3 tests) — `test/e2e/test_allowed_tools.py`
+
+| Test | What it validates | Why it matters |
+|------|-------------------|----------------|
+| `test_restricted_supervisor_cannot_bash` | Supervisor role (restricted to `@cao-mcp-server, fs_read, fs_list`) attempts to run a bash command → verify it's blocked | Validates that tool restrictions are actually enforced by the provider's native mechanism (CLI flags, agent JSON, policy engine, or system prompt). If the provider silently ignores `allowed_tools`, supervisors can execute arbitrary code — a security boundary violation. Marked `xfail` for soft-enforcement providers (Codex, Kimi). |
+| `test_unrestricted_developer_can_bash` | Developer role (unrestricted `["*"]`) runs a bash command → verify it succeeds | Validates that unrestricted access works and the provider doesn't over-restrict. Catches cases where the restriction logic has an off-by-one or blocks everything. |
+| `test_allowed_tools_stored_in_metadata` | Launch with explicit `allowed_tools` → verify they're persisted in DB and returned by `GET /terminals/{id}` | Validates the full pipeline from CLI flag → API → DB → response. If metadata isn't stored, the web UI can't display restrictions and debugging becomes impossible. |
+
+### Supervisor Orchestration tests (2 tests) — `test/e2e/test_supervisor_orchestration.py`
+
+| Test | What it validates | Why it matters |
+|------|-------------------|----------------|
+| `test_supervisor_handoff` | Supervisor terminal uses the `handoff()` MCP tool to delegate a task to a `report_generator` worker → verify the supervisor receives the worker's output and incorporates it into its final response | **Tests the supervisor's ability to use MCP tools.** Unlike `test_handoff_simple_function` (which sends tasks via API), this test verifies the supervisor agent autonomously calls the handoff MCP tool. If MCP config injection (`CAO_TERMINAL_ID`) is broken, the supervisor can't find the MCP server and falls back to answering directly — producing a plausible but wrong response. |
+| `test_supervisor_assign_and_handoff` | Supervisor uses both `assign()` and `handoff()` MCP tools in a single workflow — assigns worker(s) and hands off to another → verify the supervisor produces a final output that incorporates delegated results | **The ultimate integration test.** Exercises assign (non-blocking) + handoff (blocking) + status detection under concurrent load. If the supervisor fails to receive assign callbacks (broken `send_message` delivery), it will do the analysis work itself instead of waiting for workers. The test catches this by checking that the output references delegated results rather than self-generated analysis. |
+
+### Running the full suite
+
+```bash
+# All 11 tests for your provider (replace NewCli with your test class prefix)
+uv run pytest test/e2e/ -v -k "NewCli" -o "addopts="
+
+# Or run by category
+uv run pytest test/e2e/test_handoff.py -v -k "NewCli" -o "addopts="
+uv run pytest test/e2e/test_assign.py -v -k "NewCli" -o "addopts="
+uv run pytest test/e2e/test_send_message.py -v -k "NewCli" -o "addopts="
+uv run pytest test/e2e/test_allowed_tools.py -v -k "NewCli" -o "addopts="
+uv run pytest test/e2e/test_supervisor_orchestration.py -v -k "NewCli" -o "addopts="
+```
+
+**All 11 tests must pass.** A provider that fails even one test has a gap that will surface in production — either as a supervisor doing workers' jobs, messages never delivering, tool restrictions not enforced, or handoffs silently timing out. The manual `examples/assign/` flow (supervisor → 3x data analyst + 1x report generator) is a good smoke test, but it does not replace the automated suite:
+
 ```bash
 cao install examples/assign/data_analyst.md
 cao install examples/assign/report_generator.md
@@ -233,4 +286,3 @@ cao install examples/assign/analysis_supervisor.md
 cao launch --agents analysis_supervisor --provider new_cli --auto-approve
 ```
 Use `--provider` to target your new provider (otherwise it defaults to `kiro_cli`). Use `--auto-approve` to skip the confirmation prompt while keeping tool restrictions enforced, or `--yolo` for unrestricted access during initial debugging.
-The test flow: supervisor assigns 3x data_analyst (parallel) + handoff 1x report_generator (blocking) → analysts send_message results back → supervisor combines template + results into final report. If any step fails, the provider has a gap in status detection, message extraction, or concurrent session handling. See `test/e2e/test_assign.py` for the automated version.
