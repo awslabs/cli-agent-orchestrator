@@ -157,7 +157,7 @@ class NewCliProvider(BaseProvider):
         """Detect terminal state by analyzing tmux output.
         
         IMPORTANT: Check COMPLETED before PROCESSING to avoid the stale
-        buffer problem. See references/lessons-learned.md #1.
+        buffer problem. See references/lessons-learnt.md #1.
         """
         output = tmux_client.get_history(
             self.session_name, self.window_name, tail_lines=tail_lines

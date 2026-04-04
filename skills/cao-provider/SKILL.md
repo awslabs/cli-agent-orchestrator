@@ -27,6 +27,7 @@ Gather this information about the target CLI:
 - Does it support `--dangerously-skip-permissions` or similar flags?
 - Does it have a REPL mode or is it single-shot?
 - How does it handle MCP servers? (CLI flags, config file, agent JSON)
+- Does it use alt-screen (full-screen TUI) or scrollback (inline output)? This fundamentally changes status detection logic — see lesson #16
 - What's the exit command? (`/exit`, `/quit`, Ctrl+C)
 
 ## Step-by-Step Implementation
@@ -56,7 +57,7 @@ Read `references/provider-template.md` for the full annotated template. The key 
 - Response markers (how agent responses start — e.g., `⏺` for Claude Code)
 - Permission/confirmation prompts (if the CLI asks Y/n questions)
 
-**Status detection priority** — The order in `get_status()` matters. Read `references/lessons-learned.md` for the critical "stale buffer" lesson. The recommended pattern:
+**Status detection priority** — The order in `get_status()` matters. Read `references/lessons-learnt.md` for the critical "stale buffer" lesson. The recommended pattern:
 
 ```
 1. Strip ANSI codes from terminal output
@@ -112,7 +113,7 @@ Only add a `TOOL_MAPPING` entry if the CLI has its own native tool names that di
 
 ### Step 6: Handle startup prompts
 
-Many CLIs show prompts on first launch (workspace trust, permission bypass, terms acceptance). Handle these in `initialize()` or a dedicated `_handle_startup_prompts()` method by polling tmux output and sending the appropriate keystrokes to dismiss.
+Many CLIs show cascading prompts on first launch (workspace trust, permission bypass, terms acceptance). Handle these in `initialize()` or a dedicated `_handle_startup_prompts()` method using a polling loop — not a single check. See `references/lessons-learnt.md` #17 for the stabilization loop pattern. Also consider shell warm-up (#14) and TERM variable compatibility (#15).
 
 ### Step 7: Write unit tests
 
@@ -132,7 +133,28 @@ Use `unittest.mock.patch` to mock `tmux_client`. Create fixture files in `test/p
 
 Add test classes to existing e2e test files and a fixture in `test/e2e/conftest.py`. Read `references/test-guide.md` for the full list of e2e test classes to add.
 
-### Step 9: Documentation
+### Step 9: Validate with assign + handoff orchestration
+
+This is the canonical multi-agent e2e test. It exercises assign (non-blocking), handoff (blocking), send_message (async inbox), and status detection under concurrent load. Use the `examples/assign/` profiles:
+
+```bash
+cao install examples/assign/data_analyst.md
+cao install examples/assign/report_generator.md
+cao install examples/assign/analysis_supervisor.md
+cao launch --agents analysis_supervisor
+```
+
+**Test flow:** Supervisor assigns 3x data_analyst workers in parallel + handoff 1x report_generator (blocking) → analysts send_message results back to supervisor → supervisor combines template + results into final report.
+
+If any step fails, investigate:
+- **Assign fails:** Status detection not recognizing IDLE after analyst finishes, or per-directory lock conflict (see lesson #19)
+- **Handoff times out:** COMPLETED not detected — check stale buffer (lesson #1) or alt-screen detection (lesson #16)
+- **send_message not delivered:** Supervisor not reaching IDLE state, blocking message delivery — check startup prompt loop (lesson #17)
+- **Concurrent failures:** Race conditions in shared config files (lesson #19) or TERM env issues (lesson #15)
+
+See `test/e2e/test_assign.py` for the automated version. Reference: https://github.com/awslabs/cli-agent-orchestrator/tree/feature/kimi-cli/examples/assign
+
+### Step 10: Documentation
 
 Create `docs/new-cli.md` with prerequisites, launch examples, agent profile format, known limitations, and troubleshooting. Update `README.md` provider table and `CHANGELOG.md`.
 
