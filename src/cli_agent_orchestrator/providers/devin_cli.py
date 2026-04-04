@@ -30,9 +30,6 @@ CONTROL_CHARS_PATTERN = r"[\x00-\x08\x0b-\x1f\x7f]"
 #   ────────────────────  <- horizontal rule
 #   Mode: ... Model: ...  <- status bar
 
-# The `#` prompt is fixed TUI chrome and never disappears during processing.
-# Use a relaxed pattern that also accepts ghost/autocomplete text after `#`.
-INPUT_PROMPT_PATTERN = r"^\s*#"
 STATUS_BAR_PATTERN = r"Mode:.*Model:"
 
 # Horizontal rule: one or more chars in Unicode box-drawing range U+2500–U+257F
@@ -40,6 +37,12 @@ HORIZONTAL_RULE_PATTERN = r"^[\u2500-\u257f]{3,}"
 
 # User input lines are prefixed with "> " (with content after the space).
 USER_INPUT_PATTERN = r"^>\s+\S"
+
+# Input prompt pattern: relaxed to allow ghost/autocomplete text (e.g. "# may be").
+# NOTE: this pattern is intentionally NOT used as a response-content terminator
+# because it would also match Markdown headings (e.g. "# Title").
+# Response termination relies solely on HORIZONTAL_RULE_PATTERN / STATUS_BAR_PATTERN.
+_INPUT_PROMPT_PATTERN = r"^\s*#"
 
 # Processing state indicators (take priority over the fixed `#` prompt)
 PROCESSING_PATTERNS = [
@@ -97,26 +100,41 @@ class DevinCliProvider(BaseProvider):
             "false",
         ]
 
+        # Determine the base system prompt from the agent profile (if any).
+        system_prompt = ""
         if self._agent_profile:
-            # Write agent profile content to a temp file
             try:
                 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 
                 profile = load_agent_profile(self._agent_profile)
-                if profile.system_prompt:
-                    tmp = tempfile.NamedTemporaryFile(
-                        mode="w",
-                        suffix=".md",
-                        delete=False,
-                        prefix="devin_profile_",
-                    )
-                    tmp.write(profile.system_prompt)
-                    tmp.flush()
-                    tmp.close()
-                    self._temp_prompt_file = tmp.name
-                    command_parts.extend(["--prompt-file", tmp.name])
+                system_prompt = profile.system_prompt or ""
             except (FileNotFoundError, RuntimeError, OSError):
-                logger.debug("Could not load agent profile '%s' for Devin CLI", self._agent_profile)
+                logger.debug(
+                    "Could not load agent profile '%s' for Devin CLI", self._agent_profile
+                )
+
+        # Soft-enforce tool restrictions by prepending a security constraint to the
+        # system prompt (Devin CLI has no native deny-tool flag).
+        if self._allowed_tools and "*" not in self._allowed_tools:
+            from cli_agent_orchestrator.constants import SECURITY_PROMPT
+
+            tools_list = ", ".join(self._allowed_tools)
+            tool_constraint = f"\nYou only have access to these tools: {tools_list}\n"
+            system_prompt = SECURITY_PROMPT + tool_constraint + system_prompt
+
+        # Write the prompt file when there is content.
+        if system_prompt:
+            tmp = tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix=".md",
+                delete=False,
+                prefix="devin_profile_",
+            )
+            tmp.write(system_prompt)
+            tmp.flush()
+            tmp.close()
+            self._temp_prompt_file = tmp.name
+            command_parts.extend(["--prompt-file", tmp.name])
 
         # Build MCP config
         mcp_config = self._build_mcp_config()
@@ -196,9 +214,19 @@ class DevinCliProvider(BaseProvider):
 
     @staticmethod
     def _has_input_prompt(lines: list[str]) -> bool:
-        """Return True if the `#` input prompt is visible near the bottom."""
-        for line in reversed(lines[-20:]):
-            if re.match(INPUT_PROMPT_PATTERN, line):
+        """Return True if the `#` input prompt preceded by a horizontal rule is visible.
+
+        The Devin TUI always places a horizontal rule immediately before the `#`
+        prompt.  Requiring this context avoids false positives from Markdown
+        headings (e.g. ``# Title``) that appear inside agent responses.
+        """
+        tail = lines[-20:]
+        for idx, line in enumerate(tail):
+            if not re.match(_INPUT_PROMPT_PATTERN, line):
+                continue
+            # Verify the closest preceding non-empty line is a horizontal rule.
+            preceding = [l for l in tail[:idx] if l.strip()]
+            if preceding and re.match(HORIZONTAL_RULE_PATTERN, preceding[-1].strip()):
                 return True
         return False
 
@@ -215,7 +243,7 @@ class DevinCliProvider(BaseProvider):
 
         Decision tree:
         1. Processing patterns (Running tools, esc to interrupt, …) → PROCESSING
-        2. `#` prompt visible AND status bar visible:
+        2. `#` prompt visible (preceded by horizontal rule) AND status bar visible:
            a. `> user_input` line exists → check for response → COMPLETED or PROCESSING
            b. No user input line → IDLE
         3. Neither prompt nor status bar → PROCESSING (still starting up)
@@ -251,9 +279,11 @@ class DevinCliProvider(BaseProvider):
 
         response_lines = []
         for line in lines[last_user_idx + 1 :]:
+            # Terminate at the horizontal rule that precedes the `#` prompt.
             if re.match(HORIZONTAL_RULE_PATTERN, line.strip()):
                 break
-            if re.match(INPUT_PROMPT_PATTERN, line):
+            # Fallback: stop at the status bar line so we never include chrome.
+            if re.search(STATUS_BAR_PATTERN, line):
                 break
             if line.strip():
                 response_lines.append(line)
@@ -281,12 +311,16 @@ class DevinCliProvider(BaseProvider):
         if last_user_idx < 0:
             raise ValueError("No Devin CLI user input found — cannot locate response")
 
-        # Collect lines between the last user input and the next horizontal rule or `#` prompt.
+        # Collect lines between the last user input and the next horizontal rule.
+        # NOTE: do NOT break on the `#` pattern here — it would incorrectly truncate
+        # responses that begin with a Markdown heading (e.g. "# Overview").
+        # The horizontal rule (always present before the `#` prompt) is the safe
+        # terminator. The status bar is an additional fallback.
         response_lines = []
         for line in lines[last_user_idx + 1 :]:
             if re.match(HORIZONTAL_RULE_PATTERN, line.strip()):
                 break
-            if re.match(INPUT_PROMPT_PATTERN, line):
+            if re.search(STATUS_BAR_PATTERN, line):
                 break
             response_lines.append(line)
 

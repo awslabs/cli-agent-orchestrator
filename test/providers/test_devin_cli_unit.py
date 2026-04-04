@@ -148,6 +148,16 @@ class TestDevinCliProviderStatusDetection:
 
         assert status == TerminalStatus.PROCESSING
 
+    @patch("cli_agent_orchestrator.providers.devin_cli.tmux_client")
+    def test_get_status_completed_with_markdown_heading_response(self, mock_tmux):
+        """COMPLETED even when the response begins with a Markdown heading (Bug #1 regression)."""
+        mock_tmux.get_history.return_value = load_fixture("devin_cli_heading_response.txt")
+
+        provider = DevinCliProvider("test1234", "test-session", "window-0")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.COMPLETED
+
 
 class TestDevinCliResponseExtraction:
     """Test response extraction from script output."""
@@ -225,6 +235,104 @@ class TestDevinCliResponseExtraction:
         )
         with pytest.raises(ValueError, match="Empty Devin CLI response"):
             provider.extract_last_message_from_script(output)
+
+    def test_extract_response_with_markdown_heading(self):
+        """Response starting with a Markdown heading is extracted in full (Bug #1 regression)."""
+        provider = DevinCliProvider("test1234", "test-session", "window-0")
+        output = load_fixture("devin_cli_heading_response.txt")
+        message = provider.extract_last_message_from_script(output)
+
+        # The full response including the "# Overview" heading must be returned.
+        assert "# Overview" in message
+        assert "Supported providers" in message
+
+    def test_extract_response_with_markdown_heading_inline(self):
+        """Markdown headings inside the response are not treated as terminators."""
+        provider = DevinCliProvider("test1234", "test-session", "window-0")
+        output = (
+            "> summarise\n"
+            "# Summary\n"
+            "Here is the summary.\n"
+            "## Details\n"
+            "Some details here.\n"
+            "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+            "#\n"
+            "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+            "Mode: chat  Model: devin-v1\n"
+        )
+        message = provider.extract_last_message_from_script(output)
+        assert "# Summary" in message
+        assert "## Details" in message
+        assert "Some details here." in message
+
+
+class TestDevinCliToolRestrictions:
+    """Test that allowed_tools restrictions are enforced via the prompt file."""
+
+    def test_allowed_tools_constraint_prepended_to_prompt(self):
+        """Security constraint is prepended when allowed_tools is restricted."""
+        provider = DevinCliProvider(
+            "test1234", "test-session", "window-0", allowed_tools=["fs_read", "execute_bash"]
+        )
+        command = provider._build_command()
+
+        # A --prompt-file flag must be present.
+        assert "--prompt-file" in command
+
+        # Verify the temp file contains the security constraint and tool list.
+        assert provider._temp_prompt_file is not None
+        content = open(provider._temp_prompt_file).read()
+        assert "fs_read" in content
+        assert "execute_bash" in content
+        assert "SECURITY CONSTRAINTS" in content
+
+        # Cleanup
+        provider.cleanup()
+
+    def test_no_prompt_file_when_unrestricted(self):
+        """No prompt file is written when allowed_tools is unrestricted ('*')."""
+        provider = DevinCliProvider(
+            "test1234", "test-session", "window-0", allowed_tools=["*"]
+        )
+        provider._build_command()
+
+        assert provider._temp_prompt_file is None
+        provider.cleanup()
+
+    def test_no_prompt_file_when_no_profile_and_no_restrictions(self):
+        """No prompt file written when there is no profile and no restrictions."""
+        provider = DevinCliProvider("test1234", "test-session", "window-0")
+        command = provider._build_command()
+
+        assert "--prompt-file" not in command
+        assert provider._temp_prompt_file is None
+        provider.cleanup()
+
+    def test_tool_restriction_with_agent_profile(self):
+        """Security constraint is prepended before the profile system prompt."""
+        mock_profile = MagicMock()
+        mock_profile.system_prompt = "You are a helpful assistant."
+
+        with patch(
+            "cli_agent_orchestrator.utils.agent_profiles.load_agent_profile",
+            return_value=mock_profile,
+        ):
+            provider = DevinCliProvider(
+                "test1234",
+                "test-session",
+                "window-0",
+                agent_profile="my-agent",
+                allowed_tools=["fs_read"],
+            )
+            provider._build_command()
+
+        assert provider._temp_prompt_file is not None
+        content = open(provider._temp_prompt_file).read()
+        # Security constraint must come BEFORE the profile system prompt.
+        security_pos = content.find("SECURITY CONSTRAINTS")
+        profile_pos = content.find("You are a helpful assistant.")
+        assert security_pos < profile_pos
+        provider.cleanup()
 
 
 class TestDevinCliProviderRegistration:
