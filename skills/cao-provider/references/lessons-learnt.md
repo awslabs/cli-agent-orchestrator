@@ -230,6 +230,7 @@ Clean up the temp directory in `cleanup()`.
 cao install examples/assign/data_analyst.md
 cao install examples/assign/report_generator.md
 cao install examples/assign/analysis_supervisor.md
-cao launch --agents analysis_supervisor
+cao launch --agents analysis_supervisor --provider new_cli --auto-approve
 ```
+Use `--provider` to target your new provider (otherwise it defaults to `kiro_cli`). Use `--auto-approve` to skip the confirmation prompt while keeping tool restrictions enforced, or `--yolo` for unrestricted access during initial debugging.
 The test flow: supervisor assigns 3x data_analyst (parallel) + handoff 1x report_generator (blocking) → analysts send_message results back → supervisor combines template + results into final report. If any step fails, the provider has a gap in status detection, message extraction, or concurrent session handling. See `test/e2e/test_assign.py` for the automated version.

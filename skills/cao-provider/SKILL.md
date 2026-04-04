@@ -141,7 +141,7 @@ This is the canonical multi-agent e2e test. It exercises assign (non-blocking), 
 cao install examples/assign/data_analyst.md
 cao install examples/assign/report_generator.md
 cao install examples/assign/analysis_supervisor.md
-cao launch --agents analysis_supervisor
+cao launch --agents analysis_supervisor --provider new_cli --auto-approve
 ```
 
 **Test flow:** Supervisor assigns 3x data_analyst workers in parallel + handoff 1x report_generator (blocking) → analysts send_message results back to supervisor → supervisor combines template + results into final report.
