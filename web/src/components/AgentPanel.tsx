@@ -10,7 +10,7 @@ import { TerminalMeta } from '../api'
 import { StatusBadge } from './StatusBadge'
 import { OutputViewer } from './OutputViewer'
 
-const FALLBACK_PROVIDERS = ['kiro_cli', 'claude_code', 'q_cli', 'codex']
+const FALLBACK_PROVIDERS = ['kiro_cli', 'claude_code', 'q_cli', 'codex', 'gemini_cli', 'kimi_cli', 'copilot_cli']
 
 const SOURCE_LABELS: Record<string, string> = {
   'built-in': 'Built-in',
