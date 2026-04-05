@@ -5,10 +5,11 @@ from pathlib import Path
 
 import click
 import frontmatter
-import requests
+import requests  # type: ignore[import-untyped]
 
 from cli_agent_orchestrator.constants import (
     AGENT_CONTEXT_DIR,
+    CAO_ENV_FILE,
     COPILOT_AGENTS_DIR,
     DEFAULT_PROVIDER,
     KIRO_AGENTS_DIR,
@@ -21,6 +22,7 @@ from cli_agent_orchestrator.models.kiro_agent import KiroAgentConfig
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.q_agent import QAgentConfig
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.env import resolve_env_vars, set_env_var
 
 
 def _download_agent(source: str) -> str:
@@ -59,6 +61,17 @@ def _download_agent(source: str) -> str:
     raise FileNotFoundError(f"Source not found: {source}")
 
 
+def _parse_env_assignment(env_assignment: str) -> tuple[str, str]:
+    """Parse a ``KEY=VALUE`` env assignment for install-time injection."""
+    if "=" not in env_assignment:
+        raise click.BadParameter(
+            f"Invalid env var '{env_assignment}'. Expected format KEY=VALUE.", param_hint="--env"
+        )
+
+    key, value = env_assignment.split("=", 1)
+    return key, value
+
+
 @click.command()
 @click.argument("agent_source")
 @click.option(
@@ -67,7 +80,13 @@ def _download_agent(source: str) -> str:
     default=DEFAULT_PROVIDER,
     help=f"Provider to use (default: {DEFAULT_PROVIDER})",
 )
-def install(agent_source: str, provider: str):
+@click.option(
+    "--env",
+    "env_vars",
+    multiple=True,
+    help="Set env vars before installing the agent (repeatable: --env KEY=VALUE).",
+)
+def install(agent_source: str, provider: str, env_vars: tuple[str, ...]):
     """
     Install an agent from local store, built-in store, URL, or file path.
 
@@ -90,6 +109,10 @@ def install(agent_source: str, provider: str):
             # Treat as agent name
             agent_name = agent_source
 
+        for env_assignment in env_vars:
+            key, value = _parse_env_assignment(env_assignment)
+            set_env_var(key, value)
+
         # Load agent profile using existing Pydantic parser
         profile = load_agent_profile(agent_name)
 
@@ -106,8 +129,7 @@ def install(agent_source: str, provider: str):
 
         # Copy markdown file to agent-context directory
         dest_file = AGENT_CONTEXT_DIR / f"{profile.name}.md"
-        with open(source_file, "r") as src:
-            dest_file.write_text(src.read())
+        dest_file.write_text(resolve_env_vars(source_file.read_text()))
 
         # Resolve allowedTools from profile → role defaults → developer defaults
         from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
@@ -159,7 +181,9 @@ def install(agent_source: str, provider: str):
 
         elif provider == ProviderType.COPILOT_CLI.value:
             COPILOT_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
-            prompt = (profile.system_prompt or "").strip() or (profile.prompt or "").strip()
+            system_prompt = profile.system_prompt.strip() if profile.system_prompt else ""
+            fallback_prompt = profile.prompt.strip() if profile.prompt else ""
+            prompt = system_prompt or fallback_prompt
             if not prompt:
                 raise ValueError(
                     f"Agent '{profile.name}' has no usable prompt content for Copilot "
@@ -174,17 +198,21 @@ def install(agent_source: str, provider: str):
                 prompt=prompt,
             )
             agent_post = frontmatter.Post(
-                agent_config.prompt.rstrip(),
+                prompt.rstrip(),
                 name=agent_config.name,
                 description=agent_config.description,
             )
             agent_file.write_text(frontmatter.dumps(agent_post), encoding="utf-8")
 
         click.echo(f"✓ Agent '{profile.name}' installed successfully")
+        if env_vars:
+            click.echo(f"✓ Set {len(env_vars)} env var(s) in {CAO_ENV_FILE}")
         click.echo(f"✓ Context file: {dest_file}")
         if agent_file:
             click.echo(f"✓ {provider} agent: {agent_file}")
 
+    except click.BadParameter:
+        raise
     except FileNotFoundError as e:
         click.echo(f"Error: {e}", err=True)
         return

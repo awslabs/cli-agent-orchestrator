@@ -1,5 +1,6 @@
 """Tests for the install CLI command."""
 
+import json
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -398,3 +399,184 @@ class TestInstallCommand:
 
             assert "Failed to install agent" in result.output
             assert "has no usable prompt content for Copilot" in result.output
+
+
+class TestInstallCommandEnvFlags:
+    """Tests for install-time env var injection."""
+
+    @pytest.fixture
+    def runner(self):
+        """Create a CLI test runner."""
+        return CliRunner()
+
+    @pytest.fixture
+    def install_paths(self, tmp_path, monkeypatch):
+        """Patch install-related filesystem paths into a temp workspace."""
+        local_store_dir = tmp_path / "agent-store"
+        context_dir = tmp_path / "agent-context"
+        kiro_dir = tmp_path / "kiro"
+        q_dir = tmp_path / "q"
+        env_file = tmp_path / ".env"
+
+        local_store_dir.mkdir()
+        context_dir.mkdir()
+        kiro_dir.mkdir()
+        q_dir.mkdir()
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR", local_store_dir
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.cli.commands.install.AGENT_CONTEXT_DIR", context_dir
+        )
+        monkeypatch.setattr("cli_agent_orchestrator.cli.commands.install.KIRO_AGENTS_DIR", kiro_dir)
+        monkeypatch.setattr("cli_agent_orchestrator.cli.commands.install.Q_AGENTS_DIR", q_dir)
+        monkeypatch.setattr("cli_agent_orchestrator.cli.commands.install.CAO_ENV_FILE", env_file)
+        monkeypatch.setattr("cli_agent_orchestrator.utils.env.CAO_ENV_FILE", env_file)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR", local_store_dir
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs", lambda: {}
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", lambda: []
+        )
+
+        return {
+            "local_store_dir": local_store_dir,
+            "context_dir": context_dir,
+            "kiro_dir": kiro_dir,
+            "q_dir": q_dir,
+            "env_file": env_file,
+        }
+
+    @staticmethod
+    def _write_profile(profile_path: Path, body: str) -> None:
+        """Write a local profile with env placeholders."""
+        profile_path.write_text(
+            "---\n"
+            "name: test-agent\n"
+            "description: Test agent\n"
+            "mcpServers:\n"
+            "  obsidian:\n"
+            "    command: obsidian-mcp\n"
+            "    env:\n"
+            "      OBSIDIAN_API_KEY: ${OBSIDIAN_API_KEY}\n"
+            "      BASE_URL: ${BASE_URL}\n"
+            "      URL: ${URL}\n"
+            "---\n"
+            f"{body}\n"
+        )
+
+    def test_install_with_env_writes_env_file_and_resolves_installed_profile(
+        self, runner, install_paths
+    ):
+        """A single --env flag should persist and resolve before install output is written."""
+        profile_path = install_paths["local_store_dir"] / "test-agent.md"
+        self._write_profile(profile_path, "Token: ${OBSIDIAN_API_KEY}")
+
+        result = runner.invoke(
+            install,
+            [
+                "test-agent",
+                "--provider",
+                "kiro_cli",
+                "--env",
+                "OBSIDIAN_API_KEY=secret-token",
+            ],
+        )
+
+        assert result.exit_code == 0
+        assert install_paths["env_file"].read_text() == "OBSIDIAN_API_KEY='secret-token'\n"
+        assert (install_paths["context_dir"] / "test-agent.md").read_text().find(
+            "secret-token"
+        ) != -1
+        assert (
+            "${OBSIDIAN_API_KEY}"
+            not in (install_paths["context_dir"] / "test-agent.md").read_text()
+        )
+        assert f"✓ Set 1 env var(s) in {install_paths['env_file']}" in result.output
+
+        kiro_agent_file = install_paths["kiro_dir"] / "test-agent.json"
+        kiro_config = json.loads(kiro_agent_file.read_text())
+        assert kiro_config["mcpServers"]["obsidian"]["env"]["OBSIDIAN_API_KEY"] == "secret-token"
+
+    def test_install_with_multiple_env_flags_writes_all_values(self, runner, install_paths):
+        """Multiple --env flags should all be written before profile resolution."""
+        profile_path = install_paths["local_store_dir"] / "test-agent.md"
+        self._write_profile(profile_path, "Token: ${OBSIDIAN_API_KEY}\nBase URL: ${BASE_URL}")
+
+        result = runner.invoke(
+            install,
+            [
+                "test-agent",
+                "--provider",
+                "kiro_cli",
+                "--env",
+                "OBSIDIAN_API_KEY=secret-token",
+                "--env",
+                "BASE_URL=http://localhost:27124",
+            ],
+        )
+
+        context_text = (install_paths["context_dir"] / "test-agent.md").read_text()
+
+        assert result.exit_code == 0
+        assert "OBSIDIAN_API_KEY='secret-token'" in install_paths["env_file"].read_text()
+        assert "BASE_URL='http://localhost:27124'" in install_paths["env_file"].read_text()
+        assert "Token: secret-token" in context_text
+        assert "Base URL: http://localhost:27124" in context_text
+        assert f"✓ Set 2 env var(s) in {install_paths['env_file']}" in result.output
+
+    def test_install_with_env_value_containing_equals_preserves_full_value(
+        self, runner, install_paths
+    ):
+        """The first equals sign splits the assignment and later ones remain in the value."""
+        profile_path = install_paths["local_store_dir"] / "test-agent.md"
+        self._write_profile(profile_path, "URL: ${URL}")
+
+        result = runner.invoke(
+            install,
+            [
+                "test-agent",
+                "--provider",
+                "q_cli",
+                "--env",
+                "URL=http://host?a=b",
+            ],
+        )
+
+        context_text = (install_paths["context_dir"] / "test-agent.md").read_text()
+        q_agent_file = install_paths["q_dir"] / "test-agent.json"
+        q_config = json.loads(q_agent_file.read_text())
+
+        assert result.exit_code == 0
+        assert "URL='http://host?a=b'" in install_paths["env_file"].read_text()
+        assert "URL: http://host?a=b" in context_text
+        assert q_config["mcpServers"]["obsidian"]["env"]["URL"] == "http://host?a=b"
+
+    def test_install_with_invalid_env_format_returns_click_error(self, runner, install_paths):
+        """Assignments without '=' should fail validation with a user-friendly error."""
+        profile_path = install_paths["local_store_dir"] / "test-agent.md"
+        self._write_profile(profile_path, "Token: ${OBSIDIAN_API_KEY}")
+
+        result = runner.invoke(install, ["test-agent", "--env", "INVALID_FORMAT"])
+
+        assert result.exit_code == 2
+        assert "Invalid value for --env" in result.output
+        assert "Expected format KEY=VALUE" in result.output
+        assert not install_paths["env_file"].exists()
+
+    def test_install_without_env_does_not_modify_env_file(self, runner, install_paths):
+        """Install should not create or update the env file when --env is omitted."""
+        profile_path = install_paths["local_store_dir"] / "test-agent.md"
+        profile_path.write_text(
+            "---\nname: test-agent\ndescription: Test agent\n---\nPlain system prompt\n"
+        )
+
+        result = runner.invoke(install, ["test-agent", "--provider", "kiro_cli"])
+
+        assert result.exit_code == 0
+        assert not install_paths["env_file"].exists()
+        assert "Set 1 env var" not in result.output

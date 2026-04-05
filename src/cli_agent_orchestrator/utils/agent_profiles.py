@@ -9,6 +9,7 @@ import frontmatter
 
 from cli_agent_orchestrator.constants import LOCAL_AGENT_STORE_DIR, PROVIDERS
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
+from cli_agent_orchestrator.utils.env import resolve_env_vars
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +123,7 @@ def list_agent_profiles() -> List[Dict]:
 
 def _try_load_from_path(profile_path: Path, profile_name: str) -> AgentProfile:
     """Load an AgentProfile from a .md file path."""
-    profile_data = frontmatter.loads(profile_path.read_text())
+    profile_data = frontmatter.loads(resolve_env_vars(profile_path.read_text()))
     meta = profile_data.metadata
     meta["system_prompt"] = profile_data.content.strip()
     # Fill in required fields if missing (Kiro profiles don't have frontmatter)
@@ -188,7 +189,7 @@ def load_agent_profile(agent_name: str) -> AgentProfile:
         if not profile_file.is_file():
             raise FileNotFoundError(f"Agent profile not found: {agent_name}")
 
-        profile_data = frontmatter.loads(profile_file.read_text())
+        profile_data = frontmatter.loads(resolve_env_vars(profile_file.read_text()))
         meta = profile_data.metadata
         meta["system_prompt"] = profile_data.content.strip()
         if "name" not in meta:
