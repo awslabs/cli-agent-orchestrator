@@ -111,6 +111,17 @@ def test_unset_env_var_removes_key(tmp_path, monkeypatch):
     assert env_utils.load_env_vars() == {"BASE_URL": "http://localhost"}
 
 
+def test_unset_env_var_noop_when_key_not_in_file(tmp_path, monkeypatch):
+    """Unsetting a nonexistent key from an existing file should not raise."""
+    env_file = tmp_path / ".env"
+    env_file.write_text("OTHER_KEY=value\n")
+    monkeypatch.setattr(env_utils, "CAO_ENV_FILE", env_file)
+
+    env_utils.unset_env_var("MISSING_KEY")
+
+    assert env_utils.load_env_vars() == {"OTHER_KEY": "value"}
+
+
 def test_list_env_vars_returns_current_contents(tmp_path, monkeypatch):
     """list_env_vars is a semantic alias for loading current env values."""
     env_file = tmp_path / ".env"

@@ -69,6 +69,10 @@ def _parse_env_assignment(env_assignment: str) -> tuple[str, str]:
         )
 
     key, value = env_assignment.split("=", 1)
+    if not key:
+        raise click.BadParameter(
+            f"Invalid env var '{env_assignment}'. Key must not be empty.", param_hint="--env"
+        )
     return key, value
 
 

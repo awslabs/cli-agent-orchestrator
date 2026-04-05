@@ -574,6 +574,18 @@ class TestInstallCommandEnvFlags:
         assert "Expected format KEY=VALUE" in result.output
         assert not install_paths["env_file"].exists()
 
+    def test_install_with_empty_env_key_returns_click_error(self, runner, install_paths):
+        """Assignments with an empty key should fail validation."""
+        profile_path = install_paths["local_store_dir"] / "test-agent.md"
+        self._write_profile(profile_path, "Token: ${API_TOKEN}")
+
+        result = runner.invoke(install, ["test-agent", "--env", "=value"])
+
+        assert result.exit_code == 2
+        assert "Invalid value for --env" in result.output
+        assert "Key must not be empty" in result.output
+        assert not install_paths["env_file"].exists()
+
     def test_install_without_env_does_not_modify_env_file(self, runner, install_paths):
         """Install should not create or update the env file when --env is omitted."""
         profile_path = install_paths["local_store_dir"] / "test-agent.md"
