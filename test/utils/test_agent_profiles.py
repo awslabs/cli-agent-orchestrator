@@ -510,13 +510,13 @@ class TestLoadAgentProfileEnvResolution:
     def _write_profile(profile_path: Path, body: str) -> None:
         profile_path.write_text(
             "---\n"
-            "name: obsidian-agent\n"
-            "description: Obsidian agent\n"
+            "name: service-agent\n"
+            "description: Service agent\n"
             "mcpServers:\n"
-            "  obsidian:\n"
-            "    command: obsidian-mcp\n"
+            "  service:\n"
+            "    command: service-mcp\n"
             "    env:\n"
-            "      OBSIDIAN_API_KEY: ${OBSIDIAN_API_KEY}\n"
+            "      API_TOKEN: ${API_TOKEN}\n"
             "      OPTIONAL_VALUE: ${OPTIONAL_VALUE}\n"
             "---\n"
             f"{body}\n"
@@ -531,21 +531,21 @@ class TestLoadAgentProfileEnvResolution:
         local_store_dir = tmp_path / "agent-store"
         local_store_dir.mkdir()
         env_file = tmp_path / ".env"
-        env_file.write_text("OBSIDIAN_API_KEY=resolved-secret\nOPTIONAL_VALUE=resolved-optional\n")
-        profile_path = local_store_dir / "obsidian-agent.md"
-        self._write_profile(profile_path, "Body token: ${OBSIDIAN_API_KEY}")
+        env_file.write_text("API_TOKEN=resolved-secret\nOPTIONAL_VALUE=resolved-optional\n")
+        profile_path = local_store_dir / "service-agent.md"
+        self._write_profile(profile_path, "Body token: ${API_TOKEN}")
 
         monkeypatch.setattr(
             "cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR", local_store_dir
         )
         monkeypatch.setattr("cli_agent_orchestrator.utils.env.CAO_ENV_FILE", env_file)
 
-        profile = load_agent_profile("obsidian-agent")
+        profile = load_agent_profile("service-agent")
 
         assert profile.system_prompt == "Body token: resolved-secret"
         assert profile.mcpServers is not None
-        assert profile.mcpServers["obsidian"]["env"] == {
-            "OBSIDIAN_API_KEY": "resolved-secret",
+        assert profile.mcpServers["service"]["env"] == {
+            "API_TOKEN": "resolved-secret",
             "OPTIONAL_VALUE": "resolved-optional",
         }
 
@@ -557,19 +557,19 @@ class TestLoadAgentProfileEnvResolution:
         """Missing vars should remain as placeholders without raising."""
         local_store_dir = tmp_path / "agent-store"
         local_store_dir.mkdir()
-        profile_path = local_store_dir / "obsidian-agent.md"
-        self._write_profile(profile_path, "Body token: ${OBSIDIAN_API_KEY}")
+        profile_path = local_store_dir / "service-agent.md"
+        self._write_profile(profile_path, "Body token: ${API_TOKEN}")
 
         monkeypatch.setattr(
             "cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR", local_store_dir
         )
         monkeypatch.setattr("cli_agent_orchestrator.utils.env.CAO_ENV_FILE", tmp_path / ".env")
 
-        profile = load_agent_profile("obsidian-agent")
+        profile = load_agent_profile("service-agent")
 
-        assert profile.system_prompt == "Body token: ${OBSIDIAN_API_KEY}"
+        assert profile.system_prompt == "Body token: ${API_TOKEN}"
         assert profile.mcpServers is not None
-        assert profile.mcpServers["obsidian"]["env"]["OBSIDIAN_API_KEY"] == "${OBSIDIAN_API_KEY}"
+        assert profile.mcpServers["service"]["env"]["API_TOKEN"] == "${API_TOKEN}"
 
     @patch("cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", return_value=[])
     @patch("cli_agent_orchestrator.services.settings_service.get_agent_dirs", return_value={})
@@ -605,9 +605,9 @@ class TestLoadAgentProfileEnvResolution:
         builtin_store_dir = tmp_path / "builtin-store"
         builtin_store_dir.mkdir()
         env_file = tmp_path / ".env"
-        env_file.write_text("OBSIDIAN_API_KEY=builtin-secret\n")
-        profile_path = builtin_store_dir / "obsidian-agent.md"
-        self._write_profile(profile_path, "Body token: ${OBSIDIAN_API_KEY}")
+        env_file.write_text("API_TOKEN=builtin-secret\n")
+        profile_path = builtin_store_dir / "service-agent.md"
+        self._write_profile(profile_path, "Body token: ${API_TOKEN}")
 
         mock_files.return_value = builtin_store_dir
         monkeypatch.setattr(
@@ -616,8 +616,8 @@ class TestLoadAgentProfileEnvResolution:
         )
         monkeypatch.setattr("cli_agent_orchestrator.utils.env.CAO_ENV_FILE", env_file)
 
-        profile = load_agent_profile("obsidian-agent")
+        profile = load_agent_profile("service-agent")
 
         assert profile.system_prompt == "Body token: builtin-secret"
         assert profile.mcpServers is not None
-        assert profile.mcpServers["obsidian"]["env"]["OBSIDIAN_API_KEY"] == "builtin-secret"
+        assert profile.mcpServers["service"]["env"]["API_TOKEN"] == "builtin-secret"

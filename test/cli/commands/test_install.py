@@ -208,6 +208,15 @@ class TestInstallCommand:
         assert "Error" in result.output
         assert "Failed to install agent" in result.output
 
+    def test_install_help_describes_env_workflow(self, runner):
+        """Help text should describe env file storage, ${VAR} syntax, and an example."""
+        result = runner.invoke(install, ["--help"])
+
+        assert result.exit_code == 0
+        assert "~/.aws/cli-agent-orchestrator/.env" in result.output
+        assert "${VAR}" in result.output
+        assert "API_TOKEN=my-secret-token" in result.output
+
     @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
     @patch("cli_agent_orchestrator.cli.commands.install.AGENT_CONTEXT_DIR")
     @patch("cli_agent_orchestrator.cli.commands.install.Q_AGENTS_DIR")
@@ -459,10 +468,10 @@ class TestInstallCommandEnvFlags:
             "name: test-agent\n"
             "description: Test agent\n"
             "mcpServers:\n"
-            "  obsidian:\n"
-            "    command: obsidian-mcp\n"
+            "  service:\n"
+            "    command: service-mcp\n"
             "    env:\n"
-            "      OBSIDIAN_API_KEY: ${OBSIDIAN_API_KEY}\n"
+            "      API_TOKEN: ${API_TOKEN}\n"
             "      BASE_URL: ${BASE_URL}\n"
             "      URL: ${URL}\n"
             "---\n"
@@ -474,7 +483,7 @@ class TestInstallCommandEnvFlags:
     ):
         """A single --env flag should persist and resolve before install output is written."""
         profile_path = install_paths["local_store_dir"] / "test-agent.md"
-        self._write_profile(profile_path, "Token: ${OBSIDIAN_API_KEY}")
+        self._write_profile(profile_path, "Token: ${API_TOKEN}")
 
         result = runner.invoke(
             install,
@@ -483,29 +492,26 @@ class TestInstallCommandEnvFlags:
                 "--provider",
                 "kiro_cli",
                 "--env",
-                "OBSIDIAN_API_KEY=secret-token",
+                "API_TOKEN=secret-token",
             ],
         )
 
         assert result.exit_code == 0
-        assert install_paths["env_file"].read_text() == "OBSIDIAN_API_KEY='secret-token'\n"
+        assert install_paths["env_file"].read_text() == "API_TOKEN='secret-token'\n"
         assert (install_paths["context_dir"] / "test-agent.md").read_text().find(
             "secret-token"
         ) != -1
-        assert (
-            "${OBSIDIAN_API_KEY}"
-            not in (install_paths["context_dir"] / "test-agent.md").read_text()
-        )
+        assert "${API_TOKEN}" not in (install_paths["context_dir"] / "test-agent.md").read_text()
         assert f"✓ Set 1 env var(s) in {install_paths['env_file']}" in result.output
 
         kiro_agent_file = install_paths["kiro_dir"] / "test-agent.json"
         kiro_config = json.loads(kiro_agent_file.read_text())
-        assert kiro_config["mcpServers"]["obsidian"]["env"]["OBSIDIAN_API_KEY"] == "secret-token"
+        assert kiro_config["mcpServers"]["service"]["env"]["API_TOKEN"] == "secret-token"
 
     def test_install_with_multiple_env_flags_writes_all_values(self, runner, install_paths):
         """Multiple --env flags should all be written before profile resolution."""
         profile_path = install_paths["local_store_dir"] / "test-agent.md"
-        self._write_profile(profile_path, "Token: ${OBSIDIAN_API_KEY}\nBase URL: ${BASE_URL}")
+        self._write_profile(profile_path, "Token: ${API_TOKEN}\nBase URL: ${BASE_URL}")
 
         result = runner.invoke(
             install,
@@ -514,7 +520,7 @@ class TestInstallCommandEnvFlags:
                 "--provider",
                 "kiro_cli",
                 "--env",
-                "OBSIDIAN_API_KEY=secret-token",
+                "API_TOKEN=secret-token",
                 "--env",
                 "BASE_URL=http://localhost:27124",
             ],
@@ -523,7 +529,7 @@ class TestInstallCommandEnvFlags:
         context_text = (install_paths["context_dir"] / "test-agent.md").read_text()
 
         assert result.exit_code == 0
-        assert "OBSIDIAN_API_KEY='secret-token'" in install_paths["env_file"].read_text()
+        assert "API_TOKEN='secret-token'" in install_paths["env_file"].read_text()
         assert "BASE_URL='http://localhost:27124'" in install_paths["env_file"].read_text()
         assert "Token: secret-token" in context_text
         assert "Base URL: http://localhost:27124" in context_text
@@ -554,12 +560,12 @@ class TestInstallCommandEnvFlags:
         assert result.exit_code == 0
         assert "URL='http://host?a=b'" in install_paths["env_file"].read_text()
         assert "URL: http://host?a=b" in context_text
-        assert q_config["mcpServers"]["obsidian"]["env"]["URL"] == "http://host?a=b"
+        assert q_config["mcpServers"]["service"]["env"]["URL"] == "http://host?a=b"
 
     def test_install_with_invalid_env_format_returns_click_error(self, runner, install_paths):
         """Assignments without '=' should fail validation with a user-friendly error."""
         profile_path = install_paths["local_store_dir"] / "test-agent.md"
-        self._write_profile(profile_path, "Token: ${OBSIDIAN_API_KEY}")
+        self._write_profile(profile_path, "Token: ${API_TOKEN}")
 
         result = runner.invoke(install, ["test-agent", "--env", "INVALID_FORMAT"])
 
@@ -580,3 +586,36 @@ class TestInstallCommandEnvFlags:
         assert result.exit_code == 0
         assert not install_paths["env_file"].exists()
         assert "Set 1 env var" not in result.output
+
+    def test_install_end_to_end_resolves_env_vars_from_preexisting_env_file(
+        self, runner, install_paths, tmp_path
+    ):
+        """Installing from a file path should resolve placeholders into the copied context file."""
+        install_paths["env_file"].write_text(
+            "API_TOKEN=integration-secret\nSERVICE_URL=http://127.0.0.1:27124\n"
+        )
+        source_profile = tmp_path / "service-agent.md"
+        source_profile.write_text(
+            "---\n"
+            "name: service-agent\n"
+            "description: Integration test profile\n"
+            "mcpServers:\n"
+            "  service:\n"
+            "    command: service-mcp\n"
+            "    env:\n"
+            "      API_TOKEN: ${API_TOKEN}\n"
+            "      SERVICE_URL: ${SERVICE_URL}\n"
+            "---\n"
+            "Use the service endpoint at ${SERVICE_URL}.\n"
+        )
+
+        result = runner.invoke(install, [str(source_profile), "--provider", "claude_code"])
+
+        installed_profile = install_paths["context_dir"] / "service-agent.md"
+        installed_text = installed_profile.read_text()
+
+        assert result.exit_code == 0
+        assert "integration-secret" in installed_text
+        assert "http://127.0.0.1:27124" in installed_text
+        assert "${API_TOKEN}" not in installed_text
+        assert "${SERVICE_URL}" not in installed_text

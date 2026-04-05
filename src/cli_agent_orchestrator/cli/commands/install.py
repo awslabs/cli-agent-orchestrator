@@ -84,7 +84,11 @@ def _parse_env_assignment(env_assignment: str) -> tuple[str, str]:
     "--env",
     "env_vars",
     multiple=True,
-    help="Set env vars before installing the agent (repeatable: --env KEY=VALUE).",
+    help=(
+        "Set env vars before installing the agent. Values are stored in "
+        "~/.aws/cli-agent-orchestrator/.env and can be referenced in profiles as ${VAR}. "
+        "Repeatable: --env KEY=VALUE. Example: --env API_TOKEN=my-secret-token."
+    ),
 )
 def install(agent_source: str, provider: str, env_vars: tuple[str, ...]):
     """
@@ -94,6 +98,17 @@ def install(agent_source: str, provider: str, env_vars: tuple[str, ...]):
     - Agent name (e.g., 'developer', 'code_supervisor')
     - File path (e.g., './my-agent.md', '/path/to/agent.md')
     - URL (e.g., 'https://example.com/agent.md')
+
+    Profiles can reference values from ~/.aws/cli-agent-orchestrator/.env using ${VAR}
+    placeholders in frontmatter or markdown content. Use `cao env set KEY VALUE` to
+    manage those values separately, or pass `--env KEY=VALUE` during install to write
+    them before the profile is loaded.
+
+    Example:
+    \b
+        cao install ./service-agent.md --provider claude_code \
+          --env API_TOKEN=my-secret-token \
+          --env SERVICE_URL=http://127.0.0.1:27124
     """
     try:
         # Detect source type and handle accordingly

@@ -2,6 +2,7 @@
 
 import click
 
+from cli_agent_orchestrator.cli.commands.env import env
 from cli_agent_orchestrator.cli.commands.flow import flow
 from cli_agent_orchestrator.cli.commands.info import info
 from cli_agent_orchestrator.cli.commands.init import init
@@ -22,6 +23,7 @@ cli.add_command(init)
 cli.add_command(install)
 cli.add_command(shutdown)
 cli.add_command(flow)
+cli.add_command(env)
 cli.add_command(mcp_server)
 cli.add_command(info)
 
