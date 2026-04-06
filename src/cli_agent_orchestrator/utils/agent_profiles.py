@@ -9,6 +9,7 @@ import frontmatter
 
 from cli_agent_orchestrator.constants import LOCAL_AGENT_STORE_DIR, PROVIDERS
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
+from cli_agent_orchestrator.utils.env import resolve_env_vars
 
 logger = logging.getLogger(__name__)
 
@@ -120,9 +121,9 @@ def list_agent_profiles() -> List[Dict]:
     return sorted(profiles.values(), key=lambda p: p["name"])
 
 
-def _try_load_from_path(profile_path: Path, profile_name: str) -> AgentProfile:
-    """Load an AgentProfile from a .md file path."""
-    profile_data = frontmatter.loads(profile_path.read_text())
+def parse_agent_profile_text(resolved_text: str, profile_name: str) -> AgentProfile:
+    """Parse an AgentProfile from already-resolved markdown text."""
+    profile_data = frontmatter.loads(resolved_text)
     meta = profile_data.metadata
     meta["system_prompt"] = profile_data.content.strip()
     # Fill in required fields if missing (Kiro profiles don't have frontmatter)
@@ -131,6 +132,11 @@ def _try_load_from_path(profile_path: Path, profile_name: str) -> AgentProfile:
     if "description" not in meta:
         meta["description"] = ""
     return AgentProfile(**meta)
+
+
+def _try_load_from_path(profile_path: Path, profile_name: str) -> AgentProfile:
+    """Load an AgentProfile from a .md file path."""
+    return parse_agent_profile_text(resolve_env_vars(profile_path.read_text()), profile_name)
 
 
 def load_agent_profile(agent_name: str) -> AgentProfile:
@@ -188,14 +194,7 @@ def load_agent_profile(agent_name: str) -> AgentProfile:
         if not profile_file.is_file():
             raise FileNotFoundError(f"Agent profile not found: {agent_name}")
 
-        profile_data = frontmatter.loads(profile_file.read_text())
-        meta = profile_data.metadata
-        meta["system_prompt"] = profile_data.content.strip()
-        if "name" not in meta:
-            meta["name"] = agent_name
-        if "description" not in meta:
-            meta["description"] = ""
-        return AgentProfile(**meta)
+        return parse_agent_profile_text(resolve_env_vars(profile_file.read_text()), agent_name)
 
     except FileNotFoundError:
         raise

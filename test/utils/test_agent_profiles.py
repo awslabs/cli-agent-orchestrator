@@ -501,3 +501,123 @@ class TestScanDirectory:
         # Should retain the original profile
         assert profiles["existing"]["description"] == "Original version"
         assert profiles["existing"]["source"] == "built-in"
+
+
+class TestLoadAgentProfileEnvResolution:
+    """Tests for env var resolution during agent profile loading."""
+
+    @staticmethod
+    def _write_profile(profile_path: Path, body: str) -> None:
+        profile_path.write_text(
+            "---\n"
+            "name: service-agent\n"
+            "description: Service agent\n"
+            "mcpServers:\n"
+            "  service:\n"
+            "    command: service-mcp\n"
+            "    env:\n"
+            "      API_TOKEN: ${API_TOKEN}\n"
+            "      OPTIONAL_VALUE: ${OPTIONAL_VALUE}\n"
+            "---\n"
+            f"{body}\n"
+        )
+
+    @patch("cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", return_value=[])
+    @patch("cli_agent_orchestrator.services.settings_service.get_agent_dirs", return_value={})
+    def test_load_agent_profile_resolves_vars_in_mcp_servers_and_body(
+        self, mock_get_agent_dirs, mock_get_extra_dirs, tmp_path, monkeypatch
+    ):
+        """Vars in frontmatter and body should resolve from the managed env file."""
+        local_store_dir = tmp_path / "agent-store"
+        local_store_dir.mkdir()
+        env_file = tmp_path / ".env"
+        env_file.write_text("API_TOKEN=resolved-secret\nOPTIONAL_VALUE=resolved-optional\n")
+        profile_path = local_store_dir / "service-agent.md"
+        self._write_profile(profile_path, "Body token: ${API_TOKEN}")
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR", local_store_dir
+        )
+        monkeypatch.setattr("cli_agent_orchestrator.utils.env.CAO_ENV_FILE", env_file)
+
+        profile = load_agent_profile("service-agent")
+
+        assert profile.system_prompt == "Body token: resolved-secret"
+        assert profile.mcpServers is not None
+        assert profile.mcpServers["service"]["env"] == {
+            "API_TOKEN": "resolved-secret",
+            "OPTIONAL_VALUE": "resolved-optional",
+        }
+
+    @patch("cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", return_value=[])
+    @patch("cli_agent_orchestrator.services.settings_service.get_agent_dirs", return_value={})
+    def test_load_agent_profile_leaves_missing_vars_intact(
+        self, mock_get_agent_dirs, mock_get_extra_dirs, tmp_path, monkeypatch
+    ):
+        """Missing vars should remain as placeholders without raising."""
+        local_store_dir = tmp_path / "agent-store"
+        local_store_dir.mkdir()
+        profile_path = local_store_dir / "service-agent.md"
+        self._write_profile(profile_path, "Body token: ${API_TOKEN}")
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR", local_store_dir
+        )
+        monkeypatch.setattr("cli_agent_orchestrator.utils.env.CAO_ENV_FILE", tmp_path / ".env")
+
+        profile = load_agent_profile("service-agent")
+
+        assert profile.system_prompt == "Body token: ${API_TOKEN}"
+        assert profile.mcpServers is not None
+        assert profile.mcpServers["service"]["env"]["API_TOKEN"] == "${API_TOKEN}"
+
+    @patch("cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", return_value=[])
+    @patch("cli_agent_orchestrator.services.settings_service.get_agent_dirs", return_value={})
+    def test_load_agent_profile_without_placeholders_matches_existing_behavior(
+        self, mock_get_agent_dirs, mock_get_extra_dirs, tmp_path, monkeypatch
+    ):
+        """Profiles without placeholders should load unchanged."""
+        local_store_dir = tmp_path / "agent-store"
+        local_store_dir.mkdir()
+        profile_path = local_store_dir / "plain-agent.md"
+        profile_path.write_text(
+            "---\nname: plain-agent\ndescription: Plain agent\n---\nPlain system prompt\n"
+        )
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR", local_store_dir
+        )
+        monkeypatch.setattr("cli_agent_orchestrator.utils.env.CAO_ENV_FILE", tmp_path / ".env")
+
+        profile = load_agent_profile("plain-agent")
+
+        assert profile.name == "plain-agent"
+        assert profile.description == "Plain agent"
+        assert profile.system_prompt == "Plain system prompt"
+
+    @patch("cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", return_value=[])
+    @patch("cli_agent_orchestrator.services.settings_service.get_agent_dirs", return_value={})
+    @patch("cli_agent_orchestrator.utils.agent_profiles.resources.files")
+    def test_load_agent_profile_builtin_store_fallback_resolves_vars(
+        self, mock_files, mock_get_agent_dirs, mock_get_extra_dirs, tmp_path, monkeypatch
+    ):
+        """Built-in store fallback should apply env resolution before parsing."""
+        builtin_store_dir = tmp_path / "builtin-store"
+        builtin_store_dir.mkdir()
+        env_file = tmp_path / ".env"
+        env_file.write_text("API_TOKEN=builtin-secret\n")
+        profile_path = builtin_store_dir / "service-agent.md"
+        self._write_profile(profile_path, "Body token: ${API_TOKEN}")
+
+        mock_files.return_value = builtin_store_dir
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR",
+            tmp_path / "missing-local-store",
+        )
+        monkeypatch.setattr("cli_agent_orchestrator.utils.env.CAO_ENV_FILE", env_file)
+
+        profile = load_agent_profile("service-agent")
+
+        assert profile.system_prompt == "Body token: builtin-secret"
+        assert profile.mcpServers is not None
+        assert profile.mcpServers["service"]["env"]["API_TOKEN"] == "builtin-secret"

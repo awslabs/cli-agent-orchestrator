@@ -16,6 +16,7 @@ dependencies = [
     "libtmux>=0.51.0",
     "aiofiles>=24.1.0",
     "click>=8.0.0",
+    "python-dotenv>=1.0.0",
     "python-frontmatter>=1.1.0",
     "watchdog==6.0.0",
     "requests>=2.32.0",
