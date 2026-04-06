@@ -611,6 +611,52 @@ class TestInstallCommandEnvFlags:
         assert not install_paths["env_file"].exists()
         assert "Set 1 env var" not in result.output
 
+    def test_install_warns_about_unresolved_env_vars(self, runner, install_paths):
+        """Unresolved ${VAR} placeholders should trigger a stderr warning."""
+        profile_path = install_paths["local_store_dir"] / "test-agent.md"
+        self._write_profile(profile_path, "Token: ${API_TOKEN}")
+
+        result = runner.invoke(
+            install,
+            ["test-agent", "--provider", "kiro_cli", "--env", "API_TOKEN=secret"],
+        )
+
+        assert result.exit_code == 0
+        # API_TOKEN is set, but BASE_URL and URL are not
+        assert "Unresolved env var(s)" in result.output
+        assert "BASE_URL" in result.output
+        assert "URL" in result.output
+        assert "API_TOKEN" not in result.output.split("Unresolved")[1]
+
+    def test_install_no_warning_when_all_env_vars_resolved(self, runner, install_paths):
+        """No warning when every placeholder has a value in .env."""
+        profile_path = install_paths["local_store_dir"] / "test-agent.md"
+        profile_path.write_text(
+            "---\nname: test-agent\ndescription: Test agent\n"
+            "mcpServers:\n  svc:\n    command: svc\n    env:\n"
+            "      KEY: ${KEY}\n---\nPrompt\n"
+        )
+
+        result = runner.invoke(
+            install,
+            ["test-agent", "--provider", "kiro_cli", "--env", "KEY=value"],
+        )
+
+        assert result.exit_code == 0
+        assert "Unresolved" not in result.output
+
+    def test_install_no_warning_when_profile_has_no_placeholders(self, runner, install_paths):
+        """Profiles without any ${VAR} syntax should not trigger a warning."""
+        profile_path = install_paths["local_store_dir"] / "test-agent.md"
+        profile_path.write_text(
+            "---\nname: test-agent\ndescription: Test agent\n---\nPlain prompt\n"
+        )
+
+        result = runner.invoke(install, ["test-agent", "--provider", "kiro_cli"])
+
+        assert result.exit_code == 0
+        assert "Unresolved" not in result.output
+
     def test_install_end_to_end_keeps_placeholders_in_context_file(
         self, runner, install_paths, tmp_path
     ):

@@ -1,5 +1,6 @@
 """Install command for CLI Agent Orchestrator."""
 
+import re
 from importlib import resources
 from pathlib import Path
 
@@ -142,7 +143,18 @@ def install(agent_source: str, provider: str, env_vars: tuple[str, ...]):
 
         # Read source once; resolve for in-memory profile, keep raw for context file
         raw_content = source_file.read_text()
-        profile = parse_agent_profile_text(resolve_env_vars(raw_content), agent_name)
+        resolved_content = resolve_env_vars(raw_content)
+        profile = parse_agent_profile_text(resolved_content, agent_name)
+
+        # Warn about unresolved placeholders that will leak into provider configs
+        unresolved = set(re.findall(r"\$\{(\w+)\}", resolved_content))
+        if unresolved:
+            names = ", ".join(sorted(unresolved))
+            click.echo(
+                f"⚠ Unresolved env var(s) in profile: {names}. "
+                f"Set them with `cao env set` or pass --env KEY=VALUE.",
+                err=True,
+            )
 
         # Write unresolved source to agent-context (secrets stay in .env)
         AGENT_CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
