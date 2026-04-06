@@ -140,14 +140,14 @@ def install(agent_source: str, provider: str, env_vars: tuple[str, ...]):
             agent_store = resources.files("cli_agent_orchestrator.agent_store")
             source_file = agent_store / f"{agent_name}.md"
 
-        # Read and resolve env vars once — reuse for both profile parsing and context file
-        resolved_content = resolve_env_vars(source_file.read_text())
-        profile = parse_agent_profile_text(resolved_content, agent_name)
+        # Read source once; resolve for in-memory profile, keep raw for context file
+        raw_content = source_file.read_text()
+        profile = parse_agent_profile_text(resolve_env_vars(raw_content), agent_name)
 
-        # Write resolved content to agent-context directory
+        # Write unresolved source to agent-context (secrets stay in .env)
         AGENT_CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
         dest_file = AGENT_CONTEXT_DIR / f"{profile.name}.md"
-        dest_file.write_text(resolved_content)
+        dest_file.write_text(raw_content)
 
         # Resolve allowedTools from profile → role defaults → developer defaults
         from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools

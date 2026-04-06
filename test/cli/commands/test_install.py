@@ -485,10 +485,10 @@ class TestInstallCommandEnvFlags:
             f"{body}\n"
         )
 
-    def test_install_with_env_writes_env_file_and_resolves_installed_profile(
+    def test_install_with_env_writes_env_file_and_resolves_provider_config(
         self, runner, install_paths
     ):
-        """A single --env flag should persist and resolve before install output is written."""
+        """--env should persist to .env, resolve in provider config, but NOT in context file."""
         profile_path = install_paths["local_store_dir"] / "test-agent.md"
         self._write_profile(profile_path, "Token: ${API_TOKEN}")
 
@@ -505,12 +505,14 @@ class TestInstallCommandEnvFlags:
 
         assert result.exit_code == 0
         assert install_paths["env_file"].read_text() == "API_TOKEN='secret-token'\n"
-        assert (install_paths["context_dir"] / "test-agent.md").read_text().find(
-            "secret-token"
-        ) != -1
-        assert "${API_TOKEN}" not in (install_paths["context_dir"] / "test-agent.md").read_text()
         assert f"✓ Set 1 env var(s) in {install_paths['env_file']}" in result.output
 
+        # Context file keeps placeholders (secrets stay in .env)
+        context_text = (install_paths["context_dir"] / "test-agent.md").read_text()
+        assert "${API_TOKEN}" in context_text
+        assert "secret-token" not in context_text
+
+        # Provider config has resolved values (Kiro can't read .env)
         kiro_agent_file = install_paths["kiro_dir"] / "test-agent.json"
         kiro_config = json.loads(kiro_agent_file.read_text())
         assert kiro_config["mcpServers"]["service"]["env"]["API_TOKEN"] == "secret-token"
@@ -538,8 +540,9 @@ class TestInstallCommandEnvFlags:
         assert result.exit_code == 0
         assert "API_TOKEN='secret-token'" in install_paths["env_file"].read_text()
         assert "BASE_URL='http://localhost:27124'" in install_paths["env_file"].read_text()
-        assert "Token: secret-token" in context_text
-        assert "Base URL: http://localhost:27124" in context_text
+        # Context file keeps placeholders
+        assert "${API_TOKEN}" in context_text
+        assert "${BASE_URL}" in context_text
         assert f"✓ Set 2 env var(s) in {install_paths['env_file']}" in result.output
 
     def test_install_with_env_value_containing_equals_preserves_full_value(
@@ -566,7 +569,9 @@ class TestInstallCommandEnvFlags:
 
         assert result.exit_code == 0
         assert "URL='http://host?a=b'" in install_paths["env_file"].read_text()
-        assert "URL: http://host?a=b" in context_text
+        # Context file keeps placeholder
+        assert "${URL}" in context_text
+        # Provider config has resolved value
         assert q_config["mcpServers"]["service"]["env"]["URL"] == "http://host?a=b"
 
     def test_install_with_invalid_env_format_returns_click_error(self, runner, install_paths):
@@ -606,10 +611,10 @@ class TestInstallCommandEnvFlags:
         assert not install_paths["env_file"].exists()
         assert "Set 1 env var" not in result.output
 
-    def test_install_end_to_end_resolves_env_vars_from_preexisting_env_file(
+    def test_install_end_to_end_keeps_placeholders_in_context_file(
         self, runner, install_paths, tmp_path
     ):
-        """Installing from a file path should resolve placeholders into the copied context file."""
+        """Context file should preserve ${VAR} placeholders; secrets stay in .env."""
         install_paths["env_file"].write_text(
             "API_TOKEN=integration-secret\nSERVICE_URL=http://127.0.0.1:27124\n"
         )
@@ -634,7 +639,6 @@ class TestInstallCommandEnvFlags:
         installed_text = installed_profile.read_text()
 
         assert result.exit_code == 0
-        assert "integration-secret" in installed_text
-        assert "http://127.0.0.1:27124" in installed_text
-        assert "${API_TOKEN}" not in installed_text
-        assert "${SERVICE_URL}" not in installed_text
+        assert "${API_TOKEN}" in installed_text
+        assert "${SERVICE_URL}" in installed_text
+        assert "integration-secret" not in installed_text
