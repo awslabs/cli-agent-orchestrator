@@ -24,7 +24,8 @@ def resolve_env_vars(raw_text: str) -> str:
 def set_env_var(key: str, value: str) -> None:
     """Create or update a managed environment variable."""
     CAO_ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
-    CAO_ENV_FILE.touch(exist_ok=True)
+    if not CAO_ENV_FILE.exists():
+        CAO_ENV_FILE.touch(mode=0o600, exist_ok=True)
     set_key(str(CAO_ENV_FILE), key, value)
 
 

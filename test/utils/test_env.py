@@ -89,6 +89,16 @@ def test_set_env_var_creates_file_when_missing(tmp_path, monkeypatch):
     assert env_utils.load_env_vars() == {"API_KEY": "secret"}
 
 
+def test_set_env_var_creates_file_with_owner_only_permissions(tmp_path, monkeypatch):
+    """Newly created env files must be owner-readable/writable only (0600)."""
+    env_file = tmp_path / ".env"
+    monkeypatch.setattr(env_utils, "CAO_ENV_FILE", env_file)
+
+    env_utils.set_env_var("SECRET", "value")
+
+    assert env_file.stat().st_mode & 0o777 == 0o600
+
+
 def test_set_env_var_updates_existing_key(tmp_path, monkeypatch):
     """set_env_var should overwrite existing keys."""
     env_file = tmp_path / ".env"
