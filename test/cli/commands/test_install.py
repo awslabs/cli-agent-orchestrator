@@ -107,7 +107,7 @@ class TestInstallCommand:
         profile.model = None
         return profile
 
-    @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
+    @patch("cli_agent_orchestrator.cli.commands.install.parse_agent_profile_text")
     @patch("cli_agent_orchestrator.cli.commands.install.AGENT_CONTEXT_DIR")
     @patch("cli_agent_orchestrator.cli.commands.install.KIRO_AGENTS_DIR")
     @patch("cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR")
@@ -149,10 +149,10 @@ class TestInstallCommand:
                 result = runner.invoke(install, ["test-agent", "--provider", "kiro_cli"])
 
                 # Should not fail (may have issues with file writes in test env)
-                mock_load.assert_called_once_with("test-agent")
+                mock_load.assert_called_once()
 
     @patch("cli_agent_orchestrator.cli.commands.install._download_agent")
-    @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
+    @patch("cli_agent_orchestrator.cli.commands.install.parse_agent_profile_text")
     def test_install_from_url(self, mock_load, mock_download, runner, mock_agent_profile):
         """Test installing agent from URL."""
         mock_download.return_value = "downloaded-agent"
@@ -164,7 +164,7 @@ class TestInstallCommand:
 
     @patch("cli_agent_orchestrator.cli.commands.install.Path")
     @patch("cli_agent_orchestrator.cli.commands.install._download_agent")
-    @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
+    @patch("cli_agent_orchestrator.cli.commands.install.parse_agent_profile_text")
     def test_install_from_file_path(
         self, mock_load, mock_download, mock_path, runner, mock_agent_profile
     ):
@@ -198,15 +198,22 @@ class TestInstallCommand:
         assert "Error" in result.output
         assert "Failed to download agent" in result.output
 
-    @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
-    def test_install_general_error(self, mock_load, runner):
+    @patch("cli_agent_orchestrator.cli.commands.install.parse_agent_profile_text")
+    @patch("cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR")
+    def test_install_general_error(self, mock_local_store, mock_parse, runner):
         """Test installing agent with general error."""
-        mock_load.side_effect = Exception("Unexpected error")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            local_path = tmppath / "local"
+            local_path.mkdir(parents=True, exist_ok=True)
+            (local_path / "test-agent.md").write_text("# Test")
+            mock_local_store.__truediv__ = lambda self, x: local_path / x
+            mock_parse.side_effect = Exception("Unexpected error")
 
-        result = runner.invoke(install, ["test-agent"])
+            result = runner.invoke(install, ["test-agent"])
 
-        assert "Error" in result.output
-        assert "Failed to install agent" in result.output
+            assert "Error" in result.output
+            assert "Failed to install agent" in result.output
 
     def test_install_help_describes_env_workflow(self, runner):
         """Help text should describe env file storage, ${VAR} syntax, and an example."""
@@ -217,7 +224,7 @@ class TestInstallCommand:
         assert "${VAR}" in result.output
         assert "API_TOKEN=my-secret-token" in result.output
 
-    @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
+    @patch("cli_agent_orchestrator.cli.commands.install.parse_agent_profile_text")
     @patch("cli_agent_orchestrator.cli.commands.install.AGENT_CONTEXT_DIR")
     @patch("cli_agent_orchestrator.cli.commands.install.Q_AGENTS_DIR")
     @patch("cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR")
@@ -247,9 +254,9 @@ class TestInstallCommand:
 
             result = runner.invoke(install, ["test-agent", "--provider", "q_cli"])
 
-            mock_load.assert_called_once_with("test-agent")
+            mock_load.assert_called_once()
 
-    @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
+    @patch("cli_agent_orchestrator.cli.commands.install.parse_agent_profile_text")
     @patch("cli_agent_orchestrator.cli.commands.install.AGENT_CONTEXT_DIR")
     @patch("cli_agent_orchestrator.cli.commands.install.KIRO_AGENTS_DIR")
     @patch("cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR")
@@ -291,9 +298,9 @@ class TestInstallCommand:
 
             result = runner.invoke(install, ["test-agent", "--provider", "kiro_cli"])
 
-            mock_load.assert_called_once_with("test-agent")
+            mock_load.assert_called_once()
 
-    @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
+    @patch("cli_agent_orchestrator.cli.commands.install.parse_agent_profile_text")
     @patch("cli_agent_orchestrator.cli.commands.install.AGENT_CONTEXT_DIR")
     @patch("cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR")
     def test_install_without_provider_specific_config(
@@ -320,7 +327,7 @@ class TestInstallCommand:
 
             assert "installed successfully" in result.output
 
-    @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
+    @patch("cli_agent_orchestrator.cli.commands.install.parse_agent_profile_text")
     @patch("cli_agent_orchestrator.cli.commands.install.AGENT_CONTEXT_DIR")
     @patch("cli_agent_orchestrator.cli.commands.install.COPILOT_AGENTS_DIR")
     @patch("cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR")
@@ -367,7 +374,7 @@ class TestInstallCommand:
             assert post.metadata["description"] == "Test agent description"
             assert "Test system prompt" in post.content
 
-    @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
+    @patch("cli_agent_orchestrator.cli.commands.install.parse_agent_profile_text")
     @patch("cli_agent_orchestrator.cli.commands.install.AGENT_CONTEXT_DIR")
     @patch("cli_agent_orchestrator.cli.commands.install.COPILOT_AGENTS_DIR")
     @patch("cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR")

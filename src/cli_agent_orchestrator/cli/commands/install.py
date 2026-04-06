@@ -21,7 +21,7 @@ from cli_agent_orchestrator.models.copilot_agent import CopilotAgentConfig
 from cli_agent_orchestrator.models.kiro_agent import KiroAgentConfig
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.q_agent import QAgentConfig
-from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.agent_profiles import parse_agent_profile_text
 from cli_agent_orchestrator.utils.env import resolve_env_vars, set_env_var
 
 
@@ -132,13 +132,7 @@ def install(agent_source: str, provider: str, env_vars: tuple[str, ...]):
             key, value = _parse_env_assignment(env_assignment)
             set_env_var(key, value)
 
-        # Load agent profile using existing Pydantic parser
-        profile = load_agent_profile(agent_name)
-
-        # Ensure directories exist
-        AGENT_CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
-
-        # Determine source for context file
+        # Determine source file for the agent profile
         local_profile = LOCAL_AGENT_STORE_DIR / f"{agent_name}.md"
         if local_profile.exists():
             source_file = local_profile
@@ -146,9 +140,14 @@ def install(agent_source: str, provider: str, env_vars: tuple[str, ...]):
             agent_store = resources.files("cli_agent_orchestrator.agent_store")
             source_file = agent_store / f"{agent_name}.md"
 
-        # Copy markdown file to agent-context directory
+        # Read and resolve env vars once — reuse for both profile parsing and context file
+        resolved_content = resolve_env_vars(source_file.read_text())
+        profile = parse_agent_profile_text(resolved_content, agent_name)
+
+        # Write resolved content to agent-context directory
+        AGENT_CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
         dest_file = AGENT_CONTEXT_DIR / f"{profile.name}.md"
-        dest_file.write_text(resolve_env_vars(source_file.read_text()))
+        dest_file.write_text(resolved_content)
 
         # Resolve allowedTools from profile → role defaults → developer defaults
         from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
