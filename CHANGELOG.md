@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Kiro CLI new TUI support** — Add fallback detection patterns for the new Kiro CLI TUI prompt format (`ask a question, or describe a task`), ensuring CAO works even if `--legacy-ui` is removed in a future version
 - **Agent profile exception handling (#137)** — Fix `load_agent_profile()` wrapping `FileNotFoundError` as `RuntimeError`, which caused `assign()` to fail for JSON-only agent profiles (AIM-installed kiro-cli agents). Callers now receive `FileNotFoundError` directly and handle it gracefully
+- **Missing providers in Web UI (#157)** — Add `gemini_cli`, `kimi_cli`, and `copilot_cli` to the `/agents/providers` endpoint and frontend fallback list so all 7 providers appear in the Web UI dropdown
 
 ## [2.0.0] - 2026-03-28
 
