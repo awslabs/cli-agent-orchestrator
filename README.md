@@ -511,6 +511,35 @@ cao launch --agents code_supervisor --yolo           # Unrestricted access (WARN
 
 For the full reference — roles, tool vocabulary, custom roles, launch prompts, provider enforcement, and known limitations — see [docs/tool-restrictions.md](docs/tool-restrictions.md).
 
+## Skills
+
+Skills are portable, structured guides (following the universal [SKILL.md](https://github.com/anthropics/skills) format) that encode domain knowledge for AI agents. They work across AI coding assistants (Claude Code, Kiro CLI, Gemini CLI, Codex CLI, Kimi CLI, GitHub Copilot, Cursor, OpenCode, LobeHub), agent frameworks ([Strands Agents SDK](https://strandsagents.com/docs/user-guide/concepts/plugins/skills/), [Microsoft Agent Framework](https://devblogs.microsoft.com/agent-framework/give-your-agents-domain-expertise-with-agent-skills-in-microsoft-agent-framework/)), and other tools that support the SKILL.md format — allowing any agent to follow the same expert playbook regardless of provider.
+
+CAO includes the following built-in skills:
+
+| Skill | Description |
+|-------|-------------|
+| **[cao-provider](skills/cao-provider/SKILL.md)** | Scaffold a new CLI agent provider for CAO. Guides through the full implementation: ProviderType enum, provider class with regex patterns and status detection, ProviderManager registration, tool restriction wiring, unit/e2e tests, and documentation. Includes 20 lessons learnt from building 7 existing providers. |
+
+### Loading Skills
+
+Each AI coding tool loads skills from a different location. Copy or symlink the skill directory to the appropriate path for your tool:
+
+| Tool | Skill Location | Command |
+|------|---------------|---------|
+| **Claude Code** | `.claude/skills/` | `cp -r skills/cao-provider .claude/skills/` |
+| **Kiro CLI** | `.kiro/skills/` | `cp -r skills/cao-provider .kiro/skills/` |
+| **Amazon Q CLI** | `.amazonq/skills/` | `cp -r skills/cao-provider .amazonq/skills/` |
+| **Other tools** | Check your tool's docs for skill/prompt loading conventions |
+
+Then ask your AI coding assistant to create a new provider:
+
+```
+> I want to add support for Aider CLI as a new CAO provider
+```
+
+The assistant will follow the skill's step-by-step guide, reference the provider template, and apply lessons learnt from existing providers.
+
 ## Security
 
 The server is designed for **localhost-only use**. The WebSocket terminal endpoint (`/terminals/{id}/ws`) provides full PTY access and will reject connections from non-loopback addresses. Do not expose the server to untrusted networks without adding authentication.
