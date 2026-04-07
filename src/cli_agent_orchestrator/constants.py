@@ -42,6 +42,9 @@ TMUX_HISTORY_LINES = 200
 # Base directory for all CAO data (~/.aws/cli-agent-orchestrator)
 CAO_HOME_DIR = Path.home() / ".aws" / "cli-agent-orchestrator"
 
+# Managed environment variable file
+CAO_ENV_FILE = CAO_HOME_DIR / ".env"
+
 # SQLite database directory
 DB_DIR = CAO_HOME_DIR / "db"
 

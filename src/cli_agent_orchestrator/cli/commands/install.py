@@ -1,14 +1,16 @@
 """Install command for CLI Agent Orchestrator."""
 
+import re
 from importlib import resources
 from pathlib import Path
 
 import click
 import frontmatter
-import requests
+import requests  # type: ignore[import-untyped]
 
 from cli_agent_orchestrator.constants import (
     AGENT_CONTEXT_DIR,
+    CAO_ENV_FILE,
     COPILOT_AGENTS_DIR,
     DEFAULT_PROVIDER,
     KIRO_AGENTS_DIR,
@@ -20,7 +22,8 @@ from cli_agent_orchestrator.models.copilot_agent import CopilotAgentConfig
 from cli_agent_orchestrator.models.kiro_agent import KiroAgentConfig
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.q_agent import QAgentConfig
-from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.agent_profiles import parse_agent_profile_text
+from cli_agent_orchestrator.utils.env import resolve_env_vars, set_env_var
 
 
 def _download_agent(source: str) -> str:
@@ -59,6 +62,21 @@ def _download_agent(source: str) -> str:
     raise FileNotFoundError(f"Source not found: {source}")
 
 
+def _parse_env_assignment(env_assignment: str) -> tuple[str, str]:
+    """Parse a ``KEY=VALUE`` env assignment for install-time injection."""
+    if "=" not in env_assignment:
+        raise click.BadParameter(
+            f"Invalid env var '{env_assignment}'. Expected format KEY=VALUE.", param_hint="--env"
+        )
+
+    key, value = env_assignment.split("=", 1)
+    if not key:
+        raise click.BadParameter(
+            f"Invalid env var '{env_assignment}'. Key must not be empty.", param_hint="--env"
+        )
+    return key, value
+
+
 @click.command()
 @click.argument("agent_source")
 @click.option(
@@ -67,7 +85,17 @@ def _download_agent(source: str) -> str:
     default=DEFAULT_PROVIDER,
     help=f"Provider to use (default: {DEFAULT_PROVIDER})",
 )
-def install(agent_source: str, provider: str):
+@click.option(
+    "--env",
+    "env_vars",
+    multiple=True,
+    help=(
+        "Set env vars before installing the agent. Values are stored in "
+        "~/.aws/cli-agent-orchestrator/.env and can be referenced in profiles as ${VAR}. "
+        "Repeatable: --env KEY=VALUE. Example: --env API_TOKEN=my-secret-token."
+    ),
+)
+def install(agent_source: str, provider: str, env_vars: tuple[str, ...]):
     """
     Install an agent from local store, built-in store, URL, or file path.
 
@@ -75,6 +103,17 @@ def install(agent_source: str, provider: str):
     - Agent name (e.g., 'developer', 'code_supervisor')
     - File path (e.g., './my-agent.md', '/path/to/agent.md')
     - URL (e.g., 'https://example.com/agent.md')
+
+    Profiles can reference values from ~/.aws/cli-agent-orchestrator/.env using ${VAR}
+    placeholders in frontmatter or markdown content. Use `cao env set KEY VALUE` to
+    manage those values separately, or pass `--env KEY=VALUE` during install to write
+    them before the profile is loaded.
+
+    Example:
+    \b
+        cao install ./service-agent.md --provider claude_code \
+          --env API_TOKEN=my-secret-token \
+          --env SERVICE_URL=http://127.0.0.1:27124
     """
     try:
         # Detect source type and handle accordingly
@@ -90,13 +129,11 @@ def install(agent_source: str, provider: str):
             # Treat as agent name
             agent_name = agent_source
 
-        # Load agent profile using existing Pydantic parser
-        profile = load_agent_profile(agent_name)
+        for env_assignment in env_vars:
+            key, value = _parse_env_assignment(env_assignment)
+            set_env_var(key, value)
 
-        # Ensure directories exist
-        AGENT_CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
-
-        # Determine source for context file
+        # Determine source file for the agent profile
         local_profile = LOCAL_AGENT_STORE_DIR / f"{agent_name}.md"
         if local_profile.exists():
             source_file = local_profile
@@ -104,10 +141,25 @@ def install(agent_source: str, provider: str):
             agent_store = resources.files("cli_agent_orchestrator.agent_store")
             source_file = agent_store / f"{agent_name}.md"
 
-        # Copy markdown file to agent-context directory
+        # Read source once; resolve for in-memory profile, keep raw for context file
+        raw_content = source_file.read_text()
+        resolved_content = resolve_env_vars(raw_content)
+        profile = parse_agent_profile_text(resolved_content, agent_name)
+
+        # Warn about unresolved placeholders that will leak into provider configs
+        unresolved = set(re.findall(r"\$\{(\w+)\}", resolved_content))
+        if unresolved:
+            names = ", ".join(sorted(unresolved))
+            click.echo(
+                f"⚠ Unresolved env var(s) in profile: {names}. "
+                f"Set them with `cao env set` or pass --env KEY=VALUE.",
+                err=True,
+            )
+
+        # Write unresolved source to agent-context (secrets stay in .env)
+        AGENT_CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
         dest_file = AGENT_CONTEXT_DIR / f"{profile.name}.md"
-        with open(source_file, "r") as src:
-            dest_file.write_text(src.read())
+        dest_file.write_text(raw_content)
 
         # Resolve allowedTools from profile → role defaults → developer defaults
         from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
@@ -159,7 +211,9 @@ def install(agent_source: str, provider: str):
 
         elif provider == ProviderType.COPILOT_CLI.value:
             COPILOT_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
-            prompt = (profile.system_prompt or "").strip() or (profile.prompt or "").strip()
+            system_prompt = profile.system_prompt.strip() if profile.system_prompt else ""
+            fallback_prompt = profile.prompt.strip() if profile.prompt else ""
+            prompt = system_prompt or fallback_prompt
             if not prompt:
                 raise ValueError(
                     f"Agent '{profile.name}' has no usable prompt content for Copilot "
@@ -174,17 +228,21 @@ def install(agent_source: str, provider: str):
                 prompt=prompt,
             )
             agent_post = frontmatter.Post(
-                agent_config.prompt.rstrip(),
+                prompt.rstrip(),
                 name=agent_config.name,
                 description=agent_config.description,
             )
             agent_file.write_text(frontmatter.dumps(agent_post), encoding="utf-8")
 
         click.echo(f"✓ Agent '{profile.name}' installed successfully")
+        if env_vars:
+            click.echo(f"✓ Set {len(env_vars)} env var(s) in {CAO_ENV_FILE}")
         click.echo(f"✓ Context file: {dest_file}")
         if agent_file:
             click.echo(f"✓ {provider} agent: {agent_file}")
 
+    except click.BadParameter:
+        raise
     except FileNotFoundError as e:
         click.echo(f"Error: {e}", err=True)
         return
