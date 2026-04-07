@@ -135,15 +135,16 @@ A warning is still displayed so you know what's happening:
 
 ## Launch Confirmation Prompt
 
-When you run `cao launch` without `--yolo`, CAO shows a summary of the resolved tool restrictions and asks for confirmation:
+When you run `cao launch` without `--yolo` or `--auto-approve`, CAO shows a summary of the resolved tool restrictions and asks for confirmation:
 
 ```
 Agent 'code_supervisor' launching on kiro_cli:
-  Allowed:  @cao-mcp-server, fs_read, fs_list
-  Blocked:  Bash, Edit, Write
+  Role:      supervisor
+  Allowed:   @cao-mcp-server, fs_read, fs_list
   Directory: /home/user/my-project
 
-  To grant all permissions, re-run with --yolo.
+  To skip this prompt next time, relaunch with --auto-approve
+  To remove all restrictions, relaunch with --yolo
 
 Proceed? [Y/n]
 ```
@@ -152,30 +153,50 @@ If no `role` or `allowedTools` is set in the profile, the prompt includes an add
 
 ```
 Agent 'my_agent' launching on claude_code:
-  Allowed:  @builtin, fs_*, execute_bash, @cao-mcp-server
-  Blocked:  (none)
+  Role:      (not set — using developer defaults)
+  Allowed:   @builtin, fs_*, execute_bash, @cao-mcp-server
   Directory: /home/user/my-project
 
   Note: No role or allowedTools set — defaulting to 'developer'.
   Add 'role' or 'allowedTools' to your agent profile to control tool access.
   Docs: https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/tool-restrictions.md
 
-  To grant all permissions, re-run with --yolo.
+  To skip this prompt next time, relaunch with --auto-approve
+  To remove all restrictions, relaunch with --yolo
 
 Proceed? [Y/n]
 ```
 
-### Confirmation vs `--yolo`
+### `--auto-approve` vs `--yolo`
 
-Answering **Y** to the confirmation prompt is **not** the same as `--yolo`:
+| | `Y` at prompt | `--auto-approve` | `--yolo` |
+|---|---|---|---|
+| **Confirmation prompt** | Shown | Skipped | Skipped |
+| **Tool restrictions** | Enforced | Enforced | Removed — `["*"]` |
+| **Use case** | Interactive launch | Automated flows, scripts, agent-to-agent | Unrestricted access |
 
-| | Confirmation → Y | `--yolo` |
-|---|---|---|
-| **Tool restrictions** | Still enforced — agent is limited to the tools shown in "Allowed" | Removed — agent gets `["*"]` (all tools) |
-| **Blocked tools** | Still blocked — agent cannot use tools shown in "Blocked" | Nothing is blocked |
-| **What it means** | "I've reviewed these restrictions and want to proceed" | "Give the agent unrestricted access, no questions asked" |
+```bash
+cao launch --agents my_agent                  # interactive — shows prompt
+cao launch --agents my_agent --auto-approve   # automated — skips prompt, keeps restrictions
+cao launch --agents my_agent --yolo           # unrestricted — skips prompt AND removes restrictions
+```
 
-The confirmation prompt is a **review gate** — it shows you exactly what the agent can and cannot do, then lets you proceed or cancel. The restrictions listed in the summary are still enforced after you confirm. `--yolo` both **removes all restrictions** and **skips the review gate entirely**.
+The confirmation prompt is a **review gate** — it shows the resolved role and allowed tools, then lets you proceed or cancel. `--auto-approve` skips this gate while keeping all restrictions enforced — useful for CAO flows, scripted launches, and agent-to-agent workflows. `--yolo` sits at the top of the override hierarchy — it **overrides both role and allowedTools**, grants unrestricted access (`["*"]`), and skips the prompt entirely.
+
+### How Tool Restrictions Are Enforced (Implementation Detail)
+
+CAO defines a universal tool vocabulary (`execute_bash`, `fs_read`, `fs_write`, `fs_list`). However, not all providers understand this vocabulary natively. There are two categories:
+
+**Providers that need translation** — Claude Code, Copilot CLI, and Gemini CLI each have their own native tool names (e.g., Claude Code calls bash execution `Bash`, Copilot calls it `shell`). CAO uses an internal `TOOL_MAPPING` to translate the CAO vocabulary to provider-native names, then computes which native tools to block and passes them as CLI flags (e.g., `--disallowedTools Bash`, `--deny-tool shell`).
+
+| CAO Tool | Claude Code | Copilot CLI | Gemini CLI |
+|----------|-------------|-------------|------------|
+| `execute_bash` | `Bash` | `shell` | `run_shell_command` |
+| `fs_read` | `Read` | `read` | `read_file`, `list_directory`, `search_file_content`, `glob` |
+| `fs_write` | `Edit`, `Write` | `write` | `write_file`, `replace` |
+| `fs_list` | `Glob`, `Grep` | `list`, `grep` | `list_directory`, `glob`, `search_file_content` |
+
+**Providers that accept CAO vocabulary directly** — Kiro CLI and Q CLI accept `allowedTools` in the agent JSON at install time, using the same vocabulary as CAO. No translation needed. Kimi CLI and Codex use system prompt instructions to enforce restrictions. For all four, CAO passes the `allowedTools` list directly without translation — so no `TOOL_MAPPING` entry exists for them, and none is needed.
 
 ## How Overrides Work
 
@@ -191,11 +212,16 @@ Priority (highest to lowest):
   5. (nothing set)             → developer defaults
 ```
 
+Note: `--auto-approve` is **not** in this priority chain — it only controls whether the confirmation prompt is shown, not what restrictions are applied.
+
 Examples:
 
 ```bash
 # Profile has role: supervisor → restricted to @cao-mcp-server + fs_read + fs_list
 cao launch --agents code_supervisor
+
+# Same, but skip the confirmation prompt (restrictions still enforced)
+cao launch --agents code_supervisor --auto-approve
 
 # CLI flag overrides the role
 cao launch --agents code_supervisor --allowed-tools execute_bash --allowed-tools fs_read
@@ -206,7 +232,7 @@ cao launch --agents code_supervisor --yolo
 
 ## Provider Enforcement
 
-CAO translates `allowedTools` to each provider's native restriction mechanism:
+As described in [How Tool Restrictions Are Enforced](#how-tool-restrictions-are-enforced-implementation-detail), some providers require CAO to translate `allowedTools` to native tool names (via `TOOL_MAPPING`), while others accept the CAO vocabulary directly. The table below shows how each provider enforces restrictions:
 
 | Provider | Enforcement | How it works |
 |----------|------------|-------------|
@@ -281,8 +307,9 @@ Each agent is restricted based on its own profile, not its parent's permissions.
 | Custom tool set | `allowedTools: ["fs_read", "execute_bash"]` |
 | Reusable custom preset | Define in `settings.json` `roles`, use `role: my_preset` |
 | Override role at launch | `--allowed-tools fs_read --allowed-tools @cao-mcp-server` |
-| No restrictions at all | `--yolo` or don't set role/allowedTools |
-| Check what's allowed before launch | Launch without `--yolo` — the confirmation prompt shows the summary |
+| Skip confirmation in scripts/automation | `--auto-approve` (restrictions still enforced) |
+| No restrictions at all | `--yolo` |
+| Check what's allowed before launch | Launch without `--yolo` or `--auto-approve` — the prompt shows the summary |
 
 ## Security Recommendations
 
