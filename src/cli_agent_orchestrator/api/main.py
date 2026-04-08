@@ -635,7 +635,7 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
 
     # Start tmux attach inside the PTY
     proc = subprocess.Popen(
-        ["tmux", "attach-session", "-t", f"{session_name}:{window_name}"],
+        ["tmux", "-u", "attach-session", "-t", f"{session_name}:{window_name}"],
         stdin=slave_fd,
         stdout=slave_fd,
         stderr=slave_fd,
@@ -682,7 +682,7 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
             except asyncio.TimeoutError:
                 if proc.poll() is not None:
                     break
-            except Exception:
+            except (Exception, asyncio.CancelledError):
                 break
 
     async def _forward_input():
@@ -692,7 +692,13 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
                 msg = await websocket.receive_text()
                 payload = json.loads(msg)
                 if payload.get("type") == "input":
-                    os.write(master_fd, payload["data"].encode())
+                    raw = payload["data"].encode()
+                    # Write in chunks to avoid overflowing the PTY buffer
+                    chunk_size = 1024
+                    for i in range(0, len(raw), chunk_size):
+                        os.write(master_fd, raw[i : i + chunk_size])
+                        if i + chunk_size < len(raw):
+                            await asyncio.sleep(0.01)
                 elif payload.get("type") == "resize":
                     rows = payload.get("rows", 24)
                     cols = payload.get("cols", 80)
@@ -707,13 +713,15 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
                         pass
         except WebSocketDisconnect:
             pass
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             pass
         finally:
             done.set()
 
     try:
         await asyncio.gather(_forward_output(), _forward_input())
+    except (Exception, asyncio.CancelledError):
+        pass
     finally:
         done.set()
         try:
