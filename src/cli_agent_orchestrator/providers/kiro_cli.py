@@ -61,6 +61,12 @@ NEW_TUI_IDLE_PATTERN = r"ask a question, or describe a task"
 # New TUI IDLE prompt pattern for log files (with ANSI codes)
 NEW_TUI_IDLE_PATTERN_LOG = r"ask a question, or describe a task"
 
+# TUI separator line: horizontal bar (────) used to delimit sections
+TUI_SEPARATOR_PATTERN = r"^[─]{4,}$"
+
+# TUI Credits line: "▸ Credits: N.NN • Time: Ns" marks response completion
+TUI_CREDITS_PATTERN = r"▸\s*Credits:\s*[\d.]+"
+
 # =============================================================================
 # Error Detection
 # =============================================================================
@@ -139,8 +145,9 @@ class KiroCliProvider(BaseProvider):
         if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
-        # Step 2: Start the Kiro CLI chat session with the specified agent profile
-        command = shlex.join(["kiro-cli", "chat", "--legacy-ui", "--agent", self._agent_profile])
+        # Step 2: Start the Kiro CLI chat session in TUI mode (default).
+        # If TUI initialization fails, fall back to --legacy-ui.
+        command = shlex.join(["kiro-cli", "chat", "--agent", self._agent_profile])
         tmux_client.send_keys(self.session_name, self.window_name, command)
 
         # Step 3: Wait for Kiro CLI to fully initialize and show the agent prompt.
@@ -149,7 +156,29 @@ class KiroCliProvider(BaseProvider):
         if not wait_until_status(
             self, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=30.0
         ):
-            raise TimeoutError("Kiro CLI initialization timed out after 30 seconds")
+            # TUI mode failed — fall back to --legacy-ui
+            logger.warning(
+                "Kiro CLI TUI initialization timed out, retrying with --legacy-ui"
+            )
+            # Exit the current session and start fresh with --legacy-ui
+            tmux_client.send_keys(self.session_name, self.window_name, "/exit")
+            if not wait_for_shell(
+                tmux_client, self.session_name, self.window_name, timeout=10.0
+            ):
+                raise TimeoutError(
+                    "Shell recovery timed out after --legacy-ui fallback"
+                )
+            legacy_command = shlex.join(
+                ["kiro-cli", "chat", "--legacy-ui", "--agent", self._agent_profile]
+            )
+            tmux_client.send_keys(self.session_name, self.window_name, legacy_command)
+            if not wait_until_status(
+                self, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=30.0
+            ):
+                raise TimeoutError(
+                    "Kiro CLI initialization timed out after 30 seconds "
+                    "(both TUI and --legacy-ui failed)"
+                )
 
         self._initialized = True
         return True
@@ -186,7 +215,8 @@ class KiroCliProvider(BaseProvider):
         # Check 1: Look for the agent's IDLE prompt pattern (old or new TUI)
         # If not found, the agent is still processing a response
         has_idle_prompt = re.search(self._idle_prompt_pattern, clean_output)
-        has_new_tui_idle = re.search(NEW_TUI_IDLE_PATTERN, clean_output)
+        new_tui_idle_matches = list(re.finditer(NEW_TUI_IDLE_PATTERN, clean_output))
+        has_new_tui_idle = bool(new_tui_idle_matches)
 
         if not has_idle_prompt and not has_new_tui_idle:
             return TerminalStatus.PROCESSING
@@ -226,13 +256,25 @@ class KiroCliProvider(BaseProvider):
                     return TerminalStatus.COMPLETED
 
             # Also check new TUI idle pattern after the last green arrow
-            new_tui_idles = list(re.finditer(NEW_TUI_IDLE_PATTERN, clean_output))
-            for prompt in new_tui_idles:
+            for prompt in new_tui_idle_matches:
                 if prompt.start() > last_arrow_pos:
                     logger.debug("get_status: returning COMPLETED (new TUI)")
                     return TerminalStatus.COMPLETED
 
             # Has green arrow but no prompt after it - still processing
+            return TerminalStatus.PROCESSING
+
+        # Check 5: TUI completion — Credits marker + idle prompt after it.
+        # In pure TUI mode, there are no green arrows. Completion is indicated
+        # by "▸ Credits:" followed by the idle prompt.
+        credits_matches = list(re.finditer(TUI_CREDITS_PATTERN, clean_output))
+        if credits_matches:
+            last_credits_pos = credits_matches[-1].end()
+            for prompt in new_tui_idle_matches:
+                if prompt.start() > last_credits_pos:
+                    logger.debug("get_status: returning COMPLETED (TUI credits)")
+                    return TerminalStatus.COMPLETED
+            # Credits marker found but no idle prompt after it — still processing
             return TerminalStatus.PROCESSING
 
         # Default: Agent is IDLE, waiting for user input
@@ -249,7 +291,8 @@ class KiroCliProvider(BaseProvider):
         new_tui_idles = list(re.finditer(NEW_TUI_IDLE_PATTERN, clean_output))
 
         if not green_arrows:
-            raise ValueError("No Kiro CLI response found - no green arrow pattern detected")
+            # Fallback: try TUI extraction (separator + Credits pattern)
+            return self._extract_tui_message(clean_output)
 
         if not idle_prompts and not new_tui_idles:
             raise ValueError("Incomplete Kiro CLI response - no final prompt detected")
@@ -284,6 +327,85 @@ class KiroCliProvider(BaseProvider):
             raise ValueError("Empty Kiro CLI response - no content found")
 
         # Clean up the message
+        final_answer = re.sub(ANSI_CODE_PATTERN, "", final_answer)
+        final_answer = re.sub(ESCAPE_SEQUENCE_PATTERN, "", final_answer)
+        final_answer = re.sub(CONTROL_CHAR_PATTERN, "", final_answer)
+        return final_answer.strip()
+
+    def _extract_tui_message(self, clean_output: str) -> str:
+        """Extract agent response from pure TUI output (no green arrows).
+
+        TUI format:
+            ────────────────────────────
+              user message here
+
+              Agent's response here.
+
+            ▸ Credits: 0.24 - Time: 3s
+            ────────────────────────────
+            agent-name - model - N%
+             Ask a question or describe a task
+
+        Strategy:
+            1. Find the last Credits line (response end marker)
+            2. Find the last separator before Credits (response start area)
+            3. Extract text between separator and Credits
+            4. Skip the first paragraph (user message) if a blank line separates it
+        """
+        lines = clean_output.split("\n")
+
+        # Find the last Credits line
+        credits_idx = None
+        for i in range(len(lines) - 1, -1, -1):
+            if re.search(TUI_CREDITS_PATTERN, lines[i]):
+                credits_idx = i
+                break
+
+        if credits_idx is None:
+            raise ValueError(
+                "No Kiro CLI response found - no Credits marker or green arrow detected"
+            )
+
+        # Find the last separator before Credits
+        separator_idx = None
+        for i in range(credits_idx - 1, -1, -1):
+            if re.search(TUI_SEPARATOR_PATTERN, lines[i].strip()):
+                separator_idx = i
+                break
+
+        if separator_idx is None:
+            raise ValueError(
+                "No Kiro CLI response found - no separator before Credits marker"
+            )
+
+        # Extract content between separator and Credits
+        content_lines = lines[separator_idx + 1 : credits_idx]
+
+        # Skip the first paragraph (user message echo).
+        # The user message is the first block of non-empty lines after the separator.
+        # After a blank line, the agent response begins.
+        agent_start = 0
+        found_blank = False
+        for i, line in enumerate(content_lines):
+            stripped = line.strip()
+            if not found_blank and not stripped:
+                found_blank = True
+                continue
+            if found_blank and stripped:
+                agent_start = i
+                break
+
+        if not found_blank:
+            # No blank line found — entire content is the response
+            agent_start = 0
+
+        response_lines = content_lines[agent_start:]
+        final_answer = "\n".join(response_lines).strip()
+
+        if not final_answer:
+            raise ValueError("Empty Kiro CLI response - no content found")
+
+        # Clean up
         final_answer = re.sub(ANSI_CODE_PATTERN, "", final_answer)
         final_answer = re.sub(ESCAPE_SEQUENCE_PATTERN, "", final_answer)
         final_answer = re.sub(CONTROL_CHAR_PATTERN, "", final_answer)

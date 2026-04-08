@@ -1,0 +1,4 @@
+────────────────────────────────────────────────────
+  What files are in this directory?
+
+  Analyzing the directory structure...
