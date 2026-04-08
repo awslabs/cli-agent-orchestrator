@@ -22,6 +22,7 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
       cursorBlink: true,
       fontSize: 14,
       fontFamily: 'JetBrains Mono, Menlo, Monaco, Consolas, monospace',
+      scrollback: 10000,
       theme: {
         background: '#0d1117',
         foreground: '#c9d1d9',
@@ -71,24 +72,18 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
       }
     })
 
-    // Forward keystrokes to server, but intercept Ctrl+Shift+C for copy
+    // Ctrl+Shift+C to copy selection
     term.attachCustomKeyEventHandler((e) => {
       if (e.ctrlKey && e.shiftKey && e.key === 'C') {
         const selection = term.getSelection()
         if (selection) navigator.clipboard.writeText(selection).catch(() => {})
-        return false // prevent sending to terminal
-      }
-      if (e.ctrlKey && e.shiftKey && e.key === 'V') {
-        navigator.clipboard.readText().then(text => {
-          if (text && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'input', data: text }))
-          }
-        }).catch(() => {})
         return false
       }
       return true
     })
 
+    // onData handles ALL input including paste — xterm.js
+    // receives pasted text through the browser's input system
     term.onData((data) => {
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: 'input', data }))
