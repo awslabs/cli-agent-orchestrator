@@ -83,7 +83,9 @@ class TestKiroCliProviderInitialization:
         assert calls[0].args == ("test-session", "window-0", "kiro-cli chat --agent developer")
         assert calls[1].args == ("test-session", "window-0", "/exit")
         assert calls[2].args == (
-            "test-session", "window-0", "kiro-cli chat --legacy-ui --agent developer"
+            "test-session",
+            "window-0",
+            "kiro-cli chat --legacy-ui --agent developer",
         )
 
     def test_initialization_with_different_agent_profiles(self):
@@ -857,9 +859,7 @@ class TestKiroCliTuiMode:
     @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
     def test_tui_completed_detection(self, mock_tmux):
         """Test COMPLETED detection with Credits marker + idle prompt."""
-        mock_tmux.get_history.return_value = load_fixture(
-            "kiro_cli_tui_completed_output.txt"
-        )
+        mock_tmux.get_history.return_value = load_fixture("kiro_cli_tui_completed_output.txt")
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         status = provider.get_status()
@@ -869,9 +869,7 @@ class TestKiroCliTuiMode:
     @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
     def test_tui_processing_detection(self, mock_tmux):
         """Test PROCESSING when TUI idle prompt is absent."""
-        mock_tmux.get_history.return_value = load_fixture(
-            "kiro_cli_tui_processing_output.txt"
-        )
+        mock_tmux.get_history.return_value = load_fixture("kiro_cli_tui_processing_output.txt")
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         status = provider.get_status()
@@ -957,7 +955,9 @@ class TestKiroCliTuiMode:
         """Test TUI separator pattern matches expected formats."""
         from cli_agent_orchestrator.providers.kiro_cli import TUI_SEPARATOR_PATTERN
 
-        assert re.search(TUI_SEPARATOR_PATTERN, "────────────────────────────────────────────────────")
+        assert re.search(
+            TUI_SEPARATOR_PATTERN, "────────────────────────────────────────────────────"
+        )
         assert re.search(TUI_SEPARATOR_PATTERN, "──────")
         assert not re.search(TUI_SEPARATOR_PATTERN, "───")  # Too short (< 4)
         assert not re.search(TUI_SEPARATOR_PATTERN, "---")  # Wrong character

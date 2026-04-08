@@ -157,17 +157,11 @@ class KiroCliProvider(BaseProvider):
             self, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=30.0
         ):
             # TUI mode failed — fall back to --legacy-ui
-            logger.warning(
-                "Kiro CLI TUI initialization timed out, retrying with --legacy-ui"
-            )
+            logger.warning("Kiro CLI TUI initialization timed out, retrying with --legacy-ui")
             # Exit the current session and start fresh with --legacy-ui
             tmux_client.send_keys(self.session_name, self.window_name, "/exit")
-            if not wait_for_shell(
-                tmux_client, self.session_name, self.window_name, timeout=10.0
-            ):
-                raise TimeoutError(
-                    "Shell recovery timed out after --legacy-ui fallback"
-                )
+            if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
+                raise TimeoutError("Shell recovery timed out after --legacy-ui fallback")
             legacy_command = shlex.join(
                 ["kiro-cli", "chat", "--legacy-ui", "--agent", self._agent_profile]
             )
@@ -374,9 +368,7 @@ class KiroCliProvider(BaseProvider):
                 break
 
         if separator_idx is None:
-            raise ValueError(
-                "No Kiro CLI response found - no separator before Credits marker"
-            )
+            raise ValueError("No Kiro CLI response found - no separator before Credits marker")
 
         # Extract content between separator and Credits
         content_lines = lines[separator_idx + 1 : credits_idx]
