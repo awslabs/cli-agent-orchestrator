@@ -68,6 +68,13 @@ TUI_SEPARATOR_PATTERN = r"^[─]{20,}$"
 # TUI Credits line: "▸ Credits: N.NN • Time: Ns" marks response completion
 TUI_CREDITS_PATTERN = r"▸\s*Credits:\s*[\d.]+"
 
+# TUI processing indicator: ghost text shown while agent is working
+TUI_PROCESSING_PATTERN = r"Kiro is working"
+
+# TUI permission prompt: shown instead of legacy [y/n/t] format.
+# Requires all three options together to avoid false positives on "Yes"/"No" in agent output.
+TUI_PERMISSION_PATTERN = r"Yes\s+No\s+Always [Aa]llow"
+
 # =============================================================================
 # Error Detection
 # =============================================================================
@@ -204,7 +211,11 @@ class KiroCliProvider(BaseProvider):
         # This simplifies regex patterns and improves reliability
         clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
 
-        # Check 1: Look for the agent's IDLE prompt pattern (old or new TUI)
+        # Check 1: Look for TUI "Kiro is working" ghost text — positive PROCESSING signal
+        if re.search(TUI_PROCESSING_PATTERN, clean_output):
+            return TerminalStatus.PROCESSING
+
+        # Check 2: Look for the agent's IDLE prompt pattern (old or new TUI)
         # If not found, the agent is still processing a response
         has_idle_prompt = re.search(self._idle_prompt_pattern, clean_output)
         new_tui_idle_matches = list(re.finditer(NEW_TUI_IDLE_PATTERN, clean_output))
@@ -217,13 +228,17 @@ class KiroCliProvider(BaseProvider):
         if any(indicator.lower() in clean_output.lower() for indicator in ERROR_INDICATORS):
             return TerminalStatus.ERROR
 
-        # Check for permission prompt — count lines with idle prompt after last [y/n/t]:
+        # Check for permission prompt — legacy [y/n/t] or TUI "Yes, No, Always Allow"
         # Active prompt: 0-1 lines with idle prompt (CLI renders prompt on next line)
         # Stale prompt: 2+ lines with idle prompt (user answered, agent continued)
         # Line-based counting handles \r redraws (same line, no \n) correctly
         perm_matches = list(re.finditer(self._permission_prompt_pattern, clean_output, re.DOTALL))
-        if perm_matches:
-            after_last_perm = clean_output[perm_matches[-1].end() :]
+        tui_perm_matches = list(re.finditer(TUI_PERMISSION_PATTERN, clean_output))
+        all_perm_matches = perm_matches + tui_perm_matches
+        # Sort by position so we use the last permission prompt regardless of type
+        all_perm_matches.sort(key=lambda m: m.start())
+        if all_perm_matches:
+            after_last_perm = clean_output[all_perm_matches[-1].end() :]
             lines_after = after_last_perm.split("\n")
             idle_lines = sum(
                 1

@@ -998,3 +998,67 @@ class TestKiroCliTuiMode:
 
         # Credits present but no idle prompt after → still processing (TUI redrawing)
         assert status == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_tui_kiro_is_working_processing(self, mock_tmux):
+        """Test PROCESSING detected via 'Kiro is working' ghost text."""
+        mock_tmux.get_history.return_value = (
+            "────────────────────────────────────────────────────\n"
+            "developer · claude-opus-4.6-1m · ◔ 3%\n"
+            "\n"
+            " Kiro is working\n"
+        )
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_tui_kiro_is_working_takes_priority(self, mock_tmux):
+        """Test 'Kiro is working' returns PROCESSING even if idle prompt is also present."""
+        mock_tmux.get_history.return_value = (
+            "developer · claude-opus-4.6-1m · ◔ 3%\n"
+            " ask a question, or describe a task ↵\n"
+            " Kiro is working\n"
+        )
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        status = provider.get_status()
+
+        # "Kiro is working" is checked before idle prompt — PROCESSING wins
+        assert status == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_tui_permission_prompt_detection(self, mock_tmux):
+        """Test WAITING_USER_ANSWER with TUI permission prompt (Yes/No/Always Allow)."""
+        mock_tmux.get_history.return_value = (
+            "────────────────────────────────────────────────────\n"
+            "I need to write to /tmp/test.txt\n"
+            "Yes  No  Always Allow for this session\n"
+            "developer · claude-opus-4.6-1m · ◔ 3%\n"
+            " ask a question, or describe a task ↵"
+        )
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_tui_processing_pattern(self):
+        """Test TUI processing pattern matches expected format."""
+        from cli_agent_orchestrator.providers.kiro_cli import TUI_PROCESSING_PATTERN
+
+        assert re.search(TUI_PROCESSING_PATTERN, "Kiro is working")
+        assert re.search(TUI_PROCESSING_PATTERN, " Kiro is working ")
+        assert not re.search(TUI_PROCESSING_PATTERN, "Kiro is idle")
+
+    def test_tui_permission_pattern(self):
+        """Test TUI permission pattern matches expected formats."""
+        from cli_agent_orchestrator.providers.kiro_cli import TUI_PERMISSION_PATTERN
+
+        assert re.search(TUI_PERMISSION_PATTERN, "Yes  No  Always Allow for this session")
+        assert re.search(TUI_PERMISSION_PATTERN, "Yes No Always allow")
+        # Should NOT match bare "Yes" or "No" — too broad
+        assert not re.search(TUI_PERMISSION_PATTERN, "Yes, I can help")
+        assert not re.search(TUI_PERMISSION_PATTERN, "No problem")
