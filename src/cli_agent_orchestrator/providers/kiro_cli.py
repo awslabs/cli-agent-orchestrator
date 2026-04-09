@@ -61,8 +61,9 @@ NEW_TUI_IDLE_PATTERN = r"ask a question, or describe a task"
 # New TUI IDLE prompt pattern for log files (with ANSI codes)
 NEW_TUI_IDLE_PATTERN_LOG = r"ask a question, or describe a task"
 
-# TUI separator line: horizontal bar (────) used to delimit sections
-TUI_SEPARATOR_PATTERN = r"^[─]{4,}$"
+# TUI separator line: horizontal bar (────) used to delimit sections.
+# Require 20+ chars to avoid matching short markdown separators in agent output.
+TUI_SEPARATOR_PATTERN = r"^[─]{20,}$"
 
 # TUI Credits line: "▸ Credits: N.NN • Time: Ns" marks response completion
 TUI_CREDITS_PATTERN = r"▸\s*Credits:\s*[\d.]+"
@@ -169,10 +170,7 @@ class KiroCliProvider(BaseProvider):
             if not wait_until_status(
                 self, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=30.0
             ):
-                raise TimeoutError(
-                    "Kiro CLI initialization timed out after 30 seconds "
-                    "(both TUI and --legacy-ui failed)"
-                )
+                raise TimeoutError("Kiro CLI initialization timed out with TUI and `--legacy-ui`")
 
         self._initialized = True
         return True
@@ -397,8 +395,7 @@ class KiroCliProvider(BaseProvider):
         if not final_answer:
             raise ValueError("Empty Kiro CLI response - no content found")
 
-        # Clean up
-        final_answer = re.sub(ANSI_CODE_PATTERN, "", final_answer)
+        # Clean up (ANSI codes already stripped from clean_output at caller)
         final_answer = re.sub(ESCAPE_SEQUENCE_PATTERN, "", final_answer)
         final_answer = re.sub(CONTROL_CHAR_PATTERN, "", final_answer)
         return final_answer.strip()

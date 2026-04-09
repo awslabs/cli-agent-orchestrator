@@ -61,7 +61,7 @@ class TestKiroCliProviderInitialization:
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
 
-        with pytest.raises(TimeoutError, match="both TUI and --legacy-ui failed"):
+        with pytest.raises(TimeoutError, match="timed out with TUI and `--legacy-ui`"):
             provider.initialize()
 
     @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
@@ -958,9 +958,11 @@ class TestKiroCliTuiMode:
         assert re.search(
             TUI_SEPARATOR_PATTERN, "────────────────────────────────────────────────────"
         )
-        assert re.search(TUI_SEPARATOR_PATTERN, "──────")
-        assert not re.search(TUI_SEPARATOR_PATTERN, "───")  # Too short (< 4)
+        assert re.search(TUI_SEPARATOR_PATTERN, "──────────────────────")  # 21 chars
+        assert not re.search(TUI_SEPARATOR_PATTERN, "──────")  # Too short (< 20)
+        assert not re.search(TUI_SEPARATOR_PATTERN, "───")  # Way too short
         assert not re.search(TUI_SEPARATOR_PATTERN, "---")  # Wrong character
+        assert not re.search(TUI_SEPARATOR_PATTERN, "────────")  # 8 chars — could be markdown, skip
 
     @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
     def test_tui_status_extraction_synchronization(self, mock_tmux):
