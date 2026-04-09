@@ -55,11 +55,13 @@ IDLE_PROMPT_PATTERN_LOG = r"\x1b\[38;5;\d+m\[.+?\].*\x1b\[38;5;\d+m>\s*\x1b\[\d*
 # New TUI Patterns (Kiro CLI without --legacy-ui)
 # =============================================================================
 
-# New TUI idle prompt: "ask a question, or describe a task ↵"
-NEW_TUI_IDLE_PATTERN = r"ask a question, or describe a task"
+# New TUI idle prompt: "Ask a question or describe a task ↵"
+# Case-insensitive match; comma between "question" and "or" is optional
+# (older versions used lowercase with comma, v1.29+ uses capitalized without)
+NEW_TUI_IDLE_PATTERN = r"[Aa]sk a question,? or describe a task"
 
 # New TUI IDLE prompt pattern for log files (with ANSI codes)
-NEW_TUI_IDLE_PATTERN_LOG = r"ask a question, or describe a task"
+NEW_TUI_IDLE_PATTERN_LOG = r"[Aa]sk a question,? or describe a task"
 
 # TUI separator line: horizontal bar (────) used to delimit sections.
 # Require 20+ chars to avoid matching short markdown separators in agent output.

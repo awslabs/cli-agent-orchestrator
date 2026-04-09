@@ -918,8 +918,8 @@ class TestKiroCliTuiMode:
             "────────────────────────────────────────────────────\n"
             "  Some content without Credits marker\n"
             "────────────────────────────────────────────────────\n"
-            "developer · claude-opus-4.6-1m · ◔ 3%\n"
-            " ask a question, or describe a task ↵"
+            "developer · auto · ◔ 3%\n"
+            " Ask a question or describe a task ↵"
         )
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
@@ -933,8 +933,8 @@ class TestKiroCliTuiMode:
         output = (
             "Some content\n"
             "▸ Credits: 0.24 • Time: 3s\n"
-            "developer · claude-opus-4.6-1m · ◔ 3%\n"
-            " ask a question, or describe a task ↵"
+            "developer · auto · ◔ 3%\n"
+            " Ask a question or describe a task ↵"
         )
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
@@ -1018,8 +1018,8 @@ class TestKiroCliTuiMode:
     def test_tui_kiro_is_working_takes_priority(self, mock_tmux):
         """Test 'Kiro is working' returns PROCESSING even if idle prompt is also present."""
         mock_tmux.get_history.return_value = (
-            "developer · claude-opus-4.6-1m · ◔ 3%\n"
-            " ask a question, or describe a task ↵\n"
+            "developer · auto · ◔ 3%\n"
+            " Ask a question or describe a task ↵\n"
             " Kiro is working\n"
         )
 
@@ -1036,8 +1036,8 @@ class TestKiroCliTuiMode:
             "────────────────────────────────────────────────────\n"
             "I need to write to /tmp/test.txt\n"
             "Yes  No  Always Allow for this session\n"
-            "developer · claude-opus-4.6-1m · ◔ 3%\n"
-            " ask a question, or describe a task ↵"
+            "developer · auto · ◔ 3%\n"
+            " Ask a question or describe a task ↵"
         )
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
