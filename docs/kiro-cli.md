@@ -117,13 +117,13 @@ The profile name determines the prompt pattern used for status detection. Built-
 
 ### Launch Command
 
-The provider constructs the command without `--legacy-ui`, using the new TUI mode by default:
+The provider launches using kiro-cli's default UI, with automatic `--legacy-ui` fallback:
 
 ```
 kiro-cli chat --agent developer
 ```
 
-The provider auto-detects whether the terminal is in legacy or TUI mode and uses the appropriate detection patterns. If you need legacy mode (e.g., for older Kiro CLI versions), you can add `--legacy-ui` via a wrapper script — the legacy detection patterns remain fully supported.
+The provider auto-detects whether the terminal is in legacy or TUI mode and uses the appropriate detection patterns. If initialization times out, the provider automatically exits and retries with `--legacy-ui`. Both TUI and legacy detection patterns are fully supported.
 
 ## Implementation Notes
 

@@ -155,8 +155,9 @@ class KiroCliProvider(BaseProvider):
         if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
-        # Step 2: Start the Kiro CLI chat session in TUI mode (default).
-        # If TUI initialization fails, fall back to --legacy-ui.
+        # Step 2: Start the Kiro CLI chat session using kiro-cli's default UI.
+        # Detection code handles both legacy and TUI patterns (stateless).
+        # If initialization fails, fall back to --legacy-ui.
         command = shlex.join(["kiro-cli", "chat", "--agent", self._agent_profile])
         tmux_client.send_keys(self.session_name, self.window_name, command)
 
@@ -357,9 +358,11 @@ class KiroCliProvider(BaseProvider):
 
         Strategy:
             1. Find the last Credits line (response end marker)
-            2. Find the last separator before Credits (response start area)
-            3. Extract text between separator and Credits
-            4. Skip the first paragraph (user message) if a blank line separates it
+            2. Find the previous Credits line (prior turn boundary) or start of output
+            3. Find the first separator after that boundary (outer TUI separator)
+               This avoids matching separators inside the agent's response.
+            4. Extract text between separator and Credits
+            5. Skip the first paragraph (user message) if a blank line separates it
         """
         lines = clean_output.split("\n")
 
@@ -375,9 +378,17 @@ class KiroCliProvider(BaseProvider):
                 "No Kiro CLI response found - no Credits marker or green arrow detected"
             )
 
-        # Find the last separator before Credits
-        separator_idx = None
+        # Find the previous Credits line (prior turn's end) to establish search boundary.
+        # This ensures we find the outer TUI separator, not one inside the agent's output.
+        prev_credits_idx = -1
         for i in range(credits_idx - 1, -1, -1):
+            if re.search(TUI_CREDITS_PATTERN, lines[i]):
+                prev_credits_idx = i
+                break
+
+        # Find the first separator AFTER the previous turn boundary
+        separator_idx = None
+        for i in range(prev_credits_idx + 1, credits_idx):
             if re.search(TUI_SEPARATOR_PATTERN, lines[i].strip()):
                 separator_idx = i
                 break

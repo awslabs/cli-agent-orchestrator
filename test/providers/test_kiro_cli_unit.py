@@ -80,7 +80,11 @@ class TestKiroCliProviderInitialization:
         # Should have sent /exit then --legacy-ui command
         calls = mock_tmux.send_keys.call_args_list
         assert len(calls) == 3  # TUI command, /exit, legacy command
-        assert calls[0].args == ("test-session", "window-0", "kiro-cli chat --agent developer")
+        assert calls[0].args == (
+            "test-session",
+            "window-0",
+            "kiro-cli chat --agent developer",
+        )
         assert calls[1].args == ("test-session", "window-0", "/exit")
         assert calls[2].args == (
             "test-session",
@@ -1062,3 +1066,55 @@ class TestKiroCliTuiMode:
         # Should NOT match bare "Yes" or "No" — too broad
         assert not re.search(TUI_PERMISSION_PATTERN, "Yes, I can help")
         assert not re.search(TUI_PERMISSION_PATTERN, "No problem")
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_tui_extraction_with_separator_in_agent_output(self, mock_tmux):
+        """Test extraction works when agent output itself contains separator chars."""
+        output = (
+            "────────────────────────────────────────────────────\n"
+            "  What is a box drawing character?\n"
+            "\n"
+            "  A box drawing character looks like this:\n"
+            "  ────────────────────────────────────────────────────\n"
+            "  That line above is an example.\n"
+            "\n"
+            "▸ Credits: 0.24 • Time: 3s\n"
+            "────────────────────────────────────────────────────\n"
+            "developer · auto · ◔ 3%\n"
+            " Ask a question or describe a task ↵"
+        )
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        message = provider.extract_last_message_from_script(output)
+
+        # Must include content from BOTH sides of the inner separator
+        assert "box drawing character" in message
+        assert "That line above" in message
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_tui_extraction_multi_turn(self, mock_tmux):
+        """Test extraction picks latest turn when multiple Credits lines exist."""
+        output = (
+            "────────────────────────────────────────────────────\n"
+            "  First question\n"
+            "\n"
+            "  First answer.\n"
+            "\n"
+            "▸ Credits: 0.10 • Time: 1s\n"
+            "────────────────────────────────────────────────────\n"
+            "  Second question\n"
+            "\n"
+            "  Second answer.\n"
+            "\n"
+            "▸ Credits: 0.24 • Time: 3s\n"
+            "────────────────────────────────────────────────────\n"
+            "developer · auto · ◔ 3%\n"
+            " Ask a question or describe a task ↵"
+        )
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        message = provider.extract_last_message_from_script(output)
+
+        # Should extract second turn only
+        assert "Second answer" in message
+        assert "First answer" not in message
