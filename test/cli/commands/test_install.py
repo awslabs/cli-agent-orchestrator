@@ -776,7 +776,7 @@ class TestInstallSkillCatalogBaking:
         # Resources should contain the skill:// glob
         skill_resources = [r for r in agent_json["resources"] if r.startswith("skill://")]
         assert len(skill_resources) == 1
-        assert skill_resources[0].endswith("/*/SKILL.md")
+        assert skill_resources[0].endswith("/**/SKILL.md")
 
     def test_install_q_bakes_catalog_into_prompt(self, runner, install_workspace):
         """Q installs should bake the global skill catalog into the JSON prompt."""

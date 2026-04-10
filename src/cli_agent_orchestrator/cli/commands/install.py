@@ -198,7 +198,7 @@ def install(agent_source: str, provider: str, env_vars: tuple[str, ...]):
             # (metadata at startup, full content on demand).
             kiro_resources = [
                 f"file://{dest_file.absolute()}",
-                f"skill://{SKILLS_DIR}/*/SKILL.md",
+                f"skill://{SKILLS_DIR}/**/SKILL.md",
             ]
             raw_prompt = (
                 profile.prompt.strip() if profile.prompt and profile.prompt.strip() else None
