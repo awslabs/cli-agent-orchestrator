@@ -7,7 +7,7 @@ from pathlib import Path
 
 import click
 import frontmatter
-import requests
+import requests  # type: ignore[import-untyped]
 
 from cli_agent_orchestrator.constants import (
     AGENT_CONTEXT_DIR,
