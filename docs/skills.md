@@ -206,3 +206,8 @@ cao skills add ./my-coding-standards --force
 ```
 
 For runtime prompt providers (Claude Code, Codex, Gemini CLI, Kimi CLI) and Kiro, changes take effect on the next terminal creation. For Q CLI and Copilot CLI, running `cao skills add --force` automatically refreshes all installed agent files. If you edited the skill file directly instead, run `cao skills remove <name>` followed by `cao skills add <folder>` to trigger the refresh — or reinstall the affected agents with `cao install`.
+
+## Known Limitations
+
+- **No nested skill directories.** Skills must be immediate subdirectories of the skill store. Nested paths (e.g., `skills/team/python-testing/`) are not discovered by CAO's skill catalog. Kiro's `skill://` glob handles nested paths natively, but other providers do not.
+- **No per-profile skill scoping.** All installed skills are available to all agents. There is currently no way to restrict which skills a specific agent profile can see. A `skills` field in agent profile frontmatter for declaring allowed skills is a planned future addition.
