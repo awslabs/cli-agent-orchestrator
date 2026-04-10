@@ -166,7 +166,6 @@ class CopilotCliProvider(BaseProvider):
         merged_servers: dict = {}
         venv_script = Path(sys.executable).with_name("cao-mcp-server")
         found_script = shutil.which("cao-mcp-server")
-        mcp_args: list[str]
         if venv_script.exists():
             mcp_command = str(venv_script)
             mcp_args = []

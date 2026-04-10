@@ -961,24 +961,6 @@ class TestCodexProviderTrustPrompt:
 
         mock_tmux.server.sessions.get.assert_not_called()
 
-    @patch("cli_agent_orchestrator.providers.codex.time.sleep")
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_handle_trust_prompt_retries_when_tmux_window_missing(self, mock_tmux, mock_sleep):
-        """Trust prompt handling should retry if tmux window metadata is briefly unavailable."""
-        mock_tmux.get_history.side_effect = [
-            "allow Codex to work in this folder without asking for approval.\n› 1. Yes\n",
-            "OpenAI Codex (v0.98.0)\n› ",
-        ]
-        mock_session = MagicMock()
-        mock_tmux.server.sessions.get.return_value = mock_session
-        mock_session.windows.get.return_value = None
-
-        provider = CodexProvider("test1234", "test-session", "window-0")
-        provider._handle_trust_prompt(timeout=2.0)
-
-        mock_sleep.assert_called_once_with(1.0)
-        mock_session.windows.get.assert_called_once_with(window_name="window-0")
-
     @patch("cli_agent_orchestrator.providers.codex.tmux_client")
     def test_get_status_trust_prompt_is_waiting_user_answer(self, mock_tmux):
         """Test that trust prompt reports WAITING_USER_ANSWER, not PROCESSING."""

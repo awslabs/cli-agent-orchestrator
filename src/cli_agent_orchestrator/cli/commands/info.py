@@ -3,7 +3,7 @@
 import subprocess
 
 import click
-import requests  # type: ignore[import-untyped]
+import requests
 
 from cli_agent_orchestrator.constants import (
     DATABASE_FILE,

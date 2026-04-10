@@ -3,7 +3,7 @@
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, cast
+from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
 
@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 SETTINGS_FILE = CAO_HOME_DIR / "settings.json"
 
 # Default agent directories per provider
-_DEFAULTS: Dict[str, str] = {
+_DEFAULTS = {
     "kiro_cli": str(Path.home() / ".kiro" / "agents"),
     "q_cli": str(Path.home() / ".aws" / "amazonq" / "cli-agents"),
     "claude_code": str(Path.home() / ".aws" / "cli-agent-orchestrator" / "agent-store"),
@@ -25,7 +25,7 @@ def _load() -> Dict[str, Any]:
     """Load settings from disk."""
     if SETTINGS_FILE.exists():
         try:
-            return cast(Dict[str, Any], json.loads(SETTINGS_FILE.read_text()))
+            return json.loads(SETTINGS_FILE.read_text())
         except Exception as e:
             logger.warning(f"Failed to read settings: {e}")
     return {}
@@ -67,8 +67,7 @@ def set_agent_dirs(dirs: Dict[str, str]) -> Dict[str, str]:
 def get_extra_agent_dirs() -> List[str]:
     """Get extra agent scan directories (user-added custom paths)."""
     settings = _load()
-    extra_dirs = settings.get("extra_agent_dirs", [])
-    return [str(path) for path in extra_dirs]
+    return settings.get("extra_agent_dirs", [])
 
 
 def set_extra_agent_dirs(dirs: List[str]) -> List[str]:
@@ -76,4 +75,4 @@ def set_extra_agent_dirs(dirs: List[str]) -> List[str]:
     settings = _load()
     settings["extra_agent_dirs"] = [d for d in dirs if d.strip()]
     _save(settings)
-    return [str(path) for path in settings["extra_agent_dirs"]]
+    return settings["extra_agent_dirs"]
