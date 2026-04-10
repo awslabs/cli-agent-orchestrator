@@ -228,12 +228,15 @@ def install(agent_source: str, provider: str, env_vars: tuple[str, ...]):
             COPILOT_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
             system_prompt = profile.system_prompt.strip() if profile.system_prompt else ""
             fallback_prompt = profile.prompt.strip() if profile.prompt else ""
-            prompt = system_prompt or fallback_prompt
-            if not prompt:
+            base_prompt = system_prompt or fallback_prompt
+            if not base_prompt:
                 raise ValueError(
                     f"Agent '{profile.name}' has no usable prompt content for Copilot "
                     "(both system_prompt and prompt are empty or whitespace)"
                 )
+
+            # Bake skill catalog into the agent prompt body (same as Kiro/Q)
+            prompt = compose_agent_prompt(profile, base_prompt=base_prompt) or base_prompt
 
             safe_filename = profile.name.replace("/", "__")
             agent_file = COPILOT_AGENTS_DIR / f"{safe_filename}.agent.md"
