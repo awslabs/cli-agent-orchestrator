@@ -156,8 +156,9 @@ def create_terminal(
             terminal_id, session_name, window_name, provider, agent_profile, allowed_tools
         )
 
-        # Step 3b: Load the profile once for allowed tool resolution and
-        # skill catalog generation before provider initialization.
+        # Step 3b: Load the profile once for allowed tool resolution before
+        # provider initialization. The skill catalog is global and does not
+        # depend on profile contents.
         profile = load_agent_profile(agent_profile)
         skill_prompt = build_skill_catalog()
 
@@ -172,6 +173,10 @@ def create_terminal(
 
         # Step 4: Create and initialize the CLI provider
         # This starts the agent (e.g., runs "kiro-cli chat --agent developer")
+        # Keep the runtime skill-prompt gate at both the service and manager
+        # layers. The manager still drops the kwarg for Kiro/Q/Copilot, but
+        # the explicit branch here lets tests assert those providers never
+        # receive a runtime prompt at the service boundary.
         if provider in RUNTIME_SKILL_PROMPT_PROVIDERS:
             provider_instance = provider_manager.create_provider(
                 provider,

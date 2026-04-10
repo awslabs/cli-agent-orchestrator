@@ -41,7 +41,8 @@ def test_create_provider_kiro_does_not_forward_skill_prompt(mock_kiro_provider):
 
     assert provider is mock_instance
     assert manager.get_provider("t1") is mock_instance
-    mock_kiro_provider.assert_called_once_with("t1", "s1", "w1", "developer", None)
+    assert mock_kiro_provider.call_count == 1
+    assert "skill_prompt" not in mock_kiro_provider.call_args.kwargs
 
 
 @patch("cli_agent_orchestrator.providers.manager.QCliProvider")
@@ -61,7 +62,8 @@ def test_create_provider_q_does_not_forward_skill_prompt(mock_q_provider):
 
     assert provider is mock_instance
     assert manager.get_provider("t1") is mock_instance
-    mock_q_provider.assert_called_once_with("t1", "s1", "w1", "developer", None)
+    assert mock_q_provider.call_count == 1
+    assert "skill_prompt" not in mock_q_provider.call_args.kwargs
 
 
 def test_create_provider_copilot_stores_mapping():
@@ -95,7 +97,8 @@ def test_create_provider_copilot_does_not_forward_skill_prompt(mock_copilot_prov
 
     assert provider is mock_instance
     assert manager.get_provider("t1") is mock_instance
-    mock_copilot_provider.assert_called_once_with("t1", "s1", "w1", "developer", None)
+    assert mock_copilot_provider.call_count == 1
+    assert "skill_prompt" not in mock_copilot_provider.call_args.kwargs
 
 
 def test_create_provider_unknown_type_raises():

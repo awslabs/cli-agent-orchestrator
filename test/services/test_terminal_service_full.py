@@ -278,6 +278,7 @@ class TestCreateTerminal:
         assert skill_prompt == ""
         mock_list_skills.assert_called_once_with()
 
+    @pytest.mark.parametrize("provider_name", ["kiro_cli", "q_cli", "copilot_cli"])
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
@@ -287,7 +288,7 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
     @patch("cli_agent_orchestrator.services.terminal_service.list_skills")
     @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
-    def test_create_terminal_does_not_pass_skill_prompt_to_kiro_provider(
+    def test_create_terminal_does_not_pass_skill_prompt_to_non_runtime_provider(
         self,
         mock_load_profile,
         mock_list_skills,
@@ -298,8 +299,9 @@ class TestCreateTerminal:
         mock_db_create,
         mock_provider_manager,
         mock_log_dir,
+        provider_name,
     ):
-        """Kiro should not receive the runtime skill_prompt kwarg in Phase 1."""
+        """Kiro, Q, and Copilot should not receive runtime skill_prompt kwargs."""
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "developer-abcd"
@@ -317,7 +319,7 @@ class TestCreateTerminal:
         mock_log_path = MagicMock()
         mock_log_dir.__truediv__.return_value = mock_log_path
 
-        create_terminal("kiro_cli", "developer", new_session=True)
+        create_terminal(provider_name, "developer", new_session=True)
 
         assert "skill_prompt" not in mock_provider_manager.create_provider.call_args.kwargs
 
