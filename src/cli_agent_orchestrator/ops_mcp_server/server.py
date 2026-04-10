@@ -100,7 +100,13 @@ async def _launch_session_impl(
     working_directory: Optional[str] = None,
     allowed_tools: Optional[List[str]] = None,
 ) -> LaunchResult:
-    """Launch a session and optionally deliver an initial prompt."""
+    """Launch a session and optionally deliver an initial prompt.
+
+    If readiness or prompt delivery fails after session creation, the returned
+    failure still includes ``session_name`` and ``terminal_id`` so callers can
+    decide whether to inspect or explicitly shut down the partially launched
+    session.
+    """
     resolved_session_name = session_name or generate_session_name()
     params: Dict[str, Any] = {
         "provider": provider,
@@ -136,7 +142,10 @@ async def _launch_session_impl(
     terminal_id = str(session_data["id"])
 
     if prompt:
-        is_ready = wait_until_terminal_status(
+        # The underlying wait helper is synchronous; move it off the event loop
+        # so prompt-bearing launches do not block other async MCP work.
+        is_ready = await asyncio.to_thread(
+            wait_until_terminal_status,
             terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
             timeout=120.0,
