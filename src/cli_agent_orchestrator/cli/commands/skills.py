@@ -34,7 +34,7 @@ def _install_skill_folder(source_dir: Path, force: bool = False) -> Path:
 
 
 def _refresh_installed_agents() -> None:
-    """Refresh baked prompts for installed CAO-managed Kiro/Q/Copilot agents."""
+    """Refresh baked prompts for installed CAO-managed Q/Copilot agents."""
     try:
         refreshed = refresh_all_cao_managed_agents()
     except Exception as exc:

@@ -18,6 +18,7 @@ from cli_agent_orchestrator.constants import (
     LOCAL_AGENT_STORE_DIR,
     PROVIDERS,
     Q_AGENTS_DIR,
+    SKILLS_DIR,
 )
 from cli_agent_orchestrator.models.copilot_agent import CopilotAgentConfig
 from cli_agent_orchestrator.models.kiro_agent import KiroAgentConfig
@@ -205,13 +206,24 @@ def install(agent_source: str, provider: str, env_vars: tuple[str, ...]):
 
         elif provider == ProviderType.KIRO_CLI.value:
             KIRO_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+            # Kiro natively supports skill:// resources with progressive loading
+            # (metadata at startup, full content on demand). A single glob entry
+            # captures all installed CAO skills, so no prompt-based catalog baking
+            # or refresh-on-skill-change is needed.
+            kiro_resources = [
+                f"file://{dest_file.absolute()}",
+                f"skill://{SKILLS_DIR}/*/SKILL.md",
+            ]
+            raw_prompt = (
+                profile.prompt.strip() if profile.prompt and profile.prompt.strip() else None
+            )
             agent_config = KiroAgentConfig(
                 name=profile.name,
                 description=profile.description,
                 tools=profile.tools if profile.tools is not None else ["*"],
                 allowedTools=allowed_tools,
-                resources=[f"file://{dest_file.absolute()}"],
-                prompt=compose_agent_prompt(profile),
+                resources=kiro_resources,
+                prompt=raw_prompt,
                 mcpServers=profile.mcpServers,
                 toolAliases=profile.toolAliases,
                 toolsSettings=profile.toolsSettings,

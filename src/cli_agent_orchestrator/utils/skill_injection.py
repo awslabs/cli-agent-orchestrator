@@ -1,4 +1,8 @@
-"""Skill catalog injection helpers for installed Kiro, Q, and Copilot agent files."""
+"""Skill catalog injection helpers for installed Q and Copilot agent files.
+
+Kiro CLI uses native ``skill://`` resources with progressive loading, so it
+does not need prompt-based catalog baking or refresh-on-skill-change.
+"""
 
 import json
 import logging
@@ -12,7 +16,6 @@ import frontmatter
 from cli_agent_orchestrator.constants import (
     AGENT_CONTEXT_DIR,
     COPILOT_AGENTS_DIR,
-    KIRO_AGENTS_DIR,
     Q_AGENTS_DIR,
 )
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
@@ -50,7 +53,7 @@ def compose_agent_prompt(profile: AgentProfile, base_prompt: Optional[str] = Non
 
 
 def refresh_agent_json_prompt(json_path: Path, profile: AgentProfile) -> bool:
-    """Atomically rewrite the prompt field of one installed Kiro/Q agent JSON."""
+    """Atomically rewrite the prompt field of one installed Q agent JSON."""
     if not json_path.exists():
         return False
 
@@ -109,17 +112,14 @@ def refresh_agent_md_prompt(md_path: Path, profile: AgentProfile) -> bool:
 
 
 def refresh_installed_agent_for_profile(profile_name: str) -> List[Path]:
-    """Refresh installed Kiro, Q, and Copilot agents for one source profile."""
+    """Refresh installed Q and Copilot agents for one source profile."""
     profile = load_agent_profile(profile_name)
     safe_name = profile.name.replace("/", "__")
     refreshed_paths: List[Path] = []
 
-    for json_path in (
-        KIRO_AGENTS_DIR / f"{safe_name}.json",
-        Q_AGENTS_DIR / f"{safe_name}.json",
-    ):
-        if refresh_agent_json_prompt(json_path, profile):
-            refreshed_paths.append(json_path)
+    q_path = Q_AGENTS_DIR / f"{safe_name}.json"
+    if refresh_agent_json_prompt(q_path, profile):
+        refreshed_paths.append(q_path)
 
     copilot_path = COPILOT_AGENTS_DIR / f"{safe_name}.agent.md"
     if refresh_agent_md_prompt(copilot_path, profile):
@@ -129,10 +129,10 @@ def refresh_installed_agent_for_profile(profile_name: str) -> List[Path]:
 
 
 def refresh_all_cao_managed_agents() -> List[Path]:
-    """Refresh every installed Kiro/Q/Copilot agent managed by CAO."""
+    """Refresh every installed Q/Copilot agent managed by CAO."""
     refreshed_paths: List[Path] = []
 
-    # Kiro and Q JSON agents — identified by resources pointing at AGENT_CONTEXT_DIR
+    # Q JSON agents — identified by resources pointing at AGENT_CONTEXT_DIR
     for json_path in _iter_installed_agent_jsons():
         with json_path.open(encoding="utf-8") as source_file:
             loaded_config = json.load(source_file)
@@ -196,11 +196,10 @@ def refresh_all_cao_managed_agents() -> List[Path]:
 
 
 def _iter_installed_agent_jsons() -> Iterator[Path]:
-    """Yield installed agent JSON files from the Kiro and Q agent directories."""
-    for agents_dir in (KIRO_AGENTS_DIR, Q_AGENTS_DIR):
-        if not agents_dir.exists():
-            continue
-        yield from sorted(agents_dir.glob("*.json"))
+    """Yield installed Q agent JSON files."""
+    if not Q_AGENTS_DIR.exists():
+        return
+    yield from sorted(Q_AGENTS_DIR.glob("*.json"))
 
 
 def _iter_installed_copilot_agents() -> Iterator[Path]:

@@ -88,9 +88,9 @@ class TestSkillsAddCommand:
         skill_store = tmp_path / "skill-store"
         local_store = tmp_path / "agent-store"
         context_dir = tmp_path / "agent-context"
-        kiro_dir = tmp_path / "kiro"
         q_dir = tmp_path / "q"
-        for path in (skill_store, local_store, context_dir, kiro_dir, q_dir):
+        copilot_dir = tmp_path / "copilot"
+        for path in (skill_store, local_store, context_dir, q_dir):
             path.mkdir(parents=True, exist_ok=True)
 
         monkeypatch.setattr("cli_agent_orchestrator.cli.commands.skills.SKILLS_DIR", skill_store)
@@ -98,10 +98,10 @@ class TestSkillsAddCommand:
         monkeypatch.setattr(
             "cli_agent_orchestrator.utils.skill_injection.AGENT_CONTEXT_DIR", context_dir
         )
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.utils.skill_injection.KIRO_AGENTS_DIR", kiro_dir
-        )
         monkeypatch.setattr("cli_agent_orchestrator.utils.skill_injection.Q_AGENTS_DIR", q_dir)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.skill_injection.COPILOT_AGENTS_DIR", copilot_dir
+        )
         monkeypatch.setattr(
             "cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR", local_store
         )
@@ -118,7 +118,7 @@ class TestSkillsAddCommand:
         )
         context_file = context_dir / "developer.md"
         context_file.write_text("context", encoding="utf-8")
-        agent_json = kiro_dir / "developer.json"
+        agent_json = q_dir / "developer.json"
         agent_json.write_text(
             json.dumps(
                 {
@@ -211,10 +211,10 @@ class TestSkillsAddCommand:
         monkeypatch.setattr("cli_agent_orchestrator.cli.commands.skills.SKILLS_DIR", skill_store)
         monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", skill_store)
         monkeypatch.setattr(
-            "cli_agent_orchestrator.utils.skill_injection.KIRO_AGENTS_DIR", tmp_path / "kiro"
+            "cli_agent_orchestrator.utils.skill_injection.Q_AGENTS_DIR", tmp_path / "q"
         )
         monkeypatch.setattr(
-            "cli_agent_orchestrator.utils.skill_injection.Q_AGENTS_DIR", tmp_path / "q"
+            "cli_agent_orchestrator.utils.skill_injection.COPILOT_AGENTS_DIR", tmp_path / "copilot"
         )
 
         source_dir = tmp_path / "python-testing"
@@ -247,22 +247,18 @@ class TestSkillsAddCommand:
     def test_add_leaves_non_cao_managed_json_unchanged(self, runner, tmp_path, monkeypatch):
         """Non-CAO-managed installed JSONs should be untouched by skill add."""
         skill_store = tmp_path / "skill-store"
-        kiro_dir = tmp_path / "kiro"
         q_dir = tmp_path / "q"
-        for path in (skill_store, kiro_dir, q_dir):
+        for path in (skill_store, q_dir):
             path.mkdir(parents=True, exist_ok=True)
 
         monkeypatch.setattr("cli_agent_orchestrator.cli.commands.skills.SKILLS_DIR", skill_store)
         monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", skill_store)
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.utils.skill_injection.KIRO_AGENTS_DIR", kiro_dir
-        )
         monkeypatch.setattr("cli_agent_orchestrator.utils.skill_injection.Q_AGENTS_DIR", q_dir)
         monkeypatch.setattr(
             "cli_agent_orchestrator.utils.skill_injection.AGENT_CONTEXT_DIR", tmp_path / "context"
         )
 
-        unmanaged_json = kiro_dir / "developer.json"
+        unmanaged_json = q_dir / "developer.json"
         unmanaged_json.write_text(
             json.dumps(
                 {
@@ -333,9 +329,9 @@ class TestSkillsRemoveCommand:
         skill_store = tmp_path / "skill-store"
         local_store = tmp_path / "agent-store"
         context_dir = tmp_path / "agent-context"
-        kiro_dir = tmp_path / "kiro"
         q_dir = tmp_path / "q"
-        for path in (skill_store, local_store, context_dir, kiro_dir, q_dir):
+        copilot_dir = tmp_path / "copilot"
+        for path in (skill_store, local_store, context_dir, q_dir):
             path.mkdir(parents=True, exist_ok=True)
 
         monkeypatch.setattr("cli_agent_orchestrator.cli.commands.skills.SKILLS_DIR", skill_store)
@@ -343,10 +339,10 @@ class TestSkillsRemoveCommand:
         monkeypatch.setattr(
             "cli_agent_orchestrator.utils.skill_injection.AGENT_CONTEXT_DIR", context_dir
         )
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.utils.skill_injection.KIRO_AGENTS_DIR", kiro_dir
-        )
         monkeypatch.setattr("cli_agent_orchestrator.utils.skill_injection.Q_AGENTS_DIR", q_dir)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.skill_injection.COPILOT_AGENTS_DIR", copilot_dir
+        )
         monkeypatch.setattr(
             "cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR", local_store
         )
@@ -364,7 +360,7 @@ class TestSkillsRemoveCommand:
         _create_skill(skill_store / "python-testing", "python-testing", "Pytest conventions")
         context_file = context_dir / "developer.md"
         context_file.write_text("context", encoding="utf-8")
-        agent_json = kiro_dir / "developer.json"
+        agent_json = q_dir / "developer.json"
         agent_json.write_text(
             json.dumps(
                 {
@@ -391,23 +387,19 @@ class TestSkillsRemoveCommand:
     def test_remove_leaves_non_cao_managed_json_unchanged(self, runner, tmp_path, monkeypatch):
         """Non-CAO-managed installed JSONs should be untouched by skill remove."""
         skill_store = tmp_path / "skill-store"
-        kiro_dir = tmp_path / "kiro"
         q_dir = tmp_path / "q"
-        for path in (skill_store, kiro_dir, q_dir):
+        for path in (skill_store, q_dir):
             path.mkdir(parents=True, exist_ok=True)
 
         monkeypatch.setattr("cli_agent_orchestrator.cli.commands.skills.SKILLS_DIR", skill_store)
         monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", skill_store)
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.utils.skill_injection.KIRO_AGENTS_DIR", kiro_dir
-        )
         monkeypatch.setattr("cli_agent_orchestrator.utils.skill_injection.Q_AGENTS_DIR", q_dir)
         monkeypatch.setattr(
             "cli_agent_orchestrator.utils.skill_injection.AGENT_CONTEXT_DIR", tmp_path / "context"
         )
 
         _create_skill(skill_store / "python-testing", "python-testing", "Pytest conventions")
-        unmanaged_json = kiro_dir / "developer.json"
+        unmanaged_json = q_dir / "developer.json"
         unmanaged_json.write_text(
             json.dumps(
                 {

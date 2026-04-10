@@ -291,35 +291,12 @@ class TestRefreshAgentMdPrompt:
 class TestRefreshInstalledAgentForProfile:
     """Tests for refresh_installed_agent_for_profile."""
 
-    def test_returns_only_kiro_path_when_only_kiro_json_exists(self, tmp_path, monkeypatch):
-        kiro_dir = tmp_path / "kiro"
-        q_dir = tmp_path / "q"
-        copilot_dir = tmp_path / "copilot"
-        kiro_path = kiro_dir / "team__developer.json"
-        _write_json(kiro_path, {"name": "team/developer", "description": "Developer"})
-
-        monkeypatch.setattr(skill_injection, "KIRO_AGENTS_DIR", kiro_dir)
-        monkeypatch.setattr(skill_injection, "Q_AGENTS_DIR", q_dir)
-        monkeypatch.setattr(skill_injection, "COPILOT_AGENTS_DIR", copilot_dir)
-        monkeypatch.setattr(
-            skill_injection,
-            "load_agent_profile",
-            lambda name: AgentProfile(
-                name="team/developer", description="Developer", prompt="Prompt"
-            ),
-        )
-        monkeypatch.setattr(skill_injection, "build_skill_catalog", lambda: "")
-
-        assert skill_injection.refresh_installed_agent_for_profile("team-developer") == [kiro_path]
-
     def test_returns_only_q_path_when_only_q_json_exists(self, tmp_path, monkeypatch):
-        kiro_dir = tmp_path / "kiro"
         q_dir = tmp_path / "q"
         copilot_dir = tmp_path / "copilot"
         q_path = q_dir / "team__developer.json"
         _write_json(q_path, {"name": "team/developer", "description": "Developer"})
 
-        monkeypatch.setattr(skill_injection, "KIRO_AGENTS_DIR", kiro_dir)
         monkeypatch.setattr(skill_injection, "Q_AGENTS_DIR", q_dir)
         monkeypatch.setattr(skill_injection, "COPILOT_AGENTS_DIR", copilot_dir)
         monkeypatch.setattr(
@@ -333,40 +310,12 @@ class TestRefreshInstalledAgentForProfile:
 
         assert skill_injection.refresh_installed_agent_for_profile("team-developer") == [q_path]
 
-    def test_returns_both_paths_when_both_json_files_exist(self, tmp_path, monkeypatch):
-        kiro_dir = tmp_path / "kiro"
-        q_dir = tmp_path / "q"
-        copilot_dir = tmp_path / "copilot"
-        kiro_path = kiro_dir / "team__developer.json"
-        q_path = q_dir / "team__developer.json"
-        _write_json(kiro_path, {"name": "team/developer", "description": "Developer"})
-        _write_json(q_path, {"name": "team/developer", "description": "Developer"})
-
-        monkeypatch.setattr(skill_injection, "KIRO_AGENTS_DIR", kiro_dir)
-        monkeypatch.setattr(skill_injection, "Q_AGENTS_DIR", q_dir)
-        monkeypatch.setattr(skill_injection, "COPILOT_AGENTS_DIR", copilot_dir)
-        monkeypatch.setattr(
-            skill_injection,
-            "load_agent_profile",
-            lambda name: AgentProfile(
-                name="team/developer", description="Developer", prompt="Prompt"
-            ),
-        )
-        monkeypatch.setattr(skill_injection, "build_skill_catalog", lambda: "")
-
-        assert skill_injection.refresh_installed_agent_for_profile("team-developer") == [
-            kiro_path,
-            q_path,
-        ]
-
     def test_returns_copilot_path_when_copilot_agent_exists(self, tmp_path, monkeypatch):
-        kiro_dir = tmp_path / "kiro"
         q_dir = tmp_path / "q"
         copilot_dir = tmp_path / "copilot"
         copilot_path = copilot_dir / "team__developer.agent.md"
         _write_agent_md(copilot_path, "team/developer", "Developer", "Old prompt")
 
-        monkeypatch.setattr(skill_injection, "KIRO_AGENTS_DIR", kiro_dir)
         monkeypatch.setattr(skill_injection, "Q_AGENTS_DIR", q_dir)
         monkeypatch.setattr(skill_injection, "COPILOT_AGENTS_DIR", copilot_dir)
         monkeypatch.setattr(
@@ -382,18 +331,14 @@ class TestRefreshInstalledAgentForProfile:
             copilot_path
         ]
 
-    def test_returns_all_three_when_kiro_q_copilot_exist(self, tmp_path, monkeypatch):
-        kiro_dir = tmp_path / "kiro"
+    def test_returns_q_and_copilot_when_both_exist(self, tmp_path, monkeypatch):
         q_dir = tmp_path / "q"
         copilot_dir = tmp_path / "copilot"
-        kiro_path = kiro_dir / "team__developer.json"
         q_path = q_dir / "team__developer.json"
         copilot_path = copilot_dir / "team__developer.agent.md"
-        _write_json(kiro_path, {"name": "team/developer", "description": "Developer"})
         _write_json(q_path, {"name": "team/developer", "description": "Developer"})
         _write_agent_md(copilot_path, "team/developer", "Developer", "Old prompt")
 
-        monkeypatch.setattr(skill_injection, "KIRO_AGENTS_DIR", kiro_dir)
         monkeypatch.setattr(skill_injection, "Q_AGENTS_DIR", q_dir)
         monkeypatch.setattr(skill_injection, "COPILOT_AGENTS_DIR", copilot_dir)
         monkeypatch.setattr(
@@ -406,13 +351,11 @@ class TestRefreshInstalledAgentForProfile:
         monkeypatch.setattr(skill_injection, "build_skill_catalog", lambda: "")
 
         assert skill_injection.refresh_installed_agent_for_profile("team-developer") == [
-            kiro_path,
             q_path,
             copilot_path,
         ]
 
     def test_returns_empty_list_when_no_installed_agents_exist(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(skill_injection, "KIRO_AGENTS_DIR", tmp_path / "kiro")
         monkeypatch.setattr(skill_injection, "Q_AGENTS_DIR", tmp_path / "q")
         monkeypatch.setattr(skill_injection, "COPILOT_AGENTS_DIR", tmp_path / "copilot")
         monkeypatch.setattr(
@@ -430,12 +373,11 @@ class TestRefreshInstalledAgentForProfile:
 class TestRefreshAllCaoManagedAgents:
     """Tests for refresh_all_cao_managed_agents."""
 
-    def test_refreshes_kiro_json_with_cao_managed_resource(self, tmp_path, monkeypatch):
+    def test_refreshes_q_json_with_cao_managed_resource(self, tmp_path, monkeypatch):
         context_dir = tmp_path / "agent-context"
-        kiro_dir = tmp_path / "kiro"
         q_dir = tmp_path / "q"
         copilot_dir = tmp_path / "copilot"
-        managed_path = kiro_dir / "developer.json"
+        managed_path = q_dir / "developer.json"
         context_file = context_dir / "developer.md"
         context_file.parent.mkdir(parents=True, exist_ok=True)
         context_file.write_text("context", encoding="utf-8")
@@ -449,7 +391,6 @@ class TestRefreshAllCaoManagedAgents:
         )
 
         monkeypatch.setattr(skill_injection, "AGENT_CONTEXT_DIR", context_dir)
-        monkeypatch.setattr(skill_injection, "KIRO_AGENTS_DIR", kiro_dir)
         monkeypatch.setattr(skill_injection, "Q_AGENTS_DIR", q_dir)
         monkeypatch.setattr(skill_injection, "COPILOT_AGENTS_DIR", copilot_dir)
         monkeypatch.setattr(
@@ -466,7 +407,6 @@ class TestRefreshAllCaoManagedAgents:
 
     def test_refreshes_copilot_agent_with_matching_context_file(self, tmp_path, monkeypatch):
         context_dir = tmp_path / "agent-context"
-        kiro_dir = tmp_path / "kiro"
         q_dir = tmp_path / "q"
         copilot_dir = tmp_path / "copilot"
 
@@ -480,7 +420,6 @@ class TestRefreshAllCaoManagedAgents:
         _write_agent_md(copilot_path, "developer", "Developer", "Old prompt")
 
         monkeypatch.setattr(skill_injection, "AGENT_CONTEXT_DIR", context_dir)
-        monkeypatch.setattr(skill_injection, "KIRO_AGENTS_DIR", kiro_dir)
         monkeypatch.setattr(skill_injection, "Q_AGENTS_DIR", q_dir)
         monkeypatch.setattr(skill_injection, "COPILOT_AGENTS_DIR", copilot_dir)
         monkeypatch.setattr(
@@ -498,7 +437,6 @@ class TestRefreshAllCaoManagedAgents:
     def test_skips_copilot_agent_without_context_file(self, tmp_path, monkeypatch):
         context_dir = tmp_path / "agent-context"
         context_dir.mkdir(parents=True, exist_ok=True)
-        kiro_dir = tmp_path / "kiro"
         q_dir = tmp_path / "q"
         copilot_dir = tmp_path / "copilot"
 
@@ -508,7 +446,6 @@ class TestRefreshAllCaoManagedAgents:
         original_bytes = copilot_path.read_bytes()
 
         monkeypatch.setattr(skill_injection, "AGENT_CONTEXT_DIR", context_dir)
-        monkeypatch.setattr(skill_injection, "KIRO_AGENTS_DIR", kiro_dir)
         monkeypatch.setattr(skill_injection, "Q_AGENTS_DIR", q_dir)
         monkeypatch.setattr(skill_injection, "COPILOT_AGENTS_DIR", copilot_dir)
 
@@ -517,9 +454,9 @@ class TestRefreshAllCaoManagedAgents:
 
     def test_skips_json_with_only_non_cao_resources(self, tmp_path, monkeypatch):
         context_dir = tmp_path / "agent-context"
-        kiro_dir = tmp_path / "kiro"
+        q_dir = tmp_path / "q"
         copilot_dir = tmp_path / "copilot"
-        unmanaged_path = kiro_dir / "developer.json"
+        unmanaged_path = q_dir / "developer.json"
         _write_json(
             unmanaged_path,
             {
@@ -531,8 +468,7 @@ class TestRefreshAllCaoManagedAgents:
         original_bytes = unmanaged_path.read_bytes()
 
         monkeypatch.setattr(skill_injection, "AGENT_CONTEXT_DIR", context_dir)
-        monkeypatch.setattr(skill_injection, "KIRO_AGENTS_DIR", kiro_dir)
-        monkeypatch.setattr(skill_injection, "Q_AGENTS_DIR", tmp_path / "q")
+        monkeypatch.setattr(skill_injection, "Q_AGENTS_DIR", q_dir)
         monkeypatch.setattr(skill_injection, "COPILOT_AGENTS_DIR", copilot_dir)
         monkeypatch.setattr(
             skill_injection,
@@ -552,15 +488,14 @@ class TestRefreshAllCaoManagedAgents:
     )
     def test_skips_json_with_empty_or_missing_resources(self, payload, tmp_path, monkeypatch):
         context_dir = tmp_path / "agent-context"
-        kiro_dir = tmp_path / "kiro"
+        q_dir = tmp_path / "q"
         copilot_dir = tmp_path / "copilot"
-        json_path = kiro_dir / "developer.json"
+        json_path = q_dir / "developer.json"
         _write_json(json_path, payload)
         original_bytes = json_path.read_bytes()
 
         monkeypatch.setattr(skill_injection, "AGENT_CONTEXT_DIR", context_dir)
-        monkeypatch.setattr(skill_injection, "KIRO_AGENTS_DIR", kiro_dir)
-        monkeypatch.setattr(skill_injection, "Q_AGENTS_DIR", tmp_path / "q")
+        monkeypatch.setattr(skill_injection, "Q_AGENTS_DIR", q_dir)
         monkeypatch.setattr(skill_injection, "COPILOT_AGENTS_DIR", copilot_dir)
 
         assert skill_injection.refresh_all_cao_managed_agents() == []
@@ -578,7 +513,6 @@ class TestRefreshAllCaoManagedAgents:
         self, tmp_path, monkeypatch, caplog, load_error
     ):
         context_dir = tmp_path / "agent-context"
-        kiro_dir = tmp_path / "kiro"
         q_dir = tmp_path / "q"
         copilot_dir = tmp_path / "copilot"
         good_context = context_dir / "good.md"
@@ -587,7 +521,7 @@ class TestRefreshAllCaoManagedAgents:
         good_context.write_text("good", encoding="utf-8")
         missing_context.write_text("missing", encoding="utf-8")
 
-        good_path = kiro_dir / "good.json"
+        good_path = q_dir / "good.json"
         missing_path = q_dir / "missing.json"
         _write_json(
             good_path,
@@ -612,7 +546,6 @@ class TestRefreshAllCaoManagedAgents:
             raise load_error
 
         monkeypatch.setattr(skill_injection, "AGENT_CONTEXT_DIR", context_dir)
-        monkeypatch.setattr(skill_injection, "KIRO_AGENTS_DIR", kiro_dir)
         monkeypatch.setattr(skill_injection, "Q_AGENTS_DIR", q_dir)
         monkeypatch.setattr(skill_injection, "COPILOT_AGENTS_DIR", copilot_dir)
         monkeypatch.setattr(skill_injection, "load_agent_profile", load_profile)
@@ -626,41 +559,22 @@ class TestRefreshAllCaoManagedAgents:
         assert "missing" in caplog.text
         assert "prompt" not in _read_json(missing_path)
 
-    def test_refreshes_cao_managed_across_all_providers(self, tmp_path, monkeypatch):
+    def test_refreshes_cao_managed_across_q_and_copilot(self, tmp_path, monkeypatch):
         context_dir = tmp_path / "agent-context"
-        kiro_dir = tmp_path / "kiro"
         q_dir = tmp_path / "q"
         copilot_dir = tmp_path / "copilot"
 
         # Create context files for managed agents
-        for name in ("managed-kiro", "managed-q", "managed-copilot"):
+        for name in ("managed-q", "managed-copilot"):
             ctx = context_dir / f"{name}.md"
             ctx.parent.mkdir(parents=True, exist_ok=True)
             ctx.write_text(name, encoding="utf-8")
 
-        managed_kiro = kiro_dir / "managed-kiro.json"
-        unmanaged_kiro = kiro_dir / "unmanaged-kiro.json"
         managed_q = q_dir / "managed-q.json"
         unmanaged_q = q_dir / "unmanaged-q.json"
         managed_copilot = copilot_dir / "managed-copilot.agent.md"
         unmanaged_copilot = copilot_dir / "unmanaged-copilot.agent.md"
 
-        _write_json(
-            managed_kiro,
-            {
-                "name": "managed-kiro",
-                "description": "Managed Kiro",
-                "resources": [f"file://{context_dir / 'managed-kiro.md'}"],
-            },
-        )
-        _write_json(
-            unmanaged_kiro,
-            {
-                "name": "unmanaged-kiro",
-                "description": "Unmanaged Kiro",
-                "resources": ["file:///tmp/other.md"],
-            },
-        )
         _write_json(
             managed_q,
             {
@@ -688,7 +602,6 @@ class TestRefreshAllCaoManagedAgents:
             )
 
         monkeypatch.setattr(skill_injection, "AGENT_CONTEXT_DIR", context_dir)
-        monkeypatch.setattr(skill_injection, "KIRO_AGENTS_DIR", kiro_dir)
         monkeypatch.setattr(skill_injection, "Q_AGENTS_DIR", q_dir)
         monkeypatch.setattr(skill_injection, "COPILOT_AGENTS_DIR", copilot_dir)
         monkeypatch.setattr(skill_injection, "load_agent_profile", load_profile)
@@ -696,11 +609,9 @@ class TestRefreshAllCaoManagedAgents:
 
         refreshed = skill_injection.refresh_all_cao_managed_agents()
 
-        assert refreshed == [managed_kiro, managed_q, managed_copilot]
-        assert _read_json(managed_kiro)["prompt"] == "managed-kiro prompt\n\n## Available Skills"
+        assert refreshed == [managed_q, managed_copilot]
         assert _read_json(managed_q)["prompt"] == "managed-q prompt\n\n## Available Skills"
         assert (
             _read_agent_md_body(managed_copilot) == "managed-copilot prompt\n\n## Available Skills"
         )
-        assert "prompt" not in _read_json(unmanaged_kiro)
         assert "prompt" not in _read_json(unmanaged_q)

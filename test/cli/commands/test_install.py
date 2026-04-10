@@ -754,8 +754,8 @@ class TestInstallSkillCatalogBaking:
         """Write a local markdown profile for install tests."""
         profile_path.write_text(f"---\n{frontmatter_body}---\n{system_prompt}\n", encoding="utf-8")
 
-    def test_install_kiro_bakes_catalog_into_prompt(self, runner, install_workspace):
-        """Kiro installs should bake the global skill catalog into the JSON prompt."""
+    def test_install_kiro_uses_skill_resources_not_baked_prompt(self, runner, install_workspace):
+        """Kiro installs should use skill:// glob in resources instead of baking catalog into prompt."""
         _create_skill(
             install_workspace["skills_dir"] / "python-testing",
             "python-testing",
@@ -771,8 +771,13 @@ class TestInstallSkillCatalogBaking:
 
         assert result.exit_code == 0
         agent_json = json.loads((install_workspace["kiro_dir"] / "test-agent.json").read_text())
-        assert agent_json["prompt"].startswith("Build things\n\n## Available Skills")
-        assert "python-testing" in agent_json["prompt"]
+        # Prompt should be the raw profile prompt without skill catalog
+        assert agent_json["prompt"] == "Build things"
+        assert "Available Skills" not in agent_json["prompt"]
+        # Resources should contain the skill:// glob
+        skill_resources = [r for r in agent_json["resources"] if r.startswith("skill://")]
+        assert len(skill_resources) == 1
+        assert skill_resources[0].endswith("/*/SKILL.md")
 
     def test_install_q_bakes_catalog_into_prompt(self, runner, install_workspace):
         """Q installs should bake the global skill catalog into the JSON prompt."""
@@ -794,10 +799,10 @@ class TestInstallSkillCatalogBaking:
         assert agent_json["prompt"].startswith("Build things\n\n## Available Skills")
         assert "python-testing" in agent_json["prompt"]
 
-    def test_install_kiro_omits_prompt_field_when_profile_and_skills_are_empty(
+    def test_install_kiro_omits_prompt_field_when_profile_prompt_is_empty(
         self, runner, install_workspace
     ):
-        """Empty profile prompt plus empty skill store should preserve the no-prompt JSON shape."""
+        """Empty profile prompt should omit prompt field; skill:// glob still in resources."""
         self._write_profile(
             install_workspace["local_store_dir"] / "test-agent.md",
             "name: test-agent\ndescription: Test agent\n",
@@ -810,15 +815,9 @@ class TestInstallSkillCatalogBaking:
         agent_path = install_workspace["kiro_dir"] / "test-agent.json"
         agent_json = json.loads(agent_path.read_text())
         assert "prompt" not in agent_json
-
-        expected_json = KiroAgentConfig(
-            name="test-agent",
-            description="Test agent",
-            tools=["*"],
-            allowedTools=["@builtin", "fs_*", "execute_bash", "@cao-mcp-server"],
-            resources=[f"file://{(install_workspace['context_dir'] / 'test-agent.md').absolute()}"],
-        ).model_dump_json(indent=2, exclude_none=True)
-        assert agent_path.read_text() == expected_json
+        # skill:// glob should still be present in resources
+        skill_resources = [r for r in agent_json["resources"] if r.startswith("skill://")]
+        assert len(skill_resources) == 1
 
     @pytest.mark.parametrize("provider,dir_key", [("kiro_cli", "kiro_dir"), ("q_cli", "q_dir")])
     def test_install_writes_json_atomically_without_tmp_leak(
@@ -858,10 +857,10 @@ class TestInstallSkillCatalogBaking:
             "System prompt",
         )
 
-        result = runner.invoke(install, ["unicode-agent", "--provider", "kiro_cli"])
+        result = runner.invoke(install, ["unicode-agent", "--provider", "q_cli"])
 
         assert result.exit_code == 0
-        agent_path = install_workspace["kiro_dir"] / "unicode-agent.json"
+        agent_path = install_workspace["q_dir"] / "unicode-agent.json"
         before_refresh = agent_path.read_bytes()
 
         refreshed = refresh_agent_json_prompt(
