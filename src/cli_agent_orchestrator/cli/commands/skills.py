@@ -6,6 +6,7 @@ from pathlib import Path
 import click
 
 from cli_agent_orchestrator.constants import SKILLS_DIR
+from cli_agent_orchestrator.utils.skill_injection import refresh_all_cao_managed_agents
 from cli_agent_orchestrator.utils.skills import (
     list_skills,
     validate_skill_folder,
@@ -32,6 +33,18 @@ def _install_skill_folder(source_dir: Path, force: bool = False) -> Path:
     return destination_dir
 
 
+def _refresh_installed_agents() -> None:
+    """Refresh baked prompts for installed CAO-managed Kiro/Q agents."""
+    try:
+        refreshed = refresh_all_cao_managed_agents()
+    except Exception as exc:
+        click.echo(f"Warning: failed to refresh installed agent prompts: {exc}", err=True)
+        return
+
+    if refreshed:
+        click.echo(f"Refreshed {len(refreshed)} installed agent(s)")
+
+
 @click.group()
 def skills():
     """Manage installed skills."""
@@ -45,6 +58,7 @@ def add(folder_path: Path, force: bool) -> None:
     try:
         destination_dir = _install_skill_folder(folder_path, force=force)
         click.echo(f"Skill '{destination_dir.name}' installed successfully")
+        _refresh_installed_agents()
     except Exception as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -63,6 +77,7 @@ def remove(name: str) -> None:
 
         shutil.rmtree(skill_dir)
         click.echo(f"Skill '{skill_name}' removed successfully")
+        _refresh_installed_agents()
     except Exception as exc:
         raise click.ClickException(str(exc)) from exc
 
