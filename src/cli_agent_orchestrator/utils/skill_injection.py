@@ -53,7 +53,7 @@ def refresh_agent_json_prompt(json_path: Path, profile: AgentProfile) -> bool:
     temp_path = json_path.with_suffix(json_path.suffix + ".tmp")
     try:
         with temp_path.open("w", encoding="utf-8") as temp_file:
-            json.dump(config, temp_file, indent=2)
+            json.dump(config, temp_file, indent=2, ensure_ascii=False)
         os.replace(temp_path, json_path)
     finally:
         if temp_path.exists():

@@ -1,5 +1,6 @@
 """Install command for CLI Agent Orchestrator."""
 
+import os
 import re
 from importlib import resources
 from pathlib import Path
@@ -24,6 +25,18 @@ from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.q_agent import QAgentConfig
 from cli_agent_orchestrator.utils.agent_profiles import parse_agent_profile_text
 from cli_agent_orchestrator.utils.env import resolve_env_vars, set_env_var
+from cli_agent_orchestrator.utils.skill_injection import compose_agent_prompt
+
+
+def _write_text_atomic(target_path: Path, content: str) -> None:
+    """Write text to a sibling temp file and atomically replace the target."""
+    temp_path = target_path.with_suffix(target_path.suffix + ".tmp")
+    try:
+        temp_path.write_text(content, encoding="utf-8")
+        os.replace(temp_path, target_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
 
 
 def _download_agent(source: str) -> str:
@@ -177,7 +190,7 @@ def install(agent_source: str, provider: str, env_vars: tuple[str, ...]):
                 tools=profile.tools if profile.tools is not None else ["*"],
                 allowedTools=allowed_tools,
                 resources=[f"file://{dest_file.absolute()}"],
-                prompt=profile.prompt,
+                prompt=compose_agent_prompt(profile),
                 mcpServers=profile.mcpServers,
                 toolAliases=profile.toolAliases,
                 toolsSettings=profile.toolsSettings,
@@ -186,8 +199,9 @@ def install(agent_source: str, provider: str, env_vars: tuple[str, ...]):
             )
             safe_filename = profile.name.replace("/", "__")
             agent_file = Q_AGENTS_DIR / f"{safe_filename}.json"
-            with open(agent_file, "w") as f:
-                f.write(agent_config.model_dump_json(indent=2, exclude_none=True))
+            _write_text_atomic(
+                agent_file, agent_config.model_dump_json(indent=2, exclude_none=True)
+            )
 
         elif provider == ProviderType.KIRO_CLI.value:
             KIRO_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -197,7 +211,7 @@ def install(agent_source: str, provider: str, env_vars: tuple[str, ...]):
                 tools=profile.tools if profile.tools is not None else ["*"],
                 allowedTools=allowed_tools,
                 resources=[f"file://{dest_file.absolute()}"],
-                prompt=profile.prompt,
+                prompt=compose_agent_prompt(profile),
                 mcpServers=profile.mcpServers,
                 toolAliases=profile.toolAliases,
                 toolsSettings=profile.toolsSettings,
@@ -206,8 +220,9 @@ def install(agent_source: str, provider: str, env_vars: tuple[str, ...]):
             )
             safe_filename = profile.name.replace("/", "__")
             agent_file = KIRO_AGENTS_DIR / f"{safe_filename}.json"
-            with open(agent_file, "w") as f:
-                f.write(agent_config.model_dump_json(indent=2, exclude_none=True))
+            _write_text_atomic(
+                agent_file, agent_config.model_dump_json(indent=2, exclude_none=True)
+            )
 
         elif provider == ProviderType.COPILOT_CLI.value:
             COPILOT_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
