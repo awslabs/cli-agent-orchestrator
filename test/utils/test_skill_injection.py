@@ -26,9 +26,10 @@ def _read_json(path: Path) -> dict:
 class TestComposeAgentPrompt:
     """Tests for compose_agent_prompt."""
 
+    @pytest.mark.parametrize("prompt", [None, "", "   ", "\n"])
     @patch("cli_agent_orchestrator.utils.skill_injection.build_skill_catalog", return_value="")
-    def test_returns_none_when_prompt_and_catalog_are_empty(self, _mock_catalog):
-        profile = AgentProfile(name="developer", description="Developer")
+    def test_returns_none_when_prompt_and_catalog_are_empty(self, _mock_catalog, prompt):
+        profile = AgentProfile(name="developer", description="Developer", prompt=prompt)
 
         assert skill_injection.compose_agent_prompt(profile) is None
 
@@ -319,8 +320,16 @@ class TestRefreshAllCaoManagedAgents:
         assert skill_injection.refresh_all_cao_managed_agents() == []
         assert json_path.read_bytes() == original_bytes
 
-    def test_logs_warning_and_continues_when_source_profile_is_missing(
-        self, tmp_path, monkeypatch, caplog
+    @pytest.mark.parametrize(
+        "load_error",
+        [
+            FileNotFoundError("profile missing"),
+            RuntimeError("profile missing"),
+            ValueError("invalid profile name"),
+        ],
+    )
+    def test_logs_warning_and_continues_when_source_profile_load_fails(
+        self, tmp_path, monkeypatch, caplog, load_error
     ):
         context_dir = tmp_path / "agent-context"
         kiro_dir = tmp_path / "kiro"
@@ -353,7 +362,7 @@ class TestRefreshAllCaoManagedAgents:
         def load_profile(name: str) -> AgentProfile:
             if name == "good":
                 return AgentProfile(name="good", description="Good agent", prompt="Prompt")
-            raise FileNotFoundError("profile missing")
+            raise load_error
 
         monkeypatch.setattr(skill_injection, "AGENT_CONTEXT_DIR", context_dir)
         monkeypatch.setattr(skill_injection, "KIRO_AGENTS_DIR", kiro_dir)

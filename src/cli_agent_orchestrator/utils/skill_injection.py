@@ -102,7 +102,7 @@ def refresh_all_cao_managed_agents() -> List[Path]:
 
         try:
             profile = load_agent_profile(profile_name)
-        except (FileNotFoundError, RuntimeError) as exc:
+        except Exception as exc:
             logger.warning(
                 "Skipping CAO-managed agent '%s' at %s: source profile could not be loaded: %s",
                 profile_name,
