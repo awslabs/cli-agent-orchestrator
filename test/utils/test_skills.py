@@ -1,11 +1,13 @@
 """Tests for skill utilities."""
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from cli_agent_orchestrator.models.skill import SkillMetadata
 from cli_agent_orchestrator.utils.skills import (
+    build_skill_catalog,
     list_skills,
     load_skill_content,
     load_skill_metadata,
@@ -244,3 +246,31 @@ class TestDefaultBundledSkills:
         assert "assign" in worker_content
         assert "handoff" in worker_content
         assert "send_message" in worker_content
+
+
+class TestBuildSkillCatalog:
+    """Tests for build_skill_catalog."""
+
+    @patch("cli_agent_orchestrator.utils.skills.list_skills", return_value=[])
+    def test_returns_empty_string_when_no_skills_installed(self, mock_list_skills):
+        """Empty skill stores should produce no injected catalog."""
+        assert build_skill_catalog() == ""
+        mock_list_skills.assert_called_once_with()
+
+    @patch("cli_agent_orchestrator.utils.skills.list_skills")
+    def test_renders_all_installed_skills(self, mock_list_skills):
+        """All installed skills should appear in the global catalog."""
+        mock_list_skills.return_value = [
+            SkillMetadata(name="cao-worker-protocols", description="Worker communication"),
+            SkillMetadata(name="python-testing", description="Pytest conventions"),
+        ]
+
+        assert build_skill_catalog() == (
+            "## Available Skills\n\n"
+            "The following skills are available exclusively in this CAO orchestration context. "
+            "To load a skill's full content, use the `get_skill` MCP tool provided by the "
+            "CAO MCP server. These skills are not accessible through provider-native skill "
+            "commands or directories.\n\n"
+            "- **cao-worker-protocols**: Worker communication\n"
+            "- **python-testing**: Pytest conventions"
+        )

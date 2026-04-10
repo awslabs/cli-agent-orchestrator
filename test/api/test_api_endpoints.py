@@ -161,7 +161,7 @@ class TestGetSkillContent:
     def test_get_skill_returns_content(self, client):
         """GET /skills/{name} returns the skill body on success."""
         with patch(
-            "cli_agent_orchestrator.utils.skills.load_skill_content",
+            "cli_agent_orchestrator.api.main.load_skill_content",
             return_value="# Python Testing\n\nUse pytest.",
         ):
             response = client.get("/skills/python-testing")
@@ -175,7 +175,7 @@ class TestGetSkillContent:
     def test_get_skill_returns_400_for_invalid_name(self, client):
         """GET /skills/{name} returns 400 for path traversal names."""
         with patch(
-            "cli_agent_orchestrator.utils.skills.load_skill_content",
+            "cli_agent_orchestrator.api.main.load_skill_content",
             side_effect=SkillNameError(
                 "Invalid skill name '../secret': must not contain '/', '\\\\', or '..'"
             ),
@@ -188,7 +188,7 @@ class TestGetSkillContent:
     def test_get_skill_returns_404_for_missing_skill(self, client):
         """GET /skills/{name} returns 404 when the skill does not exist."""
         with patch(
-            "cli_agent_orchestrator.utils.skills.load_skill_content",
+            "cli_agent_orchestrator.api.main.load_skill_content",
             side_effect=FileNotFoundError("Skill folder does not exist"),
         ):
             response = client.get("/skills/missing-skill")
@@ -199,7 +199,7 @@ class TestGetSkillContent:
     def test_get_skill_returns_500_for_parse_error(self, client):
         """GET /skills/{name} returns 500 for invalid skill file content."""
         with patch(
-            "cli_agent_orchestrator.utils.skills.load_skill_content",
+            "cli_agent_orchestrator.api.main.load_skill_content",
             side_effect=ValueError("Failed to parse skill file '/tmp/SKILL.md': bad yaml"),
         ):
             response = client.get("/skills/broken-skill")
@@ -212,7 +212,7 @@ class TestGetSkillContent:
     def test_get_skill_returns_500_for_filesystem_error(self, client):
         """GET /skills/{name} returns 500 for unexpected filesystem errors."""
         with patch(
-            "cli_agent_orchestrator.utils.skills.load_skill_content",
+            "cli_agent_orchestrator.api.main.load_skill_content",
             side_effect=OSError("Permission denied"),
         ):
             response = client.get("/skills/python-testing")

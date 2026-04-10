@@ -51,6 +51,11 @@ from cli_agent_orchestrator.services.inbox_service import LogFileHandler
 from cli_agent_orchestrator.services.terminal_service import OutputMode
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 from cli_agent_orchestrator.utils.logging import setup_logging
+from cli_agent_orchestrator.utils.skills import (
+    SkillNameError,
+    load_skill_content,
+    validate_skill_name,
+)
 from cli_agent_orchestrator.utils.terminal import generate_session_name
 
 logger = logging.getLogger(__name__)
@@ -256,12 +261,6 @@ async def set_agent_dirs_endpoint(body: AgentDirsUpdate) -> Dict:
 @app.get("/skills/{name}", response_model=SkillContentResponse)
 async def get_skill_content(name: str) -> SkillContentResponse:
     """Return the full Markdown body for an installed skill."""
-    from cli_agent_orchestrator.utils.skills import (
-        SkillNameError,
-        load_skill_content,
-        validate_skill_name,
-    )
-
     try:
         skill_name = validate_skill_name(name)
         content = load_skill_content(skill_name)
