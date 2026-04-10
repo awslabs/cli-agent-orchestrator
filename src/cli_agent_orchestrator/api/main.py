@@ -30,6 +30,7 @@ from cli_agent_orchestrator.constants import (
     ALLOWED_HOSTS,
     CAO_HOME_DIR,
     CORS_ORIGINS,
+    DEFAULT_PROVIDER,
     INBOX_POLLING_INTERVAL,
     SERVER_HOST,
     SERVER_PORT,
@@ -48,8 +49,9 @@ from cli_agent_orchestrator.services import (
 )
 from cli_agent_orchestrator.services.cleanup_service import cleanup_old_data
 from cli_agent_orchestrator.services.inbox_service import LogFileHandler
+from cli_agent_orchestrator.services.install_service import install_agent, parse_env_assignment
 from cli_agent_orchestrator.services.terminal_service import OutputMode
-from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
+from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.logging import setup_logging
 from cli_agent_orchestrator.utils.terminal import generate_session_name
 
@@ -174,6 +176,18 @@ async def health_check():
     return {"status": "ok", "service": "cli-agent-orchestrator"}
 
 
+def _parse_env_vars(env_vars: str) -> Dict[str, str]:
+    """Parse a comma-separated ``KEY=VALUE`` string into a mapping."""
+    parsed: Dict[str, str] = {}
+    for raw_assignment in env_vars.split(","):
+        assignment = raw_assignment.strip()
+        if not assignment:
+            continue
+        key, value = parse_env_assignment(assignment)
+        parsed[key] = value
+    return parsed
+
+
 @app.get("/agents/profiles")
 async def list_agent_profiles_endpoint() -> List[Dict]:
     """List all available agent profiles from all configured directories."""
@@ -186,6 +200,39 @@ async def list_agent_profiles_endpoint() -> List[Dict]:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to list agent profiles: {str(e)}",
         )
+
+
+@app.get("/agents/profiles/{name}")
+async def get_agent_profile_endpoint(name: str) -> Dict:
+    """Return the full parsed content of a named agent profile."""
+    try:
+        profile = load_agent_profile(name)
+        return profile.model_dump(exclude_none=True)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@app.post("/agents/profiles/install")
+async def install_agent_profile_endpoint(
+    source: str,
+    provider: str = DEFAULT_PROVIDER,
+    env_vars: Optional[str] = None,
+) -> Dict:
+    """Install an agent profile for a target provider."""
+    try:
+        parsed_env = _parse_env_vars(env_vars) if env_vars else None
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    result = install_agent(source=source, provider=provider, env_vars=parsed_env)
+    if not result.success:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=result.message)
+
+    return result.model_dump()
 
 
 @app.get("/agents/providers")
