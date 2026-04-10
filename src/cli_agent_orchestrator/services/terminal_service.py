@@ -35,7 +35,7 @@ from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
-from cli_agent_orchestrator.utils.skills import list_skills
+from cli_agent_orchestrator.utils.skills import build_skill_catalog
 from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
     generate_terminal_id,
@@ -56,38 +56,12 @@ class OutputMode(str, Enum):
     LAST = "last"
 
 
-SKILL_CATALOG_INSTRUCTION = (
-    "The following skills are available exclusively in this CAO orchestration context. "
-    "To load a skill's full content, use the `get_skill` MCP tool provided by the CAO MCP server. "
-    "These skills are not accessible through provider-native skill commands or directories."
-)
-
-
 RUNTIME_SKILL_PROMPT_PROVIDERS = {
     ProviderType.CLAUDE_CODE.value,
     ProviderType.CODEX.value,
     ProviderType.GEMINI_CLI.value,
     ProviderType.KIMI_CLI.value,
 }
-
-
-def build_skill_catalog() -> str:
-    """Build the injected skill catalog block for all installed skills."""
-    skills = list_skills()
-    if not skills:
-        return ""
-
-    skill_lines = [f"- **{skill.name}**: {skill.description}" for skill in skills]
-
-    return "\n".join(
-        [
-            "## Available Skills",
-            "",
-            SKILL_CATALOG_INSTRUCTION,
-            "",
-            *skill_lines,
-        ]
-    )
 
 
 def create_terminal(

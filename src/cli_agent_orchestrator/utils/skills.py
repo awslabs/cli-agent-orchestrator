@@ -12,6 +12,12 @@ from cli_agent_orchestrator.models.skill import SkillMetadata
 
 logger = logging.getLogger(__name__)
 
+SKILL_CATALOG_INSTRUCTION = (
+    "The following skills are available exclusively in this CAO orchestration context. "
+    "To load a skill's full content, use the `get_skill` MCP tool provided by the CAO MCP server. "
+    "These skills are not accessible through provider-native skill commands or directories."
+)
+
 
 class SkillNameError(ValueError):
     """Raised when a skill name is empty or unsafe to resolve on disk."""
@@ -96,6 +102,25 @@ def list_skills() -> List[SkillMetadata]:
             logger.warning("Skipping invalid skill folder '%s': %s", item, exc)
 
     return sorted(skills, key=lambda skill: skill.name)
+
+
+def build_skill_catalog() -> str:
+    """Build the injected skill catalog block for all installed skills."""
+    skills = list_skills()
+    if not skills:
+        return ""
+
+    skill_lines = [f"- **{skill.name}**: {skill.description}" for skill in skills]
+
+    return "\n".join(
+        [
+            "## Available Skills",
+            "",
+            SKILL_CATALOG_INSTRUCTION,
+            "",
+            *skill_lines,
+        ]
+    )
 
 
 def validate_skill_folder(path: Path) -> SkillMetadata:

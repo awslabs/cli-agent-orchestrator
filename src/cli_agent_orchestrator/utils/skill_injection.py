@@ -9,8 +9,8 @@ from urllib.parse import unquote, urlparse
 
 from cli_agent_orchestrator.constants import AGENT_CONTEXT_DIR, KIRO_AGENTS_DIR, Q_AGENTS_DIR
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
-from cli_agent_orchestrator.services.terminal_service import build_skill_catalog
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.skills import build_skill_catalog
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +103,7 @@ def refresh_all_cao_managed_agents() -> List[Path]:
         try:
             profile = load_agent_profile(profile_name)
         except Exception as exc:
+            # Bulk refresh should never let one bad installed JSON block the rest.
             logger.warning(
                 "Skipping CAO-managed agent '%s' at %s: source profile could not be loaded: %s",
                 profile_name,
