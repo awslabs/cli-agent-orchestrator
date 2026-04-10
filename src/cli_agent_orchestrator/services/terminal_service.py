@@ -56,6 +56,9 @@ class OutputMode(str, Enum):
     LAST = "last"
 
 
+# Providers that accept a runtime skill_prompt kwarg and append it to the
+# system prompt at launch time.  Kiro, Q, and Copilot receive skills via
+# the baked JSON prompt written at install time instead.
 RUNTIME_SKILL_PROMPT_PROVIDERS = {
     ProviderType.CLAUDE_CODE.value,
     ProviderType.CODEX.value,

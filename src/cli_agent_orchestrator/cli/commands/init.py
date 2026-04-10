@@ -11,7 +11,7 @@ from cli_agent_orchestrator.constants import SKILLS_DIR
 
 
 def seed_default_skills() -> int:
-    """Seed packaged default skills into the local skill store."""
+    """Seed builtin skills (cao-supervisor-protocols, cao-worker-protocols) into the local skill store."""
     SKILLS_DIR.mkdir(parents=True, exist_ok=True)
     bundled_skills = resources.files("cli_agent_orchestrator.skills")
     seeded_count = 0
