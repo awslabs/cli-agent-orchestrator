@@ -549,6 +549,22 @@ class TestClaudeCodeProviderStartupPrompts:
 
         mock_pane.send_keys.assert_called_once_with("", enter=True)
 
+    @patch("cli_agent_orchestrator.providers.claude_code.time.sleep")
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_handle_startup_prompts_retries_when_tmux_session_missing(self, mock_tmux, mock_sleep):
+        """Trust prompt handling should retry if tmux session metadata is briefly unavailable."""
+        mock_tmux.get_history.side_effect = [
+            "❯ 1. Yes, I trust this folder\n  2. No",
+            "Welcome to Claude Code v2.1.0",
+        ]
+        mock_tmux.server.sessions.get.return_value = None
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        provider._handle_startup_prompts(timeout=5.0)
+
+        mock_sleep.assert_called_once_with(1.0)
+        mock_tmux.server.sessions.get.assert_called_once_with(session_name="test-session")
+
     @patch("cli_agent_orchestrator.providers.claude_code.subprocess")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
     def test_handle_bypass_prompt_detected_and_accepted(self, mock_tmux, mock_subprocess):
