@@ -57,8 +57,8 @@ class OutputMode(str, Enum):
 
 
 # Providers that accept a runtime skill_prompt kwarg and append it to the
-# system prompt at launch time.  Kiro, Q, and Copilot receive skills via
-# the baked JSON prompt written at install time instead.
+# system prompt at launch time.  Kiro receives skills via native skill://
+# resources; Q and Copilot receive skills via baked prompts at install time.
 RUNTIME_SKILL_PROMPT_PROVIDERS = {
     ProviderType.CLAUDE_CODE.value,
     ProviderType.CODEX.value,
@@ -153,7 +153,8 @@ def create_terminal(
         # Step 4: Create and initialize the CLI provider
         # This starts the agent (e.g., runs "kiro-cli chat --agent developer")
         # Only runtime-prompt providers (Claude Code, Codex, Gemini, Kimi) receive
-        # the skill catalog; Kiro/Q/Copilot get it baked at install time instead.
+        # the skill catalog; Kiro uses native skill:// resources, Q and Copilot
+        # get it baked at install time.
         provider_instance = provider_manager.create_provider(
             provider,
             terminal_id,

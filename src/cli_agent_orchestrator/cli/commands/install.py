@@ -195,9 +195,7 @@ def install(agent_source: str, provider: str, env_vars: tuple[str, ...]):
         elif provider == ProviderType.KIRO_CLI.value:
             KIRO_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
             # Kiro natively supports skill:// resources with progressive loading
-            # (metadata at startup, full content on demand). A single glob entry
-            # captures all installed CAO skills, so no prompt-based catalog baking
-            # or refresh-on-skill-change is needed.
+            # (metadata at startup, full content on demand).
             kiro_resources = [
                 f"file://{dest_file.absolute()}",
                 f"skill://{SKILLS_DIR}/*/SKILL.md",
