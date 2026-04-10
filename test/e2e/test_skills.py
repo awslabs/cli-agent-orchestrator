@@ -31,7 +31,7 @@ from cli_agent_orchestrator.constants import API_BASE_URL
 
 @pytest.fixture(scope="module", autouse=True)
 def ensure_skills_seeded():
-    """Seed default skills so agent profiles with skills: can resolve them."""
+    """Seed default skills so the global skill catalog is non-empty."""
     seed_default_skills()
 
 
@@ -54,7 +54,7 @@ def _capture_full_scrollback(session_name: str, window_name: str) -> str:
 
 
 def _run_skill_injection_test(provider: str, agent_profile: str):
-    """Assert the skill catalog was injected into the provider CLI command.
+    """Assert the global skill catalog was injected into the provider CLI command.
 
     Creates a terminal, waits for it to become ready, then captures the
     full tmux scrollback to verify the skill catalog text appears in the
@@ -103,9 +103,7 @@ def _run_skill_injection_test(provider: str, agent_profile: str):
         assert len(scrollback.strip()) > 0, "Scrollback should not be empty"
 
         # Step 4: Assert skill catalog markers are present in the command.
-        # The developer profile declares skills: [cao-worker-protocols].
-        # After injection, the command string should contain the catalog.
-        #
+        # The catalog is global in Phase 1, so any installed skill should appear.
         assert "Available Skills" in scrollback, (
             f"Skill catalog heading 'Available Skills' not found in scrollback "
             f"(provider={provider}). First 500 chars: {scrollback[:500]}"
@@ -139,16 +137,7 @@ class TestCodexSkills:
 # command (where the skill catalog lives) from the tmux scrollback. Skill
 # injection for Claude Code is covered by unit tests (_apply_skill_prompt,
 # skill_prompt kwarg passing) and validated indirectly via the Codex test
-# which exercises the same service-layer code path.
-
-
-@pytest.mark.e2e
-class TestKiroCliSkills:
-    """E2E skill injection tests for the Kiro CLI provider."""
-
-    def test_skill_catalog_injected(self, require_kiro):
-        """Kiro CLI terminal command contains the injected skill catalog."""
-        _run_skill_injection_test(provider="kiro_cli", agent_profile="developer")
+# which exercises the same global-catalog service-layer code path.
 
 
 @pytest.mark.e2e
@@ -167,15 +156,6 @@ class TestGeminiCliSkills:
     def test_skill_catalog_injected(self, require_gemini):
         """Gemini CLI terminal command contains the injected skill catalog."""
         _run_skill_injection_test(provider="gemini_cli", agent_profile="developer")
-
-
-@pytest.mark.e2e
-class TestCopilotCliSkills:
-    """E2E skill injection tests for the Copilot CLI provider."""
-
-    def test_skill_catalog_injected(self, require_copilot):
-        """Copilot CLI terminal command contains the injected skill catalog."""
-        _run_skill_injection_test(provider="copilot_cli", agent_profile="developer")
 
 
 # ---------------------------------------------------------------------------

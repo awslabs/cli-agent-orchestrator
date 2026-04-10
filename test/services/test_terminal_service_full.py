@@ -10,6 +10,7 @@ from cli_agent_orchestrator.models.skill import SkillMetadata
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.terminal_service import (
     OutputMode,
+    build_skill_catalog,
     create_terminal,
     delete_terminal,
     get_output,
@@ -137,12 +138,12 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_skill_metadata")
+    @patch("cli_agent_orchestrator.services.terminal_service.list_skills")
     @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
     def test_create_terminal_appends_skill_catalog(
         self,
         mock_load_profile,
-        mock_load_skill,
+        mock_list_skills,
         mock_gen_id,
         mock_gen_session,
         mock_gen_window,
@@ -151,7 +152,7 @@ class TestCreateTerminal:
         mock_provider_manager,
         mock_log_dir,
     ):
-        """Profiles with skills should receive the injected skill catalog."""
+        """Providers that consume runtime prompts should receive the global skill catalog."""
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "developer-abcd"
@@ -160,9 +161,8 @@ class TestCreateTerminal:
             name="developer",
             description="Developer",
             system_prompt="You are the developer.",
-            skills=["cao-worker-protocols", "python-testing"],
         )
-        mock_load_skill.side_effect = [
+        mock_list_skills.return_value = [
             SkillMetadata(name="cao-worker-protocols", description="Worker communication"),
             SkillMetadata(name="python-testing", description="Pytest conventions"),
         ]
@@ -191,12 +191,12 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_skill_metadata")
+    @patch("cli_agent_orchestrator.services.terminal_service.list_skills")
     @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
     def test_create_terminal_appends_single_skill_catalog_entry(
         self,
         mock_load_profile,
-        mock_load_skill,
+        mock_list_skills,
         mock_gen_id,
         mock_gen_session,
         mock_gen_window,
@@ -205,7 +205,7 @@ class TestCreateTerminal:
         mock_provider_manager,
         mock_log_dir,
     ):
-        """Single-skill profiles should still render the catalog format correctly."""
+        """A single installed skill should still render the catalog format correctly."""
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "developer-abcd"
@@ -214,11 +214,10 @@ class TestCreateTerminal:
             name="developer",
             description="Developer",
             system_prompt="You are the developer.",
-            skills=["python-testing"],
         )
-        mock_load_skill.return_value = SkillMetadata(
-            name="python-testing", description="Pytest conventions"
-        )
+        mock_list_skills.return_value = [
+            SkillMetadata(name="python-testing", description="Pytest conventions")
+        ]
         mock_provider = MagicMock()
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_log_path = MagicMock()
@@ -243,12 +242,12 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_skill_metadata")
+    @patch("cli_agent_orchestrator.services.terminal_service.list_skills")
     @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
     def test_create_terminal_without_skills_is_unchanged(
         self,
         mock_load_profile,
-        mock_load_skill,
+        mock_list_skills,
         mock_gen_id,
         mock_gen_session,
         mock_gen_window,
@@ -257,7 +256,7 @@ class TestCreateTerminal:
         mock_provider_manager,
         mock_log_dir,
     ):
-        """Profiles without skills should keep their original system prompt."""
+        """Providers should receive an empty skill prompt when no skills are installed."""
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "developer-abcd"
@@ -266,8 +265,8 @@ class TestCreateTerminal:
             name="developer",
             description="Developer",
             system_prompt="Base prompt",
-            skills=None,
         )
+        mock_list_skills.return_value = []
         mock_provider = MagicMock()
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_log_path = MagicMock()
@@ -277,7 +276,7 @@ class TestCreateTerminal:
 
         skill_prompt = mock_provider_manager.create_provider.call_args.kwargs["skill_prompt"]
         assert skill_prompt == ""
-        mock_load_skill.assert_not_called()
+        mock_list_skills.assert_called_once_with()
 
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
@@ -286,12 +285,12 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
-    @patch("cli_agent_orchestrator.services.terminal_service.load_skill_metadata")
+    @patch("cli_agent_orchestrator.services.terminal_service.list_skills")
     @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
-    def test_create_terminal_fails_when_declared_skill_is_missing(
+    def test_create_terminal_does_not_pass_skill_prompt_to_kiro_provider(
         self,
         mock_load_profile,
-        mock_load_skill,
+        mock_list_skills,
         mock_gen_id,
         mock_gen_session,
         mock_gen_window,
@@ -300,7 +299,7 @@ class TestCreateTerminal:
         mock_provider_manager,
         mock_log_dir,
     ):
-        """Missing declared skills should fail terminal creation with a clear error."""
+        """Kiro should not receive the runtime skill_prompt kwarg in Phase 1."""
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "developer-abcd"
@@ -309,17 +308,46 @@ class TestCreateTerminal:
             name="developer",
             description="Developer",
             system_prompt="Base prompt",
-            skills=["missing-skill"],
         )
-        mock_load_skill.side_effect = FileNotFoundError("Skill folder does not exist")
+        mock_list_skills.return_value = [
+            SkillMetadata(name="python-testing", description="Pytest conventions")
+        ]
+        mock_provider = MagicMock()
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_log_path = MagicMock()
+        mock_log_dir.__truediv__.return_value = mock_log_path
 
-        with pytest.raises(
-            ValueError,
-            match="Failed to load declared skill 'missing-skill' for agent profile 'developer'",
-        ):
-            create_terminal("codex", "developer", new_session=True)
+        create_terminal("kiro_cli", "developer", new_session=True)
 
-        mock_provider_manager.create_provider.assert_not_called()
+        assert "skill_prompt" not in mock_provider_manager.create_provider.call_args.kwargs
+
+
+class TestBuildSkillCatalog:
+    """Tests for build_skill_catalog."""
+
+    @patch("cli_agent_orchestrator.services.terminal_service.list_skills", return_value=[])
+    def test_returns_empty_string_when_no_skills_installed(self, mock_list_skills):
+        """Empty skill stores should produce no injected catalog."""
+        assert build_skill_catalog() == ""
+        mock_list_skills.assert_called_once_with()
+
+    @patch("cli_agent_orchestrator.services.terminal_service.list_skills")
+    def test_renders_all_installed_skills(self, mock_list_skills):
+        """All installed skills should appear in the global catalog."""
+        mock_list_skills.return_value = [
+            SkillMetadata(name="cao-worker-protocols", description="Worker communication"),
+            SkillMetadata(name="python-testing", description="Pytest conventions"),
+        ]
+
+        assert build_skill_catalog() == (
+            "## Available Skills\n\n"
+            "The following skills are available exclusively in this CAO orchestration context. "
+            "To load a skill's full content, use the `get_skill` MCP tool provided by the "
+            "CAO MCP server. These skills are not accessible through provider-native skill "
+            "commands or directories.\n\n"
+            "- **cao-worker-protocols**: Worker communication\n"
+            "- **python-testing**: Pytest conventions"
+        )
 
 
 class TestGetTerminal:

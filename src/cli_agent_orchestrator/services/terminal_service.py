@@ -31,12 +31,11 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.constants import SESSION_PREFIX, TERMINAL_LOG_DIR
-from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
-from cli_agent_orchestrator.utils.skills import load_skill_metadata
+from cli_agent_orchestrator.utils.skills import list_skills
 from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
     generate_terminal_id,
@@ -64,21 +63,21 @@ SKILL_CATALOG_INSTRUCTION = (
 )
 
 
-def _build_skill_catalog(profile: AgentProfile) -> str:
-    """Build the injected skill catalog block for an agent profile."""
-    if not profile.skills:
+RUNTIME_SKILL_PROMPT_PROVIDERS = {
+    ProviderType.CLAUDE_CODE.value,
+    ProviderType.CODEX.value,
+    ProviderType.GEMINI_CLI.value,
+    ProviderType.KIMI_CLI.value,
+}
+
+
+def build_skill_catalog() -> str:
+    """Build the injected skill catalog block for all installed skills."""
+    skills = list_skills()
+    if not skills:
         return ""
 
-    skill_lines = []
-    for skill_name in profile.skills:
-        try:
-            skill = load_skill_metadata(skill_name)
-        except Exception as exc:
-            raise ValueError(
-                f"Failed to load declared skill '{skill_name}' for agent profile '{profile.name}': "
-                f"{exc}"
-            ) from exc
-        skill_lines.append(f"- **{skill.name}**: {skill.description}")
+    skill_lines = [f"- **{skill.name}**: {skill.description}" for skill in skills]
 
     return "\n".join(
         [
@@ -160,7 +159,7 @@ def create_terminal(
         # Step 3b: Load the profile once for allowed tool resolution and
         # skill catalog generation before provider initialization.
         profile = load_agent_profile(agent_profile)
-        skill_prompt = _build_skill_catalog(profile)
+        skill_prompt = build_skill_catalog()
 
         # Step 3c: Resolve allowed_tools from profile if not explicitly provided
         if allowed_tools is None:
@@ -173,15 +172,25 @@ def create_terminal(
 
         # Step 4: Create and initialize the CLI provider
         # This starts the agent (e.g., runs "kiro-cli chat --agent developer")
-        provider_instance = provider_manager.create_provider(
-            provider,
-            terminal_id,
-            session_name,
-            window_name,
-            agent_profile,
-            allowed_tools,
-            skill_prompt=skill_prompt,
-        )
+        if provider in RUNTIME_SKILL_PROMPT_PROVIDERS:
+            provider_instance = provider_manager.create_provider(
+                provider,
+                terminal_id,
+                session_name,
+                window_name,
+                agent_profile,
+                allowed_tools,
+                skill_prompt=skill_prompt,
+            )
+        else:
+            provider_instance = provider_manager.create_provider(
+                provider,
+                terminal_id,
+                session_name,
+                window_name,
+                agent_profile,
+                allowed_tools,
+            )
         provider_instance.initialize()
 
         # Step 5: Set up terminal logging via tmux pipe-pane
@@ -197,6 +206,7 @@ def create_terminal(
             provider=ProviderType(provider),
             session_name=session_name,
             agent_profile=agent_profile,
+            allowed_tools=allowed_tools,
             status=TerminalStatus.IDLE,
             last_active=datetime.now(),
         )

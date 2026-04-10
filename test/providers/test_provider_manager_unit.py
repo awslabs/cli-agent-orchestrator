@@ -24,6 +24,46 @@ def test_create_provider_codex_stores_mapping():
     assert manager.get_provider("t1") is provider
 
 
+@patch("cli_agent_orchestrator.providers.manager.KiroCliProvider")
+def test_create_provider_kiro_does_not_forward_skill_prompt(mock_kiro_provider):
+    manager = ProviderManager()
+    mock_instance = MagicMock()
+    mock_kiro_provider.return_value = mock_instance
+
+    provider = manager.create_provider(
+        ProviderType.KIRO_CLI.value,
+        terminal_id="t1",
+        tmux_session="s1",
+        tmux_window="w1",
+        agent_profile="developer",
+        skill_prompt="## Available Skills",
+    )
+
+    assert provider is mock_instance
+    assert manager.get_provider("t1") is mock_instance
+    mock_kiro_provider.assert_called_once_with("t1", "s1", "w1", "developer", None)
+
+
+@patch("cli_agent_orchestrator.providers.manager.QCliProvider")
+def test_create_provider_q_does_not_forward_skill_prompt(mock_q_provider):
+    manager = ProviderManager()
+    mock_instance = MagicMock()
+    mock_q_provider.return_value = mock_instance
+
+    provider = manager.create_provider(
+        ProviderType.Q_CLI.value,
+        terminal_id="t1",
+        tmux_session="s1",
+        tmux_window="w1",
+        agent_profile="developer",
+        skill_prompt="## Available Skills",
+    )
+
+    assert provider is mock_instance
+    assert manager.get_provider("t1") is mock_instance
+    mock_q_provider.assert_called_once_with("t1", "s1", "w1", "developer", None)
+
+
 def test_create_provider_copilot_stores_mapping():
     manager = ProviderManager()
     provider = manager.create_provider(
@@ -36,6 +76,26 @@ def test_create_provider_copilot_stores_mapping():
 
     assert isinstance(provider, CopilotCliProvider)
     assert manager.get_provider("t1") is provider
+
+
+@patch("cli_agent_orchestrator.providers.manager.CopilotCliProvider")
+def test_create_provider_copilot_does_not_forward_skill_prompt(mock_copilot_provider):
+    manager = ProviderManager()
+    mock_instance = MagicMock()
+    mock_copilot_provider.return_value = mock_instance
+
+    provider = manager.create_provider(
+        ProviderType.COPILOT_CLI.value,
+        terminal_id="t1",
+        tmux_session="s1",
+        tmux_window="w1",
+        agent_profile="developer",
+        skill_prompt="## Available Skills",
+    )
+
+    assert provider is mock_instance
+    assert manager.get_provider("t1") is mock_instance
+    mock_copilot_provider.assert_called_once_with("t1", "s1", "w1", "developer", None)
 
 
 def test_create_provider_unknown_type_raises():

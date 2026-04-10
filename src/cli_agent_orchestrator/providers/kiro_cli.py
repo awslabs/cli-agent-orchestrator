@@ -91,7 +91,6 @@ class KiroCliProvider(BaseProvider):
         window_name: str,
         agent_profile: str,
         allowed_tools: Optional[list] = None,
-        skill_prompt: Optional[str] = None,
     ):
         """Initialize Kiro CLI provider with terminal context.
 
@@ -101,9 +100,8 @@ class KiroCliProvider(BaseProvider):
             window_name: Name of the tmux window
             agent_profile: Name of the Kiro agent profile to use (e.g., "developer")
             allowed_tools: Optional list of CAO tool names the agent is allowed to use
-            skill_prompt: Optional skill catalog text (unused — Kiro uses native profiles)
         """
-        super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
+        super().__init__(terminal_id, session_name, window_name, allowed_tools)
         self._initialized = False
         self._agent_profile = agent_profile
 

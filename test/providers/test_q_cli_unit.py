@@ -1,5 +1,6 @@
 """Unit tests for Q CLI provider."""
 
+import inspect
 import re
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
@@ -21,6 +22,10 @@ def load_fixture(filename: str) -> str:
 
 class TestQCliProviderInitialization:
     """Test Q CLI provider initialization."""
+
+    def test_init_signature_does_not_include_skill_prompt(self):
+        """Q should no longer expose the dead skill_prompt constructor arg."""
+        assert "skill_prompt" not in inspect.signature(QCliProvider.__init__).parameters
 
     @patch("cli_agent_orchestrator.providers.q_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.q_cli.wait_until_status")

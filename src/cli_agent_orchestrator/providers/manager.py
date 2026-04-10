@@ -45,7 +45,6 @@ class ProviderManager:
                     tmux_window,
                     agent_profile,
                     allowed_tools,
-                    skill_prompt=skill_prompt,
                 )
             elif provider_type == ProviderType.KIRO_CLI.value:
                 if not agent_profile:
@@ -56,7 +55,6 @@ class ProviderManager:
                     tmux_window,
                     agent_profile,
                     allowed_tools,
-                    skill_prompt=skill_prompt,
                 )
             elif provider_type == ProviderType.CLAUDE_CODE.value:
                 provider = ClaudeCodeProvider(
@@ -83,7 +81,6 @@ class ProviderManager:
                     tmux_window,
                     agent_profile,
                     allowed_tools,
-                    skill_prompt=skill_prompt,
                 )
             elif provider_type == ProviderType.GEMINI_CLI.value:
                 provider = GeminiCliProvider(

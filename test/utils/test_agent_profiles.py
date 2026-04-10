@@ -42,8 +42,8 @@ class TestLoadAgentProfile:
 
     @patch("cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR")
     @patch("cli_agent_orchestrator.utils.agent_profiles.frontmatter")
-    def test_load_agent_profile_parses_skills_field(self, mock_frontmatter, mock_local_dir):
-        """Profiles with a skills list should parse it as a list of strings."""
+    def test_load_agent_profile_ignores_legacy_skills_field(self, mock_frontmatter, mock_local_dir):
+        """Profiles with legacy skills frontmatter should still parse successfully."""
         mock_local_path = MagicMock(spec=Path)
         mock_local_path.exists.return_value = True
         mock_local_path.read_text.return_value = (
@@ -63,7 +63,7 @@ class TestLoadAgentProfile:
 
         result = load_agent_profile("test-agent")
 
-        assert result.skills == ["python-testing", "cao-worker-protocols"]
+        assert not hasattr(result, "skills")
         assert result.system_prompt == "System prompt content"
 
     @patch("cli_agent_orchestrator.utils.agent_profiles.resources")
@@ -207,13 +207,14 @@ class TestResolveProvider:
 
 
 class TestAgentProfileModel:
-    """Tests for AgentProfile skills field behavior."""
+    """Tests for AgentProfile model compatibility."""
 
-    def test_skills_field_defaults_to_none(self):
-        """Profiles without a skills field should continue to parse correctly."""
+    def test_legacy_skills_field_is_not_part_of_model(self):
+        """The dead per-profile skills field should be removed from the model."""
         profile = AgentProfile(name="developer", description="Developer")
 
-        assert profile.skills is None
+        assert "skills" not in AgentProfile.model_fields
+        assert not hasattr(profile, "skills")
 
 
 class TestListAgentProfiles:

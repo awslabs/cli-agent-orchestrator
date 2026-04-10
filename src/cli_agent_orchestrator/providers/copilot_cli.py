@@ -51,9 +51,8 @@ class CopilotCliProvider(BaseProvider):
         window_name: str,
         agent_profile: Optional[str] = None,
         allowed_tools: Optional[list] = None,
-        skill_prompt: Optional[str] = None,
     ):
-        super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
+        super().__init__(terminal_id, session_name, window_name, allowed_tools)
         self._initialized = False
         self._agent_profile = agent_profile
         self._copilot_help_text_cache: Optional[str] = None
@@ -165,6 +164,7 @@ class CopilotCliProvider(BaseProvider):
 
     def _build_runtime_mcp_config(self) -> str:
         merged_servers: dict = {}
+        mcp_args: list[str]
         venv_script = Path(sys.executable).with_name("cao-mcp-server")
         found_script = shutil.which("cao-mcp-server")
         if venv_script.exists():

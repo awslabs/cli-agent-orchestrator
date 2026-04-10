@@ -2,8 +2,6 @@
 name: developer
 description: Developer Agent in a multi-agent system
 role: developer  # @builtin, fs_*, execute_bash, @cao-mcp-server. For fine-grained control, see docs/tool-restrictions.md
-skills:
-  - cao-worker-protocols
 mcpServers:
   cao-mcp-server:
     type: stdio
