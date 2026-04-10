@@ -98,36 +98,11 @@ CAO ships with two default skills:
 | `cao-supervisor-protocols` | Multi-agent orchestration patterns for supervisors: `assign`, `handoff`, idle-based message delivery |
 | `cao-worker-protocols` | Worker-side callback and completion rules for assigned and handed-off tasks |
 
-## Using Skills in Agent Profiles
+## How Agents Discover Skills
 
-Add a `skills` field to your agent profile's YAML frontmatter:
+All installed skills are available to all CAO agents — there is no per-profile skill declaration. When an agent is launched, CAO appends a catalog block to the prompt listing every installed skill's name and description, along with instructions to use the `get_skill` MCP tool to retrieve full content. The agent then decides when and whether to load each skill based on the task at hand.
 
-```yaml
----
-name: developer
-description: Developer Agent
-role: developer
-skills:
-  - cao-worker-protocols
-  - python-testing
-mcpServers:
-  cao-mcp-server:
-    type: stdio
-    command: uvx
-    args:
-      - "--from"
-      - "git+https://github.com/awslabs/cli-agent-orchestrator.git@main"
-      - "cao-mcp-server"
----
-
-# Developer Agent
-
-You are the Developer Agent...
-```
-
-When the agent is launched, CAO appends a catalog block to the prompt listing each skill's name and description, along with instructions to use the `get_skill` MCP tool to retrieve full content. The agent then decides when and whether to load each skill based on the task at hand.
-
-You can also explicitly instruct the agent to load specific skills eagerly in the profile body:
+You can explicitly instruct the agent to load specific skills eagerly in the agent profile body:
 
 ```markdown
 Before starting any task, load the python-testing and code-style skills.
@@ -214,18 +189,7 @@ description: Team coding standards for Python services including naming, error h
 cao skills add ./my-coding-standards
 ```
 
-4. Add the skill to any agent profile's `skills` list:
-
-```yaml
-skills:
-  - my-coding-standards
-```
-
-5. Reinstall the agent to pick up the profile change:
-
-```bash
-cao install my-agent --provider claude_code
-```
+Once installed, the skill is automatically available to all CAO agents. Runtime prompt providers (Claude Code, Codex, Gemini CLI, Kimi CLI) and Kiro will pick it up on the next terminal creation. Q CLI and Copilot CLI agent files are refreshed automatically by the `cao skills add` command.
 
 ## Updating a Skill
 
