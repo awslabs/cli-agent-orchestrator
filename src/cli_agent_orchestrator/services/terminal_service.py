@@ -147,29 +147,17 @@ def create_terminal(
 
         # Step 4: Create and initialize the CLI provider
         # This starts the agent (e.g., runs "kiro-cli chat --agent developer")
-        # Keep the runtime skill-prompt gate at both the service and manager
-        # layers. The manager still drops the kwarg for Kiro/Q/Copilot, but
-        # the explicit branch here lets tests assert those providers never
-        # receive a runtime prompt at the service boundary.
-        if provider in RUNTIME_SKILL_PROMPT_PROVIDERS:
-            provider_instance = provider_manager.create_provider(
-                provider,
-                terminal_id,
-                session_name,
-                window_name,
-                agent_profile,
-                allowed_tools,
-                skill_prompt=skill_prompt,
-            )
-        else:
-            provider_instance = provider_manager.create_provider(
-                provider,
-                terminal_id,
-                session_name,
-                window_name,
-                agent_profile,
-                allowed_tools,
-            )
+        # Only runtime-prompt providers (Claude Code, Codex, Gemini, Kimi) receive
+        # the skill catalog; Kiro/Q/Copilot get it baked at install time instead.
+        provider_instance = provider_manager.create_provider(
+            provider,
+            terminal_id,
+            session_name,
+            window_name,
+            agent_profile,
+            allowed_tools,
+            skill_prompt=skill_prompt if provider in RUNTIME_SKILL_PROMPT_PROVIDERS else None,
+        )
         provider_instance.initialize()
 
         # Step 5: Set up terminal logging via tmux pipe-pane

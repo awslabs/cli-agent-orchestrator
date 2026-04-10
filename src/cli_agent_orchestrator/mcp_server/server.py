@@ -6,7 +6,7 @@ import os
 import time
 from typing import Any, Dict, Optional, Tuple, Union
 
-import requests  # type: ignore[import-untyped]
+import requests
 from fastmcp import FastMCP
 from pydantic import Field
 
@@ -369,7 +369,7 @@ async def _handoff_impl(
 if ENABLE_WORKING_DIRECTORY:
 
     @mcp.tool()
-    async def handoff(  # type: ignore[misc]
+    async def handoff(
         agent_profile: str = Field(
             description='The agent profile to hand off to (e.g., "developer", "analyst")'
         ),
@@ -427,7 +427,7 @@ if ENABLE_WORKING_DIRECTORY:
 else:
 
     @mcp.tool()
-    async def handoff(  # type: ignore[misc]
+    async def handoff(
         agent_profile: str = Field(
             description='The agent profile to hand off to (e.g., "developer", "analyst")'
         ),
@@ -548,7 +548,7 @@ _assign_message_field_desc = (
 if ENABLE_WORKING_DIRECTORY:
 
     @mcp.tool(description=_assign_description)
-    async def assign(  # type: ignore[misc]
+    async def assign(
         agent_profile: str = Field(
             description='The agent profile for the worker agent (e.g., "developer", "analyst")'
         ),
@@ -562,7 +562,7 @@ if ENABLE_WORKING_DIRECTORY:
 else:
 
     @mcp.tool(description=_assign_description)
-    async def assign(  # type: ignore[misc]
+    async def assign(
         agent_profile: str = Field(
             description='The agent profile for the worker agent (e.g., "developer", "analyst")'
         ),

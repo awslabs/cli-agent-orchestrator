@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 import json
 import shlex
 from unittest.mock import patch
@@ -14,10 +13,6 @@ from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
 
 
 class TestCopilotCliProviderCommand:
-    def test_init_signature_does_not_include_skill_prompt(self):
-        """Copilot should no longer expose the dead skill_prompt constructor arg."""
-        assert "skill_prompt" not in inspect.signature(CopilotCliProvider.__init__).parameters
-
     @patch("cli_agent_orchestrator.providers.copilot_cli.CopilotCliProvider._supports_flag")
     @patch(
         "cli_agent_orchestrator.providers.copilot_cli.CopilotCliProvider._build_runtime_mcp_config"

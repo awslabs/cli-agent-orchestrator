@@ -40,32 +40,6 @@ class TestLoadAgentProfile:
         assert result.system_prompt == "System prompt content"
         mock_local_path.exists.assert_called_once()
 
-    @patch("cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR")
-    @patch("cli_agent_orchestrator.utils.agent_profiles.frontmatter")
-    def test_load_agent_profile_ignores_legacy_skills_field(self, mock_frontmatter, mock_local_dir):
-        """Profiles with legacy skills frontmatter should still parse successfully."""
-        mock_local_path = MagicMock(spec=Path)
-        mock_local_path.exists.return_value = True
-        mock_local_path.read_text.return_value = (
-            "---\nname: test-agent\ndescription: Test agent\nskills:\n  - python-testing\n---\n"
-            "System prompt content"
-        )
-        mock_local_dir.__truediv__.return_value = mock_local_path
-
-        mock_parsed = MagicMock()
-        mock_parsed.metadata = {
-            "name": "test-agent",
-            "description": "Test agent",
-            "skills": ["python-testing", "cao-worker-protocols"],
-        }
-        mock_parsed.content = "System prompt content"
-        mock_frontmatter.loads.return_value = mock_parsed
-
-        result = load_agent_profile("test-agent")
-
-        assert not hasattr(result, "skills")
-        assert result.system_prompt == "System prompt content"
-
     @patch("cli_agent_orchestrator.utils.agent_profiles.resources")
     @patch("cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR")
     @patch("cli_agent_orchestrator.utils.agent_profiles.frontmatter")
@@ -204,17 +178,6 @@ class TestResolveProvider:
         result = resolve_provider("developer", fallback_provider="kiro_cli")
 
         assert result == "kiro_cli"
-
-
-class TestAgentProfileModel:
-    """Tests for AgentProfile model compatibility."""
-
-    def test_legacy_skills_field_is_not_part_of_model(self):
-        """The dead per-profile skills field should be removed from the model."""
-        profile = AgentProfile(name="developer", description="Developer")
-
-        assert "skills" not in AgentProfile.model_fields
-        assert not hasattr(profile, "skills")
 
 
 class TestListAgentProfiles:

@@ -4,7 +4,7 @@ import os
 import subprocess
 
 import click
-import requests  # type: ignore[import-untyped]
+import requests
 
 from cli_agent_orchestrator.constants import DEFAULT_PROVIDER, PROVIDERS, SERVER_HOST, SERVER_PORT
 
