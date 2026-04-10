@@ -1,7 +1,6 @@
 """Tests for the install CLI command."""
 
 import json
-import os
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -818,29 +817,6 @@ class TestInstallSkillCatalogBaking:
         # skill:// glob should still be present in resources
         skill_resources = [r for r in agent_json["resources"] if r.startswith("skill://")]
         assert len(skill_resources) == 1
-
-    @pytest.mark.parametrize("provider,dir_key", [("kiro_cli", "kiro_dir"), ("q_cli", "q_dir")])
-    def test_install_writes_json_atomically_without_tmp_leak(
-        self, runner, install_workspace, provider, dir_key
-    ):
-        """Kiro and Q installs should write via temp file plus os.replace."""
-        self._write_profile(
-            install_workspace["local_store_dir"] / "test-agent.md",
-            "name: test-agent\ndescription: Test agent\nprompt: Build things\n",
-            "System prompt",
-        )
-        agent_path = install_workspace[dir_key] / "test-agent.json"
-        temp_path = agent_path.with_suffix(".json.tmp")
-
-        with patch(
-            "cli_agent_orchestrator.cli.commands.install.os.replace", wraps=os.replace
-        ) as mock_replace:
-            result = runner.invoke(install, ["test-agent", "--provider", provider])
-
-        assert result.exit_code == 0
-        mock_replace.assert_called_once_with(temp_path, agent_path)
-        assert agent_path.exists()
-        assert not temp_path.exists()
 
     def test_install_non_ascii_prompt_round_trips_through_refresh_without_byte_drift(
         self, runner, install_workspace

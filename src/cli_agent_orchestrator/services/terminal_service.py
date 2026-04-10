@@ -98,7 +98,6 @@ def create_terminal(
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
         TimeoutError: If provider initialization times out
     """
-    terminal_id: Optional[str] = None
     try:
         # Step 1: Generate unique identifiers
         terminal_id = generate_terminal_id()
@@ -141,12 +140,15 @@ def create_terminal(
 
         # Step 3c: Resolve allowed_tools from profile if not explicitly provided
         if allowed_tools is None:
-            from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
+            try:
+                from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
 
-            mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
-            allowed_tools = resolve_allowed_tools(
-                profile.allowedTools, profile.role, mcp_server_names
-            )
+                mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
+                allowed_tools = resolve_allowed_tools(
+                    profile.allowedTools, profile.role, mcp_server_names
+                )
+            except FileNotFoundError:
+                pass  # Profile not found; no tool restrictions
 
         # Step 4: Create and initialize the CLI provider
         # This starts the agent (e.g., runs "kiro-cli chat --agent developer")
@@ -176,7 +178,6 @@ def create_terminal(
             provider=ProviderType(provider),
             session_name=session_name,
             agent_profile=agent_profile,
-            allowed_tools=allowed_tools,
             status=TerminalStatus.IDLE,
             last_active=datetime.now(),
         )
@@ -190,8 +191,7 @@ def create_terminal(
         # Cleanup on failure: clean up provider resources and kill session
         logger.error(f"Failed to create terminal: {e}")
         try:
-            if terminal_id:
-                provider_manager.cleanup_provider(terminal_id)
+            provider_manager.cleanup_provider(terminal_id)
         except Exception:
             pass  # Ignore cleanup errors
         if new_session and session_name:

@@ -317,7 +317,6 @@ def create_flow(
             last_run=flow.last_run,
             next_run=flow.next_run,
             enabled=flow.enabled,
-            prompt_template=None,
         )
 
 
@@ -337,7 +336,6 @@ def get_flow(name: str) -> Optional[Flow]:
             last_run=flow.last_run,
             next_run=flow.next_run,
             enabled=flow.enabled,
-            prompt_template=None,
         )
 
 
@@ -356,7 +354,6 @@ def list_flows() -> List[Flow]:
                 last_run=f.last_run,
                 next_run=f.next_run,
                 enabled=f.enabled,
-                prompt_template=None,
             )
             for f in flows
         ]
@@ -413,7 +410,6 @@ def get_flows_to_run() -> List[Flow]:
                 last_run=f.last_run,
                 next_run=f.next_run,
                 enabled=f.enabled,
-                prompt_template=None,
             )
             for f in flows
         ]

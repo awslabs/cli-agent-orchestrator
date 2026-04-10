@@ -9,15 +9,6 @@ import pytest
 from cli_agent_orchestrator.mcp_server.server import _handoff_impl
 
 
-def _run_coroutine(coroutine):
-    """Run a coroutine in an isolated event loop for test stability."""
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(coroutine)
-    finally:
-        loop.close()
-
-
 class TestHandoffMessageContext:
     """Tests for handoff message context prepended to worker agents."""
 
@@ -39,7 +30,9 @@ class TestHandoffMessageContext:
                 mock_requests.get.return_value = mock_response
                 mock_requests.post.return_value = mock_response
 
-                result = _run_coroutine(_handoff_impl("developer", "Implement hello world"))
+                result = asyncio.get_event_loop().run_until_complete(
+                    _handoff_impl("developer", "Implement hello world")
+                )
 
         # Verify _send_direct_input was called with the handoff prefix
         mock_send.assert_called_once()
@@ -65,7 +58,9 @@ class TestHandoffMessageContext:
             mock_requests.get.return_value = mock_response
             mock_requests.post.return_value = mock_response
 
-            result = _run_coroutine(_handoff_impl("developer", "Implement hello world"))
+            result = asyncio.get_event_loop().run_until_complete(
+                _handoff_impl("developer", "Implement hello world")
+            )
 
         # Verify message was sent unchanged
         mock_send.assert_called_once()
@@ -88,7 +83,9 @@ class TestHandoffMessageContext:
             mock_requests.get.return_value = mock_response
             mock_requests.post.return_value = mock_response
 
-            result = _run_coroutine(_handoff_impl("developer", "Implement hello world"))
+            result = asyncio.get_event_loop().run_until_complete(
+                _handoff_impl("developer", "Implement hello world")
+            )
 
         mock_send.assert_called_once()
         sent_message = mock_send.call_args[0][1]
@@ -113,7 +110,9 @@ class TestHandoffMessageContext:
                 mock_requests.get.return_value = mock_response
                 mock_requests.post.return_value = mock_response
 
-                _run_coroutine(_handoff_impl("developer", "Build feature X"))
+                asyncio.get_event_loop().run_until_complete(
+                    _handoff_impl("developer", "Build feature X")
+                )
 
         sent_message = mock_send.call_args[0][1]
         assert "sup-xyz789" in sent_message
@@ -136,7 +135,7 @@ class TestHandoffMessageContext:
                 mock_requests.get.return_value = mock_response
                 mock_requests.post.return_value = mock_response
 
-                _run_coroutine(_handoff_impl("developer", "Do task"))
+                asyncio.get_event_loop().run_until_complete(_handoff_impl("developer", "Do task"))
 
         sent_message = mock_send.call_args[0][1]
         assert "unknown" in sent_message
@@ -161,7 +160,7 @@ class TestHandoffMessageContext:
                 mock_requests.get.return_value = mock_response
                 mock_requests.post.return_value = mock_response
 
-                _run_coroutine(_handoff_impl("developer", original))
+                asyncio.get_event_loop().run_until_complete(_handoff_impl("developer", original))
 
         sent_message = mock_send.call_args[0][1]
         assert sent_message.endswith(original)

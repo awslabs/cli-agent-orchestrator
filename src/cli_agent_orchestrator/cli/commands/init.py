@@ -42,4 +42,4 @@ def init():
             f"Seeded {seeded_count} builtin skills."
         )
     except Exception as e:
-        raise click.ClickException(str(e)) from e
+        raise click.ClickException(str(e))
