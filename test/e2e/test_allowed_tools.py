@@ -86,6 +86,7 @@ REFUSAL_KEYWORDS = [
     "doesn't appear to be available",
     "isn't available",
     "is not available",
+    "aren't available",
 ]
 
 
