@@ -59,6 +59,10 @@ def install_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, 
         local_store_dir,
     )
     monkeypatch.setattr(
+        "cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR",
+        local_store_dir,
+    )
+    monkeypatch.setattr(
         "cli_agent_orchestrator.services.install_service.AGENT_CONTEXT_DIR",
         context_dir,
     )
@@ -139,7 +143,7 @@ class TestInstallAgent:
 
         q_config = json.loads((install_paths["q_dir"] / "downloaded-agent.json").read_text())
         assert q_config["mcpServers"]["service"]["env"]["API_TOKEN"] == "secret-token"
-        assert "BASE_URL" not in q_config["mcpServers"]["service"]["env"]["API_TOKEN"]
+        assert q_config["mcpServers"]["service"]["env"]["BASE_URL"] == "${BASE_URL}"
 
     def test_install_from_path_copies_profile_and_writes_copilot_config(
         self, install_paths: dict[str, Path], tmp_path: Path
@@ -170,7 +174,7 @@ class TestInstallAgent:
         )
 
         with patch(
-            "cli_agent_orchestrator.services.install_service.resources.files",
+            "cli_agent_orchestrator.utils.agent_profiles.resources.files",
             return_value=built_in_dir,
         ):
             result = install_agent("developer", "kiro_cli", {"API_TOKEN": "secret-token"})

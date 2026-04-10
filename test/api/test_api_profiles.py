@@ -58,14 +58,8 @@ class TestGetAgentProfileEndpoint:
         assert "malformed frontmatter" in response.json()["detail"]
 
     def test_rejects_path_traversal_names(self, client) -> None:
-        """Traversal attempts should be rejected by the profile name validator."""
-        with patch(
-            "cli_agent_orchestrator.api.main.load_agent_profile",
-            side_effect=ValueError(
-                "Invalid agent name '../etc/passwd': must not contain '/', '\\\\', or '..'"
-            ),
-        ):
-            response = client.get("/agents/profiles/..%5Cetc%5Cpasswd")
+        """Traversal attempts should be rejected by the real profile name validator."""
+        response = client.get("/agents/profiles/..evil")
 
         assert response.status_code == 400
         assert "Invalid agent name" in response.json()["detail"]

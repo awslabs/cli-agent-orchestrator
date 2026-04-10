@@ -2,8 +2,9 @@
 
 import logging
 from importlib import resources
+from importlib.resources.abc import Traversable
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Union
 
 import frontmatter
 
@@ -12,6 +13,8 @@ from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.utils.env import resolve_env_vars
 
 logger = logging.getLogger(__name__)
+
+ProfilePath = Union[Path, Traversable]
 
 
 def _validate_agent_name(agent_name: str) -> None:
@@ -139,6 +142,53 @@ def _try_load_from_path(profile_path: Path, profile_name: str) -> AgentProfile:
     return parse_agent_profile_text(resolve_env_vars(profile_path.read_text()), profile_name)
 
 
+def _find_profile_path(agent_name: str) -> ProfilePath:
+    """Find the first matching profile path using CAO's standard search order."""
+    _validate_agent_name(agent_name)
+
+    from cli_agent_orchestrator.services.settings_service import (
+        get_agent_dirs,
+        get_extra_agent_dirs,
+    )
+
+    local_profile = LOCAL_AGENT_STORE_DIR / f"{agent_name}.md"
+    if local_profile.exists():
+        return local_profile
+
+    for dir_path in get_agent_dirs().values():
+        directory = Path(dir_path)
+        if not directory.exists():
+            continue
+
+        flat_profile = directory / f"{agent_name}.md"
+        if flat_profile.exists():
+            return flat_profile
+
+        nested_profile = directory / agent_name / "agent.md"
+        if nested_profile.exists():
+            return nested_profile
+
+    for extra_dir in get_extra_agent_dirs():
+        directory = Path(extra_dir)
+        if not directory.exists():
+            continue
+
+        flat_profile = directory / f"{agent_name}.md"
+        if flat_profile.exists():
+            return flat_profile
+
+        nested_profile = directory / agent_name / "agent.md"
+        if nested_profile.exists():
+            return nested_profile
+
+    agent_store = resources.files("cli_agent_orchestrator.agent_store")
+    built_in_profile = agent_store / f"{agent_name}.md"
+    if built_in_profile.is_file():
+        return built_in_profile
+
+    raise FileNotFoundError(f"Agent profile not found: {agent_name}")
+
+
 def load_agent_profile(agent_name: str) -> AgentProfile:
     """Load agent profile from local, provider, or built-in agent store.
 
@@ -148,55 +198,13 @@ def load_agent_profile(agent_name: str) -> AgentProfile:
     3. Extra user-added directories
     4. Built-in store (packaged with CAO)
     """
-    _validate_agent_name(agent_name)
-
-    from cli_agent_orchestrator.services.settings_service import (
-        get_agent_dirs,
-        get_extra_agent_dirs,
-    )
-
     try:
-        # 1. Check local store first (flat .md files)
-        local_profile = LOCAL_AGENT_STORE_DIR / f"{agent_name}.md"
-        if local_profile.exists():
-            return _try_load_from_path(local_profile, agent_name)
-
-        # 2. Check all provider-specific directories
-        for _provider, dir_path in get_agent_dirs().items():
-            p = Path(dir_path)
-            if not p.exists():
-                continue
-            # Check flat file: {dir}/{name}.md
-            flat = p / f"{agent_name}.md"
-            if flat.exists():
-                return _try_load_from_path(flat, agent_name)
-            # Check directory-style: {dir}/{name}/agent.md
-            dir_style = p / agent_name / "agent.md"
-            if dir_style.exists():
-                return _try_load_from_path(dir_style, agent_name)
-
-        # 3. Check extra user-added directories
-        for extra_dir in get_extra_agent_dirs():
-            p = Path(extra_dir)
-            if not p.exists():
-                continue
-            flat = p / f"{agent_name}.md"
-            if flat.exists():
-                return _try_load_from_path(flat, agent_name)
-            dir_style = p / agent_name / "agent.md"
-            if dir_style.exists():
-                return _try_load_from_path(dir_style, agent_name)
-
-        # 4. Fall back to built-in store
-        agent_store = resources.files("cli_agent_orchestrator.agent_store")
-        profile_file = agent_store / f"{agent_name}.md"
-
-        if not profile_file.is_file():
-            raise FileNotFoundError(f"Agent profile not found: {agent_name}")
-
+        profile_file = _find_profile_path(agent_name)
         return parse_agent_profile_text(resolve_env_vars(profile_file.read_text()), agent_name)
 
     except FileNotFoundError:
+        raise
+    except ValueError:
         raise
     except Exception as e:
         raise RuntimeError(f"Failed to load agent profile '{agent_name}': {e}")
