@@ -34,6 +34,11 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/cli_agent_orchestrator"]
 
+[tool.hatch.build]
+artifacts = [
+    "src/cli_agent_orchestrator/web_ui/**",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=7.4.0",
