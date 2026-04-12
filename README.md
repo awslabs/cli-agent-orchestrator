@@ -222,14 +222,6 @@ node --version   # Should be 18 or higher
 
 ### Starting the Web UI
 
-> **Note:** The Web UI requires a cloned copy of the repository (the `web/` directory is not included in the `uv tool install` package). If you installed CAO via `uv tool install`, clone the repo first:
-> ```bash
-> git clone https://github.com/awslabs/cli-agent-orchestrator.git
-> cd cli-agent-orchestrator/
-> ```
-
-All commands below assume you are in the **project root** directory (`cli-agent-orchestrator/`).
-
 **Option A: Development mode** (hot-reload, two terminals needed)
 
 ```bash
@@ -246,14 +238,18 @@ Open http://localhost:5173 in your browser.
 
 **Option B: Production mode** (single server, no Vite needed)
 
-```bash
-# Build the frontend once
-cd web/
-npm install && npm run build   # Outputs to web/dist/
+The built Web UI is bundled into the CAO wheel, so a plain `uv tool install` ships everything you need. Just start the server:
 
-# Start the backend — it serves the built frontend automatically
-cd ..
+```bash
 cao-server
+```
+
+To rebuild the frontend from source:
+
+```bash
+cd web/
+npm install && npm run build   # Outputs to src/cli_agent_orchestrator/web_ui/
+uv tool install . --reinstall
 ```
 
 Open http://localhost:9889 in your browser.
