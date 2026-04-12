@@ -359,6 +359,64 @@ class TestSessionLifecycleTools:
         assert result.success is False
         assert result.message == "Launch session failed: server exploded"
 
+    async def test_launch_session_returns_failure_on_missing_id_in_response(self) -> None:
+        """Session payloads without an ``id`` field should be treated as failures."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data={"foo": "bar"}),
+        ):
+            result = await _launch_session_impl("developer")
+
+        assert result.success is False
+        assert result.message == "Launch session failed: invalid session response"
+        assert result.terminal_id is None
+        assert result.session_name is not None
+
+    async def test_launch_session_returns_failure_on_non_dict_response(self) -> None:
+        """Non-dict session payloads should also be treated as failures."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data=["unexpected", "list"]),
+        ):
+            result = await _launch_session_impl("developer")
+
+        assert result.success is False
+        assert result.message == "Launch session failed: invalid session response"
+        assert result.terminal_id is None
+
+    async def test_launch_session_returns_failure_when_prompt_delivery_fails(self) -> None:
+        """Prompt delivery errors should preserve session_name and terminal_id."""
+        responses = [
+            _response(json_data={"id": "term-prompt-fail"}),
+            _response(status_code=500, json_data={"detail": "input rejected"}),
+        ]
+        with (
+            patch(
+                "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+                side_effect=responses,
+            ),
+            patch(
+                "cli_agent_orchestrator.ops_mcp_server.server.wait_until_terminal_status",
+                return_value=True,
+            ),
+            patch(
+                "cli_agent_orchestrator.ops_mcp_server.server.asyncio.sleep",
+                new=AsyncMock(),
+            ),
+        ):
+            result = await _launch_session_impl(
+                "developer",
+                prompt="Build feature X",
+                session_name="prompt-fail-session",
+            )
+
+        assert result == LaunchResult(
+            success=False,
+            message="Send initial prompt failed: input rejected",
+            session_name="prompt-fail-session",
+            terminal_id="term-prompt-fail",
+        )
+
     async def test_list_sessions_returns_list(self) -> None:
         """Session listing should pass through the API payload."""
         sessions = [{"session_name": "cao-123", "terminal_count": 2}]

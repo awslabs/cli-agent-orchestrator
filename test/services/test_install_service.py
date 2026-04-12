@@ -174,7 +174,7 @@ class TestInstallAgent:
         )
 
         with patch(
-            "cli_agent_orchestrator.utils.agent_profiles.resources.files",
+            "cli_agent_orchestrator.services.install_service.resources.files",
             return_value=built_in_dir,
         ):
             result = install_agent("developer", "kiro_cli", {"API_TOKEN": "secret-token"})
@@ -254,3 +254,30 @@ class TestInstallAgent:
 
         assert result.success is False
         assert "has no usable prompt content for Copilot" in result.message
+
+    def test_install_rejects_url_without_md_suffix(self, install_paths: dict[str, Path]) -> None:
+        """URL sources must point at a .md file."""
+        mock_response = MagicMock()
+        mock_response.text = "not a profile"
+        mock_response.raise_for_status.return_value = None
+
+        with patch(
+            "cli_agent_orchestrator.services.install_service.requests.get",
+            return_value=mock_response,
+        ):
+            result = install_agent("https://example.com/agent.txt", "kiro_cli")
+
+        assert result.success is False
+        assert result.message == "Failed to install agent: URL must point to a .md file"
+
+    def test_install_rejects_file_path_without_md_suffix(
+        self, install_paths: dict[str, Path], tmp_path: Path
+    ) -> None:
+        """File path sources must end in .md."""
+        source_file = tmp_path / "agent.txt"
+        source_file.write_text("not a profile", encoding="utf-8")
+
+        result = install_agent(str(source_file), "kiro_cli")
+
+        assert result.success is False
+        assert result.message == "Failed to install agent: File must be a .md file"
