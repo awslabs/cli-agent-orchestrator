@@ -258,6 +258,14 @@ async def _handoff_impl(
         # providers that use an initial prompt flag process the system prompt
         # as the first user message and produce a response, reaching COMPLETED
         # without ever showing a bare IDLE state.
+        # Both states indicate the provider is ready to accept input.
+        #
+        # Use a generous timeout (120s) because provider initialization can be
+        # slow: shell warm-up (~5s), CLI startup with MCP server registration
+        # (~10-30s), and API authentication (~5-10s). If the provider's own
+        # initialize() timed out (60-90s), this acts as a fallback to catch
+        # cases where the CLI starts slightly after the provider timeout.
+        # Provider initialization can be slow (~15-45s depending on provider).
         if not wait_until_terminal_status(
             terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
@@ -265,10 +273,7 @@ async def _handoff_impl(
         ):
             return HandoffResult(
                 success=False,
-                message=(
-                    f"Terminal {terminal_id} did not reach ready status within "
-                    f"120 seconds"
-                ),
+                message=f"Terminal {terminal_id} did not reach ready status within 120 seconds",
                 output=None,
                 terminal_id=terminal_id,
             )
