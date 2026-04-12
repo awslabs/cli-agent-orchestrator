@@ -1,21 +1,20 @@
 """CAO operations MCP server implementation."""
 
-import asyncio
 from typing import Annotated, Any, Dict, List, Optional
 
 import requests  # type: ignore[import-untyped]
 from fastmcp import FastMCP
 from pydantic import Field
 
-from cli_agent_orchestrator.constants import API_BASE_URL, DEFAULT_PROVIDER, TERMINAL_READY_TIMEOUT
-from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.constants import API_BASE_URL, DEFAULT_PROVIDER
 from cli_agent_orchestrator.ops_mcp_server.models import (
     InstallResult,
     LaunchResult,
     ProfileListResult,
+    SendMessageResult,
     SessionListResult,
 )
-from cli_agent_orchestrator.utils.terminal import generate_session_name, wait_until_terminal_status
+from cli_agent_orchestrator.utils.terminal import generate_session_name
 
 JsonDict = Dict[str, Any]
 
@@ -31,9 +30,10 @@ mcp = FastMCP(
     1. list_profiles to inspect available profiles
     2. get_profile_details to review a profile's full prompt and metadata
     3. install_profile to install a profile for a target provider
-    4. launch_session to start a new CAO session with an optional initial prompt
-    5. get_session_info or list_sessions to monitor progress
-    6. shutdown_session to clean up when done
+    4. launch_session to start a new CAO session
+    5. send_session_message to deliver a prompt to a running terminal
+    6. get_session_info or list_sessions to monitor progress
+    7. shutdown_session to clean up when done
     """,
 )
 
@@ -98,19 +98,12 @@ def _install_result_from_error(message: str) -> InstallResult:
 
 async def _launch_session_impl(
     agent_profile: str,
-    prompt: Optional[str] = None,
     provider: str = DEFAULT_PROVIDER,
     session_name: Optional[str] = None,
     working_directory: Optional[str] = None,
     allowed_tools: Optional[List[str]] = None,
 ) -> LaunchResult:
-    """Launch a session and optionally deliver an initial prompt.
-
-    If readiness or prompt delivery fails after session creation, the returned
-    failure still includes ``session_name`` and ``terminal_id`` so callers can
-    decide whether to inspect or explicitly shut down the partially launched
-    session.
-    """
+    """Create a new CAO session and return the session identifiers."""
     resolved_session_name = session_name or generate_session_name()
     params: Dict[str, Any] = {
         "provider": provider,
@@ -144,43 +137,6 @@ async def _launch_session_impl(
         )
 
     terminal_id = str(session_data["id"])
-
-    if prompt:
-        # The underlying wait helper is synchronous; move it off the event loop
-        # so prompt-bearing launches do not block other async MCP work.
-        is_ready = await asyncio.to_thread(
-            wait_until_terminal_status,
-            terminal_id,
-            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-            timeout=TERMINAL_READY_TIMEOUT,
-        )
-        if not is_ready:
-            return LaunchResult(
-                success=False,
-                message=(
-                    f"Terminal {terminal_id} did not reach ready status within "
-                    f"{int(TERMINAL_READY_TIMEOUT)} seconds"
-                ),
-                session_name=resolved_session_name,
-                terminal_id=terminal_id,
-            )
-
-        await asyncio.sleep(2)
-
-        _, prompt_error = _request_json(
-            "post",
-            f"/terminals/{terminal_id}/input",
-            params={"message": prompt},
-            operation="Send initial prompt",
-        )
-        if prompt_error:
-            return LaunchResult(
-                success=False,
-                message=prompt_error,
-                session_name=resolved_session_name,
-                terminal_id=terminal_id,
-            )
-
     return LaunchResult(
         success=True,
         message=f"Session '{resolved_session_name}' launched successfully",
@@ -298,10 +254,6 @@ async def install_profile(
 @mcp.tool()
 async def launch_session(
     agent_profile: Annotated[str, Field(description="The agent profile to launch")],
-    prompt: Annotated[
-        Optional[str],
-        Field(description="Optional initial prompt to send after the session becomes ready"),
-    ] = None,
     provider: Annotated[
         str,
         Field(description="The provider to use for the launched session"),
@@ -319,31 +271,14 @@ async def launch_session(
         Field(description="Optional list of allowed tool restrictions"),
     ] = None,
 ) -> LaunchResult:
-    """Create a new CAO session and optionally deliver an initial prompt.
+    """Create a new CAO session with the given provider and agent profile.
 
-    Creates a fresh session with the given provider and agent profile. If a
-    prompt is provided, waits for the terminal to reach IDLE or COMPLETED
-    before sending it, then returns immediately without waiting for the
-    agent's response.
-
-    ## Usage
-
-    1. Create a new CAO session with the specified provider and profile
-    2. If prompt is provided: wait for readiness, then send the prompt
-    3. Return with session_name and terminal_id (non-blocking)
-
-    Use get_session_info or list_sessions to monitor progress, and
-    shutdown_session to clean up.
-
-    ## Partial Launch
-
-    On readiness timeout or prompt delivery failure, the returned
-    LaunchResult still carries session_name and terminal_id so the caller
-    can inspect or explicitly shut down the partially launched session.
+    Returns immediately with session_name and terminal_id. Use
+    send_session_message to deliver an initial prompt once the session is
+    running, and get_session_info or list_sessions to monitor progress.
 
     Args:
         agent_profile: Agent profile for the new session
-        prompt: Optional initial prompt sent after the session becomes ready
         provider: CLI provider (default: kiro_cli)
         session_name: Optional custom session name (auto-generated if omitted)
         working_directory: Optional working directory for the session
@@ -354,11 +289,43 @@ async def launch_session(
     """
     return await _launch_session_impl(
         agent_profile=agent_profile,
-        prompt=prompt,
         provider=provider,
         session_name=session_name,
         working_directory=working_directory,
         allowed_tools=allowed_tools,
+    )
+
+
+@mcp.tool()
+async def send_session_message(
+    terminal_id: Annotated[str, Field(description="The terminal ID to deliver the message to")],
+    message: Annotated[str, Field(description="The message text to deliver")],
+) -> SendMessageResult:
+    """Queue a message for delivery to a running CAO terminal via the inbox service.
+
+    Messages are delivered by the CAO inbox service when the terminal reaches
+    IDLE or COMPLETED status. Use get_session_info to retrieve terminal IDs
+    from an active session.
+
+    Args:
+        terminal_id: Target terminal ID (from launch_session or get_session_info)
+        message: Message text to deliver
+
+    Returns:
+        SendMessageResult with success status and target terminal_id
+    """
+    _, error = _request_json(
+        "post",
+        f"/terminals/{terminal_id}/inbox/messages",
+        params={"sender_id": "cao-ops-mcp", "message": message},
+        operation=f"Send message to terminal '{terminal_id}'",
+    )
+    if error:
+        return SendMessageResult(success=False, message=error, terminal_id=terminal_id)
+    return SendMessageResult(
+        success=True,
+        message=f"Message queued for terminal '{terminal_id}'",
+        terminal_id=terminal_id,
     )
 
 

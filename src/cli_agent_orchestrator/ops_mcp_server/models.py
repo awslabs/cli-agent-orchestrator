@@ -50,9 +50,18 @@ class SessionListResult(BaseModel):
     )
 
 
+class SendMessageResult(BaseModel):
+    """Result for inbox message delivery operations."""
+
+    success: bool = Field(description="Whether the message was queued successfully")
+    message: str = Field(description="A message describing the delivery result")
+    terminal_id: str = Field(description="The target terminal ID")
+
+
 __all__ = [
     "InstallResult",
     "LaunchResult",
     "ProfileListResult",
+    "SendMessageResult",
     "SessionListResult",
 ]

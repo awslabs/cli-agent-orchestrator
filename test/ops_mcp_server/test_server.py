@@ -1,7 +1,7 @@
 """Tests for the CAO operations MCP server."""
 
 from typing import TypedDict
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import requests
@@ -10,6 +10,7 @@ from cli_agent_orchestrator.ops_mcp_server.models import (
     InstallResult,
     LaunchResult,
     ProfileListResult,
+    SendMessageResult,
     SessionListResult,
 )
 from cli_agent_orchestrator.ops_mcp_server.server import (
@@ -21,6 +22,7 @@ from cli_agent_orchestrator.ops_mcp_server.server import (
     list_profiles,
     list_sessions,
     main,
+    send_session_message,
     shutdown_session,
 )
 
@@ -246,8 +248,8 @@ class TestProfileTools:
 class TestSessionLifecycleTools:
     """Tests for session lifecycle tools."""
 
-    async def test_launch_session_without_prompt_returns_immediately(self) -> None:
-        """Launching without a prompt should skip readiness waiting."""
+    async def test_launch_session_returns_success_with_session_identifiers(self) -> None:
+        """Launching a session should return session_name and terminal_id immediately."""
         with (
             patch(
                 "cli_agent_orchestrator.ops_mcp_server.server.generate_session_name",
@@ -257,9 +259,6 @@ class TestSessionLifecycleTools:
                 "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
                 return_value=_response(json_data={"id": "term-123"}),
             ) as mock_request,
-            patch(
-                "cli_agent_orchestrator.ops_mcp_server.server.wait_until_terminal_status"
-            ) as mock_wait,
         ):
             result = await _launch_session_impl(
                 agent_profile="developer",
@@ -283,31 +282,17 @@ class TestSessionLifecycleTools:
                 "allowed_tools": "fs_read,execute_bash",
             },
         )
-        mock_wait.assert_not_called()
 
-    async def test_launch_session_with_prompt_waits_and_sends_input(self) -> None:
-        """Launching with a prompt should wait for readiness, settle, and send input."""
-        responses = [
-            _response(json_data={"id": "term-456"}),
-            _response(json_data={"success": True}),
-        ]
+    async def test_launch_session_passes_custom_params(self) -> None:
+        """Custom session name and working directory should be forwarded to the API."""
         with (
             patch(
                 "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
-                side_effect=responses,
+                return_value=_response(json_data={"id": "term-456"}),
             ) as mock_request,
-            patch(
-                "cli_agent_orchestrator.ops_mcp_server.server.wait_until_terminal_status",
-                return_value=True,
-            ) as mock_wait,
-            patch(
-                "cli_agent_orchestrator.ops_mcp_server.server.asyncio.sleep",
-                new=AsyncMock(),
-            ) as mock_sleep,
         ):
             result = await launch_session(
                 agent_profile="developer",
-                prompt="Build feature X",
                 provider="codex",
                 session_name="custom-session",
                 working_directory="/workspace/project",
@@ -319,41 +304,16 @@ class TestSessionLifecycleTools:
             session_name="custom-session",
             terminal_id="term-456",
         )
-        assert mock_request.call_args_list[0].kwargs["params"] == {
-            "provider": "codex",
-            "agent_profile": "developer",
-            "session_name": "custom-session",
-            "working_directory": "/workspace/project",
-        }
-        assert mock_request.call_args_list[1].kwargs["params"] == {"message": "Build feature X"}
-        mock_wait.assert_called_once()
-        wait_args = mock_wait.call_args.args
-        assert wait_args[0] == "term-456"
-        assert wait_args[1]
-        assert mock_wait.call_args.kwargs["timeout"] == 30.0
-        mock_sleep.assert_awaited_once_with(2)
-
-    async def test_launch_session_returns_failure_on_ready_timeout(self) -> None:
-        """Prompted launches should fail if the terminal never becomes ready."""
-        with (
-            patch(
-                "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
-                return_value=_response(json_data={"id": "term-timeout"}),
-            ),
-            patch(
-                "cli_agent_orchestrator.ops_mcp_server.server.wait_until_terminal_status",
-                return_value=False,
-            ),
-        ):
-            result = await _launch_session_impl("developer", prompt="Build feature X")
-
-        assert result == LaunchResult(
-            success=False,
-            message="Terminal term-timeout did not reach ready status within 30 seconds",
-            session_name=result.session_name,
-            terminal_id="term-timeout",
+        mock_request.assert_called_once_with(
+            "post",
+            "http://127.0.0.1:9889/sessions",
+            params={
+                "provider": "codex",
+                "agent_profile": "developer",
+                "session_name": "custom-session",
+                "working_directory": "/workspace/project",
+            },
         )
-        assert result.session_name is not None
 
     async def test_launch_session_returns_failure_on_api_error(self) -> None:
         """Session API errors should return failed LaunchResults."""
@@ -391,38 +351,63 @@ class TestSessionLifecycleTools:
         assert result.message == "Launch session failed: invalid session response"
         assert result.terminal_id is None
 
-    async def test_launch_session_returns_failure_when_prompt_delivery_fails(self) -> None:
-        """Prompt delivery errors should preserve session_name and terminal_id."""
-        responses = [
-            _response(json_data={"id": "term-prompt-fail"}),
-            _response(status_code=500, json_data={"detail": "input rejected"}),
-        ]
-        with (
-            patch(
-                "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
-                side_effect=responses,
-            ),
-            patch(
-                "cli_agent_orchestrator.ops_mcp_server.server.wait_until_terminal_status",
-                return_value=True,
-            ),
-            patch(
-                "cli_agent_orchestrator.ops_mcp_server.server.asyncio.sleep",
-                new=AsyncMock(),
-            ),
-        ):
-            result = await _launch_session_impl(
-                "developer",
-                prompt="Build feature X",
-                session_name="prompt-fail-session",
-            )
+    async def test_send_session_message_queues_message(self) -> None:
+        """A successful inbox delivery should return SendMessageResult with success."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data={"success": True}),
+        ) as mock_request:
+            result = await send_session_message(terminal_id="term-123", message="Build feature X")
 
-        assert result == LaunchResult(
-            success=False,
-            message="Send initial prompt failed: input rejected",
-            session_name="prompt-fail-session",
-            terminal_id="term-prompt-fail",
+        assert result == SendMessageResult(
+            success=True,
+            message="Message queued for terminal 'term-123'",
+            terminal_id="term-123",
         )
+        mock_request.assert_called_once_with(
+            "post",
+            "http://127.0.0.1:9889/terminals/term-123/inbox/messages",
+            params={"sender_id": "cao-ops-mcp", "message": "Build feature X"},
+        )
+
+    async def test_send_session_message_returns_failure_for_not_found(self) -> None:
+        """A 404 response should return a failed SendMessageResult."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(status_code=404, json_data={"detail": "Terminal not found"}),
+        ):
+            result = await send_session_message(terminal_id="missing", message="hello")
+
+        assert result == SendMessageResult(
+            success=False,
+            message="Send message to terminal 'missing' failed: Terminal not found",
+            terminal_id="missing",
+        )
+
+    async def test_send_session_message_returns_failure_on_api_error(self) -> None:
+        """Transport errors should return failed SendMessageResults."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            side_effect=requests.ConnectionError("api offline"),
+        ):
+            result = await send_session_message(terminal_id="term-123", message="hello")
+
+        assert result == SendMessageResult(
+            success=False,
+            message="Send message to terminal 'term-123' failed: api offline",
+            terminal_id="term-123",
+        )
+
+    async def test_send_session_message_includes_terminal_id_on_failure(self) -> None:
+        """The terminal_id should always be echoed back regardless of outcome."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(status_code=500, text="internal error"),
+        ):
+            result = await send_session_message(terminal_id="term-abc", message="ping")
+
+        assert result.success is False
+        assert result.terminal_id == "term-abc"
 
     async def test_list_sessions_returns_list(self) -> None:
         """Session listing should wrap the API payload in a SessionListResult."""
