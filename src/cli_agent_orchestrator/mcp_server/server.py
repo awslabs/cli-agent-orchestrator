@@ -10,7 +10,7 @@ import requests
 from fastmcp import FastMCP
 from pydantic import Field
 
-from cli_agent_orchestrator.constants import API_BASE_URL, DEFAULT_PROVIDER, TERMINAL_READY_TIMEOUT
+from cli_agent_orchestrator.constants import API_BASE_URL, DEFAULT_PROVIDER
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.utils.terminal import generate_session_name, wait_until_terminal_status
@@ -261,13 +261,13 @@ async def _handoff_impl(
         if not wait_until_terminal_status(
             terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-            timeout=TERMINAL_READY_TIMEOUT,
+            timeout=120.0,
         ):
             return HandoffResult(
                 success=False,
                 message=(
                     f"Terminal {terminal_id} did not reach ready status within "
-                    f"{int(TERMINAL_READY_TIMEOUT)} seconds"
+                    f"120 seconds"
                 ),
                 output=None,
                 terminal_id=terminal_id,
