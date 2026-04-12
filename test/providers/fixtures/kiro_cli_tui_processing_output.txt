@@ -1,0 +1,8 @@
+────────────────────────────────────────────────────
+  What files are in this directory?
+
+  Analyzing the directory structure...
+
+developer · auto · ◔ 3%              ~/project · (main)
+
+ Kiro is working
