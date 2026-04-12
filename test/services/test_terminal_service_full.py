@@ -163,7 +163,7 @@ class TestCreateTerminal:
         mock_build_skill_catalog.return_value = (
             "## Available Skills\n\n"
             "The following skills are available exclusively in this CAO orchestration context. "
-            "To load a skill's full content, use the `get_skill` MCP tool provided by the "
+            "To load a skill's full content, use the `load_skill` MCP tool provided by the "
             "CAO MCP server. These skills are not accessible through provider-native skill "
             "commands or directories.\n\n"
             "- **cao-worker-protocols**: Worker communication\n"
@@ -180,7 +180,7 @@ class TestCreateTerminal:
         assert skill_prompt == (
             "## Available Skills\n\n"
             "The following skills are available exclusively in this CAO orchestration context. "
-            "To load a skill's full content, use the `get_skill` MCP tool provided by the "
+            "To load a skill's full content, use the `load_skill` MCP tool provided by the "
             "CAO MCP server. These skills are not accessible through provider-native skill "
             "commands or directories.\n\n"
             "- **cao-worker-protocols**: Worker communication\n"
@@ -266,7 +266,7 @@ class TestCreateTerminal:
         mock_build_skill_catalog.return_value = (
             "## Available Skills\n\n"
             "The following skills are available exclusively in this CAO orchestration context. "
-            "To load a skill's full content, use the `get_skill` MCP tool provided by the "
+            "To load a skill's full content, use the `load_skill` MCP tool provided by the "
             "CAO MCP server. These skills are not accessible through provider-native skill "
             "commands or directories.\n\n"
             "- **python-testing**: Pytest conventions"

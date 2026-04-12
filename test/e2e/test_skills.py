@@ -3,7 +3,7 @@
 Tests the full skill pipeline — validates that:
 1. The skill catalog text is injected into the provider CLI command
    (verified by inspecting the tmux scrollback, not LLM output)
-2. The get_skill API endpoint returns installed skill content
+2. The load_skill MCP tool / API endpoint returns installed skill content
 
 Requires: running CAO server, authenticated CLI tools, tmux, seeded skills.
 

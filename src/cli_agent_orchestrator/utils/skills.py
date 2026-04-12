@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 SKILL_CATALOG_INSTRUCTION = (
     "The following skills are available exclusively in this CAO orchestration context. "
-    "To load a skill's full content, use the `get_skill` MCP tool provided by the CAO MCP server. "
+    "To load a skill's full content, use the `load_skill` MCP tool provided by the CAO MCP server. "
     "These skills are not accessible through provider-native skill commands or directories."
 )
 

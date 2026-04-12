@@ -39,7 +39,7 @@ mcp = FastMCP(
     """,
 )
 
-GET_SKILL_TOOL_DESCRIPTION = """Retrieve the full Markdown body of an available skill from cao-server.
+LOAD_SKILL_TOOL_DESCRIPTION = """Retrieve the full Markdown body of an available skill from cao-server.
 
 Use this tool when your prompt lists a CAO skill and you need its full instructions at runtime.
 
@@ -266,7 +266,7 @@ def _extract_error_detail(response: requests.Response, fallback: str) -> str:
     return fallback
 
 
-def _get_skill_impl(name: str) -> Union[str, Dict[str, Any]]:
+def _load_skill_impl(name: str) -> Union[str, Dict[str, Any]]:
     """Fetch a skill body from cao-server and return content or a structured error."""
     try:
         response = requests.get(f"{API_BASE_URL}/skills/{name}")
@@ -608,12 +608,12 @@ async def send_message(
     return _send_message_impl(receiver_id, message)
 
 
-@mcp.tool(description=GET_SKILL_TOOL_DESCRIPTION)
-async def get_skill(
+@mcp.tool(description=LOAD_SKILL_TOOL_DESCRIPTION)
+async def load_skill(
     name: str = Field(description="Name of the skill to retrieve"),
 ) -> Any:
     """Retrieve skill content from cao-server."""
-    return _get_skill_impl(name)
+    return _load_skill_impl(name)
 
 
 def main():

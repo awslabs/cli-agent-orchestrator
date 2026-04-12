@@ -100,7 +100,7 @@ CAO ships with two default skills:
 
 ## How Agents Discover Skills
 
-All installed skills are available to all CAO agents — there is no per-profile skill declaration. When an agent is launched, CAO appends a catalog block to the prompt listing every installed skill's name and description, along with instructions to use the `get_skill` MCP tool to retrieve full content. The agent then decides when and whether to load each skill based on the task at hand.
+All installed skills are available to all CAO agents — there is no per-profile skill declaration. When an agent is launched, CAO appends a catalog block to the prompt listing every installed skill's name and description, along with instructions to use the `load_skill` MCP tool to retrieve full content. The agent then decides when and whether to load each skill based on the task at hand.
 
 You can explicitly instruct the agent to load specific skills eagerly in the agent profile body:
 
@@ -114,19 +114,19 @@ Skills are delivered to agents differently depending on the provider. The table 
 
 | Provider | Injection Method | When Catalog Updates | Skill Retrieval |
 |----------|-----------------|---------------------|-----------------|
-| Claude Code | Runtime prompt | Every terminal creation | `get_skill` MCP tool |
-| Codex | Runtime prompt | Every terminal creation | `get_skill` MCP tool |
-| Gemini CLI | Runtime prompt | Every terminal creation | `get_skill` MCP tool |
-| Kimi CLI | Runtime prompt | Every terminal creation | `get_skill` MCP tool |
+| Claude Code | Runtime prompt | Every terminal creation | `load_skill` MCP tool |
+| Codex | Runtime prompt | Every terminal creation | `load_skill` MCP tool |
+| Gemini CLI | Runtime prompt | Every terminal creation | `load_skill` MCP tool |
+| Kimi CLI | Runtime prompt | Every terminal creation | `load_skill` MCP tool |
 | Kiro CLI | Native `skill://` resources | Every terminal creation | Kiro progressive loading |
-| Q CLI | Baked into agent JSON at install | On `cao skills add/remove` | `get_skill` MCP tool |
-| Copilot CLI | Baked into `.agent.md` at install | On `cao skills add/remove` | `get_skill` MCP tool |
+| Q CLI | Baked into agent JSON at install | On `cao skills add/remove` | `load_skill` MCP tool |
+| Copilot CLI | Baked into `.agent.md` at install | On `cao skills add/remove` | `load_skill` MCP tool |
 
 ### Runtime Prompt Providers (Claude Code, Codex, Gemini CLI, Kimi CLI)
 
 For these providers, the skill catalog is built fresh each time a terminal is created. The catalog — a list of skill names and descriptions — is appended to the system prompt via the provider's native CLI flags.
 
-The agent retrieves full skill content at runtime by calling the `get_skill` MCP tool, which fetches the skill body from the CAO server.
+The agent retrieves full skill content at runtime by calling the `load_skill` MCP tool, which fetches the skill body from the CAO server.
 
 No action is needed after `cao skills add` or `cao skills remove` — the next terminal created will automatically reflect the current set of installed skills.
 
