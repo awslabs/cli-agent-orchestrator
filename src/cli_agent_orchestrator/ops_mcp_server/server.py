@@ -7,7 +7,7 @@ import requests  # type: ignore[import-untyped]
 from fastmcp import FastMCP
 from pydantic import Field
 
-from cli_agent_orchestrator.constants import API_BASE_URL, DEFAULT_PROVIDER
+from cli_agent_orchestrator.constants import API_BASE_URL, DEFAULT_PROVIDER, TERMINAL_READY_TIMEOUT
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.ops_mcp_server.models import InstallResult, LaunchResult
 from cli_agent_orchestrator.utils.terminal import generate_session_name, wait_until_terminal_status
@@ -61,7 +61,7 @@ def _request_json(
     """Execute an API request and return either JSON data or an error message."""
     try:
         response = requests.request(method, f"{API_BASE_URL}{path}", params=params)
-    except Exception as exc:
+    except requests.RequestException as exc:
         return None, f"{operation} failed: {exc}"
 
     if response.status_code >= 400:
@@ -148,12 +148,15 @@ async def _launch_session_impl(
             wait_until_terminal_status,
             terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-            timeout=120.0,
+            timeout=TERMINAL_READY_TIMEOUT,
         )
         if not is_ready:
             return LaunchResult(
                 success=False,
-                message=f"Terminal {terminal_id} did not reach ready status within 120 seconds",
+                message=(
+                    f"Terminal {terminal_id} did not reach ready status within "
+                    f"{int(TERMINAL_READY_TIMEOUT)} seconds"
+                ),
                 session_name=resolved_session_name,
                 terminal_id=terminal_id,
             )

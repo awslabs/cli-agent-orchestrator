@@ -4,6 +4,7 @@ from typing import TypedDict
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import requests
 
 from cli_agent_orchestrator.ops_mcp_server.models import InstallResult, LaunchResult
 from cli_agent_orchestrator.ops_mcp_server.server import (
@@ -115,7 +116,7 @@ class TestProfileTools:
         """Transport errors should be returned instead of raised."""
         with patch(
             "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
-            side_effect=Exception("boom"),
+            side_effect=requests.ConnectionError("boom"),
         ):
             result = await get_profile_details("developer")
 
@@ -221,7 +222,7 @@ class TestProfileTools:
         """Transport failures should return failed InstallResults."""
         with patch(
             "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
-            side_effect=RuntimeError("network down"),
+            side_effect=requests.ConnectionError("network down"),
         ):
             result = await install_profile("developer")
 
@@ -442,7 +443,7 @@ class TestSessionLifecycleTools:
         """Session list errors should be returned as failures."""
         with patch(
             "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
-            side_effect=RuntimeError("api offline"),
+            side_effect=requests.ConnectionError("api offline"),
         ):
             result = await list_sessions()
 
@@ -476,7 +477,7 @@ class TestSessionLifecycleTools:
         """Transport errors should be returned for session info lookups."""
         with patch(
             "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
-            side_effect=RuntimeError("boom"),
+            side_effect=requests.ConnectionError("boom"),
         ):
             result = await get_session_info("cao-123")
 
@@ -513,7 +514,7 @@ class TestSessionLifecycleTools:
         """Shutdown transport errors should be converted into failures."""
         with patch(
             "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
-            side_effect=RuntimeError("delete failed"),
+            side_effect=requests.ConnectionError("delete failed"),
         ):
             result = await shutdown_session("cao-123")
 

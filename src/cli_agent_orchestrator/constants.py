@@ -37,6 +37,16 @@ DEFAULT_PROVIDER = ProviderType.KIRO_CLI.value
 TMUX_HISTORY_LINES = 200
 
 # =============================================================================
+# Terminal Readiness
+# =============================================================================
+# Maximum time (seconds) to wait for a freshly launched terminal to reach a
+# ready state (IDLE or COMPLETED) before sending an initial prompt. Provider
+# initialization can be slow: shell warm-up (~5s), CLI startup with MCP server
+# registration (~10-30s), and API authentication (~5-10s). This acts as a
+# fallback in case the provider's own initialize() hook times out.
+TERMINAL_READY_TIMEOUT = 120.0
+
+# =============================================================================
 # Application Directory Structure
 # =============================================================================
 # Base directory for all CAO data (~/.aws/cli-agent-orchestrator)

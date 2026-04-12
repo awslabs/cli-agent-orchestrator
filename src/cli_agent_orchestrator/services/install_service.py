@@ -259,5 +259,5 @@ def install_agent(
         return InstallResult(success=False, message=f"Failed to download agent: {exc}")
     except FileNotFoundError as exc:
         return InstallResult(success=False, message=str(exc))
-    except Exception as exc:
+    except (ValueError, OSError) as exc:
         return InstallResult(success=False, message=f"Failed to install agent: {exc}")
