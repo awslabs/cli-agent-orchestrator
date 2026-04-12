@@ -1,7 +1,7 @@
 """CAO operations MCP server implementation."""
 
 import asyncio
-from typing import Annotated, Any, Dict, List, Optional, Union
+from typing import Annotated, Any, Dict, List, Optional
 
 import requests  # type: ignore[import-untyped]
 from fastmcp import FastMCP
@@ -9,11 +9,15 @@ from pydantic import Field
 
 from cli_agent_orchestrator.constants import API_BASE_URL, DEFAULT_PROVIDER, TERMINAL_READY_TIMEOUT
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.ops_mcp_server.models import InstallResult, LaunchResult
+from cli_agent_orchestrator.ops_mcp_server.models import (
+    InstallResult,
+    LaunchResult,
+    ProfileListResult,
+    SessionListResult,
+)
 from cli_agent_orchestrator.utils.terminal import generate_session_name, wait_until_terminal_status
 
 JsonDict = Dict[str, Any]
-JsonList = List[JsonDict]
 
 mcp = FastMCP(
     "cao-ops-mcp",
@@ -186,21 +190,41 @@ async def _launch_session_impl(
 
 
 @mcp.tool()
-async def discover_profiles() -> Union[JsonList, JsonDict]:
-    """List available agent profiles."""
+async def discover_profiles() -> ProfileListResult:
+    """List available agent profiles.
+
+    Scans built-in store, local store, and all configured provider agent
+    directories. Profiles are deduplicated by name with source metadata.
+
+    Returns:
+        ProfileListResult with success status and profiles list
+    """
     data, error = _request_json("get", "/agents/profiles", operation="Discover profiles")
     if error:
-        return {"success": False, "message": error}
+        return ProfileListResult(success=False, message=error)
     if isinstance(data, list):
-        return data
-    return {"success": False, "message": "Discover profiles failed: invalid response payload"}
+        return ProfileListResult(success=True, profiles=data)
+    return ProfileListResult(
+        success=False,
+        message="Discover profiles failed: invalid response payload",
+    )
 
 
 @mcp.tool()
 async def get_profile_details(
     name: Annotated[str, Field(description="The agent profile name to inspect")],
 ) -> JsonDict:
-    """Get the full parsed content of a specific agent profile."""
+    """Get the full parsed content of a specific agent profile.
+
+    Returns all AgentProfile fields (name, description, system_prompt, role,
+    provider, allowedTools, mcpServers, model) with None-valued fields excluded.
+
+    Args:
+        name: Agent profile name to inspect
+
+    Returns:
+        Dict with profile fields, or {"success": False, "message": ...} on error
+    """
     data, error = _request_json(
         "get",
         f"/agents/profiles/{name}",
@@ -225,7 +249,34 @@ async def install_profile(
         Field(description="Optional environment variables to inject before install"),
     ] = None,
 ) -> InstallResult:
-    """Install an agent profile for a target provider."""
+    """Install an agent profile for a target provider.
+
+    ## Source Resolution
+
+    The source is resolved in order:
+    1. URL (http:// or https://) — downloaded into the local agent store
+    2. Existing file on disk — copied into the local agent store
+    3. Agent name — looked up in local store, provider dirs, then built-in store
+
+    Path resolution checks the current working directory, so a bare agent
+    name that collides with a file or directory in CWD will route to path
+    resolution and fail. Use an explicit ``./`` prefix for file paths, or
+    ensure agent names do not collide with CWD contents.
+
+    ## Provider Config
+
+    - q_cli, kiro_cli: JSON config written to the provider's agents directory
+    - copilot_cli: frontmatter markdown written to the Copilot agents directory
+    - claude_code, codex: context file only, no provider-specific config
+
+    Args:
+        source: Agent name, file path, or URL
+        provider: Target provider (default: kiro_cli)
+        env_vars: Optional env vars written to the managed .env before install
+
+    Returns:
+        InstallResult with success status, file paths, and unresolved env vars
+    """
     params: Dict[str, Any] = {"source": source, "provider": provider}
     serialized_env_vars = _serialize_env_vars(env_vars)
     if serialized_env_vars:
@@ -268,7 +319,39 @@ async def launch_session(
         Field(description="Optional list of allowed tool restrictions"),
     ] = None,
 ) -> LaunchResult:
-    """Create a new CAO session and optionally deliver an initial prompt."""
+    """Create a new CAO session and optionally deliver an initial prompt.
+
+    Creates a fresh session with the given provider and agent profile. If a
+    prompt is provided, waits for the terminal to reach IDLE or COMPLETED
+    before sending it, then returns immediately without waiting for the
+    agent's response.
+
+    ## Usage
+
+    1. Create a new CAO session with the specified provider and profile
+    2. If prompt is provided: wait for readiness, then send the prompt
+    3. Return with session_name and terminal_id (non-blocking)
+
+    Use get_session_info or list_sessions to monitor progress, and
+    shutdown_session to clean up.
+
+    ## Partial Launch
+
+    On readiness timeout or prompt delivery failure, the returned
+    LaunchResult still carries session_name and terminal_id so the caller
+    can inspect or explicitly shut down the partially launched session.
+
+    Args:
+        agent_profile: Agent profile for the new session
+        prompt: Optional initial prompt sent after the session becomes ready
+        provider: CLI provider (default: kiro_cli)
+        session_name: Optional custom session name (auto-generated if omitted)
+        working_directory: Optional working directory for the session
+        allowed_tools: Optional list of tool restrictions
+
+    Returns:
+        LaunchResult with success status, session_name, and terminal_id
+    """
     return await _launch_session_impl(
         agent_profile=agent_profile,
         prompt=prompt,
@@ -280,21 +363,38 @@ async def launch_session(
 
 
 @mcp.tool()
-async def list_sessions() -> Union[JsonList, JsonDict]:
-    """List active CAO sessions."""
+async def list_sessions() -> SessionListResult:
+    """List active CAO sessions with terminal counts and statuses.
+
+    Returns:
+        SessionListResult with success status and sessions list
+    """
     data, error = _request_json("get", "/sessions", operation="List sessions")
     if error:
-        return {"success": False, "message": error}
+        return SessionListResult(success=False, message=error)
     if isinstance(data, list):
-        return data
-    return {"success": False, "message": "List sessions failed: invalid response payload"}
+        return SessionListResult(success=True, sessions=data)
+    return SessionListResult(
+        success=False,
+        message="List sessions failed: invalid response payload",
+    )
 
 
 @mcp.tool()
 async def get_session_info(
     session_name: Annotated[str, Field(description="The CAO session name to inspect")],
 ) -> JsonDict:
-    """Get detailed information for a specific CAO session."""
+    """Get detailed session metadata including per-terminal status.
+
+    Returns session fields along with a terminals array containing each
+    terminal's status, provider, profile, and last activity.
+
+    Args:
+        session_name: CAO session name to inspect
+
+    Returns:
+        Dict with session fields, or {"success": False, "message": ...} on error
+    """
     data, error = _request_json(
         "get",
         f"/sessions/{session_name}",
@@ -311,7 +411,16 @@ async def get_session_info(
 async def shutdown_session(
     session_name: Annotated[str, Field(description="The CAO session name to shut down")],
 ) -> JsonDict:
-    """Shut down a CAO session."""
+    """Cleanly shut down a CAO session.
+
+    Exits all providers, kills the tmux session, and removes database records.
+
+    Args:
+        session_name: CAO session name to shut down
+
+    Returns:
+        Dict with success status and cleanup details, or failure dict on error
+    """
     data, error = _request_json(
         "delete",
         f"/sessions/{session_name}",

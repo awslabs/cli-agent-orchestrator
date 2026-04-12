@@ -6,7 +6,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import requests
 
-from cli_agent_orchestrator.ops_mcp_server.models import InstallResult, LaunchResult
+from cli_agent_orchestrator.ops_mcp_server.models import (
+    InstallResult,
+    LaunchResult,
+    ProfileListResult,
+    SessionListResult,
+)
 from cli_agent_orchestrator.ops_mcp_server.server import (
     _launch_session_impl,
     discover_profiles,
@@ -50,7 +55,7 @@ class TestProfileTools:
     """Tests for profile management tools."""
 
     async def test_discover_profiles_returns_non_empty_list(self) -> None:
-        """Profile discovery should return the API list unchanged."""
+        """Profile discovery should wrap the API list in a ProfileListResult."""
         profiles = [{"name": "developer", "description": "Writes code", "source": "built-in"}]
         with patch(
             "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
@@ -58,7 +63,7 @@ class TestProfileTools:
         ) as mock_request:
             result = await discover_profiles()
 
-        assert result == profiles
+        assert result == ProfileListResult(success=True, profiles=profiles)
         mock_request.assert_called_once_with(
             "get",
             "http://127.0.0.1:9889/agents/profiles",
@@ -66,27 +71,28 @@ class TestProfileTools:
         )
 
     async def test_discover_profiles_returns_empty_list(self) -> None:
-        """Empty profile stores should return an empty list."""
+        """Empty profile stores should still be a successful result."""
         with patch(
             "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
             return_value=_response(json_data=[]),
         ):
             result = await discover_profiles()
 
-        assert result == []
+        assert result == ProfileListResult(success=True, profiles=[])
 
-    async def test_discover_profiles_returns_error_dict_on_api_error(self) -> None:
-        """Profile discovery should convert API errors into structured failures."""
+    async def test_discover_profiles_returns_failure_on_api_error(self) -> None:
+        """Profile discovery should convert API errors into failed results."""
         with patch(
             "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
             return_value=_response(status_code=500, json_data={"detail": "server exploded"}),
         ):
             result = await discover_profiles()
 
-        assert result == {
-            "success": False,
-            "message": "Discover profiles failed: server exploded",
-        }
+        assert result == ProfileListResult(
+            success=False,
+            message="Discover profiles failed: server exploded",
+            profiles=[],
+        )
 
     async def test_get_profile_details_returns_profile(self) -> None:
         """Profile details should return the parsed profile payload."""
@@ -419,7 +425,7 @@ class TestSessionLifecycleTools:
         )
 
     async def test_list_sessions_returns_list(self) -> None:
-        """Session listing should pass through the API payload."""
+        """Session listing should wrap the API payload in a SessionListResult."""
         sessions = [{"session_name": "cao-123", "terminal_count": 2}]
         with patch(
             "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
@@ -427,27 +433,31 @@ class TestSessionLifecycleTools:
         ):
             result = await list_sessions()
 
-        assert result == sessions
+        assert result == SessionListResult(success=True, sessions=sessions)
 
     async def test_list_sessions_returns_empty_list(self) -> None:
-        """Empty session lists should be returned unchanged."""
+        """Empty session lists should still be a successful result."""
         with patch(
             "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
             return_value=_response(json_data=[]),
         ):
             result = await list_sessions()
 
-        assert result == []
+        assert result == SessionListResult(success=True, sessions=[])
 
     async def test_list_sessions_returns_failure_on_api_error(self) -> None:
-        """Session list errors should be returned as failures."""
+        """Session list errors should be returned as failed results."""
         with patch(
             "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
             side_effect=requests.ConnectionError("api offline"),
         ):
             result = await list_sessions()
 
-        assert result == {"success": False, "message": "List sessions failed: api offline"}
+        assert result == SessionListResult(
+            success=False,
+            message="List sessions failed: api offline",
+            sessions=[],
+        )
 
     async def test_get_session_info_returns_payload(self) -> None:
         """Session details should be returned unchanged."""

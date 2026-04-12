@@ -1,6 +1,6 @@
 """Models for the CAO operations MCP server."""
 
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -22,4 +22,37 @@ class LaunchResult(BaseModel):
     )
 
 
-__all__ = ["InstallResult", "LaunchResult"]
+class ProfileListResult(BaseModel):
+    """Result for profile discovery operations."""
+
+    success: bool = Field(description="Whether the discovery operation succeeded")
+    message: Optional[str] = Field(
+        default=None,
+        description="Error message when success is False",
+    )
+    profiles: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Available profiles with name, description, and source",
+    )
+
+
+class SessionListResult(BaseModel):
+    """Result for session list operations."""
+
+    success: bool = Field(description="Whether the list operation succeeded")
+    message: Optional[str] = Field(
+        default=None,
+        description="Error message when success is False",
+    )
+    sessions: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Active CAO sessions with terminal counts and statuses",
+    )
+
+
+__all__ = [
+    "InstallResult",
+    "LaunchResult",
+    "ProfileListResult",
+    "SessionListResult",
+]
