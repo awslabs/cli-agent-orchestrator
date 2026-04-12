@@ -14,11 +14,11 @@ from cli_agent_orchestrator.ops_mcp_server.models import (
 )
 from cli_agent_orchestrator.ops_mcp_server.server import (
     _launch_session_impl,
-    discover_profiles,
     get_profile_details,
     get_session_info,
     install_profile,
     launch_session,
+    list_profiles,
     list_sessions,
     main,
     shutdown_session,
@@ -54,14 +54,14 @@ def _response(
 class TestProfileTools:
     """Tests for profile management tools."""
 
-    async def test_discover_profiles_returns_non_empty_list(self) -> None:
-        """Profile discovery should wrap the API list in a ProfileListResult."""
+    async def test_list_profiles_returns_non_empty_list(self) -> None:
+        """Profile listing should wrap the API list in a ProfileListResult."""
         profiles = [{"name": "developer", "description": "Writes code", "source": "built-in"}]
         with patch(
             "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
             return_value=_response(json_data=profiles),
         ) as mock_request:
-            result = await discover_profiles()
+            result = await list_profiles()
 
         assert result == ProfileListResult(success=True, profiles=profiles)
         mock_request.assert_called_once_with(
@@ -70,27 +70,27 @@ class TestProfileTools:
             params=None,
         )
 
-    async def test_discover_profiles_returns_empty_list(self) -> None:
+    async def test_list_profiles_returns_empty_list(self) -> None:
         """Empty profile stores should still be a successful result."""
         with patch(
             "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
             return_value=_response(json_data=[]),
         ):
-            result = await discover_profiles()
+            result = await list_profiles()
 
         assert result == ProfileListResult(success=True, profiles=[])
 
-    async def test_discover_profiles_returns_failure_on_api_error(self) -> None:
-        """Profile discovery should convert API errors into failed results."""
+    async def test_list_profiles_returns_failure_on_api_error(self) -> None:
+        """Profile listing should convert API errors into failed results."""
         with patch(
             "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
             return_value=_response(status_code=500, json_data={"detail": "server exploded"}),
         ):
-            result = await discover_profiles()
+            result = await list_profiles()
 
         assert result == ProfileListResult(
             success=False,
-            message="Discover profiles failed: server exploded",
+            message="List profiles failed: server exploded",
             profiles=[],
         )
 
@@ -330,7 +330,7 @@ class TestSessionLifecycleTools:
         wait_args = mock_wait.call_args.args
         assert wait_args[0] == "term-456"
         assert wait_args[1]
-        assert mock_wait.call_args.kwargs["timeout"] == 120.0
+        assert mock_wait.call_args.kwargs["timeout"] == 30.0
         mock_sleep.assert_awaited_once_with(2)
 
     async def test_launch_session_returns_failure_on_ready_timeout(self) -> None:
@@ -349,7 +349,7 @@ class TestSessionLifecycleTools:
 
         assert result == LaunchResult(
             success=False,
-            message="Terminal term-timeout did not reach ready status within 120 seconds",
+            message="Terminal term-timeout did not reach ready status within 30 seconds",
             session_name=result.session_name,
             terminal_id="term-timeout",
         )

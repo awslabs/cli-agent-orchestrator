@@ -28,7 +28,7 @@ mcp = FastMCP(
     Requires the CAO API server running at localhost:9889.
 
     ## Typical Workflow
-    1. discover_profiles to inspect available profiles
+    1. list_profiles to inspect available profiles
     2. get_profile_details to review a profile's full prompt and metadata
     3. install_profile to install a profile for a target provider
     4. launch_session to start a new CAO session with an optional initial prompt
@@ -190,7 +190,7 @@ async def _launch_session_impl(
 
 
 @mcp.tool()
-async def discover_profiles() -> ProfileListResult:
+async def list_profiles() -> ProfileListResult:
     """List available agent profiles.
 
     Scans built-in store, local store, and all configured provider agent
@@ -199,14 +199,14 @@ async def discover_profiles() -> ProfileListResult:
     Returns:
         ProfileListResult with success status and profiles list
     """
-    data, error = _request_json("get", "/agents/profiles", operation="Discover profiles")
+    data, error = _request_json("get", "/agents/profiles", operation="List profiles")
     if error:
         return ProfileListResult(success=False, message=error)
     if isinstance(data, list):
         return ProfileListResult(success=True, profiles=data)
     return ProfileListResult(
         success=False,
-        message="Discover profiles failed: invalid response payload",
+        message="List profiles failed: invalid response payload",
     )
 
 
