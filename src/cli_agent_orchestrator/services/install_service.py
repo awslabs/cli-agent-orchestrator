@@ -15,6 +15,7 @@ from cli_agent_orchestrator.constants import (
     KIRO_AGENTS_DIR,
     LOCAL_AGENT_STORE_DIR,
     Q_AGENTS_DIR,
+    SKILLS_DIR,
 )
 from cli_agent_orchestrator.models.copilot_agent import CopilotAgentConfig
 from cli_agent_orchestrator.models.kiro_agent import KiroAgentConfig
@@ -25,6 +26,7 @@ from cli_agent_orchestrator.utils.agent_profiles import (
     parse_agent_profile_text,
 )
 from cli_agent_orchestrator.utils.env import resolve_env_vars, set_env_var
+from cli_agent_orchestrator.utils.skill_injection import compose_agent_prompt
 from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
 
 
@@ -184,7 +186,7 @@ def install_agent(
                 tools=profile.tools if profile.tools is not None else ["*"],
                 allowedTools=allowed_tools,
                 resources=[f"file://{context_file.absolute()}"],
-                prompt=profile.prompt,
+                prompt=compose_agent_prompt(profile),
                 mcpServers=profile.mcpServers,
                 toolAliases=profile.toolAliases,
                 toolsSettings=profile.toolsSettings,
@@ -199,13 +201,22 @@ def install_agent(
 
         elif provider == ProviderType.KIRO_CLI.value:
             KIRO_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+            # Kiro natively supports skill:// resources with progressive loading
+            # (metadata at startup, full content on demand).
+            kiro_resources = [
+                f"file://{context_file.absolute()}",
+                f"skill://{SKILLS_DIR}/**/SKILL.md",
+            ]
+            raw_prompt = (
+                profile.prompt.strip() if profile.prompt and profile.prompt.strip() else None
+            )
             kiro_agent_config = KiroAgentConfig(
                 name=profile.name,
                 description=profile.description,
                 tools=profile.tools if profile.tools is not None else ["*"],
                 allowedTools=allowed_tools,
-                resources=[f"file://{context_file.absolute()}"],
-                prompt=profile.prompt,
+                resources=kiro_resources,
+                prompt=raw_prompt,
                 mcpServers=profile.mcpServers,
                 toolAliases=profile.toolAliases,
                 toolsSettings=profile.toolsSettings,
@@ -222,17 +233,18 @@ def install_agent(
             COPILOT_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
             system_prompt = profile.system_prompt.strip() if profile.system_prompt else ""
             fallback_prompt = profile.prompt.strip() if profile.prompt else ""
-            resolved_prompt = system_prompt or fallback_prompt
-            if not resolved_prompt:
+            base_prompt = system_prompt or fallback_prompt
+            if not base_prompt:
                 raise ValueError(
                     f"Agent '{profile.name}' has no usable prompt content for Copilot "
                     "(both system_prompt and prompt are empty or whitespace)"
                 )
 
+            prompt = compose_agent_prompt(profile, base_prompt=base_prompt) or base_prompt
             copilot_agent_config = CopilotAgentConfig(
                 name=profile.name,
                 description=profile.description,
-                prompt=resolved_prompt,
+                prompt=prompt,
             )
             agent_file = COPILOT_AGENTS_DIR / f"{safe_filename}.agent.md"
             agent_file.write_text(
