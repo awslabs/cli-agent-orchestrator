@@ -49,7 +49,9 @@ class TestPluginRegistryLoad:
         assert "No CAO plugins registered" in caplog.text
 
     @pytest.mark.asyncio
-    async def test_load_single_plugin_with_one_hook_dispatches_matching_event(self) -> None:
+    async def test_load_single_plugin_with_one_hook_dispatches_matching_event(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
         """A single registered hook should receive matching dispatched events."""
 
         received: list[str] = []
@@ -65,13 +67,15 @@ class TestPluginRegistryLoad:
             "importlib.metadata.entry_points",
             return_value=[make_entry_point("single-hook", SingleHookPlugin)],
         ):
-            await registry.load()
+            with caplog.at_level(logging.INFO, logger="cli_agent_orchestrator.plugins.registry"):
+                await registry.load()
 
         await registry.dispatch("message_sent", MessageSentEvent(message="hello"))
 
         assert received == ["hello"]
         assert len(registry._plugins) == 1
         assert len(registry._dispatch["message_sent"]) == 1
+        assert "Loaded CAO plugin: single-hook" in caplog.text
 
     @pytest.mark.asyncio
     async def test_load_single_plugin_with_two_hooks_for_same_event_invokes_both(self) -> None:
@@ -173,6 +177,7 @@ class TestPluginRegistryLoad:
         assert received == ["healthy:hello"]
         assert len(registry._plugins) == 1
         assert "Failed to load plugin 'failing-setup'" in caplog.text
+        assert caplog.records[-1].exc_info is not None
 
     @pytest.mark.asyncio
     async def test_load_skips_non_plugin_entry_point_with_warning(
@@ -231,6 +236,7 @@ class TestPluginRegistryDispatch:
 
         assert set(received) == {"broken", "healthy"}
         assert "raised an error for event 'message_sent'" in caplog.text
+        assert caplog.records[-1].exc_info is not None
 
     @pytest.mark.asyncio
     async def test_dispatch_with_no_registered_handlers_is_no_op(
@@ -283,3 +289,4 @@ class TestPluginRegistryTeardown:
 
         assert set(torn_down) == {"failing", "healthy"}
         assert "Plugin teardown failed for FailingTeardownPlugin" in caplog.text
+        assert caplog.records[-1].exc_info is not None
