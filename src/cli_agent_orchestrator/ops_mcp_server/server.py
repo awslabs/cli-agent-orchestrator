@@ -1,5 +1,6 @@
 """CAO operations MCP server implementation."""
 
+import json
 from typing import Annotated, Any, Dict, List, Optional
 
 import requests  # type: ignore[import-untyped]
@@ -78,10 +79,10 @@ def _request_json(
 
 
 def _serialize_env_vars(env_vars: Optional[Dict[str, str]]) -> Optional[str]:
-    """Serialize env var mappings into the API's comma-separated format."""
+    """Serialize env var mappings into the API's JSON format."""
     if not env_vars:
         return None
-    return ",".join(f"{key}={value}" for key, value in env_vars.items())
+    return json.dumps(env_vars)
 
 
 def _serialize_allowed_tools(allowed_tools: Optional[List[str]]) -> Optional[str]:
@@ -89,11 +90,6 @@ def _serialize_allowed_tools(allowed_tools: Optional[List[str]]) -> Optional[str
     if not allowed_tools:
         return None
     return ",".join(allowed_tools)
-
-
-def _install_result_from_error(message: str) -> InstallResult:
-    """Build a failed InstallResult."""
-    return InstallResult(success=False, message=message)
 
 
 async def _launch_session_impl(
@@ -245,10 +241,10 @@ async def install_profile(
         operation=f"Install profile '{source}'",
     )
     if error:
-        return _install_result_from_error(error)
+        return InstallResult(success=False, message=error)
     if isinstance(data, dict):
         return InstallResult(**data)
-    return _install_result_from_error("Install profile failed: invalid response payload")
+    return InstallResult(success=False, message="Install profile failed: invalid response payload")
 
 
 @mcp.tool()

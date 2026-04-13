@@ -56,10 +56,14 @@ def install(agent_source: str, provider: str, env_vars: tuple[str, ...]) -> None
         return
 
     click.echo(f"✓ Agent '{result.agent_name}' installed successfully")
-    if parsed_env:
-        click.echo(f"✓ Set {len(parsed_env)} env var(s) in {CAO_ENV_FILE}")
+    if env_vars:
+        click.echo(f"✓ Set {len(env_vars)} env var(s) in {CAO_ENV_FILE}")
     if result.unresolved_vars:
-        click.echo(f"⚠ Unresolved env var(s): {', '.join(result.unresolved_vars)}", err=True)
+        click.echo(
+            f"⚠ Unresolved env var(s) in profile: {', '.join(result.unresolved_vars)}. "
+            "Set them with `cao env set` or pass --env KEY=VALUE.",
+            err=True,
+        )
     if result.context_file:
         click.echo(f"✓ Context file: {result.context_file}")
     if result.agent_file:

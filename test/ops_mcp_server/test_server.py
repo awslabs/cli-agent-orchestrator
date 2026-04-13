@@ -180,7 +180,7 @@ class TestProfileTools:
         )
 
     async def test_install_profile_serializes_env_vars(self) -> None:
-        """Env var maps should be serialized into the API's comma-separated format."""
+        """Env var maps should be serialized into the API's JSON format."""
         payload = {
             "success": True,
             "message": "installed",
@@ -205,7 +205,7 @@ class TestProfileTools:
             params={
                 "source": "developer",
                 "provider": "kiro_cli",
-                "env_vars": "API_TOKEN=secret,BASE_URL=http://localhost:27124",
+                "env_vars": '{"API_TOKEN": "secret", "BASE_URL": "http://localhost:27124"}',
             },
         )
 

@@ -88,7 +88,7 @@ class TestInstallAgentProfileEndpoint:
                 params={
                     "source": "developer",
                     "provider": "kiro_cli",
-                    "env_vars": "API_TOKEN=secret-token,BASE_URL=http://localhost:27124",
+                    "env_vars": '{"API_TOKEN": "secret-token", "BASE_URL": "http://localhost:27124"}',
                 },
             )
 
@@ -118,11 +118,11 @@ class TestInstallAgentProfileEndpoint:
         assert response.json()["detail"] == "Agent profile not found: missing"
 
     def test_returns_400_for_invalid_env_var_string(self, client) -> None:
-        """Bad env var assignments should fail request validation."""
+        """Non-JSON env_vars should fail request validation."""
         response = client.post(
             "/agents/profiles/install",
             params={"source": "developer", "env_vars": "INVALID_FORMAT"},
         )
 
         assert response.status_code == 400
-        assert "Expected format KEY=VALUE" in response.json()["detail"]
+        assert "Invalid env_vars JSON" in response.json()["detail"]

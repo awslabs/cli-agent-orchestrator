@@ -55,7 +55,8 @@ class TestInstallCommand:
         assert result.exit_code == 0
         assert "Agent 'developer' installed successfully" in result.output
         assert "Set 1 env var(s)" in result.output
-        assert "Unresolved env var(s): BASE_URL" in result.output
+        assert "Unresolved env var(s) in profile: BASE_URL" in result.output
+        assert "cao env set" in result.output
         assert "Context file: /tmp/agent-context/developer.md" in result.output
         assert "kiro_cli agent: /tmp/kiro/developer.json" in result.output
         mock_install.assert_called_once_with(

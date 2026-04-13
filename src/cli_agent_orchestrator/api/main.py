@@ -49,7 +49,7 @@ from cli_agent_orchestrator.services import (
 )
 from cli_agent_orchestrator.services.cleanup_service import cleanup_old_data
 from cli_agent_orchestrator.services.inbox_service import LogFileHandler
-from cli_agent_orchestrator.services.install_service import install_agent, parse_env_assignment
+from cli_agent_orchestrator.services.install_service import InstallResult, install_agent, parse_env_assignment
 from cli_agent_orchestrator.services.terminal_service import OutputMode
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.logging import setup_logging
@@ -189,15 +189,18 @@ async def health_check():
 
 
 def _parse_env_vars(env_vars: str) -> Dict[str, str]:
-    """Parse a comma-separated ``KEY=VALUE`` string into a mapping."""
-    parsed: Dict[str, str] = {}
-    for raw_assignment in env_vars.split(","):
-        assignment = raw_assignment.strip()
-        if not assignment:
-            continue
-        key, value = parse_env_assignment(assignment)
-        parsed[key] = value
-    return parsed
+    """Parse a JSON-encoded ``{"KEY": "VALUE"}`` string into a mapping."""
+    import json as _json
+
+    try:
+        result = _json.loads(env_vars)
+    except _json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid env_vars JSON: {exc}") from exc
+
+    if not isinstance(result, dict):
+        raise ValueError("env_vars must be a JSON object mapping string keys to string values")
+
+    return result
 
 
 @app.get("/agents/profiles")
@@ -233,7 +236,7 @@ async def install_agent_profile_endpoint(
     source: str,
     provider: str = DEFAULT_PROVIDER,
     env_vars: Optional[str] = None,
-) -> Dict:
+) -> InstallResult:
     """Install an agent profile for a target provider."""
     try:
         parsed_env = _parse_env_vars(env_vars) if env_vars else None
@@ -244,7 +247,7 @@ async def install_agent_profile_endpoint(
     if not result.success:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=result.message)
 
-    return result.model_dump()
+    return result
 
 
 @app.get("/agents/providers")

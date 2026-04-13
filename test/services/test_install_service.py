@@ -119,6 +119,43 @@ class TestInstallAgent:
         assert "${API_TOKEN}" in context_text
         assert "${BASE_URL}" in context_text
 
+    def test_install_from_flat_profile_in_provider_dir(
+        self, install_paths: dict[str, Path]
+    ) -> None:
+        """Flat <provider_dir>/<name>.md layout should be resolved correctly."""
+        flat_profile = install_paths["provider_dir"] / "flat-agent.md"
+        flat_profile.write_text(_profile_text(name="flat-agent"), encoding="utf-8")
+
+        result = install_agent("flat-agent", "claude_code")
+
+        assert result.success is True
+        assert result.agent_name == "flat-agent"
+
+    def test_install_from_extra_dir_flat_profile(
+        self, install_paths: dict[str, Path]
+    ) -> None:
+        """Flat <extra_dir>/<name>.md layout in extra dirs should be resolved correctly."""
+        flat_profile = install_paths["extra_dir"] / "extra-agent.md"
+        flat_profile.write_text(_profile_text(name="extra-agent"), encoding="utf-8")
+
+        result = install_agent("extra-agent", "claude_code")
+
+        assert result.success is True
+        assert result.agent_name == "extra-agent"
+
+    def test_install_from_extra_dir_nested_profile(
+        self, install_paths: dict[str, Path]
+    ) -> None:
+        """Nested <extra_dir>/<name>/agent.md layout should be resolved correctly."""
+        nested_dir = install_paths["extra_dir"] / "nested-agent"
+        nested_dir.mkdir()
+        (nested_dir / "agent.md").write_text(_profile_text(name="nested-agent"), encoding="utf-8")
+
+        result = install_agent("nested-agent", "claude_code")
+
+        assert result.success is True
+        assert result.agent_name == "nested-agent"
+
     def test_install_from_url_downloads_and_writes_q_config(
         self, install_paths: dict[str, Path]
     ) -> None:
