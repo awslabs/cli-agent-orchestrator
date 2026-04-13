@@ -542,7 +542,7 @@ The assistant will follow the skill's step-by-step guide, reference the provider
 
 ### Managed Skills
 
-CAO also manages skills that are shared across all agent sessions. Builtin skills (`cao-supervisor-protocols`, `cao-worker-protocols`) are auto-seeded when the server starts — no `cao init` required.
+CAO also manages skills that are shared across all agent sessions. Builtin skills (`cao-supervisor-protocols`, `cao-worker-protocols`) are auto-seeded when the `cao-server` starts — no `cao init` required.
 
 ```bash
 # List installed skills
