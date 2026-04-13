@@ -1,21 +1,20 @@
 """Tests for CAO plugin base primitives."""
 
-from typing import Any
-
 import pytest
 
 from cli_agent_orchestrator.plugins.base import _HOOK_EVENT_ATTR, CaoPlugin, hook
+from cli_agent_orchestrator.plugins.events import MessageSentEvent, SessionCreatedEvent
 
 
 class ExamplePlugin(CaoPlugin):
     """Simple plugin used to verify hook registration."""
 
     @hook("message_sent")
-    async def on_message(self, event: Any) -> None:
+    async def on_message(self, event: MessageSentEvent) -> None:
         """Handle a message event."""
 
     @hook("session_created")
-    async def on_session_created(self, event: Any) -> None:
+    async def on_session_created(self, event: SessionCreatedEvent) -> None:
         """Handle a session creation event."""
 
 
@@ -54,7 +53,7 @@ class TestHookDecorator:
     def test_hook_preserves_original_callable_reference(self) -> None:
         """Decorator returns the same callable instead of wrapping it."""
 
-        async def handler(event: Any) -> None:
+        async def handler(event: MessageSentEvent) -> None:
             """Standalone handler used for identity checks."""
 
         decorated = hook("terminal_created")(handler)

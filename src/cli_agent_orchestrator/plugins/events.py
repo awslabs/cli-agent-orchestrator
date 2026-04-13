@@ -14,6 +14,7 @@ def _utc_now() -> datetime:
 class CaoEvent:
     """Base class for all CAO plugin events."""
 
+    # Empty by default so the base dataclass is zero-arg constructible for Phase 1 tests.
     event_type: str = ""
     timestamp: datetime = field(default_factory=_utc_now)
     session_id: str | None = None

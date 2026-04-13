@@ -1,6 +1,6 @@
 """Tests for CAO plugin event dataclasses."""
 
-from datetime import timezone
+from datetime import timedelta
 
 from cli_agent_orchestrator.plugins.events import (
     CaoEvent,
@@ -62,7 +62,7 @@ class TestEventDefaults:
         event = CaoEvent()
 
         assert event.timestamp.tzinfo is not None
-        assert event.timestamp.utcoffset() == timezone.utc.utcoffset(event.timestamp)
+        assert event.timestamp.utcoffset() == timedelta(0)
         assert event.event_type == ""
         assert event.session_id is None
 
