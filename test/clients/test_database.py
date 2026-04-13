@@ -525,6 +525,7 @@ class TestFlowOperations:
             msg.sender_id = "sender-123"
             msg.receiver_id = "receiver-456"
             msg.message = "Hello"
+            msg.orchestration_type = "send_message"
             msg.status = MessageStatus.PENDING.value
             msg.created_at = datetime.now()
 
@@ -535,6 +536,7 @@ class TestFlowOperations:
         assert result.sender_id == "sender-123"
         assert result.receiver_id == "receiver-456"
         assert result.message == "Hello"
+        assert result.orchestration_type == "send_message"
         mock_session.add.assert_called_once()
         mock_session.commit.assert_called_once()
 

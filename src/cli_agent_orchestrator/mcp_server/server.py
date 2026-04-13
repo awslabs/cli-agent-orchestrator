@@ -12,6 +12,7 @@ from pydantic import Field
 
 from cli_agent_orchestrator.constants import API_BASE_URL, DEFAULT_PROVIDER
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
+from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.utils.terminal import generate_session_name, wait_until_terminal_status
 
@@ -177,18 +178,26 @@ def _create_terminal(
     return terminal["id"], provider
 
 
-def _send_direct_input(terminal_id: str, message: str) -> None:
+def _send_direct_input(
+    terminal_id: str, message: str, orchestration_type: OrchestrationType
+) -> None:
     """Send input directly to a terminal (bypasses inbox).
 
     Args:
         terminal_id: Terminal ID
         message: Message to send
+        orchestration_type: Orchestration mode for plugin event emission
 
     Raises:
         Exception: If sending fails
     """
     response = requests.post(
-        f"{API_BASE_URL}/terminals/{terminal_id}/input", params={"message": message}
+        f"{API_BASE_URL}/terminals/{terminal_id}/input",
+        params={
+            "message": message,
+            "sender_id": os.environ.get("CAO_TERMINAL_ID", "supervisor"),
+            "orchestration_type": orchestration_type,
+        },
     )
     response.raise_for_status()
 
@@ -211,7 +220,7 @@ def _send_direct_input_handoff(terminal_id: str, provider: str, message: str) ->
     else:
         handoff_message = message
 
-    _send_direct_input(terminal_id, handoff_message)
+    _send_direct_input(terminal_id, handoff_message, "handoff")
 
 
 def _send_direct_input_assign(terminal_id: str, message: str) -> None:
@@ -224,10 +233,12 @@ def _send_direct_input_assign(terminal_id: str, message: str) -> None:
             f"When done, send results back to terminal {sender_id} using send_message]"
         )
 
-    _send_direct_input(terminal_id, message)
+    _send_direct_input(terminal_id, message, "assign")
 
 
-def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
+def _send_to_inbox(
+    receiver_id: str, message: str, orchestration_type: OrchestrationType = "send_message"
+) -> Dict[str, Any]:
     """Send message to another terminal's inbox (queued delivery when IDLE).
 
     Args:
@@ -247,7 +258,11 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
 
     response = requests.post(
         f"{API_BASE_URL}/terminals/{receiver_id}/inbox/messages",
-        params={"sender_id": sender_id, "message": message},
+        params={
+            "sender_id": sender_id,
+            "message": message,
+            "orchestration_type": orchestration_type,
+        },
     )
     response.raise_for_status()
     return response.json()
@@ -583,7 +598,7 @@ def _send_message_impl(receiver_id: str, message: str) -> Dict[str, Any]:
                 "Use send_message MCP tool for any follow-up work.]"
             )
 
-        return _send_to_inbox(receiver_id, message)
+        return _send_to_inbox(receiver_id, message, "send_message")
     except Exception as e:
         return {"success": False, "error": str(e)}
 

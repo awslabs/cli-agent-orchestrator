@@ -28,9 +28,43 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.constants import SESSION_PREFIX
+from cli_agent_orchestrator.models.terminal import Terminal
+from cli_agent_orchestrator.plugins import PluginRegistry, SessionCreatedEvent, SessionKilledEvent
 from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
+from cli_agent_orchestrator.services.terminal_service import create_terminal
 
 logger = logging.getLogger(__name__)
+
+
+def create_session(
+    provider: str,
+    agent_profile: str,
+    session_name: str | None = None,
+    working_directory: str | None = None,
+    allowed_tools: list[str] | None = None,
+    registry: PluginRegistry | None = None,
+) -> Terminal:
+    """Create a new session by creating its initial terminal."""
+
+    terminal = create_terminal(
+        provider=provider,
+        agent_profile=agent_profile,
+        session_name=session_name,
+        new_session=True,
+        working_directory=working_directory,
+        allowed_tools=allowed_tools,
+        registry=registry,
+    )
+    dispatch_plugin_event(
+        registry,
+        "session_created",
+        SessionCreatedEvent(
+            session_id=terminal.session_name,
+            session_name=terminal.session_name,
+        ),
+    )
+    return terminal
 
 
 def list_sessions() -> List[Dict]:
@@ -63,7 +97,7 @@ def get_session(session_name: str) -> Dict:
         raise
 
 
-def delete_session(session_name: str) -> Dict:
+def delete_session(session_name: str, registry: PluginRegistry | None = None) -> Dict:
     """Delete session and cleanup.
 
     Returns:
@@ -91,6 +125,11 @@ def delete_session(session_name: str) -> Dict:
 
         result["deleted"].append(session_name)
         logger.info(f"Deleted session: {session_name}")
+        dispatch_plugin_event(
+            registry,
+            "session_killed",
+            SessionKilledEvent(session_id=session_name, session_name=session_name),
+        )
         return result
 
     except Exception as e:

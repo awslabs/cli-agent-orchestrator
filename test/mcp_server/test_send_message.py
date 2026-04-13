@@ -19,6 +19,7 @@ class TestSendMessageSenderIdInjection:
             result = _send_message_impl("receiver-123", "Here are the results")
 
         sent_message = mock_inbox.call_args[0][1]
+        assert mock_inbox.call_args[0][2] == "send_message"
         assert sent_message.startswith("Here are the results")
         assert "[Message from terminal sender-xyz" in sent_message
         assert "Use send_message MCP tool for any follow-up work.]" in sent_message
@@ -35,6 +36,7 @@ class TestSendMessageSenderIdInjection:
             result = _send_message_impl("receiver-123", "Here are the results")
 
         sent_message = mock_inbox.call_args[0][1]
+        assert mock_inbox.call_args[0][2] == "send_message"
         assert sent_message == "Here are the results"
 
     @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
@@ -49,6 +51,7 @@ class TestSendMessageSenderIdInjection:
             result = _send_message_impl("receiver-123", "Status update")
 
         sent_message = mock_inbox.call_args[0][1]
+        assert mock_inbox.call_args[0][2] == "send_message"
         assert "[Message from terminal unknown" in sent_message
 
     @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
@@ -64,5 +67,6 @@ class TestSendMessageSenderIdInjection:
             _send_message_impl("receiver-123", original)
 
         sent_message = mock_inbox.call_args[0][1]
+        assert mock_inbox.call_args[0][2] == "send_message"
         assert sent_message.startswith(original)
         assert sent_message.index("[Message from terminal") > len(original)
