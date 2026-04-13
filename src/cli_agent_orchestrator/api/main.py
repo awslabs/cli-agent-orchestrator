@@ -49,7 +49,7 @@ from cli_agent_orchestrator.services import (
 )
 from cli_agent_orchestrator.services.cleanup_service import cleanup_old_data
 from cli_agent_orchestrator.services.inbox_service import LogFileHandler
-from cli_agent_orchestrator.services.install_service import InstallResult, install_agent, parse_env_assignment
+from cli_agent_orchestrator.services.install_service import InstallResult, install_agent
 from cli_agent_orchestrator.services.terminal_service import OutputMode
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.logging import setup_logging
@@ -190,11 +190,9 @@ async def health_check():
 
 def _parse_env_vars(env_vars: str) -> Dict[str, str]:
     """Parse a JSON-encoded ``{"KEY": "VALUE"}`` string into a mapping."""
-    import json as _json
-
     try:
-        result = _json.loads(env_vars)
-    except _json.JSONDecodeError as exc:
+        result = json.loads(env_vars)
+    except json.JSONDecodeError as exc:
         raise ValueError(f"Invalid env_vars JSON: {exc}") from exc
 
     if not isinstance(result, dict):
