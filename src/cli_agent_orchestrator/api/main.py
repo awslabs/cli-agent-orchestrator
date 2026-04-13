@@ -12,9 +12,9 @@ import subprocess
 import termios
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Dict, List, Optional
+from typing import Annotated, Dict, List, Optional, cast
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field, field_validator
@@ -39,6 +39,7 @@ from cli_agent_orchestrator.constants import (
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import MessageStatus
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalId
+from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services import (
     flow_service,
@@ -127,6 +128,9 @@ async def lifespan(app: FastAPI):
     logger.info("Starting CLI Agent Orchestrator server...")
     setup_logging()
     init_db()
+    registry = PluginRegistry()
+    await registry.load()
+    app.state.plugin_registry = registry
 
     # Run cleanup in background
     asyncio.create_task(asyncio.to_thread(cleanup_old_data))
@@ -154,7 +158,14 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
 
+    await registry.teardown()
     logger.info("Shutting down CLI Agent Orchestrator server...")
+
+
+def get_plugin_registry(request: Request) -> PluginRegistry:
+    """Return the plugin registry stored on the FastAPI application state."""
+
+    return cast(PluginRegistry, request.app.state.plugin_registry)
 
 
 app = FastAPI(
