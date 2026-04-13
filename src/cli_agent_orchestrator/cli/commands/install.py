@@ -17,6 +17,7 @@ from cli_agent_orchestrator.constants import (
     LOCAL_AGENT_STORE_DIR,
     PROVIDERS,
     Q_AGENTS_DIR,
+    SKILLS_DIR,
 )
 from cli_agent_orchestrator.models.copilot_agent import CopilotAgentConfig
 from cli_agent_orchestrator.models.kiro_agent import KiroAgentConfig
@@ -24,6 +25,7 @@ from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.q_agent import QAgentConfig
 from cli_agent_orchestrator.utils.agent_profiles import parse_agent_profile_text
 from cli_agent_orchestrator.utils.env import resolve_env_vars, set_env_var
+from cli_agent_orchestrator.utils.skill_injection import compose_agent_prompt
 
 
 def _download_agent(source: str) -> str:
@@ -177,7 +179,7 @@ def install(agent_source: str, provider: str, env_vars: tuple[str, ...]):
                 tools=profile.tools if profile.tools is not None else ["*"],
                 allowedTools=allowed_tools,
                 resources=[f"file://{dest_file.absolute()}"],
-                prompt=profile.prompt,
+                prompt=compose_agent_prompt(profile),
                 mcpServers=profile.mcpServers,
                 toolAliases=profile.toolAliases,
                 toolsSettings=profile.toolsSettings,
@@ -186,18 +188,28 @@ def install(agent_source: str, provider: str, env_vars: tuple[str, ...]):
             )
             safe_filename = profile.name.replace("/", "__")
             agent_file = Q_AGENTS_DIR / f"{safe_filename}.json"
-            with open(agent_file, "w") as f:
-                f.write(agent_config.model_dump_json(indent=2, exclude_none=True))
+            agent_file.write_text(
+                agent_config.model_dump_json(indent=2, exclude_none=True), encoding="utf-8"
+            )
 
         elif provider == ProviderType.KIRO_CLI.value:
             KIRO_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+            # Kiro natively supports skill:// resources with progressive loading
+            # (metadata at startup, full content on demand).
+            kiro_resources = [
+                f"file://{dest_file.absolute()}",
+                f"skill://{SKILLS_DIR}/**/SKILL.md",
+            ]
+            raw_prompt = (
+                profile.prompt.strip() if profile.prompt and profile.prompt.strip() else None
+            )
             agent_config = KiroAgentConfig(
                 name=profile.name,
                 description=profile.description,
                 tools=profile.tools if profile.tools is not None else ["*"],
                 allowedTools=allowed_tools,
-                resources=[f"file://{dest_file.absolute()}"],
-                prompt=profile.prompt,
+                resources=kiro_resources,
+                prompt=raw_prompt,
                 mcpServers=profile.mcpServers,
                 toolAliases=profile.toolAliases,
                 toolsSettings=profile.toolsSettings,
@@ -206,19 +218,23 @@ def install(agent_source: str, provider: str, env_vars: tuple[str, ...]):
             )
             safe_filename = profile.name.replace("/", "__")
             agent_file = KIRO_AGENTS_DIR / f"{safe_filename}.json"
-            with open(agent_file, "w") as f:
-                f.write(agent_config.model_dump_json(indent=2, exclude_none=True))
+            agent_file.write_text(
+                agent_config.model_dump_json(indent=2, exclude_none=True), encoding="utf-8"
+            )
 
         elif provider == ProviderType.COPILOT_CLI.value:
             COPILOT_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
             system_prompt = profile.system_prompt.strip() if profile.system_prompt else ""
             fallback_prompt = profile.prompt.strip() if profile.prompt else ""
-            prompt = system_prompt or fallback_prompt
-            if not prompt:
+            base_prompt = system_prompt or fallback_prompt
+            if not base_prompt:
                 raise ValueError(
                     f"Agent '{profile.name}' has no usable prompt content for Copilot "
                     "(both system_prompt and prompt are empty or whitespace)"
                 )
+
+            # Bake skill catalog into the agent prompt body (same as Kiro/Q)
+            prompt = compose_agent_prompt(profile, base_prompt=base_prompt) or base_prompt
 
             safe_filename = profile.name.replace("/", "__")
             agent_file = COPILOT_AGENTS_DIR / f"{safe_filename}.agent.md"

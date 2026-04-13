@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Union
 
 import requests
 from fastmcp import FastMCP
@@ -38,6 +38,17 @@ mcp = FastMCP(
     - Ensure you're running within a CAO terminal (CAO_TERMINAL_ID must be set)
     """,
 )
+
+LOAD_SKILL_TOOL_DESCRIPTION = """Retrieve the full Markdown body of an available skill from cao-server.
+
+Use this tool when your prompt lists a CAO skill and you need its full instructions at runtime.
+
+Args:
+    name: Name of the skill to retrieve
+
+Returns:
+    The skill content on success, or a dict with success=False and an error message on failure
+"""
 
 
 def _resolve_child_allowed_tools(
@@ -240,6 +251,39 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
     )
     response.raise_for_status()
     return response.json()
+
+
+def _extract_error_detail(response: requests.Response, fallback: str) -> str:
+    """Extract a human-readable error detail from an API response."""
+    try:
+        payload = response.json()
+    except ValueError:
+        return fallback
+
+    detail = payload.get("detail")
+    if isinstance(detail, str) and detail:
+        return detail
+    return fallback
+
+
+def _load_skill_impl(name: str) -> Union[str, Dict[str, Any]]:
+    """Fetch a skill body from cao-server and return content or a structured error."""
+    try:
+        response = requests.get(f"{API_BASE_URL}/skills/{name}")
+        response.raise_for_status()
+        return response.json()["content"]
+    except requests.HTTPError as exc:
+        detail = str(exc)
+        if exc.response is not None:
+            detail = _extract_error_detail(exc.response, detail)
+        return {"success": False, "error": detail}
+    except requests.ConnectionError:
+        return {
+            "success": False,
+            "error": "Failed to connect to cao-server. The server may not be running.",
+        }
+    except Exception as exc:
+        return {"success": False, "error": f"Failed to retrieve skill: {str(exc)}"}
 
 
 # Implementation functions
@@ -562,6 +606,14 @@ async def send_message(
         Dict with success status and message details
     """
     return _send_message_impl(receiver_id, message)
+
+
+@mcp.tool(description=LOAD_SKILL_TOOL_DESCRIPTION)
+async def load_skill(
+    name: str = Field(description="Name of the skill to retrieve"),
+) -> Any:
+    """Retrieve skill content from cao-server."""
+    return _load_skill_impl(name)
 
 
 def main():

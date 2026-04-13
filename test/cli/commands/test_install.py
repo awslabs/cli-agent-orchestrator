@@ -10,6 +10,17 @@ import pytest
 from click.testing import CliRunner
 
 from cli_agent_orchestrator.cli.commands.install import _download_agent, install
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
+from cli_agent_orchestrator.models.kiro_agent import KiroAgentConfig
+from cli_agent_orchestrator.utils.skill_injection import refresh_agent_json_prompt
+
+
+def _create_skill(folder: Path, name: str, description: str, body: str = "# Skill\n\nBody") -> None:
+    """Create a skill folder with SKILL.md and optional content."""
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "SKILL.md").write_text(
+        "---\n" f"name: {name}\n" f"description: {description}\n" "---\n\n" f"{body}\n"
+    )
 
 
 class TestDownloadAgent:
@@ -688,3 +699,150 @@ class TestInstallCommandEnvFlags:
         assert "${API_TOKEN}" in installed_text
         assert "${SERVICE_URL}" in installed_text
         assert "integration-secret" not in installed_text
+
+
+class TestInstallSkillCatalogBaking:
+    """Tests for baked skill catalog injection during install."""
+
+    @pytest.fixture
+    def runner(self):
+        """Create a CLI test runner."""
+        return CliRunner()
+
+    @pytest.fixture
+    def install_workspace(self, tmp_path, monkeypatch):
+        """Patch install and skills paths into a temp workspace."""
+        local_store_dir = tmp_path / "agent-store"
+        context_dir = tmp_path / "agent-context"
+        kiro_dir = tmp_path / "kiro"
+        q_dir = tmp_path / "q"
+        skills_dir = tmp_path / "skills"
+
+        local_store_dir.mkdir()
+        context_dir.mkdir()
+        kiro_dir.mkdir()
+        q_dir.mkdir()
+        skills_dir.mkdir()
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR", local_store_dir
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.cli.commands.install.AGENT_CONTEXT_DIR", context_dir
+        )
+        monkeypatch.setattr("cli_agent_orchestrator.cli.commands.install.KIRO_AGENTS_DIR", kiro_dir)
+        monkeypatch.setattr("cli_agent_orchestrator.cli.commands.install.Q_AGENTS_DIR", q_dir)
+        monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", skills_dir)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs", lambda: {}
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", lambda: []
+        )
+
+        return {
+            "local_store_dir": local_store_dir,
+            "context_dir": context_dir,
+            "kiro_dir": kiro_dir,
+            "q_dir": q_dir,
+            "skills_dir": skills_dir,
+        }
+
+    @staticmethod
+    def _write_profile(profile_path: Path, frontmatter_body: str, system_prompt: str) -> None:
+        """Write a local markdown profile for install tests."""
+        profile_path.write_text(f"---\n{frontmatter_body}---\n{system_prompt}\n", encoding="utf-8")
+
+    def test_install_kiro_uses_skill_resources_not_baked_prompt(self, runner, install_workspace):
+        """Kiro installs should use skill:// glob in resources instead of baking catalog into prompt."""
+        _create_skill(
+            install_workspace["skills_dir"] / "python-testing",
+            "python-testing",
+            "Pytest conventions",
+        )
+        self._write_profile(
+            install_workspace["local_store_dir"] / "test-agent.md",
+            "name: test-agent\ndescription: Test agent\nprompt: Build things\n",
+            "System prompt",
+        )
+
+        result = runner.invoke(install, ["test-agent", "--provider", "kiro_cli"])
+
+        assert result.exit_code == 0
+        agent_json = json.loads((install_workspace["kiro_dir"] / "test-agent.json").read_text())
+        # Prompt should be the raw profile prompt without skill catalog
+        assert agent_json["prompt"] == "Build things"
+        assert "Available Skills" not in agent_json["prompt"]
+        # Resources should contain the skill:// glob
+        skill_resources = [r for r in agent_json["resources"] if r.startswith("skill://")]
+        assert len(skill_resources) == 1
+        assert skill_resources[0].endswith("/**/SKILL.md")
+
+    def test_install_q_bakes_catalog_into_prompt(self, runner, install_workspace):
+        """Q installs should bake the global skill catalog into the JSON prompt."""
+        _create_skill(
+            install_workspace["skills_dir"] / "python-testing",
+            "python-testing",
+            "Pytest conventions",
+        )
+        self._write_profile(
+            install_workspace["local_store_dir"] / "test-agent.md",
+            "name: test-agent\ndescription: Test agent\nprompt: Build things\n",
+            "System prompt",
+        )
+
+        result = runner.invoke(install, ["test-agent", "--provider", "q_cli"])
+
+        assert result.exit_code == 0
+        agent_json = json.loads((install_workspace["q_dir"] / "test-agent.json").read_text())
+        assert agent_json["prompt"].startswith("Build things\n\n## Available Skills")
+        assert "python-testing" in agent_json["prompt"]
+
+    def test_install_kiro_omits_prompt_field_when_profile_prompt_is_empty(
+        self, runner, install_workspace
+    ):
+        """Empty profile prompt should omit prompt field; skill:// glob still in resources."""
+        self._write_profile(
+            install_workspace["local_store_dir"] / "test-agent.md",
+            "name: test-agent\ndescription: Test agent\n",
+            "System prompt",
+        )
+
+        result = runner.invoke(install, ["test-agent", "--provider", "kiro_cli"])
+
+        assert result.exit_code == 0
+        agent_path = install_workspace["kiro_dir"] / "test-agent.json"
+        agent_json = json.loads(agent_path.read_text())
+        assert "prompt" not in agent_json
+        # skill:// glob should still be present in resources
+        skill_resources = [r for r in agent_json["resources"] if r.startswith("skill://")]
+        assert len(skill_resources) == 1
+
+    def test_install_non_ascii_prompt_round_trips_through_refresh_without_byte_drift(
+        self, runner, install_workspace
+    ):
+        """Non-ASCII prompt content should survive install and refresh with byte-identical JSON."""
+        _create_skill(
+            install_workspace["skills_dir"] / "unicode-skill",
+            "unicode-skill",
+            "Unicode skill",
+        )
+        self._write_profile(
+            install_workspace["local_store_dir"] / "unicode-agent.md",
+            "name: unicode-agent\ndescription: Test agent\nprompt: こんにちは 🚀\n",
+            "System prompt",
+        )
+
+        result = runner.invoke(install, ["unicode-agent", "--provider", "q_cli"])
+
+        assert result.exit_code == 0
+        agent_path = install_workspace["q_dir"] / "unicode-agent.json"
+        before_refresh = agent_path.read_bytes()
+
+        refreshed = refresh_agent_json_prompt(
+            agent_path,
+            AgentProfile(name="unicode-agent", description="Test agent", prompt="こんにちは 🚀"),
+        )
+
+        assert refreshed is True
+        assert agent_path.read_bytes() == before_refresh

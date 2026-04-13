@@ -8,6 +8,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
 
 class TestCreateTerminalCleanup:
     """Test error cleanup paths in create_terminal."""
@@ -23,14 +25,23 @@ class TestCreateTerminalCleanup:
         "cli_agent_orchestrator.services.terminal_service.generate_terminal_id",
         return_value="tid1",
     )
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
     def test_cleanup_on_provider_init_failure(
-        self, mock_tid, mock_wname, mock_db_create, mock_pm, mock_tmux, mock_log_dir
+        self,
+        mock_load_profile,
+        mock_tid,
+        mock_wname,
+        mock_db_create,
+        mock_pm,
+        mock_tmux,
+        mock_log_dir,
     ):
         """When provider.initialize() fails, cleanup should kill session and cleanup provider."""
         from cli_agent_orchestrator.services.terminal_service import create_terminal
 
         mock_tmux.session_exists.return_value = False
         mock_tmux.create_session.return_value = "w1"
+        mock_load_profile.return_value = AgentProfile(name="dev", description="Dev")
 
         mock_provider = MagicMock()
         mock_provider.initialize.side_effect = Exception("Provider init failed")
@@ -59,14 +70,23 @@ class TestCreateTerminalCleanup:
         "cli_agent_orchestrator.services.terminal_service.generate_terminal_id",
         return_value="tid1",
     )
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
     def test_cleanup_on_failure_does_not_kill_session_if_not_new(
-        self, mock_tid, mock_wname, mock_db_create, mock_pm, mock_tmux, mock_log_dir
+        self,
+        mock_load_profile,
+        mock_tid,
+        mock_wname,
+        mock_db_create,
+        mock_pm,
+        mock_tmux,
+        mock_log_dir,
     ):
         """When new_session=False, cleanup should NOT kill the session."""
         from cli_agent_orchestrator.services.terminal_service import create_terminal
 
         mock_tmux.session_exists.return_value = True
         mock_tmux.create_window.return_value = "w1"
+        mock_load_profile.return_value = AgentProfile(name="dev", description="Dev")
 
         mock_provider = MagicMock()
         mock_provider.initialize.side_effect = Exception("fail")
@@ -95,14 +115,23 @@ class TestCreateTerminalCleanup:
         "cli_agent_orchestrator.services.terminal_service.generate_terminal_id",
         return_value="tid1",
     )
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
     def test_cleanup_ignores_cleanup_errors(
-        self, mock_tid, mock_wname, mock_db_create, mock_pm, mock_tmux, mock_log_dir
+        self,
+        mock_load_profile,
+        mock_tid,
+        mock_wname,
+        mock_db_create,
+        mock_pm,
+        mock_tmux,
+        mock_log_dir,
     ):
         """Cleanup errors should be swallowed, original error re-raised."""
         from cli_agent_orchestrator.services.terminal_service import create_terminal
 
         mock_tmux.session_exists.return_value = False
         mock_tmux.create_session.return_value = "w1"
+        mock_load_profile.return_value = AgentProfile(name="dev", description="Dev")
 
         mock_provider = MagicMock()
         mock_provider.initialize.side_effect = Exception("original error")
@@ -130,14 +159,23 @@ class TestCreateTerminalCleanup:
         "cli_agent_orchestrator.services.terminal_service.generate_terminal_id",
         return_value="tid1",
     )
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
     def test_session_prefix_added_for_new_session(
-        self, mock_tid, mock_wname, mock_db_create, mock_pm, mock_tmux, mock_log_dir
+        self,
+        mock_load_profile,
+        mock_tid,
+        mock_wname,
+        mock_db_create,
+        mock_pm,
+        mock_tmux,
+        mock_log_dir,
     ):
         """New sessions without the prefix get it added automatically."""
         from cli_agent_orchestrator.services.terminal_service import create_terminal
 
         mock_tmux.session_exists.return_value = False
         mock_tmux.create_session.return_value = "w1"
+        mock_load_profile.return_value = AgentProfile(name="dev", description="Dev")
         mock_provider = MagicMock()
         mock_pm.create_provider.return_value = mock_provider
         mock_log_dir.__truediv__ = MagicMock(return_value=MagicMock())

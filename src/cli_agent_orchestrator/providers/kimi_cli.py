@@ -141,8 +141,10 @@ class KimiCliProvider(BaseProvider):
         window_name: str,
         agent_profile: Optional[str] = None,
         allowed_tools: Optional[list] = None,
+        skill_prompt: Optional[str] = None,
     ):
-        super().__init__(terminal_id, session_name, window_name, allowed_tools)
+        """Initialize provider state."""
+        super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
         # Track temp directory for cleanup (created when agent profile needs temp files)
@@ -196,6 +198,7 @@ class KimiCliProvider(BaseProvider):
                 # Kimi uses YAML agent files with a system_prompt_path pointing
                 # to a markdown file. We create both in the temp directory.
                 system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
+                system_prompt = self._apply_skill_prompt(system_prompt)
 
                 # Prepend security constraints for soft enforcement (Kimi CLI has no
                 # native tool restriction mechanism). Only applied when tool
