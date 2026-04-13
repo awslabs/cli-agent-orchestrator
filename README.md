@@ -540,6 +540,38 @@ Then ask your AI coding assistant to create a new provider:
 
 The assistant will follow the skill's step-by-step guide, reference the provider template, and apply lessons learnt from existing providers.
 
+### Managed Skills
+
+CAO also manages skills that are shared across all agent sessions. Builtin skills (`cao-supervisor-protocols`, `cao-worker-protocols`) are auto-seeded when the `cao-server` starts — no `cao init` required.
+
+```bash
+# List installed skills
+cao skills list
+
+# Install a custom skill from a local folder
+cao skills add ./my-coding-standards
+
+# Update an existing skill (overwrite)
+cao skills add ./my-coding-standards --force
+
+# Remove a skill
+cao skills remove my-coding-standards
+```
+
+Skills are delivered to each provider automatically:
+
+| Provider | Delivery Method |
+|----------|----------------|
+| Kiro CLI | Native `skill://` resources (progressive loading) |
+| Claude Code, Codex, Gemini CLI, Kimi CLI | Runtime prompt injection (every terminal creation) |
+| Copilot CLI | Baked into `.agent.md` at install time |
+
+When you add or remove a skill, all providers pick up the change automatically. Copilot agent files are refreshed immediately; other providers pick up changes on the next terminal creation.
+
+**Updating skills:** Use `cao skills add ./my-skill --force` to overwrite an existing skill. Without `--force`, the command errors if the skill already exists. Builtin skills are auto-seeded on server startup but are never overwritten — to update a builtin after a CAO upgrade, remove it first with `cao skills remove` then restart the server.
+
+For full details, see [docs/skills.md](docs/skills.md).
+
 ## Security
 
 The server is designed for **localhost-only use**. The WebSocket terminal endpoint (`/terminals/{id}/ws`) provides full PTY access and will reject connections from non-loopback addresses. Do not expose the server to untrusted networks without adding authentication.
