@@ -176,6 +176,7 @@ class TestInstallAgent:
 
         assert result.success is True
         assert result.agent_name == "downloaded-agent"
+        assert result.source_kind == "url"
         assert result.unresolved_vars == ["BASE_URL"]
         mock_get.assert_called_once_with("https://example.com/downloaded-agent.md")
         assert (install_paths["local_store_dir"] / "downloaded-agent.md").exists()
@@ -194,6 +195,7 @@ class TestInstallAgent:
         result = install_agent(str(source_profile), "copilot_cli", {"API_TOKEN": "secret-token"})
 
         assert result.success is True
+        assert result.source_kind == "file"
         assert (install_paths["local_store_dir"] / "copilot-agent.md").exists()
         agent_file = install_paths["copilot_dir"] / "copilot-agent.agent.md"
         assert agent_file.exists()

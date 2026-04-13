@@ -35,6 +35,7 @@ class TestInstallCommand:
             context_file="/tmp/agent-context/developer.md",
             agent_file="/tmp/kiro/developer.json",
             unresolved_vars=["BASE_URL"],
+            source_kind="name",
         )
 
         with patch(
@@ -64,6 +65,50 @@ class TestInstallCommand:
             "kiro_cli",
             {"API_TOKEN": "secret-token"},
         )
+
+    def test_install_url_source_prints_download_confirmation(self, runner: CliRunner) -> None:
+        """URL installs should print a download confirmation line."""
+        service_result = InstallResult(
+            success=True,
+            message="Agent 'remote' installed successfully",
+            agent_name="remote",
+            source_kind="url",
+        )
+
+        with patch(
+            "cli_agent_orchestrator.cli.commands.install.install_agent",
+            return_value=service_result,
+        ):
+            result = runner.invoke(
+                install,
+                ["https://example.com/remote.md", "--provider", "kiro_cli"],
+            )
+
+        assert result.exit_code == 0
+        assert "Downloaded agent from URL to local store" in result.output
+        assert "Agent 'remote' installed successfully" in result.output
+
+    def test_install_file_source_prints_copy_confirmation(self, runner: CliRunner) -> None:
+        """File path installs should print a copy confirmation line."""
+        service_result = InstallResult(
+            success=True,
+            message="Agent 'local' installed successfully",
+            agent_name="local",
+            source_kind="file",
+        )
+
+        with patch(
+            "cli_agent_orchestrator.cli.commands.install.install_agent",
+            return_value=service_result,
+        ):
+            result = runner.invoke(
+                install,
+                ["./local.md", "--provider", "kiro_cli"],
+            )
+
+        assert result.exit_code == 0
+        assert "Copied agent from file to local store" in result.output
+        assert "Agent 'local' installed successfully" in result.output
 
     def test_install_failure_prints_error(self, runner: CliRunner) -> None:
         """Service failures should be surfaced as CLI errors without raising."""

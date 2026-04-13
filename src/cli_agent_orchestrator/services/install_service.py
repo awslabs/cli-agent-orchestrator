@@ -3,7 +3,7 @@
 import re
 from importlib import resources
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 
 import frontmatter
 import requests  # type: ignore[import-untyped]
@@ -39,6 +39,7 @@ class InstallResult(BaseModel):
     context_file: Optional[str] = None
     agent_file: Optional[str] = None
     unresolved_vars: Optional[List[str]] = None
+    source_kind: Optional[Literal["url", "file", "name"]] = None
 
 
 def _download_agent(source: str) -> str:
@@ -156,10 +157,15 @@ def install_agent(
 ) -> InstallResult:
     """Install an agent profile for the requested provider."""
     try:
-        if source.startswith(("http://", "https://")) or Path(source).exists():
+        if source.startswith(("http://", "https://")):
             agent_name = _download_agent(source)
+            source_kind: Literal["url", "file", "name"] = "url"
+        elif Path(source).exists():
+            agent_name = _download_agent(source)
+            source_kind = "file"
         else:
             agent_name = source
+            source_kind = "name"
 
         if env_vars:
             for key, value in env_vars.items():
@@ -265,6 +271,7 @@ def install_agent(
             context_file=str(context_file),
             agent_file=str(agent_file) if agent_file else None,
             unresolved_vars=unresolved_vars or None,
+            source_kind=source_kind,
         )
 
     except requests.RequestException as exc:

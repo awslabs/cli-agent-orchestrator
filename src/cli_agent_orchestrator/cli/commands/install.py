@@ -55,6 +55,10 @@ def install(agent_source: str, provider: str, env_vars: tuple[str, ...]) -> None
         click.echo(f"Error: {result.message}", err=True)
         return
 
+    if result.source_kind == "url":
+        click.echo("✓ Downloaded agent from URL to local store")
+    elif result.source_kind == "file":
+        click.echo("✓ Copied agent from file to local store")
     click.echo(f"✓ Agent '{result.agent_name}' installed successfully")
     if env_vars:
         click.echo(f"✓ Set {len(env_vars)} env var(s) in {CAO_ENV_FILE}")
