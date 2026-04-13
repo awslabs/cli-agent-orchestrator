@@ -1,8 +1,22 @@
 """Helpers for emitting plugin events from synchronous service functions."""
 
 import asyncio
+import logging
 
 from cli_agent_orchestrator.plugins import CaoEvent, PluginRegistry
+
+logger = logging.getLogger(__name__)
+
+
+async def _dispatch_with_logging(
+    registry: PluginRegistry, event_type: str, event: CaoEvent
+) -> None:
+    """Run registry dispatch with local error isolation at the adapter boundary."""
+
+    try:
+        await registry.dispatch(event_type, event)
+    except Exception:
+        logger.warning("Plugin event dispatch failed for %s", event_type, exc_info=True)
 
 
 def dispatch_plugin_event(
@@ -19,7 +33,7 @@ def dispatch_plugin_event(
     if registry is None:
         return
 
-    coroutine = registry.dispatch(event_type, event)
+    coroutine = _dispatch_with_logging(registry, event_type, event)
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
