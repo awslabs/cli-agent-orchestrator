@@ -1,0 +1,1 @@
+"""CAO plugin package."""
