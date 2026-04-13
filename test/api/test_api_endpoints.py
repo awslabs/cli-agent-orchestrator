@@ -13,6 +13,7 @@ import pytest
 
 from cli_agent_orchestrator.api.main import app, flow_daemon
 from cli_agent_orchestrator.models.terminal import Terminal
+from cli_agent_orchestrator.utils.skills import SkillNameError
 
 # ── Health endpoint ──────────────────────────────────────────────────
 
@@ -149,6 +150,75 @@ class TestAgentProviders:
         assert providers_dict["gemini_cli"]["binary"] == "gemini"
         assert providers_dict["kimi_cli"]["binary"] == "kimi"
         assert providers_dict["copilot_cli"]["binary"] == "copilot"
+
+
+# ── Skills endpoint ──────────────────────────────────────────────────
+
+
+class TestGetSkillContent:
+    """Tests for GET /skills/{name} endpoint."""
+
+    def test_get_skill_returns_content(self, client):
+        """GET /skills/{name} returns the skill body on success."""
+        with patch(
+            "cli_agent_orchestrator.api.main.load_skill_content",
+            return_value="# Python Testing\n\nUse pytest.",
+        ):
+            response = client.get("/skills/python-testing")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "name": "python-testing",
+            "content": "# Python Testing\n\nUse pytest.",
+        }
+
+    def test_get_skill_returns_400_for_invalid_name(self, client):
+        """GET /skills/{name} returns 400 for path traversal names."""
+        with patch(
+            "cli_agent_orchestrator.api.main.load_skill_content",
+            side_effect=SkillNameError(
+                "Invalid skill name '../secret': must not contain '/', '\\\\', or '..'"
+            ),
+        ):
+            response = client.get("/skills/%2E%2E")
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Invalid skill name: .."
+
+    def test_get_skill_returns_404_for_missing_skill(self, client):
+        """GET /skills/{name} returns 404 when the skill does not exist."""
+        with patch(
+            "cli_agent_orchestrator.api.main.load_skill_content",
+            side_effect=FileNotFoundError("Skill folder does not exist"),
+        ):
+            response = client.get("/skills/missing-skill")
+
+        assert response.status_code == 404
+        assert response.json()["detail"] == "Skill not found: missing-skill"
+
+    def test_get_skill_returns_500_for_parse_error(self, client):
+        """GET /skills/{name} returns 500 for invalid skill file content."""
+        with patch(
+            "cli_agent_orchestrator.api.main.load_skill_content",
+            side_effect=ValueError("Failed to parse skill file '/tmp/SKILL.md': bad yaml"),
+        ):
+            response = client.get("/skills/broken-skill")
+
+        assert response.status_code == 500
+        assert response.json()["detail"] == (
+            "Failed to load skill: Failed to parse skill file '/tmp/SKILL.md': bad yaml"
+        )
+
+    def test_get_skill_returns_500_for_filesystem_error(self, client):
+        """GET /skills/{name} returns 500 for unexpected filesystem errors."""
+        with patch(
+            "cli_agent_orchestrator.api.main.load_skill_content",
+            side_effect=OSError("Permission denied"),
+        ):
+            response = client.get("/skills/python-testing")
+
+        assert response.status_code == 500
+        assert response.json()["detail"] == "Failed to load skill: Permission denied"
 
 
 # ── Sessions CRUD ────────────────────────────────────────────────────
