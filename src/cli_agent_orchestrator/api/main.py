@@ -51,6 +51,11 @@ from cli_agent_orchestrator.services.inbox_service import LogFileHandler
 from cli_agent_orchestrator.services.terminal_service import OutputMode
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 from cli_agent_orchestrator.utils.logging import setup_logging
+from cli_agent_orchestrator.utils.skills import (
+    SkillNameError,
+    load_skill_content,
+    validate_skill_name,
+)
 from cli_agent_orchestrator.utils.terminal import generate_session_name
 
 logger = logging.getLogger(__name__)
@@ -81,6 +86,13 @@ async def flow_daemon():
 class TerminalOutputResponse(BaseModel):
     output: str
     mode: str
+
+
+class SkillContentResponse(BaseModel):
+    """Response model for a skill content lookup."""
+
+    name: str
+    content: str
 
 
 class WorkingDirectoryResponse(BaseModel):
@@ -244,6 +256,35 @@ async def set_agent_dirs_endpoint(body: AgentDirsUpdate) -> Dict:
         "agent_dirs": result_dirs or {},
         "extra_dirs": result_extra or get_extra_agent_dirs(),
     }
+
+
+@app.get("/skills/{name}", response_model=SkillContentResponse)
+async def get_skill_content(name: str) -> SkillContentResponse:
+    """Return the full Markdown body for an installed skill."""
+    try:
+        skill_name = validate_skill_name(name)
+        content = load_skill_content(skill_name)
+        return SkillContentResponse(name=name, content=content)
+    except SkillNameError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid skill name: {name}",
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to load skill: {str(e)}",
+        )
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Skill not found: {name}",
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to load skill: {str(e)}",
+        )
 
 
 @app.post("/sessions", response_model=Terminal, status_code=status.HTTP_201_CREATED)

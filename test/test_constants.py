@@ -109,6 +109,12 @@ class TestCaoHomeDir:
 
         assert LOCAL_AGENT_STORE_DIR == CAO_HOME_DIR / "agent-store"
 
+    def test_skills_dir_is_under_cao_home(self):
+        """Test that SKILLS_DIR is under CAO_HOME_DIR."""
+        from cli_agent_orchestrator.constants import CAO_HOME_DIR, SKILLS_DIR
+
+        assert SKILLS_DIR == CAO_HOME_DIR / "skills"
+
 
 class TestSessionConstants:
     """Tests for session configuration constants."""

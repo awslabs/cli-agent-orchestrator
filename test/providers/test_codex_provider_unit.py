@@ -71,6 +71,27 @@ class TestCodexBuildCommand:
         assert command == "codex --yolo --no-alt-screen --disable shell_snapshot"
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_build_command_with_skill_prompt(self, mock_load_profile):
+        mock_profile = MagicMock()
+        mock_profile.system_prompt = "You are a supervisor."
+        mock_profile.mcpServers = None
+        mock_load_profile.return_value = mock_profile
+
+        provider = CodexProvider(
+            "test1234",
+            "test-session",
+            "window-0",
+            "code_supervisor",
+            skill_prompt="## Available Skills\n- **python-testing**: Pytest",
+        )
+        command = provider._build_codex_command()
+
+        mock_load_profile.assert_called_once_with("code_supervisor")
+        assert "developer_instructions=" in command
+        assert "## Available Skills" in command
+        assert "python-testing" in command
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_build_command_with_agent_profile(self, mock_load_profile):
         mock_profile = MagicMock()
         mock_profile.system_prompt = "You are a code supervisor agent."
