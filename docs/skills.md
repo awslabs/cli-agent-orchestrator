@@ -75,7 +75,7 @@ Validation checks (in order):
 5. No path traversal characters in the name (`/`, `\`, `..`)
 6. Skill does not already exist (unless `--force` is passed)
 
-After installation, all CAO-managed Q CLI and Copilot CLI agent files are automatically refreshed to include the new skill in their prompt catalog.
+After installation, all providers pick up the new skill automatically — Copilot CLI agent files are refreshed immediately, and other providers pick up changes on the next terminal creation.
 
 ### `cao skills remove <name>`
 
@@ -85,13 +85,13 @@ Removes an installed skill from the skill store.
 cao skills remove python-testing
 ```
 
-After removal, all CAO-managed Q CLI and Copilot CLI agent files are automatically refreshed to remove the skill from their prompt catalog.
+After removal, all providers pick up the change automatically — Copilot CLI agent files are refreshed immediately, and other providers pick up changes on the next terminal creation.
 
-### `cao init` (skill seeding)
+### Builtin skill seeding
 
-Running `cao init` seeds default skills into the skill store. If a skill with the same name already exists, it is skipped — preserving any edits you've made. Re-running `cao init` after a CAO upgrade will seed any new default skills without overwriting your changes.
+Builtin skills are auto-seeded when `cao-server` starts — no manual step required. If a skill with the same name already exists, it is skipped — preserving any edits you've made. After a CAO upgrade, restarting the server will seed any new builtin skills without overwriting your changes. You can also run `cao init` to seed them manually.
 
-CAO ships with two default skills:
+CAO ships with two builtin skills:
 
 | Skill | Description |
 |-------|-------------|
@@ -119,7 +119,6 @@ Skills are delivered to agents differently depending on the provider. The table 
 | Gemini CLI | Runtime prompt | Every terminal creation | `load_skill` MCP tool |
 | Kimi CLI | Runtime prompt | Every terminal creation | `load_skill` MCP tool |
 | Kiro CLI | Native `skill://` resources | Every terminal creation | Kiro progressive loading |
-| Q CLI | Baked into agent JSON at install | On `cao skills add/remove` | `load_skill` MCP tool |
 | Copilot CLI | Baked into `.agent.md` at install | On `cao skills add/remove` | `load_skill` MCP tool |
 
 ### Runtime Prompt Providers (Claude Code, Codex, Gemini CLI, Kimi CLI)
@@ -141,14 +140,6 @@ skill://~/.aws/cli-agent-orchestrator/skills/**/SKILL.md
 Kiro loads only skill metadata (name and description) at startup, then retrieves full content on demand through its own progressive loading mechanism — no MCP tool call needed.
 
 Because Kiro reads directly from the skill store, changes from `cao skills add` or `cao skills remove` take effect the next time a terminal is created. No agent file refresh is needed.
-
-### Q CLI
-
-The skill catalog is baked into the agent's JSON file (`~/.q/agents/{name}.json`) at install time via `cao install`. The `prompt` field in the JSON contains the agent's prompt with the skill catalog appended.
-
-When you run `cao skills add` or `cao skills remove`, all CAO-managed Q agent files are automatically refreshed — their `prompt` field is rewritten with the updated skill catalog.
-
-CAO identifies Q agents it manages by checking whether the agent's `resources` field contains a `file://` URI pointing to the CAO agent context directory (`~/.aws/cli-agent-orchestrator/agent-context/`).
 
 ### Copilot CLI
 
@@ -189,7 +180,7 @@ description: Team coding standards for Python services including naming, error h
 cao skills add ./my-coding-standards
 ```
 
-Once installed, the skill is automatically available to all CAO agents. Runtime prompt providers (Claude Code, Codex, Gemini CLI, Kimi CLI) and Kiro will pick it up on the next terminal creation. Q CLI and Copilot CLI agent files are refreshed automatically by the `cao skills add` command.
+Once installed, the skill is automatically available to all CAO agents. Copilot CLI agent files are refreshed immediately by the `cao skills add` command. All other providers pick up changes on the next terminal creation.
 
 ## Updating a Skill
 
@@ -205,7 +196,7 @@ Or overwrite it with an updated version from a local folder:
 cao skills add ./my-coding-standards --force
 ```
 
-For runtime prompt providers (Claude Code, Codex, Gemini CLI, Kimi CLI) and Kiro, changes take effect on the next terminal creation. For Q CLI and Copilot CLI, running `cao skills add --force` automatically refreshes all installed agent files. If you edited the skill file directly instead, run `cao skills remove <name>` followed by `cao skills add <folder>` to trigger the refresh — or reinstall the affected agents with `cao install`.
+Running `cao skills add --force` refreshes Copilot CLI agent files immediately. All other providers pick up the change on the next terminal creation. If you edited the skill file directly in the store instead of using `cao skills add --force`, Copilot files won't be refreshed — run `cao skills remove <name>` followed by `cao skills add <folder>` to trigger the refresh, or reinstall the affected agents with `cao install`.
 
 ## Known Limitations
 
