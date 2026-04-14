@@ -119,8 +119,11 @@ class CodexProvider(BaseProvider):
         session_name: str,
         window_name: str,
         agent_profile: Optional[str] = None,
+        allowed_tools: Optional[list] = None,
+        skill_prompt: Optional[str] = None,
     ):
-        super().__init__(terminal_id, session_name, window_name)
+        """Initialize provider state."""
+        super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
 
@@ -130,13 +133,30 @@ class CodexProvider(BaseProvider):
         Returns properly escaped shell command string that can be safely sent via tmux.
         Uses codex's -c developer_instructions flag to inject agent system prompts.
         """
-        command_parts = ["codex", "--no-alt-screen", "--disable", "shell_snapshot"]
+        # --yolo (alias for --dangerously-bypass-approvals-and-sandbox):
+        # bypass approval prompts and sandboxing. CAO agents run in
+        # non-interactive tmux sessions where interactive approval prompts
+        # block handoff/assign flows. This mirrors Claude Code's
+        # --dangerously-skip-permissions and Gemini CLI's --yolo flags.
+        command_parts = ["codex", "--yolo", "--no-alt-screen", "--disable", "shell_snapshot"]
 
         if self._agent_profile is not None:
             try:
                 profile = load_agent_profile(self._agent_profile)
 
                 system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
+                system_prompt = self._apply_skill_prompt(system_prompt)
+
+                # Prepend security constraints for soft enforcement (Codex has no
+                # native tool restriction mechanism). Only applied when tool
+                # restrictions are active (not unrestricted "*").
+                if self._allowed_tools and "*" not in self._allowed_tools:
+                    from cli_agent_orchestrator.constants import SECURITY_PROMPT
+
+                    tools_list = ", ".join(self._allowed_tools)
+                    tool_constraint = f"\nYou only have access to these tools: {tools_list}\n"
+                    system_prompt = SECURITY_PROMPT + tool_constraint + system_prompt
+
                 if system_prompt:
                     # Codex accepts developer_instructions via -c config override.
                     # This is injected as a developer role message before AGENTS.md content.
@@ -246,7 +266,12 @@ class CodexProvider(BaseProvider):
         # Handle workspace trust prompt if it appears (new/untrusted directories)
         self._handle_trust_prompt(timeout=20.0)
 
-        if not wait_until_status(self, TerminalStatus.IDLE, timeout=60.0, polling_interval=1.0):
+        if not wait_until_status(
+            self,
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+            timeout=60.0,
+            polling_interval=1.0,
+        ):
             raise TimeoutError("Codex initialization timed out after 60 seconds")
 
         self._initialized = True

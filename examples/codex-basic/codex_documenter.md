@@ -1,6 +1,7 @@
 ---
 name: codex_documenter
 description: A technical writing specialist focused on creating clear, comprehensive documentation for software projects. Expert in API documentation, user guides, tutorials, README files, and developer-focused content. Translates complex technical concepts into accessible documentation.
+role: developer  # @builtin, fs_*, execute_bash, @cao-mcp-server. For fine-grained control, see docs/tool-restrictions.md
 
 mcpServers:
   cao-mcp-server:

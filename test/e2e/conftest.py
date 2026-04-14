@@ -2,13 +2,14 @@
 
 E2E tests require:
 - A running CAO server (cao-server / uvicorn on localhost:9889)
-- The provider CLI tool installed and authenticated (codex, claude, kiro-cli, gemini)
+- The provider CLI tool installed and authenticated (codex, claude, kiro-cli, gemini, copilot)
 - tmux available on the system
 
 Run with: uv run pytest -m e2e test/e2e/ -v
 """
 
 import shutil
+import subprocess
 import time
 
 import pytest
@@ -26,6 +27,32 @@ def require_cao_server():
             pytest.skip("CAO server not healthy")
     except requests.ConnectionError:
         pytest.skip("CAO server not running — start with: uv run cao-server")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def warmup_mcp_server_cache():
+    """Pre-warm the uvx cache for cao-mcp-server.
+
+    Agent profiles launch cao-mcp-server via ``uvx --from git+...``. On a cold
+    cache uvx must download and install ~80 packages, which takes ~20s and
+    exceeds Codex's default 10s MCP startup timeout. Running uvx once here
+    populates the cache so that all subsequent provider launches resolve
+    instantly (<3s).
+    """
+    try:
+        subprocess.run(
+            [
+                "uvx",
+                "--from",
+                "git+https://github.com/awslabs/cli-agent-orchestrator.git@main",
+                "cao-mcp-server",
+                "--help",
+            ],
+            capture_output=True,
+            timeout=120,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass  # Best-effort; tests may still work if cao-mcp-server is installed locally
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -62,6 +89,13 @@ def require_kiro():
 
 
 @pytest.fixture()
+def require_kimi():
+    """Skip test if kimi CLI is not available."""
+    if not _cli_available("kimi"):
+        pytest.skip("kimi CLI not installed")
+
+
+@pytest.fixture()
 def require_gemini():
     """Skip test if gemini CLI is not available.
 
@@ -77,6 +111,13 @@ def require_gemini():
     # Gemini's free-tier RPM limit is low; sequential tests exhaust the quota
     # and cause the CLI to hang in a retry loop during initialization.
     time.sleep(15)
+
+
+@pytest.fixture()
+def require_copilot():
+    """Skip test if copilot CLI is not available."""
+    if not _cli_available("copilot"):
+        pytest.skip("copilot CLI not installed")
 
 
 def create_terminal(

@@ -1,26 +1,42 @@
 """Single FastAPI entry point for all HTTP routes."""
 
 import asyncio
+import fcntl
+import json
 import logging
+import os
+import pty
+import signal
+import struct
+import subprocess
+import termios
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Path, Query, status
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field, field_validator
 from watchdog.observers.polling import PollingObserver
 
 from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
     get_inbox_messages,
+    get_terminal_metadata,
     init_db,
 )
 from cli_agent_orchestrator.constants import (
+    ALLOWED_HOSTS,
+    CAO_HOME_DIR,
+    CORS_ORIGINS,
     INBOX_POLLING_INTERVAL,
     SERVER_HOST,
     SERVER_PORT,
     SERVER_VERSION,
     TERMINAL_LOG_DIR,
 )
+from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import MessageStatus
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalId
 from cli_agent_orchestrator.providers.manager import provider_manager
@@ -35,6 +51,11 @@ from cli_agent_orchestrator.services.inbox_service import LogFileHandler
 from cli_agent_orchestrator.services.terminal_service import OutputMode
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 from cli_agent_orchestrator.utils.logging import setup_logging
+from cli_agent_orchestrator.utils.skills import (
+    SkillNameError,
+    load_skill_content,
+    validate_skill_name,
+)
 from cli_agent_orchestrator.utils.terminal import generate_session_name
 
 logger = logging.getLogger(__name__)
@@ -67,12 +88,37 @@ class TerminalOutputResponse(BaseModel):
     mode: str
 
 
+class SkillContentResponse(BaseModel):
+    """Response model for a skill content lookup."""
+
+    name: str
+    content: str
+
+
 class WorkingDirectoryResponse(BaseModel):
     """Response model for terminal working directory."""
 
     working_directory: Optional[str] = Field(
         description="Current working directory of the terminal, or None if unavailable"
     )
+
+
+class CreateFlowRequest(BaseModel):
+    """Request model for creating a flow."""
+
+    name: str
+    schedule: str
+    agent_profile: str
+    provider: str = "kiro_cli"
+    prompt_template: str
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        """Prevent path traversal — flow name becomes a filename."""
+        if "/" in v or "\\" in v or ".." in v:
+            raise ValueError("Flow name must not contain '/', '\\', or '..'")
+        return v
 
 
 @asynccontextmanager
@@ -118,10 +164,127 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Security: DNS Rebinding Protection
+# Validate Host header to prevent DNS rebinding attacks (CVE mitigation)
+# Only allow requests with localhost Host headers
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=ALLOWED_HOSTS,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 @app.get("/health")
 async def health_check():
     return {"status": "ok", "service": "cli-agent-orchestrator"}
+
+
+@app.get("/agents/profiles")
+async def list_agent_profiles_endpoint() -> List[Dict]:
+    """List all available agent profiles from all configured directories."""
+    try:
+        from cli_agent_orchestrator.utils.agent_profiles import list_agent_profiles
+
+        return list_agent_profiles()
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to list agent profiles: {str(e)}",
+        )
+
+
+@app.get("/agents/providers")
+async def list_providers_endpoint() -> List[Dict]:
+    """List available providers with installation status."""
+    import shutil
+
+    provider_binaries = {
+        "kiro_cli": "kiro-cli",
+        "claude_code": "claude",
+        "q_cli": "q",
+        "codex": "codex",
+        "gemini_cli": "gemini",
+        "kimi_cli": "kimi",
+        "copilot_cli": "copilot",
+    }
+    result = []
+    for provider, binary in provider_binaries.items():
+        installed = shutil.which(binary) is not None
+        result.append({"name": provider, "binary": binary, "installed": installed})
+    return result
+
+
+@app.get("/settings/agent-dirs")
+async def get_agent_dirs_endpoint() -> Dict:
+    """Get configured agent directories per provider."""
+    from cli_agent_orchestrator.services.settings_service import (
+        get_agent_dirs,
+        get_extra_agent_dirs,
+    )
+
+    return {"agent_dirs": get_agent_dirs(), "extra_dirs": get_extra_agent_dirs()}
+
+
+class AgentDirsUpdate(BaseModel):
+    agent_dirs: Optional[Dict[str, str]] = None
+    extra_dirs: Optional[List[str]] = None
+
+
+@app.post("/settings/agent-dirs")
+async def set_agent_dirs_endpoint(body: AgentDirsUpdate) -> Dict:
+    """Update agent directories per provider."""
+    from cli_agent_orchestrator.services.settings_service import (
+        get_extra_agent_dirs,
+        set_agent_dirs,
+        set_extra_agent_dirs,
+    )
+
+    result_dirs = {}
+    result_extra = []
+    if body.agent_dirs:
+        result_dirs = set_agent_dirs(body.agent_dirs)
+    if body.extra_dirs is not None:
+        result_extra = set_extra_agent_dirs(body.extra_dirs)
+    return {
+        "agent_dirs": result_dirs or {},
+        "extra_dirs": result_extra or get_extra_agent_dirs(),
+    }
+
+
+@app.get("/skills/{name}", response_model=SkillContentResponse)
+async def get_skill_content(name: str) -> SkillContentResponse:
+    """Return the full Markdown body for an installed skill."""
+    try:
+        skill_name = validate_skill_name(name)
+        content = load_skill_content(skill_name)
+        return SkillContentResponse(name=name, content=content)
+    except SkillNameError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid skill name: {name}",
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to load skill: {str(e)}",
+        )
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Skill not found: {name}",
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to load skill: {str(e)}",
+        )
 
 
 @app.post("/sessions", response_model=Terminal, status_code=status.HTTP_201_CREATED)
@@ -130,15 +293,20 @@ async def create_session(
     agent_profile: str,
     session_name: Optional[str] = None,
     working_directory: Optional[str] = None,
+    allowed_tools: Optional[str] = None,
 ) -> Terminal:
     """Create a new session with exactly one terminal."""
     try:
+        # Parse comma-separated allowed_tools string into list
+        allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
+
         result = terminal_service.create_terminal(
             provider=provider,
             agent_profile=agent_profile,
             session_name=session_name,
             new_session=True,
             working_directory=working_directory,
+            allowed_tools=allowed_tools_list,
         )
         return result
 
@@ -178,8 +346,8 @@ async def get_session(session_name: str) -> Dict:
 @app.delete("/sessions/{session_name}")
 async def delete_session(session_name: str) -> Dict:
     try:
-        success = session_service.delete_session(session_name)
-        return {"success": success}
+        result = session_service.delete_session(session_name)
+        return {"success": True, **result}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -199,10 +367,14 @@ async def create_terminal_in_session(
     provider: str,
     agent_profile: str,
     working_directory: Optional[str] = None,
+    allowed_tools: Optional[str] = None,
 ) -> Terminal:
     """Create additional terminal in existing session."""
     try:
         resolved_provider = resolve_provider(agent_profile, fallback_provider=provider)
+
+        # Parse comma-separated allowed_tools string into list
+        allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
         result = terminal_service.create_terminal(
             provider=resolved_provider,
@@ -210,6 +382,7 @@ async def create_terminal_in_session(
             session_name=session_name,
             new_session=False,
             working_directory=working_directory,
+            allowed_tools=allowed_tools_list,
         )
         return result
     except ValueError as e:
@@ -428,11 +601,309 @@ async def get_inbox_messages_endpoint(
         )
 
 
+@app.websocket("/terminals/{terminal_id}/ws")
+async def terminal_ws(websocket: WebSocket, terminal_id: str):
+    """WebSocket endpoint for live terminal streaming via tmux attach.
+
+    Security: This endpoint provides full PTY access with no authentication.
+    It is intended for localhost-only use. Do NOT expose the server to
+    untrusted networks (e.g. --host 0.0.0.0) without adding authentication.
+    """
+    # Reject connections from non-loopback clients
+    client_host = websocket.client.host if websocket.client else None
+    if client_host not in (None, "127.0.0.1", "::1", "localhost"):
+        await websocket.close(code=4003, reason="WebSocket access is restricted to localhost")
+        return
+
+    await websocket.accept()
+
+    metadata = get_terminal_metadata(terminal_id)
+    if not metadata:
+        await websocket.close(code=4004, reason="Terminal not found")
+        return
+
+    session_name = metadata["tmux_session"]
+    window_name = metadata["tmux_window"]
+
+    # Create PTY pair for tmux attach
+    master_fd, slave_fd = pty.openpty()
+
+    # Set initial terminal size
+    winsize = struct.pack("HHHH", 24, 80, 0, 0)
+    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
+
+    # Start tmux attach inside the PTY
+    proc = subprocess.Popen(
+        ["tmux", "-u", "attach-session", "-t", f"{session_name}:{window_name}"],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        close_fds=True,
+        preexec_fn=os.setsid,
+    )
+    os.close(slave_fd)
+
+    # Make master_fd non-blocking for event-driven reads
+    flag = fcntl.fcntl(master_fd, fcntl.F_GETFL)
+    fcntl.fcntl(master_fd, fcntl.F_SETFL, flag | os.O_NONBLOCK)
+
+    loop = asyncio.get_event_loop()
+    output_queue: asyncio.Queue[bytes] = asyncio.Queue()
+    done = asyncio.Event()
+
+    def _on_pty_data():
+        """Callback when PTY has data available."""
+        try:
+            data = os.read(master_fd, 65536)
+            if data:
+                output_queue.put_nowait(data)
+            else:
+                done.set()
+        except BlockingIOError:
+            pass
+        except OSError:
+            done.set()
+
+    loop.add_reader(master_fd, _on_pty_data)
+
+    async def _forward_output():
+        """Read from PTY queue and send to WebSocket."""
+        while not done.is_set():
+            try:
+                data = await asyncio.wait_for(output_queue.get(), timeout=1.0)
+                # Drain any additional pending data for batching
+                while not output_queue.empty():
+                    try:
+                        data += output_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                await websocket.send_bytes(data)
+            except asyncio.TimeoutError:
+                if proc.poll() is not None:
+                    break
+            except (Exception, asyncio.CancelledError):
+                break
+
+    async def _forward_input():
+        """Receive from WebSocket and write to PTY."""
+        try:
+            while not done.is_set():
+                msg = await websocket.receive_text()
+                payload = json.loads(msg)
+                if payload.get("type") == "input":
+                    raw = payload["data"].encode()
+                    # Write in chunks to avoid overflowing the PTY buffer
+                    chunk_size = 1024
+                    for i in range(0, len(raw), chunk_size):
+                        os.write(master_fd, raw[i : i + chunk_size])
+                        if i + chunk_size < len(raw):
+                            await asyncio.sleep(0.01)
+                elif payload.get("type") == "resize":
+                    rows = payload.get("rows", 24)
+                    cols = payload.get("cols", 80)
+                    winsize_data = struct.pack("HHHH", rows, cols, 0, 0)
+                    fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize_data)
+                    # Explicitly notify tmux of the size change —
+                    # TIOCSWINSZ on the master doesn't always deliver
+                    # SIGWINCH to the child process group.
+                    try:
+                        os.kill(proc.pid, signal.SIGWINCH)
+                    except OSError:
+                        pass
+        except WebSocketDisconnect:
+            pass
+        except (Exception, asyncio.CancelledError):
+            pass
+        finally:
+            done.set()
+
+    try:
+        await asyncio.gather(_forward_output(), _forward_input())
+    except (Exception, asyncio.CancelledError):
+        pass
+    finally:
+        done.set()
+        try:
+            loop.remove_reader(master_fd)
+        except Exception:
+            pass
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+        # Terminate tmux attach (just detaches, doesn't kill the session)
+        proc.terminate()
+        try:
+            await asyncio.wait_for(asyncio.to_thread(proc.wait), timeout=3.0)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await asyncio.to_thread(proc.wait)
+
+
+# ── Flow management endpoints ────────────────────────────────────────
+
+
+@app.get("/flows", response_model=List[Flow])
+async def list_flows() -> List[Flow]:
+    """List all flows."""
+    try:
+        return flow_service.list_flows()
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to list flows: {str(e)}",
+        )
+
+
+@app.get("/flows/{name}", response_model=Flow)
+async def get_flow(name: str) -> Flow:
+    """Get a specific flow by name."""
+    try:
+        return flow_service.get_flow(name)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get flow: {str(e)}",
+        )
+
+
+@app.post("/flows", response_model=Flow, status_code=status.HTTP_201_CREATED)
+async def create_flow(body: CreateFlowRequest) -> Flow:
+    """Create a new flow.
+
+    Writes a .flow.md file with YAML frontmatter and prompt body, then
+    registers it via flow_service.add_flow().
+    """
+    try:
+        flows_dir = CAO_HOME_DIR / "flows"
+        flows_dir.mkdir(parents=True, exist_ok=True)
+
+        file_path = flows_dir / f"{body.name}.flow.md"
+
+        # Build YAML frontmatter content
+        frontmatter_lines = [
+            "---",
+            f"name: {body.name}",
+            f'schedule: "{body.schedule}"',
+            f"agent_profile: {body.agent_profile}",
+            f"provider: {body.provider}",
+            "---",
+        ]
+        file_content = "\n".join(frontmatter_lines) + "\n" + body.prompt_template
+
+        file_path.write_text(file_content)
+
+        return flow_service.add_flow(str(file_path))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create flow: {str(e)}",
+        )
+
+
+@app.delete("/flows/{name}")
+async def remove_flow(name: str) -> Dict:
+    """Remove a flow."""
+    try:
+        flow_service.remove_flow(name)
+        return {"success": True}
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to remove flow: {str(e)}",
+        )
+
+
+@app.post("/flows/{name}/enable")
+async def enable_flow(name: str) -> Dict:
+    """Enable a flow."""
+    try:
+        flow_service.enable_flow(name)
+        return {"success": True}
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to enable flow: {str(e)}",
+        )
+
+
+@app.post("/flows/{name}/disable")
+async def disable_flow(name: str) -> Dict:
+    """Disable a flow."""
+    try:
+        flow_service.disable_flow(name)
+        return {"success": True}
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to disable flow: {str(e)}",
+        )
+
+
+@app.post("/flows/{name}/run")
+async def run_flow(name: str) -> Dict:
+    """Manually execute a flow."""
+    try:
+        executed = flow_service.execute_flow(name)
+        return {"executed": executed}
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to execute flow: {str(e)}",
+        )
+
+
+# Static file serving for built web UI.
+# Anchored to the package via importlib.resources so it works for both
+# editable installs (uv sync) and wheel installs (uv tool install, pip install).
+from importlib.resources import files as _pkg_files
+
+WEB_DIST = Path(str(_pkg_files("cli_agent_orchestrator") / "web_ui"))
+if (WEB_DIST / "index.html").exists():
+    from starlette.staticfiles import StaticFiles
+
+    app.mount("/", StaticFiles(directory=str(WEB_DIST), html=True), name="web")
+
+
 def main():
     """Entry point for cao-server command."""
+    import argparse
+
     import uvicorn
 
-    uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT)
+    parser = argparse.ArgumentParser(description="CLI Agent Orchestrator Server")
+    parser.add_argument(
+        "--agents-dir",
+        type=str,
+        default=None,
+        help="Path to agents directory (overrides CAO_AGENTS_DIR env var)",
+    )
+    parser.add_argument("--host", type=str, default=None, help="Server host")
+    parser.add_argument("--port", type=int, default=None, help="Server port")
+    args = parser.parse_args()
+
+    if args.agents_dir:
+        os.environ["CAO_AGENTS_DIR"] = args.agents_dir
+        import cli_agent_orchestrator.constants as constants
+
+        constants.KIRO_AGENTS_DIR = Path(args.agents_dir)
+        logger.info(f"Using agents directory: {args.agents_dir}")
+
+    host = args.host or SERVER_HOST
+    port = args.port or SERVER_PORT
+    uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":

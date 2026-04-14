@@ -146,9 +146,10 @@ def test_launch_workspace_confirmation_accepted():
         )
 
         assert result.exit_code == 0
-        assert "provider (claude_code) will be trusted to perform all actions" in result.output
-        assert "cao launch --yolo" in result.output
-        assert "Do you trust all the actions in this folder?" in result.output
+        # New prompt format shows tool summary
+        assert "launching on claude_code" in result.output
+        assert "Allowed:" in result.output
+        assert "Proceed?" in result.output
         mock_post.assert_called_once()
 
 
@@ -184,8 +185,9 @@ def test_launch_workspace_confirmation_skipped_with_yolo_flag():
         )
 
         assert result.exit_code == 0
-        # No confirmation prompt should appear
-        assert "Do you trust all the actions in this folder?" not in result.output
+        # --yolo shows warning but no confirmation prompt
+        assert "Proceed?" not in result.output
+        assert "WARNING" in result.output
         mock_post.assert_called_once()
 
 
@@ -207,5 +209,89 @@ def test_launch_workspace_confirmation_for_default_provider():
         result = runner.invoke(launch, ["--agents", "test-agent", "--headless"], input="y\n")
 
         assert result.exit_code == 0
-        assert "provider (kiro_cli) will be trusted to perform all actions" in result.output
-        assert "Do you trust all the actions in this folder?" in result.output
+        assert "launching on kiro_cli" in result.output
+        assert "Proceed?" in result.output
+
+
+def test_launch_yolo_sets_unrestricted_allowed_tools():
+    """Test --yolo flag passes allowed_tools=* to the API."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run") as mock_subprocess,
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
+
+        assert result.exit_code == 0
+        call_args = mock_post.call_args
+        params = call_args.kwargs["params"]
+        assert params["allowed_tools"] == "*"
+
+
+def test_launch_allowed_tools_override():
+    """Test --allowed-tools CLI flag overrides profile defaults."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run") as mock_subprocess,
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+
+        result = runner.invoke(
+            launch,
+            [
+                "--agents",
+                "test-agent",
+                "--allowed-tools",
+                "@cao-mcp-server",
+                "--allowed-tools",
+                "fs_read",
+                "--headless",
+            ],
+            input="y\n",
+        )
+
+        assert result.exit_code == 0
+        call_args = mock_post.call_args
+        params = call_args.kwargs["params"]
+        assert params["allowed_tools"] == "@cao-mcp-server,fs_read"
+
+
+def test_launch_builtin_profile_resolves_role_defaults():
+    """Test that launching a built-in profile resolves role-based allowedTools."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run") as mock_subprocess,
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+
+        # code_supervisor is a built-in profile with role=supervisor
+        result = runner.invoke(
+            launch,
+            ["--agents", "code_supervisor", "--headless"],
+            input="y\n",
+        )
+
+        assert result.exit_code == 0
+        call_args = mock_post.call_args
+        params = call_args.kwargs["params"]
+        # Supervisor should only have MCP server tools
+        assert "@cao-mcp-server" in params["allowed_tools"]

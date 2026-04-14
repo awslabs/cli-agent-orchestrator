@@ -17,13 +17,63 @@ Check if the server is running.
 
 ---
 
+## Providers
+
+### GET /agents/providers
+List available providers with installation status.
+
+**Response:** Array of provider objects
+```json
+[
+  {
+    "name": "kiro_cli",
+    "binary": "kiro-cli",
+    "installed": true
+  },
+  {
+    "name": "claude_code",
+    "binary": "claude",
+    "installed": true
+  },
+  {
+    "name": "q_cli",
+    "binary": "q",
+    "installed": false
+  },
+  {
+    "name": "codex",
+    "binary": "codex",
+    "installed": true
+  },
+  {
+    "name": "gemini_cli",
+    "binary": "gemini",
+    "installed": true
+  },
+  {
+    "name": "kimi_cli",
+    "binary": "kimi",
+    "installed": false
+  },
+  {
+    "name": "copilot_cli",
+    "binary": "copilot",
+    "installed": false
+  }
+]
+```
+
+**Note:** The `installed` field checks if the provider binary is available in the system PATH via `shutil.which()`.
+
+---
+
 ## Sessions
 
 ### POST /sessions
 Create a new session with one terminal.
 
 **Parameters:**
-- `provider` (string, required): Provider type ("kiro_cli", "claude_code", "codex", or "q_cli")
+- `provider` (string, required): Provider type ("kiro_cli", "claude_code", "codex", "gemini_cli", "kimi_cli", "copilot_cli", or "q_cli")
 - `agent_profile` (string, required): Agent profile name
 - `session_name` (string, optional): Custom session name
 - `working_directory` (string, optional): Working directory for the agent session
@@ -79,7 +129,7 @@ Get terminal details.
 {
   "id": "string",
   "name": "string",
-  "provider": "kiro_cli|claude_code|codex|q_cli",
+  "provider": "kiro_cli|claude_code|codex|gemini_cli|kimi_cli|copilot_cli|q_cli",
   "session_name": "string",
   "agent_profile": "string",
   "status": "idle|processing|completed|waiting_user_answer|error",
@@ -139,6 +189,9 @@ Send provider-specific exit command to terminal.
 | kiro_cli | `/exit` | Text |
 | claude_code | `/exit` | Text |
 | codex | `/exit` | Text |
+| gemini_cli | `/exit` | Text |
+| kimi_cli | `/exit` | Text |
+| copilot_cli | `/exit` | Text |
 | q_cli | `/exit` | Text |
 
 **Response:**
@@ -205,4 +258,3 @@ Error response format:
 ```
 
 ---
-

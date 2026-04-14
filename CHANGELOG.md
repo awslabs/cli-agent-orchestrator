@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Launch prompt clarity + `--auto-approve`** — Redesign the `cao launch` confirmation prompt to show `Role` instead of `Blocked`, clearly distinguish `[Y]` / `[--auto-approve]` / `[--yolo]`, and add `--auto-approve` flag to skip the prompt without removing restrictions (for automated flows, scripts, and agent-to-agent launches)
+
+### Fixed
+
+- **Kiro CLI new TUI support** — Add fallback detection patterns for the new Kiro CLI TUI prompt format (`ask a question, or describe a task`), ensuring CAO works even if `--legacy-ui` is removed in a future version
+- **Agent profile exception handling (#137)** — Fix `load_agent_profile()` wrapping `FileNotFoundError` as `RuntimeError`, which caused `assign()` to fail for JSON-only agent profiles (AIM-installed kiro-cli agents). Callers now receive `FileNotFoundError` directly and handle it gracefully
+- **Missing providers in Web UI (#157)** — Add `gemini_cli`, `kimi_cli`, and `copilot_cli` to the `/agents/providers` endpoint and frontend fallback list so all 7 providers appear in the Web UI dropdown
+
+## [2.0.0] - 2026-03-28
+
+### Added
+
+- **Gemini CLI provider** — Full integration with Google's Gemini CLI, including status detection, message extraction, and E2E tests (#102)
+- **Kimi CLI provider** — Support for Moonshot's Kimi CLI with agent profiles and MCP server integration (#113)
+- **Copilot CLI provider** — Native GitHub Copilot CLI provider (#82)
+- **Web UI dashboard** — React-based web interface for managing sessions, spawning agents, viewing live terminal status, configuring agent directories, and interacting with agents from the browser (#108)
+- **Provider override in agent profiles** — Agent profiles can now specify a `provider` field to override the default provider, enabling cross-provider workflows (#101)
+- **Auto-inject sender terminal ID** — New `CAO_ENABLE_SENDER_ID_INJECTION` env var automatically appends sender terminal ID and callback instructions to `assign` and `send_message` messages, removing the need for manual prompt engineering (#98)
+- Cross-provider example profiles and updated README with `gemini_cli` documentation (#109)
+
+### Fixed
+
+- **Claude Code bypass permissions prompt** — Auto-set `skipDangerousModePermissionPrompt` in `~/.claude/settings.json` and handle the bypass prompt via subprocess on startup, preventing initialization hangs (#120)
+- **Claude Code Processing spinner** — Fix regex to catch newer spinner format (#92)
+- **Codex TUI footer detection** — Update detection for Codex v0.111.0 (#99)
+- **Q CLI unit tests** — Fix failing tests due to working directory validation changes (#94)
+- **Terminal init status** — Accept both IDLE and COMPLETED during terminal initialization for providers with initial prompts (#111)
+- **400 Bad Request on non-home directories** — Fix launching agents in directories outside `~/` (e.g., `/Volumes/workplace` on macOS) (#110)
+- **Gemini CLI extraction retry** — Add extraction retry for TUI-based providers where premature COMPLETED status can occur (#117)
+- **Path traversal in agent profile loading** — Validate agent names to reject `/`, `\`, and `..` before path construction (CodeQL py/path-injection) (#129)
+- **Pre-existing test failure** — Fix `test_skips_provider_dir_same_as_local` failing on macOS due to `/home` symlink resolution (#129)
+
+### Security
+
+- Add DNS rebinding protection via Host header validation (#124)
+- Add CodeQL SafeAccessCheck guard for path injection in API (#121)
+- Pin trivy-action to SHA instead of mutable `master` ref in CI (#126)
+- Bump vite 5→6.4.1 and vitest 2→3.2.4 to fix esbuild vulnerability GHSA-67mh-4wv8-2f99 (#129)
+- Bump requests 2.32.5→2.33.0 for CVE-2026-25645 (#130)
+- Bump authlib 1.6.7→1.6.9 (#122)
+- Bump pyjwt 2.11.0→2.12.0 (#118)
+- Bump black 25.9.0→26.3.1 (#114)
+
 ## [1.1.0] - 2026-02-26
 
 ### Fixed

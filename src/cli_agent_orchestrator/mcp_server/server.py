@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Union
 
 import requests
 from fastmcp import FastMCP
@@ -19,6 +19,9 @@ logger = logging.getLogger(__name__)
 
 # Environment variable to enable/disable working_directory parameter
 ENABLE_WORKING_DIRECTORY = os.getenv("CAO_ENABLE_WORKING_DIRECTORY", "false").lower() == "true"
+
+# Environment variable to enable/disable automatic sender terminal ID injection
+ENABLE_SENDER_ID_INJECTION = os.getenv("CAO_ENABLE_SENDER_ID_INJECTION", "false").lower() == "true"
 
 # Create MCP server
 mcp = FastMCP(
@@ -35,6 +38,63 @@ mcp = FastMCP(
     - Ensure you're running within a CAO terminal (CAO_TERMINAL_ID must be set)
     """,
 )
+
+LOAD_SKILL_TOOL_DESCRIPTION = """Retrieve the full Markdown body of an available skill from cao-server.
+
+Use this tool when your prompt lists a CAO skill and you need its full instructions at runtime.
+
+Args:
+    name: Name of the skill to retrieve
+
+Returns:
+    The skill content on success, or a dict with success=False and an error message on failure
+"""
+
+
+def _resolve_child_allowed_tools(
+    parent_allowed_tools: Optional[list], child_profile_name: str
+) -> Optional[str]:
+    """Resolve allowed_tools for a child terminal via intersection.
+
+    The child gets at most the union of: what the parent allows + what the
+    child profile specifies. If the parent is unrestricted ("*"), the child
+    profile's allowedTools are used as-is.
+
+    Returns:
+        Comma-separated string of allowed tools, or None for unrestricted.
+    """
+    from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+    from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
+
+    try:
+        child_profile = load_agent_profile(child_profile_name)
+        mcp_server_names = (
+            list(child_profile.mcpServers.keys()) if child_profile.mcpServers else None
+        )
+        child_allowed = resolve_allowed_tools(
+            child_profile.allowedTools, child_profile.role, mcp_server_names
+        )
+    except FileNotFoundError:
+        child_allowed = None
+
+    # If parent is unrestricted or has no restrictions, use child's tools
+    if parent_allowed_tools is None or "*" in parent_allowed_tools:
+        if child_allowed:
+            return ",".join(child_allowed)
+        return None
+
+    # If child has no opinion (None), inherit parent's restrictions
+    if child_allowed is None:
+        return ",".join(parent_allowed_tools)
+
+    # If child explicitly requests unrestricted ("*"), honor it
+    if "*" in child_allowed:
+        return None
+
+    # Both have restrictions: child gets its own profile tools
+    # (the child profile defines what it needs; parent's restrictions
+    # are enforced by the parent not delegating unauthorized work)
+    return ",".join(child_allowed)
 
 
 def _create_terminal(
@@ -53,6 +113,7 @@ def _create_terminal(
         Exception: If terminal creation fails
     """
     provider = DEFAULT_PROVIDER
+    parent_allowed_tools = None
 
     # Get current terminal ID from environment
     current_terminal_id = os.environ.get("CAO_TERMINAL_ID")
@@ -64,6 +125,7 @@ def _create_terminal(
 
         provider = terminal_metadata["provider"]
         session_name = terminal_metadata["session_name"]
+        parent_allowed_tools = terminal_metadata.get("allowed_tools")
 
         # If no working_directory specified, get conductor's current directory
         if working_directory is None:
@@ -84,10 +146,15 @@ def _create_terminal(
                     f"Error fetching conductor's working directory: {e}, will use server default"
                 )
 
+        # Resolve child's allowed_tools via inheritance
+        child_allowed_tools = _resolve_child_allowed_tools(parent_allowed_tools, agent_profile)
+
         # Create new terminal in existing session - always pass working_directory
         params = {"provider": provider, "agent_profile": agent_profile}
         if working_directory:
             params["working_directory"] = working_directory
+        if child_allowed_tools:
+            params["allowed_tools"] = child_allowed_tools
 
         response = requests.post(f"{API_BASE_URL}/sessions/{session_name}/terminals", params=params)
         response.raise_for_status()
@@ -126,6 +193,40 @@ def _send_direct_input(terminal_id: str, message: str) -> None:
     response.raise_for_status()
 
 
+def _send_direct_input_handoff(terminal_id: str, provider: str, message: str) -> None:
+    """Send handoff payload to an agent, prepending orchestrator instructions if needed."""
+    # For Codex provider: prepend handoff context so the worker agent knows
+    # this is a blocking handoff and should simply output results rather than
+    # attempting to call send_message back to the supervisor.
+    if provider == "codex":
+        supervisor_id = os.environ.get("CAO_TERMINAL_ID", "unknown")
+        handoff_message = (
+            f"[CAO Handoff] Supervisor terminal ID: {supervisor_id}. "
+            "This is a blocking handoff — the orchestrator will automatically "
+            "capture your response when you finish. Complete the task and output "
+            "your results directly. Do NOT use send_message to notify the supervisor "
+            "unless explicitly needed — just do the work and present your deliverables.\n\n"
+            f"{message}"
+        )
+    else:
+        handoff_message = message
+
+    _send_direct_input(terminal_id, handoff_message)
+
+
+def _send_direct_input_assign(terminal_id: str, message: str) -> None:
+    """Send assign payload to a worker agent, appending callback instructions."""
+    # Auto-inject sender terminal ID suffix when enabled
+    if ENABLE_SENDER_ID_INJECTION:
+        sender_id = os.environ.get("CAO_TERMINAL_ID", "unknown")
+        message += (
+            f"\n\n[Assigned by terminal {sender_id}. "
+            f"When done, send results back to terminal {sender_id} using send_message]"
+        )
+
+    _send_direct_input(terminal_id, message)
+
+
 def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
     """Send message to another terminal's inbox (queued delivery when IDLE).
 
@@ -150,6 +251,39 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
     )
     response.raise_for_status()
     return response.json()
+
+
+def _extract_error_detail(response: requests.Response, fallback: str) -> str:
+    """Extract a human-readable error detail from an API response."""
+    try:
+        payload = response.json()
+    except ValueError:
+        return fallback
+
+    detail = payload.get("detail")
+    if isinstance(detail, str) and detail:
+        return detail
+    return fallback
+
+
+def _load_skill_impl(name: str) -> Union[str, Dict[str, Any]]:
+    """Fetch a skill body from cao-server and return content or a structured error."""
+    try:
+        response = requests.get(f"{API_BASE_URL}/skills/{name}")
+        response.raise_for_status()
+        return response.json()["content"]
+    except requests.HTTPError as exc:
+        detail = str(exc)
+        if exc.response is not None:
+            detail = _extract_error_detail(exc.response, detail)
+        return {"success": False, "error": detail}
+    except requests.ConnectionError:
+        return {
+            "success": False,
+            "error": "Failed to connect to cao-server. The server may not be running.",
+        }
+    except Exception as exc:
+        return {"success": False, "error": f"Failed to retrieve skill: {str(exc)}"}
 
 
 # Implementation functions
@@ -190,28 +324,8 @@ async def _handoff_impl(
 
         await asyncio.sleep(2)  # wait another 2s
 
-        # For Codex provider: prepend handoff context so the worker agent knows
-        # this is a blocking handoff and should simply output results rather than
-        # attempting to call send_message back to the supervisor.
-        # Includes the supervisor's terminal ID (from CAO_TERMINAL_ID env var in
-        # the MCP server process) so the worker can call back if needed.
-        # Other providers (Claude Code, Kiro CLI) naturally complete and return
-        # to idle without this hint, so the message is left unchanged for them.
-        if provider == "codex":
-            supervisor_id = os.environ.get("CAO_TERMINAL_ID", "unknown")
-            handoff_message = (
-                f"[CAO Handoff] Supervisor terminal ID: {supervisor_id}. "
-                "This is a blocking handoff — the orchestrator will automatically "
-                "capture your response when you finish. Complete the task and output "
-                "your results directly. Do NOT use send_message to notify the supervisor "
-                "unless explicitly needed — just do the work and present your deliverables.\n\n"
-                f"{message}"
-            )
-        else:
-            handoff_message = message
-
-        # Send message to terminal
-        _send_direct_input(terminal_id, handoff_message)
+        # Send message to terminal (injects handoff instructions for codex if needed)
+        _send_direct_input_handoff(terminal_id, provider, message)
 
         # Monitor until completion with timeout
         if not wait_until_terminal_status(
@@ -365,8 +479,8 @@ def _assign_impl(
         # Create terminal
         terminal_id, _ = _create_terminal(agent_profile, working_directory)
 
-        # Send message immediately
-        _send_direct_input(terminal_id, message)
+        # Send message immediately (auto-injects sender terminal ID suffix when enabled)
+        _send_direct_input_assign(terminal_id, message)
 
         return {
             "success": True,
@@ -378,70 +492,100 @@ def _assign_impl(
         return {"success": False, "terminal_id": None, "message": f"Assignment failed: {str(e)}"}
 
 
-# Conditional tool registration for assign
+def _build_assign_description(enable_sender_id: bool, enable_workdir: bool) -> str:
+    """Build the assign tool description based on feature flags."""
+    # Build tool description overview.
+    if enable_sender_id:
+        desc = """\
+Assigns a task to another agent without blocking.
+
+The sender's terminal ID and callback instructions will automatically be appended to the message."""
+    else:
+        desc = """\
+Assigns a task to another agent without blocking.
+
+In the message to the worker agent include instruction to send results back via send_message tool.
+**IMPORTANT**: The terminal id of each agent is available in environment variable CAO_TERMINAL_ID.
+When assigning, first find out your own CAO_TERMINAL_ID value, then include the terminal_id value in the message to the worker agent to allow callback.
+Example message: "Analyze the logs. When done, send results back to terminal ee3f93b3 using send_message tool.\""""
+
+    if enable_workdir:
+        desc += """
+
+## Working Directory
+
+- By default, agents start in the supervisor's current working directory
+- You can specify a custom directory via working_directory parameter
+- Directory must exist and be accessible"""
+
+    desc += """
+
+Args:
+    agent_profile: Agent profile for the worker terminal
+    message: Task message (include callback instructions)"""
+
+    if enable_workdir:
+        desc += """
+    working_directory: Optional working directory where the agent should execute"""
+
+    desc += """
+
+Returns:
+    Dict with success status, worker terminal_id, and message"""
+
+    return desc
+
+
+_assign_description = _build_assign_description(
+    ENABLE_SENDER_ID_INJECTION, ENABLE_WORKING_DIRECTORY
+)
+_assign_message_field_desc = (
+    "The task message to send to the worker agent."
+    if ENABLE_SENDER_ID_INJECTION
+    else "The task message to send. Include callback instructions for the worker to send results back."
+)
+
 if ENABLE_WORKING_DIRECTORY:
 
-    @mcp.tool()
+    @mcp.tool(description=_assign_description)
     async def assign(
         agent_profile: str = Field(
             description='The agent profile for the worker agent (e.g., "developer", "analyst")'
         ),
-        message: str = Field(
-            description="The task message to send. Include callback instructions for the worker to send results back."
-        ),
+        message: str = Field(description=_assign_message_field_desc),
         working_directory: Optional[str] = Field(
             default=None, description="Optional working directory where the agent should execute"
         ),
     ) -> Dict[str, Any]:
-        """Assigns a task to another agent without blocking.
-
-        In the message to the worker agent include instruction to send results back via send_message tool.
-        **IMPORTANT**: The terminal id of each agent is available in environment variable CAO_TERMINAL_ID.
-        When assigning, first find out your own CAO_TERMINAL_ID value, then include the terminal_id value in the message to the worker agent to allow callback.
-        Example message: "Analyze the logs. When done, send results back to terminal ee3f93b3 using send_message tool."
-
-        ## Working Directory
-
-        - By default, agents start in the supervisor's current working directory
-        - You can specify a custom directory via working_directory parameter
-        - Directory must exist and be accessible
-
-        Args:
-            agent_profile: Agent profile for the worker terminal
-            message: Task message (include callback instructions)
-            working_directory: Optional directory path where agent should execute
-
-        Returns:
-            Dict with success status, worker terminal_id, and message
-        """
         return _assign_impl(agent_profile, message, working_directory)
 
 else:
 
-    @mcp.tool()
+    @mcp.tool(description=_assign_description)
     async def assign(
         agent_profile: str = Field(
             description='The agent profile for the worker agent (e.g., "developer", "analyst")'
         ),
-        message: str = Field(
-            description="The task message to send. Include callback instructions for the worker to send results back."
-        ),
+        message: str = Field(description=_assign_message_field_desc),
     ) -> Dict[str, Any]:
-        """Assigns a task to another agent without blocking.
-
-        In the message to the worker agent include instruction to send results back via send_message tool.
-        **IMPORTANT**: The terminal id of each agent is available in environment variable CAO_TERMINAL_ID.
-        When assigning, first find out your own CAO_TERMINAL_ID value, then include the terminal_id value in the message to the worker agent to allow callback.
-        Example message: "Analyze the logs. When done, send results back to terminal ee3f93b3 using send_message tool."
-
-        Args:
-            agent_profile: Agent profile for the worker terminal
-            message: Task message (include callback instructions)
-
-        Returns:
-            Dict with success status, worker terminal_id, and message
-        """
         return _assign_impl(agent_profile, message, None)
+
+
+# Implementation function for send_message
+def _send_message_impl(receiver_id: str, message: str) -> Dict[str, Any]:
+    """Implementation of send_message logic."""
+    try:
+        # Auto-inject sender terminal ID suffix when enabled
+        if ENABLE_SENDER_ID_INJECTION:
+            sender_id = os.environ.get("CAO_TERMINAL_ID", "unknown")
+            message += (
+                f"\n\n[Message from terminal {sender_id}. "
+                "Use send_message MCP tool for any follow-up work.]"
+            )
+
+        return _send_to_inbox(receiver_id, message)
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 @mcp.tool()
@@ -461,10 +605,15 @@ async def send_message(
     Returns:
         Dict with success status and message details
     """
-    try:
-        return _send_to_inbox(receiver_id, message)
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    return _send_message_impl(receiver_id, message)
+
+
+@mcp.tool(description=LOAD_SKILL_TOOL_DESCRIPTION)
+async def load_skill(
+    name: str = Field(description="Name of the skill to retrieve"),
+) -> Any:
+    """Retrieve skill content from cao-server."""
+    return _load_skill_impl(name)
 
 
 def main():

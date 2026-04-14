@@ -27,8 +27,15 @@ ERROR_INDICATORS = ["Amazon Q is having trouble responding right now"]
 class QCliProvider(BaseProvider):
     """Provider for Q CLI tool integration."""
 
-    def __init__(self, terminal_id: str, session_name: str, window_name: str, agent_profile: str):
-        super().__init__(terminal_id, session_name, window_name)
+    def __init__(
+        self,
+        terminal_id: str,
+        session_name: str,
+        window_name: str,
+        agent_profile: str,
+        allowed_tools: Optional[list] = None,
+    ):
+        super().__init__(terminal_id, session_name, window_name, allowed_tools)
         # TODO: remove the ._initialized if it's not referenced anywhere
         self._initialized = False
         self._agent_profile = agent_profile
@@ -50,7 +57,9 @@ class QCliProvider(BaseProvider):
         command = shlex.join(["q", "chat", "--agent", self._agent_profile])
         tmux_client.send_keys(self.session_name, self.window_name, command)
 
-        if not wait_until_status(self, TerminalStatus.IDLE, timeout=30.0):
+        if not wait_until_status(
+            self, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=30.0
+        ):
             raise TimeoutError("Q CLI initialization timed out after 30 seconds")
 
         self._initialized = True

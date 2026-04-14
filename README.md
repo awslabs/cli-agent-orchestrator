@@ -22,6 +22,7 @@ CLI Agent Orchestrator (CAO) implements a hierarchical multi-agent system that e
 * **Flow - Scheduled runs** – Automated execution of workflows at specified intervals using cron-like scheduling, enabling routine tasks and monitoring workflows to run unattended.
 * **Context preservation** – The supervisor agent provides only necessary context to each worker agent, avoiding context pollution while maintaining workflow coherence.
 * **Direct worker interaction and steering** – Users can interact directly with worker agents to provide additional steering, distinguishing from sub-agents features by allowing real-time guidance and course correction.
+* **Tool restrictions** – Control what each agent can do through `role` and `allowedTools`. Built-in roles (`supervisor`, `developer`, `reviewer`) provide sensible defaults, while `allowedTools` gives fine-grained control. CAO translates restrictions to each provider's native enforcement mechanism. See [Tool Restrictions](#tool-restrictions-allowedtools).
 * **Advanced CLI integration** – CAO agents have full access to advanced features of the developer CLI, such as the [sub-agents](https://docs.claude.com/en/docs/claude-code/sub-agents) feature of Claude Code, [Custom Agent](https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/command-line-custom-agents.html) of Amazon Q Developer for CLI and so on.
 
 For detailed project structure and architecture, see [CODEBASE.md](CODEBASE.md).
@@ -30,6 +31,7 @@ For detailed project structure and architecture, see [CODEBASE.md](CODEBASE.md).
 
 ### Requirements
 
+- **curl** and **git** — For downloading installers and cloning the repo
 - **Python 3.10 or higher** — CAO requires Python >=3.10 (see [pyproject.toml](pyproject.toml))
 - **tmux 3.3+** — Used for agent session isolation
 - **[uv](https://docs.astral.sh/uv/)** — Fast Python package installer and virtual environment manager
@@ -67,6 +69,7 @@ bash <(curl -s https://raw.githubusercontent.com/awslabs/cli-agent-orchestrator/
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.local/bin/env   # Add uv to PATH (or restart your shell)
 ```
 
 ### 4. Install CLI Agent Orchestrator
@@ -98,6 +101,8 @@ Before using CAO, install at least one supported CLI agent tool:
 | **Claude Code** | [Provider docs](docs/claude-code.md) · [Installation](https://docs.anthropic.com/en/docs/claude-code/getting-started) | Anthropic API key |
 | **Codex CLI** | [Provider docs](docs/codex-cli.md) · [Installation](https://github.com/openai/codex) | OpenAI API key |
 | **Gemini CLI** | [Provider docs](docs/gemini-cli.md) · [Installation](https://github.com/google-gemini/gemini-cli) | Google AI API key |
+| **Kimi CLI** | [Provider docs](docs/kimi-cli.md) · [Installation](https://platform.moonshot.cn/docs/kimi-cli) | Moonshot API key |
+| **GitHub Copilot CLI** | [Provider docs](docs/copilot-cli.md) · [Installation](https://github.com/features/copilot/cli) | GitHub auth |
 | **Q CLI** | [Installation](https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/command-line.html) | AWS credentials |
 
 ## Quick Start
@@ -144,7 +149,9 @@ cao launch --agents code_supervisor --provider kiro_cli
 cao launch --agents code_supervisor --provider claude_code
 cao launch --agents code_supervisor --provider codex
 cao launch --agents code_supervisor --provider gemini_cli
-# Skip workspace trust confirmation
+cao launch --agents code_supervisor --provider kimi_cli
+cao launch --agents code_supervisor --provider copilot_cli
+# Unrestricted access + skip confirmation (DANGEROUS)
 cao launch --agents code_supervisor --yolo
 ```
 
@@ -187,6 +194,85 @@ cao shutdown --session <session-name>
 **List all windows (Ctrl+b, w):**
 
 ![Tmux Window Selector](./docs/assets/tmux_all_windows.png)
+
+## Web UI
+
+CAO includes a web dashboard for managing agents, terminals, and flows from the browser.
+
+![CAO Web UI](https://github.com/user-attachments/assets/e7db9261-62b1-4422-b9f5-6fe5f65bdea4)
+
+### Additional Requirements
+
+- **Node.js 18+** — Required for the frontend dev server and Codex CLI
+
+```bash
+# macOS (Homebrew)
+brew install node
+
+# Ubuntu/Debian
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo bash -
+sudo apt-get install -y nodejs
+
+# Amazon Linux 2023 / Fedora
+sudo dnf install nodejs20
+
+# Verify
+node --version   # Should be 18 or higher
+```
+
+### Starting the Web UI
+
+**Option A: Development mode** (hot-reload, two terminals needed)
+
+```bash
+# Terminal 1 — start the backend server
+cao-server
+
+# Terminal 2 — start the frontend dev server
+cd web/
+npm install        # First time only
+npm run dev        # Starts on http://localhost:5173
+```
+
+Open http://localhost:5173 in your browser.
+
+**Option B: Production mode** (single server, no Vite needed)
+
+The built Web UI is bundled into the CAO wheel, so a plain `uv tool install` ships everything you need. Just start the server:
+
+```bash
+cao-server
+```
+
+To rebuild the frontend from source:
+
+```bash
+cd web/
+npm install && npm run build   # Outputs to src/cli_agent_orchestrator/web_ui/
+uv tool install . --reinstall
+```
+
+Open http://localhost:9889 in your browser.
+
+> **Custom host/port:** `cao-server --host 0.0.0.0 --port 9889` exposes the server to the network — see Security note below.
+
+**Remote machine access** — If you're running CAO on a remote host (e.g. dev desktop), set up an SSH tunnel:
+
+```bash
+# Dev mode (proxy both frontend and backend)
+ssh -L 5173:localhost:5173 -L 9889:localhost:9889 your-remote-host
+
+# Production mode (backend serves UI directly)
+ssh -L 9889:localhost:9889 your-remote-host
+```
+
+Then open the same URLs (localhost:5173 or localhost:9889) in your local browser.
+
+### Features
+
+Manage sessions, spawn agents, create scheduled flows, configure agent directories, and interact with live terminals — all from the browser. Includes live status badges, an inbox for agent-to-agent messaging, output viewer, and provider auto-detection.
+
+For frontend architecture and component details, see [web/README.md](web/README.md). For agent directory configuration, see [docs/settings.md](docs/settings.md).
 
 ## MCP Server Tools and Orchestration Modes
 
@@ -394,7 +480,7 @@ provider: claude_code
 ---
 ```
 
-Valid values: `kiro_cli`, `claude_code`, `codex`, `q_cli`, `gemini_cli`.
+Valid values: `kiro_cli`, `claude_code`, `codex`, `q_cli`, `gemini_cli`, `kimi_cli`, `copilot_cli`.
 
 When a supervisor calls `assign` or `handoff`, CAO reads the worker's agent profile and uses the declared provider if present. If the key is missing or invalid, the worker falls back to the supervisor's provider.
 
@@ -402,7 +488,95 @@ The `cao launch --provider` flag always takes precedence — it is treated as an
 
 For ready-to-use examples, see [`examples/cross-provider/`](examples/cross-provider/).
 
+## Tool Restrictions
+
+CAO controls what tools each agent can use through `role` in the agent profile. Built-in roles (`supervisor`, `developer`, `reviewer`) map to sensible defaults, and `allowedTools` provides fine-grained override when needed. CAO translates restrictions to each provider's native enforcement mechanism — 5 of 7 providers support hard enforcement.
+
+```yaml
+---
+name: my_agent
+role: supervisor  # @cao-mcp-server, fs_read, fs_list
+---
+```
+
+```bash
+cao launch --agents code_supervisor                  # Uses role defaults (confirmation prompt shown)
+cao launch --agents code_supervisor --auto-approve   # Skip prompt (restrictions still enforced)
+cao launch --agents code_supervisor --yolo           # Unrestricted access (WARNING shown)
+```
+
+For the full reference — roles, tool vocabulary, custom roles, launch prompts, provider enforcement, and known limitations — see [docs/tool-restrictions.md](docs/tool-restrictions.md).
+
+## Skills
+
+Skills are portable, structured guides (following the universal [SKILL.md](https://github.com/anthropics/skills) format) that encode domain knowledge for AI agents. They work across AI coding assistants (Claude Code, Kiro CLI, Gemini CLI, Codex CLI, Kimi CLI, GitHub Copilot, Cursor, OpenCode, LobeHub), agent frameworks ([Strands Agents SDK](https://strandsagents.com/docs/user-guide/concepts/plugins/skills/), [Microsoft Agent Framework](https://devblogs.microsoft.com/agent-framework/give-your-agents-domain-expertise-with-agent-skills-in-microsoft-agent-framework/)), and other tools that support the SKILL.md format — allowing any agent to follow the same expert playbook regardless of provider.
+
+CAO includes the following built-in skills:
+
+| Skill | Description |
+|-------|-------------|
+| **[cao-provider](skills/cao-provider/SKILL.md)** | Scaffold a new CLI agent provider for CAO. Guides through the full implementation: ProviderType enum, provider class with regex patterns and status detection, ProviderManager registration, tool restriction wiring, unit/e2e tests, and documentation. Includes 20 lessons learnt from building 7 existing providers. |
+
+### Loading Skills
+
+Each AI coding tool loads skills from a different location. Copy or symlink the skill directory to the appropriate path for your tool:
+
+| Tool | Skill Location | Command |
+|------|---------------|---------|
+| **Claude Code** | `.claude/skills/` | `cp -r skills/cao-provider .claude/skills/` |
+| **Kiro CLI** | `.kiro/skills/` | `cp -r skills/cao-provider .kiro/skills/` |
+| **Amazon Q CLI** | `.amazonq/skills/` | `cp -r skills/cao-provider .amazonq/skills/` |
+| **Other tools** | Check your tool's docs for skill/prompt loading conventions |
+
+Then ask your AI coding assistant to create a new provider:
+
+```
+> I want to add support for Aider CLI as a new CAO provider
+```
+
+The assistant will follow the skill's step-by-step guide, reference the provider template, and apply lessons learnt from existing providers.
+
+### Managed Skills
+
+CAO also manages skills that are shared across all agent sessions. Builtin skills (`cao-supervisor-protocols`, `cao-worker-protocols`) are auto-seeded when the `cao-server` starts — no `cao init` required.
+
+```bash
+# List installed skills
+cao skills list
+
+# Install a custom skill from a local folder
+cao skills add ./my-coding-standards
+
+# Update an existing skill (overwrite)
+cao skills add ./my-coding-standards --force
+
+# Remove a skill
+cao skills remove my-coding-standards
+```
+
+Skills are delivered to each provider automatically:
+
+| Provider | Delivery Method |
+|----------|----------------|
+| Kiro CLI | Native `skill://` resources (progressive loading) |
+| Claude Code, Codex, Gemini CLI, Kimi CLI | Runtime prompt injection (every terminal creation) |
+| Copilot CLI | Baked into `.agent.md` at install time |
+
+When you add or remove a skill, all providers pick up the change automatically. Copilot agent files are refreshed immediately; other providers pick up changes on the next terminal creation.
+
+**Updating skills:** Use `cao skills add ./my-skill --force` to overwrite an existing skill. Without `--force`, the command errors if the skill already exists. Builtin skills are auto-seeded on server startup but are never overwritten — to update a builtin after a CAO upgrade, remove it first with `cao skills remove` then restart the server.
+
+For full details, see [docs/skills.md](docs/skills.md).
+
 ## Security
+
+The server is designed for **localhost-only use**. The WebSocket terminal endpoint (`/terminals/{id}/ws`) provides full PTY access and will reject connections from non-loopback addresses. Do not expose the server to untrusted networks without adding authentication.
+
+### DNS Rebinding Protection
+
+The CAO server validates HTTP `Host` headers to prevent [DNS rebinding attacks](https://owasp.org/www-community/attacks/DNS_Rebinding). Only `localhost` and `127.0.0.1` are accepted by default — requests with other hostnames are rejected with `400 Bad Request`.
+
+**Note:** If you need to expose the server on a network (not recommended for development use), be aware that the Host header validation will reject requests unless the hostname matches the allowed list.
 
 See [SECURITY.md](SECURITY.md) for vulnerability reporting, security scanning, and best practices.
 

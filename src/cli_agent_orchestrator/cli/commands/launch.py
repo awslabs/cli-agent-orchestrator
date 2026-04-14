@@ -12,8 +12,10 @@ from cli_agent_orchestrator.constants import DEFAULT_PROVIDER, PROVIDERS, SERVER
 PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
     "claude_code",
     "codex",
-    "kiro_cli",
+    "copilot_cli",
     "gemini_cli",
+    "kimi_cli",
+    "kiro_cli",
 }
 
 
@@ -24,8 +26,23 @@ PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
 @click.option(
     "--provider", default=DEFAULT_PROVIDER, help=f"Provider to use (default: {DEFAULT_PROVIDER})"
 )
-@click.option("--yolo", is_flag=True, help="Skip workspace trust confirmation")
-def launch(agents, session_name, headless, provider, yolo):
+@click.option(
+    "--allowed-tools",
+    multiple=True,
+    help="Override allowedTools (CAO format: execute_bash, fs_read, @cao-mcp-server). Repeatable.",
+)
+@click.option(
+    "--auto-approve",
+    is_flag=True,
+    help="Skip confirmation prompt (restrictions still enforced).",
+)
+@click.option(
+    "--yolo",
+    is_flag=True,
+    help="[DANGEROUS] Unrestricted tool access AND skip confirmation prompts. "
+    "Agent can execute ANY command including aws, rm, curl.",
+)
+def launch(agents, session_name, headless, provider, allowed_tools, auto_approve, yolo):
     """Launch cao session with specified agent profile."""
     try:
         # Validate provider
@@ -35,19 +52,70 @@ def launch(agents, session_name, headless, provider, yolo):
             )
         working_directory = os.path.realpath(os.getcwd())
 
-        # Ask for workspace trust confirmation for providers that need it.
-        # Note: CAO itself does not access the workspace — it is the underlying
-        # provider (e.g. claude_code, codex) that reads, writes, and executes
-        # commands in the workspace directory.
-        if provider in PROVIDERS_REQUIRING_WORKSPACE_ACCESS and not yolo:
-            click.echo(
-                f"The underlying provider ({provider}) will be trusted to perform all actions "
-                f"(read, write, and execute) in:\n"
-                f"  {working_directory}\n\n"
-                f"To skip this confirmation, use: cao launch --yolo\n"
-            )
-            if not click.confirm("Do you trust all the actions in this folder?", default=True):
-                raise click.ClickException("Launch cancelled by user")
+        # Resolve allowedTools: --yolo > --allowed-tools CLI > profile/role defaults
+        from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+        from cli_agent_orchestrator.utils.tool_mapping import (
+            format_tool_summary,
+            resolve_allowed_tools,
+        )
+
+        resolved_allowed_tools = None
+        no_role_set = False
+        resolved_role = None
+        if yolo:
+            resolved_allowed_tools = ["*"]
+        elif allowed_tools:
+            resolved_allowed_tools = list(allowed_tools)
+        else:
+            # Load profile to get role-based defaults
+            try:
+                profile = load_agent_profile(agents)
+                mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
+                no_role_set = not profile.role and not profile.allowedTools
+                resolved_role = profile.role
+                resolved_allowed_tools = resolve_allowed_tools(
+                    profile.allowedTools, profile.role, mcp_server_names
+                )
+            except (FileNotFoundError, RuntimeError):
+                # Profile not found — use developer defaults (backward compatible)
+                no_role_set = True
+                resolved_allowed_tools = resolve_allowed_tools(None, None, None)
+
+        # Confirmation / warning prompts
+        if provider in PROVIDERS_REQUIRING_WORKSPACE_ACCESS:
+            if yolo:
+                # --yolo: warn but don't block
+                click.echo(click.style("\n[WARNING] --yolo mode enabled", fg="yellow", bold=True))
+                click.echo(
+                    f"  Agent '{agents}' launching UNRESTRICTED on {provider}.\n"
+                    f"  Agent can execute ANY command (aws, rm, curl, read credentials).\n"
+                    f"  Directory: {working_directory}\n"
+                )
+            else:
+                # Normal launch: show tool summary and confirm
+                tool_summary = format_tool_summary(resolved_allowed_tools)
+                role_display = (
+                    resolved_role if resolved_role else "(not set — using developer defaults)"
+                )
+
+                click.echo(
+                    f"\nAgent '{agents}' launching on {provider}:\n"
+                    f"  Role:      {role_display}\n"
+                    f"  Allowed:   {tool_summary}\n"
+                    f"  Directory: {working_directory}\n"
+                )
+                if no_role_set:
+                    click.echo(
+                        "  Note: No role or allowedTools set — defaulting to 'developer'.\n"
+                        "  Add 'role' or 'allowedTools' to your agent profile to control tool access.\n"
+                        "  Docs: https://github.com/awslabs/cli-agent-orchestrator/blob/main/docs/tool-restrictions.md\n"
+                    )
+                click.echo(
+                    "  To skip this prompt next time, relaunch with --auto-approve\n"
+                    "  To remove all restrictions, relaunch with --yolo\n"
+                )
+                if not auto_approve and not click.confirm("Proceed?", default=True):
+                    raise click.ClickException("Launch cancelled by user")
 
         # Call API to create session
         url = f"http://{SERVER_HOST}:{SERVER_PORT}/sessions"
@@ -58,6 +126,9 @@ def launch(agents, session_name, headless, provider, yolo):
         }
         if session_name:
             params["session_name"] = session_name
+        if resolved_allowed_tools:
+            # Pass as comma-separated string for query param
+            params["allowed_tools"] = ",".join(resolved_allowed_tools)
 
         response = requests.post(url, params=params)
         response.raise_for_status()
@@ -73,5 +144,7 @@ def launch(agents, session_name, headless, provider, yolo):
 
     except requests.exceptions.RequestException as e:
         raise click.ClickException(f"Failed to connect to cao-server: {str(e)}")
+    except click.ClickException:
+        raise
     except Exception as e:
         raise click.ClickException(str(e))

@@ -52,6 +52,32 @@ BELL_CHAR = "\x07"
 IDLE_PROMPT_PATTERN_LOG = r"\x1b\[38;5;\d+m\[.+?\].*\x1b\[38;5;\d+m>\s*\x1b\[\d*m"
 
 # =============================================================================
+# New TUI Patterns (Kiro CLI without --legacy-ui)
+# =============================================================================
+
+# New TUI idle prompt: "Ask a question or describe a task ↵"
+# Case-insensitive match; comma between "question" and "or" is optional
+# (older versions used lowercase with comma, v1.29+ uses capitalized without)
+NEW_TUI_IDLE_PATTERN = r"[Aa]sk a question,? or describe a task"
+
+# New TUI IDLE prompt pattern for log files (with ANSI codes)
+NEW_TUI_IDLE_PATTERN_LOG = r"[Aa]sk a question,? or describe a task"
+
+# TUI separator line: horizontal bar (────) used to delimit sections.
+# Require 20+ chars to avoid matching short markdown separators in agent output.
+TUI_SEPARATOR_PATTERN = r"^[─]{20,}$"
+
+# TUI Credits line: "▸ Credits: N.NN • Time: Ns" marks response completion
+TUI_CREDITS_PATTERN = r"▸\s*Credits:\s*[\d.]+"
+
+# TUI processing indicator: ghost text shown while agent is working
+TUI_PROCESSING_PATTERN = r"Kiro is working"
+
+# TUI permission prompt: shown instead of legacy [y/n/t] format.
+# Requires all three options together to avoid false positives on "Yes"/"No" in agent output.
+TUI_PERMISSION_PATTERN = r"Yes\s+No\s+Always [Aa]llow"
+
+# =============================================================================
 # Error Detection
 # =============================================================================
 
@@ -74,7 +100,14 @@ class KiroCliProvider(BaseProvider):
         _permission_prompt_pattern: Regex pattern for detecting permission prompts
     """
 
-    def __init__(self, terminal_id: str, session_name: str, window_name: str, agent_profile: str):
+    def __init__(
+        self,
+        terminal_id: str,
+        session_name: str,
+        window_name: str,
+        agent_profile: str,
+        allowed_tools: Optional[list] = None,
+    ):
         """Initialize Kiro CLI provider with terminal context.
 
         Args:
@@ -82,8 +115,9 @@ class KiroCliProvider(BaseProvider):
             session_name: Name of the tmux session
             window_name: Name of the tmux window
             agent_profile: Name of the Kiro agent profile to use (e.g., "developer")
+            allowed_tools: Optional list of CAO tool names the agent is allowed to use
         """
-        super().__init__(terminal_id, session_name, window_name)
+        super().__init__(terminal_id, session_name, window_name, allowed_tools)
         self._initialized = False
         self._agent_profile = agent_profile
 
@@ -98,6 +132,9 @@ class KiroCliProvider(BaseProvider):
             rf"\[{re.escape(self._agent_profile)}\]\s*(?:\d+%\s*)?(?:\u03bb\s*)?!?>\s*"
         )
         self._permission_prompt_pattern = r"Allow this action\?.*?\[.*?y.*?/.*?n.*?/.*?t.*?\]:"
+
+        # New TUI header pattern: "agent_name · model · ◔ N%"
+        self._new_tui_header_pattern = rf"{re.escape(self._agent_profile)}\s+·\s+.*·\s+◔\s*\d+%"
 
     def initialize(self) -> bool:
         """Initialize Kiro CLI provider by starting kiro-cli chat command.
@@ -118,13 +155,32 @@ class KiroCliProvider(BaseProvider):
         if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
-        # Step 2: Start the Kiro CLI chat session with the specified agent profile
+        # Step 2: Start the Kiro CLI chat session using kiro-cli's default UI.
+        # Detection code handles both legacy and TUI patterns (stateless).
+        # If initialization fails, fall back to --legacy-ui.
         command = shlex.join(["kiro-cli", "chat", "--agent", self._agent_profile])
         tmux_client.send_keys(self.session_name, self.window_name, command)
 
-        # Step 3: Wait for Kiro CLI to fully initialize and show the agent prompt
-        if not wait_until_status(self, TerminalStatus.IDLE, timeout=30.0):
-            raise TimeoutError("Kiro CLI initialization timed out after 30 seconds")
+        # Step 3: Wait for Kiro CLI to fully initialize and show the agent prompt.
+        # Accept both IDLE and COMPLETED — some CLI versions show a startup
+        # message that get_status() interprets as a completed response.
+        if not wait_until_status(
+            self, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=30.0
+        ):
+            # TUI mode failed — fall back to --legacy-ui
+            logger.warning("Kiro CLI TUI initialization timed out, retrying with --legacy-ui")
+            # Exit the current session and start fresh with --legacy-ui
+            tmux_client.send_keys(self.session_name, self.window_name, "/exit")
+            if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
+                raise TimeoutError("Shell recovery timed out after --legacy-ui fallback")
+            legacy_command = shlex.join(
+                ["kiro-cli", "chat", "--legacy-ui", "--agent", self._agent_profile]
+            )
+            tmux_client.send_keys(self.session_name, self.window_name, legacy_command)
+            if not wait_until_status(
+                self, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=30.0
+            ):
+                raise TimeoutError("Kiro CLI initialization timed out with TUI and `--legacy-ui`")
 
         self._initialized = True
         return True
@@ -158,27 +214,40 @@ class KiroCliProvider(BaseProvider):
         # This simplifies regex patterns and improves reliability
         clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
 
-        # Check 1: Look for the agent's IDLE prompt pattern
+        # Check 1: Look for TUI "Kiro is working" ghost text — positive PROCESSING signal
+        if re.search(TUI_PROCESSING_PATTERN, clean_output):
+            return TerminalStatus.PROCESSING
+
+        # Check 2: Look for the agent's IDLE prompt pattern (old or new TUI)
         # If not found, the agent is still processing a response
         has_idle_prompt = re.search(self._idle_prompt_pattern, clean_output)
+        new_tui_idle_matches = list(re.finditer(NEW_TUI_IDLE_PATTERN, clean_output))
+        has_new_tui_idle = bool(new_tui_idle_matches)
 
-        if not has_idle_prompt:
+        if not has_idle_prompt and not has_new_tui_idle:
             return TerminalStatus.PROCESSING
 
         # Check 2: Look for known error messages in the output
         if any(indicator.lower() in clean_output.lower() for indicator in ERROR_INDICATORS):
             return TerminalStatus.ERROR
 
-        # Check for permission prompt — count lines with idle prompt after last [y/n/t]:
+        # Check for permission prompt — legacy [y/n/t] or TUI "Yes, No, Always Allow"
         # Active prompt: 0-1 lines with idle prompt (CLI renders prompt on next line)
         # Stale prompt: 2+ lines with idle prompt (user answered, agent continued)
         # Line-based counting handles \r redraws (same line, no \n) correctly
         perm_matches = list(re.finditer(self._permission_prompt_pattern, clean_output, re.DOTALL))
-        if perm_matches:
-            after_last_perm = clean_output[perm_matches[-1].end() :]
+        tui_perm_matches = list(re.finditer(TUI_PERMISSION_PATTERN, clean_output))
+        all_perm_matches = perm_matches + tui_perm_matches
+        # Sort by position so we use the last permission prompt regardless of type
+        all_perm_matches.sort(key=lambda m: m.start())
+        if all_perm_matches:
+            after_last_perm = clean_output[all_perm_matches[-1].end() :]
             lines_after = after_last_perm.split("\n")
             idle_lines = sum(
-                1 for line in lines_after if re.search(self._idle_prompt_pattern, line)
+                1
+                for line in lines_after
+                if re.search(self._idle_prompt_pattern, line)
+                or re.search(NEW_TUI_IDLE_PATTERN, line)
             )
             if idle_lines <= 1:
                 return TerminalStatus.WAITING_USER_ANSWER
@@ -196,7 +265,26 @@ class KiroCliProvider(BaseProvider):
                     logger.debug(f"get_status: returning COMPLETED")
                     return TerminalStatus.COMPLETED
 
+            # Also check new TUI idle pattern after the last green arrow
+            for prompt in new_tui_idle_matches:
+                if prompt.start() > last_arrow_pos:
+                    logger.debug("get_status: returning COMPLETED (new TUI)")
+                    return TerminalStatus.COMPLETED
+
             # Has green arrow but no prompt after it - still processing
+            return TerminalStatus.PROCESSING
+
+        # Check 5: TUI completion — Credits marker + idle prompt after it.
+        # In pure TUI mode, there are no green arrows. Completion is indicated
+        # by "▸ Credits:" followed by the idle prompt.
+        credits_matches = list(re.finditer(TUI_CREDITS_PATTERN, clean_output))
+        if credits_matches:
+            last_credits_pos = credits_matches[-1].end()
+            for prompt in new_tui_idle_matches:
+                if prompt.start() > last_credits_pos:
+                    logger.debug("get_status: returning COMPLETED (TUI credits)")
+                    return TerminalStatus.COMPLETED
+            # Credits marker found but no idle prompt after it — still processing
             return TerminalStatus.PROCESSING
 
         # Default: Agent is IDLE, waiting for user input
@@ -210,22 +298,29 @@ class KiroCliProvider(BaseProvider):
         # Find patterns in clean output
         green_arrows = list(re.finditer(GREEN_ARROW_PATTERN, clean_output, re.MULTILINE))
         idle_prompts = list(re.finditer(self._idle_prompt_pattern, clean_output))
+        new_tui_idles = list(re.finditer(NEW_TUI_IDLE_PATTERN, clean_output))
 
         if not green_arrows:
-            raise ValueError("No Kiro CLI response found - no green arrow pattern detected")
+            # Fallback: try TUI extraction (separator + Credits pattern)
+            return self._extract_tui_message(clean_output)
 
-        if not idle_prompts:
+        if not idle_prompts and not new_tui_idles:
             raise ValueError("Incomplete Kiro CLI response - no final prompt detected")
 
         # Find the last green arrow (response start)
         last_arrow_pos = green_arrows[-1].end()
 
-        # Find idle prompt that comes AFTER the last green arrow
+        # Find idle prompt that comes AFTER the last green arrow (old or new TUI)
         final_prompt = None
         for prompt in idle_prompts:
             if prompt.start() > last_arrow_pos:
                 final_prompt = prompt
                 break
+        if not final_prompt:
+            for prompt in new_tui_idles:
+                if prompt.start() > last_arrow_pos:
+                    final_prompt = prompt
+                    break
 
         if not final_prompt:
             raise ValueError(
@@ -247,9 +342,99 @@ class KiroCliProvider(BaseProvider):
         final_answer = re.sub(CONTROL_CHAR_PATTERN, "", final_answer)
         return final_answer.strip()
 
+    def _extract_tui_message(self, clean_output: str) -> str:
+        """Extract agent response from pure TUI output (no green arrows).
+
+        TUI format:
+            ────────────────────────────
+              user message here
+
+              Agent's response here.
+
+            ▸ Credits: 0.24 - Time: 3s
+            ────────────────────────────
+            agent-name - model - N%
+             Ask a question or describe a task
+
+        Strategy:
+            1. Find the last Credits line (response end marker)
+            2. Find the previous Credits line (prior turn boundary) or start of output
+            3. Find the first separator after that boundary (outer TUI separator)
+               This avoids matching separators inside the agent's response.
+            4. Extract text between separator and Credits
+            5. Skip the first paragraph (user message) if a blank line separates it
+        """
+        lines = clean_output.split("\n")
+
+        # Find the last Credits line
+        credits_idx = None
+        for i in range(len(lines) - 1, -1, -1):
+            if re.search(TUI_CREDITS_PATTERN, lines[i]):
+                credits_idx = i
+                break
+
+        if credits_idx is None:
+            raise ValueError(
+                "No Kiro CLI response found - no Credits marker or green arrow detected"
+            )
+
+        # Find the previous Credits line (prior turn's end) to establish search boundary.
+        # This ensures we find the outer TUI separator, not one inside the agent's output.
+        prev_credits_idx = -1
+        for i in range(credits_idx - 1, -1, -1):
+            if re.search(TUI_CREDITS_PATTERN, lines[i]):
+                prev_credits_idx = i
+                break
+
+        # Find the first separator AFTER the previous turn boundary
+        separator_idx = None
+        for i in range(prev_credits_idx + 1, credits_idx):
+            if re.search(TUI_SEPARATOR_PATTERN, lines[i].strip()):
+                separator_idx = i
+                break
+
+        if separator_idx is None:
+            raise ValueError("No Kiro CLI response found - no separator before Credits marker")
+
+        # Extract content between separator and Credits
+        content_lines = lines[separator_idx + 1 : credits_idx]
+
+        # Skip the first paragraph (user message echo).
+        # The user message is the first block of non-empty lines after the separator.
+        # After a blank line, the agent response begins.
+        agent_start = 0
+        found_blank = False
+        for i, line in enumerate(content_lines):
+            stripped = line.strip()
+            if not found_blank and not stripped:
+                found_blank = True
+                continue
+            if found_blank and stripped:
+                agent_start = i
+                break
+
+        if not found_blank:
+            # No blank line found — entire content is the response
+            agent_start = 0
+
+        response_lines = content_lines[agent_start:]
+        final_answer = "\n".join(response_lines).strip()
+
+        if not final_answer:
+            raise ValueError("Empty Kiro CLI response - no content found")
+
+        # Clean up (ANSI codes already stripped from clean_output at caller)
+        final_answer = re.sub(ESCAPE_SEQUENCE_PATTERN, "", final_answer)
+        final_answer = re.sub(CONTROL_CHAR_PATTERN, "", final_answer)
+        return final_answer.strip()
+
     def get_idle_pattern_for_log(self) -> str:
-        """Return Kiro CLI IDLE prompt pattern for log files."""
-        return IDLE_PROMPT_PATTERN_LOG
+        """Return Kiro CLI IDLE prompt pattern for log files.
+
+        Returns a pattern that matches either the legacy UI format
+        or the new TUI format.
+        """
+        return rf"(?:{IDLE_PROMPT_PATTERN_LOG}|{NEW_TUI_IDLE_PATTERN_LOG})"
 
     def exit_cli(self) -> str:
         """Get the command to exit Kiro CLI."""
