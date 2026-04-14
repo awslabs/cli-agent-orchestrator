@@ -865,9 +865,13 @@ async def run_flow(name: str) -> Dict:
         )
 
 
-# Static file serving for built web UI
-WEB_DIST = Path(__file__).parent.parent.parent.parent / "web" / "dist"
-if WEB_DIST.exists():
+# Static file serving for built web UI.
+# Anchored to the package via importlib.resources so it works for both
+# editable installs (uv sync) and wheel installs (uv tool install, pip install).
+from importlib.resources import files as _pkg_files
+
+WEB_DIST = Path(str(_pkg_files("cli_agent_orchestrator") / "web_ui"))
+if (WEB_DIST / "index.html").exists():
     from starlette.staticfiles import StaticFiles
 
     app.mount("/", StaticFiles(directory=str(WEB_DIST), html=True), name="web")
