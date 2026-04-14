@@ -222,14 +222,6 @@ node --version   # Should be 18 or higher
 
 ### Starting the Web UI
 
-> **Note:** The Web UI requires a cloned copy of the repository (the `web/` directory is not included in the `uv tool install` package). If you installed CAO via `uv tool install`, clone the repo first:
-> ```bash
-> git clone https://github.com/awslabs/cli-agent-orchestrator.git
-> cd cli-agent-orchestrator/
-> ```
-
-All commands below assume you are in the **project root** directory (`cli-agent-orchestrator/`).
-
 **Option A: Development mode** (hot-reload, two terminals needed)
 
 ```bash
@@ -246,14 +238,18 @@ Open http://localhost:5173 in your browser.
 
 **Option B: Production mode** (single server, no Vite needed)
 
-```bash
-# Build the frontend once
-cd web/
-npm install && npm run build   # Outputs to web/dist/
+The built Web UI is bundled into the CAO wheel, so a plain `uv tool install` ships everything you need. Just start the server:
 
-# Start the backend — it serves the built frontend automatically
-cd ..
+```bash
 cao-server
+```
+
+To rebuild the frontend from source:
+
+```bash
+cd web/
+npm install && npm run build   # Outputs to src/cli_agent_orchestrator/web_ui/
+uv tool install . --reinstall
 ```
 
 Open http://localhost:9889 in your browser.
@@ -613,6 +609,38 @@ Then ask your AI coding assistant to create a new provider:
 ```
 
 The assistant will follow the skill's step-by-step guide, reference the provider template, and apply lessons learnt from existing providers.
+
+### Managed Skills
+
+CAO also manages skills that are shared across all agent sessions. Builtin skills (`cao-supervisor-protocols`, `cao-worker-protocols`) are auto-seeded when the `cao-server` starts — no `cao init` required.
+
+```bash
+# List installed skills
+cao skills list
+
+# Install a custom skill from a local folder
+cao skills add ./my-coding-standards
+
+# Update an existing skill (overwrite)
+cao skills add ./my-coding-standards --force
+
+# Remove a skill
+cao skills remove my-coding-standards
+```
+
+Skills are delivered to each provider automatically:
+
+| Provider | Delivery Method |
+|----------|----------------|
+| Kiro CLI | Native `skill://` resources (progressive loading) |
+| Claude Code, Codex, Gemini CLI, Kimi CLI | Runtime prompt injection (every terminal creation) |
+| Copilot CLI | Baked into `.agent.md` at install time |
+
+When you add or remove a skill, all providers pick up the change automatically. Copilot agent files are refreshed immediately; other providers pick up changes on the next terminal creation.
+
+**Updating skills:** Use `cao skills add ./my-skill --force` to overwrite an existing skill. Without `--force`, the command errors if the skill already exists. Builtin skills are auto-seeded on server startup but are never overwritten — to update a builtin after a CAO upgrade, remove it first with `cao skills remove` then restart the server.
+
+For full details, see [docs/skills.md](docs/skills.md).
 
 ## Security
 

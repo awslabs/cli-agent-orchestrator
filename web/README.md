@@ -55,7 +55,7 @@ A single-page dashboard for managing CLI Agent Orchestrator sessions, agents, fl
 | Mode | Frontend | Backend | URL |
 |------|----------|---------|-----|
 | **Development** | `npm run dev` (Vite dev server with hot-reload) | `cao-server` | `http://localhost:5173` |
-| **Production** | `npm run build` (static files in `web/dist/`) | `cao-server` serves `dist/` | `http://localhost:9889` |
+| **Production** | `npm run build` (static files emitted into `src/cli_agent_orchestrator/web_ui/`) | `cao-server` serves the bundled UI from the installed package | `http://localhost:9889` |
 
 In development mode, Vite proxies API requests (`/sessions`, `/terminals`, `/agents`, `/flows`, `/settings`, `/health`) to `cao-server` on port 9889 (configured in `vite.config.ts`).
 
