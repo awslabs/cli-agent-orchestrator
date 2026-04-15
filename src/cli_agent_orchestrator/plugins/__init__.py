@@ -3,11 +3,11 @@
 from cli_agent_orchestrator.plugins.base import CaoPlugin, hook
 from cli_agent_orchestrator.plugins.events import (
     CaoEvent,
-    MessageSentEvent,
-    SessionCreatedEvent,
-    SessionKilledEvent,
-    TerminalCreatedEvent,
-    TerminalKilledEvent,
+    PostCreateSessionEvent,
+    PostCreateTerminalEvent,
+    PostKillSessionEvent,
+    PostKillTerminalEvent,
+    PostSendMessageEvent,
 )
 from cli_agent_orchestrator.plugins.registry import PluginRegistry
 
@@ -15,10 +15,10 @@ __all__ = [
     "CaoPlugin",
     "hook",
     "CaoEvent",
-    "MessageSentEvent",
-    "SessionCreatedEvent",
-    "SessionKilledEvent",
-    "TerminalCreatedEvent",
-    "TerminalKilledEvent",
+    "PostSendMessageEvent",
+    "PostCreateSessionEvent",
+    "PostKillSessionEvent",
+    "PostCreateTerminalEvent",
+    "PostKillTerminalEvent",
     "PluginRegistry",
 ]

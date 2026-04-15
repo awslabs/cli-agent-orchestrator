@@ -7,7 +7,7 @@ from unittest.mock import patch
 import pytest
 
 from cli_agent_orchestrator.plugins import CaoPlugin, PluginRegistry, hook
-from cli_agent_orchestrator.plugins.events import MessageSentEvent
+from cli_agent_orchestrator.plugins.events import PostSendMessageEvent
 
 
 @dataclass
@@ -57,8 +57,8 @@ class TestPluginRegistryLoad:
         received: list[str] = []
 
         class SingleHookPlugin(CaoPlugin):
-            @hook("message_sent")
-            async def on_message(self, event: MessageSentEvent) -> None:
+            @hook("post_send_message")
+            async def on_message(self, event: PostSendMessageEvent) -> None:
                 received.append(event.message)
 
         registry = PluginRegistry()
@@ -70,11 +70,11 @@ class TestPluginRegistryLoad:
             with caplog.at_level(logging.INFO, logger="cli_agent_orchestrator.plugins.registry"):
                 await registry.load()
 
-        await registry.dispatch("message_sent", MessageSentEvent(message="hello"))
+        await registry.dispatch("post_send_message", PostSendMessageEvent(message="hello"))
 
         assert received == ["hello"]
         assert len(registry._plugins) == 1
-        assert len(registry._dispatch["message_sent"]) == 1
+        assert len(registry._dispatch["post_send_message"]) == 1
         assert "Loaded CAO plugin: single-hook" in caplog.text
 
     @pytest.mark.asyncio
@@ -84,12 +84,12 @@ class TestPluginRegistryLoad:
         received: list[str] = []
 
         class DoubleHookPlugin(CaoPlugin):
-            @hook("message_sent")
-            async def first(self, event: MessageSentEvent) -> None:
+            @hook("post_send_message")
+            async def first(self, event: PostSendMessageEvent) -> None:
                 received.append(f"first:{event.message}")
 
-            @hook("message_sent")
-            async def second(self, event: MessageSentEvent) -> None:
+            @hook("post_send_message")
+            async def second(self, event: PostSendMessageEvent) -> None:
                 received.append(f"second:{event.message}")
 
         registry = PluginRegistry()
@@ -100,11 +100,11 @@ class TestPluginRegistryLoad:
         ):
             await registry.load()
 
-        await registry.dispatch("message_sent", MessageSentEvent(message="hello"))
+        await registry.dispatch("post_send_message", PostSendMessageEvent(message="hello"))
 
         assert set(received) == {"first:hello", "second:hello"}
         assert len(received) == 2
-        assert len(registry._dispatch["message_sent"]) == 2
+        assert len(registry._dispatch["post_send_message"]) == 2
 
     @pytest.mark.asyncio
     async def test_load_multiple_plugins_for_same_event_invokes_all(self) -> None:
@@ -113,13 +113,13 @@ class TestPluginRegistryLoad:
         received: list[str] = []
 
         class FirstPlugin(CaoPlugin):
-            @hook("message_sent")
-            async def on_message(self, event: MessageSentEvent) -> None:
+            @hook("post_send_message")
+            async def on_message(self, event: PostSendMessageEvent) -> None:
                 received.append(f"first:{event.message}")
 
         class SecondPlugin(CaoPlugin):
-            @hook("message_sent")
-            async def on_message(self, event: MessageSentEvent) -> None:
+            @hook("post_send_message")
+            async def on_message(self, event: PostSendMessageEvent) -> None:
                 received.append(f"second:{event.message}")
 
         registry = PluginRegistry()
@@ -133,11 +133,11 @@ class TestPluginRegistryLoad:
         ):
             await registry.load()
 
-        await registry.dispatch("message_sent", MessageSentEvent(message="hello"))
+        await registry.dispatch("post_send_message", PostSendMessageEvent(message="hello"))
 
         assert set(received) == {"first:hello", "second:hello"}
         assert len(registry._plugins) == 2
-        assert len(registry._dispatch["message_sent"]) == 2
+        assert len(registry._dispatch["post_send_message"]) == 2
 
     @pytest.mark.asyncio
     async def test_load_skips_plugin_when_setup_raises_and_loads_remaining(
@@ -151,13 +151,13 @@ class TestPluginRegistryLoad:
             async def setup(self) -> None:
                 raise RuntimeError("setup failed")
 
-            @hook("message_sent")
-            async def on_message(self, event: MessageSentEvent) -> None:
+            @hook("post_send_message")
+            async def on_message(self, event: PostSendMessageEvent) -> None:
                 received.append(f"failing:{event.message}")
 
         class HealthyPlugin(CaoPlugin):
-            @hook("message_sent")
-            async def on_message(self, event: MessageSentEvent) -> None:
+            @hook("post_send_message")
+            async def on_message(self, event: PostSendMessageEvent) -> None:
                 received.append(f"healthy:{event.message}")
 
         registry = PluginRegistry()
@@ -172,7 +172,7 @@ class TestPluginRegistryLoad:
             with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.plugins.registry"):
                 await registry.load()
 
-        await registry.dispatch("message_sent", MessageSentEvent(message="hello"))
+        await registry.dispatch("post_send_message", PostSendMessageEvent(message="hello"))
 
         assert received == ["healthy:hello"]
         assert len(registry._plugins) == 1
@@ -214,13 +214,13 @@ class TestPluginRegistryDispatch:
         received: list[str] = []
 
         class FailingHookPlugin(CaoPlugin):
-            @hook("message_sent")
-            async def broken(self, event: MessageSentEvent) -> None:
+            @hook("post_send_message")
+            async def broken(self, event: PostSendMessageEvent) -> None:
                 received.append("broken")
                 raise RuntimeError("dispatch failed")
 
-            @hook("message_sent")
-            async def healthy(self, event: MessageSentEvent) -> None:
+            @hook("post_send_message")
+            async def healthy(self, event: PostSendMessageEvent) -> None:
                 received.append("healthy")
 
         registry = PluginRegistry()
@@ -232,10 +232,10 @@ class TestPluginRegistryDispatch:
             await registry.load()
 
         with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.plugins.registry"):
-            await registry.dispatch("message_sent", MessageSentEvent(message="hello"))
+            await registry.dispatch("post_send_message", PostSendMessageEvent(message="hello"))
 
         assert set(received) == {"broken", "healthy"}
-        assert "raised an error for event 'message_sent'" in caplog.text
+        assert "raised an error for event 'post_send_message'" in caplog.text
         assert caplog.records[-1].exc_info is not None
 
     @pytest.mark.asyncio
@@ -247,7 +247,7 @@ class TestPluginRegistryDispatch:
         registry = PluginRegistry()
 
         with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.plugins.registry"):
-            await registry.dispatch("message_sent", MessageSentEvent(message="hello"))
+            await registry.dispatch("post_send_message", PostSendMessageEvent(message="hello"))
 
         assert registry._dispatch == {}
         assert caplog.records == []

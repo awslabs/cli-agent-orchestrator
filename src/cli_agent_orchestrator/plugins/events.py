@@ -21,8 +21,8 @@ class CaoEvent:
 
 
 @dataclass
-class MessageSentEvent(CaoEvent):
-    """Emitted when a message is dispatched to an agent's inbox.
+class PostSendMessageEvent(CaoEvent):
+    """Emitted after a message is dispatched to an agent's inbox.
 
     Fired for all three orchestration methods:
     - send_message: direct message to an existing terminal
@@ -30,10 +30,10 @@ class MessageSentEvent(CaoEvent):
     - assign: message sent as part of an asynchronous assign
 
     Orchestration methods like assign span multiple steps and may therefore
-    emit more than one MessageSentEvent across their lifecycle.
+    emit more than one PostSendMessageEvent across their lifecycle.
     """
 
-    event_type: str = "message_sent"
+    event_type: str = "post_send_message"
     sender: str = ""
     receiver: str = ""
     message: str = ""
@@ -41,35 +41,35 @@ class MessageSentEvent(CaoEvent):
 
 
 @dataclass
-class SessionCreatedEvent(CaoEvent):
-    """Emitted when a CAO session is created."""
+class PostCreateSessionEvent(CaoEvent):
+    """Emitted after a CAO session is created."""
 
-    event_type: str = "session_created"
+    event_type: str = "post_create_session"
     session_name: str = ""
 
 
 @dataclass
-class SessionKilledEvent(CaoEvent):
-    """Emitted when a CAO session is killed."""
+class PostKillSessionEvent(CaoEvent):
+    """Emitted after a CAO session is killed."""
 
-    event_type: str = "session_killed"
+    event_type: str = "post_kill_session"
     session_name: str = ""
 
 
 @dataclass
-class TerminalCreatedEvent(CaoEvent):
-    """Emitted when a CAO terminal is created."""
+class PostCreateTerminalEvent(CaoEvent):
+    """Emitted after a CAO terminal is created."""
 
-    event_type: str = "terminal_created"
+    event_type: str = "post_create_terminal"
     terminal_id: str = ""
     agent_name: str | None = None
     provider: str = ""
 
 
 @dataclass
-class TerminalKilledEvent(CaoEvent):
-    """Emitted when a CAO terminal is killed."""
+class PostKillTerminalEvent(CaoEvent):
+    """Emitted after a CAO terminal is killed."""
 
-    event_type: str = "terminal_killed"
+    event_type: str = "post_kill_terminal"
     terminal_id: str = ""
     agent_name: str | None = None

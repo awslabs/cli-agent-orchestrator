@@ -29,7 +29,11 @@ from cli_agent_orchestrator.clients.database import (
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.constants import SESSION_PREFIX
 from cli_agent_orchestrator.models.terminal import Terminal
-from cli_agent_orchestrator.plugins import PluginRegistry, SessionCreatedEvent, SessionKilledEvent
+from cli_agent_orchestrator.plugins import (
+    PluginRegistry,
+    PostCreateSessionEvent,
+    PostKillSessionEvent,
+)
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
 from cli_agent_orchestrator.services.terminal_service import create_terminal
@@ -58,8 +62,8 @@ def create_session(
     )
     dispatch_plugin_event(
         registry,
-        "session_created",
-        SessionCreatedEvent(
+        "post_create_session",
+        PostCreateSessionEvent(
             session_id=terminal.session_name,
             session_name=terminal.session_name,
         ),
@@ -127,8 +131,8 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
         logger.info(f"Deleted session: {session_name}")
         dispatch_plugin_event(
             registry,
-            "session_killed",
-            SessionKilledEvent(session_id=session_name, session_name=session_name),
+            "post_kill_session",
+            PostKillSessionEvent(session_id=session_name, session_name=session_name),
         )
         return result
 

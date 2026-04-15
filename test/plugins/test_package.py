@@ -3,23 +3,27 @@
 from cli_agent_orchestrator.plugins import (
     CaoEvent,
     CaoPlugin,
-    MessageSentEvent,
     PluginRegistry,
-    SessionCreatedEvent,
-    SessionKilledEvent,
-    TerminalCreatedEvent,
-    TerminalKilledEvent,
+    PostCreateSessionEvent,
+    PostCreateTerminalEvent,
+    PostKillSessionEvent,
+    PostKillTerminalEvent,
+    PostSendMessageEvent,
     __all__,
     hook,
 )
 from cli_agent_orchestrator.plugins.base import CaoPlugin as BaseCaoPlugin
 from cli_agent_orchestrator.plugins.base import hook as base_hook
 from cli_agent_orchestrator.plugins.events import CaoEvent as BaseCaoEvent
-from cli_agent_orchestrator.plugins.events import MessageSentEvent as BaseMessageSentEvent
-from cli_agent_orchestrator.plugins.events import SessionCreatedEvent as BaseSessionCreatedEvent
-from cli_agent_orchestrator.plugins.events import SessionKilledEvent as BaseSessionKilledEvent
-from cli_agent_orchestrator.plugins.events import TerminalCreatedEvent as BaseTerminalCreatedEvent
-from cli_agent_orchestrator.plugins.events import TerminalKilledEvent as BaseTerminalKilledEvent
+from cli_agent_orchestrator.plugins.events import (
+    PostCreateSessionEvent as BasePostCreateSessionEvent,
+)
+from cli_agent_orchestrator.plugins.events import (
+    PostCreateTerminalEvent as BasePostCreateTerminalEvent,
+)
+from cli_agent_orchestrator.plugins.events import PostKillSessionEvent as BasePostKillSessionEvent
+from cli_agent_orchestrator.plugins.events import PostKillTerminalEvent as BasePostKillTerminalEvent
+from cli_agent_orchestrator.plugins.events import PostSendMessageEvent as BasePostSendMessageEvent
 from cli_agent_orchestrator.plugins.registry import PluginRegistry as BasePluginRegistry
 
 
@@ -32,11 +36,11 @@ class TestPluginPackageAPI:
         assert CaoPlugin is BaseCaoPlugin
         assert hook is base_hook
         assert CaoEvent is BaseCaoEvent
-        assert MessageSentEvent is BaseMessageSentEvent
-        assert SessionCreatedEvent is BaseSessionCreatedEvent
-        assert SessionKilledEvent is BaseSessionKilledEvent
-        assert TerminalCreatedEvent is BaseTerminalCreatedEvent
-        assert TerminalKilledEvent is BaseTerminalKilledEvent
+        assert PostSendMessageEvent is BasePostSendMessageEvent
+        assert PostCreateSessionEvent is BasePostCreateSessionEvent
+        assert PostKillSessionEvent is BasePostKillSessionEvent
+        assert PostCreateTerminalEvent is BasePostCreateTerminalEvent
+        assert PostKillTerminalEvent is BasePostKillTerminalEvent
         assert PluginRegistry is BasePluginRegistry
 
     def test___all___contains_exactly_the_phase_two_public_api(self) -> None:
@@ -46,10 +50,10 @@ class TestPluginPackageAPI:
             "CaoPlugin",
             "hook",
             "CaoEvent",
-            "MessageSentEvent",
-            "SessionCreatedEvent",
-            "SessionKilledEvent",
-            "TerminalCreatedEvent",
-            "TerminalKilledEvent",
+            "PostSendMessageEvent",
+            "PostCreateSessionEvent",
+            "PostKillSessionEvent",
+            "PostCreateTerminalEvent",
+            "PostKillTerminalEvent",
             "PluginRegistry",
         ]

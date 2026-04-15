@@ -4,56 +4,56 @@ from datetime import timedelta
 
 from cli_agent_orchestrator.plugins.events import (
     CaoEvent,
-    MessageSentEvent,
-    SessionCreatedEvent,
-    SessionKilledEvent,
-    TerminalCreatedEvent,
-    TerminalKilledEvent,
+    PostCreateSessionEvent,
+    PostCreateTerminalEvent,
+    PostKillSessionEvent,
+    PostKillTerminalEvent,
+    PostSendMessageEvent,
 )
 
 
 class TestEventDefaults:
     """Tests for default plugin event values."""
 
-    def test_message_sent_event_defaults(self) -> None:
-        """MessageSentEvent defaults to the message_sent type."""
+    def test_post_send_message_event_defaults(self) -> None:
+        """PostSendMessageEvent defaults to the post_send_message type."""
 
-        event = MessageSentEvent()
+        event = PostSendMessageEvent()
 
-        assert event.event_type == "message_sent"
+        assert event.event_type == "post_send_message"
         assert event.session_id is None
         assert isinstance(event, CaoEvent)
 
-    def test_session_created_event_defaults(self) -> None:
-        """SessionCreatedEvent defaults to the session_created type."""
+    def test_post_create_session_event_defaults(self) -> None:
+        """PostCreateSessionEvent defaults to the post_create_session type."""
 
-        event = SessionCreatedEvent()
+        event = PostCreateSessionEvent()
 
-        assert event.event_type == "session_created"
+        assert event.event_type == "post_create_session"
         assert event.session_id is None
 
-    def test_session_killed_event_defaults(self) -> None:
-        """SessionKilledEvent defaults to the session_killed type."""
+    def test_post_kill_session_event_defaults(self) -> None:
+        """PostKillSessionEvent defaults to the post_kill_session type."""
 
-        event = SessionKilledEvent()
+        event = PostKillSessionEvent()
 
-        assert event.event_type == "session_killed"
+        assert event.event_type == "post_kill_session"
         assert event.session_id is None
 
-    def test_terminal_created_event_defaults(self) -> None:
-        """TerminalCreatedEvent defaults to the terminal_created type."""
+    def test_post_create_terminal_event_defaults(self) -> None:
+        """PostCreateTerminalEvent defaults to the post_create_terminal type."""
 
-        event = TerminalCreatedEvent()
+        event = PostCreateTerminalEvent()
 
-        assert event.event_type == "terminal_created"
+        assert event.event_type == "post_create_terminal"
         assert event.session_id is None
 
-    def test_terminal_killed_event_defaults(self) -> None:
-        """TerminalKilledEvent defaults to the terminal_killed type."""
+    def test_post_kill_terminal_event_defaults(self) -> None:
+        """PostKillTerminalEvent defaults to the post_kill_terminal type."""
 
-        event = TerminalKilledEvent()
+        event = PostKillTerminalEvent()
 
-        assert event.event_type == "terminal_killed"
+        assert event.event_type == "post_kill_terminal"
         assert event.session_id is None
 
     def test_base_event_has_utc_timestamp(self) -> None:
@@ -70,10 +70,10 @@ class TestEventDefaults:
 class TestEventFields:
     """Tests for event-specific payload fields."""
 
-    def test_message_sent_event_accepts_orchestration_fields(self) -> None:
-        """MessageSentEvent accepts all messaging payload fields."""
+    def test_post_send_message_event_accepts_orchestration_fields(self) -> None:
+        """PostSendMessageEvent accepts all messaging payload fields."""
 
-        event = MessageSentEvent(
+        event = PostSendMessageEvent(
             session_id="session-123",
             sender="supervisor",
             receiver="worker-1",
@@ -90,8 +90,8 @@ class TestEventFields:
     def test_session_events_carry_session_identifier_fields(self) -> None:
         """Session lifecycle events carry their session name payload."""
 
-        created_event = SessionCreatedEvent(session_id="session-1", session_name="Build")
-        killed_event = SessionKilledEvent(session_id="session-1", session_name="Build")
+        created_event = PostCreateSessionEvent(session_id="session-1", session_name="Build")
+        killed_event = PostKillSessionEvent(session_id="session-1", session_name="Build")
 
         assert created_event.session_id == "session-1"
         assert created_event.session_name == "Build"
@@ -101,13 +101,13 @@ class TestEventFields:
     def test_terminal_events_carry_terminal_identifier_fields(self) -> None:
         """Terminal lifecycle events carry terminal-specific identifiers."""
 
-        created_event = TerminalCreatedEvent(
+        created_event = PostCreateTerminalEvent(
             session_id="session-2",
             terminal_id="term-1",
             agent_name="worker",
             provider="codex",
         )
-        killed_event = TerminalKilledEvent(
+        killed_event = PostKillTerminalEvent(
             session_id="session-2",
             terminal_id="term-1",
             agent_name="worker",

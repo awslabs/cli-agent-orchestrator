@@ -35,10 +35,10 @@ from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
 from cli_agent_orchestrator.plugins import (
-    MessageSentEvent,
     PluginRegistry,
-    TerminalCreatedEvent,
-    TerminalKilledEvent,
+    PostCreateTerminalEvent,
+    PostKillTerminalEvent,
+    PostSendMessageEvent,
 )
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
@@ -197,8 +197,8 @@ def create_terminal(
         )
         dispatch_plugin_event(
             registry,
-            "terminal_created",
-            TerminalCreatedEvent(
+            "post_create_terminal",
+            PostCreateTerminalEvent(
                 session_id=terminal.session_name,
                 terminal_id=terminal.id,
                 agent_name=terminal.agent_profile,
@@ -318,8 +318,8 @@ def send_input(
         if registry is not None and sender_id is not None and orchestration_type is not None:
             dispatch_plugin_event(
                 registry,
-                "message_sent",
-                MessageSentEvent(
+                "post_send_message",
+                PostSendMessageEvent(
                     session_id=metadata["tmux_session"],
                     sender=sender_id,
                     receiver=terminal_id,
@@ -440,8 +440,8 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
         if deleted and metadata:
             dispatch_plugin_event(
                 registry,
-                "terminal_killed",
-                TerminalKilledEvent(
+                "post_kill_terminal",
+                PostKillTerminalEvent(
                     session_id=metadata["tmux_session"],
                     terminal_id=terminal_id,
                     agent_name=metadata.get("agent_profile"),

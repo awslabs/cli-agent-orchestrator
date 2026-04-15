@@ -8,11 +8,11 @@ from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import MessageStatus
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
 from cli_agent_orchestrator.plugins import (
-    MessageSentEvent,
-    SessionCreatedEvent,
-    SessionKilledEvent,
-    TerminalCreatedEvent,
-    TerminalKilledEvent,
+    PostCreateSessionEvent,
+    PostCreateTerminalEvent,
+    PostKillSessionEvent,
+    PostKillTerminalEvent,
+    PostSendMessageEvent,
 )
 from cli_agent_orchestrator.services.inbox_service import check_and_send_pending_messages
 from cli_agent_orchestrator.services.session_service import create_session, delete_session
@@ -35,8 +35,8 @@ class TestSessionPluginEvents:
     """Verify session lifecycle events are emitted correctly."""
 
     @patch("cli_agent_orchestrator.services.session_service.create_terminal")
-    def test_create_session_dispatches_session_created_event(self, mock_create_terminal):
-        """Successful session creation should emit exactly one session_created event."""
+    def test_create_session_dispatches_post_create_session_event(self, mock_create_terminal):
+        """Successful session creation should emit exactly one post_create_session event."""
         registry = _registry_mock()
         mock_create_terminal.return_value = Terminal(
             id="abcd1234",
@@ -56,8 +56,8 @@ class TestSessionPluginEvents:
         assert result.session_name == "cao-demo"
         registry.dispatch.assert_awaited_once()
         event_type, event = registry.dispatch.await_args.args
-        assert event_type == "session_created"
-        assert isinstance(event, SessionCreatedEvent)
+        assert event_type == "post_create_session"
+        assert isinstance(event, PostCreateSessionEvent)
         assert event.session_id == "cao-demo"
         assert event.session_name == "cao-demo"
 
@@ -75,7 +75,7 @@ class TestSessionPluginEvents:
     @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.tmux_client")
-    def test_delete_session_dispatches_session_killed_event_after_cleanup(
+    def test_delete_session_dispatches_post_kill_session_event_after_cleanup(
         self, mock_tmux, mock_list_terminals, mock_delete_terminals
     ):
         """Session kill should emit after the tmux kill and DB cleanup succeed."""
@@ -96,8 +96,8 @@ class TestSessionPluginEvents:
         assert result == {"deleted": ["cao-demo"], "errors": []}
         assert call_order == ["kill_session", "delete_terminals", "dispatch"]
         event_type, event = registry.dispatch.await_args.args
-        assert event_type == "session_killed"
-        assert isinstance(event, SessionKilledEvent)
+        assert event_type == "post_kill_session"
+        assert isinstance(event, PostKillSessionEvent)
         assert event.session_id == "cao-demo"
         assert event.session_name == "cao-demo"
 
@@ -124,7 +124,7 @@ class TestTerminalPluginEvents:
     @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
-    def test_create_terminal_dispatches_terminal_created_event_after_setup(
+    def test_create_terminal_dispatches_post_create_terminal_event_after_setup(
         self,
         mock_provider_manager,
         mock_db_create_terminal,
@@ -169,8 +169,8 @@ class TestTerminalPluginEvents:
         assert terminal.id == "abcd1234"
         assert call_order == ["db_create", "provider_initialize", "pipe_pane", "dispatch"]
         event_type, event = registry.dispatch.await_args.args
-        assert event_type == "terminal_created"
-        assert isinstance(event, TerminalCreatedEvent)
+        assert event_type == "post_create_terminal"
+        assert isinstance(event, PostCreateTerminalEvent)
         assert event.session_id == "cao-demo"
         assert event.terminal_id == "abcd1234"
         assert event.agent_name == "developer"
@@ -195,7 +195,7 @@ class TestTerminalPluginEvents:
         mock_build_skill_catalog,
         mock_log_dir,
     ):
-        """Terminal creation failures must not emit terminal_created."""
+        """Terminal creation failures must not emit post_create_terminal."""
         registry = _registry_mock()
         mock_generate_terminal_id.return_value = "abcd1234"
         mock_generate_window_name.return_value = "developer-abcd"
@@ -223,7 +223,7 @@ class TestTerminalPluginEvents:
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_delete_terminal_dispatches_terminal_killed_event_after_delete(
+    def test_delete_terminal_dispatches_post_kill_terminal_event_after_delete(
         self, mock_get_metadata, mock_tmux, mock_provider_manager, mock_db_delete_terminal
     ):
         """Terminal kill should emit only after deletion succeeds."""
@@ -247,8 +247,8 @@ class TestTerminalPluginEvents:
         assert deleted is True
         assert call_order[-2:] == ["db_delete", "dispatch"]
         event_type, event = registry.dispatch.await_args.args
-        assert event_type == "terminal_killed"
-        assert isinstance(event, TerminalKilledEvent)
+        assert event_type == "post_kill_terminal"
+        assert isinstance(event, PostKillTerminalEvent)
         assert event.session_id == "cao-demo"
         assert event.terminal_id == "abcd1234"
         assert event.agent_name == "developer"
@@ -260,7 +260,7 @@ class TestTerminalPluginEvents:
     def test_delete_terminal_does_not_dispatch_on_failure(
         self, mock_get_metadata, mock_tmux, mock_provider_manager, mock_db_delete_terminal
     ):
-        """Deletion failures must not emit terminal_killed."""
+        """Deletion failures must not emit post_kill_terminal."""
         registry = _registry_mock()
         mock_get_metadata.return_value = {
             "tmux_session": "cao-demo",
@@ -283,7 +283,7 @@ class TestMessagePluginEvents:
     @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_send_input_dispatches_message_sent_event_for_each_orchestration_mode(
+    def test_send_input_dispatches_post_send_message_event_for_each_orchestration_mode(
         self,
         mock_get_metadata,
         mock_provider_manager,
@@ -291,7 +291,7 @@ class TestMessagePluginEvents:
         mock_update_last_active,
         orchestration_type,
     ):
-        """Every successful delivery should emit one message_sent event."""
+        """Every successful delivery should emit one post_send_message event."""
         registry = _registry_mock()
         call_order: list[str] = []
 
@@ -321,8 +321,8 @@ class TestMessagePluginEvents:
         assert delivered is True
         assert call_order[-1] == "dispatch"
         event_type, event = registry.dispatch.await_args.args
-        assert event_type == "message_sent"
-        assert isinstance(event, MessageSentEvent)
+        assert event_type == "post_send_message"
+        assert isinstance(event, PostSendMessageEvent)
         assert event.session_id == "cao-demo"
         assert event.sender == "supervisor-1"
         assert event.receiver == "abcd1234"
@@ -335,7 +335,7 @@ class TestMessagePluginEvents:
     def test_send_input_does_not_dispatch_on_failure(
         self, mock_get_metadata, mock_provider_manager, mock_tmux
     ):
-        """Message delivery failures must not emit message_sent."""
+        """Message delivery failures must not emit post_send_message."""
         registry = _registry_mock()
         mock_get_metadata.return_value = {
             "tmux_session": "cao-demo",

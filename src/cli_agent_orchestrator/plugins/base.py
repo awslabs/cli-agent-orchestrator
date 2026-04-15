@@ -37,11 +37,11 @@ def hook(event_type: str) -> Callable[[AsyncMethodT[P, R]], AsyncMethodT[P, R]]:
     """Decorator that registers a plugin method as a hook for a CAO event.
 
     Args:
-        event_type: The CAO event type to listen for (e.g. "message_sent").
+        event_type: The CAO event type to listen for (e.g. "post_send_message").
 
     Example:
-        @hook("message_sent")
-        async def notify(self, event: MessageSentEvent) -> None:
+        @hook("post_send_message")
+        async def notify(self, event: PostSendMessageEvent) -> None:
             ...
     """
 

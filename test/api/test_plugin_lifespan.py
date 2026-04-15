@@ -8,7 +8,7 @@ from fastapi import Request
 
 from cli_agent_orchestrator.api.main import app, get_plugin_registry, lifespan
 from cli_agent_orchestrator.plugins import CaoPlugin, PluginRegistry, hook
-from cli_agent_orchestrator.plugins.events import MessageSentEvent
+from cli_agent_orchestrator.plugins.events import PostSendMessageEvent
 
 
 async def fake_flow_daemon() -> None:
@@ -96,8 +96,8 @@ class TestPluginRegistryLifespan:
                 raise RuntimeError("setup failed")
 
         class HealthyPlugin(CaoPlugin):
-            @hook("message_sent")
-            async def on_message(self, event: MessageSentEvent) -> None:
+            @hook("post_send_message")
+            async def on_message(self, event: PostSendMessageEvent) -> None:
                 del event
 
         with (
