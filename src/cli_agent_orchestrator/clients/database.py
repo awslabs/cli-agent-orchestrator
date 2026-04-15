@@ -209,11 +209,7 @@ def delete_terminals_by_session(tmux_session: str) -> int:
         return deleted
 
 
-def create_inbox_message(
-    sender_id: str,
-    receiver_id: str,
-    message: str,
-) -> InboxMessage:
+def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> InboxMessage:
     """Create inbox message with status=MessageStatus.PENDING."""
     with SessionLocal() as db:
         inbox_msg = InboxModel(

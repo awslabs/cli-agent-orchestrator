@@ -220,7 +220,7 @@ def _send_direct_input_handoff(terminal_id: str, provider: str, message: str) ->
     else:
         handoff_message = message
 
-    _send_direct_input(terminal_id, handoff_message, "handoff")
+    _send_direct_input(terminal_id, handoff_message, OrchestrationType.HANDOFF)
 
 
 def _send_direct_input_assign(terminal_id: str, message: str) -> None:
@@ -233,7 +233,7 @@ def _send_direct_input_assign(terminal_id: str, message: str) -> None:
             f"When done, send results back to terminal {sender_id} using send_message]"
         )
 
-    _send_direct_input(terminal_id, message, "assign")
+    _send_direct_input(terminal_id, message, OrchestrationType.ASSIGN)
 
 
 def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:

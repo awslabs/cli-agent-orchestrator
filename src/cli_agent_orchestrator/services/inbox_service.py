@@ -30,7 +30,7 @@ from watchdog.events import FileModifiedEvent, FileSystemEventHandler
 
 from cli_agent_orchestrator.clients.database import get_pending_messages, update_message_status
 from cli_agent_orchestrator.constants import TERMINAL_LOG_DIR
-from cli_agent_orchestrator.models.inbox import MessageStatus
+from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.manager import provider_manager
@@ -121,7 +121,7 @@ def check_and_send_pending_messages(
                 message.message,
                 registry=registry,
                 sender_id=message.sender_id,
-                orchestration_type="send_message",
+                orchestration_type=OrchestrationType.SEND_MESSAGE,
             )
         update_message_status(message.id, MessageStatus.DELIVERED)
         logger.info(f"Delivered message {message.id} to terminal {terminal_id}")

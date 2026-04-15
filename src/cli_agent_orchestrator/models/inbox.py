@@ -2,11 +2,16 @@
 
 from datetime import datetime
 from enum import Enum
-from typing import Literal
 
 from pydantic import BaseModel, Field
 
-OrchestrationType = Literal["send_message", "handoff", "assign"]
+
+class OrchestrationType(str, Enum):
+    """Orchestration mode for a message delivery."""
+
+    SEND_MESSAGE = "send_message"
+    HANDOFF = "handoff"
+    ASSIGN = "assign"
 
 
 class MessageStatus(str, Enum):
