@@ -4,6 +4,10 @@ import react from '@vitejs/plugin-react'
 
 export default defineConfig({
   plugins: [react()],
+  build: {
+    outDir: '../src/cli_agent_orchestrator/web_ui',
+    emptyOutDir: true,
+  },
   test: {
     globals: true,
     environment: 'jsdom',
