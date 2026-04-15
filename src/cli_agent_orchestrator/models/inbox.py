@@ -24,9 +24,5 @@ class InboxMessage(BaseModel):
     sender_id: str = Field(..., description="Sender terminal ID")
     receiver_id: str = Field(..., description="Receiver terminal ID")
     message: str = Field(..., description="Message content")
-    orchestration_type: OrchestrationType = Field(
-        default="send_message",
-        description="The orchestration mode that caused the message delivery",
-    )
     status: MessageStatus = Field(..., description="Message status")
     created_at: datetime = Field(..., description="Creation timestamp")

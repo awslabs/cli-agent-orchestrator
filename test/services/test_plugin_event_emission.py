@@ -368,13 +368,12 @@ class TestMessagePluginEvents:
         mock_terminal_service,
         mock_update_message_status,
     ):
-        """Queued inbox delivery should forward sender and orchestration metadata to send_input."""
+        """Queued inbox delivery should forward sender context and hardcode send_message."""
         registry = _registry_mock()
         message = MagicMock()
         message.id = 17
         message.sender_id = "supervisor-1"
         message.message = "Please review this"
-        message.orchestration_type = "send_message"
         mock_get_pending_messages.return_value = [message]
 
         provider = MagicMock()

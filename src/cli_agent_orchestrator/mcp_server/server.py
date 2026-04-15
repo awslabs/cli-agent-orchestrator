@@ -236,9 +236,7 @@ def _send_direct_input_assign(terminal_id: str, message: str) -> None:
     _send_direct_input(terminal_id, message, "assign")
 
 
-def _send_to_inbox(
-    receiver_id: str, message: str, orchestration_type: OrchestrationType = "send_message"
-) -> Dict[str, Any]:
+def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
     """Send message to another terminal's inbox (queued delivery when IDLE).
 
     Args:
@@ -261,7 +259,6 @@ def _send_to_inbox(
         params={
             "sender_id": sender_id,
             "message": message,
-            "orchestration_type": orchestration_type,
         },
     )
     response.raise_for_status()
@@ -598,7 +595,7 @@ def _send_message_impl(receiver_id: str, message: str) -> Dict[str, Any]:
                 "Use send_message MCP tool for any follow-up work.]"
             )
 
-        return _send_to_inbox(receiver_id, message, "send_message")
+        return _send_to_inbox(receiver_id, message)
     except Exception as e:
         return {"success": False, "error": str(e)}
 

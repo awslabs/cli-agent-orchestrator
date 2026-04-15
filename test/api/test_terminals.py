@@ -345,7 +345,6 @@ class TestCreateInboxMessageEndpoint:
                 "sender1",
                 "abcd1234",
                 "hello",
-                orchestration_type="send_message",
             )
             mock_inbox.check_and_send_pending_messages.assert_called_once_with(
                 "abcd1234", registry=ANY

@@ -544,7 +544,6 @@ async def create_inbox_message_endpoint(
     receiver_id: TerminalId,
     sender_id: str,
     message: str,
-    orchestration_type: OrchestrationType = "send_message",
 ) -> Dict:
     """Create inbox message and attempt immediate delivery."""
     try:
@@ -552,7 +551,6 @@ async def create_inbox_message_endpoint(
             sender_id,
             receiver_id,
             message,
-            orchestration_type=orchestration_type,
         )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))

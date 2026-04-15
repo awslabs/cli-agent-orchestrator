@@ -108,7 +108,10 @@ def check_and_send_pending_messages(
         logger.debug(f"Terminal {terminal_id} not ready (status={status})")
         return False
 
-    # Send message
+    # Send message. Inbox-queued delivery is only reached via the send_message
+    # MCP tool, so the orchestration_type is always "send_message" here — the
+    # synchronous handoff/assign paths bypass the inbox and pass their own
+    # orchestration_type directly to send_input().
     try:
         if registry is None:
             terminal_service.send_input(terminal_id, message.message)
@@ -118,7 +121,7 @@ def check_and_send_pending_messages(
                 message.message,
                 registry=registry,
                 sender_id=message.sender_id,
-                orchestration_type=message.orchestration_type,
+                orchestration_type="send_message",
             )
         update_message_status(message.id, MessageStatus.DELIVERED)
         logger.info(f"Delivered message {message.id} to terminal {terminal_id}")

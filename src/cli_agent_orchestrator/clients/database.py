@@ -9,7 +9,7 @@ from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
 
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
 from cli_agent_orchestrator.models.flow import Flow
-from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus, OrchestrationType
+from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +39,6 @@ class InboxModel(Base):
     sender_id = Column(String, nullable=False)
     receiver_id = Column(String, nullable=False)
     message = Column(String, nullable=False)
-    orchestration_type = Column(String, nullable=False, default="send_message")
     status = Column(String, nullable=False)  # MessageStatus enum value
     created_at = Column(DateTime, default=datetime.now)
 
@@ -70,7 +69,6 @@ def init_db() -> None:
     """Initialize database tables and apply schema migrations."""
     Base.metadata.create_all(bind=engine)
     _migrate_add_allowed_tools()
-    _migrate_add_inbox_orchestration_type()
 
 
 def _migrate_add_allowed_tools() -> None:
@@ -90,27 +88,6 @@ def _migrate_add_allowed_tools() -> None:
         conn.close()
     except Exception as e:
         logger.warning(f"Migration check for allowed_tools failed: {e}")
-
-
-def _migrate_add_inbox_orchestration_type() -> None:
-    """Add orchestration_type column to inbox table if missing."""
-    import sqlite3
-
-    from cli_agent_orchestrator.constants import DATABASE_FILE
-
-    try:
-        conn = sqlite3.connect(str(DATABASE_FILE))
-        cursor = conn.execute("PRAGMA table_info(inbox)")
-        columns = {row[1] for row in cursor.fetchall()}
-        if "orchestration_type" not in columns:
-            conn.execute(
-                "ALTER TABLE inbox ADD COLUMN orchestration_type TEXT NOT NULL DEFAULT 'send_message'"
-            )
-            conn.commit()
-            logger.info("Migration: added orchestration_type column to inbox table")
-        conn.close()
-    except Exception as e:
-        logger.warning(f"Migration check for inbox orchestration_type failed: {e}")
 
 
 def create_terminal(
@@ -236,7 +213,6 @@ def create_inbox_message(
     sender_id: str,
     receiver_id: str,
     message: str,
-    orchestration_type: OrchestrationType = "send_message",
 ) -> InboxMessage:
     """Create inbox message with status=MessageStatus.PENDING."""
     with SessionLocal() as db:
@@ -244,7 +220,6 @@ def create_inbox_message(
             sender_id=sender_id,
             receiver_id=receiver_id,
             message=message,
-            orchestration_type=orchestration_type,
             status=MessageStatus.PENDING.value,
         )
         db.add(inbox_msg)
@@ -255,7 +230,6 @@ def create_inbox_message(
             sender_id=inbox_msg.sender_id,
             receiver_id=inbox_msg.receiver_id,
             message=inbox_msg.message,
-            orchestration_type=inbox_msg.orchestration_type,
             status=MessageStatus(inbox_msg.status),
             created_at=inbox_msg.created_at,
         )
@@ -293,7 +267,6 @@ def get_inbox_messages(
                 sender_id=msg.sender_id,
                 receiver_id=msg.receiver_id,
                 message=msg.message,
-                orchestration_type=msg.orchestration_type,
                 status=MessageStatus(msg.status),
                 created_at=msg.created_at,
             )
