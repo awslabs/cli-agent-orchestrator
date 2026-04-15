@@ -23,6 +23,11 @@ CAO_DISCORD_TIMEOUT_SECONDS=5.0
 2. Install the plugin:
    ```bash
    uv pip install -e examples/plugins/cao-discord
+
+   # Or use if you prefer uv tool install
+   # (from project root)
+   uv tool install --reinstall . \
+    --with-editable ./examples/plugins/cao-discord
    ```
 3. Create a `.env` file in the directory where you will run `cao-server`, or export the variables in your shell:
    ```dotenv
