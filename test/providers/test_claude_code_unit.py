@@ -234,6 +234,30 @@ class TestClaudeCodeProviderStatusDetection:
         assert status == TerminalStatus.PROCESSING
 
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_get_status_completed_despite_stale_spinner_in_scrollback(self, mock_tmux):
+        """Stale spinner in scrollback must not block COMPLETED detection (#104)."""
+        mock_tmux.get_history.return_value = (
+            "✻ Orbiting…\n"
+            "⏺ Previous response\n"
+            "❯ user sent new task\n"
+            "⏺ Completed response\n"
+            "❯ "
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_get_status_idle_despite_stale_spinner_in_scrollback(self, mock_tmux):
+        """Stale spinner in scrollback must not block IDLE detection (#104)."""
+        mock_tmux.get_history.return_value = (
+            "✶ Processing… (esc to interrupt)\n" "Some previous output\n" "❯ "
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
     def test_get_status_idle_not_false_processing_from_status_bar(self, mock_tmux):
         """Status bar '· latest:…' must not false-positive as PROCESSING."""
         mock_tmux.get_history.return_value = (

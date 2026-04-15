@@ -256,7 +256,16 @@ class ClaudeCodeProvider(BaseProvider):
         return True
 
     def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
-        """Get Claude Code status by analyzing terminal output."""
+        """Get Claude Code status by analyzing terminal output.
+
+        Uses position-based comparison to prevent stale spinner text in
+        scrollback from masking the current idle state.  Claude Code renders
+        inline (not in the alternate screen buffer), so old spinner lines can
+        persist in tmux scrollback after the cursor-up overwrite fails to
+        reach them.  By comparing the last position of the processing spinner
+        against the last idle prompt, we let the more recent marker decide
+        the current state.  See: https://github.com/awslabs/cli-agent-orchestrator/issues/104
+        """
 
         # Use tmux client singleton to get window history
         output = tmux_client.get_history(self.session_name, self.window_name, tail_lines=tail_lines)
@@ -264,9 +273,22 @@ class ClaudeCodeProvider(BaseProvider):
         if not output:
             return TerminalStatus.ERROR
 
-        # Check for processing state first
-        if re.search(PROCESSING_PATTERN, output):
-            return TerminalStatus.PROCESSING
+        # Find the LAST occurrence of processing spinner and idle prompt.
+        # Only the relative position matters — whichever appears later in
+        # the buffer reflects the current terminal state.
+        last_processing = None
+        for m in re.finditer(PROCESSING_PATTERN, output):
+            last_processing = m
+
+        last_idle = None
+        for m in re.finditer(IDLE_PROMPT_PATTERN, output):
+            last_idle = m
+
+        # Currently processing only if spinner appears AFTER the last idle
+        # prompt (or if there is no idle prompt at all).
+        if last_processing:
+            if last_idle is None or last_processing.start() > last_idle.start():
+                return TerminalStatus.PROCESSING
 
         # Check for waiting user answer via the active Ink selection footer.
         # Exclude startup prompts (trust + bypass), which also render the footer.
@@ -278,11 +300,11 @@ class ClaudeCodeProvider(BaseProvider):
             return TerminalStatus.WAITING_USER_ANSWER
 
         # Check for completed state (has response + ready prompt)
-        if re.search(RESPONSE_PATTERN, output) and re.search(IDLE_PROMPT_PATTERN, output):
+        if re.search(RESPONSE_PATTERN, output) and last_idle:
             return TerminalStatus.COMPLETED
 
         # Check for idle state (just ready prompt, no response)
-        if re.search(IDLE_PROMPT_PATTERN, output):
+        if last_idle:
             return TerminalStatus.IDLE
 
         # If no recognizable state, return ERROR
