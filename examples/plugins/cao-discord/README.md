@@ -50,3 +50,7 @@ CAO_DISCORD_TIMEOUT_SECONDS=5.0
 ## Troubleshooting
 
 If `CAO_DISCORD_WEBHOOK_URL` is missing, `PluginRegistry.load()` logs a warning during `cao-server` startup and skips registering the plugin for the lifetime of that server process.
+
+## Note
+
+This plugin is provided as an example to demonstrate a plugin use case and implementation. It is not expected to be actively maintained. Users are encouraged to take the implementation as a starting point and build on it for their own use cases.
