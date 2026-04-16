@@ -460,16 +460,13 @@ async def send_terminal_input(
     orchestration_type: Optional[OrchestrationType] = None,
 ) -> Dict:
     try:
-        if sender_id is None or orchestration_type is None:
-            success = terminal_service.send_input(terminal_id, message)
-        else:
-            success = terminal_service.send_input(
-                terminal_id,
-                message,
-                registry=get_plugin_registry(request),
-                sender_id=sender_id,
-                orchestration_type=orchestration_type,
-            )
+        success = terminal_service.send_input(
+            terminal_id,
+            message,
+            registry=get_plugin_registry(request),
+            sender_id=sender_id,
+            orchestration_type=orchestration_type,
+        )
         return {"success": success}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))

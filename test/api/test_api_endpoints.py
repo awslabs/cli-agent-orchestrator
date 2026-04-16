@@ -616,7 +616,13 @@ class TestSendTerminalInput:
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
-        mock_svc.send_input.assert_called_once_with("abcd1234", "hello world")
+        mock_svc.send_input.assert_called_once_with(
+            "abcd1234",
+            "hello world",
+            registry=ANY,
+            sender_id=None,
+            orchestration_type=None,
+        )
 
     def test_send_input_with_orchestration_context(self, client):
         """POST /terminals/{id}/input forwards registry and orchestration metadata when provided."""
