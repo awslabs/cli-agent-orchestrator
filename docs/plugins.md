@@ -12,6 +12,39 @@ Typical uses today:
 
 For ready-to-try reference plugins, see [`examples/plugins/`](../examples/plugins).
 
+## Quick start: your first plugin event
+
+This walkthrough takes you from a fresh clone to seeing plugin events fire end-to-end. It uses the bundled Discord example plugin, but the steps apply to any plugin.
+
+1. **Install CAO** (if you haven't already):
+   ```bash
+   git clone https://github.com/awslabs/cli-agent-orchestrator.git
+   cd cli-agent-orchestrator/
+   uv sync
+   ```
+2. **Install the Discord plugin** into the same environment:
+   ```bash
+   uv pip install -e examples/plugins/cao-discord
+   ```
+3. **Configure the plugin** — create a `.env` file in the repo root (where you'll run `cao-server`):
+   ```dotenv
+   CAO_DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/<id>/<token>
+   ```
+4. **Start the server** — the plugin is discovered automatically on startup:
+   ```bash
+   cao-server
+   ```
+   Confirm you see `Loaded CAO plugin: discord` in the server logs.
+5. **Install an agent profile and launch a session:**
+   ```bash
+   cao install examples/assign/analysis_supervisor.md
+   cao install examples/assign/data_analyst.md
+   cao launch --agents analysis_supervisor
+   ```
+6. **Trigger a handoff or assign** in the supervisor terminal — watch the Discord channel for forwarded inter-agent messages.
+
+For detailed installation options, configuration, and troubleshooting, continue reading below.
+
 ## Installing a plugin
 
 Plugins are standard Python packages distributed with a `cao.plugins` entry point. Installing a plugin means installing that package into the same Python environment `cao-server` runs from, configuring it, and restarting the server. The Discord example plugin at [`examples/plugins/cao-discord`](../examples/plugins/cao-discord) is used throughout this section.

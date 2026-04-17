@@ -20,14 +20,9 @@ CAO_DISCORD_TIMEOUT_SECONDS=5.0
 ## Setup
 
 1. Create a webhook in Discord: Channel -> Edit Channel -> Integrations -> Webhooks -> New Webhook -> Copy URL.
-2. Install the plugin:
+2. Install the plugin (from the repository root, inside the CAO development virtual environment):
    ```bash
    uv pip install -e examples/plugins/cao-discord
-
-   # Or use if you prefer uv tool install
-   # (from project root)
-   uv tool install --reinstall . \
-    --with-editable ./examples/plugins/cao-discord
    ```
 3. Create a `.env` file in the directory where you will run `cao-server`, or export the variables in your shell:
    ```dotenv
@@ -50,6 +45,15 @@ CAO_DISCORD_TIMEOUT_SECONDS=5.0
 ## Troubleshooting
 
 If `CAO_DISCORD_WEBHOOK_URL` is missing, `PluginRegistry.load()` logs a warning during `cao-server` startup and skips registering the plugin for the lifetime of that server process.
+
+## Alternative: global tool install
+
+If you prefer installing CAO as a global `uv` tool rather than working inside the development venv, you can bundle the plugin in a single install from the project root:
+
+```bash
+uv tool install --reinstall . \
+  --with-editable ./examples/plugins/cao-discord
+```
 
 ## Note
 
