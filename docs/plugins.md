@@ -16,12 +16,7 @@ For ready-to-try reference plugins, see [`examples/plugins/`](../examples/plugin
 
 This walkthrough takes you from a fresh clone to seeing plugin events fire end-to-end. It uses the bundled Discord example plugin, but the steps apply to any plugin.
 
-1. **Install CAO** (if you haven't already):
-   ```bash
-   git clone https://github.com/awslabs/cli-agent-orchestrator.git
-   cd cli-agent-orchestrator/
-   uv sync
-   ```
+1. **Install CAO and its prerequisites** — follow [README.md § Installation](../README.md#installation) (uv, tmux 3.3+, Python 3.10+, then `uv sync` for a dev checkout).
 2. **Install the Discord plugin** into the same environment:
    ```bash
    uv pip install -e examples/plugins/cao-discord
@@ -35,12 +30,7 @@ This walkthrough takes you from a fresh clone to seeing plugin events fire end-t
    cao-server
    ```
    Confirm you see `Loaded CAO plugin: discord` in the server logs.
-5. **Install an agent profile and launch a session:**
-   ```bash
-   cao install examples/assign/analysis_supervisor.md
-   cao install examples/assign/data_analyst.md
-   cao launch --agents analysis_supervisor
-   ```
+5. **Install agents and launch a session** — follow [README.md § Quick Start](../README.md#quick-start) steps 1 and 3 to install an agent profile and launch a supervisor terminal.
 6. **Trigger a handoff or assign** in the supervisor terminal — watch the Discord channel for forwarded inter-agent messages.
 
 For detailed installation options, configuration, and troubleshooting, continue reading below.
