@@ -1020,7 +1020,12 @@ class TestKiroCliTuiMode:
 
     @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
     def test_tui_kiro_is_working_takes_priority(self, mock_tmux):
-        """Test 'Kiro is working' returns PROCESSING even if idle prompt is also present."""
+        """Test 'Kiro is working' after idle prompt still returns PROCESSING.
+
+        Idle prompt appears BEFORE 'Kiro is working' in the buffer — the agent
+        started a new task after the previous idle.  The last 'Kiro is working'
+        has no idle prompt after it, so the result must be PROCESSING.
+        """
         mock_tmux.get_history.return_value = (
             "developer · auto · ◔ 3%\n"
             " Ask a question or describe a task ↵\n"
@@ -1030,8 +1035,71 @@ class TestKiroCliTuiMode:
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         status = provider.get_status()
 
-        # "Kiro is working" is checked before idle prompt — PROCESSING wins
+        # idle prompt is BEFORE "Kiro is working" → no idle after last working → PROCESSING
         assert status == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_tui_stale_kiro_is_working_before_idle_yields_idle(self, mock_tmux):
+        """Test that a stale 'Kiro is working' line does not block IDLE detection.
+
+        Kiro TUI redraws in-place.  After the agent finishes the buffer retains
+        the old 'Kiro is working' ghost text above the newly rendered idle prompt.
+        The fix: only return PROCESSING when no idle prompt appears *after* the
+        last 'Kiro is working' occurrence.
+        """
+        mock_tmux.get_history.return_value = (
+            "────────────────────────────────────────────────────\n"
+            " Kiro is working\n"
+            "────────────────────────────────────────────────────\n"
+            "developer · auto · ◔ 0%\n"
+            " Ask a question or describe a task ↵\n"
+        )
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_tui_stale_kiro_is_working_with_credits_yields_completed(self, mock_tmux):
+        """Test COMPLETED when stale 'Kiro is working' precedes credits + idle prompt.
+
+        After a successful response the buffer may contain:
+          1. stale 'Kiro is working' from the in-progress render
+          2. '▸ Credits:' completion marker
+          3. idle prompt
+
+        The stale ghost text must not block the COMPLETED detection.
+        """
+        mock_tmux.get_history.return_value = (
+            " Kiro is working\n"
+            "────────────────────────────────────────────────────\n"
+            "> Here is the result you asked for.\n"
+            "▸ Credits: 0.05 • Time: 3s\n"
+            "developer · auto · ◔ 0%\n"
+            " Ask a question or describe a task ↵\n"
+        )
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_tui_multiple_stale_kiro_is_working_lines_yield_idle(self, mock_tmux):
+        """Test that multiple stale 'Kiro is working' lines all before the idle
+        prompt still resolve to IDLE (uses the *last* working-line position)."""
+        mock_tmux.get_history.return_value = (
+            " Kiro is working\n"
+            " Kiro is working\n"
+            "developer · auto · ◔ 0%\n"
+            " Ask a question or describe a task ↵\n"
+        )
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.IDLE
 
     @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
     def test_tui_permission_prompt_detection(self, mock_tmux):
