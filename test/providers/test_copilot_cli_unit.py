@@ -337,6 +337,83 @@ class TestCopilotCliProviderStatusDetection:
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
         assert provider.get_status() == TerminalStatus.COMPLETED
 
+    # ------------------------------------------------------------------
+    # Copilot v1.0.31+ layout: bare ❯ followed by the status bar line
+    # ------------------------------------------------------------------
+
+    @patch("cli_agent_orchestrator.providers.copilot_cli.tmux_client")
+    def test_get_status_idle_with_v1031_autopilot_status_bar(self, mock_tmux):
+        """Bare ❯ + 'autopilot · / commands ...' status bar → IDLE (no prior user turn)."""
+        mock_tmux.get_history.return_value = (
+            "● Selected custom agent: developer\n"
+            "\n"
+            "● Environment loaded: 3 custom instructions, 1 hook, 2 MCP servers\n"
+            "\n"
+            " ~/repo [⎇ main*%]\n"
+            "────────────────────────────────────────────────────────────────────────────────\n"
+            "❯\n"
+            "────────────────────────────────────────────────────────────────────────────────\n"
+            " autopilot · / commands \u200b                        Claude Sonnet 4.6 · (0%)\n"
+        )
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.copilot_cli.tmux_client")
+    def test_get_status_idle_with_v1031_plan_status_bar(self, mock_tmux):
+        """Bare ❯ + 'plan · / commands ...' status bar → IDLE."""
+        mock_tmux.get_history.return_value = (
+            " ~/repo [⎇ main]\n"
+            "────────────────────────────────────────────────────────────────────────────────\n"
+            "❯\n"
+            "────────────────────────────────────────────────────────────────────────────────\n"
+            " plan · / commands \u200b                             Claude Sonnet 4.6 · (0%)\n"
+        )
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.copilot_cli.tmux_client")
+    def test_get_status_idle_with_v1031_interactive_status_bar(self, mock_tmux):
+        """Bare ❯ + 'interactive · / commands ...' status bar → IDLE."""
+        mock_tmux.get_history.return_value = (
+            " ~/repo [⎇ main]\n"
+            "────────────────────────────────────────────────────────────────────────────────\n"
+            "❯\n"
+            "────────────────────────────────────────────────────────────────────────────────\n"
+            " interactive · / commands \u200b                      Claude Sonnet 4.6 · (0%)\n"
+        )
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.copilot_cli.tmux_client")
+    def test_get_status_completed_with_v1031_status_bar_after_user_turn(self, mock_tmux):
+        """User turn + agent response + bare ❯ + status bar → COMPLETED."""
+        mock_tmux.get_history.return_value = (
+            "❯ fix the bug\n"
+            "● Edit src/main.py (+3 -1)\n"
+            " ~/repo [⎇ main*%]\n"
+            "────────────────────────────────────────────────────────────────────────────────\n"
+            "❯\n"
+            "────────────────────────────────────────────────────────────────────────────────\n"
+            " autopilot · / commands \u200b                        Claude Sonnet 4.6 · (0%)\n"
+        )
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.copilot_cli.tmux_client")
+    def test_get_status_processing_with_spinner_and_v1031_status_bar(self, mock_tmux):
+        """Spinner line present alongside status bar → still PROCESSING."""
+        mock_tmux.get_history.return_value = (
+            "❯ refactor utils.py\n"
+            "∙ Thinking (Esc to cancel)\n"
+            " ~/repo [⎇ main*%]\n"
+            "────────────────────────────────────────────────────────────────────────────────\n"
+            "❯\n"
+            "────────────────────────────────────────────────────────────────────────────────\n"
+            " autopilot · / commands \u200b                        Claude Sonnet 4.6 · (0%)\n"
+        )
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.PROCESSING
+
 
 class TestCopilotCliProviderMessageExtraction:
     def test_extract_last_message_from_post_user_lines(self):

@@ -42,6 +42,10 @@ PROMPT_HELPER_CONTINUATION_PATTERN = r"^(?:shortcuts|for shortcuts)$"
 # " autopilot · / commands    Claude Sonnet 4.6 · (0%)"
 # This must be treated as a footer line so idle detection works correctly.
 COPILOT_STATUS_BAR_PATTERN = r"^\s*(?:autopilot|plan|interactive)\s*[·•]"
+# Copilot v1.0.31+ cwd breadcrumb: " ~/path [⎇ branch*%]"
+# Older versions appended " model (0x)" which was caught by \(\d+x\); the
+# token/model info moved to the status bar in v1.0.31, leaving only the path.
+COPILOT_CWD_BREADCRUMB_PATTERN = r"^\s+~/.*\["
 PROCESSING_LINE_PATTERN = r"^(?:[●◐◑◒◓◉◎∙]\s*)?.*\besc to cancel\b.*$"
 
 
@@ -327,6 +331,10 @@ class CopilotCliProvider(BaseProvider):
             return True
         # Copilot v1.0.31+ status bar: " autopilot · / commands    Claude Sonnet 4.6 · (0%)"
         if re.match(COPILOT_STATUS_BAR_PATTERN, stripped):
+            return True
+        # Copilot v1.0.31+ cwd breadcrumb: " ~/path [⎇ branch*%]"
+        # (pre-v1.0.31 form included "(0x)" and was caught by the \(\d+x\) check above)
+        if re.match(COPILOT_CWD_BREADCRUMB_PATTERN, line):  # intentionally use raw line (preserves leading spaces)
             return True
         return False
 
