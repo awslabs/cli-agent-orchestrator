@@ -131,9 +131,7 @@ class TestInstallAgent:
         assert result.success is True
         assert result.agent_name == "flat-agent"
 
-    def test_install_from_extra_dir_flat_profile(
-        self, install_paths: dict[str, Path]
-    ) -> None:
+    def test_install_from_extra_dir_flat_profile(self, install_paths: dict[str, Path]) -> None:
         """Flat <extra_dir>/<name>.md layout in extra dirs should be resolved correctly."""
         flat_profile = install_paths["extra_dir"] / "extra-agent.md"
         flat_profile.write_text(_profile_text(name="extra-agent"), encoding="utf-8")
@@ -143,9 +141,7 @@ class TestInstallAgent:
         assert result.success is True
         assert result.agent_name == "extra-agent"
 
-    def test_install_from_extra_dir_nested_profile(
-        self, install_paths: dict[str, Path]
-    ) -> None:
+    def test_install_from_extra_dir_nested_profile(self, install_paths: dict[str, Path]) -> None:
         """Nested <extra_dir>/<name>/agent.md layout should be resolved correctly."""
         nested_dir = install_paths["extra_dir"] / "nested-agent"
         nested_dir.mkdir()
@@ -378,9 +374,7 @@ class TestInstallSkillCatalogBaking:
         monkeypatch.setattr(
             "cli_agent_orchestrator.services.install_service.KIRO_AGENTS_DIR", kiro_dir
         )
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.services.install_service.Q_AGENTS_DIR", q_dir
-        )
+        monkeypatch.setattr("cli_agent_orchestrator.services.install_service.Q_AGENTS_DIR", q_dir)
         monkeypatch.setattr(
             "cli_agent_orchestrator.services.install_service.SKILLS_DIR", skills_dir
         )
@@ -402,9 +396,7 @@ class TestInstallSkillCatalogBaking:
 
     @staticmethod
     def _write_profile(profile_path: Path, frontmatter_body: str, system_prompt: str) -> None:
-        profile_path.write_text(
-            f"---\n{frontmatter_body}---\n{system_prompt}\n", encoding="utf-8"
-        )
+        profile_path.write_text(f"---\n{frontmatter_body}---\n{system_prompt}\n", encoding="utf-8")
 
     def test_install_kiro_uses_skill_resources_not_baked_prompt(
         self, install_workspace: dict
@@ -424,9 +416,7 @@ class TestInstallSkillCatalogBaking:
         result = install_agent("test-agent", "kiro_cli")
 
         assert result.success is True
-        agent_json = json.loads(
-            (install_workspace["kiro_dir"] / "test-agent.json").read_text()
-        )
+        agent_json = json.loads((install_workspace["kiro_dir"] / "test-agent.json").read_text())
         assert agent_json["prompt"] == "Build things"
         assert "Available Skills" not in agent_json["prompt"]
         skill_resources = [r for r in agent_json["resources"] if r.startswith("skill://")]
@@ -449,9 +439,7 @@ class TestInstallSkillCatalogBaking:
         result = install_agent("test-agent", "q_cli")
 
         assert result.success is True
-        agent_json = json.loads(
-            (install_workspace["q_dir"] / "test-agent.json").read_text()
-        )
+        agent_json = json.loads((install_workspace["q_dir"] / "test-agent.json").read_text())
         assert agent_json["prompt"].startswith("Build things\n\n## Available Skills")
         assert "python-testing" in agent_json["prompt"]
 
@@ -574,9 +562,7 @@ class TestInstallAgentEnvBehaviour:
         self, install_paths: dict[str, Path]
     ) -> None:
         """The first '=' splits the assignment; subsequent '=' chars remain in the value."""
-        self._write_profile(
-            install_paths["local_store_dir"] / "test-agent.md", body="URL: ${URL}"
-        )
+        self._write_profile(install_paths["local_store_dir"] / "test-agent.md", body="URL: ${URL}")
 
         result = install_agent("test-agent", "q_cli", {"URL": "http://host?a=b"})
 
@@ -599,9 +585,7 @@ class TestInstallAgentEnvBehaviour:
         assert result.success is True
         assert not install_paths["env_file"].exists()
 
-    def test_install_warns_about_unresolved_env_vars(
-        self, install_paths: dict[str, Path]
-    ) -> None:
+    def test_install_warns_about_unresolved_env_vars(self, install_paths: dict[str, Path]) -> None:
         """Placeholders not supplied via env_vars should appear in result.unresolved_vars."""
         self._write_profile(install_paths["local_store_dir"] / "test-agent.md")
 
