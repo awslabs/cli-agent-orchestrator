@@ -11,10 +11,10 @@ from click.testing import CliRunner
 from cli_agent_orchestrator.cli.commands.memory import clear, delete, list_memories, show
 from cli_agent_orchestrator.models.memory import Memory
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_memory(
     key: str = "test-key",
@@ -54,10 +54,14 @@ class TestMemoryList:
     def test_memory_list_shows_memories(self, mock_get_svc):
         """list command should display memories in table format."""
         mock_svc = MagicMock()
-        mock_svc.recall = AsyncMock(return_value=[
-            _make_memory(key="pref-pytest", scope="global", memory_type="feedback", tags="testing"),
-            _make_memory(key="deploy-cfg", scope="project", memory_type="reference", tags="ci"),
-        ])
+        mock_svc.recall = AsyncMock(
+            return_value=[
+                _make_memory(
+                    key="pref-pytest", scope="global", memory_type="feedback", tags="testing"
+                ),
+                _make_memory(key="deploy-cfg", scope="project", memory_type="reference", tags="ci"),
+            ]
+        )
         mock_get_svc.return_value = mock_svc
 
         runner = CliRunner()
@@ -94,7 +98,9 @@ class TestMemoryList:
         assert result.exit_code == 0
         mock_svc.recall.assert_called_once()
         call_kwargs = mock_svc.recall.call_args
-        assert call_kwargs[1].get("scope") == "global" or call_kwargs.kwargs.get("scope") == "global"
+        assert (
+            call_kwargs[1].get("scope") == "global" or call_kwargs.kwargs.get("scope") == "global"
+        )
 
     @patch("cli_agent_orchestrator.cli.commands.memory._get_memory_service")
     def test_memory_list_all_flag(self, mock_get_svc):
@@ -135,9 +141,13 @@ class TestMemoryShow:
     def test_memory_show_displays_content(self, mock_get_svc):
         """show command should display full memory content."""
         mock_svc = MagicMock()
-        mock_svc.recall = AsyncMock(return_value=[
-            _make_memory(key="my-key", content="Detailed memory content here", tags="tag1,tag2"),
-        ])
+        mock_svc.recall = AsyncMock(
+            return_value=[
+                _make_memory(
+                    key="my-key", content="Detailed memory content here", tags="tag1,tag2"
+                ),
+            ]
+        )
         mock_get_svc.return_value = mock_svc
 
         runner = CliRunner()
@@ -270,10 +280,12 @@ class TestMemoryClearRequiresScope:
     def test_memory_clear_with_scope(self, mock_get_svc):
         """clear command with --scope should clear all memories in that scope."""
         mock_svc = MagicMock()
-        mock_svc.recall = AsyncMock(return_value=[
-            _make_memory(key="m1", scope="session"),
-            _make_memory(key="m2", scope="session"),
-        ])
+        mock_svc.recall = AsyncMock(
+            return_value=[
+                _make_memory(key="m1", scope="session"),
+                _make_memory(key="m2", scope="session"),
+            ]
+        )
         mock_svc.forget = AsyncMock(return_value=True)
         mock_get_svc.return_value = mock_svc
 

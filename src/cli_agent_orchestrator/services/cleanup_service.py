@@ -6,7 +6,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from cli_agent_orchestrator.clients.database import InboxModel, SessionLocal, TerminalModel
-from cli_agent_orchestrator.constants import CAO_HOME_DIR, LOG_DIR, MEMORY_BASE_DIR, RETENTION_DAYS, TERMINAL_LOG_DIR
+from cli_agent_orchestrator.constants import (
+    CAO_HOME_DIR,
+    LOG_DIR,
+    MEMORY_BASE_DIR,
+    RETENTION_DAYS,
+    TERMINAL_LOG_DIR,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -118,9 +124,7 @@ async def cleanup_expired_memories() -> None:
                         f"type={entry['memory_type']}"
                     )
                 except Exception as e:
-                    logger.warning(
-                        f"Failed to expire memory key={entry['key']}: {e}"
-                    )
+                    logger.warning(f"Failed to expire memory key={entry['key']}: {e}")
 
         if expired_count > 0:
             logger.info(f"Memory cleanup: expired {expired_count} memories")
@@ -181,21 +185,25 @@ def _find_expired_entries(index_path: Path, now: datetime) -> list[dict]:
         # Session-scoped: 14-day retention regardless of type
         if current_scope == "session":
             if age_days > SESSION_SCOPE_RETENTION_DAYS:
-                expired.append({
-                    "key": key,
-                    "scope": current_scope,
-                    "memory_type": memory_type,
-                })
+                expired.append(
+                    {
+                        "key": key,
+                        "scope": current_scope,
+                        "memory_type": memory_type,
+                    }
+                )
             continue
 
         # Type-based retention
         retention_days = RETENTION_POLICY.get(memory_type)
         if retention_days is not None and age_days > retention_days:
-            expired.append({
-                "key": key,
-                "scope": current_scope,
-                "memory_type": memory_type,
-            })
+            expired.append(
+                {
+                    "key": key,
+                    "scope": current_scope,
+                    "memory_type": memory_type,
+                }
+            )
 
     return expired
 

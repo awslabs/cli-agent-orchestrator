@@ -46,7 +46,10 @@ from cli_agent_orchestrator.services import (
     session_service,
     terminal_service,
 )
-from cli_agent_orchestrator.services.cleanup_service import cleanup_expired_memories, cleanup_old_data
+from cli_agent_orchestrator.services.cleanup_service import (
+    cleanup_expired_memories,
+    cleanup_old_data,
+)
 from cli_agent_orchestrator.services.inbox_service import LogFileHandler
 from cli_agent_orchestrator.services.terminal_service import OutputMode
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider

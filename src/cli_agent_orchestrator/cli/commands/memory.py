@@ -113,7 +113,9 @@ def show(key, scope):
     svc = _get_memory_service()
     try:
         memories = _run_async(
-            svc.recall(query=key, scope=scope, limit=100, terminal_context=_cwd_context(), scan_all=True)
+            svc.recall(
+                query=key, scope=scope, limit=100, terminal_context=_cwd_context(), scan_all=True
+            )
         )
     except Exception as e:
         raise click.ClickException(str(e))

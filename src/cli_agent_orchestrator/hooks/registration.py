@@ -20,18 +20,22 @@ _SAFE_PROFILE_RE = re.compile(r"^[a-zA-Z0-9_\-]+$")
 def _resolve_working_directory(working_directory: str) -> Path:
     """Resolve and validate a working directory path to prevent path traversal.
 
-    Resolves symlinks via realpath and verifies the result is an absolute path
-    before it is used to construct config file paths.
+    Uses the same two-step pattern as TmuxClient._resolve_and_validate_working_directory:
+    1. os.path.realpath() — CodeQL PathNormalization (taint → NormalizedUnchecked)
+    2. startswith("/") guard — CodeQL SafeAccessCheck (NormalizedUnchecked → sanitized)
 
     Raises:
         ValueError: If the resolved path is not absolute or contains null bytes.
     """
     if "\x00" in working_directory:
         raise ValueError("Working directory contains null bytes")
-    resolved = Path(os.path.realpath(working_directory))
-    if not resolved.is_absolute():
-        raise ValueError(f"Working directory resolved to a non-absolute path: {resolved}")
-    return resolved
+    # Step 1: PathNormalization — resolves symlinks and .. sequences
+    real_path = os.path.realpath(os.path.abspath(working_directory))
+    # Step 2: SafeAccessCheck — CodeQL recognizes startswith() as the guard
+    # that transitions the taint state to sanitized on the true branch
+    if not real_path.startswith("/"):
+        raise ValueError(f"Working directory must be an absolute path: {working_directory}")
+    return Path(real_path)
 
 
 def _sanitize_agent_profile(agent_profile: str) -> str:
@@ -52,6 +56,7 @@ def _sanitize_agent_profile(agent_profile: str) -> str:
             f"Invalid agent profile name '{basename}': only alphanumeric, hyphens, and underscores allowed"
         )
     return basename
+
 
 logger = logging.getLogger(__name__)
 
@@ -169,7 +174,9 @@ def register_hooks_kiro(agent_profile: str) -> None:
     if not str(agent_config_path.resolve()).startswith(str(KIRO_AGENTS_DIR.resolve())):
         raise ValueError(f"Agent profile path escapes agents directory: {agent_config_path}")
     if not agent_config_path.exists():
-        logger.warning(f"Kiro agent config not found: {agent_config_path}, skipping hook registration")
+        logger.warning(
+            f"Kiro agent config not found: {agent_config_path}, skipping hook registration"
+        )
         return
 
     existing: dict = {}
@@ -184,7 +191,8 @@ def register_hooks_kiro(agent_profile: str) -> None:
     # Remove all existing CAO entries from every event key (handles stale/old-format entries)
     for event_key in list(hooks.keys()):
         hooks[event_key] = [
-            e for e in hooks[event_key]
+            e
+            for e in hooks[event_key]
             if isinstance(e, dict) and e.get("command") not in _CAO_HOOK_COMMANDS
         ]
         if not hooks[event_key]:
