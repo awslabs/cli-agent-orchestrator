@@ -616,6 +616,184 @@ async def load_skill(
     return _load_skill_impl(name)
 
 
+# =============================================================================
+# Memory Tools
+# =============================================================================
+
+
+def _get_terminal_context_from_env() -> Optional[Dict[str, Any]]:
+    """Build terminal context dict from the calling terminal's CAO_TERMINAL_ID."""
+    terminal_id = os.environ.get("CAO_TERMINAL_ID")
+    if not terminal_id:
+        return None
+
+    try:
+        response = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}")
+        response.raise_for_status()
+        meta = response.json()
+        ctx: Dict[str, Any] = {
+            "terminal_id": meta["id"],
+            "session_name": meta["session_name"],
+            "provider": meta["provider"],
+            "agent_profile": meta.get("agent_profile"),
+        }
+        # Try to get working directory for project scope resolution
+        try:
+            wd_resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}/working-directory")
+            if wd_resp.status_code == 200:
+                ctx["cwd"] = wd_resp.json().get("working_directory")
+        except Exception:
+            pass
+        return ctx
+    except Exception as e:
+        logger.warning(f"Failed to get terminal context for memory tools: {e}")
+        return None
+
+
+@mcp.tool()
+async def memory_store(
+    content: str = Field(description="Memory content to store (markdown supported)"),
+    scope: str = Field(
+        default="project",
+        description='Memory scope: "global", "project", "session", or "agent"',
+    ),
+    memory_type: str = Field(
+        default="project",
+        description='Memory type: "user", "feedback", "project", or "reference"',
+    ),
+    key: Optional[str] = Field(
+        default=None,
+        description="Slug identifier (e.g. 'prefer-pytest'). Auto-generated from content if omitted.",
+    ),
+    tags: Optional[str] = Field(
+        default=None,
+        description="Comma-separated tags for search (e.g. 'testing,pytest')",
+    ),
+) -> Dict[str, Any]:
+    """Store a persistent memory. Content is saved to a wiki file and indexed.
+
+    Identical key+scope combinations are updated (upsert) — new content is appended
+    as a timestamped entry. If key is omitted, it is auto-generated as a slug of the
+    first 6 words of content.
+
+    Use this to persist facts, decisions, user preferences, and project conventions
+    that should be available across agent sessions.
+    """
+    from cli_agent_orchestrator.services.memory_service import MemoryService
+
+    try:
+        service = MemoryService()
+        terminal_context = _get_terminal_context_from_env()
+        memory = await service.store(
+            content=content,
+            scope=scope,
+            memory_type=memory_type,
+            key=key,
+            tags=tags or "",
+            terminal_context=terminal_context,
+        )
+        return {
+            "success": True,
+            "key": memory.key,
+            "scope": memory.scope,
+            "scope_id": memory.scope_id,
+            "file_path": memory.file_path,
+            "action": "updated" if memory.created_at != memory.updated_at else "created",
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def memory_recall(
+    query: Optional[str] = Field(
+        default=None,
+        description="Search query matched against memory content (case-insensitive)",
+    ),
+    scope: Optional[str] = Field(
+        default=None,
+        description='Filter by scope: "global", "project", "session", "agent". Omit to search all.',
+    ),
+    memory_type: Optional[str] = Field(
+        default=None,
+        description='Filter by type: "user", "feedback", "project", "reference". Omit for all types.',
+    ),
+    limit: int = Field(
+        default=10,
+        description="Maximum number of results to return",
+        ge=1,
+        le=100,
+    ),
+) -> Dict[str, Any]:
+    """Retrieve memories matching a query and optional filters.
+
+    Returns content from matching wiki files, sorted by recency.
+    When no scope is specified, results follow scope precedence: session > project > global.
+
+    Use this to check if relevant knowledge already exists before asking the user.
+    """
+    from cli_agent_orchestrator.services.memory_service import MemoryService
+
+    try:
+        service = MemoryService()
+        terminal_context = _get_terminal_context_from_env()
+        memories = await service.recall(
+            query=query,
+            scope=scope,
+            memory_type=memory_type,
+            limit=limit,
+            terminal_context=terminal_context,
+        )
+        return {
+            "memories": [
+                {
+                    "key": m.key,
+                    "content": m.content,
+                    "memory_type": m.memory_type,
+                    "scope": m.scope,
+                    "tags": m.tags,
+                    "file_path": m.file_path,
+                    "updated_at": m.updated_at.isoformat() + "Z",
+                }
+                for m in memories
+            ]
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def memory_forget(
+    key: str = Field(description="Key of the memory to remove (e.g. 'prefer-pytest')"),
+    scope: str = Field(
+        default="project",
+        description='Scope of the memory to remove: "global", "project", "session", or "agent"',
+    ),
+) -> Dict[str, Any]:
+    """Remove a memory by key and scope.
+
+    Deletes the wiki topic file and removes the entry from index.md.
+    """
+    from cli_agent_orchestrator.services.memory_service import MemoryService
+
+    try:
+        service = MemoryService()
+        terminal_context = _get_terminal_context_from_env()
+        deleted = await service.forget(
+            key=key,
+            scope=scope,
+            terminal_context=terminal_context,
+        )
+        return {
+            "success": True,
+            "deleted": deleted,
+            "key": key,
+            "scope": scope,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 def main():
     """Main entry point for the MCP server."""
     mcp.run()

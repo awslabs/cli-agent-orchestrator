@@ -34,6 +34,7 @@ from cli_agent_orchestrator.constants import SESSION_PREFIX, TERMINAL_LOG_DIR
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
 from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
 from cli_agent_orchestrator.utils.terminal import (
@@ -43,6 +44,34 @@ from cli_agent_orchestrator.utils.terminal import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Track terminals that have already received memory injection (first message only).
+_memory_injected_terminals: set = set()
+
+
+def inject_memory_context(first_message: str, terminal_id: str) -> str:
+    """Prepend <cao-memory> context block to the first user message.
+
+    Tracks which terminals have already been injected so that only the very
+    first user message after init receives the memory block.
+
+    Calls MemoryService.get_memory_context_for_terminal() which returns
+    a formatted <cao-memory>...</cao-memory> block (or empty string if
+    no memories exist). Stateless — no file mutation, no backup/restore.
+    """
+    if terminal_id in _memory_injected_terminals:
+        return first_message
+
+    _memory_injected_terminals.add(terminal_id)
+
+    try:
+        svc = MemoryService()
+        context = svc.get_memory_context_for_terminal(terminal_id)
+        if context:
+            return context + "\n\n" + first_message
+    except Exception as e:
+        logger.warning(f"Failed to inject memory context for terminal {terminal_id}: {e}")
+    return first_message
 
 
 class OutputMode(str, Enum):
@@ -149,6 +178,23 @@ def create_terminal(
                 )
             except FileNotFoundError:
                 pass  # Profile not found; no tool restrictions
+
+        # Step 3d: Register provider-specific hooks for memory self-save
+        try:
+            from cli_agent_orchestrator.hooks.registration import (
+                register_hooks_claude_code,
+                register_hooks_codex,
+                register_hooks_kiro,
+            )
+
+            if provider == ProviderType.CLAUDE_CODE.value and working_directory:
+                register_hooks_claude_code(working_directory)
+            elif provider == ProviderType.CODEX.value and working_directory:
+                register_hooks_codex(working_directory)
+            elif provider == ProviderType.KIRO_CLI.value:
+                register_hooks_kiro(agent_profile)
+        except Exception as e:
+            logger.warning(f"Failed to register hooks for terminal {terminal_id}: {e}")
 
         # Step 4: Create and initialize the CLI provider
         # This starts the agent (e.g., runs "kiro-cli chat --agent developer")
@@ -272,6 +318,11 @@ def send_input(terminal_id: str, message: str) -> bool:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
+
+        # Inject memory context into the very first user message after init.
+        # Kiro uses the AgentSpawn hook for injection instead to avoid double injection — skip here.
+        if metadata.get("provider") != ProviderType.KIRO_CLI.value:
+            message = inject_memory_context(message, terminal_id)
 
         # Check how many Enter keys the provider needs after paste
         provider = provider_manager.get_provider(terminal_id)
@@ -398,6 +449,7 @@ def delete_terminal(terminal_id: str) -> bool:
 
         # Cleanup provider state and database record
         provider_manager.cleanup_provider(terminal_id)
+        _memory_injected_terminals.discard(terminal_id)
         deleted = db_delete_terminal(terminal_id)
         logger.info(f"Deleted terminal: {terminal_id}")
         return deleted
