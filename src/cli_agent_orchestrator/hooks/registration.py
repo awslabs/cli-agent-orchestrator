@@ -148,23 +148,25 @@ def register_hooks_kiro(agent_profile: str) -> None:
             "only alphanumeric, hyphens, and underscores allowed"
         )
 
+    # Normalize: join known base with sanitized filename, then normpath.
+    # Check the normalized path starts with the base before any file access.
+    # All filesystem operations use config_path (built from the checked normalized
+    # string), never the raw user-derived value — matches CodeQL's recommended pattern.
     agents_dir = str(KIRO_AGENTS_DIR.resolve())
-    agent_config_path = KIRO_AGENTS_DIR / f"{safe_profile}.json"
-    # SafeAccessCheck: verify the resolved path stays within KIRO_AGENTS_DIR
-    if not str(agent_config_path.resolve()).startswith(agents_dir):
-        raise ValueError(f"Agent profile path escapes agents directory: {agent_config_path}")
+    normalized = os.path.normpath(os.path.join(agents_dir, f"{safe_profile}.json"))
+    if not normalized.startswith(agents_dir):
+        raise ValueError(f"Agent profile path escapes agents directory: {normalized}")
 
-    if not agent_config_path.exists():
-        logger.warning(
-            f"Kiro agent config not found: {agent_config_path}, skipping hook registration"
-        )
+    config_path = Path(normalized)
+    if not config_path.exists():
+        logger.warning(f"Kiro agent config not found: {config_path}, skipping hook registration")
         return
 
     existing: dict = {}
     try:
-        existing = json.loads(agent_config_path.read_text())
+        existing = json.loads(config_path.read_text())
     except (json.JSONDecodeError, OSError):
-        logger.warning(f"Could not parse {agent_config_path}, skipping hook registration")
+        logger.warning(f"Could not parse {config_path}, skipping hook registration")
         return
 
     hooks = existing.setdefault("hooks", {})
@@ -183,8 +185,8 @@ def register_hooks_kiro(agent_profile: str) -> None:
     hooks.setdefault("agentSpawn", []).append({"command": str(KIRO_SPAWN_HOOK_PATH)})
     hooks.setdefault("userPromptSubmit", []).append({"command": str(KIRO_PROMPT_HOOK_PATH)})
 
-    agent_config_path.write_text(json.dumps(existing, indent=2) + "\n")
-    logger.info(f"Registered CAO hooks in {agent_config_path}")
+    config_path.write_text(json.dumps(existing, indent=2) + "\n")
+    logger.info(f"Registered CAO hooks in {config_path}")
 
 
 def register_hooks_codex(working_directory: str) -> None:
