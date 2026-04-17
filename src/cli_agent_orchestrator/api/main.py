@@ -48,7 +48,7 @@ from cli_agent_orchestrator.services import (
     session_service,
     terminal_service,
 )
-from cli_agent_orchestrator.services.cleanup_service import cleanup_old_data
+from cli_agent_orchestrator.services.cleanup_service import cleanup_expired_memories, cleanup_old_data
 from cli_agent_orchestrator.services.inbox_service import LogFileHandler
 from cli_agent_orchestrator.services.install_service import InstallResult, install_agent
 from cli_agent_orchestrator.services.terminal_service import OutputMode
@@ -157,8 +157,17 @@ async def lifespan(app: FastAPI):
     await registry.load()
     app.state.plugin_registry = registry
 
+    # Install hook scripts to ~/.aws/cli-agent-orchestrator/hooks/ (idempotent)
+    try:
+        from cli_agent_orchestrator.hooks.registration import install_hooks
+
+        install_hooks()
+    except Exception as e:
+        logger.warning(f"Failed to install hook scripts: {e}")
+
     # Run cleanup in background
     asyncio.create_task(asyncio.to_thread(cleanup_old_data))
+    asyncio.create_task(cleanup_expired_memories())
 
     # Start flow daemon as background task
     daemon_task = asyncio.create_task(flow_daemon())
@@ -508,6 +517,30 @@ async def get_terminal(terminal_id: TerminalId) -> Terminal:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get terminal: {str(e)}",
+        )
+
+
+@app.get("/terminals/{terminal_id}/memory-context")
+async def get_terminal_memory_context(terminal_id: TerminalId):
+    """Return the CAO memory context block for a terminal as plain text.
+
+    Used by the Kiro AgentSpawn hook to inject memory into agent context.
+    Returns empty 200 if no memories exist for this terminal.
+    """
+    from fastapi.responses import PlainTextResponse
+
+    try:
+        from cli_agent_orchestrator.services.memory_service import MemoryService
+
+        svc = MemoryService()
+        context = svc.get_memory_context_for_terminal(terminal_id)
+        return PlainTextResponse(content=context)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get memory context: {str(e)}",
         )
 
 

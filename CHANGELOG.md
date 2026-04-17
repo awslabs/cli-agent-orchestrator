@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [Unreleased]
+
+### Added
+
+- **Persistent agent memory system (Phase 1)** — Agents can now store and recall knowledge across sessions using `memory_store`, `memory_recall`, and `memory_forget` MCP tools. Memories are scoped to `global`, `project`, `session`, or `agent` and stored as wiki markdown files under `~/.aws/cli-agent-orchestrator/memory/`. CAO automatically injects relevant memories as `<cao-memory>` context at session start. Includes CLI commands (`cao memory list/show/delete/clear`), auto-save hooks for Claude Code (Stop + PreCompact) and Kiro CLI (AgentSpawn + UserPromptSubmit), tiered retention, and concurrent-write safety via file locking. See [docs/memory.md](docs/memory.md).
+
 ## [2.1.1] - 2026-04-28
 
 ### Added
