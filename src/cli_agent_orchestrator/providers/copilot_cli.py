@@ -38,6 +38,10 @@ WAITING_PROMPT_PATTERN = (
 )
 ERROR_PATTERN = r"(?:Error:|ERROR:|Traceback \(most recent call last\):|panic:)"
 PROMPT_HELPER_CONTINUATION_PATTERN = r"^(?:shortcuts|for shortcuts)$"
+# Copilot v1.0.31+ renders a status bar below the ❯ prompt:
+# " autopilot · / commands    Claude Sonnet 4.6 · (0%)"
+# This must be treated as a footer line so idle detection works correctly.
+COPILOT_STATUS_BAR_PATTERN = r"^\s*(?:autopilot|plan|interactive)\s*[·•]"
 PROCESSING_LINE_PATTERN = r"^(?:[●◐◑◒◓◉◎∙]\s*)?.*\besc to cancel\b.*$"
 
 
@@ -320,6 +324,9 @@ class CopilotCliProvider(BaseProvider):
         if re.match(PROMPT_HELPER_CONTINUATION_PATTERN, stripped):
             return True
         if stripped.startswith("╭") or stripped.startswith("╰") or stripped.startswith("│"):
+            return True
+        # Copilot v1.0.31+ status bar: " autopilot · / commands    Claude Sonnet 4.6 · (0%)"
+        if re.match(COPILOT_STATUS_BAR_PATTERN, stripped):
             return True
         return False
 
