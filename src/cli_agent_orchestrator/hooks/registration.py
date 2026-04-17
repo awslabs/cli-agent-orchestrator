@@ -6,10 +6,52 @@ and registers them with provider-specific config files on terminal creation.
 
 import json
 import logging
+import os
+import re
 import shutil
 from pathlib import Path
 
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
+
+# Safe characters for agent profile names (no path separators or special chars)
+_SAFE_PROFILE_RE = re.compile(r"^[a-zA-Z0-9_\-]+$")
+
+
+def _resolve_working_directory(working_directory: str) -> Path:
+    """Resolve and validate a working directory path to prevent path traversal.
+
+    Resolves symlinks via realpath and verifies the result is an absolute path
+    before it is used to construct config file paths.
+
+    Raises:
+        ValueError: If the resolved path is not absolute or contains null bytes.
+    """
+    if "\x00" in working_directory:
+        raise ValueError("Working directory contains null bytes")
+    resolved = Path(os.path.realpath(working_directory))
+    if not resolved.is_absolute():
+        raise ValueError(f"Working directory resolved to a non-absolute path: {resolved}")
+    return resolved
+
+
+def _sanitize_agent_profile(agent_profile: str) -> str:
+    """Sanitize an agent profile name to prevent path traversal.
+
+    Strips directory separators and validates only safe characters remain.
+    The result is used as a filename component under KIRO_AGENTS_DIR.
+
+    Raises:
+        ValueError: If the profile name contains unsafe characters.
+    """
+    if "\x00" in agent_profile:
+        raise ValueError("Agent profile name contains null bytes")
+    # Strip any directory components — only the basename matters
+    basename = os.path.basename(agent_profile)
+    if not _SAFE_PROFILE_RE.match(basename):
+        raise ValueError(
+            f"Invalid agent profile name '{basename}': only alphanumeric, hyphens, and underscores allowed"
+        )
+    return basename
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +102,8 @@ def register_hooks_claude_code(working_directory: str) -> None:
     Args:
         working_directory: The terminal's working directory (where .claude/ lives).
     """
-    settings_path = Path(working_directory) / ".claude" / "settings.local.json"
+    resolved_dir = _resolve_working_directory(working_directory)
+    settings_path = resolved_dir / ".claude" / "settings.local.json"
     settings_path.parent.mkdir(parents=True, exist_ok=True)
 
     existing: dict = {}
@@ -120,7 +163,11 @@ def register_hooks_kiro(agent_profile: str) -> None:
     """
     from cli_agent_orchestrator.constants import KIRO_AGENTS_DIR
 
-    agent_config_path = KIRO_AGENTS_DIR / f"{agent_profile}.json"
+    safe_profile = _sanitize_agent_profile(agent_profile)
+    agent_config_path = KIRO_AGENTS_DIR / f"{safe_profile}.json"
+    # Verify resolved path stays within KIRO_AGENTS_DIR to prevent traversal
+    if not str(agent_config_path.resolve()).startswith(str(KIRO_AGENTS_DIR.resolve())):
+        raise ValueError(f"Agent profile path escapes agents directory: {agent_config_path}")
     if not agent_config_path.exists():
         logger.warning(f"Kiro agent config not found: {agent_config_path}, skipping hook registration")
         return
@@ -157,7 +204,8 @@ def register_hooks_codex(working_directory: str) -> None:
     Args:
         working_directory: The terminal's working directory (where .codex/ lives).
     """
-    hooks_path = Path(working_directory) / ".codex" / "hooks.json"
+    resolved_dir = _resolve_working_directory(working_directory)
+    hooks_path = resolved_dir / ".codex" / "hooks.json"
     hooks_path.parent.mkdir(parents=True, exist_ok=True)
 
     existing: dict = {}
