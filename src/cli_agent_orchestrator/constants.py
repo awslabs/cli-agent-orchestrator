@@ -121,6 +121,12 @@ ALLOWED_HOSTS = [
 ]
 
 # =============================================================================
+# Memory System Configuration
+# =============================================================================
+# Base directory for all memory wiki files
+MEMORY_BASE_DIR = CAO_HOME_DIR / "memory"
+
+# =============================================================================
 # Tool Restriction Configuration
 # =============================================================================
 # Built-in role defaults. A role is a named bundle of allowedTools.

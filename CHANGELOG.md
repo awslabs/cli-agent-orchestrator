@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Persistent agent memory system** — Agents can now store and recall knowledge across sessions using `memory_store`, `memory_recall`, and `memory_forget` MCP tools. Memories are scoped to `global`, `project`, `session`, or `agent` and stored as wiki markdown files under `~/.aws/cli-agent-orchestrator/memory/`. CAO automatically injects relevant memories as `<cao-memory>` context at session start. Includes CLI commands (`cao memory list/show/delete/clear`), auto-save hooks for Claude Code (Stop + PreCompact) and Kiro CLI (AgentSpawn + UserPromptSubmit), tiered retention, and concurrent-write safety via file locking. See [docs/memory.md](docs/memory.md).
+
 ### Changed
 
 - **Launch prompt clarity + `--auto-approve`** — Redesign the `cao launch` confirmation prompt to show `Role` instead of `Blocked`, clearly distinguish `[Y]` / `[--auto-approve]` / `[--yolo]`, and add `--auto-approve` flag to skip the prompt without removing restrictions (for automated flows, scripts, and agent-to-agent launches)
