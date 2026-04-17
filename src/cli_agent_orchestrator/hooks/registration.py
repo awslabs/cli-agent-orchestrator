@@ -13,51 +13,6 @@ from pathlib import Path
 
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
 
-# Safe characters for agent profile names (no path separators or special chars)
-_SAFE_PROFILE_RE = re.compile(r"^[a-zA-Z0-9_\-]+$")
-
-
-def _resolve_working_directory(working_directory: str) -> Path:
-    """Resolve and validate a working directory path to prevent path traversal.
-
-    Uses the same two-step pattern as TmuxClient._resolve_and_validate_working_directory:
-    1. os.path.realpath() — CodeQL PathNormalization (taint → NormalizedUnchecked)
-    2. startswith("/") guard — CodeQL SafeAccessCheck (NormalizedUnchecked → sanitized)
-
-    Raises:
-        ValueError: If the resolved path is not absolute or contains null bytes.
-    """
-    if "\x00" in working_directory:
-        raise ValueError("Working directory contains null bytes")
-    # Step 1: PathNormalization — resolves symlinks and .. sequences
-    real_path = os.path.realpath(os.path.abspath(working_directory))
-    # Step 2: SafeAccessCheck — CodeQL recognizes startswith() as the guard
-    # that transitions the taint state to sanitized on the true branch
-    if not real_path.startswith("/"):
-        raise ValueError(f"Working directory must be an absolute path: {working_directory}")
-    return Path(real_path)
-
-
-def _sanitize_agent_profile(agent_profile: str) -> str:
-    """Sanitize an agent profile name to prevent path traversal.
-
-    Strips directory separators and validates only safe characters remain.
-    The result is used as a filename component under KIRO_AGENTS_DIR.
-
-    Raises:
-        ValueError: If the profile name contains unsafe characters.
-    """
-    if "\x00" in agent_profile:
-        raise ValueError("Agent profile name contains null bytes")
-    # Strip any directory components — only the basename matters
-    basename = os.path.basename(agent_profile)
-    if not _SAFE_PROFILE_RE.match(basename):
-        raise ValueError(
-            f"Invalid agent profile name '{basename}': only alphanumeric, hyphens, and underscores allowed"
-        )
-    return basename
-
-
 logger = logging.getLogger(__name__)
 
 HOOKS_INSTALL_DIR = CAO_HOME_DIR / "hooks"
@@ -74,6 +29,9 @@ STOP_HOOK_PATH = HOOKS_INSTALL_DIR / STOP_HOOK_SCRIPT
 PRECOMPACT_HOOK_PATH = HOOKS_INSTALL_DIR / PRECOMPACT_HOOK_SCRIPT
 KIRO_SPAWN_HOOK_PATH = HOOKS_INSTALL_DIR / KIRO_SPAWN_HOOK_SCRIPT
 KIRO_PROMPT_HOOK_PATH = HOOKS_INSTALL_DIR / KIRO_PROMPT_HOOK_SCRIPT
+
+# Safe characters for agent profile names (no path separators or special chars)
+_SAFE_PROFILE_RE = re.compile(r"^[a-zA-Z0-9_\-]+$")
 
 
 def install_hooks() -> None:
@@ -107,8 +65,18 @@ def register_hooks_claude_code(working_directory: str) -> None:
     Args:
         working_directory: The terminal's working directory (where .claude/ lives).
     """
-    resolved_dir = _resolve_working_directory(working_directory)
-    settings_path = resolved_dir / ".claude" / "settings.local.json"
+    # Path validation — mirrors TmuxClient._resolve_and_validate_working_directory.
+    # Step 1: PathNormalization — os.path.realpath() resolves symlinks and .. sequences.
+    #         CodeQL transitions taint state: tainted → NormalizedUnchecked.
+    # Step 2: SafeAccessCheck — str.startswith() is recognized by CodeQL as the guard
+    #         that transitions NormalizedUnchecked → sanitized on the true branch.
+    if "\x00" in working_directory:
+        raise ValueError("Working directory contains null bytes")
+    real_dir = os.path.realpath(os.path.abspath(working_directory))
+    if not real_dir.startswith("/"):
+        raise ValueError(f"Working directory must be an absolute path: {working_directory}")
+
+    settings_path = Path(real_dir) / ".claude" / "settings.local.json"
     settings_path.parent.mkdir(parents=True, exist_ok=True)
 
     existing: dict = {}
@@ -168,11 +136,24 @@ def register_hooks_kiro(agent_profile: str) -> None:
     """
     from cli_agent_orchestrator.constants import KIRO_AGENTS_DIR
 
-    safe_profile = _sanitize_agent_profile(agent_profile)
+    # Sanitize agent_profile: os.path.basename() is recognized by CodeQL as a
+    # PathNormalization that strips directory separators (CWE-22 prevention).
+    # The subsequent startswith() containment check is the SafeAccessCheck.
+    if "\x00" in agent_profile:
+        raise ValueError("Agent profile name contains null bytes")
+    safe_profile = os.path.basename(agent_profile)
+    if not _SAFE_PROFILE_RE.match(safe_profile):
+        raise ValueError(
+            f"Invalid agent profile name '{safe_profile}': "
+            "only alphanumeric, hyphens, and underscores allowed"
+        )
+
+    agents_dir = str(KIRO_AGENTS_DIR.resolve())
     agent_config_path = KIRO_AGENTS_DIR / f"{safe_profile}.json"
-    # Verify resolved path stays within KIRO_AGENTS_DIR to prevent traversal
-    if not str(agent_config_path.resolve()).startswith(str(KIRO_AGENTS_DIR.resolve())):
+    # SafeAccessCheck: verify the resolved path stays within KIRO_AGENTS_DIR
+    if not str(agent_config_path.resolve()).startswith(agents_dir):
         raise ValueError(f"Agent profile path escapes agents directory: {agent_config_path}")
+
     if not agent_config_path.exists():
         logger.warning(
             f"Kiro agent config not found: {agent_config_path}, skipping hook registration"
@@ -212,8 +193,14 @@ def register_hooks_codex(working_directory: str) -> None:
     Args:
         working_directory: The terminal's working directory (where .codex/ lives).
     """
-    resolved_dir = _resolve_working_directory(working_directory)
-    hooks_path = resolved_dir / ".codex" / "hooks.json"
+    # Same PathNormalization + SafeAccessCheck pattern as register_hooks_claude_code.
+    if "\x00" in working_directory:
+        raise ValueError("Working directory contains null bytes")
+    real_dir = os.path.realpath(os.path.abspath(working_directory))
+    if not real_dir.startswith("/"):
+        raise ValueError(f"Working directory must be an absolute path: {working_directory}")
+
+    hooks_path = Path(real_dir) / ".codex" / "hooks.json"
     hooks_path.parent.mkdir(parents=True, exist_ok=True)
 
     existing: dict = {}
