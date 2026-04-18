@@ -7,7 +7,7 @@ flow_daemon, lifespan, and the main() entry point.
 
 import asyncio
 from datetime import datetime
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -236,8 +236,8 @@ class TestCreateSession:
             provider="kiro_cli",
             agent_profile="developer",
         )
-        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.create_terminal.return_value = mock_terminal
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session.return_value = mock_terminal
 
             response = client.post(
                 "/sessions",
@@ -252,6 +252,14 @@ class TestCreateSession:
         assert data["id"] == "abcd1234"
         assert data["provider"] == "kiro_cli"
         assert data["agent_profile"] == "developer"
+        mock_svc.create_session.assert_called_once_with(
+            provider="kiro_cli",
+            agent_profile="developer",
+            session_name=None,
+            working_directory=None,
+            allowed_tools=None,
+            registry=ANY,
+        )
 
     def test_create_session_with_session_name(self, client):
         """POST /sessions with explicit session_name."""
@@ -262,8 +270,8 @@ class TestCreateSession:
             provider="q_cli",
             agent_profile="developer",
         )
-        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.create_terminal.return_value = mock_terminal
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session.return_value = mock_terminal
 
             response = client.post(
                 "/sessions",
@@ -275,14 +283,14 @@ class TestCreateSession:
             )
 
         assert response.status_code == 201
-        call_kwargs = mock_svc.create_terminal.call_args.kwargs
+        call_kwargs = mock_svc.create_session.call_args.kwargs
         assert call_kwargs["session_name"] == "my-custom-session"
-        assert call_kwargs["new_session"] is True
+        assert call_kwargs["registry"] is not None
 
     def test_create_session_value_error(self, client):
         """POST /sessions returns 400 on ValueError."""
-        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.create_terminal.side_effect = ValueError("Invalid provider")
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session.side_effect = ValueError("Invalid provider")
 
             response = client.post(
                 "/sessions",
@@ -297,8 +305,8 @@ class TestCreateSession:
 
     def test_create_session_server_error(self, client):
         """POST /sessions returns 500 on unexpected error."""
-        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.create_terminal.side_effect = Exception("TMux crashed")
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session.side_effect = Exception("TMux crashed")
 
             response = client.post(
                 "/sessions",
@@ -408,7 +416,7 @@ class TestDeleteSession:
         data = response.json()
         assert data["success"] is True
         assert data["deleted"] == ["test-session"]
-        mock_svc.delete_session.assert_called_once_with("test-session")
+        mock_svc.delete_session.assert_called_once_with("test-session", registry=ANY)
 
     def test_delete_session_not_found(self, client):
         """DELETE /sessions/{name} returns 404 for nonexistent session."""
@@ -608,7 +616,36 @@ class TestSendTerminalInput:
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
-        mock_svc.send_input.assert_called_once_with("abcd1234", "hello world")
+        mock_svc.send_input.assert_called_once_with(
+            "abcd1234",
+            "hello world",
+            registry=ANY,
+            sender_id=None,
+            orchestration_type=None,
+        )
+
+    def test_send_input_with_orchestration_context(self, client):
+        """POST /terminals/{id}/input forwards registry and orchestration metadata when provided."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.send_input.return_value = True
+
+            response = client.post(
+                "/terminals/abcd1234/input",
+                params={
+                    "message": "hello world",
+                    "sender_id": "supervisor-1",
+                    "orchestration_type": "assign",
+                },
+            )
+
+        assert response.status_code == 200
+        mock_svc.send_input.assert_called_once_with(
+            "abcd1234",
+            "hello world",
+            registry=ANY,
+            sender_id="supervisor-1",
+            orchestration_type="assign",
+        )
 
     def test_send_input_terminal_not_found(self, client):
         """POST /terminals/{id}/input returns 404 for nonexistent terminal."""
@@ -698,7 +735,7 @@ class TestDeleteTerminal:
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
-        mock_svc.delete_terminal.assert_called_once_with("abcd1234")
+        mock_svc.delete_terminal.assert_called_once_with("abcd1234", registry=ANY)
 
     def test_delete_terminal_not_found(self, client):
         """DELETE /terminals/{id} returns 404 for nonexistent terminal."""
