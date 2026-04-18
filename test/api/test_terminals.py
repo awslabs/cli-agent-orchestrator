@@ -1,6 +1,6 @@
 """Tests for terminal-related API endpoints including working directory and exit."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -70,8 +70,8 @@ class TestSessionCreationWithWorkingDirectory:
 
     def test_create_session_passes_working_directory(self, client, tmp_path):
         """Test that working_directory parameter is passed to service."""
-        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.create_terminal.return_value = Terminal(
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session.return_value = Terminal(
                 id="abcd1234",
                 name="test-window",
                 session_name="test-session",
@@ -90,13 +90,14 @@ class TestSessionCreationWithWorkingDirectory:
 
             assert response.status_code == 201
             # Verify working_directory was passed
-            call_kwargs = mock_svc.create_terminal.call_args.kwargs
+            call_kwargs = mock_svc.create_session.call_args.kwargs
             assert call_kwargs.get("working_directory") == str(tmp_path)
+            assert call_kwargs.get("registry") is not None
 
     def test_create_session_with_working_directory(self, client):
         """Test POST /sessions with working_directory parameter."""
-        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.create_terminal.return_value = Terminal(
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session.return_value = Terminal(
                 id="abcd1234",
                 name="test-window",
                 session_name="test-session",
@@ -114,7 +115,7 @@ class TestSessionCreationWithWorkingDirectory:
             )
 
             assert response.status_code == 201
-            call_kwargs = mock_svc.create_terminal.call_args.kwargs
+            call_kwargs = mock_svc.create_session.call_args.kwargs
             assert call_kwargs.get("working_directory") == "/custom/path"
 
 
@@ -291,7 +292,7 @@ class TestDeleteTerminalEndpoint:
 
             assert response.status_code == 200
             assert response.json() == {"success": True}
-            mock_svc.delete_terminal.assert_called_once_with("abcd1234")
+            mock_svc.delete_terminal.assert_called_once_with("abcd1234", registry=ANY)
 
     def test_delete_terminal_not_found(self, client):
         """DELETE /terminals/{terminal_id} returns 404 for missing terminal."""
@@ -340,6 +341,14 @@ class TestCreateInboxMessageEndpoint:
             assert data["success"] is True
             assert data["message_id"] == 1
             assert data["sender_id"] == "sender1"
+            mock_create.assert_called_once_with(
+                "sender1",
+                "abcd1234",
+                "hello",
+            )
+            mock_inbox.check_and_send_pending_messages.assert_called_once_with(
+                "abcd1234", registry=ANY
+            )
 
     def test_create_inbox_message_delivery_failure_still_succeeds(self, client):
         """Immediate delivery failure should not fail the API response."""
@@ -467,9 +476,9 @@ class TestCrossProviderResolution:
         """create_session should NOT call resolve_provider — CLI flag is the override."""
         with (
             patch("cli_agent_orchestrator.api.main.resolve_provider") as mock_resolve,
-            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+            patch("cli_agent_orchestrator.api.main.session_service") as mock_svc,
         ):
-            mock_svc.create_terminal.return_value = Terminal(
+            mock_svc.create_session.return_value = Terminal(
                 id="abcd1234",
                 name="test-window",
                 session_name="test-session",
@@ -488,8 +497,8 @@ class TestCrossProviderResolution:
             assert response.status_code == 201
             # resolve_provider should NOT have been called
             mock_resolve.assert_not_called()
-            # terminal_service should get the raw provider param
-            call_kwargs = mock_svc.create_terminal.call_args.kwargs
+            # session_service should get the raw provider param
+            call_kwargs = mock_svc.create_session.call_args.kwargs
             assert call_kwargs["provider"] == "kiro_cli"
 
     def test_create_terminal_returns_500_on_resolve_error(self, client):

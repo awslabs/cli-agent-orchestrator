@@ -13,6 +13,7 @@ Run:
     uv run pytest -m e2e test/e2e/test_skills.py -v -k ClaudeCode
 """
 
+import os
 import subprocess
 import time
 import uuid
@@ -56,11 +57,17 @@ def _capture_full_scrollback(session_name: str, window_name: str) -> str:
 def _run_skill_injection_test(provider: str, agent_profile: str):
     """Assert the global skill catalog was injected into the provider CLI command.
 
-    Creates a terminal, waits for it to become ready, then captures the
-    full tmux scrollback to verify the skill catalog text appears in the
-    command that was sent via tmux send-keys.
+    Creates a terminal, waits for it to become ready, then verifies the
+    skill catalog text reached the provider.
 
-    This is a deterministic assertion — it checks the command string,
+    For most providers the catalog is embedded in the CLI command string
+    sent via tmux send-keys and is therefore visible in tmux scrollback.
+    Gemini CLI is an exception: its system prompt is written to
+    ``GEMINI.md`` in the working directory because passing the catalog via
+    ``-i`` causes Gemini to treat it as a task to execute. For Gemini we
+    assert against the on-disk ``GEMINI.md`` instead.
+
+    This is a deterministic assertion — it checks the injected payload,
     not LLM output.
     """
     session_suffix = uuid.uuid4().hex[:6]
@@ -87,35 +94,55 @@ def _run_skill_injection_test(provider: str, agent_profile: str):
             "completed",
         ), f"Terminal did not become ready within 90s (provider={provider})"
 
-        # Step 3: Capture full tmux scrollback.
-        # The API's get_output(mode=full) uses capture-pane with a 200-line
-        # limit, which is too small for long commands (Claude Code's system
-        # prompt + MCP config + skill catalog). Instead, capture directly
-        # with -S - (from the very start of the scrollback buffer).
-        #
-        # The window name is the terminal name returned by the API. Look it
-        # up from the terminal metadata.
-        resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}")
-        assert resp.status_code == 200
-        window_name = resp.json()["name"]
-
-        scrollback = _capture_full_scrollback(actual_session, window_name)
-        assert len(scrollback.strip()) > 0, "Scrollback should not be empty"
-
-        # Step 4: Assert skill catalog markers are present in the command.
+        # Step 3: Assert skill catalog markers are present in the injection payload.
         # The catalog is global in Phase 1, so any installed skill should appear.
-        assert "Available Skills" in scrollback, (
-            f"Skill catalog heading 'Available Skills' not found in scrollback "
-            f"(provider={provider}). First 500 chars: {scrollback[:500]}"
+        if provider == "gemini_cli":
+            # Gemini writes the full system prompt (including the skill catalog)
+            # to GEMINI.md in the working directory rather than embedding it in
+            # the CLI command — the command carries only a short role-acknowledge
+            # prompt via -i. Read GEMINI.md directly.
+            payload = _read_gemini_md()
+            source = "GEMINI.md"
+        else:
+            # Capture the full tmux scrollback (capture-pane -S - reads from the
+            # very start of the buffer so the initial CLI command with the
+            # injected catalog is included).
+            resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}")
+            assert resp.status_code == 200
+            window_name = resp.json()["name"]
+            payload = _capture_full_scrollback(actual_session, window_name)
+            source = "tmux scrollback"
+
+        assert len(payload.strip()) > 0, f"{source} should not be empty"
+
+        assert "Available Skills" in payload, (
+            f"Skill catalog heading 'Available Skills' not found in {source} "
+            f"(provider={provider}). First 500 chars: {payload[:500]}"
         )
-        assert "cao-worker-protocols" in scrollback, (
-            f"Skill name 'cao-worker-protocols' not found in scrollback "
-            f"(provider={provider}). First 500 chars: {scrollback[:500]}"
+        assert "cao-worker-protocols" in payload, (
+            f"Skill name 'cao-worker-protocols' not found in {source} "
+            f"(provider={provider}). First 500 chars: {payload[:500]}"
         )
 
     finally:
         if terminal_id and actual_session:
             cleanup_terminal(terminal_id, actual_session)
+
+
+def _read_gemini_md() -> str:
+    """Read GEMINI.md from the current working directory.
+
+    The Gemini CLI provider writes its system prompt (including the injected
+    skill catalog) to ``GEMINI.md`` in the pane's working directory, which is
+    the same directory the test runs from. Returns empty string if the file
+    does not exist so the caller can produce a useful assertion error.
+    """
+    path = os.path.join(os.getcwd(), "GEMINI.md")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
 
 
 # ---------------------------------------------------------------------------

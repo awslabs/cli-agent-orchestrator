@@ -30,8 +30,9 @@ from watchdog.events import FileModifiedEvent, FileSystemEventHandler
 
 from cli_agent_orchestrator.clients.database import get_pending_messages, update_message_status
 from cli_agent_orchestrator.constants import TERMINAL_LOG_DIR
-from cli_agent_orchestrator.models.inbox import MessageStatus
+from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services import terminal_service
 
@@ -71,7 +72,9 @@ def _has_idle_pattern(terminal_id: str) -> bool:
         return False
 
 
-def check_and_send_pending_messages(terminal_id: str) -> bool:
+def check_and_send_pending_messages(
+    terminal_id: str, registry: PluginRegistry | None = None
+) -> bool:
     """Check for pending messages and send if terminal is ready.
 
     Args:
@@ -105,9 +108,21 @@ def check_and_send_pending_messages(terminal_id: str) -> bool:
         logger.debug(f"Terminal {terminal_id} not ready (status={status})")
         return False
 
-    # Send message
+    # Send message. Inbox-queued delivery is only reached via the send_message
+    # MCP tool, so the orchestration_type is always "send_message" here — the
+    # synchronous handoff/assign paths bypass the inbox and pass their own
+    # orchestration_type directly to send_input().
     try:
-        terminal_service.send_input(terminal_id, message.message)
+        if registry is None:
+            terminal_service.send_input(terminal_id, message.message)
+        else:
+            terminal_service.send_input(
+                terminal_id,
+                message.message,
+                registry=registry,
+                sender_id=message.sender_id,
+                orchestration_type=OrchestrationType.SEND_MESSAGE,
+            )
         update_message_status(message.id, MessageStatus.DELIVERED)
         logger.info(f"Delivered message {message.id} to terminal {terminal_id}")
         return True
@@ -119,6 +134,12 @@ def check_and_send_pending_messages(terminal_id: str) -> bool:
 
 class LogFileHandler(FileSystemEventHandler):
     """Handler for terminal log file changes."""
+
+    def __init__(self, registry: PluginRegistry | None = None) -> None:
+        """Initialize the log file handler with an optional plugin registry."""
+
+        super().__init__()
+        self._registry = registry
 
     def on_modified(self, event):
         """Handle file modification events."""
@@ -145,7 +166,7 @@ class LogFileHandler(FileSystemEventHandler):
                 return
 
             # Attempt delivery
-            check_and_send_pending_messages(terminal_id)
+            check_and_send_pending_messages(terminal_id, registry=self._registry)
 
         except Exception as e:
             logger.error(f"Error handling log change for {terminal_id}: {e}")

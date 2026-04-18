@@ -26,6 +26,7 @@ class TestAssignSenderIdInjection:
 
         assert result["success"] is True
         sent_message = mock_send.call_args[0][1]
+        assert mock_send.call_args[0][2] == "assign"
         assert sent_message.startswith("Analyze the logs")
         assert "[Assigned by terminal supervisor-abc123" in sent_message
         assert "send results back to terminal supervisor-abc123 using send_message]" in sent_message
@@ -45,6 +46,7 @@ class TestAssignSenderIdInjection:
 
         assert result["success"] is True
         sent_message = mock_send.call_args[0][1]
+        assert mock_send.call_args[0][2] == "assign"
         assert sent_message == "Analyze the logs"
 
     @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
@@ -61,6 +63,7 @@ class TestAssignSenderIdInjection:
             result = _assign_impl("developer", "Build feature X")
 
         sent_message = mock_send.call_args[0][1]
+        assert mock_send.call_args[0][2] == "assign"
         assert "[Assigned by terminal unknown" in sent_message
 
     @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
@@ -78,6 +81,7 @@ class TestAssignSenderIdInjection:
             _assign_impl("developer", original)
 
         sent_message = mock_send.call_args[0][1]
+        assert mock_send.call_args[0][2] == "assign"
         assert sent_message.startswith(original)
         assert sent_message.index("[Assigned by terminal") > len(original)
 
