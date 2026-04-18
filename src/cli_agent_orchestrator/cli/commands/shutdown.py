@@ -1,8 +1,30 @@
 """Shutdown command for CLI Agent Orchestrator."""
 
 import click
+import requests
 
-from cli_agent_orchestrator.services.session_service import delete_session, list_sessions
+from cli_agent_orchestrator.constants import API_BASE_URL
+
+
+def _list_sessions():
+    try:
+        response = requests.get(f"{API_BASE_URL}/sessions")
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        raise click.ClickException(f"Failed to connect to cao-server: {e}")
+
+
+def _delete_session(name):
+    try:
+        response = requests.delete(f"{API_BASE_URL}/sessions/{name}")
+        if response.status_code == 404:
+            click.echo(f"Session '{name}' already removed", err=True)
+            return False
+        response.raise_for_status()
+        return True
+    except requests.exceptions.RequestException as e:
+        raise click.ClickException(f"Failed to connect to cao-server: {e}")
 
 
 @click.command()
@@ -17,12 +39,9 @@ def shutdown(shutdown_all, session):
     if shutdown_all and session:
         raise click.ClickException("Cannot use --all and --session together")
 
-    # Determine sessions to shutdown
-    sessions_to_shutdown = []
-
     if shutdown_all:
-        sessions = list_sessions()
-        sessions_to_shutdown = [s["id"] for s in sessions]
+        sessions = _list_sessions()
+        sessions_to_shutdown = [s["name"] for s in sessions]
     else:
         sessions_to_shutdown = [session]
 
@@ -30,10 +49,11 @@ def shutdown(shutdown_all, session):
         click.echo("No cao sessions found to shutdown")
         return
 
-    # Shutdown each session
     for session_name in sessions_to_shutdown:
         try:
-            delete_session(session_name)
-            click.echo(f"✓ Shutdown session '{session_name}'")
-        except Exception as e:
-            click.echo(f"Error shutting down session '{session_name}': {e}", err=True)
+            if _delete_session(session_name):
+                click.echo(f"✓ Shutdown session '{session_name}'")
+        except click.ClickException as e:
+            if not shutdown_all:
+                raise
+            click.echo(f"Error: {e.format_message()}", err=True)
