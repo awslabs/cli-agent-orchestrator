@@ -280,6 +280,43 @@ class TestCreateTerminal:
 
         assert mock_provider_manager.create_provider.call_args.kwargs["skill_prompt"] is None
 
+    @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    def test_create_terminal_profile_not_found(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_log_dir,
+    ):
+        """Terminal creation succeeds when agent profile is not in CAO store (e.g. JSON-only profiles)."""
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "my-agent-abcd"
+        mock_tmux.session_exists.return_value = False
+        mock_load_profile.side_effect = FileNotFoundError("Agent profile not found: my-agent")
+        mock_provider = MagicMock()
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_log_path = MagicMock()
+        mock_log_dir.__truediv__.return_value = mock_log_path
+
+        result = create_terminal("kiro_cli", "my-agent", new_session=True)
+
+        assert result.id == "test1234"
+        mock_provider.initialize.assert_called_once()
+        # allowed_tools should be None since profile was not found
+        assert mock_provider_manager.create_provider.call_args.kwargs.get("allowed_tools") is None
+
 
 class TestGetTerminal:
     """Tests for get_terminal function."""
