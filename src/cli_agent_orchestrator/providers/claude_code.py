@@ -33,7 +33,23 @@ RESPONSE_PATTERN = r"⏺(?:\x1b\[[0-9;]*m)*\s+"  # Handle any ANSI codes between
 # - New format: "✽ Cooking… (6s · ↓ 174 tokens · thinking)"
 # - Minimal format: "✻ Orbiting…" (no parenthesized status)
 # Common: spinner char + text + ellipsis, optionally followed by parenthesized status
-PROCESSING_PATTERN = r"[✶✢✽✻✳].*…"
+PROCESSING_PATTERN = r"[✶✢✽✻✳·].*\u2026"
+# Structural PROCESSING indicator: a spinner line (spinner char + … ) immediately
+# before the ──────── separator line that Claude Code draws before the input prompt.
+# Requires a known spinner character on the same line as … to avoid false-positives
+# from response text or tool outputs that happen to contain … .
+# Allows 0–2 blank lines between the spinner and the separator.
+# The separator line starts with an ANSI colour code (\x1b[38;5;244m) before the
+# box-drawing characters (U+2500), so the pattern skips that prefix explicitly.
+#
+# Processing: "✻ Skedaddling…\n\n────────\n❯ " → spinner+… before separator → PROCESSING
+# Idle/done: "⏺ response text\n────────\n❯ " → no spinner before separator → not PROCESSING
+# Stale spinner: "✢ Thinking…" far back in scrollback, current separator has
+# no spinner immediately before it → not PROCESSING
+THINKING_BEFORE_SEPARATOR_PATTERN = re.compile(
+    r"[^\n]*[✶✢✽✻✳·][^\n]*\u2026[^\n]*\n(?:[^\n]*\n){0,2}(?:\x1b\[[0-9;]*m)*\u2500{20,}",
+    re.MULTILINE,
+)
 IDLE_PROMPT_PATTERN = r"[>❯][\s\xa0]"  # Handle both old ">" and new "❯" prompt styles
 WAITING_USER_ANSWER_PATTERN = (
     r"↑/↓ to navigate"  # Ink TUI footer shown only while a selection widget is active
@@ -258,24 +274,48 @@ class ClaudeCodeProvider(BaseProvider):
     def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
         """Get Claude Code status by analyzing terminal output.
 
-        Uses position-based comparison to prevent stale spinner text in
-        scrollback from masking the current idle state.  Claude Code renders
-        inline (not in the alternate screen buffer), so old spinner lines can
-        persist in tmux scrollback after the cursor-up overwrite fails to
-        reach them.  By comparing the last position of the processing spinner
-        against the last idle prompt, we let the more recent marker decide
-        the current state.  See: https://github.com/awslabs/cli-agent-orchestrator/issues/104
+        Uses a structural "thinking-before-separator" check as the primary
+        PROCESSING indicator, plus position-based fallbacks for edge cases.
+
+        Bug history:
+        1. Stale-spinner bug (#104): Old spinner lines persist in the tmux
+           scrollback after the agent returns to idle (Claude Code renders
+           inline, not alt-screen, inside a tmux pane). Position comparison
+           of last spinner vs last idle prompt catches this.
+
+        2. Mid-tool-execution race (this issue): The ❯ input prompt is ALWAYS
+           rendered at the bottom of the tmux pane (last position in the
+           scrollback buffer). Position-based comparisons against ❯ are
+           therefore unreliable — last_idle.start() is always greater than
+           any other marker when anything has been typed/executed.
+
+        V3 fix (structural): Check whether any line containing … (U+2026,
+        the ellipsis used in all Claude Code thinking/spinner text) appears
+        immediately before the ──────── separator line. Claude Code draws
+        this separator between the active-execution area and the input prompt.
+        When the agent is thinking/processing:
+        "· Swirling… (thinking)\n\n──────────────────────\n❯ "
+        When idle or completed:
+        "some response text\n──────────────────────\n❯ "
+        A stale old spinner line far back in scrollback will NOT be
+        immediately before the separator, so the structural check is immune
+        to the stale-spinner false-positive.
+
+        See: https://github.com/awslabs/cli-agent-orchestrator/issues/104
         """
 
-        # Use tmux client singleton to get window history
         output = tmux_client.get_history(self.session_name, self.window_name, tail_lines=tail_lines)
 
         if not output:
             return TerminalStatus.ERROR
 
-        # Find the LAST occurrence of processing spinner and idle prompt.
-        # Only the relative position matters — whichever appears later in
-        # the buffer reflects the current terminal state.
+        # PRIMARY PROCESSING check: structural — thinking line immediately
+        # before the ──────── separator. Catches ALL spinner variants (including
+        # newer "· Swirling…" format) and is immune to the ❯ position problem.
+        if THINKING_BEFORE_SEPARATOR_PATTERN.search(output):
+            return TerminalStatus.PROCESSING
+
+        # Find the LAST occurrence of each marker for fallback position checks.
         last_processing = None
         for m in re.finditer(PROCESSING_PATTERN, output):
             last_processing = m
@@ -284,9 +324,14 @@ class ClaudeCodeProvider(BaseProvider):
         for m in re.finditer(IDLE_PROMPT_PATTERN, output):
             last_idle = m
 
-        # Currently processing only if spinner appears AFTER the last idle
-        # prompt (or if there is no idle prompt at all).
-        if last_processing:
+        last_response = None
+        for m in re.finditer(RESPONSE_PATTERN, output):
+            last_response = m
+
+        # FALLBACK PROCESSING: spinner visible AND no separator follows it yet
+        # (early in execution before the separator appears). Position comparison
+        # is used here only when no separator is present (safe case).
+        if last_processing and not re.search(r"\u2500{20,}", output):
             if last_idle is None or last_processing.start() > last_idle.start():
                 return TerminalStatus.PROCESSING
 
@@ -299,15 +344,14 @@ class ClaudeCodeProvider(BaseProvider):
         ):
             return TerminalStatus.WAITING_USER_ANSWER
 
-        # Check for completed state (has response + ready prompt)
-        if re.search(RESPONSE_PATTERN, output) and last_idle:
+        # COMPLETED: ⏺ response exists AND ❯ prompt is visible (agent finished).
+        if last_response and last_idle:
             return TerminalStatus.COMPLETED
 
-        # Check for idle state (just ready prompt, no response)
+        # IDLE: shell prompt visible but no response yet (e.g. just initialized).
         if last_idle:
             return TerminalStatus.IDLE
 
-        # If no recognizable state, return ERROR
         return TerminalStatus.ERROR
 
     def get_idle_pattern_for_log(self) -> str:

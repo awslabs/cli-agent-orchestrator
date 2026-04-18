@@ -568,6 +568,16 @@ When you add or remove a skill, all providers pick up the change automatically. 
 
 For full details, see [docs/skills.md](docs/skills.md).
 
+## Plugins
+
+Plugins are observer-only extensions that react to server-side events inside `cao-server` — session and terminal lifecycle changes, and message delivery between agents. Typical uses include forwarding inter-agent messages to external chat (Discord, Slack), audit logging, and observability/metrics export.
+
+Plugins are standard Python packages discovered automatically via the `cao.plugins` entry-point group at server startup. Install a plugin into the same environment as `cao-server`, configure it, and restart the server — no registration step required.
+
+- **Installation, events, and troubleshooting:** [docs/plugins.md](docs/plugins.md)
+- **Ready-to-run example:** [examples/plugins/cao-discord/](examples/plugins/cao-discord/)
+- **Author your own plugin:** use the [cao-plugin skill](skills/cao-plugin/SKILL.md)
+
 ## Security
 
 The server is designed for **localhost-only use**. The WebSocket terminal endpoint (`/terminals/{id}/ws`) provides full PTY access and will reject connections from non-loopback addresses. Do not expose the server to untrusted networks without adding authentication.

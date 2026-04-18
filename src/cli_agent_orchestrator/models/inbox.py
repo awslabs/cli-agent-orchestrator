@@ -6,6 +6,14 @@ from enum import Enum
 from pydantic import BaseModel, Field
 
 
+class OrchestrationType(str, Enum):
+    """Orchestration mode for a message delivery."""
+
+    SEND_MESSAGE = "send_message"
+    HANDOFF = "handoff"
+    ASSIGN = "assign"
+
+
 class MessageStatus(str, Enum):
     """Message status enumeration."""
 

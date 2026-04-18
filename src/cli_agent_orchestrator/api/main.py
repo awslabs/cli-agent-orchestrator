@@ -12,9 +12,9 @@ import subprocess
 import termios
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Dict, List, Optional
+from typing import Annotated, Dict, List, Optional, cast
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field, field_validator
@@ -37,8 +37,9 @@ from cli_agent_orchestrator.constants import (
     TERMINAL_LOG_DIR,
 )
 from cli_agent_orchestrator.models.flow import Flow
-from cli_agent_orchestrator.models.inbox import MessageStatus
+from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalId
+from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services import (
     flow_service,
@@ -127,6 +128,9 @@ async def lifespan(app: FastAPI):
     logger.info("Starting CLI Agent Orchestrator server...")
     setup_logging()
     init_db()
+    registry = PluginRegistry()
+    await registry.load()
+    app.state.plugin_registry = registry
 
     # Run cleanup in background
     asyncio.create_task(asyncio.to_thread(cleanup_old_data))
@@ -136,7 +140,7 @@ async def lifespan(app: FastAPI):
 
     # Start inbox watcher
     inbox_observer = PollingObserver(timeout=INBOX_POLLING_INTERVAL)
-    inbox_observer.schedule(LogFileHandler(), str(TERMINAL_LOG_DIR), recursive=False)
+    inbox_observer.schedule(LogFileHandler(registry), str(TERMINAL_LOG_DIR), recursive=False)
     inbox_observer.start()
     logger.info("Inbox watcher started (PollingObserver)")
 
@@ -154,7 +158,14 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
 
+    await registry.teardown()
     logger.info("Shutting down CLI Agent Orchestrator server...")
+
+
+def get_plugin_registry(request: Request) -> PluginRegistry:
+    """Return the plugin registry stored on the FastAPI application state."""
+
+    return cast(PluginRegistry, request.app.state.plugin_registry)
 
 
 app = FastAPI(
@@ -289,6 +300,7 @@ async def get_skill_content(name: str) -> SkillContentResponse:
 
 @app.post("/sessions", response_model=Terminal, status_code=status.HTTP_201_CREATED)
 async def create_session(
+    request: Request,
     provider: str,
     agent_profile: str,
     session_name: Optional[str] = None,
@@ -300,13 +312,13 @@ async def create_session(
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
-        result = terminal_service.create_terminal(
+        result = session_service.create_session(
             provider=provider,
             agent_profile=agent_profile,
             session_name=session_name,
-            new_session=True,
             working_directory=working_directory,
             allowed_tools=allowed_tools_list,
+            registry=get_plugin_registry(request),
         )
         return result
 
@@ -344,9 +356,9 @@ async def get_session(session_name: str) -> Dict:
 
 
 @app.delete("/sessions/{session_name}")
-async def delete_session(session_name: str) -> Dict:
+async def delete_session(request: Request, session_name: str) -> Dict:
     try:
-        result = session_service.delete_session(session_name)
+        result = session_service.delete_session(session_name, registry=get_plugin_registry(request))
         return {"success": True, **result}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -363,6 +375,7 @@ async def delete_session(session_name: str) -> Dict:
     status_code=status.HTTP_201_CREATED,
 )
 async def create_terminal_in_session(
+    request: Request,
     session_name: str,
     provider: str,
     agent_profile: str,
@@ -383,6 +396,7 @@ async def create_terminal_in_session(
             new_session=False,
             working_directory=working_directory,
             allowed_tools=allowed_tools_list,
+            registry=get_plugin_registry(request),
         )
         return result
     except ValueError as e:
@@ -438,9 +452,21 @@ async def get_terminal_working_directory(terminal_id: TerminalId) -> WorkingDire
 
 
 @app.post("/terminals/{terminal_id}/input")
-async def send_terminal_input(terminal_id: TerminalId, message: str) -> Dict:
+async def send_terminal_input(
+    request: Request,
+    terminal_id: TerminalId,
+    message: str,
+    sender_id: Optional[str] = None,
+    orchestration_type: Optional[OrchestrationType] = None,
+) -> Dict:
     try:
-        success = terminal_service.send_input(terminal_id, message)
+        success = terminal_service.send_input(
+            terminal_id,
+            message,
+            registry=get_plugin_registry(request),
+            sender_id=sender_id,
+            orchestration_type=orchestration_type,
+        )
         return {"success": success}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -493,10 +519,12 @@ async def exit_terminal(terminal_id: TerminalId) -> Dict:
 
 
 @app.delete("/terminals/{terminal_id}")
-async def delete_terminal(terminal_id: TerminalId) -> Dict:
+async def delete_terminal(request: Request, terminal_id: TerminalId) -> Dict:
     """Delete a terminal."""
     try:
-        success = terminal_service.delete_terminal(terminal_id)
+        success = terminal_service.delete_terminal(
+            terminal_id, registry=get_plugin_registry(request)
+        )
         return {"success": success}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -509,11 +537,18 @@ async def delete_terminal(terminal_id: TerminalId) -> Dict:
 
 @app.post("/terminals/{receiver_id}/inbox/messages")
 async def create_inbox_message_endpoint(
-    receiver_id: TerminalId, sender_id: str, message: str
+    request: Request,
+    receiver_id: TerminalId,
+    sender_id: str,
+    message: str,
 ) -> Dict:
     """Create inbox message and attempt immediate delivery."""
     try:
-        inbox_msg = create_inbox_message(sender_id, receiver_id, message)
+        inbox_msg = create_inbox_message(
+            sender_id,
+            receiver_id,
+            message,
+        )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -527,7 +562,9 @@ async def create_inbox_message_endpoint(
     # the terminal becomes idle. Delivery failures must not cause the API
     # to report an error — the message was already persisted above.
     try:
-        inbox_service.check_and_send_pending_messages(receiver_id)
+        inbox_service.check_and_send_pending_messages(
+            receiver_id, registry=get_plugin_registry(request)
+        )
     except Exception as e:
         logger.warning(f"Immediate delivery attempt failed for {receiver_id}: {e}")
 

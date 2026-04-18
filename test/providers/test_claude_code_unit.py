@@ -258,6 +258,77 @@ class TestClaudeCodeProviderStatusDetection:
         assert provider.get_status() == TerminalStatus.IDLE
 
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_get_status_processing_spinner_before_separator(self, mock_tmux):
+        """Spinner immediately before ──────── separator → PROCESSING (structural check)."""
+        mock_tmux.get_history.return_value = (
+            "❯ do the task\n"
+            "⏺ Let me read the file\n"
+            "✢ Thinking…\n"
+            "\n"
+            "────────────────────────\n"
+            "❯ "
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_get_status_completed_no_spinner_before_separator(self, mock_tmux):
+        """Response text (no spinner) before separator → COMPLETED, not PROCESSING."""
+        mock_tmux.get_history.return_value = (
+            "❯ do the task\n" "⏺ Here is the completed response\n" "────────────────────────\n" "❯ "
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_get_status_stale_spinner_far_back_not_processing(self, mock_tmux):
+        """Stale spinner far back in scrollback + current separator with no spinner → COMPLETED."""
+        mock_tmux.get_history.return_value = (
+            "✢ Thinking…\n"
+            "⏺ Old response from first task line 1\n"
+            "Old response from first task line 2\n"
+            "Old response from first task line 3\n"
+            "Old response from first task line 4\n"
+            "────────────────────────\n"
+            "❯ second task\n"
+            "⏺ Completed second response\n"
+            "────────────────────────\n"
+            "❯ "
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_get_status_processing_no_separator_yet(self, mock_tmux):
+        """Early execution with spinner but no separator yet → position fallback PROCESSING."""
+        mock_tmux.get_history.return_value = "✻ Orbiting…"
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_get_status_processing_ansi_separator(self, mock_tmux):
+        """Spinner before separator with ANSI colour codes on separator → PROCESSING."""
+        mock_tmux.get_history.return_value = (
+            "❯ do the task\n"
+            "⏺ Reading file…\n"
+            "✽ Cooking…\n"
+            "\n"
+            "\x1b[38;5;244m────────────────────────\x1b[0m\n"
+            "❯ "
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_get_status_processing_middle_dot_spinner(self, mock_tmux):
+        """New · Swirling… spinner variant → PROCESSING via structural check."""
+        mock_tmux.get_history.return_value = (
+            "❯ do the task\n" "· Swirling…\n" "\n" "────────────────────────\n" "❯ "
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
     def test_get_status_idle_not_false_processing_from_status_bar(self, mock_tmux):
         """Status bar '· latest:…' must not false-positive as PROCESSING."""
         mock_tmux.get_history.return_value = (
