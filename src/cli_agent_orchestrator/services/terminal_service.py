@@ -135,20 +135,20 @@ def create_terminal(
         # Step 3b: Load the profile once for allowed tool resolution before
         # provider initialization. The skill catalog is global and does not
         # depend on profile contents.
-        profile = load_agent_profile(agent_profile)
+        try:
+            profile = load_agent_profile(agent_profile)
+        except FileNotFoundError:
+            profile = None
         skill_prompt = build_skill_catalog()
 
         # Step 3c: Resolve allowed_tools from profile if not explicitly provided
-        if allowed_tools is None:
-            try:
-                from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
+        if allowed_tools is None and profile is not None:
+            from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
 
-                mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
-                allowed_tools = resolve_allowed_tools(
-                    profile.allowedTools, profile.role, mcp_server_names
-                )
-            except FileNotFoundError:
-                pass  # Profile not found; no tool restrictions
+            mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
+            allowed_tools = resolve_allowed_tools(
+                profile.allowedTools, profile.role, mcp_server_names
+            )
 
         # Step 4: Create and initialize the CLI provider
         # This starts the agent (e.g., runs "kiro-cli chat --agent developer")
