@@ -9,8 +9,8 @@ from click.testing import CliRunner
 from cli_agent_orchestrator.cli.commands.launch import launch
 
 
-def test_launch_includes_working_directory():
-    """Test that launch command includes current working directory in the params passed to subprocess."""
+def test_launch_passes_cwd_by_default():
+    """Test that launch command sends current working directory when not explicitly provided."""
     runner = CliRunner()
 
     with (
@@ -33,9 +33,7 @@ def test_launch_includes_working_directory():
 
         # Verify requests.post was called with working_directory parameter
         mock_post.assert_called_once()
-        call_args = mock_post.call_args
-        params = call_args.kwargs["params"]
-
+        params = mock_post.call_args.kwargs["params"]
         assert "working_directory" in params
         assert params["working_directory"] == os.path.realpath(os.getcwd())
 
