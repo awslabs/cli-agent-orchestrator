@@ -230,8 +230,7 @@ class KiroCliProvider(BaseProvider):
         if tui_working_matches:
             last_working_pos = tui_working_matches[-1].end()
             idle_after_working = any(
-                m.start() > last_working_pos
-                for m in new_tui_idle_matches + old_idle_matches
+                m.start() > last_working_pos for m in new_tui_idle_matches + old_idle_matches
             )
             if not idle_after_working:
                 return TerminalStatus.PROCESSING
