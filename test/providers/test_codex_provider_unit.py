@@ -73,6 +73,7 @@ class TestCodexBuildCommand:
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_build_command_with_skill_prompt(self, mock_load_profile):
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = "You are a supervisor."
         mock_profile.mcpServers = None
         mock_load_profile.return_value = mock_profile
@@ -94,6 +95,7 @@ class TestCodexBuildCommand:
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_build_command_with_agent_profile(self, mock_load_profile):
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = "You are a code supervisor agent."
         mock_profile.mcpServers = None
         mock_load_profile.return_value = mock_profile
@@ -110,6 +112,7 @@ class TestCodexBuildCommand:
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_build_command_escapes_quotes(self, mock_load_profile):
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = 'Use "double quotes" carefully.'
         mock_profile.mcpServers = None
         mock_load_profile.return_value = mock_profile
@@ -122,6 +125,7 @@ class TestCodexBuildCommand:
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_build_command_escapes_newlines(self, mock_load_profile):
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = "Line one.\nLine two.\n\n## Section\n- Item"
         mock_profile.mcpServers = None
         mock_load_profile.return_value = mock_profile
@@ -137,6 +141,7 @@ class TestCodexBuildCommand:
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_build_command_with_mcp_servers(self, mock_load_profile):
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = "You are a supervisor."
         mock_profile.mcpServers = {
             "cao-mcp-server": {
@@ -163,6 +168,7 @@ class TestCodexBuildCommand:
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_build_command_with_mcp_servers_env(self, mock_load_profile):
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = ""
         mock_profile.mcpServers = {
             "test-server": {
@@ -186,6 +192,7 @@ class TestCodexBuildCommand:
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_build_command_mcp_preserves_existing_env_vars(self, mock_load_profile):
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = ""
         mock_profile.mcpServers = {
             "my-server": {
@@ -207,6 +214,7 @@ class TestCodexBuildCommand:
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_build_command_empty_system_prompt(self, mock_load_profile):
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = ""
         mock_profile.mcpServers = None
         mock_load_profile.return_value = mock_profile
@@ -220,6 +228,7 @@ class TestCodexBuildCommand:
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_build_command_none_system_prompt(self, mock_load_profile):
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = None
         mock_profile.mcpServers = None
         mock_load_profile.return_value = mock_profile
@@ -249,6 +258,7 @@ class TestCodexBuildCommand:
         mock_wait_status.return_value = True
         mock_tmux.get_history.return_value = "OpenAI Codex (v0.98.0)"
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = "You are a supervisor."
         mock_profile.mcpServers = None
         mock_load_profile.return_value = mock_profile
@@ -261,6 +271,36 @@ class TestCodexBuildCommand:
         codex_call = mock_tmux.send_keys.call_args_list[1]
         assert "developer_instructions=" in codex_call.args[2]
         assert "You are a supervisor." in codex_call.args[2]
+
+
+class TestCodexProviderModelFlag:
+    """Tests that profile.model is forwarded to Codex via --model."""
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_build_command_appends_model_when_set(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = "gpt-5"
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+
+        assert "--model gpt-5" in command
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_build_command_omits_model_when_unset(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+
+        assert "--model" not in command
 
 
 class TestCodexProviderStatusDetection:

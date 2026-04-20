@@ -110,6 +110,7 @@ class TestGeminiCliProviderInitialization:
         idle_output = " *   Type your message or @path/to/file\n"
         mock_tmux.get_history.side_effect = ["CAO_SHELL_READY", idle_output]
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {
             "cao-mcp-server": {
@@ -186,6 +187,7 @@ class TestGeminiCliProviderInitialization:
         mock_time.time.side_effect = [0, 0, 0, 0, 0, 0, 0]
         mock_time.sleep = MagicMock()
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = "You are a supervisor."
         mock_profile.mcpServers = {}
         mock_load.return_value = mock_profile
@@ -224,6 +226,7 @@ class TestGeminiCliProviderInitialization:
     def test_build_command_sets_prompt_interactive_flag(self, mock_tmux, mock_load):
         """Test _build_gemini_command sets _uses_prompt_interactive when -i is used."""
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = "You are a supervisor."
         mock_profile.mcpServers = {}
         mock_load.return_value = mock_profile
@@ -240,6 +243,7 @@ class TestGeminiCliProviderInitialization:
     def test_build_command_no_prompt_interactive_without_system_prompt(self, mock_tmux, mock_load):
         """Test _uses_prompt_interactive stays False when profile has no system prompt."""
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = ""
         mock_profile.mcpServers = {}
         mock_load.return_value = mock_profile
@@ -711,6 +715,7 @@ class TestGeminiCliProviderBuildCommand:
     def test_build_command_with_mcp_config(self, mock_load, tmp_path):
         """Test command with MCP server writes to settings.json, not gemini mcp add."""
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {"test-server": {"command": "npx", "args": ["test-pkg"]}}
         mock_load.return_value = mock_profile
@@ -741,6 +746,7 @@ class TestGeminiCliProviderBuildCommand:
         mock_server.model_dump.return_value = {"command": "node", "args": ["server.js"]}
 
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {"my-server": mock_server}
         mock_load.return_value = mock_profile
@@ -765,6 +771,7 @@ class TestGeminiCliProviderBuildCommand:
     def test_build_command_profile_no_mcp(self, mock_load, mock_tmux, tmp_path):
         """Test command with profile writes GEMINI.md and uses short -i acknowledgment."""
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.name = "developer"
         mock_profile.system_prompt = "You are a developer"
         mock_profile.mcpServers = None
@@ -797,6 +804,7 @@ class TestGeminiCliProviderBuildCommand:
         existing_md.write_text("User's existing instructions")
 
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.name = "supervisor"
         mock_profile.system_prompt = "Supervisor agent prompt"
         mock_profile.mcpServers = None
@@ -820,6 +828,7 @@ class TestGeminiCliProviderBuildCommand:
     def test_build_command_system_prompt_no_working_dir(self, mock_load, mock_tmux):
         """Test -i flag still used when working dir unavailable (GEMINI.md skipped)."""
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.name = "developer"
         mock_profile.system_prompt = "You are a developer"
         mock_profile.mcpServers = None
@@ -847,6 +856,7 @@ class TestGeminiCliProviderBuildCommand:
     def test_build_command_multiple_mcp_servers(self, mock_load, tmp_path):
         """Test multiple MCP servers are all written to settings.json."""
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {
             "server-a": {"command": "npx", "args": ["-y", "server-a"]},
@@ -876,6 +886,42 @@ class TestGeminiCliProviderBuildCommand:
 # =============================================================================
 # Misc / lifecycle tests
 # =============================================================================
+
+
+class TestGeminiCliProviderModelFlag:
+    """Tests that profile.model is forwarded to Gemini CLI via --model."""
+
+    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
+    def test_build_command_appends_model_when_set(self, mock_load, mock_tmux, tmp_path):
+        mock_tmux.get_pane_working_directory.return_value = str(tmp_path)
+        mock_profile = MagicMock()
+        mock_profile.model = "gemini-2.5-pro"
+        mock_profile.name = "agent"
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_load.return_value = mock_profile
+
+        provider = GeminiCliProvider("term-1", "session-1", "window-1", "agent")
+        command = provider._build_gemini_command()
+
+        assert "--model gemini-2.5-pro" in command
+
+    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
+    def test_build_command_omits_model_when_unset(self, mock_load, mock_tmux, tmp_path):
+        mock_tmux.get_pane_working_directory.return_value = str(tmp_path)
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.name = "agent"
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_load.return_value = mock_profile
+
+        provider = GeminiCliProvider("term-1", "session-1", "window-1", "agent")
+        command = provider._build_gemini_command()
+
+        assert "--model" not in command
 
 
 class TestGeminiCliProviderMisc:
