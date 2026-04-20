@@ -334,7 +334,9 @@ class CopilotCliProvider(BaseProvider):
             return True
         # Copilot v1.0.31+ cwd breadcrumb: " ~/path [⎇ branch*%]"
         # (pre-v1.0.31 form included "(0x)" and was caught by the \(\d+x\) check above)
-        if re.match(COPILOT_CWD_BREADCRUMB_PATTERN, line):  # intentionally use raw line (preserves leading spaces)
+        if re.match(
+            COPILOT_CWD_BREADCRUMB_PATTERN, line
+        ):  # intentionally use raw line (preserves leading spaces)
             return True
         return False
 
