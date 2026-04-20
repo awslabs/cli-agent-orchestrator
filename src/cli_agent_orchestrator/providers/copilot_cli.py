@@ -130,18 +130,17 @@ class CopilotCliProvider(BaseProvider):
 
         if self._agent_profile:
             command_parts.extend(["--agent", self._agent_profile])
-            if self._supports_flag("--model"):
-                try:
-                    profile = load_agent_profile(self._agent_profile)
-                except Exception as exc:
-                    logger.warning(
-                        "Could not load agent profile '%s' for model selection: %s",
-                        self._agent_profile,
-                        exc,
-                    )
-                else:
-                    if profile.model:
-                        command_parts.extend(["--model", profile.model])
+            try:
+                profile = load_agent_profile(self._agent_profile)
+            except Exception as exc:
+                logger.warning(
+                    "Could not load agent profile '%s' for model selection: %s",
+                    self._agent_profile,
+                    exc,
+                )
+            else:
+                if profile.model:
+                    command_parts.extend(["--model", profile.model])
 
         command_parts.extend(["--config-dir", str(config_dir)])
         try:

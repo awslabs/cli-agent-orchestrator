@@ -185,30 +185,6 @@ class TestCopilotCliProviderModelFlag:
     )
     @patch("cli_agent_orchestrator.providers.copilot_cli.tmux_client")
     @patch.dict("os.environ", {}, clear=True)
-    def test_command_skips_model_when_flag_unsupported(
-        self, mock_tmux, mock_build_mcp, mock_supports_flag, mock_load
-    ):
-        # --additional-mcp-config is probed first, then --model. When copilot
-        # predates --model, the capability probe returns False and no profile
-        # is loaded for model selection.
-        mock_supports_flag.return_value = False
-        mock_tmux.get_pane_working_directory.return_value = "/tmp/project"
-
-        provider = CopilotCliProvider(
-            "test1234", "test-session", "window-0", agent_profile="repo-agent"
-        )
-        parts = shlex.split(provider._command())
-
-        assert "--model" not in parts
-        mock_load.assert_not_called()
-
-    @patch("cli_agent_orchestrator.providers.copilot_cli.load_agent_profile")
-    @patch("cli_agent_orchestrator.providers.copilot_cli.CopilotCliProvider._supports_flag")
-    @patch(
-        "cli_agent_orchestrator.providers.copilot_cli.CopilotCliProvider._build_runtime_mcp_config"
-    )
-    @patch("cli_agent_orchestrator.providers.copilot_cli.tmux_client")
-    @patch.dict("os.environ", {}, clear=True)
     def test_command_tolerates_profile_load_failure(
         self, mock_tmux, mock_build_mcp, mock_supports_flag, mock_load
     ):
