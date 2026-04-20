@@ -218,6 +218,8 @@ class GeminiCliProvider(BaseProvider):
             try:
                 profile = load_agent_profile(self._agent_profile)
 
+                command_parts.extend(self._model_args(profile))
+
                 # System prompt injection: write to GEMINI.md so Gemini loads it
                 # as persistent project context on startup.
                 #

@@ -4,6 +4,7 @@ from typing import Optional
 
 import pytest
 
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 
@@ -84,6 +85,21 @@ class TestBaseProvider:
         provider = ConcreteProvider("term-123", "session-1", "window-0", skill_prompt="## Skills")
         result = provider._apply_skill_prompt("")
         assert result == "## Skills"
+
+    def test_model_args_returns_flag_when_set(self):
+        provider = ConcreteProvider("term-123", "session-1", "window-0")
+        profile = AgentProfile(name="a", description="d", model="sonnet")
+        assert provider._model_args(profile) == ["--model", "sonnet"]
+
+    def test_model_args_empty_when_unset(self):
+        provider = ConcreteProvider("term-123", "session-1", "window-0")
+        profile = AgentProfile(name="a", description="d")
+        assert provider._model_args(profile) == []
+
+    def test_model_args_empty_when_blank(self):
+        provider = ConcreteProvider("term-123", "session-1", "window-0")
+        profile = AgentProfile(name="a", description="d", model="")
+        assert provider._model_args(profile) == []
 
     def test_abstract_methods_implemented(self):
         """Test that concrete implementation works."""

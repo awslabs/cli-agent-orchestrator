@@ -76,6 +76,7 @@ class TestClaudeCodeProviderInitialization:
         mock_wait_status.return_value = True
         mock_tmux.get_history.return_value = "Welcome to Claude Code v2.0"
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = "Test system prompt"
         mock_profile.mcpServers = None
         mock_load.return_value = mock_profile
@@ -113,6 +114,7 @@ class TestClaudeCodeProviderInitialization:
         mock_wait_status.return_value = True
         mock_tmux.get_history.return_value = "Welcome to Claude Code v2.0"
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {"server1": {"command": "test", "args": ["--flag"]}}
         mock_load.return_value = mock_profile
@@ -493,6 +495,7 @@ class TestClaudeCodeProviderMisc:
     def test_build_claude_command_with_system_prompt(self, mock_load):
         """Test building Claude command with system prompt."""
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = "Test prompt\nwith newlines"
         mock_profile.mcpServers = None
         mock_load.return_value = mock_profile
@@ -507,6 +510,7 @@ class TestClaudeCodeProviderMisc:
     def test_build_command_mcp_injects_terminal_id(self, mock_load):
         """Test that _build_claude_command injects CAO_TERMINAL_ID into MCP server env."""
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {
             "cao-mcp-server": {"command": "cao-mcp-server", "args": ["--port", "8080"]}
@@ -531,6 +535,7 @@ class TestClaudeCodeProviderMisc:
     def test_build_command_mcp_preserves_existing_env(self, mock_load):
         """Test that existing env vars in MCP config are preserved when injecting CAO_TERMINAL_ID."""
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {
             "my-server": {
@@ -559,6 +564,7 @@ class TestClaudeCodeProviderMisc:
     def test_build_command_mcp_does_not_override_existing_terminal_id(self, mock_load):
         """Test that an existing CAO_TERMINAL_ID in MCP env is NOT overwritten."""
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {
             "my-server": {
@@ -579,6 +585,36 @@ class TestClaudeCodeProviderMisc:
         server_env = mcp_data["mcpServers"]["my-server"]["env"]
         # Should keep the user-provided value, NOT overwrite with term-99
         assert server_env["CAO_TERMINAL_ID"] == "user-provided-id"
+
+
+class TestClaudeCodeProviderModelFlag:
+    """Tests that profile.model is forwarded to Claude Code via --model."""
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_build_command_appends_model_when_set(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = "sonnet"
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent")
+        command = provider._build_claude_command()
+
+        assert "--model sonnet" in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_build_command_omits_model_when_unset(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent")
+        command = provider._build_claude_command()
+
+        assert "--model" not in command
 
 
 class TestClaudeCodeProviderStartupPrompts:
