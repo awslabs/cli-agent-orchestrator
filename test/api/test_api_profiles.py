@@ -85,10 +85,13 @@ class TestInstallAgentProfileEndpoint:
         ) as mock_install:
             response = client.post(
                 "/agents/profiles/install",
-                params={
+                json={
                     "source": "developer",
                     "provider": "kiro_cli",
-                    "env_vars": '{"API_TOKEN": "secret-token", "BASE_URL": "http://localhost:27124"}',
+                    "env_vars": {
+                        "API_TOKEN": "secret-token",
+                        "BASE_URL": "http://localhost:27124",
+                    },
                 },
             )
 
@@ -111,18 +114,17 @@ class TestInstallAgentProfileEndpoint:
         ):
             response = client.post(
                 "/agents/profiles/install",
-                params={"source": "missing", "provider": "kiro_cli"},
+                json={"source": "missing", "provider": "kiro_cli"},
             )
 
         assert response.status_code == 400
         assert response.json()["detail"] == "Agent profile not found: missing"
 
-    def test_returns_400_for_invalid_env_var_string(self, client) -> None:
-        """Non-JSON env_vars should fail request validation."""
+    def test_returns_422_for_malformed_env_vars(self, client) -> None:
+        """Env vars with the wrong type should be rejected by Pydantic validation."""
         response = client.post(
             "/agents/profiles/install",
-            params={"source": "developer", "env_vars": "INVALID_FORMAT"},
+            json={"source": "developer", "env_vars": "INVALID_FORMAT"},
         )
 
-        assert response.status_code == 400
-        assert "Invalid env_vars JSON" in response.json()["detail"]
+        assert response.status_code == 422

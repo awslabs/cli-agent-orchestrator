@@ -1,6 +1,5 @@
 """CAO operations MCP server implementation."""
 
-import json
 from typing import Annotated, Any, Dict, List, Optional
 
 import requests  # type: ignore[import-untyped]
@@ -61,11 +60,17 @@ def _request_json(
     path: str,
     *,
     params: Optional[Dict[str, Any]] = None,
+    json: Optional[Any] = None,
     operation: str,
 ) -> tuple[Optional[Any], Optional[str]]:
     """Execute an API request and return either JSON data or an error message."""
     try:
-        response = requests.request(method, f"{API_BASE_URL}{path}", params=params)
+        response = requests.request(
+            method,
+            f"{API_BASE_URL}{path}",
+            params=params,
+            json=json,
+        )
     except requests.RequestException as exc:
         return None, f"{operation} failed: {exc}"
 
@@ -76,13 +81,6 @@ def _request_json(
         return response.json(), None
     except ValueError as exc:
         return None, f"{operation} failed: invalid JSON response ({exc})"
-
-
-def _serialize_env_vars(env_vars: Optional[Dict[str, str]]) -> Optional[str]:
-    """Serialize env var mappings into the API's JSON format."""
-    if not env_vars:
-        return None
-    return json.dumps(env_vars)
 
 
 def _serialize_allowed_tools(allowed_tools: Optional[List[str]]) -> Optional[str]:
@@ -229,15 +227,14 @@ async def install_profile(
     Returns:
         InstallResult with success status, file paths, and unresolved env vars
     """
-    params: Dict[str, Any] = {"source": source, "provider": provider}
-    serialized_env_vars = _serialize_env_vars(env_vars)
-    if serialized_env_vars:
-        params["env_vars"] = serialized_env_vars
+    body: Dict[str, Any] = {"source": source, "provider": provider}
+    if env_vars:
+        body["env_vars"] = env_vars
 
     data, error = _request_json(
         "post",
         "/agents/profiles/install",
-        params=params,
+        json=body,
         operation=f"Install profile '{source}'",
     )
     if error:

@@ -70,6 +70,7 @@ class TestProfileTools:
             "get",
             "http://127.0.0.1:9889/agents/profiles",
             params=None,
+            json=None,
         )
 
     async def test_list_profiles_returns_empty_list(self) -> None:
@@ -153,7 +154,8 @@ class TestProfileTools:
         mock_request.assert_called_once_with(
             "post",
             "http://127.0.0.1:9889/agents/profiles/install",
-            params={"source": "developer", "provider": "kiro_cli"},
+            params=None,
+            json={"source": "developer", "provider": "kiro_cli"},
         )
 
     async def test_install_profile_returns_result_for_url_source(self) -> None:
@@ -176,11 +178,12 @@ class TestProfileTools:
         mock_request.assert_called_once_with(
             "post",
             "http://127.0.0.1:9889/agents/profiles/install",
-            params={"source": "https://example.com/remote.md", "provider": "q_cli"},
+            params=None,
+            json={"source": "https://example.com/remote.md", "provider": "q_cli"},
         )
 
-    async def test_install_profile_serializes_env_vars(self) -> None:
-        """Env var maps should be serialized into the API's JSON format."""
+    async def test_install_profile_forwards_env_vars(self) -> None:
+        """Env var maps should be forwarded to the API install endpoint."""
         payload = {
             "success": True,
             "message": "installed",
@@ -202,10 +205,11 @@ class TestProfileTools:
         mock_request.assert_called_once_with(
             "post",
             "http://127.0.0.1:9889/agents/profiles/install",
-            params={
+            params=None,
+            json={
                 "source": "developer",
                 "provider": "kiro_cli",
-                "env_vars": '{"API_TOKEN": "secret", "BASE_URL": "http://localhost:27124"}',
+                "env_vars": {"API_TOKEN": "secret", "BASE_URL": "http://localhost:27124"},
             },
         )
 
@@ -281,6 +285,7 @@ class TestSessionLifecycleTools:
                 "session_name": "cao-generated",
                 "allowed_tools": "fs_read,execute_bash",
             },
+            json=None,
         )
 
     async def test_launch_session_passes_custom_params(self) -> None:
@@ -313,6 +318,7 @@ class TestSessionLifecycleTools:
                 "session_name": "custom-session",
                 "working_directory": "/workspace/project",
             },
+            json=None,
         )
 
     async def test_launch_session_returns_failure_on_api_error(self) -> None:
@@ -368,6 +374,7 @@ class TestSessionLifecycleTools:
             "post",
             "http://127.0.0.1:9889/terminals/term-123/inbox/messages",
             params={"sender_id": "cao-ops-mcp", "message": "Build feature X"},
+            json=None,
         )
 
     async def test_send_session_message_returns_failure_for_not_found(self) -> None:

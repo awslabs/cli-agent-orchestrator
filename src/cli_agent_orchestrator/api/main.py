@@ -106,6 +106,18 @@ class WorkingDirectoryResponse(BaseModel):
     )
 
 
+class InstallAgentProfileRequest(BaseModel):
+    """Request body for installing an agent profile.
+
+    ``env_vars`` travels in the JSON body rather than as a query parameter so
+    that any secrets callers inject are not written to HTTP access logs.
+    """
+
+    source: str
+    provider: str = DEFAULT_PROVIDER
+    env_vars: Optional[Dict[str, str]] = None
+
+
 class CreateFlowRequest(BaseModel):
     """Request model for creating a flow."""
 
@@ -199,19 +211,6 @@ async def health_check():
     return {"status": "ok", "service": "cli-agent-orchestrator"}
 
 
-def _parse_env_vars(env_vars: str) -> Dict[str, str]:
-    """Parse a JSON-encoded ``{"KEY": "VALUE"}`` string into a mapping."""
-    try:
-        result = json.loads(env_vars)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Invalid env_vars JSON: {exc}") from exc
-
-    if not isinstance(result, dict):
-        raise ValueError("env_vars must be a JSON object mapping string keys to string values")
-
-    return result
-
-
 @app.get("/agents/profiles")
 async def list_agent_profiles_endpoint() -> List[Dict]:
     """List all available agent profiles from all configured directories."""
@@ -241,18 +240,13 @@ async def get_agent_profile_endpoint(name: str) -> Dict:
 
 
 @app.post("/agents/profiles/install")
-async def install_agent_profile_endpoint(
-    source: str,
-    provider: str = DEFAULT_PROVIDER,
-    env_vars: Optional[str] = None,
-) -> InstallResult:
+async def install_agent_profile_endpoint(request: InstallAgentProfileRequest) -> InstallResult:
     """Install an agent profile for a target provider."""
-    try:
-        parsed_env = _parse_env_vars(env_vars) if env_vars else None
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-
-    result = install_agent(source=source, provider=provider, env_vars=parsed_env)
+    result = install_agent(
+        source=request.source,
+        provider=request.provider,
+        env_vars=request.env_vars,
+    )
     if not result.success:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=result.message)
 

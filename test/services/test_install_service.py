@@ -211,7 +211,7 @@ class TestInstallAgent:
         )
 
         with patch(
-            "cli_agent_orchestrator.services.install_service.resources.files",
+            "cli_agent_orchestrator.utils.agent_profiles.resources.files",
             return_value=built_in_dir,
         ):
             result = install_agent("developer", "kiro_cli", {"API_TOKEN": "secret-token"})

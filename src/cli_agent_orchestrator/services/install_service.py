@@ -1,7 +1,6 @@
 """Service helpers for installing agent profiles."""
 
 import re
-from importlib import resources
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Tuple
 
@@ -22,7 +21,7 @@ from cli_agent_orchestrator.models.kiro_agent import KiroAgentConfig
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.q_agent import QAgentConfig
 from cli_agent_orchestrator.utils.agent_profiles import (
-    _validate_agent_name,
+    _read_agent_profile_source,
     parse_agent_profile_text,
 )
 from cli_agent_orchestrator.utils.env import resolve_env_vars, set_env_var
@@ -82,53 +81,6 @@ def parse_env_assignment(env_assignment: str) -> Tuple[str, str]:
     return key, value
 
 
-def _resolve_named_source(agent_name: str) -> str:
-    """Locate a named profile and return its raw content."""
-    _validate_agent_name(agent_name)
-
-    from cli_agent_orchestrator.services.settings_service import (
-        get_agent_dirs,
-        get_extra_agent_dirs,
-    )
-
-    local_profile = LOCAL_AGENT_STORE_DIR / f"{agent_name}.md"
-    if local_profile.exists():
-        return local_profile.read_text(encoding="utf-8")
-
-    for dir_path in get_agent_dirs().values():
-        directory = Path(dir_path)
-        if not directory.exists():
-            continue
-
-        flat_profile = directory / f"{agent_name}.md"
-        if flat_profile.exists():
-            return flat_profile.read_text(encoding="utf-8")
-
-        nested_profile = directory / agent_name / "agent.md"
-        if nested_profile.exists():
-            return nested_profile.read_text(encoding="utf-8")
-
-    for extra_dir in get_extra_agent_dirs():
-        directory = Path(extra_dir)
-        if not directory.exists():
-            continue
-
-        flat_profile = directory / f"{agent_name}.md"
-        if flat_profile.exists():
-            return flat_profile.read_text(encoding="utf-8")
-
-        nested_profile = directory / agent_name / "agent.md"
-        if nested_profile.exists():
-            return nested_profile.read_text(encoding="utf-8")
-
-    agent_store = resources.files("cli_agent_orchestrator.agent_store")
-    built_in_profile = agent_store / f"{agent_name}.md"
-    if built_in_profile.is_file():
-        return built_in_profile.read_text(encoding="utf-8")
-
-    raise FileNotFoundError(f"Agent profile not found: {agent_name}")
-
-
 def _write_context_file(agent_name: str, raw_content: str) -> Path:
     """Write the unresolved profile source to the shared context directory."""
     AGENT_CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
@@ -171,7 +123,7 @@ def install_agent(
             for key, value in env_vars.items():
                 set_env_var(key, value)
 
-        raw_content = _resolve_named_source(agent_name)
+        raw_content = _read_agent_profile_source(agent_name)
         resolved_content = resolve_env_vars(raw_content)
         profile = parse_agent_profile_text(resolved_content, agent_name)
 
