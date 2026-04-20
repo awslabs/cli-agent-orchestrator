@@ -144,6 +144,9 @@ class CodexProvider(BaseProvider):
             try:
                 profile = load_agent_profile(self._agent_profile)
 
+                if profile.model:
+                    command_parts.extend(["--model", profile.model])
+
                 system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
                 system_prompt = self._apply_skill_prompt(system_prompt)
 

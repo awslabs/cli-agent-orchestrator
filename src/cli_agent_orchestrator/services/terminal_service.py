@@ -172,6 +172,7 @@ def create_terminal(
             agent_profile,
             allowed_tools,
             skill_prompt=skill_prompt if provider in RUNTIME_SKILL_PROMPT_PROVIDERS else None,
+            model=profile.model if profile else None,
         )
         provider_instance.initialize()
 
