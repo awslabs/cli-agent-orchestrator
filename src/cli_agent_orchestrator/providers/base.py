@@ -23,7 +23,6 @@ and output format to reliably detect status changes.
 from abc import ABC, abstractmethod
 from typing import List, Optional
 
-from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
 
@@ -165,19 +164,6 @@ class BaseProvider(ABC):
         post-task completed.
         """
         pass
-
-    def _model_args(self, profile: AgentProfile) -> List[str]:
-        """Build the CLI arguments for selecting a model from a profile.
-
-        Claude Code, Codex, Gemini CLI, Copilot CLI, and Kimi CLI all accept
-        the model via a ``--model <value>`` flag, so the helper returns that
-        pair when the profile specifies a model and an empty list otherwise.
-        Providers with other mechanisms (e.g. Q CLI / Kiro CLI, which bake
-        the model into an agent JSON at install time) should not use this.
-        """
-        if profile.model:
-            return ["--model", profile.model]
-        return []
 
     def _apply_skill_prompt(self, system_prompt: str) -> str:
         """Append skill catalog text to a system prompt if available.

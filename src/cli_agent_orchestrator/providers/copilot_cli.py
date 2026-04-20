@@ -140,7 +140,8 @@ class CopilotCliProvider(BaseProvider):
                         exc,
                     )
                 else:
-                    command_parts.extend(self._model_args(profile))
+                    if profile.model:
+                        command_parts.extend(["--model", profile.model])
 
         command_parts.extend(["--config-dir", str(config_dir)])
         try:
