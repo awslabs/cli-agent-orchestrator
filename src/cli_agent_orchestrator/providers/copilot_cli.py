@@ -59,10 +59,12 @@ class CopilotCliProvider(BaseProvider):
         window_name: str,
         agent_profile: Optional[str] = None,
         allowed_tools: Optional[list] = None,
+        model: Optional[str] = None,
     ):
         super().__init__(terminal_id, session_name, window_name, allowed_tools)
         self._initialized = False
         self._agent_profile = agent_profile
+        self._model = model
         self._copilot_help_text_cache: Optional[str] = None
 
     @property
@@ -137,6 +139,8 @@ class CopilotCliProvider(BaseProvider):
 
         if self._agent_profile:
             command_parts.extend(["--agent", self._agent_profile])
+            if self._model:
+                command_parts.extend(["--model", self._model])
 
         command_parts.extend(["--config-dir", str(config_dir)])
         try:
