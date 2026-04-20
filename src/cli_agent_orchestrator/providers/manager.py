@@ -32,6 +32,7 @@ class ProviderManager:
         agent_profile: Optional[str] = None,
         allowed_tools: Optional[List[str]] = None,
         skill_prompt: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> BaseProvider:
         """Create and store provider instance."""
         try:
@@ -81,6 +82,7 @@ class ProviderManager:
                     tmux_window,
                     agent_profile,
                     allowed_tools,
+                    model=model,
                 )
             elif provider_type == ProviderType.GEMINI_CLI.value:
                 provider = GeminiCliProvider(

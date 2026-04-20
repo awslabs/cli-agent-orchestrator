@@ -19,7 +19,6 @@ from libtmux.exc import LibTmuxException
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
-from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_for_shell
 
 logger = logging.getLogger(__name__)
@@ -52,10 +51,12 @@ class CopilotCliProvider(BaseProvider):
         window_name: str,
         agent_profile: Optional[str] = None,
         allowed_tools: Optional[list] = None,
+        model: Optional[str] = None,
     ):
         super().__init__(terminal_id, session_name, window_name, allowed_tools)
         self._initialized = False
         self._agent_profile = agent_profile
+        self._model = model
         self._copilot_help_text_cache: Optional[str] = None
 
     @property
@@ -130,17 +131,8 @@ class CopilotCliProvider(BaseProvider):
 
         if self._agent_profile:
             command_parts.extend(["--agent", self._agent_profile])
-            try:
-                profile = load_agent_profile(self._agent_profile)
-            except Exception as exc:
-                logger.warning(
-                    "Could not load agent profile '%s' for model selection: %s",
-                    self._agent_profile,
-                    exc,
-                )
-            else:
-                if profile.model:
-                    command_parts.extend(["--model", profile.model])
+            if self._model:
+                command_parts.extend(["--model", self._model])
 
         command_parts.extend(["--config-dir", str(config_dir)])
         try:

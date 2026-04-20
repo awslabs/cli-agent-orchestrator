@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import shlex
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -127,49 +127,46 @@ class TestCopilotCliProviderCommand:
 
 
 class TestCopilotCliProviderModelFlag:
-    """Tests that profile.model is forwarded to Copilot CLI via --model."""
+    """Tests that the model kwarg is forwarded to Copilot CLI via --model.
 
-    @patch("cli_agent_orchestrator.providers.copilot_cli.load_agent_profile")
+    The Copilot provider takes the model value directly from the constructor
+    (populated by terminal_service from the already-loaded AgentProfile) to
+    avoid re-loading the profile.
+    """
+
     @patch("cli_agent_orchestrator.providers.copilot_cli.CopilotCliProvider._supports_flag")
     @patch(
         "cli_agent_orchestrator.providers.copilot_cli.CopilotCliProvider._build_runtime_mcp_config"
     )
     @patch("cli_agent_orchestrator.providers.copilot_cli.tmux_client")
     @patch.dict("os.environ", {}, clear=True)
-    def test_command_appends_model_when_set(
-        self, mock_tmux, mock_build_mcp, mock_supports_flag, mock_load
-    ):
+    def test_command_appends_model_when_set(self, mock_tmux, mock_build_mcp, mock_supports_flag):
         mock_supports_flag.return_value = True
         mock_build_mcp.return_value = '{"mcpServers":{"cao-mcp-server":{"command":"x"}}}'
         mock_tmux.get_pane_working_directory.return_value = "/tmp/project"
-        mock_profile = MagicMock()
-        mock_profile.model = "claude-sonnet-4.5"
-        mock_load.return_value = mock_profile
 
         provider = CopilotCliProvider(
-            "test1234", "test-session", "window-0", agent_profile="repo-agent"
+            "test1234",
+            "test-session",
+            "window-0",
+            agent_profile="repo-agent",
+            model="claude-sonnet-4.5",
         )
         parts = shlex.split(provider._command())
 
         assert "--model" in parts
         assert parts[parts.index("--model") + 1] == "claude-sonnet-4.5"
 
-    @patch("cli_agent_orchestrator.providers.copilot_cli.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.copilot_cli.CopilotCliProvider._supports_flag")
     @patch(
         "cli_agent_orchestrator.providers.copilot_cli.CopilotCliProvider._build_runtime_mcp_config"
     )
     @patch("cli_agent_orchestrator.providers.copilot_cli.tmux_client")
     @patch.dict("os.environ", {}, clear=True)
-    def test_command_omits_model_when_unset(
-        self, mock_tmux, mock_build_mcp, mock_supports_flag, mock_load
-    ):
+    def test_command_omits_model_when_unset(self, mock_tmux, mock_build_mcp, mock_supports_flag):
         mock_supports_flag.return_value = True
         mock_build_mcp.return_value = '{"mcpServers":{"cao-mcp-server":{"command":"x"}}}'
         mock_tmux.get_pane_working_directory.return_value = "/tmp/project"
-        mock_profile = MagicMock()
-        mock_profile.model = None
-        mock_load.return_value = mock_profile
 
         provider = CopilotCliProvider(
             "test1234", "test-session", "window-0", agent_profile="repo-agent"
@@ -178,29 +175,27 @@ class TestCopilotCliProviderModelFlag:
 
         assert "--model" not in parts
 
-    @patch("cli_agent_orchestrator.providers.copilot_cli.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.copilot_cli.CopilotCliProvider._supports_flag")
     @patch(
         "cli_agent_orchestrator.providers.copilot_cli.CopilotCliProvider._build_runtime_mcp_config"
     )
     @patch("cli_agent_orchestrator.providers.copilot_cli.tmux_client")
     @patch.dict("os.environ", {}, clear=True)
-    def test_command_tolerates_profile_load_failure(
-        self, mock_tmux, mock_build_mcp, mock_supports_flag, mock_load
+    def test_command_omits_model_when_no_agent_profile(
+        self, mock_tmux, mock_build_mcp, mock_supports_flag
     ):
+        # --model is only meaningful alongside --agent; without an agent
+        # profile the flag is not emitted even if a model is passed.
         mock_supports_flag.return_value = True
         mock_build_mcp.return_value = '{"mcpServers":{"cao-mcp-server":{"command":"x"}}}'
         mock_tmux.get_pane_working_directory.return_value = "/tmp/project"
-        mock_load.side_effect = FileNotFoundError("profile missing")
 
         provider = CopilotCliProvider(
-            "test1234", "test-session", "window-0", agent_profile="repo-agent"
+            "test1234", "test-session", "window-0", model="claude-sonnet-4.5"
         )
         parts = shlex.split(provider._command())
 
-        # Profile load failure is non-fatal: command still builds without --model
         assert "--model" not in parts
-        assert parts[parts.index("--agent") + 1] == "repo-agent"
 
 
 class TestCopilotCliProviderInitialization:
