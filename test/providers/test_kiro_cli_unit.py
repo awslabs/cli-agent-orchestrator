@@ -943,8 +943,34 @@ class TestKiroCliTuiMode:
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
 
-        with pytest.raises(ValueError, match="no separator before Credits"):
+        with pytest.raises(ValueError, match="no separator found near Credits"):
             provider.extract_last_message_from_script(output)
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_tui_extraction_kiro2_forward_scan(self, mock_tmux):
+        """Test extraction exercises the Kiro 2.0 forward scan path.
+
+        Layout: two Credits lines (prev turn + current turn), separator ONLY after
+        the second Credits line. The forward scan from prev_credits_idx+1 to
+        credits_idx finds no separator (separator_idx stays None), then the
+        forward scan from credits_idx+1 finds the separator, triggering the
+        separator_idx > credits_idx branch which extracts prev_credits_idx+1:credits_idx.
+        """
+        output = (
+            "▸ Credits: 0.10 • Time: 1s\n"  # prev turn Credits (prev_credits_idx=0)
+            "  Content between turns\n"  # content for current turn
+            "\n"
+            "  Agent response here.\n"
+            "\n"
+            "▸ Credits: 0.24 • Time: 3s\n"  # current turn Credits (credits_idx=5)
+            "────────────────────────────────────────────────────\n"  # separator AFTER credits
+            "developer · auto · 3%\n"
+            " Ask a question or describe a task ↵"
+        )
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        message = provider.extract_last_message_from_script(output)
+        assert "Agent response here." in message
+        assert "Content between turns" not in message
 
     def test_tui_credits_pattern(self):
         """Test TUI Credits pattern matches expected formats."""

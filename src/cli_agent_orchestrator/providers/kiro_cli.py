@@ -406,11 +406,28 @@ class KiroCliProvider(BaseProvider):
                 separator_idx = i
                 break
 
+        # Kiro 2.0: separator is AFTER credits_idx. Scan forward to find it.
         if separator_idx is None:
-            raise ValueError("No Kiro CLI response found - no separator before Credits marker")
+            next_credits_idx = len(lines)
+            for i in range(credits_idx + 1, len(lines)):
+                if re.search(TUI_CREDITS_PATTERN, lines[i]):
+                    next_credits_idx = i
+                    break
+            for i in range(credits_idx + 1, next_credits_idx):
+                if re.search(TUI_SEPARATOR_PATTERN, lines[i].strip()):
+                    separator_idx = i
+                    break
+
+        if separator_idx is None:
+            raise ValueError("No Kiro CLI response found - no separator found near Credits marker")
 
         # Extract content between separator and Credits
-        content_lines = lines[separator_idx + 1 : credits_idx]
+        if separator_idx > credits_idx:
+            # Kiro 2.0: separator after Credits. Content precedes credits_idx.
+            content_lines = lines[prev_credits_idx + 1 : credits_idx]
+        else:
+            # Pre-2.0: separator before Credits (existing behavior)
+            content_lines = lines[separator_idx + 1 : credits_idx]
 
         # Skip the first paragraph (user message echo).
         # The user message is the first block of non-empty lines after the separator.
