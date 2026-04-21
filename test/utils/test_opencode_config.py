@@ -163,6 +163,17 @@ class TestRemoveAgentTools:
         data = json.loads(tmp_config.read_text())
         assert "agent" not in data or "nonexistent" not in data.get("agent", {})
 
+    def test_noop_on_completely_missing_file(self, tmp_config: Path):
+        """remove_agent_tools when opencode.json does not exist yet should not raise."""
+        assert not tmp_config.exists()
+        remove_agent_tools("anything")  # triggers read_config() skeleton path
+        # The function writes back whatever read_config() returns (skeleton); the file
+        # may or may not exist afterward — what matters is no exception was raised.
+        # If a file was written it must not contain the requested agent key.
+        if tmp_config.exists():
+            data = json.loads(tmp_config.read_text())
+            assert "anything" not in data.get("agent", {})
+
     def test_other_agents_preserved(self, tmp_config: Path):
         upsert_agent_tools("developer", ["cao-mcp-server"])
         upsert_agent_tools("supervisor", ["cao-mcp-server"])

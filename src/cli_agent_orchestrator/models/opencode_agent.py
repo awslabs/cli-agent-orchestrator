@@ -17,7 +17,7 @@ class OpenCodeAgentConfig(BaseModel):
 
     description: str
     mode: Literal["all", "primary", "subagent"] = "all"
+    # Phase 1 simplification: flat {tool: "allow"|"ask"|"deny"} covers all translator output.
+    # Widen to Dict[str, Union[str, Dict[str, str]]] if §7 granular per-command bash patterns
+    # (e.g. bash: {"git status": "allow"}) are needed in a later phase.
     permission: Optional[Dict[str, str]] = None
-
-    class Config:
-        exclude_none = True

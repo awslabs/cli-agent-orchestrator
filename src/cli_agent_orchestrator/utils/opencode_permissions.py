@@ -105,7 +105,10 @@ def cao_tools_to_opencode_permission(
             # CAO-vocabulary tool that was not permitted → deny.
             result[tool] = "deny"
         else:
-            # Should not happen given the sets above cover ALL_OPENCODE_TOOLS.
-            result[tool] = "deny"
+            # A tool was added to ALL_OPENCODE_TOOLS without a policy — fail loudly.
+            raise AssertionError(
+                f"unhandled tool '{tool}': add it to _HARDCODED_DENY, _HARDCODED_ALLOW, "
+                "or _CAO_CATEGORY_MAP in opencode_permissions.py"
+            )
 
     return result
