@@ -1,10 +1,12 @@
 """Read-modify-write helper for the shared ``opencode.json`` config file.
 
 Provides idempotent upsert operations for MCP server declarations and per-agent
-tool gating, as described in §6 of docs/feat-opencode-provider-design.md.
+tool gating, plus the ``to_opencode_agent_id`` helper that derives a single
+slash-safe identifier used consistently for the installed ``.md`` filename,
+the runtime ``--agent`` argument, and the ``agent.<id>.tools`` key.
 
-No file locking is applied in v1; concurrent ``cao install --provider opencode_cli``
-invocations are not a supported scenario (see §6 "Concurrent-write policy").
+No file locking is applied; concurrent ``cao install --provider opencode_cli``
+invocations are not a supported scenario.
 """
 
 import json
@@ -19,14 +21,32 @@ logger = logging.getLogger(__name__)
 _SCHEMA = "https://opencode.ai/config.json"
 
 
+def to_opencode_agent_id(profile_name: str) -> str:
+    """Derive the OpenCode agent ID from a CAO profile name.
+
+    OpenCode treats the filename stem of an agent ``.md`` file as its agent ID
+    (used for ``--agent <id>`` and keyed by the same value under
+    ``agent.<id>`` in ``opencode.json``). Profile names may contain ``/`` —
+    illegal in filenames — so the conversion replaces every slash with ``__``.
+
+    The output is the single source of truth for:
+
+    - the installed ``<id>.md`` filename under ``OPENCODE_AGENTS_DIR``
+    - the ``agent.<id>.tools`` key written to ``opencode.json``
+    - the value passed to ``opencode --agent <id>`` at runtime
+
+    Idempotent: inputs that contain no ``/`` are returned unchanged.
+    """
+    return profile_name.replace("/", "__")
+
+
 def ensure_skills_symlink() -> None:
     """Create ``OPENCODE_CONFIG_DIR/skills`` as a symlink pointing at ``SKILLS_DIR``.
 
     Idempotent: no-op when the correct symlink already exists.
     Warns and skips without modification when the target path is occupied by any
     other entity (non-symlink directory, file, or symlink pointing elsewhere) —
-    per §5.1 of docs/feat-opencode-provider-design.md, CAO does not repair
-    user-owned state at this path.
+    CAO does not repair user-owned state at this path.
     """
     target = OPENCODE_CONFIG_DIR / "skills"
 
@@ -111,7 +131,7 @@ def upsert_mcp_server(name: str, config: Dict[str, Any]) -> None:
     Also sets a default-deny entry ``"<name>*": false`` under the top-level
     ``tools`` section so new agents do not gain the server's tools by default.
 
-    Per §6: name collisions silently overwrite the prior ``mcp`` entry.  The
+    Name collisions silently overwrite the prior ``mcp`` entry.  The
     ``tools`` default-deny is always (re-)set to ``false``.
     """
     data = read_config()
@@ -136,8 +156,14 @@ def upsert_agent_tools(agent_name: str, mcp_names: List[str]) -> None:
 def remove_agent_tools(agent_name: str) -> None:
     """Remove the ``agent.<agent_name>`` section entirely.
 
-    No-ops if the agent entry does not exist.
+    True no-op when the config file doesn't exist or the agent entry is absent
+    — the file is not created just to record a removal.
     """
+    if not OPENCODE_CONFIG_FILE.exists():
+        return
     data = read_config()
-    data.get("agent", {}).pop(agent_name, None)
+    agents = data.get("agent")
+    if not agents or agent_name not in agents:
+        return
+    agents.pop(agent_name)
     write_config(data)

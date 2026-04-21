@@ -29,6 +29,8 @@ from cli_agent_orchestrator.utils.agent_profiles import parse_agent_profile_text
 from cli_agent_orchestrator.utils.env import resolve_env_vars, set_env_var
 from cli_agent_orchestrator.utils.opencode_config import (
     ensure_skills_symlink,
+    remove_agent_tools,
+    to_opencode_agent_id,
     translate_mcp_server_config,
     upsert_agent_tools,
     upsert_mcp_server,
@@ -106,17 +108,7 @@ def _parse_env_assignment(env_assignment: str) -> tuple[str, str]:
         "Repeatable: --env KEY=VALUE. Example: --env API_TOKEN=my-secret-token."
     ),
 )
-@click.option(
-    "--auto-approve",
-    "auto_approve",
-    is_flag=True,
-    default=False,
-    help=(
-        "Emit 'allow' (rather than 'ask') for all permitted tools in the OpenCode agent "
-        "permission block. Has no effect on other providers."
-    ),
-)
-def install(agent_source: str, provider: str, env_vars: tuple[str, ...], auto_approve: bool):
+def install(agent_source: str, provider: str, env_vars: tuple[str, ...]):
     """
     Install an agent from local store, built-in store, URL, or file path.
 
@@ -273,24 +265,27 @@ def install(agent_source: str, provider: str, env_vars: tuple[str, ...], auto_ap
             OPENCODE_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
             ensure_skills_symlink()
             # Use the raw profile prompt as the body — skills are delivered natively
-            # via OpenCode's skill tool through the OPENCODE_CONFIG_DIR/skills symlink
-            # (see §5.1 of docs/feat-opencode-provider-design.md). compose_agent_prompt
-            # is NOT called here so the skill catalog stays out of the system prompt.
+            # via OpenCode's skill tool through the OPENCODE_CONFIG_DIR/skills symlink.
+            # compose_agent_prompt is NOT called here so the skill catalog stays out
+            # of the system prompt.
             body = profile.system_prompt or profile.prompt or ""
             agent_config = OpenCodeAgentConfig(
                 description=profile.description,
                 mode="all",
-                permission=cao_tools_to_opencode_permission(allowed_tools, auto_approve),
+                permission=cao_tools_to_opencode_permission(allowed_tools),
             )
-            safe_filename = profile.name.replace("/", "__")
-            agent_file = OPENCODE_AGENTS_DIR / f"{safe_filename}.md"
+            agent_id = to_opencode_agent_id(profile.name)
+            agent_file = OPENCODE_AGENTS_DIR / f"{agent_id}.md"
             agent_post = frontmatter.Post(
                 body.rstrip() if body else "",
                 **agent_config.model_dump(exclude_none=True),
             )
             agent_file.write_text(frontmatter.dumps(agent_post), encoding="utf-8")
 
-            # Upsert MCP server declarations and per-agent tool gating into opencode.json
+            # Upsert MCP server declarations and per-agent tool gating into opencode.json.
+            # When a profile no longer declares MCP servers, explicitly strip any stale
+            # agent.<id>.tools entry from a previous install so revoked grants do not
+            # survive a reinstall.
             if profile.mcpServers:
                 mcp_names = list(profile.mcpServers.keys())
                 for mcp_name, mcp_cfg in profile.mcpServers.items():
@@ -298,7 +293,9 @@ def install(agent_source: str, provider: str, env_vars: tuple[str, ...], auto_ap
                     # before writing (type:stdio+command str+args → type:local+command list).
                     opencode_mcp_cfg = translate_mcp_server_config(dict(mcp_cfg))
                     upsert_mcp_server(mcp_name, opencode_mcp_cfg)
-                upsert_agent_tools(profile.name, mcp_names)
+                upsert_agent_tools(agent_id, mcp_names)
+            else:
+                remove_agent_tools(agent_id)
 
         click.echo(f"✓ Agent '{profile.name}' installed successfully")
         if env_vars:

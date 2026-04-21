@@ -133,7 +133,7 @@ class TestFreshInstall:
         # Body must contain the raw profile.system_prompt — NOT the baked skill catalog.
         assert "You are a test sentinel agent." in post.content
         # Skills are delivered via the native skills/ symlink; the catalog must NOT
-        # be baked into the system prompt (§5.1 of feat-opencode-provider-design.md).
+        # be baked into the system prompt.
         assert "## Available Skills" not in post.content
 
     def test_ensure_skills_symlink_called(
@@ -152,7 +152,7 @@ class TestFreshInstall:
         assert calls, "ensure_skills_symlink() was not called during opencode_cli install"
 
     def test_no_model_in_frontmatter(self, runner: CliRunner, install_workspace: Dict[str, Any]):
-        """model goes via --model at launch time (§3.1), never in frontmatter."""
+        """model goes via --model at launch time, never in frontmatter."""
         _write_profile(
             install_workspace["local_store"] / "test-agent.md",
             extra_frontmatter="model: anthropic/claude-sonnet-4-6\n",
@@ -227,29 +227,26 @@ class TestIdempotentInstall:
 
 
 # ---------------------------------------------------------------------------
-# Scenario (c): --auto-approve produces permission: allow
+# Scenario (c): permission frontmatter always emits allow/deny (no ask)
 # ---------------------------------------------------------------------------
 
 
-class TestAutoApprove:
-    def test_auto_approve_sets_allow_for_permitted_tools(
-        self, runner: CliRunner, install_workspace: Dict[str, Any]
-    ):
+class TestPermissionTranslation:
+    def test_allowed_tools_emit_allow(self, runner: CliRunner, install_workspace: Dict[str, Any]):
         _write_profile(
             install_workspace["local_store"] / "test-agent.md",
             extra_frontmatter="allowedTools:\n  - fs_read\n  - execute_bash\n",
         )
 
-        runner.invoke(install, ["test-agent", "--provider", "opencode_cli", "--auto-approve"])
+        runner.invoke(install, ["test-agent", "--provider", "opencode_cli"])
 
         post = frontmatter.loads((install_workspace["agents_dir"] / "test-agent.md").read_text())
         perm = post.metadata["permission"]
         assert perm["read"] == "allow"
         assert perm["bash"] == "allow"
 
-    def test_auto_approve_false_uses_ask(
-        self, runner: CliRunner, install_workspace: Dict[str, Any]
-    ):
+    def test_never_emits_ask(self, runner: CliRunner, install_workspace: Dict[str, Any]):
+        """CAO owns the permission decision — ``ask`` must never be written."""
         _write_profile(
             install_workspace["local_store"] / "test-agent.md",
             extra_frontmatter="allowedTools:\n  - fs_read\n",
@@ -259,17 +256,15 @@ class TestAutoApprove:
 
         post = frontmatter.loads((install_workspace["agents_dir"] / "test-agent.md").read_text())
         perm = post.metadata["permission"]
-        assert perm["read"] == "ask"
+        assert "ask" not in perm.values()
 
-    def test_auto_approve_wildcard_allows_all(
-        self, runner: CliRunner, install_workspace: Dict[str, Any]
-    ):
+    def test_wildcard_allows_all(self, runner: CliRunner, install_workspace: Dict[str, Any]):
         _write_profile(
             install_workspace["local_store"] / "test-agent.md",
             extra_frontmatter="allowedTools:\n  - '*'\n",
         )
 
-        runner.invoke(install, ["test-agent", "--provider", "opencode_cli", "--auto-approve"])
+        runner.invoke(install, ["test-agent", "--provider", "opencode_cli"])
 
         post = frontmatter.loads((install_workspace["agents_dir"] / "test-agent.md").read_text())
         perm = post.metadata["permission"]
@@ -284,12 +279,28 @@ class TestAutoApprove:
             extra_frontmatter="allowedTools:\n  - '@builtin'\n",
         )
 
-        runner.invoke(install, ["test-agent", "--provider", "opencode_cli", "--auto-approve"])
+        runner.invoke(install, ["test-agent", "--provider", "opencode_cli"])
 
         post = frontmatter.loads((install_workspace["agents_dir"] / "test-agent.md").read_text())
         perm = post.metadata["permission"]
         for tool in ("task", "question", "webfetch", "websearch", "codesearch"):
             assert perm[tool] == "deny", f"{tool} should always be deny"
+
+    def test_unpermitted_cao_tools_emit_deny(
+        self, runner: CliRunner, install_workspace: Dict[str, Any]
+    ):
+        _write_profile(
+            install_workspace["local_store"] / "test-agent.md",
+            extra_frontmatter="allowedTools:\n  - fs_read\n",
+        )
+
+        runner.invoke(install, ["test-agent", "--provider", "opencode_cli"])
+
+        post = frontmatter.loads((install_workspace["agents_dir"] / "test-agent.md").read_text())
+        perm = post.metadata["permission"]
+        assert perm["bash"] == "deny"
+        assert perm["write"] == "deny"
+        assert perm["edit"] == "deny"
 
 
 # ---------------------------------------------------------------------------
@@ -414,28 +425,83 @@ class TestPreserveExistingConfig:
 
 
 # ---------------------------------------------------------------------------
-# Scenario: safe filename (slash replacement)
+# Scenario: slash-safe agent ID parity (filename === opencode.json key)
 # ---------------------------------------------------------------------------
 
 
-class TestSafeFilename:
-    def test_slash_replaced_in_agent_filename(
-        self, runner: CliRunner, install_workspace: Dict[str, Any]
-    ):
+class TestSlashSafeAgentId:
+    """The sanitized agent ID must be used for both the .md filename and the
+    ``agent.<id>.tools`` key in opencode.json, so the value passed to
+    ``opencode --agent <id>`` at runtime lines up with its MCP grants."""
+
+    def _write_slash_profile(self, install_workspace: Dict[str, Any]) -> None:
         _write_profile(
             install_workspace["local_store"] / "my__agent.md",
             name="my/agent",
+            mcp_servers="  cao-mcp-server:\n    command: cao-mcp-server\n",
         )
         # profile.name "my/agent" → context path would be context_dir/my/agent.md;
         # pre-create the intermediate dir so the context write doesn't fail before
         # reaching the agent-file step that we want to assert on.
         (install_workspace["context_dir"] / "my").mkdir(parents=True, exist_ok=True)
 
-        runner.invoke(install, ["my__agent", "--provider", "opencode_cli"])  # store key uses __
+    def test_slash_replaced_in_agent_filename(
+        self, runner: CliRunner, install_workspace: Dict[str, Any]
+    ):
+        self._write_slash_profile(install_workspace)
 
-        # Profile name contains '/' → file uses '__'
+        runner.invoke(install, ["my__agent", "--provider", "opencode_cli"])
+
         agent_file = install_workspace["agents_dir"] / "my__agent.md"
         assert agent_file.exists()
+
+    def test_opencode_json_uses_sanitized_agent_id(
+        self, runner: CliRunner, install_workspace: Dict[str, Any]
+    ):
+        """The agent.<id>.tools key must use the sanitized filename, not the
+        frontmatter ``name`` with ``/`` in it."""
+        self._write_slash_profile(install_workspace)
+
+        runner.invoke(install, ["my__agent", "--provider", "opencode_cli"])
+
+        data = json.loads(install_workspace["config_file"].read_text())
+        assert "my__agent" in data["agent"], "sanitized agent ID must be the key"
+        assert data["agent"]["my__agent"]["tools"]["cao-mcp-server*"] is True
+        assert (
+            "my/agent" not in data["agent"]
+        ), "unsanitized profile.name must not be written as an agent key"
+
+
+# ---------------------------------------------------------------------------
+# Scenario: reinstalling without MCP strips stale agent.<id>.tools
+# ---------------------------------------------------------------------------
+
+
+class TestStaleMcpGrantsRemoved:
+    def test_reinstall_without_mcp_removes_agent_tools(
+        self, runner: CliRunner, install_workspace: Dict[str, Any]
+    ):
+        # First install: agent has an MCP server → agent.<id>.tools is written.
+        _write_profile(
+            install_workspace["local_store"] / "test-agent.md",
+            mcp_servers="  cao-mcp-server:\n    command: cao-mcp-server\n",
+        )
+        runner.invoke(install, ["test-agent", "--provider", "opencode_cli"])
+
+        data = json.loads(install_workspace["config_file"].read_text())
+        assert "test-agent" in data.get("agent", {}), "precondition: agent entry present"
+
+        # Second install: same agent, MCP servers removed from the profile.
+        _write_profile(
+            install_workspace["local_store"] / "test-agent.md",
+            mcp_servers="",
+        )
+        runner.invoke(install, ["test-agent", "--provider", "opencode_cli"])
+
+        data = json.loads(install_workspace["config_file"].read_text())
+        assert "test-agent" not in data.get(
+            "agent", {}
+        ), "stale agent.<id>.tools entry must be removed on reinstall without MCP"
 
 
 # ---------------------------------------------------------------------------

@@ -31,7 +31,7 @@ from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_sta
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# Regex Patterns — verified from probe fixtures (§8.1 of design doc)
+# Regex Patterns — verified from live OpenCode TUI probe fixtures.
 # =============================================================================
 
 # ANSI escape code pattern — handles 24-bit truecolor sequences (\x1b[38;2;R;G;Bm)
@@ -90,7 +90,7 @@ class OpenCodeCliProvider(BaseProvider):
             window_name: Name of the tmux window
             agent_profile: Name of the installed OpenCode agent (e.g. ``"developer"``)
             allowed_tools: Optional CAO tool list (informational; enforcement is via frontmatter)
-            model: Optional model override passed via ``--model`` at launch (§3.1 exception)
+            model: Optional model override passed via ``--model`` at launch
         """
         super().__init__(terminal_id, session_name, window_name, allowed_tools)
         self._agent_profile = agent_profile or ""
@@ -125,7 +125,7 @@ class OpenCodeCliProvider(BaseProvider):
         1. Wait for the shell prompt in the tmux window.
         2. Send the inline-env ``opencode --agent <name>`` launch command.
         3. Wait for IDLE or COMPLETED with a 120s timeout to cover the first-run
-           ``npm install @opencode-ai/plugin`` blocking period (§8.2, §10.7).
+           ``npm install @opencode-ai/plugin`` blocking period.
 
         Returns:
             True if initialization completed successfully.
@@ -151,7 +151,7 @@ class OpenCodeCliProvider(BaseProvider):
         return True
 
     def _build_launch_command(self) -> str:
-        """Build the inline-env opencode launch command string (§5 of design doc)."""
+        """Build the inline-env opencode launch command string."""
         env_pairs = [
             f"OPENCODE_CONFIG={OPENCODE_CONFIG_FILE}",
             f"OPENCODE_CONFIG_DIR={OPENCODE_CONFIG_DIR}",
@@ -172,7 +172,7 @@ class OpenCodeCliProvider(BaseProvider):
     def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
         """Detect current TUI state from the tmux capture buffer.
 
-        Priority order (§8.3 of design doc):
+        Priority order:
         1. WAITING_USER_ANSWER — permission dialog heading present, no idle footer after it
         2. PROCESSING — ``esc interrupt`` footer; line-level guard prevents stale-buffer
            false positives (lesson #16)
@@ -249,7 +249,7 @@ class OpenCodeCliProvider(BaseProvider):
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract the agent's response from the TUI scrollback.
 
-        Algorithm (§8.4 of design doc):
+        Algorithm:
         1. Strip ANSI codes.
         2. Find the last ``USER_MESSAGE_PATTERN`` (last user turn start).
         3. Find the first full ``COMPLETION_MARKER_PATTERN`` at or after that position.
@@ -357,7 +357,7 @@ class OpenCodeCliProvider(BaseProvider):
         return IDLE_FOOTER_PATTERN
 
     def exit_cli(self) -> str:
-        """Return the command to exit the OpenCode TUI (§8.5)."""
+        """Return the command to exit the OpenCode TUI."""
         return "/exit"
 
     def cleanup(self) -> None:

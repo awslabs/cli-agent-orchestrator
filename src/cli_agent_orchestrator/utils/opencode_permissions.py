@@ -1,12 +1,14 @@
 """CAO allowedTools → OpenCode ``permission:`` frontmatter translator.
 
-Implements the two-step algorithm from §9 of docs/feat-opencode-provider-design.md:
+CAO owns the permission decision, so the output is always ``allow`` or ``deny``
+for every built-in OpenCode tool. ``ask`` is never emitted — OpenCode's native
+runtime prompt is treated as a provider-internal UX that CAO's policy replaces.
+
+Algorithm:
 
 1. Expand CAO shorthand (``*``, ``@builtin``, ``@<mcp>``) in the input list.
-2. Map CAO categories to OpenCode native tool names; apply hardcoded non-vocabulary policy.
-
-Returns a ``{tool: "allow"|"ask"|"deny"}`` dict suitable for the ``permission:``
-frontmatter field of an OpenCode agent ``.md`` file.
+2. Map CAO categories to OpenCode native tool names; apply hardcoded non-vocabulary
+   policy.
 """
 
 from typing import Dict, List
@@ -51,25 +53,18 @@ _HARDCODED_DENY: frozenset = frozenset(["task", "question", "webfetch", "websear
 _HARDCODED_ALLOW: frozenset = frozenset(["todowrite", "skill"])
 
 
-def cao_tools_to_opencode_permission(
-    allowed_tools: List[str],
-    auto_approve: bool,
-) -> Dict[str, str]:
+def cao_tools_to_opencode_permission(allowed_tools: List[str]) -> Dict[str, str]:
     """Translate a CAO ``allowedTools`` list to an OpenCode ``permission:`` dict.
 
     Args:
         allowed_tools: CAO-vocabulary tool list, e.g. ``["@builtin", "execute_bash"]``.
-        auto_approve: When ``True``, permitted tools get ``"allow"``; when
-            ``False``, they get ``"ask"`` (OpenCode prompts the user).
 
     Returns:
-        A ``{tool_name: "allow"|"ask"|"deny"}`` dict covering all 13 OpenCode
+        A ``{tool_name: "allow"|"deny"}`` dict covering all 13 OpenCode
         built-in tools.  ``@<mcp-server>`` entries in ``allowed_tools`` are
-        silently skipped — they are handled via ``opencode.json`` agent tool gating
-        (see §6 of the design doc).
+        silently skipped — they are handled via ``opencode.json`` agent tool
+        gating.
     """
-    permit_value = "allow" if auto_approve else "ask"
-
     # ── Step 1: shorthand expansion ──────────────────────────────────────────
     if "*" in allowed_tools:
         # Unrestricted: every OpenCode tool → allow.
@@ -100,7 +95,7 @@ def cao_tools_to_opencode_permission(
         elif tool in _HARDCODED_ALLOW:
             result[tool] = "allow"
         elif tool in permitted_tools:
-            result[tool] = permit_value
+            result[tool] = "allow"
         elif tool in _CAO_VOCABULARY_TOOLS:
             # CAO-vocabulary tool that was not permitted → deny.
             result[tool] = "deny"

@@ -4,8 +4,6 @@
 
 The OpenCode CLI provider enables CLI Agent Orchestrator (CAO) to work with **OpenCode**, a terminal-based AI assistant with a native agent system. OpenCode uses Markdown files with YAML frontmatter as its agent format — nearly identical to CAO's own profile format — making this integration especially clean.
 
-For the full design rationale, architecture decisions, and permission-mapping tables, see [`docs/feat-opencode-provider-design.md`](feat-opencode-provider-design.md).
-
 ## Prerequisites
 
 1. **OpenCode binary** — install from [opencode.ai](https://opencode.ai):
@@ -51,7 +49,7 @@ uv run cao-server
 # Standard launch — shows tool summary and asks for confirmation
 cao launch --agents developer --provider opencode_cli
 
-# Skip confirmation prompt (restrictions still enforced)
+# Skip CAO's launch-time confirmation prompt (tool restrictions still enforced)
 cao launch --agents developer --provider opencode_cli --auto-approve
 
 # Specify model override
@@ -92,7 +90,7 @@ Storage layout:
 
 OpenCode enforces permissions natively via `permission:` YAML frontmatter in each agent file. CAO translates its `allowedTools` list to an OpenCode `permission:` dict at install time — **no entry in `utils/tool_mapping.py` is needed**.
 
-For the complete CAO-category → OpenCode-tool mapping table and per-tool default policies, see [§9 of the design doc](feat-opencode-provider-design.md#9-tool-vocabulary).
+CAO owns the permission decision, so the translator only ever emits `allow` or `deny`. The `ask` value — OpenCode's native runtime prompt — is intentionally never written, which keeps OpenCode aligned with the other CAO providers (Kiro, Q, Claude Code) where allowed tools are allowed outright.
 
 ### Summary
 
@@ -116,13 +114,9 @@ Tools not in any enabled category default to `deny`. The following tools have ha
 
 Pass `--yolo` (or set `allowedTools: ["*"]` in the profile) to allow all 13 tools including the above.
 
-### Auto-approve
+### `cao launch --auto-approve`
 
-```bash
-cao launch --agents developer --provider opencode_cli --auto-approve
-```
-
-With `--auto-approve`, CAO writes `permission: allow` for all enabled tools into the agent frontmatter at install time. Without it, permission-gated operations raise OpenCode's native `△ Permission required` dialog — CAO detects this as `WAITING_USER_ANSWER` and halts the polling loop until a human confirms.
+`--auto-approve` on `cao launch` matches the repo-wide semantics: it skips CAO's launch-time confirmation prompt only. Tool restrictions are still enforced, and this flag does not modify any files in `OPENCODE_CONFIG_DIR`. It has **no** `cao install` counterpart — install-time permissions are driven entirely by the profile's `allowedTools` / `role`.
 
 ## Skills
 
@@ -139,8 +133,6 @@ OpenCode auto-discovers `<OPENCODE_CONFIG_DIR>/skills/` and makes its contents a
 - Skill additions or removals under `~/.aws/cli-agent-orchestrator/skills/` take effect on the next OpenCode launch with no reinstall required.
 - The agent's system prompt stays lean — only `profile.system_prompt`/`profile.prompt` is written to the `.md` body, with no catalog injection.
 - CAO's `load_skill` MCP tool remains available as a second path to the same content (cross-provider parity).
-
-For the full design rationale, see [§5.1 of docs/feat-opencode-provider-design.md](feat-opencode-provider-design.md#51-skill-delivery-native-discovery).
 
 ## Status Detection
 
@@ -160,7 +152,11 @@ The provider detects terminal state from the tmux capture buffer (ANSI-stripped)
 
 - Each `mcpServers` entry from the agent profile is added under the top-level `mcp` key
 - The server's tools are default-denied globally (`"<servername>*": false` under `tools`)
-- Re-enabled per-agent under `agent.<profile_name>.tools`
+- Re-enabled per-agent under `agent.<agent_id>.tools`
+
+The agent ID is the slash-sanitized form of the profile name (`/` → `__`) — the same identifier used for the installed `.md` filename and the runtime `opencode --agent <id>` argument. This keeps the filename, the `--agent` arg, and the `opencode.json` key aligned for any profile name.
+
+Reinstalling an agent whose profile no longer declares `mcpServers` explicitly removes its `agent.<agent_id>` entry from `opencode.json`, so previously-granted MCP tools do not survive as stale grants.
 
 `CAO_TERMINAL_ID` is **not** written to `opencode.json`. OpenCode spawns MCP subprocesses that inherit the tmux window's environment, so the terminal ID propagates naturally — the same mechanism Kiro uses.
 
@@ -237,10 +233,9 @@ OpenCode itself handles model authentication. Verify your credentials are set fo
 
 ### Permission prompt blocking an automated flow
 
-If OpenCode raises `△ Permission required` and your flow is blocking:
-1. Re-install the agent with `--auto-approve` to bake `permission: allow` into its frontmatter
-2. Or respond to the prompt manually in the tmux window
-3. Or use `--yolo` to disable all restrictions **(DANGEROUS — allows any command including `aws`, `rm`, `curl`)**
+CAO emits only `allow` or `deny` in the permission frontmatter, so `△ Permission required` should not appear for CAO-managed tools. If it does:
+1. Verify the profile's `allowedTools` / `role` grants the tool in question and reinstall — CAO translates allowed tools directly to `permission: allow`.
+2. If the prompt comes from a tool outside CAO's vocabulary, respond to it manually in the tmux window, or use `--yolo` to disable all restrictions **(DANGEROUS — allows any command including `aws`, `rm`, `curl`)**.
 
 ### Status stuck as `PROCESSING`
 
