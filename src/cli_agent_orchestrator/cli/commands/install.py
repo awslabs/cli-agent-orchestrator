@@ -267,7 +267,7 @@ def install(agent_source: str, provider: str, env_vars: tuple[str, ...], auto_ap
         elif provider == ProviderType.OPENCODE_CLI.value:
             OPENCODE_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
             body = compose_agent_prompt(profile)
-            agent_config_oc = OpenCodeAgentConfig(
+            agent_config = OpenCodeAgentConfig(
                 description=profile.description,
                 mode="all",
                 permission=cao_tools_to_opencode_permission(allowed_tools, auto_approve),
@@ -276,7 +276,7 @@ def install(agent_source: str, provider: str, env_vars: tuple[str, ...], auto_ap
             agent_file = OPENCODE_AGENTS_DIR / f"{safe_filename}.md"
             agent_post = frontmatter.Post(
                 body.rstrip() if body else "",
-                **agent_config_oc.model_dump(exclude_none=True),
+                **agent_config.model_dump(exclude_none=True),
             )
             agent_file.write_text(frontmatter.dumps(agent_post), encoding="utf-8")
 

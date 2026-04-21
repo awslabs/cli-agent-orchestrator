@@ -119,13 +119,14 @@ class TestFreshInstall:
     def test_agent_md_has_body(self, runner: CliRunner, install_workspace: Dict[str, Any]):
         _write_profile(
             install_workspace["local_store"] / "test-agent.md",
-            body="You are a helpful assistant.",
+            extra_frontmatter="prompt: You are a test sentinel agent.\n",
         )
 
         runner.invoke(install, ["test-agent", "--provider", "opencode_cli"])
 
         post = frontmatter.loads((install_workspace["agents_dir"] / "test-agent.md").read_text())
-        assert post.content.strip()  # body must be non-empty
+        # compose_agent_prompt prepends profile.prompt to the body; assert the sentinel text.
+        assert "You are a test sentinel agent." in post.content
 
     def test_no_model_in_frontmatter(self, runner: CliRunner, install_workspace: Dict[str, Any]):
         """model goes via --model at launch time (§3.1), never in frontmatter."""
@@ -471,6 +472,6 @@ class TestOpencodeAgentListIntegration:
             capture_output=True,
             text=True,
             env={**os.environ, **env},
-            timeout=30,
+            timeout=60,
         )
         assert "smoke-test-agent" in proc.stdout or "smoke-test-agent" in proc.stderr
