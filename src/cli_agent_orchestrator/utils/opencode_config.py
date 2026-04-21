@@ -8,12 +8,50 @@ invocations are not a supported scenario (see §6 "Concurrent-write policy").
 """
 
 import json
+import logging
 from pathlib import Path
 from typing import Any, Dict, List
 
-from cli_agent_orchestrator.constants import OPENCODE_CONFIG_FILE
+from cli_agent_orchestrator.constants import OPENCODE_CONFIG_DIR, OPENCODE_CONFIG_FILE, SKILLS_DIR
+
+logger = logging.getLogger(__name__)
 
 _SCHEMA = "https://opencode.ai/config.json"
+
+
+def ensure_skills_symlink() -> None:
+    """Create ``OPENCODE_CONFIG_DIR/skills`` as a symlink pointing at ``SKILLS_DIR``.
+
+    Idempotent: no-op when the correct symlink already exists.
+    Warns and skips without modification when the target path is occupied by any
+    other entity (non-symlink directory, file, or symlink pointing elsewhere) —
+    per §5.1 of docs/feat-opencode-provider-design.md, CAO does not repair
+    user-owned state at this path.
+    """
+    target = OPENCODE_CONFIG_DIR / "skills"
+
+    if target.is_symlink():
+        # Handles both valid and broken symlinks.
+        if target.resolve() == SKILLS_DIR.resolve():
+            return  # Already correct — idempotent no-op.
+        logger.warning(
+            "opencode skills symlink at %s points to %s instead of %s — skipping",
+            target,
+            target.resolve(),
+            SKILLS_DIR.resolve(),
+        )
+        return
+
+    if target.exists():
+        # A real directory or file — do not touch it.
+        logger.warning(
+            "opencode skills target %s exists but is not a symlink — skipping",
+            target,
+        )
+        return
+
+    OPENCODE_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    target.symlink_to(SKILLS_DIR)
 
 
 def read_config() -> Dict[str, Any]:

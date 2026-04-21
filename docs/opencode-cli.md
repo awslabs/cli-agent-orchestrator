@@ -124,6 +124,24 @@ cao launch --agents developer --provider opencode_cli --auto-approve
 
 With `--auto-approve`, CAO writes `permission: allow` for all enabled tools into the agent frontmatter at install time. Without it, permission-gated operations raise OpenCode's native `△ Permission required` dialog — CAO detects this as `WAITING_USER_ANSWER` and halts the polling loop until a human confirms.
 
+## Skills
+
+CAO skills (e.g. `cao-supervisor-protocols`, `cao-worker-protocols`) are exposed to OpenCode agents through OpenCode's **native `skill` tool** with progressive loading — they are **not** baked into the agent's system prompt.
+
+At `cao install --provider opencode_cli` time, CAO creates a symlink:
+
+```
+~/.aws/opencode_cli/skills → ~/.aws/cli-agent-orchestrator/skills/
+```
+
+OpenCode auto-discovers `<OPENCODE_CONFIG_DIR>/skills/` and makes its contents available through the `skill` tool. Metadata (name, description) is listed up front; full skill bodies are loaded on demand. This means:
+
+- Skill additions or removals under `~/.aws/cli-agent-orchestrator/skills/` take effect on the next OpenCode launch with no reinstall required.
+- The agent's system prompt stays lean — only `profile.system_prompt`/`profile.prompt` is written to the `.md` body, with no catalog injection.
+- CAO's `load_skill` MCP tool remains available as a second path to the same content (cross-provider parity).
+
+For the full design rationale, see [§5.1 of docs/feat-opencode-provider-design.md](feat-opencode-provider-design.md#51-skill-delivery-native-discovery).
+
 ## Status Detection
 
 The provider detects terminal state from the tmux capture buffer (ANSI-stripped):

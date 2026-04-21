@@ -28,6 +28,7 @@ from cli_agent_orchestrator.models.q_agent import QAgentConfig
 from cli_agent_orchestrator.utils.agent_profiles import parse_agent_profile_text
 from cli_agent_orchestrator.utils.env import resolve_env_vars, set_env_var
 from cli_agent_orchestrator.utils.opencode_config import (
+    ensure_skills_symlink,
     translate_mcp_server_config,
     upsert_agent_tools,
     upsert_mcp_server,
@@ -270,7 +271,12 @@ def install(agent_source: str, provider: str, env_vars: tuple[str, ...], auto_ap
 
         elif provider == ProviderType.OPENCODE_CLI.value:
             OPENCODE_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
-            body = compose_agent_prompt(profile)
+            ensure_skills_symlink()
+            # Use the raw profile prompt as the body — skills are delivered natively
+            # via OpenCode's skill tool through the OPENCODE_CONFIG_DIR/skills symlink
+            # (see §5.1 of docs/feat-opencode-provider-design.md). compose_agent_prompt
+            # is NOT called here so the skill catalog stays out of the system prompt.
+            body = profile.system_prompt or profile.prompt or ""
             agent_config = OpenCodeAgentConfig(
                 description=profile.description,
                 mode="all",

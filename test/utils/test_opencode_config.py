@@ -8,6 +8,7 @@ import pytest
 
 import cli_agent_orchestrator.utils.opencode_config as cfg_module
 from cli_agent_orchestrator.utils.opencode_config import (
+    ensure_skills_symlink,
     read_config,
     remove_agent_tools,
     translate_mcp_server_config,
@@ -23,6 +24,64 @@ def tmp_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     config_file = tmp_path / "opencode_cli" / "opencode.json"
     monkeypatch.setattr(cfg_module, "OPENCODE_CONFIG_FILE", config_file)
     return config_file
+
+
+class TestEnsureSkillsSymlink:
+    """ensure_skills_symlink() creates/validates the skills → SKILLS_DIR symlink."""
+
+    @pytest.fixture()
+    def symlink_env(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """Redirect OPENCODE_CONFIG_DIR and SKILLS_DIR to isolated tmp locations."""
+        config_dir = tmp_path / "opencode_cli"
+        skills_dir = tmp_path / "cao_skills"
+        skills_dir.mkdir()  # SKILLS_DIR must exist for resolve() to work consistently
+
+        monkeypatch.setattr(cfg_module, "OPENCODE_CONFIG_DIR", config_dir)
+        monkeypatch.setattr(cfg_module, "SKILLS_DIR", skills_dir)
+        return {"config_dir": config_dir, "skills_dir": skills_dir}
+
+    def test_creates_symlink_when_target_missing(self, symlink_env):
+        config_dir = symlink_env["config_dir"]
+        skills_dir = symlink_env["skills_dir"]
+        target = config_dir / "skills"
+
+        ensure_skills_symlink()
+
+        assert target.is_symlink()
+        assert target.resolve() == skills_dir.resolve()
+
+    def test_noop_when_correct_symlink_exists(self, symlink_env):
+        config_dir = symlink_env["config_dir"]
+        skills_dir = symlink_env["skills_dir"]
+        target = config_dir / "skills"
+
+        # Create the correct symlink first
+        config_dir.mkdir(parents=True, exist_ok=True)
+        target.symlink_to(skills_dir)
+        mtime_before = target.lstat().st_mtime
+
+        ensure_skills_symlink()
+
+        assert target.is_symlink()
+        assert target.lstat().st_mtime == mtime_before  # unchanged
+
+    def test_warns_and_skips_when_target_is_directory(self, symlink_env, caplog):
+        config_dir = symlink_env["config_dir"]
+        target = config_dir / "skills"
+
+        # Pre-create a real directory (not a symlink)
+        target.mkdir(parents=True, exist_ok=True)
+
+        import logging
+
+        with caplog.at_level(
+            logging.WARNING, logger="cli_agent_orchestrator.utils.opencode_config"
+        ):
+            ensure_skills_symlink()
+
+        # Warning was logged — no write attempted, directory still intact
+        assert any("not a symlink" in rec.message for rec in caplog.records)
+        assert target.is_dir() and not target.is_symlink()
 
 
 class TestTranslateMcpServerConfig:

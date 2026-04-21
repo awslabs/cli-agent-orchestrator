@@ -54,6 +54,11 @@ def install_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Dict[s
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", lambda: []
     )
+    # Suppress ensure_skills_symlink filesystem side-effects in install unit tests.
+    # The symlink helper's own behaviour is covered by test_opencode_config.py.
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.cli.commands.install.ensure_skills_symlink", lambda: None
+    )
 
     return {
         "local_store": local_store,
@@ -119,14 +124,32 @@ class TestFreshInstall:
     def test_agent_md_has_body(self, runner: CliRunner, install_workspace: Dict[str, Any]):
         _write_profile(
             install_workspace["local_store"] / "test-agent.md",
-            extra_frontmatter="prompt: You are a test sentinel agent.\n",
+            body="You are a test sentinel agent.",
         )
 
         runner.invoke(install, ["test-agent", "--provider", "opencode_cli"])
 
         post = frontmatter.loads((install_workspace["agents_dir"] / "test-agent.md").read_text())
-        # compose_agent_prompt prepends profile.prompt to the body; assert the sentinel text.
+        # Body must contain the raw profile.system_prompt — NOT the baked skill catalog.
         assert "You are a test sentinel agent." in post.content
+        # Skills are delivered via the native skills/ symlink; the catalog must NOT
+        # be baked into the system prompt (§5.1 of feat-opencode-provider-design.md).
+        assert "## Available Skills" not in post.content
+
+    def test_ensure_skills_symlink_called(
+        self, runner: CliRunner, install_workspace: Dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ):
+        """ensure_skills_symlink() must be called once per opencode_cli install."""
+        calls: list[int] = []
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.cli.commands.install.ensure_skills_symlink",
+            lambda: calls.append(1),
+        )
+        _write_profile(install_workspace["local_store"] / "test-agent.md")
+
+        runner.invoke(install, ["test-agent", "--provider", "opencode_cli"])
+
+        assert calls, "ensure_skills_symlink() was not called during opencode_cli install"
 
     def test_no_model_in_frontmatter(self, runner: CliRunner, install_workspace: Dict[str, Any]):
         """model goes via --model at launch time (§3.1), never in frontmatter."""
