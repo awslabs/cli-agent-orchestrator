@@ -28,16 +28,23 @@ Added the OpenCode CLI e2e test class (with `require_opencode` fixture), created
 
 ### AC-1 — E2E test passes: `uv run pytest -m e2e test/e2e/test_assign.py -k opencode`
 
-**Blocked — cannot execute.** Explanation:
+**Satisfied — all 3 tests passed.**
 
-- `opencode` binary: **FOUND** at `/usr/local/bin/opencode`
-- `require_opencode` fixture: would **not** skip (binary is present)
-- `require_cao_server` fixture: would **skip** — the old installed `cao-server` binary (PID 55944, `/home/bajablast69/.local/bin/cao-server`) is running on port 9889 but predates Phase 3 and does not know the `opencode_cli` provider type
-- Per user instruction: cannot start a new server on port 9889 in this session
+The dev server was started on port 9888 (`CAO_API_PORT=9888`) leaving the old installed server on port 9889 untouched. Three agent profiles were installed with `--auto-approve` before the run.
 
-The e2e test is structurally complete and follows the exact same pattern as all other provider test classes in `TestKiroCliAssign`, `TestCopilotCliAssign`, etc. The `test_assign_with_callback` method covers all four orchestration modes as required by the acceptance criteria.
+```
+test/e2e/test_assign.py::TestOpenCodeCliAssign::test_assign_data_analyst     PASSED
+test/e2e/test_assign.py::TestOpenCodeCliAssign::test_assign_report_generator PASSED
+test/e2e/test_assign.py::TestOpenCodeCliAssign::test_assign_with_callback    PASSED
+```
 
-**Phase 3 regression check:** No regression was discovered during Phase 4 code authoring. The provider dispatch (`manager.py`), launch command composition (`opencode_cli.py::_build_launch_command`), and env propagation were re-verified via direct Python invocation in Phase 3 review. The e2e run remains the authoritative check per the reviewer's contingent ruling — it should be executed when the port constraint is lifted.
+`test_assign_data_analyst` passed in the first run. `test_assign_report_generator` and `test_assign_with_callback` passed together in 2 minutes 4 seconds (`2 passed in 124.53s`).
+
+**Phase 3 regression discovered and fixed (commit 4c30661):**
+
+The live e2e revealed that `cao install --provider opencode_cli` was writing OpenCode's `opencode.json` with the raw CAO MCP server format (`type: "stdio"`, `command` as string, `args` as separate list) instead of OpenCode's format (`type: "local"`, `command` as a combined list, `enabled: true`). OpenCode rejected the config with: `Configuration is invalid: Invalid input mcp.cao-mcp-server`.
+
+Fix: `translate_mcp_server_config()` added to `utils/opencode_config.py`; the opencode_cli install branch now calls it before `upsert_mcp_server()`. Six unit tests added. The opencode.json was regenerated with the correct format after the fix.
 
 ### AC-2 — `docs/opencode-cli.md` exists with required sections
 
@@ -64,33 +71,17 @@ Also added `cao launch --agents code_supervisor --provider opencode_cli` to the 
 
 ## Test Run Summary
 
+Unit tests (post-regression fix):
 ```
 uv run pytest test/ --ignore=test/e2e -q
-1434 passed, 16 skipped, 4 warnings in 43.78s
+1440 passed, 16 skipped, 4 warnings in 44.13s
 ```
 
-No regressions introduced by Phase 4 changes.
-
----
-
-## E2E Port Constraint — Recommended Unblock Path
-
-To run the e2e test in a future session:
-
-```bash
-# Kill the old installed binary
-pkill -f '/home/bajablast69/.local/bin/cao-server'
-
-# Start the dev server
-uv run cao-server &
-
-# Install profiles for opencode_cli
-uv run cao install examples/assign/data_analyst.md --provider opencode_cli --auto-approve
-uv run cao install examples/assign/report_generator.md --provider opencode_cli --auto-approve
-uv run cao install developer --provider opencode_cli --auto-approve
-
-# Run e2e
-uv run pytest -m e2e test/e2e/test_assign.py -k opencode -v
+E2E tests (`CAO_API_PORT=9888 uv run pytest -m e2e test/e2e/test_assign.py -k opencode -v`):
+```
+test_assign_data_analyst     PASSED
+test_assign_report_generator PASSED  (124.53s combined with test below)
+test_assign_with_callback    PASSED
 ```
 
-If the e2e reveals a Phase 3 launch-path regression, it is fixed before Phase 4 closes per the reviewer's contingent ruling.
+No regressions from Phase 4 changes; one Phase 3 regression found and fixed (see AC-1 above).
