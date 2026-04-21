@@ -70,6 +70,35 @@ more natural `opencode` namespace already used by the tool itself.
   which would itself have matched the grep pattern. Reworded to describe the constraint
   in prose without embedding the old path string.
 
-## Commit
+## Commits
 
-`(see git log)`
+`079f4a9` — `refactor(opencode): rename on-disk config directory from opencode_cli to opencode`
+
+`bd92d87` — `fix(opencode): fall back to first agent-indented line when user message scrolled off viewport`
+
+`89ad483` — `refactor(terminal_service): guard build_skill_catalog() call and update skill-delivery comments`
+
+## Additional Fix Found During Live Verification
+
+### Root-cause: OpenCode alt-screen mode, `history_size ≈ 2`
+
+The Phase 6 live smoke triggered an intermittent e2e failure on `test_assign_report_generator`
+("No user message found in OpenCode output"). Investigation showed:
+
+- OpenCode renders its TUI in alternate-screen mode; `tmux history_size` for an active
+  OpenCode pane is effectively 2 lines (just the shell prompt before launch).
+- `tmux capture-pane -S -2000` therefore returns only the 41 currently visible lines
+  (182×41 pane), regardless of `history-limit`.
+- The Phase 5 `extraction_tail_lines=2000` fix was a misdiagnosis: the buffer was
+  always ~41 lines, not 200. Phase 5 passed because the response happened to be short
+  enough on that run to keep the user message in the visible frame.
+- When the model produces a longer response (≥35 lines), the user message bar (`┃  `)
+  scrolls off the top, and the original code raised `ValueError("No user message found")`.
+
+### Fix (Commit A: `bd92d87`)
+
+`extract_last_message_from_script` now falls back to the first 5-space-indented agent
+line as the left boundary when no `┃  ` is found before the completion marker. The
+visible frame already contains only the current turn's tail, so multi-turn ambiguity
+is not an issue. A unit test `test_fallback_extracts_when_user_message_scrolled_off`
+was added to cover this path. e2e: 3/3 PASSED after the fix.
