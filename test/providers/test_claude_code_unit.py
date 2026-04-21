@@ -26,7 +26,11 @@ class TestClaudeCodeProviderInitialization:
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
         # First call is the pre-launch snapshot, subsequent calls return Claude output
-        mock_tmux.get_history.side_effect = ["", "Welcome to Claude Code v2.0", "Welcome to Claude Code v2.0"]
+        mock_tmux.get_history.side_effect = [
+            "",
+            "Welcome to Claude Code v2.0",
+            "Welcome to Claude Code v2.0",
+        ]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         with patch.object(provider, "get_status", return_value=TerminalStatus.IDLE):
@@ -61,9 +65,11 @@ class TestClaudeCodeProviderInitialization:
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
 
-        with patch.object(provider, "_handle_startup_prompts"), \
-             patch("cli_agent_orchestrator.providers.claude_code.time.time", side_effect=[0, 31]), \
-             patch("cli_agent_orchestrator.providers.claude_code.time.sleep"):
+        with (
+            patch.object(provider, "_handle_startup_prompts"),
+            patch("cli_agent_orchestrator.providers.claude_code.time.time", side_effect=[0, 31]),
+            patch("cli_agent_orchestrator.providers.claude_code.time.sleep"),
+        ):
             with pytest.raises(TimeoutError, match="Claude Code initialization timed out"):
                 provider.initialize()
 
@@ -78,7 +84,11 @@ class TestClaudeCodeProviderInitialization:
         """Test initialization with agent profile."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
-        mock_tmux.get_history.side_effect = ["", "Welcome to Claude Code v2.0", "Welcome to Claude Code v2.0"]
+        mock_tmux.get_history.side_effect = [
+            "",
+            "Welcome to Claude Code v2.0",
+            "Welcome to Claude Code v2.0",
+        ]
         mock_profile = MagicMock()
         mock_profile.system_prompt = "Test system prompt"
         mock_profile.mcpServers = None
@@ -116,7 +126,11 @@ class TestClaudeCodeProviderInitialization:
         """Test initialization with MCP servers in profile."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
-        mock_tmux.get_history.side_effect = ["", "Welcome to Claude Code v2.0", "Welcome to Claude Code v2.0"]
+        mock_tmux.get_history.side_effect = [
+            "",
+            "Welcome to Claude Code v2.0",
+            "Welcome to Claude Code v2.0",
+        ]
         mock_profile = MagicMock()
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {"server1": {"command": "test", "args": ["--flag"]}}
@@ -136,7 +150,11 @@ class TestClaudeCodeProviderInitialization:
         """Test that initialize sends the 'claude' command to tmux."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
-        mock_tmux.get_history.side_effect = ["", "Welcome to Claude Code v2.0", "Welcome to Claude Code v2.0"]
+        mock_tmux.get_history.side_effect = [
+            "",
+            "Welcome to Claude Code v2.0",
+            "Welcome to Claude Code v2.0",
+        ]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         with patch.object(provider, "get_status", return_value=TerminalStatus.IDLE):

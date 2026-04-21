@@ -274,12 +274,14 @@ class ClaudeCodeProvider(BaseProvider):
         deadline = time.time() + 30.0
         while time.time() < deadline:
             current_output = tmux_client.get_history(self.session_name, self.window_name) or ""
-            new_content = current_output[len(pre_launch_snapshot):]
+            new_content = current_output[len(pre_launch_snapshot) :]
             # Claude-specific startup markers that cannot come from the shell:
             # the ──────── separator, bypass/trust prompt text, or "Claude Code"
             claude_started = bool(
                 re.search(r"\u2500{20,}", new_content)
-                or re.search(r"bypass permissions|trust this folder|Claude Code", new_content, re.IGNORECASE)
+                or re.search(
+                    r"bypass permissions|trust this folder|Claude Code", new_content, re.IGNORECASE
+                )
             )
             if claude_started:
                 status = self.get_status()

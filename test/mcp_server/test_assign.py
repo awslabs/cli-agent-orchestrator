@@ -15,7 +15,9 @@ class TestAssignSenderIdInjection:
     @patch("cli_agent_orchestrator.mcp_server.server._send_direct_input")
     @patch("cli_agent_orchestrator.mcp_server.server.wait_until_terminal_status", return_value=True)
     @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
-    def test_assign_appends_sender_id_when_injection_enabled(self, mock_create, mock_wait, mock_send):
+    def test_assign_appends_sender_id_when_injection_enabled(
+        self, mock_create, mock_wait, mock_send
+    ):
         """When injection is enabled, assign should append sender ID suffix."""
         from cli_agent_orchestrator.mcp_server.server import _assign_impl
 
