@@ -212,7 +212,7 @@ OpenCode itself handles model authentication. Verify your credentials are set fo
 If OpenCode raises `△ Permission required` and your flow is blocking:
 1. Re-install the agent with `--auto-approve` to bake `permission: allow` into its frontmatter
 2. Or respond to the prompt manually in the tmux window
-3. Or use `--yolo` to disable all restrictions
+3. Or use `--yolo` to disable all restrictions **(DANGEROUS — allows any command including `aws`, `rm`, `curl`)**
 
 ### Status stuck as `PROCESSING`
 
