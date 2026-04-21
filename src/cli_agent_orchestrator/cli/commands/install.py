@@ -27,7 +27,11 @@ from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.q_agent import QAgentConfig
 from cli_agent_orchestrator.utils.agent_profiles import parse_agent_profile_text
 from cli_agent_orchestrator.utils.env import resolve_env_vars, set_env_var
-from cli_agent_orchestrator.utils.opencode_config import upsert_agent_tools, upsert_mcp_server
+from cli_agent_orchestrator.utils.opencode_config import (
+    translate_mcp_server_config,
+    upsert_agent_tools,
+    upsert_mcp_server,
+)
 from cli_agent_orchestrator.utils.opencode_permissions import cao_tools_to_opencode_permission
 from cli_agent_orchestrator.utils.skill_injection import compose_agent_prompt
 
@@ -284,7 +288,10 @@ def install(agent_source: str, provider: str, env_vars: tuple[str, ...], auto_ap
             if profile.mcpServers:
                 mcp_names = list(profile.mcpServers.keys())
                 for mcp_name, mcp_cfg in profile.mcpServers.items():
-                    upsert_mcp_server(mcp_name, mcp_cfg)
+                    # Translate CAO's mcpServer format to OpenCode's opencode.json format
+                    # before writing (type:stdio+command str+args → type:local+command list).
+                    opencode_mcp_cfg = translate_mcp_server_config(dict(mcp_cfg))
+                    upsert_mcp_server(mcp_name, opencode_mcp_cfg)
                 upsert_agent_tools(profile.name, mcp_names)
 
         click.echo(f"✓ Agent '{profile.name}' installed successfully")

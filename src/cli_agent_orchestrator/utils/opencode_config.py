@@ -33,8 +33,42 @@ def write_config(data: Dict[str, Any]) -> None:
     )
 
 
+def translate_mcp_server_config(cao_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Translate a CAO mcpServer entry to OpenCode's ``mcp`` format.
+
+    CAO profiles store MCP servers in Claude/Q CLI format::
+
+        {"type": "stdio", "command": "uvx", "args": ["--from", "...", "cao-mcp-server"]}
+
+    OpenCode ``opencode.json`` uses a different schema::
+
+        {"type": "local", "command": ["uvx", "--from", "...", "cao-mcp-server"], "enabled": true}
+
+    Differences:
+    - ``type`` → always ``"local"`` (OpenCode's only supported subprocess type)
+    - ``command`` (str) + ``args`` (list) → ``command`` (list, combined)
+    - ``"enabled": true`` added
+    - ``env`` → ``environment`` (OpenCode's key for process env vars)
+    """
+    command_str: str = cao_config.get("command", "")
+    args: List[str] = cao_config.get("args", [])
+    full_command: List[str] = ([command_str] if command_str else []) + list(args)
+
+    result: Dict[str, Any] = {
+        "type": "local",
+        "command": full_command,
+        "enabled": True,
+    }
+    if "env" in cao_config:
+        result["environment"] = cao_config["env"]
+    return result
+
+
 def upsert_mcp_server(name: str, config: Dict[str, Any]) -> None:
     """Add or overwrite the MCP server entry named *name*.
+
+    ``config`` must already be in OpenCode format (use
+    ``translate_mcp_server_config`` to convert a CAO profile entry first).
 
     Also sets a default-deny entry ``"<name>*": false`` under the top-level
     ``tools`` section so new agents do not gain the server's tools by default.

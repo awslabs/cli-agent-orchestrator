@@ -10,6 +10,7 @@ import cli_agent_orchestrator.utils.opencode_config as cfg_module
 from cli_agent_orchestrator.utils.opencode_config import (
     read_config,
     remove_agent_tools,
+    translate_mcp_server_config,
     upsert_agent_tools,
     upsert_mcp_server,
     write_config,
@@ -22,6 +23,60 @@ def tmp_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     config_file = tmp_path / "opencode_cli" / "opencode.json"
     monkeypatch.setattr(cfg_module, "OPENCODE_CONFIG_FILE", config_file)
     return config_file
+
+
+class TestTranslateMcpServerConfig:
+    """translate_mcp_server_config converts CAO mcpServer dicts to OpenCode format."""
+
+    def test_basic_stdio_command_and_args(self):
+        result = translate_mcp_server_config(
+            {"type": "stdio", "command": "uvx", "args": ["--from", "pkg", "cao-mcp-server"]}
+        )
+        assert result["type"] == "local"
+        assert result["command"] == ["uvx", "--from", "pkg", "cao-mcp-server"]
+        assert result["enabled"] is True
+
+    def test_command_only_no_args(self):
+        result = translate_mcp_server_config({"type": "stdio", "command": "my-server"})
+        assert result["command"] == ["my-server"]
+        assert result["enabled"] is True
+
+    def test_args_only_no_command(self):
+        result = translate_mcp_server_config({"args": ["server"]})
+        assert result["command"] == ["server"]
+
+    def test_env_translated_to_environment(self):
+        result = translate_mcp_server_config({"command": "srv", "env": {"FOO": "bar"}})
+        assert result["environment"] == {"FOO": "bar"}
+        assert "env" not in result
+
+    def test_no_env_key_absent(self):
+        result = translate_mcp_server_config({"command": "srv"})
+        assert "environment" not in result
+        assert "env" not in result
+
+    def test_real_cao_mcp_server_entry(self):
+        """Full translation of the cao-mcp-server entry as it appears in agent profiles."""
+        cao_cfg = {
+            "type": "stdio",
+            "command": "uvx",
+            "args": [
+                "--from",
+                "git+https://github.com/awslabs/cli-agent-orchestrator.git@main",
+                "cao-mcp-server",
+            ],
+        }
+        result = translate_mcp_server_config(cao_cfg)
+        assert result == {
+            "type": "local",
+            "command": [
+                "uvx",
+                "--from",
+                "git+https://github.com/awslabs/cli-agent-orchestrator.git@main",
+                "cao-mcp-server",
+            ],
+            "enabled": True,
+        }
 
 
 class TestReadConfig:
