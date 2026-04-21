@@ -40,9 +40,11 @@ ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
 # User message indent: blue vertical bar + 2 spaces
 USER_MESSAGE_PATTERN = r"^┃\s{2}"
 
-# Per-turn completion marker: "▣  <agent>  ·  <model>  ·  <duration>s"
+# Per-turn completion marker: "▣  <agent>  ·  <model>  ·  <duration>"
 # Two middle-dot separators and a trailing duration are required.
-COMPLETION_MARKER_PATTERN = r"▣\s+\S+\s+·\s+.+?\s+·\s+\d+(?:\.\d+)?s"
+# OpenCode formats duration as "Ns" for short runs and "Nm Ns" once the turn
+# exceeds 60 seconds (e.g. "1m 8s").  Both forms must be matched.
+COMPLETION_MARKER_PATTERN = r"▣\s+\S+\s+·\s+.+?\s+·\s+(?:\d+m\s+)?\d+(?:\.\d+)?s"
 
 # Processing footer — keybind hint present while the agent is generating.
 PROCESSING_FOOTER_PATTERN = r"\besc interrupt\b"
@@ -99,6 +101,18 @@ class OpenCodeCliProvider(BaseProvider):
     def paste_enter_count(self) -> int:
         """OpenCode TUI submits on a single Enter after bracketed paste."""
         return 1
+
+    @property
+    def extraction_tail_lines(self) -> int:
+        """Use a larger scrollback window for extraction.
+
+        OpenCode renders the full conversation in the TUI scrollback.  With
+        detailed system prompts, agents can produce responses long enough to
+        push the user-message marker (┃  ) beyond the default 200-line capture
+        window, causing "No user message found" extraction failures.  2000
+        matches the tmux history-limit so we capture the full available buffer.
+        """
+        return 2000
 
     def initialize(self) -> bool:
         """Start the OpenCode TUI and wait for the idle splash frame.

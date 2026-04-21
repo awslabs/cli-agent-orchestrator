@@ -58,6 +58,11 @@ class TestRegexPatterns:
     def test_completion_marker_pattern_matches_full_marker(self):
         assert re.search(COMPLETION_MARKER_PATTERN, "▣  Build · Big Pickle · 7.2s")
 
+    def test_completion_marker_pattern_matches_minute_second_duration(self):
+        # Responses > 60 s are formatted as "Nm Ns" by OpenCode.
+        assert re.search(COMPLETION_MARKER_PATTERN, "▣  Data_analyst · Big Pickle · 1m 8s")
+        assert re.search(COMPLETION_MARKER_PATTERN, "▣  Data_analyst · Big Pickle · 2m 30.5s")
+
     def test_completion_marker_pattern_rejects_incomplete(self):
         # No duration suffix → not a full completion marker
         assert not re.search(COMPLETION_MARKER_PATTERN, "▣  Build · Big Pickle")
@@ -385,6 +390,10 @@ class TestMiscInterface:
 
     def test_paste_enter_count_is_one(self):
         assert make_provider().paste_enter_count == 1
+
+    def test_extraction_tail_lines_is_2000(self):
+        """extraction_tail_lines must be large enough for long-response agents."""
+        assert make_provider().extraction_tail_lines == 2000
 
 
 # ---------------------------------------------------------------------------

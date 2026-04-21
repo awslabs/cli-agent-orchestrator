@@ -128,6 +128,18 @@ class BaseProvider(ABC):
         """
         return 0
 
+    @property
+    def extraction_tail_lines(self) -> Optional[int]:
+        """Number of scrollback lines to capture for output extraction.
+
+        Output extraction needs more history than status detection (which only
+        needs the last few lines for footer/marker checks).  Override in
+        providers whose agents produce long responses that may push the
+        user-message marker beyond ``TMUX_HISTORY_LINES``.  ``None`` uses
+        the default ``TMUX_HISTORY_LINES`` constant.
+        """
+        return None
+
     @abstractmethod
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract the last message from terminal script output.

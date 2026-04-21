@@ -374,6 +374,10 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
     retries extraction with 10 s delays between attempts.  This handles
     TUI-based providers (e.g. Gemini CLI's Ink renderer) whose notification
     spinners can temporarily obscure response text in the tmux capture buffer.
+
+    If the provider declares ``extraction_tail_lines``, the history capture
+    for LAST mode uses that value instead of the default ``TMUX_HISTORY_LINES``.
+    Status-check captures are unaffected (they go through get_status directly).
     """
     try:
         metadata = get_terminal_metadata(terminal_id)
@@ -389,6 +393,17 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
             if provider is None:
                 raise ValueError(f"Provider not found for terminal {terminal_id}")
 
+            # Re-capture with provider's preferred extraction window if it differs
+            # from the default (status checks use TMUX_HISTORY_LINES; long-response
+            # providers need more lines so user-message markers don't scroll off).
+            extract_lines = provider.extraction_tail_lines
+            if extract_lines is not None:
+                full_output = tmux_client.get_history(
+                    metadata["tmux_session"],
+                    metadata["tmux_window"],
+                    tail_lines=extract_lines,
+                )
+
             retries = provider.extraction_retries
             last_err: Exception | None = None
             for attempt in range(1 + retries):
@@ -396,7 +411,9 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
                     if attempt > 0:
                         time.sleep(10.0)
                         full_output = tmux_client.get_history(
-                            metadata["tmux_session"], metadata["tmux_window"]
+                            metadata["tmux_session"],
+                            metadata["tmux_window"],
+                            tail_lines=extract_lines,
                         )
                     return provider.extract_last_message_from_script(full_output)
                 except ValueError as exc:
