@@ -15,16 +15,20 @@ from cli_agent_orchestrator.constants import (
     DEFAULT_PROVIDER,
     KIRO_AGENTS_DIR,
     LOCAL_AGENT_STORE_DIR,
+    OPENCODE_AGENTS_DIR,
     PROVIDERS,
     Q_AGENTS_DIR,
     SKILLS_DIR,
 )
 from cli_agent_orchestrator.models.copilot_agent import CopilotAgentConfig
 from cli_agent_orchestrator.models.kiro_agent import KiroAgentConfig
+from cli_agent_orchestrator.models.opencode_agent import OpenCodeAgentConfig
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.q_agent import QAgentConfig
 from cli_agent_orchestrator.utils.agent_profiles import parse_agent_profile_text
 from cli_agent_orchestrator.utils.env import resolve_env_vars, set_env_var
+from cli_agent_orchestrator.utils.opencode_config import upsert_agent_tools, upsert_mcp_server
+from cli_agent_orchestrator.utils.opencode_permissions import cao_tools_to_opencode_permission
 from cli_agent_orchestrator.utils.skill_injection import compose_agent_prompt
 
 
@@ -97,7 +101,17 @@ def _parse_env_assignment(env_assignment: str) -> tuple[str, str]:
         "Repeatable: --env KEY=VALUE. Example: --env API_TOKEN=my-secret-token."
     ),
 )
-def install(agent_source: str, provider: str, env_vars: tuple[str, ...]):
+@click.option(
+    "--auto-approve",
+    "auto_approve",
+    is_flag=True,
+    default=False,
+    help=(
+        "Emit 'allow' (rather than 'ask') for all permitted tools in the OpenCode agent "
+        "permission block. Has no effect on other providers."
+    ),
+)
+def install(agent_source: str, provider: str, env_vars: tuple[str, ...], auto_approve: bool):
     """
     Install an agent from local store, built-in store, URL, or file path.
 
@@ -249,6 +263,29 @@ def install(agent_source: str, provider: str, env_vars: tuple[str, ...]):
                 description=agent_config.description,
             )
             agent_file.write_text(frontmatter.dumps(agent_post), encoding="utf-8")
+
+        elif provider == ProviderType.OPENCODE_CLI.value:
+            OPENCODE_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+            body = compose_agent_prompt(profile)
+            agent_config_oc = OpenCodeAgentConfig(
+                description=profile.description,
+                mode="all",
+                permission=cao_tools_to_opencode_permission(allowed_tools, auto_approve),
+            )
+            safe_filename = profile.name.replace("/", "__")
+            agent_file = OPENCODE_AGENTS_DIR / f"{safe_filename}.md"
+            agent_post = frontmatter.Post(
+                body.rstrip() if body else "",
+                **agent_config_oc.model_dump(exclude_none=True),
+            )
+            agent_file.write_text(frontmatter.dumps(agent_post), encoding="utf-8")
+
+            # Upsert MCP server declarations and per-agent tool gating into opencode.json
+            if profile.mcpServers:
+                mcp_names = list(profile.mcpServers.keys())
+                for mcp_name, mcp_cfg in profile.mcpServers.items():
+                    upsert_mcp_server(mcp_name, mcp_cfg)
+                upsert_agent_tools(profile.name, mcp_names)
 
         click.echo(f"✓ Agent '{profile.name}' installed successfully")
         if env_vars:
