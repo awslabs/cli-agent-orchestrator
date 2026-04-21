@@ -491,7 +491,23 @@ def _assign_impl(
         # Create terminal
         terminal_id, _ = _create_terminal(agent_profile, working_directory)
 
-        # Send message immediately (auto-injects sender terminal ID suffix when enabled)
+        # Guard: wait for the terminal to be genuinely ready before sending
+        # the task message. create_terminal() calls provider.initialize() which
+        # already waits 30 s for IDLE, but that check can return a false-positive
+        # on the pre-existing shell ❯ prompt (zsh/bash) before claude starts.
+        # A secondary API-level wait (same as handoff uses) catches that race.
+        if not wait_until_terminal_status(
+            terminal_id,
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+            timeout=60.0,
+        ):
+            return {
+                "success": False,
+                "terminal_id": terminal_id,
+                "message": f"Terminal {terminal_id} did not reach ready status within 60 seconds — agent may not have started",
+            }
+
+        # Send message (auto-injects sender terminal ID suffix when enabled)
         _send_direct_input_assign(terminal_id, message)
 
         return {

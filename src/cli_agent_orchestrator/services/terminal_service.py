@@ -107,6 +107,7 @@ def create_terminal(
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
         TimeoutError: If provider initialization times out
     """
+    session_created = False  # tracks whether THIS call created the tmux session
     try:
         # Step 1: Generate unique identifiers
         terminal_id = generate_terminal_id()
@@ -128,6 +129,7 @@ def create_terminal(
 
             # Create new tmux session with initial window
             tmux_client.create_session(session_name, window_name, terminal_id, working_directory)
+            session_created = True  # only set after successful creation
         else:
             # Add window to existing session
             if not tmux_client.session_exists(session_name):
@@ -172,6 +174,7 @@ def create_terminal(
             agent_profile,
             allowed_tools,
             skill_prompt=skill_prompt if provider in RUNTIME_SKILL_PROMPT_PROVIDERS else None,
+            model=profile.model if profile else None,
         )
         provider_instance.initialize()
 
@@ -214,7 +217,7 @@ def create_terminal(
             provider_manager.cleanup_provider(terminal_id)
         except Exception:
             pass  # Ignore cleanup errors
-        if new_session and session_name:
+        if session_created and session_name:
             try:
                 tmux_client.kill_session(session_name)
             except:
