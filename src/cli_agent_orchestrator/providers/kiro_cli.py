@@ -214,16 +214,28 @@ class KiroCliProvider(BaseProvider):
         # This simplifies regex patterns and improves reliability
         clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
 
-        # Check 1: Look for TUI "Kiro is working" ghost text — positive PROCESSING signal
-        if re.search(TUI_PROCESSING_PATTERN, clean_output):
-            return TerminalStatus.PROCESSING
-
-        # Check 2: Look for the agent's IDLE prompt pattern (old or new TUI)
-        # If not found, the agent is still processing a response
-        has_idle_prompt = re.search(self._idle_prompt_pattern, clean_output)
+        # Check 1: Detect idle prompts early — required for the position-aware
+        # processing check below.
+        old_idle_matches = list(re.finditer(self._idle_prompt_pattern, clean_output))
         new_tui_idle_matches = list(re.finditer(NEW_TUI_IDLE_PATTERN, clean_output))
+        has_idle_prompt = old_idle_matches[0] if old_idle_matches else None
         has_new_tui_idle = bool(new_tui_idle_matches)
 
+        # Check 2: Look for TUI "Kiro is working" ghost text.
+        # Kiro TUI redraws the screen in-place, so the buffer can retain a stale
+        # "Kiro is working" line from an earlier render even after the agent has
+        # finished and the idle prompt has appeared below it.  Only return
+        # PROCESSING when no idle prompt appears *after* the last match.
+        tui_working_matches = list(re.finditer(TUI_PROCESSING_PATTERN, clean_output))
+        if tui_working_matches:
+            last_working_pos = tui_working_matches[-1].end()
+            idle_after_working = any(
+                m.start() > last_working_pos for m in new_tui_idle_matches + old_idle_matches
+            )
+            if not idle_after_working:
+                return TerminalStatus.PROCESSING
+
+        # Check 3: If no idle prompt found at all the agent is still processing
         if not has_idle_prompt and not has_new_tui_idle:
             return TerminalStatus.PROCESSING
 
@@ -393,11 +405,28 @@ class KiroCliProvider(BaseProvider):
                 separator_idx = i
                 break
 
+        # Kiro 2.0: separator is AFTER credits_idx. Scan forward to find it.
         if separator_idx is None:
-            raise ValueError("No Kiro CLI response found - no separator before Credits marker")
+            next_credits_idx = len(lines)
+            for i in range(credits_idx + 1, len(lines)):
+                if re.search(TUI_CREDITS_PATTERN, lines[i]):
+                    next_credits_idx = i
+                    break
+            for i in range(credits_idx + 1, next_credits_idx):
+                if re.search(TUI_SEPARATOR_PATTERN, lines[i].strip()):
+                    separator_idx = i
+                    break
+
+        if separator_idx is None:
+            raise ValueError("No Kiro CLI response found - no separator found near Credits marker")
 
         # Extract content between separator and Credits
-        content_lines = lines[separator_idx + 1 : credits_idx]
+        if separator_idx > credits_idx:
+            # Kiro 2.0: separator after Credits. Content precedes credits_idx.
+            content_lines = lines[prev_credits_idx + 1 : credits_idx]
+        else:
+            # Pre-2.0: separator before Credits (existing behavior)
+            content_lines = lines[separator_idx + 1 : credits_idx]
 
         # Skip the first paragraph (user message echo).
         # The user message is the first block of non-empty lines after the separator.
