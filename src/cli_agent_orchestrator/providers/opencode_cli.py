@@ -281,16 +281,25 @@ class OpenCodeCliProvider(BaseProvider):
         # Searching only in the slice before the completion start avoids matching
         # the bottom input-box header (┃  <agent> · <model>) that follows the turn.
         user_matches = list(re.finditer(r"┃\s{2}", clean[: last_completion.start()]))
-        if not user_matches:
-            raise ValueError("No user message found in OpenCode output")
+        if user_matches:
+            # Normal path: anchor on the last visible user message bar.
+            response_start = user_matches[-1].end()  # after the ┃  bar
+        else:
+            # Fallback: user message has scrolled off the top of the 41-line TUI viewport
+            # (history_size ≈ 2; alt-screen rendering does not accumulate scrollback).
+            # Find the first 5-space-indented agent line as the left boundary instead.
+            first_indent = re.search(r"^     \S", clean[: last_completion.start()], re.MULTILINE)
+            if not first_indent:
+                raise ValueError("No user message found in OpenCode output")
+            response_start = first_indent.start()
 
-        # Both positions are absolute offsets in clean (the slice starts at 0).
-        response_start = user_matches[-1].end()  # after the ┃  bar
         response_end = last_completion.start()  # before the ▣ completion marker
 
         raw_response = clean[response_start:response_end]
 
-        # Skip user-message lines (those still using ┃ indent) to find agent block
+        # Skip user-message lines (those still using ┃ indent) to find agent block.
+        # When the fallback path was taken there are no ┃ lines; the loop only strips
+        # leading blank lines in that case.
         response_lines = raw_response.split("\n")
         agent_lines = []
         past_user_block = False

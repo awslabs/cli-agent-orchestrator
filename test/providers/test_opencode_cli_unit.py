@@ -259,6 +259,28 @@ class TestExtractLastMessage:
         with pytest.raises(ValueError, match="No user message"):
             provider.extract_last_message_from_script(output)
 
+    def test_fallback_extracts_when_user_message_scrolled_off(self):
+        provider = make_provider()
+        # Simulate the 41-line TUI viewport where the user message has scrolled off the top.
+        # Only the tail of the agent's response is visible, plus the completion marker and
+        # the input box (┃ lines) below it. No ┃  appears before the completion marker.
+        output = (
+            "\n"
+            "➜  cli-agent-orchestrator\n"  # shell prompt from 2-line tmux scrollback
+            "     Response line 1.\n"
+            "     Response line 2.\n"
+            "\n"
+            "     ▣  Developer · Big Pickle · 8s\n"
+            "\n"
+            "  ┃\n"
+            "  ┃  Developer · Big Pickle OpenCode Zen\n"
+        )
+        result = provider.extract_last_message_from_script(output)
+        assert "Response line 1." in result
+        assert "Response line 2." in result
+        # Shell prompt must not leak into extracted content
+        assert "cli-agent-orchestrator" not in result
+
     def test_strips_ansi_before_extraction(self):
         provider = make_provider()
         ansi_output = load_ansi_fixture("opencode_cli_completed.ansi.txt")
