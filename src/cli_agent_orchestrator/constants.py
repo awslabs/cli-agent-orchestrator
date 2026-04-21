@@ -82,6 +82,9 @@ SKILLS_DIR = CAO_HOME_DIR / "skills"
 Q_AGENTS_DIR = Path.home() / ".aws" / "amazonq" / "cli-agents"  # Q CLI agents
 KIRO_AGENTS_DIR = Path(os.environ.get("CAO_AGENTS_DIR", str(Path.home() / ".kiro" / "agents")))
 COPILOT_AGENTS_DIR = Path.home() / ".copilot" / "agents"  # Copilot custom agents
+OPENCODE_CONFIG_DIR = Path.home() / ".aws" / "opencode_cli"  # OpenCode CAO-managed config root
+OPENCODE_AGENTS_DIR = OPENCODE_CONFIG_DIR / "agents"  # OpenCode agent .md files
+OPENCODE_CONFIG_FILE = OPENCODE_CONFIG_DIR / "opencode.json"  # OpenCode MCP + tool gating config
 
 # =============================================================================
 # Database Configuration
