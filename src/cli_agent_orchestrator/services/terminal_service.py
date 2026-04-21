@@ -378,31 +378,29 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
     If the provider declares ``extraction_tail_lines``, the history capture
     for LAST mode uses that value instead of the default ``TMUX_HISTORY_LINES``.
     Status-check captures are unaffected (they go through get_status directly).
+    A single capture-pane call is made per get_output invocation.
     """
     try:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        full_output = tmux_client.get_history(metadata["tmux_session"], metadata["tmux_window"])
-
         if mode == OutputMode.FULL:
-            return full_output
+            return tmux_client.get_history(metadata["tmux_session"], metadata["tmux_window"])
         elif mode == OutputMode.LAST:
             provider = provider_manager.get_provider(terminal_id)
             if provider is None:
                 raise ValueError(f"Provider not found for terminal {terminal_id}")
 
-            # Re-capture with provider's preferred extraction window if it differs
-            # from the default (status checks use TMUX_HISTORY_LINES; long-response
-            # providers need more lines so user-message markers don't scroll off).
+            # Determine capture depth once: use provider's extraction window if set,
+            # otherwise fall back to the TMUX_HISTORY_LINES default (tail_lines=None).
+            # Status-check captures (via get_status) are always at the default depth.
             extract_lines = provider.extraction_tail_lines
-            if extract_lines is not None:
-                full_output = tmux_client.get_history(
-                    metadata["tmux_session"],
-                    metadata["tmux_window"],
-                    tail_lines=extract_lines,
-                )
+            full_output = tmux_client.get_history(
+                metadata["tmux_session"],
+                metadata["tmux_window"],
+                tail_lines=extract_lines,
+            )
 
             retries = provider.extraction_retries
             last_err: Exception | None = None

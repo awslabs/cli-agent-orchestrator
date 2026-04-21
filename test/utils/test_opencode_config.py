@@ -83,6 +83,28 @@ class TestEnsureSkillsSymlink:
         assert any("not a symlink" in rec.message for rec in caplog.records)
         assert target.is_dir() and not target.is_symlink()
 
+    def test_warns_and_skips_when_symlink_points_elsewhere(self, symlink_env, caplog):
+        config_dir = symlink_env["config_dir"]
+        other_dir = symlink_env["config_dir"].parent / "other_skills"
+        other_dir.mkdir()
+        target = config_dir / "skills"
+
+        # Create a symlink pointing at a different directory
+        config_dir.mkdir(parents=True, exist_ok=True)
+        target.symlink_to(other_dir)
+
+        import logging
+
+        with caplog.at_level(
+            logging.WARNING, logger="cli_agent_orchestrator.utils.opencode_config"
+        ):
+            ensure_skills_symlink()
+
+        # Warning was logged and symlink is unchanged (still points at other_dir)
+        assert any("skipping" in rec.message for rec in caplog.records)
+        assert target.is_symlink()
+        assert target.resolve() == other_dir.resolve()
+
 
 class TestTranslateMcpServerConfig:
     """translate_mcp_server_config converts CAO mcpServer dicts to OpenCode format."""
