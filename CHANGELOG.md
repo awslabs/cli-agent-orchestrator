@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **OpenCode CLI provider** — Full integration with [OpenCode](https://opencode.ai), a terminal-based AI assistant whose native agent format (Markdown + YAML frontmatter) maps directly onto CAO profiles. Supports `cao install --provider opencode_cli`, all five terminal states (IDLE, PROCESSING, COMPLETED, WAITING_USER_ANSWER, ERROR), permission translation from CAO `allowedTools` to OpenCode `permission:` frontmatter, MCP server wiring via a CAO-owned `opencode.json`, and config isolation from the user's personal OpenCode setup. Provider docs: [`docs/opencode-cli.md`](docs/opencode-cli.md). Design doc: [`docs/feat-opencode-provider-design.md`](docs/feat-opencode-provider-design.md).
+
 ### Changed
 
 - **Launch prompt clarity + `--auto-approve`** — Redesign the `cao launch` confirmation prompt to show `Role` instead of `Blocked`, clearly distinguish `[Y]` / `[--auto-approve]` / `[--yolo]`, and add `--auto-approve` flag to skip the prompt without removing restrictions (for automated flows, scripts, and agent-to-agent launches)

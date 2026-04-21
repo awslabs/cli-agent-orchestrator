@@ -528,3 +528,60 @@ class TestCopilotCliAssign:
     def test_assign_with_callback(self, require_copilot):
         """Copilot CLI full round-trip: worker completes → sends result → supervisor receives."""
         _run_assign_with_callback_test(provider="copilot_cli")
+
+
+# ---------------------------------------------------------------------------
+# OpenCode CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestOpenCodeCliAssign:
+    """E2E assign tests for the OpenCode CLI provider using examples/assign/ profiles.
+
+    Requires:
+    - opencode binary on PATH (skip otherwise via require_opencode fixture)
+    - Running CAO server
+    - Agent profiles installed for opencode_cli:
+        cao install examples/assign/data_analyst.md --provider opencode_cli
+        cao install examples/assign/report_generator.md --provider opencode_cli
+        cao install developer --provider opencode_cli  # for callback test
+
+    This test class is the authoritative live smoke test for Phase 3 of the
+    OpenCode provider integration (the Phase 3 smoke test was deferred here
+    by the reviewer's contingent ruling).  If any test reveals a Phase 3
+    regression (command composition, env propagation, polling-loop interaction),
+    the underlying provider/install code is fixed before Phase 4 closes.
+
+    Run:
+        uv run pytest -m e2e test/e2e/test_assign.py -k opencode -v
+    """
+
+    def test_assign_data_analyst(self, require_opencode):
+        """OpenCode data_analyst receives dataset, performs statistical analysis."""
+        _run_assign_test(
+            provider="opencode_cli",
+            agent_profile="data_analyst",
+            task_message=DATA_ANALYST_TASK,
+            content_keywords=DATA_ANALYST_KEYWORDS,
+        )
+
+    def test_assign_report_generator(self, require_opencode):
+        """OpenCode report_generator creates a report template."""
+        _run_assign_test(
+            provider="opencode_cli",
+            agent_profile="report_generator",
+            task_message=REPORT_GENERATOR_TASK,
+            content_keywords=REPORT_GENERATOR_KEYWORDS,
+        )
+
+    def test_assign_with_callback(self, require_opencode):
+        """OpenCode full round-trip: worker completes → sends result → supervisor receives.
+
+        Validates all four orchestration modes in a single flow:
+        - assign (non-blocking): supervisor terminal created and stays IDLE
+        - send_message (inbox delivery): worker pushes result to supervisor inbox
+        - status transitions: IDLE → PROCESSING → COMPLETED across concurrent terminals
+        - handoff (blocking): inbox delivery triggers supervisor state transition
+        """
+        _run_assign_with_callback_test(provider="opencode_cli")
