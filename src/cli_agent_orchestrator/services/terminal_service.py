@@ -152,9 +152,7 @@ def create_terminal(
             profile = load_agent_profile(agent_profile)
         except FileNotFoundError:
             profile = None
-        skill_prompt = (
-            build_skill_catalog() if provider in RUNTIME_SKILL_PROMPT_PROVIDERS else None
-        )
+        skill_prompt = build_skill_catalog() if provider in RUNTIME_SKILL_PROMPT_PROVIDERS else None
 
         # Step 3c: Resolve allowed_tools from profile if not explicitly provided
         if allowed_tools is None and profile is not None:

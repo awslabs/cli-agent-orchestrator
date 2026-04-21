@@ -104,13 +104,17 @@ class OpenCodeCliProvider(BaseProvider):
 
     @property
     def extraction_tail_lines(self) -> int:
-        """Use a larger scrollback window for extraction.
+        """Capture extra scrollback for extraction (belt-and-braces).
 
-        OpenCode renders the full conversation in the TUI scrollback.  With
-        detailed system prompts, agents can produce responses long enough to
-        push the user-message marker (┃  ) beyond the default 200-line capture
-        window, causing "No user message found" extraction failures.  2000
-        matches the tmux history-limit so we capture the full available buffer.
+        OpenCode renders in alt-screen mode, so tmux's history_size stays near 2
+        and capture-pane returns only the current viewport (~41 lines) regardless
+        of the -S prefix. This override is therefore a no-op in current opencode
+        releases — extraction relies on the within-viewport fallback at
+        extract_last_message_from_script (see the ``first_indent`` branch).
+
+        The override is retained as belt-and-braces in case opencode ever switches
+        out of alt-screen mode (at which point the 2000-line capture would start
+        providing the extra scrollback the extraction loop originally expected).
         """
         return 2000
 
@@ -283,6 +287,8 @@ class OpenCodeCliProvider(BaseProvider):
         user_matches = list(re.finditer(r"┃\s{2}", clean[: last_completion.start()]))
         if user_matches:
             # Normal path: anchor on the last visible user message bar.
+            # Alt-screen redraws each turn in place; earlier turns are not present in the
+            # visible frame, so the last ┃  bar is unambiguously the current turn's.
             response_start = user_matches[-1].end()  # after the ┃  bar
         else:
             # Fallback: user message has scrolled off the top of the 41-line TUI viewport
