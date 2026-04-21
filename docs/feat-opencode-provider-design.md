@@ -230,7 +230,7 @@ opencode --agent <name> [--model <provider/model>]
 ### Stability env vars
 
 - `OPENCODE_DISABLE_AUTOUPDATE=1` — prevent version-check pause on startup[^1]
-- `OPENCODE_DISABLE_MOUSE=1` — mouse escape sequences pollute scrollback (critical for status detection)[^1]
+- `OPENCODE_DISABLE_MOUSE=1` — when mouse reporting is enabled, OpenCode claims scroll events and the user (or any tmux automation) can scroll the TUI's conversation history. The footer (`ctrl+p commands`, `esc interrupt`) is pinned and remains visible regardless of scroll position, so IDLE and PROCESSING detection are unaffected. However, the completion marker (`▣ <agent> · <model> · Ns`) is conversation content — not a fixed footer — and scrolling up moves it off the captured frame. Since COMPLETED detection requires both the completion marker and the idle footer to be present simultaneously, scrolling during an active turn would prevent COMPLETED from ever being detected even after the agent finishes. Disabling mouse removes this risk by keeping the frame locked to the most recent render. Side effect: tmux falls back to copy-mode on mouse-wheel scroll (the pane never claimed mouse events, so tmux intercepts them instead).[^1]
 - `OPENCODE_DISABLE_TERMINAL_TITLE=1` — don't clobber tmux window titles[^1]
 - `OPENCODE_CLIENT=cao` — clean telemetry/identification[^1]
 - `TERM=xterm-256color` — per `cao-provider` skill lesson #15 (Kiro hit issues with unusual TERM values)

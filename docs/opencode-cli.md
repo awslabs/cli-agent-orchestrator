@@ -196,6 +196,16 @@ OpenCode's config merge precedence places a project-local `opencode.json` in the
 
 **Workaround:** remove or rename the project-local `opencode.json` before launching CAO, or move it under `.opencode/` (a subdirectory OpenCode also searches but at a lower priority level).
 
+### Scrolling enters tmux copy mode
+
+When you scroll (mouse wheel or trackpad) inside a CAO-managed OpenCode terminal, tmux enters copy mode instead of scrolling the TUI conversation history. This is intentional.
+
+CAO launches OpenCode with `OPENCODE_DISABLE_MOUSE=1`, which prevents OpenCode from requesting application mouse-reporting mode (`\x1b[?1000h`). Without that request, tmux does not forward scroll events to the OpenCode process — it intercepts them and enters copy mode instead.
+
+The reason for this trade-off: if OpenCode owned scroll events, scrolling the conversation history would move the completion marker (`▣ <agent> · <model> · Ns`) off screen. The footer (`ctrl+p commands`, `esc interrupt`) is pinned to the bottom of the TUI and remains visible regardless of scroll position, so IDLE and PROCESSING detection are unaffected. But COMPLETED detection requires both the completion marker and the idle footer to be present simultaneously in the captured frame — if the marker has scrolled away, CAO never detects COMPLETED even after the agent finishes. Disabling mouse keeps the frame locked to the most recent render.
+
+Press `q` or `Escape` to exit copy mode. If you need to read earlier conversation history, use the `get_output` API endpoint or the `/terminals/<id>/output` endpoint to retrieve the full captured log.
+
 ### `opencode.json` concurrent writes
 
 Parallel `cao install --provider opencode_cli` invocations (e.g., from a batch script) can race on the shared `~/.aws/opencode/opencode.json` file. The second writer may clobber the first's agent entry. **Sequential installs are safe.** File locking is deferred to a future release.
