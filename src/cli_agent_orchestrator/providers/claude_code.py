@@ -251,6 +251,13 @@ class ClaudeCodeProvider(BaseProvider):
         # Build properly escaped command string
         command = self._build_claude_command()
 
+        # Snapshot current pane content before sending the command.
+        # We use this to distinguish the pre-existing shell ❯ prompt (zsh/bash)
+        # from Claude Code's own ❯ REPL prompt — they are visually identical
+        # after ANSI stripping, so without a snapshot, status detection can
+        # falsely return IDLE on the old shell prompt before claude even starts.
+        pre_launch_snapshot = tmux_client.get_history(self.session_name, self.window_name) or ""
+
         # Send Claude Code command using tmux client
         tmux_client.send_keys(self.session_name, self.window_name, command)
 
@@ -260,12 +267,26 @@ class ClaudeCodeProvider(BaseProvider):
         # Wait for Claude Code prompt to be ready.
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
         # message that get_status() interprets as a completed response.
-        if not wait_until_status(
-            self,
-            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-            timeout=30.0,
-            polling_interval=1.0,
-        ):
+        #
+        # We require that new content appeared beyond the pre-launch snapshot
+        # before accepting IDLE, to avoid the false-positive where the old zsh
+        # ❯ prompt triggers an immediate IDLE return before claude starts.
+        deadline = time.time() + 30.0
+        while time.time() < deadline:
+            current_output = tmux_client.get_history(self.session_name, self.window_name) or ""
+            new_content = current_output[len(pre_launch_snapshot):]
+            # Claude-specific startup markers that cannot come from the shell:
+            # the ──────── separator, bypass/trust prompt text, or "Claude Code"
+            claude_started = bool(
+                re.search(r"\u2500{20,}", new_content)
+                or re.search(r"bypass permissions|trust this folder|Claude Code", new_content, re.IGNORECASE)
+            )
+            if claude_started:
+                status = self.get_status()
+                if status in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}:
+                    break
+            time.sleep(1.0)
+        else:
             raise TimeoutError("Claude Code initialization timed out after 30 seconds")
 
         self._initialized = True

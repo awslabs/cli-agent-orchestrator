@@ -25,17 +25,17 @@ class TestClaudeCodeProviderInitialization:
         """Test successful initialization."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
-        # _handle_startup_prompts needs get_history to return a string
-        mock_tmux.get_history.return_value = "Welcome to Claude Code v2.0"
+        # First call is the pre-launch snapshot, subsequent calls return Claude output
+        mock_tmux.get_history.side_effect = ["", "Welcome to Claude Code v2.0", "Welcome to Claude Code v2.0"]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        result = provider.initialize()
+        with patch.object(provider, "get_status", return_value=TerminalStatus.IDLE):
+            result = provider.initialize()
 
         assert result is True
         assert provider._initialized is True
         mock_wait_shell.assert_called_once()
         mock_tmux.send_keys.assert_called_once()
-        mock_wait_status.assert_called_once()
 
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
@@ -53,15 +53,19 @@ class TestClaudeCodeProviderInitialization:
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
     def test_initialize_timeout(self, mock_tmux, mock_wait_status, mock_wait_shell, _):
-        """Test initialization timeout."""
+        """Test initialization timeout when no Claude markers appear."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = False
-        mock_tmux.get_history.return_value = "Welcome to Claude Code v2.0"
+        # Snapshot and loop return the same content → no new Claude markers
+        mock_tmux.get_history.return_value = "some shell output"
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
 
-        with pytest.raises(TimeoutError, match="Claude Code initialization timed out"):
-            provider.initialize()
+        with patch.object(provider, "_handle_startup_prompts"), \
+             patch("cli_agent_orchestrator.providers.claude_code.time.time", side_effect=[0, 31]), \
+             patch("cli_agent_orchestrator.providers.claude_code.time.sleep"):
+            with pytest.raises(TimeoutError, match="Claude Code initialization timed out"):
+                provider.initialize()
 
     @_PATCH_SETTINGS
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
@@ -74,14 +78,15 @@ class TestClaudeCodeProviderInitialization:
         """Test initialization with agent profile."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
-        mock_tmux.get_history.return_value = "Welcome to Claude Code v2.0"
+        mock_tmux.get_history.side_effect = ["", "Welcome to Claude Code v2.0", "Welcome to Claude Code v2.0"]
         mock_profile = MagicMock()
         mock_profile.system_prompt = "Test system prompt"
         mock_profile.mcpServers = None
         mock_load.return_value = mock_profile
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0", "test-agent")
-        result = provider.initialize()
+        with patch.object(provider, "get_status", return_value=TerminalStatus.IDLE):
+            result = provider.initialize()
 
         assert result is True
         mock_load.assert_called_once_with("test-agent")
@@ -111,14 +116,15 @@ class TestClaudeCodeProviderInitialization:
         """Test initialization with MCP servers in profile."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
-        mock_tmux.get_history.return_value = "Welcome to Claude Code v2.0"
+        mock_tmux.get_history.side_effect = ["", "Welcome to Claude Code v2.0", "Welcome to Claude Code v2.0"]
         mock_profile = MagicMock()
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {"server1": {"command": "test", "args": ["--flag"]}}
         mock_load.return_value = mock_profile
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0", "test-agent")
-        result = provider.initialize()
+        with patch.object(provider, "get_status", return_value=TerminalStatus.IDLE):
+            result = provider.initialize()
 
         assert result is True
 
@@ -130,10 +136,11 @@ class TestClaudeCodeProviderInitialization:
         """Test that initialize sends the 'claude' command to tmux."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
-        mock_tmux.get_history.return_value = "Welcome to Claude Code v2.0"
+        mock_tmux.get_history.side_effect = ["", "Welcome to Claude Code v2.0", "Welcome to Claude Code v2.0"]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider.initialize()
+        with patch.object(provider, "get_status", return_value=TerminalStatus.IDLE):
+            provider.initialize()
 
         call_args = mock_tmux.send_keys.call_args
         assert call_args[0][0] == "test-session"
@@ -745,7 +752,8 @@ class TestClaudeCodeProviderStartupPrompts:
         """Test that initialize calls _handle_startup_prompts."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
-        mock_tmux.get_history.return_value = "❯ 1. Yes, I trust this folder\n  2. No"
+        trust_output = "❯ 1. Yes, I trust this folder\n  2. No"
+        mock_tmux.get_history.side_effect = ["", trust_output, trust_output]
         mock_session = MagicMock()
         mock_window = MagicMock()
         mock_pane = MagicMock()
@@ -754,7 +762,8 @@ class TestClaudeCodeProviderStartupPrompts:
         mock_window.active_pane = mock_pane
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        result = provider.initialize()
+        with patch.object(provider, "get_status", return_value=TerminalStatus.IDLE):
+            result = provider.initialize()
 
         assert result is True
         mock_pane.send_keys.assert_called_with("", enter=True)
