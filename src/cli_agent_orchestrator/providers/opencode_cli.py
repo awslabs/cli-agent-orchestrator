@@ -259,7 +259,11 @@ class OpenCodeCliProvider(BaseProvider):
         last_completion = all_completions[-1]
 
         # Find the last user-message bar (┃  ) that appears BEFORE the completion marker.
-        # TUI lines have leading spaces before ┃; searching unanchored handles that.
+        # NOTE: intentionally NOT using the module-level USER_MESSAGE_PATTERN (r"^┃\s{2}") here.
+        # TUI lines carry variable leading spaces (e.g. "  ┃  say hello"), so the ^-anchored
+        # form only matches when ┃ is the very first character.  The unanchored r"┃\s{2}" finds
+        # the bar regardless of indentation.  USER_MESSAGE_PATTERN is correct for whole-line
+        # MULTILINE matches; this unanchored variant is correct for substring position-finding.
         # Searching only in the slice before the completion start avoids matching
         # the bottom input-box header (┃  <agent> · <model>) that follows the turn.
         user_matches = list(re.finditer(r"┃\s{2}", clean[: last_completion.start()]))

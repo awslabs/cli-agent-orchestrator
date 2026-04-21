@@ -10,7 +10,7 @@ Implemented the `OpenCodeCliProvider` class, registered it in the provider manag
 
 | File | Purpose |
 |------|---------|
-| `src/cli_agent_orchestrator/providers/opencode_cli.py` | Full provider implementation (125 lines) |
+| `src/cli_agent_orchestrator/providers/opencode_cli.py` | Full provider implementation (332 lines) |
 | `test/providers/test_opencode_cli_unit.py` | 43 unit tests (96% line coverage) |
 
 ## Files Modified
