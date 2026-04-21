@@ -134,7 +134,7 @@ class TestOpenCodeConstants:
 
         from cli_agent_orchestrator.constants import OPENCODE_CONFIG_DIR
 
-        assert OPENCODE_CONFIG_DIR == Path.home() / ".aws" / "opencode_cli"
+        assert OPENCODE_CONFIG_DIR == Path.home() / ".aws" / "opencode"
 
     def test_opencode_agents_dir_is_under_config_dir(self):
         from cli_agent_orchestrator.constants import OPENCODE_AGENTS_DIR, OPENCODE_CONFIG_DIR

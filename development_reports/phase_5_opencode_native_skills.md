@@ -107,4 +107,4 @@ test/e2e/test_assign.py::TestOpenCodeCliAssign::test_assign_with_callback    PAS
 
 `7c0c224` — `fix(opencode): handle Nm Ns duration format and extend extraction buffer`
 
-`(pending)` — Phase 5 review revisions: single-capture consolidation, wrong-target symlink test
+`8979d41` — Phase 5 review revisions: single-capture consolidation, wrong-target symlink test
