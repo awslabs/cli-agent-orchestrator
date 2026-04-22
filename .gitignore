@@ -48,3 +48,6 @@ context/
 
 # Worktrees
 .worktrees
+
+# Separate git repos (not part of this project)
+cao-flows/
