@@ -34,7 +34,9 @@ PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
 @click.option("--session-name", help="Name of the session (default: auto-generated)")
 @click.option("--headless", is_flag=True, help="Launch in detached mode")
 @click.option(
-    "--provider", default=DEFAULT_PROVIDER, help=f"Provider to use (default: {DEFAULT_PROVIDER})"
+    "--provider",
+    default=None,
+    help=f"Provider to use (default: profile provider or {DEFAULT_PROVIDER})",
 )
 @click.option(
     "--allowed-tools",
@@ -77,11 +79,6 @@ def launch(
 ):
     """Launch cao session with specified agent profile."""
     try:
-        # Validate provider
-        if provider not in PROVIDERS:
-            raise click.ClickException(
-                f"Invalid provider '{provider}'. Available providers: {', '.join(PROVIDERS)}"
-            )
         display_dir = working_directory or os.path.realpath(os.getcwd())
 
         # Resolve allowedTools: --yolo > --allowed-tools CLI > profile/role defaults
@@ -107,11 +104,26 @@ def launch(
                 resolved_allowed_tools = resolve_allowed_tools(
                     profile.allowedTools, profile.role, mcp_server_names
                 )
+                # Honour profile.provider when --provider not explicitly passed
+                if provider is None:
+                    from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
+
+                    provider = resolve_provider(agents, DEFAULT_PROVIDER)
             except (FileNotFoundError, RuntimeError):
                 # Profile not found — use developer defaults (backward compatible)
                 no_role_set = True
                 resolved_allowed_tools = resolve_allowed_tools(None, None, None)
 
+        # Fall back to DEFAULT_PROVIDER when --provider was not given and
+        # profile resolution didn't set it (yolo, --allowed-tools, or missing profile)
+        if provider is None:
+            provider = DEFAULT_PROVIDER
+
+        # Validate provider
+        if provider not in PROVIDERS:
+            raise click.ClickException(
+                f"Invalid provider '{provider}'. Available providers: {', '.join(PROVIDERS)}"
+            )
         # Confirmation / warning prompts
         if provider in PROVIDERS_REQUIRING_WORKSPACE_ACCESS:
             if yolo:
