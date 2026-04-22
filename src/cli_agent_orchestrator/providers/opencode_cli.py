@@ -106,13 +106,17 @@ class OpenCodeCliProvider(BaseProvider):
     def extraction_tail_lines(self) -> int:
         """Capture extra scrollback for extraction (belt-and-braces).
 
+        Consumed by ``terminal_service.get_output`` via a ``getattr`` capability
+        check: providers that define this attribute opt in to a deeper
+        ``capture-pane`` for LAST-mode extraction.
+
         OpenCode renders in alt-screen mode, so tmux's history_size stays near 2
         and capture-pane returns only the current viewport (~41 lines) regardless
-        of the -S prefix. This override is therefore a no-op in current opencode
-        releases — extraction relies on the within-viewport fallback at
+        of the -S prefix. In current opencode releases this request is therefore
+        a no-op — extraction relies on the within-viewport fallback at
         extract_last_message_from_script (see the ``first_indent`` branch).
 
-        The override is retained as belt-and-braces in case opencode ever switches
+        The value is retained as belt-and-braces in case opencode ever switches
         out of alt-screen mode (at which point the 2000-line capture would start
         providing the extra scrollback the extraction loop originally expected).
         """

@@ -380,10 +380,11 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
     TUI-based providers (e.g. Gemini CLI's Ink renderer) whose notification
     spinners can temporarily obscure response text in the tmux capture buffer.
 
-    If the provider declares ``extraction_tail_lines``, the history capture
-    for LAST mode uses that value instead of the default ``TMUX_HISTORY_LINES``.
-    Status-check captures are unaffected (they go through get_status directly).
-    A single capture-pane call is made per get_output invocation.
+    If the provider exposes an ``extraction_tail_lines`` attribute, the
+    history capture for LAST mode uses that value instead of the default
+    ``TMUX_HISTORY_LINES``. Status-check captures are unaffected (they go
+    through get_status directly). A single capture-pane call is made per
+    get_output invocation.
     """
     try:
         metadata = get_terminal_metadata(terminal_id)
@@ -397,10 +398,9 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
             if provider is None:
                 raise ValueError(f"Provider not found for terminal {terminal_id}")
 
-            # Determine capture depth once: use provider's extraction window if set,
-            # otherwise fall back to the TMUX_HISTORY_LINES default (tail_lines=None).
-            # Status-check captures (via get_status) are always at the default depth.
-            extract_lines = provider.extraction_tail_lines
+            # Capability check: providers that need deeper scrollback for extraction
+            # opt in by defining ``extraction_tail_lines``. Base providers don't.
+            extract_lines = getattr(provider, "extraction_tail_lines", None)
             full_output = tmux_client.get_history(
                 metadata["tmux_session"],
                 metadata["tmux_window"],
