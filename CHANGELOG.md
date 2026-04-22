@@ -10,16 +10,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **OpenCode CLI provider** — Full integration with [OpenCode](https://opencode.ai), a terminal-based AI assistant whose native agent format (Markdown + YAML frontmatter) maps directly onto CAO profiles. Supports `cao install --provider opencode_cli`, all five terminal states (IDLE, PROCESSING, COMPLETED, WAITING_USER_ANSWER, ERROR), permission translation from CAO `allowedTools` to OpenCode `permission:` frontmatter, MCP server wiring via a CAO-owned `opencode.json`, and config isolation from the user's personal OpenCode setup. CAO's on-disk config directory for OpenCode is `~/.aws/opencode/` — users who installed an earlier pre-release build (which used `~/.aws/opencode_cli`) must re-run `cao install --provider opencode_cli` to populate the new location. The old directory can be removed with: `rm -rf ~/.aws/opencode_cli`. Provider docs: [`docs/opencode-cli.md`](docs/opencode-cli.md).
+## [2.1.0] - 2026-04-22
+
+### Added
+
+- **`cao session` command group + HTTP-based CLI refactor (#187)** — New `cao session list | status | send` commands for inspecting and driving running sessions from the CLI. `cao shutdown` and `cao launch` now go through the HTTP API instead of direct service calls, enabling a local CLI to drive a remote `cao-server`. `cao launch` also gains `--working-directory` and an optional trailing `message` argument for one-shot headless task execution. New `cao-session-management` skill documents the command group for LLM-driven operators.
+- **External plugins support (#172)** — Observer/hook plugins can now be installed via pip and auto-discovered through the `cao.plugins` entry point group. Plugins subclass `CaoPlugin` and register handlers with the `@hook` decorator. See [docs/plugins.md](docs/plugins.md).
+- **Skills system (#145, #154, #170)** — Native support for reusable agent skills installed to `~/.cao/skills/` via `cao skill add`. New `cao-provider` skill guides contributors through adding new CLI agent providers; `cao-supervisor-protocols` and `cao-worker-protocols` seeded via `cao init`. Managed-skills section added to README.
+- **Kiro CLI full TUI mode + `--legacy-ui` fallback (#138, #163)** — Support for Kiro CLI's new full-screen TUI alongside the legacy prompt; `--legacy-ui` flag preserved for compatibility.
+- **Agent-profile environment variable injection (#156)** — Agent profiles can declare `env` entries that are loaded into the agent process at launch, with secret-aware handling via `~/.cao/.env`.
+- **`allowedTools` universal tool restriction (#125, #144)** — Unified CAO tool-restriction vocabulary translated per-provider, replacing provider-specific allow/deny flags. Child agents honor explicit `allowedTools=["*"]` instead of silently inheriting parent restrictions.
+- **Web UI bundled in Python wheel (#169)** — Built Web UI assets now ship inside the wheel, so `uv tool install git+https://github.com/awslabs/cli-agent-orchestrator.git` gives you the dashboard with no extra build steps.
 
 ### Changed
 
-- **Launch prompt clarity + `--auto-approve`** — Redesign the `cao launch` confirmation prompt to show `Role` instead of `Blocked`, clearly distinguish `[Y]` / `[--auto-approve]` / `[--yolo]`, and add `--auto-approve` flag to skip the prompt without removing restrictions (for automated flows, scripts, and agent-to-agent launches)
+- **Launch prompt clarity + `--auto-approve` (#146)** — Redesigned the `cao launch` confirmation prompt to show `Role` instead of `Blocked`, clearly distinguish `[Y]` / `[--auto-approve]` / `[--yolo]`, and added `--auto-approve` flag to skip the prompt without removing restrictions (for automated flows, scripts, and agent-to-agent launches).
 
 ### Fixed
 
-- **Kiro CLI new TUI support** — Add fallback detection patterns for the new Kiro CLI TUI prompt format (`ask a question, or describe a task`), ensuring CAO works even if `--legacy-ui` is removed in a future version
-- **Agent profile exception handling (#137)** — Fix `load_agent_profile()` wrapping `FileNotFoundError` as `RuntimeError`, which caused `assign()` to fail for JSON-only agent profiles (AIM-installed kiro-cli agents). Callers now receive `FileNotFoundError` directly and handle it gracefully
-- **Missing providers in Web UI (#157)** — Add `gemini_cli`, `kimi_cli`, and `copilot_cli` to the `/agents/providers` endpoint and frontend fallback list so all 7 providers appear in the Web UI dropdown
+- **Terminal-service cleanup guard (#191)** — `_create_terminal` no longer kills sessions it didn't create during rollback: the cleanup path now tracks whether this call actually created the tmux session (`session_created` fact) instead of the `new_session` intent flag. Prevents collateral damage to pre-existing sessions when terminal creation fails partway through.
+- **Claude Code false-positive IDLE on shell prompt (#190)** — Initialize-time status check could return IDLE against the pre-existing zsh/bash `❯` prompt before Claude Code actually started. Added pre-launch pane snapshot + Claude-specific startup markers to confirm the CLI is actually running before accepting IDLE.
+- **Claude Code structural PROCESSING detection (#177)** — `get_status()` now uses structural detection for PROCESSING instead of relying on `❯` position, eliminating a race where the spinner and prompt interleaved mid-capture.
+- **Stale processing spinners no longer block Claude Code inbox delivery (#106)** — The inbox watchdog no longer gets stuck on lingering spinner output after a response completes, so messages to Claude Code workers are delivered reliably.
+- **Profile-level `model` honored at terminal creation (#189)** — Providers now pass `profile.model` through to the CLI at launch, so per-agent model selection works end-to-end.
+- **Kiro CLI 2.0 Credits-before-separator layout (#188)** — Status detection updated for the new Kiro TUI layout where the credits line appears before the separator.
+- **Kiro CLI position-aware "Kiro is working" check (#185)** — Stale scrollback could leave "Kiro is working" in the capture after completion and block handoffs with a false PROCESSING; detection is now position-aware to the latest interaction.
+- **Kiro CLI new TUI fallback patterns (#140)** — Added fallback detection patterns for the new Kiro CLI TUI prompt format (`ask a question, or describe a task`), ensuring CAO works even if `--legacy-ui` is removed in a future version.
+- **Agent profile exception handling (#140, resolves #137)** — `load_agent_profile()` no longer wraps `FileNotFoundError` as `RuntimeError`, which caused `assign()` to fail for JSON-only agent profiles (AIM-installed Kiro CLI agents). Callers now receive `FileNotFoundError` directly and handle it gracefully.
+- **Terminal-service graceful handling of missing agent profiles (#186)** — When an agent profile can't be found in the CAO store, `terminal_service` returns a clear error instead of tracebacking.
+- **Missing providers in Web UI (#158, resolves #157)** — Added `gemini_cli`, `kimi_cli`, and `copilot_cli` to the `/agents/providers` endpoint and frontend fallback list so all 7 providers appear in the Web UI dropdown.
+- **Web UI terminal scroll and paste reliability (#162)** — Fixes for scrollback drift and multi-line paste handling in the browser terminal.
+- **WAITING_USER_ANSWER false positives from stale scrollback (#142)** — Regex hardened so historical "confirm? [y/n]" lines in scrollback don't get re-detected as active prompts.
+- **Gemini skill catalog injection assertion in tests (#180)** — Test reads `GEMINI.md` rather than a hardcoded fixture so the catalog assertion tracks the live skill set.
+
+### Security
+
+- Bump authlib 1.6.9 → 1.6.11 (#178)
+- Bump python-multipart 0.0.22 → 0.0.26 (#175)
+- Bump cryptography 46.0.5 → 46.0.7 (#135, #165)
+- Bump fastmcp 2.14.5 → 3.2.0 (#139)
+- Bump pygments 2.19.2 → 2.20.0 (#136)
+- Bump vite 6.4.1 → 6.4.2 (#160)
+- Bump pytest (dev) 8.4.2 → 9.0.3 (#173)
+- Bump python-dotenv 1.1.1 → 1.2.2 (#194)
 
 ## [2.0.0] - 2026-03-28
 
