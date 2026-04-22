@@ -166,6 +166,17 @@ class TestGetStatusFromFixtures:
         provider = make_provider()
         assert provider.get_status() == TerminalStatus.ERROR
 
+    @patch("cli_agent_orchestrator.providers.opencode_cli.tmux_client")
+    def test_unknown_output_returns_error_fallback(self, mock_tmux):
+        """Non-empty output with no recognizable pattern → ERROR fallback.
+
+        Exercises the final ``return TerminalStatus.ERROR`` at the end of
+        get_status(), distinct from the early return on empty/None output.
+        """
+        mock_tmux.get_history.return_value = "random text without any tui markers"
+        provider = make_provider()
+        assert provider.get_status() == TerminalStatus.ERROR
+
 
 # ---------------------------------------------------------------------------
 # (c)  Stale ``esc interrupt`` + idle footer on later line → IDLE
@@ -288,6 +299,39 @@ class TestExtractLastMessage:
         # Should not contain raw ANSI sequences
         assert "\x1b[" not in result
         assert result.strip()
+
+    def test_extract_skips_residual_bar_lines(self):
+        """Residual ┃ lines inside raw_response are stripped by the agent-block loop.
+
+        Constructs a raw_response slice whose first ``┃\\s{2}`` match anchors at the
+        top but contains a bare ┃ line (followed by non-whitespace so the regex
+        doesn't consume it) and a trailing blank line before the agent response.
+        Exercises both the ``^\\s*┃`` branch and the ``not past_user_block and not
+        line.strip()`` branch of the extraction loop.
+        """
+        provider = make_provider()
+        output = (
+            "┃  user msg\n"
+            "  ┃Xstray-residual\n"  # residual ┃ line; does not match ┃\\s{2}
+            "\n"  # blank after ┃-strip → past_user_block=False branch
+            "     agent reply here\n"
+            "\n"
+            "     ▣  Build · Big Pickle · 3.1s\n"
+        )
+        result = provider.extract_last_message_from_script(output)
+        assert "agent reply here" in result
+        assert "stray-residual" not in result
+
+    def test_extract_raises_when_response_is_empty(self):
+        """Empty content between user bar and ▣ → ValueError.
+
+        Exercises the ``if not result:`` guard after dedent/strip.
+        """
+        provider = make_provider()
+        # User bar with nothing after it before the ▣ marker.
+        output = "┃  \n     ▣  Build · Big Pickle · 3.1s\n"
+        with pytest.raises(ValueError, match="Empty OpenCode response"):
+            provider.extract_last_message_from_script(output)
 
 
 # ---------------------------------------------------------------------------

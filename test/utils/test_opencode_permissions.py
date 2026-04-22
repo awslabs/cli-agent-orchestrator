@@ -2,6 +2,7 @@
 
 import pytest
 
+from cli_agent_orchestrator.utils import opencode_permissions
 from cli_agent_orchestrator.utils.opencode_permissions import (
     ALL_OPENCODE_TOOLS,
     cao_tools_to_opencode_permission,
@@ -146,3 +147,16 @@ class TestResultContainsAllTools:
     def test_exactly_13_tools_returned(self, allowed: list):
         result = cao_tools_to_opencode_permission(allowed)
         assert set(result.keys()) == set(ALL_OPENCODE_TOOLS)
+
+
+class TestUnhandledToolFailsLoudly:
+    """A tool added to ALL_OPENCODE_TOOLS without a policy must raise AssertionError."""
+
+    def test_unhandled_tool_raises(self, monkeypatch):
+        monkeypatch.setattr(
+            opencode_permissions,
+            "ALL_OPENCODE_TOOLS",
+            list(opencode_permissions.ALL_OPENCODE_TOOLS) + ["mystery_tool"],
+        )
+        with pytest.raises(AssertionError, match="unhandled tool 'mystery_tool'"):
+            cao_tools_to_opencode_permission(["@builtin"])
