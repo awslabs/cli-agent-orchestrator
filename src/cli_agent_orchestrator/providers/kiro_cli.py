@@ -136,6 +136,11 @@ class KiroCliProvider(BaseProvider):
         # New TUI header pattern: "agent_name · model · ◔ N%"
         self._new_tui_header_pattern = rf"{re.escape(self._agent_profile)}\s+·\s+.*·\s+◔\s*\d+%"
 
+    @property
+    def paste_enter_count(self) -> int:
+        """Kiro CLI submits on single Enter after bracketed paste."""
+        return 1
+
     def initialize(self) -> bool:
         """Initialize Kiro CLI provider by starting kiro-cli chat command.
 
@@ -311,6 +316,26 @@ class KiroCliProvider(BaseProvider):
         green_arrows = list(re.finditer(GREEN_ARROW_PATTERN, clean_output, re.MULTILINE))
         idle_prompts = list(re.finditer(self._idle_prompt_pattern, clean_output))
         new_tui_idles = list(re.finditer(NEW_TUI_IDLE_PATTERN, clean_output))
+
+        # Slash command fallback: if the most recent interaction (between the
+        # last two idle prompts) has no green arrow, it was a CLI-handled
+        # command like /context or /compact. Extract that output instead.
+        if len(idle_prompts) >= 2:
+            last_prompt_pos = idle_prompts[-1].start()
+            prev_prompt_pos = idle_prompts[-2].end()
+            has_arrow_in_last_interaction = any(
+                m.start() > prev_prompt_pos and m.start() < last_prompt_pos for m in green_arrows
+            )
+            if not has_arrow_in_last_interaction:
+                between = clean_output[prev_prompt_pos:last_prompt_pos]
+                # First line is the user's command text, skip it
+                lines = between.split("\n", 1)
+                if lines[0].lstrip().startswith("/"):
+                    output = lines[1].strip() if len(lines) > 1 else ""
+                    if output:
+                        output = re.sub(ESCAPE_SEQUENCE_PATTERN, "", output)
+                        output = re.sub(CONTROL_CHAR_PATTERN, "", output)
+                        return output.strip()
 
         if not green_arrows:
             # Fallback: try TUI extraction (separator + Credits pattern)
