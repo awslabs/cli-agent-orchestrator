@@ -17,7 +17,7 @@ def seed_default_skills() -> int:
     seeded_count = 0
 
     for skill_dir in bundled_skills.iterdir():
-        if not skill_dir.is_dir():
+        if not skill_dir.is_dir() or not (skill_dir / "SKILL.md").is_file():
             continue
 
         destination_dir = SKILLS_DIR / skill_dir.name

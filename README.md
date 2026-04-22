@@ -197,6 +197,41 @@ cao shutdown --session <session-name>
 
 ![Tmux Window Selector](./docs/assets/tmux_all_windows.png)
 
+
+## Session Management
+
+CAO provides CLI commands for managing sessions programmatically — useful for scripting, CI pipelines, or headless operation.
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `cao session list` | List active sessions |
+| `cao session status <name>` | Show conductor status and last output |
+| `cao session status <name> --workers` | Include worker terminal statuses |
+| `cao session send <name> "msg"` | Send message and wait for completion |
+| `cao session send <name> "msg" --async` | Fire-and-forget without waiting |
+| `cao session send <name> "msg" --timeout N` | Wait up to N seconds |
+| `cao shutdown --session <name>` | Shut down a session |
+
+### Headless Launch
+
+```bash
+cao launch --agents supervisor --headless --yolo \
+  --session-name my-task --working-directory '/path/to/project' "Your task here"
+```
+
+Add `--async` to send the message and return immediately without waiting for completion:
+
+```bash
+cao launch --agents supervisor --headless --async --yolo \
+  --session-name my-task --working-directory '/path/to/project' "Your task here"
+```
+
+> **Note:** Session names are automatically prefixed with `cao-`. Use the prefixed form (e.g., `cao-my-task`) when referencing sessions in commands like `cao session send` and `cao shutdown`.
+
+For full details, see the [Session Management skill](skills/cao-session-management/SKILL.md).
+
 ## Web UI
 
 CAO includes a web dashboard for managing agents, terminals, and flows from the browser.
