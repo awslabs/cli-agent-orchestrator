@@ -481,3 +481,33 @@ def test_launch_headless_message_poll_processing_then_completed():
 
         assert result.exit_code == 0
         assert "done" in result.output
+
+
+def test_launch_honors_profile_provider_when_flag_not_given():
+    """Test that profile.provider is used when --provider is not passed."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run"),
+        patch(
+            "cli_agent_orchestrator.utils.agent_profiles.resolve_provider",
+            return_value="claude_code",
+        ) as mock_resolve,
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+
+        result = runner.invoke(
+            launch,
+            ["--agents", "code_supervisor", "--headless"],
+            input="y\n",
+        )
+
+        assert result.exit_code == 0
+        mock_resolve.assert_called_once()
+        params = mock_post.call_args.kwargs["params"]
+        assert params["provider"] == "claude_code"
