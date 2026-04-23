@@ -30,6 +30,7 @@ from cli_agent_orchestrator.constants import (
     ALLOWED_HOSTS,
     CAO_HOME_DIR,
     CORS_ORIGINS,
+    DEFAULT_PROVIDER,
     INBOX_POLLING_INTERVAL,
     SERVER_HOST,
     SERVER_PORT,
@@ -49,8 +50,9 @@ from cli_agent_orchestrator.services import (
 )
 from cli_agent_orchestrator.services.cleanup_service import cleanup_old_data
 from cli_agent_orchestrator.services.inbox_service import LogFileHandler
+from cli_agent_orchestrator.services.install_service import InstallResult, install_agent
 from cli_agent_orchestrator.services.terminal_service import OutputMode
-from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
+from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.logging import setup_logging
 from cli_agent_orchestrator.utils.skills import (
     SkillNameError,
@@ -102,6 +104,18 @@ class WorkingDirectoryResponse(BaseModel):
     working_directory: Optional[str] = Field(
         description="Current working directory of the terminal, or None if unavailable"
     )
+
+
+class InstallAgentProfileRequest(BaseModel):
+    """Request body for installing an agent profile.
+
+    ``env_vars`` travels in the JSON body rather than as a query parameter so
+    that any secrets callers inject are not written to HTTP access logs.
+    """
+
+    source: str
+    provider: str = DEFAULT_PROVIDER
+    env_vars: Optional[Dict[str, str]] = None
 
 
 class CreateFlowRequest(BaseModel):
@@ -209,6 +223,34 @@ async def list_agent_profiles_endpoint() -> List[Dict]:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to list agent profiles: {str(e)}",
         )
+
+
+@app.get("/agents/profiles/{name}")
+async def get_agent_profile_endpoint(name: str) -> Dict:
+    """Return the full parsed content of a named agent profile."""
+    try:
+        profile = load_agent_profile(name)
+        return profile.model_dump(exclude_none=True)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@app.post("/agents/profiles/install")
+async def install_agent_profile_endpoint(request: InstallAgentProfileRequest) -> InstallResult:
+    """Install an agent profile for a target provider."""
+    result = install_agent(
+        source=request.source,
+        provider=request.provider,
+        env_vars=request.env_vars,
+    )
+    if not result.success:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=result.message)
+
+    return result
 
 
 @app.get("/agents/providers")

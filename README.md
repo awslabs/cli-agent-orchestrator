@@ -378,6 +378,80 @@ You can combine the three orchestration modes above into custom workflows, or cr
 
 For complete API documentation, see [docs/api.md](docs/api.md).
 
+## CAO Ops MCP Server
+
+`cao-ops-mcp` is an MCP server that exposes CAO management operations as structured tools for your primary agent. Add it to your primary agent's MCP configuration to install profiles and manage sessions directly from the agent interface — no separate terminal required.
+
+**How it differs from `cao-mcp-server`:**
+
+| Server | Who uses it | Purpose |
+|--------|-------------|---------|
+| `cao-mcp-server` | Agents **inside** a CAO session | Inter-agent orchestration: `handoff`, `assign`, `send_message` |
+| `cao-ops-mcp` | Your primary agent, **outside** a CAO session | Meta management: install profiles, launch and monitor sessions |
+
+### Setup
+
+Add `cao-ops-mcp` to your primary agent's MCP configuration. The server requires `cao-server` running at `localhost:9889`.
+
+**Claude Code** — add to `.mcp.json` in the project root:
+
+```json
+{
+  "mcpServers": {
+    "cao-ops-mcp": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/awslabs/cli-agent-orchestrator.git@main", "cao-ops-mcp-server"]
+    }
+  }
+}
+```
+
+**Other agents** — configure the equivalent stdio MCP server command in your agent's MCP settings:
+
+```
+uvx --from git+https://github.com/awslabs/cli-agent-orchestrator.git@main cao-ops-mcp-server
+```
+
+### Available Tools
+
+**Profile management:**
+
+| Tool | Description |
+|------|-------------|
+| `list_profiles` | List available agent profiles with name, description, and source |
+| `get_profile_details` | Inspect full content and metadata of a specific profile |
+| `install_profile` | Install a profile for a target provider (accepts name, file path, or URL) |
+
+**Session lifecycle:**
+
+| Tool | Description |
+|------|-------------|
+| `launch_session` | Create a new CAO session — returns `session_name` and `terminal_id` immediately |
+| `send_session_message` | Queue a message for delivery to a running terminal |
+| `list_sessions` | List active sessions with terminal counts and statuses |
+| `get_session_info` | Get per-terminal status, provider, profile, and last activity |
+| `shutdown_session` | Cleanly shut down a session — exits providers, kills tmux session |
+
+### Typical Workflow
+
+```
+list_profiles ──> install_profile ──> launch_session
+                                           │
+                                    send_session_message  (deliver task)
+                                           │
+                                    get_session_info      (poll for progress)
+                                           │
+                                    shutdown_session
+```
+
+1. **Discover** available profiles with `list_profiles`
+2. **Inspect** a profile's system prompt and metadata with `get_profile_details`
+3. **Install** the profile for your provider with `install_profile`
+4. **Launch** a session with `launch_session` — returns immediately with `session_name` and `terminal_id`
+5. **Deliver** the initial task with `send_session_message` using the returned `terminal_id`
+6. **Monitor** progress with `get_session_info` or `list_sessions`
+7. **Clean up** when done with `shutdown_session`
+
 ## Flows - Scheduled Agent Sessions
 
 Flows allow you to schedule agent sessions to run automatically based on cron expressions.
