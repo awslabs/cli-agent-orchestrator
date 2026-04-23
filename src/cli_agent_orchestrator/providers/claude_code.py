@@ -34,18 +34,11 @@ RESPONSE_PATTERN = r"⏺(?:\x1b\[[0-9;]*m)*\s+"  # Handle any ANSI codes between
 # - Minimal format: "✻ Orbiting…" (no parenthesized status)
 # Common: spinner char + text + ellipsis, optionally followed by parenthesized status
 PROCESSING_PATTERN = r"[✶✢✽✻✳·].*\u2026"
-# Structural PROCESSING indicator: a spinner line (spinner char + … ) immediately
-# before the ──────── separator line that Claude Code draws before the input prompt.
-# Requires a known spinner character on the same line as … to avoid false-positives
-# from response text or tool outputs that happen to contain … .
-# Allows 0–2 blank lines between the spinner and the separator.
-# The separator line starts with an ANSI colour code (\x1b[38;5;244m) before the
-# box-drawing characters (U+2500), so the pattern skips that prefix explicitly.
-#
-# Processing: "✻ Skedaddling…\n\n────────\n❯ " → spinner+… before separator → PROCESSING
-# Idle/done: "⏺ response text\n────────\n❯ " → no spinner before separator → not PROCESSING
-# Stale spinner: "✢ Thinking…" far back in scrollback, current separator has
-# no spinner immediately before it → not PROCESSING
+# Structural PROCESSING indicator (reference pattern — get_status uses an
+# inline last-separator-anchored version to avoid false positives from
+# mid-conversation compaction events like "✢ Compacting conversation…"):
+# a spinner line (spinner char + … ) immediately before the ────────
+# separator, allowing 0–2 blank lines between them.
 THINKING_BEFORE_SEPARATOR_PATTERN = re.compile(
     r"[^\n]*[✶✢✽✻✳·][^\n]*\u2026[^\n]*\n(?:[^\n]*\n){0,2}(?:\x1b\[[0-9;]*m)*\u2500{20,}",
     re.MULTILINE,
@@ -335,11 +328,22 @@ class ClaudeCodeProvider(BaseProvider):
         if not output:
             return TerminalStatus.ERROR
 
-        # PRIMARY PROCESSING check: structural — thinking line immediately
-        # before the ──────── separator. Catches ALL spinner variants (including
-        # newer "· Swirling…" format) and is immune to the ❯ position problem.
-        if THINKING_BEFORE_SEPARATOR_PATTERN.search(output):
-            return TerminalStatus.PROCESSING
+        # PRIMARY PROCESSING check: walk backwards from the *last* separator.
+        # If we encounter a spinner line (spinner char + …) before we encounter
+        # another separator, the agent is actively processing.
+        # If we hit another separator first, the spinner belongs to a previously
+        # completed task — covers two distinct false-positive patterns:
+        # 1. Mid-conversation compaction: "✢ Compacting…" → sep → more output → last sep
+        # 2. Post-exit: live spinner → sep (task done) → ❯ /exit → last sep (exit menu)
+        _sep_re = re.compile(r"(?:\x1b\[[0-9;]*m)*\u2500{20,}")
+        _sep_positions = [m.start() for m in _sep_re.finditer(output)]
+        if _sep_positions:
+            pre_sep_lines = output[: _sep_positions[-1]].rstrip("\n").split("\n")
+            for line in reversed(pre_sep_lines):
+                if re.search(r"[✶✢✽✻✳·][^\n]*\u2026", line):
+                    return TerminalStatus.PROCESSING  # spinner before another separator
+                if _sep_re.search(line):
+                    break  # hit another separator first — spinner is from a completed task
 
         # Find the LAST occurrence of each marker for fallback position checks.
         last_processing = None
