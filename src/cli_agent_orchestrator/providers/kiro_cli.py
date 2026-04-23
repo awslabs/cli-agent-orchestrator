@@ -25,6 +25,7 @@ from typing import Optional
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 
 logger = logging.getLogger(__name__)
@@ -141,6 +142,24 @@ class KiroCliProvider(BaseProvider):
         """Kiro CLI submits on single Enter after bracketed paste."""
         return 1
 
+    def _get_profile_model(self) -> Optional[str]:
+        """Return profile.model if the agent profile can be loaded, else None.
+
+        Best-effort: historically the Kiro CLI provider has not required the
+        CAO agent profile to be loadable at runtime (kiro-cli has its own
+        agent store). A missing or unparseable profile must not block launch.
+        """
+        try:
+            profile = load_agent_profile(self._agent_profile)
+        except (FileNotFoundError, RuntimeError) as exc:
+            logger.debug(
+                "Profile '%s' not loadable by CAO; skipping --model resolution: %s",
+                self._agent_profile,
+                exc,
+            )
+            return None
+        return profile.model or None
+
     def initialize(self) -> bool:
         """Initialize Kiro CLI provider by starting kiro-cli chat command.
 
@@ -163,7 +182,19 @@ class KiroCliProvider(BaseProvider):
         # Step 2: Start the Kiro CLI chat session using kiro-cli's default UI.
         # Detection code handles both legacy and TUI patterns (stateless).
         # If initialization fails, fall back to --legacy-ui.
-        command = shlex.join(["kiro-cli", "chat", "--agent", self._agent_profile])
+        #
+        # --trust-all-tools: bypass Kiro CLI's permission prompts when CAO
+        # launches with --yolo (allowed_tools=['*']). Without this, every
+        # tool invocation re-prompts, blocking assign/handoff flows.
+        # --model: honor profile.model so workflows can pin a specific model.
+        base_args = ["kiro-cli", "chat"]
+        if self._allowed_tools and "*" in self._allowed_tools:
+            base_args.append("--trust-all-tools")
+        model = self._get_profile_model()
+        if model:
+            base_args.extend(["--model", model])
+        base_args.extend(["--agent", self._agent_profile])
+        command = shlex.join(base_args)
         tmux_client.send_keys(self.session_name, self.window_name, command)
 
         # Step 3: Wait for Kiro CLI to fully initialize and show the agent prompt.
@@ -178,9 +209,13 @@ class KiroCliProvider(BaseProvider):
             tmux_client.send_keys(self.session_name, self.window_name, "/exit")
             if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
                 raise TimeoutError("Shell recovery timed out after --legacy-ui fallback")
-            legacy_command = shlex.join(
-                ["kiro-cli", "chat", "--legacy-ui", "--agent", self._agent_profile]
-            )
+            legacy_args = ["kiro-cli", "chat", "--legacy-ui"]
+            if self._allowed_tools and "*" in self._allowed_tools:
+                legacy_args.append("--trust-all-tools")
+            if model:
+                legacy_args.extend(["--model", model])
+            legacy_args.extend(["--agent", self._agent_profile])
+            legacy_command = shlex.join(legacy_args)
             tmux_client.send_keys(self.session_name, self.window_name, legacy_command)
             if not wait_until_status(
                 self, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=30.0
