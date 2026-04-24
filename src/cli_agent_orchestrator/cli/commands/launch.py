@@ -143,6 +143,19 @@ def launch(
                         "  Note: kiro_cli will launch in --legacy-ui mode so "
                         "--trust-all-tools can be applied non-interactively.\n"
                     )
+                elif provider == "opencode_cli":
+                    # opencode's TUI has no runtime skip-permissions flag
+                    # (tracked upstream in sst/opencode#8463). Permissions are
+                    # install-time only, so --yolo cannot loosen them here.
+                    click.echo(
+                        click.style(
+                            "  Note: --yolo has no runtime effect on opencode_cli.\n"
+                            "  Permissions are set at cao install time. To get unrestricted\n"
+                            "  access, set 'allowedTools: [\"*\"]' in the profile and re-run\n"
+                            "  'cao install'. See docs/opencode-cli.md for details.\n",
+                            fg="yellow",
+                        )
+                    )
             else:
                 # Normal launch: show tool summary and confirm
                 tool_summary = format_tool_summary(resolved_allowed_tools)
