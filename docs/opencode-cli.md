@@ -1,5 +1,7 @@
 # OpenCode CLI Provider
 
+> ⚠️ **Experimental — single-agent flows only.** Multi-agent orchestration (assign / send_message back to a supervisor) is **not yet reliable** on `opencode_cli`: the supervisor's inbox can deadlock with `pending` messages after its turn settles. Single-agent and pure handoff workflows are unaffected. Tracking: [#203](https://github.com/awslabs/cli-agent-orchestrator/issues/203).
+
 ## Overview
 
 The OpenCode CLI provider enables CLI Agent Orchestrator (CAO) to work with **OpenCode**, a terminal-based AI assistant with a native agent system. OpenCode uses Markdown files with YAML frontmatter as its agent format — nearly identical to CAO's own profile format — making this integration especially clean.
