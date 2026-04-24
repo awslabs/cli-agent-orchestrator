@@ -25,6 +25,7 @@ PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
     "gemini_cli",
     "kimi_cli",
     "kiro_cli",
+    "opencode_cli",
 }
 
 
