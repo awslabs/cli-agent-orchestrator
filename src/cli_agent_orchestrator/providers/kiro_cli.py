@@ -179,18 +179,31 @@ class KiroCliProvider(BaseProvider):
         if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
-        # Step 2: Start the Kiro CLI chat session using kiro-cli's default UI.
-        # Detection code handles both legacy and TUI patterns (stateless).
-        # If initialization fails, fall back to --legacy-ui.
+        # Step 2: Start the Kiro CLI chat session.
         #
         # --trust-all-tools: bypass Kiro CLI's permission prompts when CAO
         # launches with --yolo (allowed_tools=['*']). Without this, every
         # tool invocation re-prompts, blocking assign/handoff flows.
         # --model: honor profile.model so workflows can pin a specific model.
-        base_args = ["kiro-cli", "chat"]
-        if self._allowed_tools and "*" in self._allowed_tools:
-            base_args.append("--trust-all-tools")
+        #
+        # UI mode selection:
+        # - Yolo (--trust-all-tools): kiro-cli 2.0.1 TUI blocks on an
+        #   interactive "Yes, I accept" consent dialog before the chat is
+        #   ready; only --legacy-ui/--classic/--no-interactive bypass it.
+        #   CAO drives kiro-cli headlessly, so we force --legacy-ui for yolo.
+        # - Non-yolo: use the default TUI (fall back to --legacy-ui on
+        #   timeout, preserving prior behavior for older kiro-cli versions).
+        yolo = bool(self._allowed_tools and "*" in self._allowed_tools)
         model = self._get_profile_model()
+
+        if yolo:
+            logger.info(
+                "kiro_cli yolo mode: forcing --legacy-ui (kiro-cli 2.0.1 TUI "
+                "shows a non-bypassable trust-all-tools consent dialog)"
+            )
+            base_args = ["kiro-cli", "chat", "--legacy-ui", "--trust-all-tools"]
+        else:
+            base_args = ["kiro-cli", "chat"]
         if model:
             base_args.extend(["--model", model])
         base_args.extend(["--agent", self._agent_profile])
@@ -203,15 +216,18 @@ class KiroCliProvider(BaseProvider):
         if not wait_until_status(
             self, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=30.0
         ):
-            # TUI mode failed — fall back to --legacy-ui
+            if yolo:
+                # Yolo already launched with --legacy-ui; no further fallback.
+                raise TimeoutError(
+                    "Kiro CLI initialization timed out with --legacy-ui (yolo mode)"
+                )
+            # Non-yolo TUI mode failed — fall back to --legacy-ui
             logger.warning("Kiro CLI TUI initialization timed out, retrying with --legacy-ui")
             # Exit the current session and start fresh with --legacy-ui
             tmux_client.send_keys(self.session_name, self.window_name, "/exit")
             if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
                 raise TimeoutError("Shell recovery timed out after --legacy-ui fallback")
             legacy_args = ["kiro-cli", "chat", "--legacy-ui"]
-            if self._allowed_tools and "*" in self._allowed_tools:
-                legacy_args.append("--trust-all-tools")
             if model:
                 legacy_args.extend(["--model", model])
             legacy_args.extend(["--agent", self._agent_profile])
