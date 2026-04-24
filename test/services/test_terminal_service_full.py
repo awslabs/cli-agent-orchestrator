@@ -24,7 +24,7 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_multiplexer")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
@@ -35,16 +35,17 @@ class TestCreateTerminal:
         mock_gen_id,
         mock_gen_session,
         mock_gen_window,
-        mock_tmux,
+        mock_get_multiplexer,
         mock_db_create,
         mock_provider_manager,
         mock_log_dir,
     ):
         """Test creating terminal with new session."""
+        mock_multiplexer = mock_get_multiplexer.return_value
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "developer-abcd"
-        mock_tmux.session_exists.return_value = False
+        mock_multiplexer.session_exists.return_value = False
         mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
         mock_provider = MagicMock()
         mock_provider_manager.create_provider.return_value = mock_provider
@@ -54,13 +55,13 @@ class TestCreateTerminal:
         result = create_terminal("kiro_cli", "developer", new_session=True)
 
         assert result.id == "test1234"
-        mock_tmux.create_session.assert_called_once()
+        mock_multiplexer.create_session.assert_called_once()
         mock_provider.initialize.assert_called_once()
 
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_multiplexer")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
@@ -71,17 +72,18 @@ class TestCreateTerminal:
         mock_gen_id,
         mock_gen_session,
         mock_gen_window,
-        mock_tmux,
+        mock_get_multiplexer,
         mock_db_create,
         mock_provider_manager,
         mock_log_dir,
     ):
         """Test creating terminal in existing session."""
+        mock_multiplexer = mock_get_multiplexer.return_value
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "developer-abcd"
-        mock_tmux.session_exists.return_value = True
-        mock_tmux.create_window.return_value = "developer-abcd"
+        mock_multiplexer.session_exists.return_value = True
+        mock_multiplexer.create_window.return_value = "developer-abcd"
         mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
         mock_provider = MagicMock()
         mock_provider_manager.create_provider.return_value = mock_provider
@@ -91,39 +93,41 @@ class TestCreateTerminal:
         result = create_terminal("kiro_cli", "developer", session_name="cao-existing")
 
         assert result.id == "test1234"
-        mock_tmux.create_window.assert_called_once()
+        mock_multiplexer.create_window.assert_called_once()
 
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_multiplexer")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
     @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
     def test_create_terminal_session_not_found(
-        self, mock_load_profile, mock_gen_id, mock_gen_session, mock_gen_window, mock_tmux
+        self, mock_load_profile, mock_gen_id, mock_gen_session, mock_gen_window, mock_get_multiplexer
     ):
         """Test creating terminal when session not found."""
+        mock_multiplexer = mock_get_multiplexer.return_value
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "developer-abcd"
-        mock_tmux.session_exists.return_value = False
+        mock_multiplexer.session_exists.return_value = False
         mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
 
         with pytest.raises(ValueError, match="not found"):
             create_terminal("kiro_cli", "developer", session_name="cao-nonexistent")
 
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_multiplexer")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
     @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
     def test_create_terminal_session_already_exists(
-        self, mock_load_profile, mock_gen_id, mock_gen_session, mock_gen_window, mock_tmux
+        self, mock_load_profile, mock_gen_id, mock_gen_session, mock_gen_window, mock_get_multiplexer
     ):
         """Test creating terminal when session already exists."""
+        mock_multiplexer = mock_get_multiplexer.return_value
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "developer-abcd"
-        mock_tmux.session_exists.return_value = True
+        mock_multiplexer.session_exists.return_value = True
         mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
 
         with pytest.raises(ValueError, match="already exists"):
@@ -132,7 +136,7 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_multiplexer")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
@@ -145,16 +149,17 @@ class TestCreateTerminal:
         mock_gen_id,
         mock_gen_session,
         mock_gen_window,
-        mock_tmux,
+        mock_get_multiplexer,
         mock_db_create,
         mock_provider_manager,
         mock_log_dir,
     ):
         """Providers that consume runtime prompts should receive the global skill catalog."""
+        mock_multiplexer = mock_get_multiplexer.return_value
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "developer-abcd"
-        mock_tmux.session_exists.return_value = False
+        mock_multiplexer.session_exists.return_value = False
         mock_load_profile.return_value = AgentProfile(
             name="developer",
             description="Developer",
@@ -190,7 +195,7 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_multiplexer")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
@@ -203,16 +208,17 @@ class TestCreateTerminal:
         mock_gen_id,
         mock_gen_session,
         mock_gen_window,
-        mock_tmux,
+        mock_get_multiplexer,
         mock_db_create,
         mock_provider_manager,
         mock_log_dir,
     ):
         """Providers should receive an empty skill prompt when no skills are installed."""
+        mock_multiplexer = mock_get_multiplexer.return_value
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "developer-abcd"
-        mock_tmux.session_exists.return_value = False
+        mock_multiplexer.session_exists.return_value = False
         mock_load_profile.return_value = AgentProfile(
             name="developer",
             description="Developer",
@@ -234,7 +240,7 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_multiplexer")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
@@ -247,17 +253,18 @@ class TestCreateTerminal:
         mock_gen_id,
         mock_gen_session,
         mock_gen_window,
-        mock_tmux,
+        mock_get_multiplexer,
         mock_db_create,
         mock_provider_manager,
         mock_log_dir,
         provider_name,
     ):
         """Kiro, Q, and Copilot should receive skill_prompt=None."""
+        mock_multiplexer = mock_get_multiplexer.return_value
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "developer-abcd"
-        mock_tmux.session_exists.return_value = False
+        mock_multiplexer.session_exists.return_value = False
         mock_load_profile.return_value = AgentProfile(
             name="developer",
             description="Developer",
@@ -283,7 +290,7 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_multiplexer")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
@@ -296,16 +303,17 @@ class TestCreateTerminal:
         mock_gen_id,
         mock_gen_session,
         mock_gen_window,
-        mock_tmux,
+        mock_get_multiplexer,
         mock_db_create,
         mock_provider_manager,
         mock_log_dir,
     ):
         """build_skill_catalog() is called exactly once for runtime-prompt providers."""
+        mock_multiplexer = mock_get_multiplexer.return_value
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "developer-abcd"
-        mock_tmux.session_exists.return_value = False
+        mock_multiplexer.session_exists.return_value = False
         mock_load_profile.return_value = AgentProfile(
             name="developer", description="Developer", system_prompt="You are the developer."
         )
@@ -321,7 +329,7 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_multiplexer")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
@@ -334,7 +342,7 @@ class TestCreateTerminal:
         mock_gen_id,
         mock_gen_session,
         mock_gen_window,
-        mock_tmux,
+        mock_get_multiplexer,
         mock_db_create,
         mock_provider_manager,
         mock_log_dir,
@@ -342,10 +350,11 @@ class TestCreateTerminal:
     ):
         """build_skill_catalog() is never called for providers that deliver skills natively or
         at install time — OpenCode (symlink), Kiro (skill:// resources), Q, Copilot."""
+        mock_multiplexer = mock_get_multiplexer.return_value
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "developer-abcd"
-        mock_tmux.session_exists.return_value = False
+        mock_multiplexer.session_exists.return_value = False
         mock_load_profile.return_value = AgentProfile(
             name="developer", description="Developer", system_prompt="Base prompt"
         )
@@ -359,7 +368,7 @@ class TestCreateTerminal:
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_multiplexer")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
@@ -370,16 +379,17 @@ class TestCreateTerminal:
         mock_gen_id,
         mock_gen_session,
         mock_gen_window,
-        mock_tmux,
+        mock_get_multiplexer,
         mock_db_create,
         mock_provider_manager,
         mock_log_dir,
     ):
         """Terminal creation succeeds when agent profile is not in CAO store (e.g. JSON-only profiles)."""
+        mock_multiplexer = mock_get_multiplexer.return_value
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
         mock_gen_window.return_value = "my-agent-abcd"
-        mock_tmux.session_exists.return_value = False
+        mock_multiplexer.session_exists.return_value = False
         mock_load_profile.side_effect = FileNotFoundError("Agent profile not found: my-agent")
         mock_provider = MagicMock()
         mock_provider_manager.create_provider.return_value = mock_provider
@@ -447,15 +457,16 @@ class TestGetTerminal:
 class TestGetWorkingDirectory:
     """Tests for get_working_directory function."""
 
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_multiplexer")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_get_working_directory_success(self, mock_get_metadata, mock_tmux):
+    def test_get_working_directory_success(self, mock_get_metadata, mock_get_multiplexer):
         """Test getting working directory successfully."""
+        mock_multiplexer = mock_get_multiplexer.return_value
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
             "tmux_window": "developer-abcd",
         }
-        mock_tmux.get_pane_working_directory.return_value = "/home/user/project"
+        mock_multiplexer.get_pane_working_directory.return_value = "/home/user/project"
 
         result = get_working_directory("test1234")
 
@@ -475,10 +486,11 @@ class TestSendInput:
 
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_multiplexer")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_send_input_success(self, mock_get_metadata, mock_tmux, mock_pm, mock_update):
+    def test_send_input_success(self, mock_get_metadata, mock_get_multiplexer, mock_pm, mock_update):
         """Test sending input successfully."""
+        mock_multiplexer = mock_get_multiplexer.return_value
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
             "tmux_window": "developer-abcd",
@@ -489,7 +501,7 @@ class TestSendInput:
         result = send_input("test1234", "test message")
 
         assert result is True
-        mock_tmux.send_keys.assert_called_once_with(
+        mock_multiplexer.send_keys.assert_called_once_with(
             "cao-session", "developer-abcd", "test message", enter_count=2
         )
         mock_update.assert_called_once_with("test1234")
@@ -506,30 +518,32 @@ class TestSendInput:
 class TestGetOutput:
     """Tests for get_output function."""
 
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_multiplexer")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_get_output_full(self, mock_get_metadata, mock_tmux):
+    def test_get_output_full(self, mock_get_metadata, mock_get_multiplexer):
         """Test getting full output."""
+        mock_multiplexer = mock_get_multiplexer.return_value
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
             "tmux_window": "developer-abcd",
         }
-        mock_tmux.get_history.return_value = "full terminal output"
+        mock_multiplexer.get_history.return_value = "full terminal output"
 
         result = get_output("test1234", OutputMode.FULL)
 
         assert result == "full terminal output"
 
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_multiplexer")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_get_output_last(self, mock_get_metadata, mock_tmux, mock_provider_manager):
+    def test_get_output_last(self, mock_get_metadata, mock_get_multiplexer, mock_provider_manager):
         """Test getting last message."""
+        mock_multiplexer = mock_get_multiplexer.return_value
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
             "tmux_window": "developer-abcd",
         }
-        mock_tmux.get_history.return_value = "full terminal output"
+        mock_multiplexer.get_history.return_value = "full terminal output"
         mock_provider = MagicMock()
         mock_provider.extract_last_message_from_script.return_value = "last message"
         mock_provider_manager.get_provider.return_value = mock_provider
@@ -547,15 +561,18 @@ class TestGetOutput:
             get_output("nonexistent")
 
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_multiplexer")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_get_output_last_no_provider(self, mock_get_metadata, mock_tmux, mock_provider_manager):
+    def test_get_output_last_no_provider(
+        self, mock_get_metadata, mock_get_multiplexer, mock_provider_manager
+    ):
         """Test getting last message when provider not found."""
+        mock_multiplexer = mock_get_multiplexer.return_value
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
             "tmux_window": "developer-abcd",
         }
-        mock_tmux.get_history.return_value = "full output"
+        mock_multiplexer.get_history.return_value = "full output"
         mock_provider_manager.get_provider.return_value = None
 
         with pytest.raises(ValueError, match="Provider not found"):
@@ -567,12 +584,13 @@ class TestDeleteTerminal:
 
     @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_multiplexer")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_delete_terminal_success(
-        self, mock_get_metadata, mock_tmux, mock_provider_manager, mock_db_delete
+        self, mock_get_metadata, mock_get_multiplexer, mock_provider_manager, mock_db_delete
     ):
         """Test deleting terminal successfully."""
+        mock_multiplexer = mock_get_multiplexer.return_value
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
             "tmux_window": "developer-abcd",
@@ -582,22 +600,23 @@ class TestDeleteTerminal:
         result = delete_terminal("test1234")
 
         assert result is True
-        mock_tmux.stop_pipe_pane.assert_called_once()
+        mock_multiplexer.stop_pipe_pane.assert_called_once()
         mock_provider_manager.cleanup_provider.assert_called_once_with("test1234")
 
     @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_multiplexer")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_delete_terminal_pipe_pane_error(
-        self, mock_get_metadata, mock_tmux, mock_provider_manager, mock_db_delete
+        self, mock_get_metadata, mock_get_multiplexer, mock_provider_manager, mock_db_delete
     ):
         """Test deleting terminal when stop_pipe_pane fails."""
+        mock_multiplexer = mock_get_multiplexer.return_value
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
             "tmux_window": "developer-abcd",
         }
-        mock_tmux.stop_pipe_pane.side_effect = Exception("Pipe error")
+        mock_multiplexer.stop_pipe_pane.side_effect = Exception("Pipe error")
         mock_db_delete.return_value = True
 
         # Should not raise, just warn

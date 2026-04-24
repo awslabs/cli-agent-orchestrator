@@ -29,8 +29,9 @@ from cli_agent_orchestrator.clients.database import (
     get_terminal_metadata,
     update_last_active,
 )
-from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.constants import SESSION_PREFIX, TERMINAL_LOG_DIR
+from cli_agent_orchestrator.multiplexers import get_multiplexer
+from cli_agent_orchestrator.multiplexers.base import LaunchSpec
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
@@ -83,6 +84,7 @@ def create_terminal(
     session_name: Optional[str] = None,
     new_session: bool = False,
     working_directory: Optional[str] = None,
+    launch_spec: LaunchSpec | None = None,
     allowed_tools: Optional[list[str]] = None,
     registry: PluginRegistry | None = None,
 ) -> Terminal:
@@ -101,6 +103,7 @@ def create_terminal(
         session_name: Optional custom session name. If not provided, auto-generated.
         new_session: If True, creates a new tmux session. If False, adds to existing.
         working_directory: Optional working directory for the terminal shell
+        launch_spec: Optional backend-specific initial process launch request
 
     Returns:
         Terminal object with all metadata populated
@@ -126,18 +129,28 @@ def create_terminal(
                 session_name = f"{SESSION_PREFIX}{session_name}"
 
             # Prevent duplicate sessions
-            if tmux_client.session_exists(session_name):
+            if get_multiplexer().session_exists(session_name):
                 raise ValueError(f"Session '{session_name}' already exists")
 
             # Create new tmux session with initial window
-            tmux_client.create_session(session_name, window_name, terminal_id, working_directory)
+            get_multiplexer().create_session(
+                session_name,
+                window_name,
+                terminal_id,
+                working_directory,
+                launch_spec=launch_spec,
+            )
             session_created = True  # only set after successful creation
         else:
             # Add window to existing session
-            if not tmux_client.session_exists(session_name):
+            if not get_multiplexer().session_exists(session_name):
                 raise ValueError(f"Session '{session_name}' not found")
-            window_name = tmux_client.create_window(
-                session_name, window_name, terminal_id, working_directory
+            window_name = get_multiplexer().create_window(
+                session_name,
+                window_name,
+                terminal_id,
+                working_directory,
+                launch_spec=launch_spec,
             )
 
         # Step 3: Persist terminal metadata to database
@@ -185,7 +198,7 @@ def create_terminal(
         # This captures all terminal output to a log file for inbox monitoring
         log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
         log_path.touch()  # Ensure file exists before watching
-        tmux_client.pipe_pane(session_name, window_name, str(log_path))
+        get_multiplexer().pipe_pane(session_name, window_name, str(log_path))
 
         # Build and return the Terminal object
         terminal = Terminal(
@@ -222,7 +235,7 @@ def create_terminal(
             pass  # Ignore cleanup errors
         if session_created and session_name:
             try:
-                tmux_client.kill_session(session_name)
+                get_multiplexer().kill_session(session_name)
             except:
                 pass  # Ignore cleanup errors
         raise
@@ -275,7 +288,7 @@ def get_working_directory(terminal_id: str) -> Optional[str]:
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        working_dir = tmux_client.get_pane_working_directory(
+        working_dir = get_multiplexer().get_pane_working_directory(
             metadata["tmux_session"], metadata["tmux_window"]
         )
         return working_dir
@@ -308,7 +321,7 @@ def send_input(
         provider = provider_manager.get_provider(terminal_id)
         enter_count = provider.paste_enter_count if provider else 1
 
-        tmux_client.send_keys(
+        get_multiplexer().send_keys(
             metadata["tmux_session"], metadata["tmux_window"], message, enter_count=enter_count
         )
 
@@ -361,7 +374,7 @@ def send_special_key(terminal_id: str, key: str) -> bool:
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        tmux_client.send_special_key(metadata["tmux_session"], metadata["tmux_window"], key)
+        get_multiplexer().send_special_key(metadata["tmux_session"], metadata["tmux_window"], key)
 
         update_last_active(terminal_id)
         logger.info(f"Sent special key '{key}' to terminal: {terminal_id}")
@@ -392,7 +405,7 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
         if mode == OutputMode.FULL:
-            return tmux_client.get_history(metadata["tmux_session"], metadata["tmux_window"])
+            return get_multiplexer().get_history(metadata["tmux_session"], metadata["tmux_window"])
         elif mode == OutputMode.LAST:
             provider = provider_manager.get_provider(terminal_id)
             if provider is None:
@@ -401,7 +414,7 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
             # Capability check: providers that need deeper scrollback for extraction
             # opt in by defining ``extraction_tail_lines``. Base providers don't.
             extract_lines = getattr(provider, "extraction_tail_lines", None)
-            full_output = tmux_client.get_history(
+            full_output = get_multiplexer().get_history(
                 metadata["tmux_session"],
                 metadata["tmux_window"],
                 tail_lines=extract_lines,
@@ -413,7 +426,7 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
                 try:
                     if attempt > 0:
                         time.sleep(10.0)
-                        full_output = tmux_client.get_history(
+                        full_output = get_multiplexer().get_history(
                             metadata["tmux_session"],
                             metadata["tmux_window"],
                             tail_lines=extract_lines,
@@ -444,13 +457,13 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
         if metadata:
             # Stop pipe-pane logging
             try:
-                tmux_client.stop_pipe_pane(metadata["tmux_session"], metadata["tmux_window"])
+                get_multiplexer().stop_pipe_pane(metadata["tmux_session"], metadata["tmux_window"])
             except Exception as e:
                 logger.warning(f"Failed to stop pipe-pane for {terminal_id}: {e}")
 
             # Kill the tmux window (this terminates the agent process)
             try:
-                tmux_client.kill_window(metadata["tmux_session"], metadata["tmux_window"])
+                get_multiplexer().kill_window(metadata["tmux_session"], metadata["tmux_window"])
             except Exception as e:
                 logger.warning(f"Failed to kill tmux window for {terminal_id}: {e}")
 

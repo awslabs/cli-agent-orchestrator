@@ -121,14 +121,14 @@ class TestTerminalPluginEvents:
     @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_multiplexer")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     def test_create_terminal_dispatches_post_create_terminal_event_after_setup(
         self,
         mock_provider_manager,
         mock_db_create_terminal,
-        mock_tmux,
+        mock_get_multiplexer,
         mock_generate_window_name,
         mock_generate_terminal_id,
         mock_load_agent_profile,
@@ -138,13 +138,14 @@ class TestTerminalPluginEvents:
         """Terminal creation should emit only after persistence and startup complete."""
         registry = _registry_mock()
         call_order: list[str] = []
+        mock_multiplexer = mock_get_multiplexer.return_value
 
         async def record_dispatch(*_args):
             call_order.append("dispatch")
 
         mock_generate_terminal_id.return_value = "abcd1234"
         mock_generate_window_name.return_value = "developer-abcd"
-        mock_tmux.session_exists.return_value = False
+        mock_multiplexer.session_exists.return_value = False
         mock_db_create_terminal.side_effect = lambda *_: call_order.append("db_create")
         mock_load_agent_profile.return_value = AgentProfile(name="developer", description="Dev")
 
@@ -154,7 +155,7 @@ class TestTerminalPluginEvents:
 
         log_path = MagicMock()
         mock_log_dir.__truediv__.return_value = log_path
-        mock_tmux.pipe_pane.side_effect = lambda *_: call_order.append("pipe_pane")
+        mock_multiplexer.pipe_pane.side_effect = lambda *_: call_order.append("pipe_pane")
         registry.dispatch.side_effect = record_dispatch
 
         terminal = create_terminal(
@@ -181,14 +182,14 @@ class TestTerminalPluginEvents:
     @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_multiplexer")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     def test_create_terminal_does_not_dispatch_on_failure(
         self,
         mock_provider_manager,
         mock_db_create_terminal,
-        mock_tmux,
+        mock_get_multiplexer,
         mock_generate_window_name,
         mock_generate_terminal_id,
         mock_load_agent_profile,
@@ -197,9 +198,10 @@ class TestTerminalPluginEvents:
     ):
         """Terminal creation failures must not emit post_create_terminal."""
         registry = _registry_mock()
+        mock_multiplexer = mock_get_multiplexer.return_value
         mock_generate_terminal_id.return_value = "abcd1234"
         mock_generate_window_name.return_value = "developer-abcd"
-        mock_tmux.session_exists.return_value = False
+        mock_multiplexer.session_exists.return_value = False
         mock_load_agent_profile.return_value = AgentProfile(name="developer", description="Dev")
 
         provider = MagicMock()
@@ -221,14 +223,15 @@ class TestTerminalPluginEvents:
 
     @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal", return_value=True)
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_multiplexer")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_delete_terminal_dispatches_post_kill_terminal_event_after_delete(
-        self, mock_get_metadata, mock_tmux, mock_provider_manager, mock_db_delete_terminal
+        self, mock_get_metadata, mock_get_multiplexer, mock_provider_manager, mock_db_delete_terminal
     ):
         """Terminal kill should emit only after deletion succeeds."""
         registry = _registry_mock()
         call_order: list[str] = []
+        mock_get_multiplexer.return_value
 
         async def record_dispatch(*_args):
             call_order.append("dispatch")
@@ -255,13 +258,14 @@ class TestTerminalPluginEvents:
 
     @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_multiplexer")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_delete_terminal_does_not_dispatch_on_failure(
-        self, mock_get_metadata, mock_tmux, mock_provider_manager, mock_db_delete_terminal
+        self, mock_get_metadata, mock_get_multiplexer, mock_provider_manager, mock_db_delete_terminal
     ):
         """Deletion failures must not emit post_kill_terminal."""
         registry = _registry_mock()
+        mock_get_multiplexer.return_value
         mock_get_metadata.return_value = {
             "tmux_session": "cao-demo",
             "tmux_window": "developer-abcd",
@@ -280,20 +284,21 @@ class TestMessagePluginEvents:
 
     @pytest.mark.parametrize("orchestration_type", ["send_message", "assign", "handoff"])
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_multiplexer")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_send_input_dispatches_post_send_message_event_for_each_orchestration_mode(
         self,
         mock_get_metadata,
         mock_provider_manager,
-        mock_tmux,
+        mock_get_multiplexer,
         mock_update_last_active,
         orchestration_type,
     ):
         """Every successful delivery should emit one post_send_message event."""
         registry = _registry_mock()
         call_order: list[str] = []
+        mock_multiplexer = mock_get_multiplexer.return_value
 
         async def record_dispatch(*_args):
             call_order.append("dispatch")
@@ -306,7 +311,9 @@ class TestMessagePluginEvents:
         provider.paste_enter_count = 2
         provider.mark_input_received.side_effect = lambda: call_order.append("mark_input_received")
         mock_provider_manager.get_provider.return_value = provider
-        mock_tmux.send_keys.side_effect = lambda *_args, **_kwargs: call_order.append("send_keys")
+        mock_multiplexer.send_keys.side_effect = lambda *_args, **_kwargs: call_order.append(
+            "send_keys"
+        )
         mock_update_last_active.side_effect = lambda *_: call_order.append("update_last_active")
         registry.dispatch.side_effect = record_dispatch
 
@@ -329,14 +336,15 @@ class TestMessagePluginEvents:
         assert event.message == "Hello from supervisor"
         assert event.orchestration_type == orchestration_type
 
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_multiplexer")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_send_input_does_not_dispatch_on_failure(
-        self, mock_get_metadata, mock_provider_manager, mock_tmux
+        self, mock_get_metadata, mock_provider_manager, mock_get_multiplexer
     ):
         """Message delivery failures must not emit post_send_message."""
         registry = _registry_mock()
+        mock_multiplexer = mock_get_multiplexer.return_value
         mock_get_metadata.return_value = {
             "tmux_session": "cao-demo",
             "tmux_window": "developer-abcd",
@@ -344,7 +352,7 @@ class TestMessagePluginEvents:
         provider = MagicMock()
         provider.paste_enter_count = 1
         mock_provider_manager.get_provider.return_value = provider
-        mock_tmux.send_keys.side_effect = RuntimeError("send failed")
+        mock_multiplexer.send_keys.side_effect = RuntimeError("send failed")
 
         with pytest.raises(RuntimeError, match="send failed"):
             send_input(
