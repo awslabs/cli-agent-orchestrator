@@ -70,11 +70,12 @@ markers = [
     "asyncio: marks tests that use asyncio",
     "integration: marks integration tests",
     "e2e: marks end-to-end tests",
-    "slow: marks tests as slow (deselect with '-m \"not slow\"')"
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "smoke: opt-in tests that require real wezterm + provider CLIs on PATH; not run by default",
 ]
 asyncio_mode = "strict"
 testpaths = ["test"]
 python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
-addopts = "--cov=src --cov-report=term-missing -m 'not e2e'"
+addopts = "--cov=src --cov-report=term-missing -m 'not e2e and not smoke'"
