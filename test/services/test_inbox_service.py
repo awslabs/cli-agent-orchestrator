@@ -18,28 +18,91 @@ from cli_agent_orchestrator.services.inbox_service import (
 class TestGetLogTail:
     """Tests for _get_log_tail function."""
 
-    @patch("cli_agent_orchestrator.services.inbox_service.subprocess.run")
-    @patch("cli_agent_orchestrator.services.inbox_service.TERMINAL_LOG_DIR")
-    def test_get_log_tail_success(self, mock_log_dir, mock_run):
-        """Test getting log tail successfully."""
-        mock_log_dir.__truediv__ = lambda self, x: Path("/tmp") / x
-        mock_run.return_value = MagicMock(stdout="last line\n")
+    @staticmethod
+    def _set_log_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        monkeypatch.setattr("cli_agent_orchestrator.services.inbox_service.TERMINAL_LOG_DIR", tmp_path)
 
-        result = _get_log_tail("test-terminal", lines=5)
+    @staticmethod
+    def _write_log(tmp_path: Path, terminal_id: str, content: bytes) -> None:
+        (tmp_path / f"{terminal_id}.log").write_bytes(content)
 
-        assert result == "last line\n"
-        mock_run.assert_called_once()
+    def test_get_log_tail_empty_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """Test empty log files return an empty string."""
+        self._set_log_dir(monkeypatch, tmp_path)
+        self._write_log(tmp_path, "test-terminal", b"")
 
-    @patch("cli_agent_orchestrator.services.inbox_service.subprocess.run")
-    @patch("cli_agent_orchestrator.services.inbox_service.TERMINAL_LOG_DIR")
-    def test_get_log_tail_exception(self, mock_log_dir, mock_run):
-        """Test getting log tail with exception."""
-        mock_log_dir.__truediv__ = lambda self, x: Path("/tmp") / x
-        mock_run.side_effect = Exception("Subprocess error")
+        assert _get_log_tail("test-terminal") == ""
 
-        result = _get_log_tail("test-terminal")
+    def test_get_log_tail_one_line_without_trailing_newline(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Test single-line logs without trailing newlines."""
+        self._set_log_dir(monkeypatch, tmp_path)
+        self._write_log(tmp_path, "test-terminal", b"last line")
 
-        assert result == ""
+        assert _get_log_tail("test-terminal", lines=5) == "last line"
+
+    def test_get_log_tail_one_line_with_trailing_newline(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Test single-line logs with trailing newlines."""
+        self._set_log_dir(monkeypatch, tmp_path)
+        self._write_log(tmp_path, "test-terminal", b"last line\n")
+
+        assert _get_log_tail("test-terminal", lines=5) == "last line\n"
+
+    def test_get_log_tail_exactly_n_lines(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """Test logs with exactly the requested number of lines."""
+        self._set_log_dir(monkeypatch, tmp_path)
+        content = "".join(f"line {i}\n" for i in range(1, 6)).encode()
+        self._write_log(tmp_path, "test-terminal", content)
+
+        assert _get_log_tail("test-terminal", lines=5) == content.decode()
+
+    def test_get_log_tail_more_than_n_lines(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """Test logs longer than the requested tail count."""
+        self._set_log_dir(monkeypatch, tmp_path)
+        content = "".join(f"line {i}\n" for i in range(1, 9)).encode()
+        self._write_log(tmp_path, "test-terminal", content)
+
+        assert _get_log_tail("test-terminal", lines=3) == "line 6\nline 7\nline 8\n"
+
+    def test_get_log_tail_handles_long_lines_across_block_boundary(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Test tails spanning lines larger than the backward read block size."""
+        self._set_log_dir(monkeypatch, tmp_path)
+        long_line = "a" * 5000
+        content = f"{long_line}\nsecond line\nthird line\n".encode()
+        self._write_log(tmp_path, "test-terminal", content)
+
+        assert _get_log_tail("test-terminal", lines=2) == "second line\nthird line\n"
+
+    def test_get_log_tail_normalizes_windows_line_endings(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Test CRLF log files are normalized like subprocess text output."""
+        self._set_log_dir(monkeypatch, tmp_path)
+        self._write_log(tmp_path, "test-terminal", b"line 1\r\nline 2\r\nline 3\r\n")
+
+        assert _get_log_tail("test-terminal", lines=2) == "line 2\nline 3\n"
+
+    def test_get_log_tail_preserves_utf8_across_block_boundary(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Test multibyte UTF-8 content split across read blocks decodes safely."""
+        self._set_log_dir(monkeypatch, tmp_path)
+        prefix = b"a" * 4095
+        content = prefix + "€\nfinal line\n".encode("utf-8")
+        self._write_log(tmp_path, "test-terminal", content)
+
+        assert _get_log_tail("test-terminal", lines=2) == f"{'a' * 4095}€\nfinal line\n"
+
+    def test_get_log_tail_missing_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """Test missing log files return an empty string."""
+        self._set_log_dir(monkeypatch, tmp_path)
+
+        assert _get_log_tail("missing-terminal") == ""
 
 
 class TestHasIdlePattern:

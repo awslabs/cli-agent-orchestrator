@@ -23,7 +23,6 @@ Performance Optimization:
 
 import logging
 import re
-import subprocess
 from pathlib import Path
 
 from watchdog.events import FileModifiedEvent, FileSystemEventHandler
@@ -44,14 +43,41 @@ def _get_log_tail(terminal_id: str, lines: int = 100) -> str:
 
     Default of 100 lines covers full-screen TUI providers where the idle
     prompt sits mid-screen with 30+ padding lines below it.
-    Reading 100 lines via tail is still sub-millisecond.
+    Reading 100 lines via a backward block scan is still sub-millisecond.
     """
     log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
     try:
-        result = subprocess.run(
-            ["tail", "-n", str(lines), str(log_path)], capture_output=True, text=True, timeout=1
+        if lines <= 0 or not log_path.exists():
+            return ""
+
+        block_size = 4096
+
+        with log_path.open("rb") as log_file:
+            log_file.seek(0, 2)
+            file_size = log_file.tell()
+            if file_size == 0:
+                return ""
+
+            position = file_size
+            buffer = b""
+            newline_count = 0
+
+            while position > 0 and newline_count <= lines:
+                read_size = min(block_size, position)
+                position -= read_size
+                log_file.seek(position)
+                buffer = log_file.read(read_size) + buffer
+                newline_count = buffer.count(b"\n")
+
+        tail_text = buffer.decode("utf-8", errors="replace").replace("\r\n", "\n").replace(
+            "\r", "\n"
         )
-        return result.stdout
+        tail_lines = tail_text.splitlines(keepends=True)
+
+        if position > 0 and tail_lines:
+            tail_lines = tail_lines[1:]
+
+        return "".join(tail_lines[-lines:])
     except Exception:
         return ""
 
