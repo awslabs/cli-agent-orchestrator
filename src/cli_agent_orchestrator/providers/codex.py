@@ -232,11 +232,7 @@ class CodexProvider(BaseProvider):
 
             if re.search(TRUST_PROMPT_PATTERN, clean_output):
                 logger.info("Codex workspace trust prompt detected, auto-accepting")
-                session = tmux_client.server.sessions.get(session_name=self.session_name)
-                window = session.windows.get(window_name=self.window_name)
-                pane = window.active_pane
-                if pane:
-                    pane.send_keys("", enter=True)
+                tmux_client.send_special_key(self.session_name, self.window_name, "Enter")
                 return
 
             # Check if Codex has fully started (welcome banner visible)

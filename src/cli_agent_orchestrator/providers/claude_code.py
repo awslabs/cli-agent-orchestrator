@@ -4,7 +4,6 @@ import json
 import logging
 import re
 import shlex
-import subprocess
 import time
 from pathlib import Path
 from typing import Optional
@@ -203,13 +202,17 @@ class ClaudeCodeProvider(BaseProvider):
             #    Only act once — the text stays in the buffer after dismissal.
             if not bypass_accepted and re.search(BYPASS_PROMPT_PATTERN, clean_output):
                 logger.info("Bypass permissions prompt detected, auto-accepting")
-                target = f"{self.session_name}:{self.window_name}"
                 # Send raw Down arrow escape sequence (-l for literal) to move
                 # cursor to "Yes, I accept", then Enter to confirm.
                 # tmux send-keys "Down" doesn't work with Claude's Ink TUI.
-                subprocess.run(["tmux", "send-keys", "-t", target, "-l", "\x1b[B"], check=False)
+                tmux_client.send_special_key(
+                    self.session_name,
+                    self.window_name,
+                    "\x1b[B",
+                    literal=True,
+                )
                 time.sleep(0.5)
-                subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], check=False)
+                tmux_client.send_special_key(self.session_name, self.window_name, "Enter")
                 bypass_accepted = True
                 time.sleep(1.0)
                 continue  # Trust prompt may follow
@@ -217,11 +220,7 @@ class ClaudeCodeProvider(BaseProvider):
             # 2) Handle workspace trust prompt
             if re.search(TRUST_PROMPT_PATTERN, clean_output):
                 logger.info("Workspace trust prompt detected, auto-accepting")
-                session = tmux_client.server.sessions.get(session_name=self.session_name)
-                window = session.windows.get(window_name=self.window_name)
-                pane = window.active_pane
-                if pane:
-                    pane.send_keys("", enter=True)
+                tmux_client.send_special_key(self.session_name, self.window_name, "Enter")
                 return
 
             # 3) Claude Code fully started — no prompts needed

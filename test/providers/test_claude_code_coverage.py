@@ -50,9 +50,8 @@ class TestBuildCommandMcpServerModelDump:
 class TestHandleStartupPromptsBranches:
     """Test _handle_startup_prompts branches."""
 
-    @patch("cli_agent_orchestrator.providers.claude_code.subprocess")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_bypass_permissions_prompt(self, mock_tmux, mock_subprocess, provider):
+    def test_bypass_permissions_prompt(self, mock_tmux, provider):
         """Detects bypass permissions prompt and sends Down + Enter."""
         mock_tmux.get_history.return_value = (
             "⚠ Bypass Permissions mode\n" "1. No, exit\n" "2. Yes, I accept\n"
@@ -60,8 +59,12 @@ class TestHandleStartupPromptsBranches:
 
         provider._handle_startup_prompts(timeout=1.0)
 
-        # Should have called subprocess.run twice (Down arrow + Enter)
-        assert mock_subprocess.run.call_count == 2
+        calls = mock_tmux.send_special_key.call_args_list
+        assert len(calls) == 2
+        assert calls[0].args == ("ses", "win", "\x1b[B")
+        assert calls[0].kwargs == {"literal": True}
+        assert calls[1].args == ("ses", "win", "Enter")
+        assert calls[1].kwargs == {}
 
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
     def test_idle_prompt_detected_early_return(self, mock_tmux, provider):
@@ -87,16 +90,10 @@ class TestHandleStartupPromptsBranches:
         mock_tmux.get_history.return_value = (
             "Do you trust the files in this folder?\n" "❯ Yes, I trust this folder"
         )
-        mock_pane = MagicMock()
-        mock_window = MagicMock()
-        mock_window.active_pane = mock_pane
-        mock_session = MagicMock()
-        mock_session.windows.get.return_value = mock_window
-        mock_tmux.server.sessions.get.return_value = mock_session
 
         provider._handle_startup_prompts(timeout=1.0)
 
-        mock_pane.send_keys.assert_called_once_with("", enter=True)
+        mock_tmux.send_special_key.assert_called_once_with("ses", "win", "Enter")
 
 
 class TestDatabaseListAllTerminals:

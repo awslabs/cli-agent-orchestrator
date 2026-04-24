@@ -3,5 +3,6 @@
 from __future__ import annotations
 
 from cli_agent_orchestrator.multiplexers.base import BaseMultiplexer, LaunchSpec
+from cli_agent_orchestrator.multiplexers.tmux import TmuxMultiplexer
 
-__all__ = ["BaseMultiplexer", "LaunchSpec"]
+__all__ = ["BaseMultiplexer", "LaunchSpec", "TmuxMultiplexer"]
