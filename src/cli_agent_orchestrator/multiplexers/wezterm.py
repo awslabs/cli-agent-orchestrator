@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
+import threading
 import time
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence
 
 from cli_agent_orchestrator.multiplexers.base import BaseMultiplexer, LaunchSpec
@@ -13,6 +17,8 @@ WezTermRunner = Callable[
     [Sequence[str], Optional[Mapping[str, str]]],
     "subprocess.CompletedProcess[str]",
 ]
+
+logger = logging.getLogger(__name__)
 
 _VT_KEY_MAP: dict[str, str] = {
     "Enter": "\r",
@@ -24,6 +30,14 @@ _VT_KEY_MAP: dict[str, str] = {
     "Left": "\x1b[D",
     "Right": "\x1b[C",
 }
+
+
+@dataclass
+class _PollerState:
+    thread: threading.Thread
+    stop_event: threading.Event
+    snapshot: str
+    file_path: str
 
 
 def _default_runner(
@@ -52,10 +66,15 @@ class WezTermMultiplexer(BaseMultiplexer):
         self,
         runner: Optional[WezTermRunner] = None,
         wezterm_bin: Optional[str] = None,
+        poll_interval: float = 0.5,
+        clock_sleep: Optional[Callable[[float], None]] = None,
     ) -> None:
         self._run: WezTermRunner = runner or _default_runner
         self._bin: str = wezterm_bin or os.environ.get("WEZTERM_EXECUTABLE") or "wezterm"
         self._sessions: dict[str, dict[str, dict[str, Optional[str]]]] = {}
+        self._pollers: dict[tuple[str, str], _PollerState] = {}
+        self._poll_interval = poll_interval
+        self._clock_sleep = clock_sleep or time.sleep
 
     def _pane_id(self, session_name: str, window_name: str) -> str:
         session = self._sessions.get(session_name)
@@ -145,13 +164,65 @@ class WezTermMultiplexer(BaseMultiplexer):
         pane_id = self._pane_id(session_name, window_name)
         for i in range(enter_count):
             if i == 0:
-                time.sleep(0.3)
+                self._clock_sleep(0.3)
             else:
-                time.sleep(0.5)
+                self._clock_sleep(0.5)
             self._run(
                 [self._bin, "cli", "send-text", "--pane-id", pane_id, "--no-paste", "--", "\r"],
                 None,
             )
+
+    def _get_pane_text(self, pane_id: str) -> str:
+        result = self._run(
+            [self._bin, "cli", "get-text", "--pane-id", pane_id],
+            None,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"WezTerm get-text failed for pane {pane_id}; returncode={result.returncode}"
+            )
+        return result.stdout
+
+    def _diff_snapshot(self, prev: str, current: str) -> str:
+        if not prev:
+            return current
+        if current == prev:
+            return ""
+        if current.startswith(prev):
+            return current[len(prev) :]
+        prev_lines = prev.splitlines(keepends=True)
+        cur_lines = current.splitlines(keepends=True)
+        for k in range(min(len(prev_lines), len(cur_lines)), 0, -1):
+            if prev_lines[-k:] == cur_lines[:k]:
+                return "".join(cur_lines[k:])
+        return current
+
+    def _poll_loop(
+        self,
+        session_name: str,
+        window_name: str,
+        pane_id: str,
+        stop_event: threading.Event,
+        file_path: str,
+    ) -> None:
+        key = (session_name, window_name)
+        prev = ""
+        while not stop_event.wait(self._poll_interval):
+            try:
+                snapshot = self._get_pane_text(pane_id)
+            except RuntimeError:
+                return
+            delta = self._diff_snapshot(prev, snapshot)
+            if delta:
+                with open(file_path, "a", encoding="utf-8") as fh:
+                    fh.write(delta)
+                prev = snapshot
+                poller = self._pollers.get(key)
+                if poller is not None:
+                    poller.snapshot = snapshot
+            elif current_state := self._pollers.get(key):
+                current_state.snapshot = snapshot
+                prev = snapshot
 
     def send_special_key(
         self,
@@ -187,11 +258,7 @@ class WezTermMultiplexer(BaseMultiplexer):
         provider-relevant patterns.
         """
         pane_id = self._pane_id(session_name, window_name)
-        result = self._run(
-            [self._bin, "cli", "get-text", "--pane-id", pane_id],
-            None,
-        )
-        text = result.stdout
+        text = self._get_pane_text(pane_id)
         if tail_lines is not None:
             lines = text.rstrip("\n").splitlines()
             text = "\n".join(lines[-tail_lines:])
@@ -206,9 +273,14 @@ class WezTermMultiplexer(BaseMultiplexer):
 
     def kill_session(self, session_name: str) -> bool:
         """Terminate a session and kill all owned panes."""
-        session = self._sessions.pop(session_name, None)
+        session = self._sessions.get(session_name)
         if session is None:
             return False
+        for window_name in list(session):
+            try:
+                self.stop_pipe_pane(session_name, window_name)
+            except RuntimeError:
+                pass
         for window_info in session.values():
             pane_id = window_info.get("pane_id")
             if pane_id is not None:
@@ -216,6 +288,7 @@ class WezTermMultiplexer(BaseMultiplexer):
                     [self._bin, "cli", "kill-pane", "--pane-id", pane_id],
                     None,
                 )
+        self._sessions.pop(session_name, None)
         return True
 
     def kill_window(self, session_name: str, window_name: str) -> bool:
@@ -223,6 +296,10 @@ class WezTermMultiplexer(BaseMultiplexer):
         session = self._sessions.get(session_name)
         if session is None or window_name not in session:
             return False
+        try:
+            self.stop_pipe_pane(session_name, window_name)
+        except RuntimeError:
+            pass
         window_info = session.pop(window_name)
         pane_id = window_info.get("pane_id")
         if pane_id is not None:
@@ -248,11 +325,41 @@ class WezTermMultiplexer(BaseMultiplexer):
         return None
 
     def pipe_pane(self, session_name: str, window_name: str, file_path: str) -> None:
-        raise NotImplementedError(
-            "Task 7 (poller-backed pipe_pane) not yet implemented"
+        pane_id = self._pane_id(session_name, window_name)
+        key = (session_name, window_name)
+        if key in self._pollers:
+            raise RuntimeError(
+                f"pipe_pane already running for {session_name}:{window_name}"
+            )
+        Path(file_path).touch(exist_ok=True)
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=self._poll_loop,
+            args=(session_name, window_name, pane_id, stop_event, file_path),
+            daemon=True,
+            name=f"wezterm-pipe-{session_name}-{window_name}",
         )
+        self._pollers[key] = _PollerState(
+            thread=thread,
+            stop_event=stop_event,
+            snapshot="",
+            file_path=file_path,
+        )
+        thread.start()
 
     def stop_pipe_pane(self, session_name: str, window_name: str) -> None:
-        raise NotImplementedError(
-            "Task 7 (poller-backed pipe_pane) not yet implemented"
-        )
+        key = (session_name, window_name)
+        state = self._pollers.get(key)
+        if state is None:
+            raise RuntimeError(
+                f"pipe_pane not running for {session_name}:{window_name}"
+            )
+        state.stop_event.set()
+        state.thread.join(timeout=2.0)
+        if state.thread.is_alive():
+            logger.warning(
+                "Timed out stopping WezTerm pipe poller for %s:%s",
+                session_name,
+                window_name,
+            )
+        self._pollers.pop(key, None)

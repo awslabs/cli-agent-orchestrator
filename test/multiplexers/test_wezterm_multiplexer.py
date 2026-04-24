@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import subprocess
-from typing import Optional
-from unittest.mock import MagicMock, call, patch
+import threading
+from collections import deque
+from unittest.mock import patch
 
 import pytest
 
@@ -12,60 +13,87 @@ from cli_agent_orchestrator.multiplexers.base import LaunchSpec
 from cli_agent_orchestrator.multiplexers.wezterm import WezTermMultiplexer
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
 def _make_result(stdout: str = "", returncode: int = 0) -> subprocess.CompletedProcess[str]:
-    result: subprocess.CompletedProcess[str] = subprocess.CompletedProcess(
-        args=[], returncode=returncode, stdout=stdout, stderr=""
+    return subprocess.CompletedProcess(
+        args=[],
+        returncode=returncode,
+        stdout=stdout,
+        stderr="",
     )
-    return result
 
 
 def _spawn_result(pane_id: str = "42") -> subprocess.CompletedProcess[str]:
     return _make_result(stdout=f"{pane_id}\n")
 
 
-def _runner_factory(responses: dict[str, subprocess.CompletedProcess[str]]):
-    """Return a runner that matches on the first unique fragment of argv."""
+class FakeRunner:
+    def __init__(self, pane_id: str = "42") -> None:
+        self.pane_id = pane_id
+        self.get_text_queue: deque[str | RuntimeError] = deque()
+        self.calls: list[list[str]] = []
+        self._condition = threading.Condition()
 
-    def runner(argv, env=None):
-        key = " ".join(str(a) for a in argv)
-        for fragment, result in responses.items():
-            if fragment in key:
-                return result
+    def __call__(self, argv, env=None):
+        del env
+        call = [str(part) for part in argv]
+        with self._condition:
+            self.calls.append(call)
+
+        if "spawn" in call:
+            return _spawn_result(self.pane_id)
+        if "get-text" in call:
+            with self._condition:
+                if self.get_text_queue:
+                    item = self.get_text_queue.popleft()
+                    self._condition.notify_all()
+                else:
+                    item = ""
+            if isinstance(item, RuntimeError):
+                raise item
+            return _make_result(stdout=item)
+        if "kill-pane" in call or "send-text" in call:
+            return _make_result()
         return _make_result()
 
-    return runner
+    def queue_responses(self, responses: list[str | RuntimeError]) -> None:
+        with self._condition:
+            self.get_text_queue.extend(responses)
+            self._condition.notify_all()
 
+    def wait_for_queue_drain(self, timeout: float = 1.0) -> bool:
+        def drained() -> bool:
+            return not self.get_text_queue
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
+        with self._condition:
+            return self._condition.wait_for(drained, timeout=timeout)
+
+    def pending_get_text(self) -> int:
+        with self._condition:
+            return len(self.get_text_queue)
 
 
 @pytest.fixture
-def wez(tmp_path):
-    """WezTermMultiplexer with a no-op runner and patched working-dir validation."""
-    mux = WezTermMultiplexer(runner=lambda argv, env=None: _spawn_result(), wezterm_bin="wezterm")
+def fake_runner() -> FakeRunner:
+    return FakeRunner()
+
+
+@pytest.fixture
+def multiplexer(tmp_path, fake_runner: FakeRunner):
+    mux = WezTermMultiplexer(
+        runner=fake_runner,
+        wezterm_bin="wezterm",
+        poll_interval=0.001,
+        clock_sleep=lambda *_: None,
+    )
     with patch.object(
         mux,
         "_resolve_and_validate_working_directory",
         return_value=str(tmp_path),
     ):
-        yield mux, str(tmp_path)
-
-
-@pytest.fixture
-def no_sleep(monkeypatch):
-    monkeypatch.setattr("cli_agent_orchestrator.multiplexers.wezterm.time.sleep", lambda *_: None)
-
-
-# ---------------------------------------------------------------------------
-# create_session
-# ---------------------------------------------------------------------------
+        mux.create_session("sess", "win", "tid", str(tmp_path))
+    yield mux
+    for key in list(mux._pollers):
+        mux.stop_pipe_pane(*key)
 
 
 class TestCreateSession:
@@ -73,6 +101,7 @@ class TestCreateSession:
         calls: list[list[str]] = []
 
         def runner(argv, env=None):
+            del env
             calls.append(list(argv))
             return _spawn_result("17")
 
@@ -82,23 +111,19 @@ class TestCreateSession:
         ):
             mux.create_session("ses", "win", "tid-abc", str(tmp_path))
 
-        assert len(calls) == 1
         argv = calls[0]
-        assert "wezterm" == argv[0]
+        assert argv[0] == "wezterm"
         assert "cli" in argv
         assert "spawn" in argv
         assert "--new-window" in argv
         assert "--cwd" in argv
         assert str(tmp_path) in argv
-        assert "--set-environment" in argv
-        cad_idx = argv.index("--set-environment")
-        # find the CAO_TERMINAL_ID entry — may not be directly after --set-environment
-        # when multiple --set-environment entries exist; check all pairs
-        env_pairs = []
-        for i, tok in enumerate(argv):
-            if tok == "--set-environment" and i + 1 < len(argv):
-                env_pairs.append(argv[i + 1])
-        assert any("CAO_TERMINAL_ID=tid-abc" == pair for pair in env_pairs)
+        env_pairs = [
+            argv[i + 1]
+            for i, token in enumerate(argv)
+            if token == "--set-environment" and i + 1 < len(argv)
+        ]
+        assert "CAO_TERMINAL_ID=tid-abc" in env_pairs
 
     def test_parses_pane_id_from_stdout(self, tmp_path):
         mux = WezTermMultiplexer(runner=lambda argv, env=None: _spawn_result("99"), wezterm_bin="wezterm")
@@ -116,6 +141,7 @@ class TestCreateSession:
         calls: list[list[str]] = []
 
         def runner(argv, env=None):
+            del env
             calls.append(list(argv))
             return _spawn_result("5")
 
@@ -130,14 +156,14 @@ class TestCreateSession:
             )
 
         argv = calls[0]
-        dd_idx = argv.index("--")
-        assert argv[dd_idx + 1] == "codex.cmd"
-        assert argv[dd_idx + 2] == "--yolo"
+        idx = argv.index("--")
+        assert argv[idx + 1 : idx + 3] == ["codex.cmd", "--yolo"]
 
     def test_launch_spec_env_adds_set_environment(self, tmp_path):
         calls: list[list[str]] = []
 
         def runner(argv, env=None):
+            del env
             calls.append(list(argv))
             return _spawn_result("5")
 
@@ -152,10 +178,11 @@ class TestCreateSession:
             )
 
         argv = calls[0]
-        env_pairs = []
-        for i, tok in enumerate(argv):
-            if tok == "--set-environment" and i + 1 < len(argv):
-                env_pairs.append(argv[i + 1])
+        env_pairs = [
+            argv[i + 1]
+            for i, token in enumerate(argv)
+            if token == "--set-environment" and i + 1 < len(argv)
+        ]
         assert "FOO=bar" in env_pairs
 
     def test_raises_runtime_error_when_stdout_has_no_pane_id(self, tmp_path):
@@ -177,26 +204,19 @@ class TestCreateSession:
                 mux.create_session("ses", "win", "tid", str(tmp_path))
 
 
-# ---------------------------------------------------------------------------
-# create_window
-# ---------------------------------------------------------------------------
-
-
 class TestCreateWindow:
     def test_create_window_stores_pane_in_existing_session(self, tmp_path):
         mux = WezTermMultiplexer(runner=lambda argv, env=None: _spawn_result("55"), wezterm_bin="wezterm")
         with patch.object(mux, "_resolve_and_validate_working_directory", return_value=str(tmp_path)):
             mux.create_session("ses", "win1", "tid1", str(tmp_path))
-            mux._sessions["ses"]["win1"]["pane_id"] = "55"
-        with patch.object(mux, "_resolve_and_validate_working_directory", return_value=str(tmp_path)):
             mux.create_window("ses", "win2", "tid2", str(tmp_path))
-        assert "win2" in mux._sessions["ses"]
         assert mux._sessions["ses"]["win2"]["pane_id"] == "55"
 
     def test_create_window_uses_new_window_flag(self, tmp_path):
         calls: list[list[str]] = []
 
         def runner(argv, env=None):
+            del env
             calls.append(list(argv))
             return _spawn_result("10")
 
@@ -207,16 +227,12 @@ class TestCreateWindow:
         assert "--new-window" in calls[0]
 
 
-# ---------------------------------------------------------------------------
-# _paste_text
-# ---------------------------------------------------------------------------
-
-
 class TestPasteText:
-    def test_sends_send_text_with_pane_id_and_text(self, tmp_path, no_sleep):
+    def test_sends_send_text_with_pane_id_and_text(self, tmp_path):
         calls: list[list[str]] = []
 
         def runner(argv, env=None):
+            del env
             calls.append(list(argv))
             return _spawn_result("11")
 
@@ -227,15 +243,10 @@ class TestPasteText:
 
         mux._paste_text("ses", "win", "hello world")
 
-        assert len(calls) == 1
         argv = calls[0]
         assert argv[:3] == ["wezterm", "cli", "send-text"]
-        assert "--pane-id" in argv
-        pane_idx = argv.index("--pane-id")
-        assert argv[pane_idx + 1] == "11"
-        assert "--" in argv
-        dd_idx = argv.index("--")
-        assert argv[dd_idx + 1] == "hello world"
+        assert argv[argv.index("--pane-id") + 1] == "11"
+        assert argv[argv.index("--") + 1] == "hello world"
         assert "--no-paste" not in argv
 
     def test_raises_when_pane_not_found(self):
@@ -244,103 +255,107 @@ class TestPasteText:
             mux._paste_text("missing_ses", "missing_win", "text")
 
 
-# ---------------------------------------------------------------------------
-# _submit_input
-# ---------------------------------------------------------------------------
-
-
 class TestSubmitInput:
-    def test_submit_once_sends_carriage_return_with_no_paste(self, tmp_path, no_sleep):
+    def test_submit_once_sends_carriage_return_with_no_paste(self, tmp_path):
         calls: list[list[str]] = []
 
         def runner(argv, env=None):
+            del env
             calls.append(list(argv))
             return _spawn_result("22")
 
-        mux = WezTermMultiplexer(runner=runner, wezterm_bin="wezterm")
+        mux = WezTermMultiplexer(
+            runner=runner,
+            wezterm_bin="wezterm",
+            clock_sleep=lambda *_: None,
+        )
         with patch.object(mux, "_resolve_and_validate_working_directory", return_value=str(tmp_path)):
             mux.create_session("ses", "win", "tid", str(tmp_path))
         calls.clear()
 
         mux._submit_input("ses", "win", enter_count=1)
 
-        assert len(calls) == 1
         argv = calls[0]
         assert argv[:3] == ["wezterm", "cli", "send-text"]
-        assert "--pane-id" in argv
         assert "--no-paste" in argv
-        dd_idx = argv.index("--")
-        assert argv[dd_idx + 1] == "\r"
+        assert argv[argv.index("--") + 1] == "\r"
 
     def test_submit_once_sleeps_300ms(self, tmp_path):
         sleep_calls: list[float] = []
-
-        def runner(argv, env=None):
-            return _spawn_result("22")
-
-        mux = WezTermMultiplexer(runner=runner, wezterm_bin="wezterm")
+        mux = WezTermMultiplexer(
+            runner=lambda argv, env=None: _spawn_result("22"),
+            wezterm_bin="wezterm",
+            clock_sleep=lambda duration: sleep_calls.append(duration),
+        )
         with patch.object(mux, "_resolve_and_validate_working_directory", return_value=str(tmp_path)):
             mux.create_session("ses", "win", "tid", str(tmp_path))
 
-        with patch("cli_agent_orchestrator.multiplexers.wezterm.time.sleep", side_effect=lambda d: sleep_calls.append(d)):
-            mux._submit_input("ses", "win", enter_count=1)
+        mux._submit_input("ses", "win", enter_count=1)
 
-        assert sleep_calls[0] == pytest.approx(0.3)
+        assert sleep_calls == [pytest.approx(0.3)]
 
-    def test_submit_three_times_produces_three_enter_calls(self, tmp_path, no_sleep):
+    def test_submit_three_times_produces_three_enter_calls(self, tmp_path):
         calls: list[list[str]] = []
 
         def runner(argv, env=None):
+            del env
             calls.append(list(argv))
             return _spawn_result("33")
 
-        mux = WezTermMultiplexer(runner=runner, wezterm_bin="wezterm")
+        mux = WezTermMultiplexer(
+            runner=runner,
+            wezterm_bin="wezterm",
+            clock_sleep=lambda *_: None,
+        )
         with patch.object(mux, "_resolve_and_validate_working_directory", return_value=str(tmp_path)):
             mux.create_session("ses", "win", "tid", str(tmp_path))
         calls.clear()
 
         mux._submit_input("ses", "win", enter_count=3)
 
-        enter_calls = [a for a in calls if "--no-paste" in a and "\r" in a]
+        enter_calls = [argv for argv in calls if "--no-paste" in argv and "\r" in argv]
         assert len(enter_calls) == 3
 
     def test_submit_three_times_sleeps_300ms_then_500ms_between(self, tmp_path):
         sleep_calls: list[float] = []
-
-        mux = WezTermMultiplexer(runner=lambda argv, env=None: _spawn_result("33"), wezterm_bin="wezterm")
+        mux = WezTermMultiplexer(
+            runner=lambda argv, env=None: _spawn_result("33"),
+            wezterm_bin="wezterm",
+            clock_sleep=lambda duration: sleep_calls.append(duration),
+        )
         with patch.object(mux, "_resolve_and_validate_working_directory", return_value=str(tmp_path)):
             mux.create_session("ses", "win", "tid", str(tmp_path))
 
-        with patch("cli_agent_orchestrator.multiplexers.wezterm.time.sleep", side_effect=lambda d: sleep_calls.append(d)):
-            mux._submit_input("ses", "win", enter_count=3)
+        mux._submit_input("ses", "win", enter_count=3)
 
-        assert sleep_calls[0] == pytest.approx(0.3)
-        assert sleep_calls[1] == pytest.approx(0.5)
-        assert sleep_calls[2] == pytest.approx(0.5)
-
-
-# ---------------------------------------------------------------------------
-# send_keys (inherited default)
-# ---------------------------------------------------------------------------
+        assert sleep_calls == [
+            pytest.approx(0.3),
+            pytest.approx(0.5),
+            pytest.approx(0.5),
+        ]
 
 
 class TestSendKeys:
-    def test_send_keys_calls_paste_then_submit(self, tmp_path, no_sleep):
+    def test_send_keys_calls_paste_then_submit(self, tmp_path):
         method_calls: list[str] = []
-        mux = WezTermMultiplexer(runner=lambda argv, env=None: _spawn_result("44"), wezterm_bin="wezterm")
+        mux = WezTermMultiplexer(
+            runner=lambda argv, env=None: _spawn_result("44"),
+            wezterm_bin="wezterm",
+            clock_sleep=lambda *_: None,
+        )
         with patch.object(mux, "_resolve_and_validate_working_directory", return_value=str(tmp_path)):
             mux.create_session("ses", "win", "tid", str(tmp_path))
 
         original_paste = mux._paste_text
         original_submit = mux._submit_input
 
-        def record_paste(s, w, t):
+        def record_paste(session_name, window_name, text):
             method_calls.append("paste")
-            original_paste(s, w, t)
+            original_paste(session_name, window_name, text)
 
-        def record_submit(s, w, enter_count=1):
+        def record_submit(session_name, window_name, enter_count=1):
             method_calls.append("submit")
-            original_submit(s, w, enter_count=enter_count)
+            original_submit(session_name, window_name, enter_count=enter_count)
 
         mux._paste_text = record_paste  # type: ignore[method-assign]
         mux._submit_input = record_submit  # type: ignore[method-assign]
@@ -350,18 +365,12 @@ class TestSendKeys:
         assert method_calls == ["paste", "submit"]
 
 
-# ---------------------------------------------------------------------------
-# send_special_key
-# ---------------------------------------------------------------------------
-
-
 class TestSendSpecialKey:
     def test_enter_maps_to_carriage_return_no_paste(self, tmp_path):
         calls: list[list[str]] = []
 
-        mux = WezTermMultiplexer(runner=lambda argv, env=None: (calls.append(list(argv)) or _spawn_result("50")), wezterm_bin="wezterm")  # type: ignore[return-value]
-
         def runner(argv, env=None):
+            del env
             calls.append(list(argv))
             return _spawn_result("50")
 
@@ -372,16 +381,15 @@ class TestSendSpecialKey:
 
         mux.send_special_key("ses", "win", "Enter")
 
-        assert len(calls) == 1
         argv = calls[0]
         assert "--no-paste" in argv
-        dd_idx = argv.index("--")
-        assert argv[dd_idx + 1] == "\r"
+        assert argv[argv.index("--") + 1] == "\r"
 
     def test_literal_true_sends_raw_bytes_no_paste(self, tmp_path):
         calls: list[list[str]] = []
 
         def runner(argv, env=None):
+            del env
             calls.append(list(argv))
             return _spawn_result("51")
 
@@ -394,13 +402,13 @@ class TestSendSpecialKey:
 
         argv = calls[0]
         assert "--no-paste" in argv
-        dd_idx = argv.index("--")
-        assert argv[dd_idx + 1] == "\x1b[B"
+        assert argv[argv.index("--") + 1] == "\x1b[B"
 
     def test_tab_maps_to_tab_character(self, tmp_path):
         calls: list[list[str]] = []
 
         def runner(argv, env=None):
+            del env
             calls.append(list(argv))
             return _spawn_result("52")
 
@@ -412,13 +420,13 @@ class TestSendSpecialKey:
         mux.send_special_key("ses", "win", "Tab")
 
         argv = calls[0]
-        dd_idx = argv.index("--")
-        assert argv[dd_idx + 1] == "\t"
+        assert argv[argv.index("--") + 1] == "\t"
 
     def test_up_arrow_maps_to_vt_sequence(self, tmp_path):
         calls: list[list[str]] = []
 
         def runner(argv, env=None):
+            del env
             calls.append(list(argv))
             return _spawn_result("53")
 
@@ -430,13 +438,7 @@ class TestSendSpecialKey:
         mux.send_special_key("ses", "win", "Up")
 
         argv = calls[0]
-        dd_idx = argv.index("--")
-        assert argv[dd_idx + 1] == "\x1b[A"
-
-
-# ---------------------------------------------------------------------------
-# get_history
-# ---------------------------------------------------------------------------
+        assert argv[argv.index("--") + 1] == "\x1b[A"
 
 
 class TestGetHistory:
@@ -444,6 +446,7 @@ class TestGetHistory:
         calls: list[list[str]] = []
 
         def runner(argv, env=None):
+            del env
             calls.append(list(argv))
             if "spawn" in argv:
                 return _spawn_result("60")
@@ -456,10 +459,8 @@ class TestGetHistory:
 
         result = mux.get_history("ses", "win")
 
-        assert len(calls) == 1
         argv = calls[0]
         assert argv[:3] == ["wezterm", "cli", "get-text"]
-        assert "--pane-id" in argv
         assert "--escapes" not in argv
         assert result == "output line\n"
 
@@ -467,6 +468,7 @@ class TestGetHistory:
         content = "\n".join(f"line{i}" for i in range(10))
 
         def runner(argv, env=None):
+            del env
             if "spawn" in argv:
                 return _spawn_result("61")
             return _make_result(stdout=content)
@@ -488,16 +490,12 @@ class TestGetHistory:
             mux.get_history("missing_ses", "missing_win")
 
 
-# ---------------------------------------------------------------------------
-# kill_session / kill_window
-# ---------------------------------------------------------------------------
-
-
 class TestKillSession:
     def test_removes_session_from_registry_and_kills_panes(self, tmp_path):
         calls: list[list[str]] = []
 
         def runner(argv, env=None):
+            del env
             calls.append(list(argv))
             if "spawn" in argv:
                 return _spawn_result("70")
@@ -512,17 +510,13 @@ class TestKillSession:
 
         assert result is True
         assert "ses" not in mux._sessions
-        kill_calls = [a for a in calls if "kill-pane" in a]
-        assert len(kill_calls) >= 1
-        kill_argv = kill_calls[0]
-        assert "--pane-id" in kill_argv
-        pane_idx = kill_argv.index("--pane-id")
-        assert kill_argv[pane_idx + 1] == "70"
+        kill_calls = [argv for argv in calls if "kill-pane" in argv]
+        assert len(kill_calls) == 1
+        assert kill_calls[0][kill_calls[0].index("--pane-id") + 1] == "70"
 
     def test_returns_false_for_nonexistent_session(self):
         mux = WezTermMultiplexer(runner=lambda argv, env=None: _spawn_result(), wezterm_bin="wezterm")
-        result = mux.kill_session("nonexistent")
-        assert result is False
+        assert mux.kill_session("nonexistent") is False
 
 
 class TestKillWindow:
@@ -530,6 +524,7 @@ class TestKillWindow:
         calls: list[list[str]] = []
 
         def runner(argv, env=None):
+            del env
             calls.append(list(argv))
             if "spawn" in argv:
                 return _spawn_result("80")
@@ -546,23 +541,11 @@ class TestKillWindow:
         assert "win" not in mux._sessions.get("ses", {})
 
     def test_returns_false_for_nonexistent_window(self, tmp_path):
-        calls: list[list[str]] = []
-
-        def runner(argv, env=None):
-            calls.append(list(argv))
-            return _spawn_result("81")
-
-        mux = WezTermMultiplexer(runner=runner, wezterm_bin="wezterm")
+        mux = WezTermMultiplexer(runner=lambda argv, env=None: _spawn_result("81"), wezterm_bin="wezterm")
         with patch.object(mux, "_resolve_and_validate_working_directory", return_value=str(tmp_path)):
             mux.create_session("ses", "win", "tid", str(tmp_path))
 
-        result = mux.kill_window("ses", "no_such_win")
-        assert result is False
-
-
-# ---------------------------------------------------------------------------
-# session_exists
-# ---------------------------------------------------------------------------
+        assert mux.kill_window("ses", "no_such_win") is False
 
 
 class TestSessionExists:
@@ -577,11 +560,6 @@ class TestSessionExists:
         assert mux.session_exists("nope") is False
 
 
-# ---------------------------------------------------------------------------
-# list_sessions
-# ---------------------------------------------------------------------------
-
-
 class TestListSessions:
     def test_returns_registered_session(self, tmp_path):
         mux = WezTermMultiplexer(runner=lambda argv, env=None: _spawn_result("91"), wezterm_bin="wezterm")
@@ -589,17 +567,11 @@ class TestListSessions:
             mux.create_session("my-ses", "win", "tid", str(tmp_path))
 
         sessions = mux.list_sessions()
-        names = [s["name"] for s in sessions]
-        assert "my-ses" in names
+        assert [session["name"] for session in sessions] == ["my-ses"]
 
     def test_returns_empty_when_no_sessions(self):
         mux = WezTermMultiplexer(runner=lambda argv, env=None: _spawn_result(), wezterm_bin="wezterm")
         assert mux.list_sessions() == []
-
-
-# ---------------------------------------------------------------------------
-# get_pane_working_directory
-# ---------------------------------------------------------------------------
 
 
 class TestGetPaneWorkingDirectory:
@@ -608,22 +580,150 @@ class TestGetPaneWorkingDirectory:
         assert mux.get_pane_working_directory("ses", "win") is None
 
 
-# ---------------------------------------------------------------------------
-# pipe_pane / stop_pipe_pane — Task 7 stubs
-# ---------------------------------------------------------------------------
+class TestDiffSnapshot:
+    def test_diff_snapshot_pure_append(self):
+        mux = WezTermMultiplexer(runner=lambda argv, env=None: _spawn_result(), wezterm_bin="wezterm")
+        assert mux._diff_snapshot("hello\n", "hello\nworld\n") == "world\n"
+
+    def test_diff_snapshot_line_suffix_overlap(self):
+        mux = WezTermMultiplexer(runner=lambda argv, env=None: _spawn_result(), wezterm_bin="wezterm")
+        assert mux._diff_snapshot("a\nb\nc\n", "b\nc\nd\n") == "d\n"
+
+    def test_diff_snapshot_redraw_no_overlap(self):
+        mux = WezTermMultiplexer(runner=lambda argv, env=None: _spawn_result(), wezterm_bin="wezterm")
+        assert mux._diff_snapshot("abc\n", "xyz\n") == "xyz\n"
 
 
-class TestPipePaneNotImplemented:
-    def test_pipe_pane_raises_not_implemented(self, tmp_path):
-        mux = WezTermMultiplexer(runner=lambda argv, env=None: _spawn_result("100"), wezterm_bin="wezterm")
-        with patch.object(mux, "_resolve_and_validate_working_directory", return_value=str(tmp_path)):
-            mux.create_session("ses", "win", "tid", str(tmp_path))
-        with pytest.raises(NotImplementedError, match="Task 7"):
-            mux.pipe_pane("ses", "win", "/tmp/log.txt")
+class TestPipePane:
+    def test_pipe_pane_raises_if_pane_not_registered(self, fake_runner: FakeRunner, tmp_path):
+        mux = WezTermMultiplexer(
+            runner=fake_runner,
+            wezterm_bin="wezterm",
+            poll_interval=0.001,
+            clock_sleep=lambda *_: None,
+        )
 
-    def test_stop_pipe_pane_raises_not_implemented(self, tmp_path):
-        mux = WezTermMultiplexer(runner=lambda argv, env=None: _spawn_result("101"), wezterm_bin="wezterm")
-        with patch.object(mux, "_resolve_and_validate_working_directory", return_value=str(tmp_path)):
-            mux.create_session("ses", "win", "tid", str(tmp_path))
-        with pytest.raises(NotImplementedError, match="Task 7"):
-            mux.stop_pipe_pane("ses", "win")
+        with pytest.raises(RuntimeError, match="pane not found"):
+            mux.pipe_pane("missing", "win", str(tmp_path / "pipe.log"))
+
+    def test_pipe_pane_raises_if_already_running(self, multiplexer, tmp_path):
+        path = tmp_path / "pipe.log"
+        multiplexer.pipe_pane("sess", "win", str(path))
+
+        with pytest.raises(RuntimeError, match="pipe_pane already running for sess:win"):
+            multiplexer.pipe_pane("sess", "win", str(path))
+
+    def test_after_one_tick_with_no_change_file_is_empty(self, multiplexer, fake_runner: FakeRunner, tmp_path):
+        path = tmp_path / "pipe.log"
+        fake_runner.queue_responses([""])
+
+        multiplexer.pipe_pane("sess", "win", str(path))
+        assert fake_runner.wait_for_queue_drain(timeout=1.0)
+        multiplexer.stop_pipe_pane("sess", "win")
+
+        assert path.read_text(encoding="utf-8") == ""
+
+    def test_after_one_tick_with_text_file_contains_text(self, multiplexer, fake_runner: FakeRunner, tmp_path):
+        path = tmp_path / "pipe.log"
+        fake_runner.queue_responses(["hello\n"])
+
+        multiplexer.pipe_pane("sess", "win", str(path))
+        assert fake_runner.wait_for_queue_drain(timeout=1.0)
+        multiplexer.stop_pipe_pane("sess", "win")
+
+        assert path.read_text(encoding="utf-8") == "hello\n"
+
+    def test_pure_append(self, multiplexer, tmp_path, fake_runner: FakeRunner):
+        path = tmp_path / "pipe.log"
+        fake_runner.queue_responses(["hello\n", "hello\nworld\n"])
+
+        multiplexer.pipe_pane("sess", "win", str(path))
+        assert fake_runner.wait_for_queue_drain(timeout=1.0)
+        multiplexer.stop_pipe_pane("sess", "win")
+
+        assert path.read_text(encoding="utf-8") == "hello\nworld\n"
+
+    def test_redraw_appends_full_snapshot_when_no_overlap(
+        self, multiplexer, tmp_path, fake_runner: FakeRunner
+    ):
+        path = tmp_path / "pipe.log"
+        fake_runner.queue_responses(["abc\n", "xyz\n"])
+
+        multiplexer.pipe_pane("sess", "win", str(path))
+        assert fake_runner.wait_for_queue_drain(timeout=1.0)
+        multiplexer.stop_pipe_pane("sess", "win")
+
+        assert path.read_text(encoding="utf-8") == "abc\nxyz\n"
+
+    def test_line_suffix_overlap_appends_only_new_lines(
+        self, multiplexer, tmp_path, fake_runner: FakeRunner
+    ):
+        path = tmp_path / "pipe.log"
+        fake_runner.queue_responses(["a\nb\nc\n", "b\nc\nd\n"])
+
+        multiplexer.pipe_pane("sess", "win", str(path))
+        assert fake_runner.wait_for_queue_drain(timeout=1.0)
+        multiplexer.stop_pipe_pane("sess", "win")
+
+        assert path.read_text(encoding="utf-8") == "a\nb\nc\nd\n"
+
+    def test_pane_disappears_mid_poll_exits_cleanly(
+        self, multiplexer, tmp_path, fake_runner: FakeRunner
+    ):
+        path = tmp_path / "pipe.log"
+        fake_runner.queue_responses(["hello\n", RuntimeError("pane gone")])
+
+        multiplexer.pipe_pane("sess", "win", str(path))
+        assert fake_runner.wait_for_queue_drain(timeout=1.0)
+
+        state = multiplexer._pollers[("sess", "win")]
+        state.thread.join(timeout=1.0)
+        assert not state.thread.is_alive()
+        multiplexer.stop_pipe_pane("sess", "win")
+
+        assert path.read_text(encoding="utf-8") == "hello\n"
+
+    def test_stop_pipe_pane_cancels_thread_and_prevents_further_writes(
+        self, multiplexer, tmp_path, fake_runner: FakeRunner
+    ):
+        path = tmp_path / "pipe.log"
+        fake_runner.queue_responses(["hello\n"])
+
+        multiplexer.pipe_pane("sess", "win", str(path))
+        assert fake_runner.wait_for_queue_drain(timeout=1.0)
+        multiplexer.stop_pipe_pane("sess", "win")
+
+        fake_runner.queue_responses(["hello\nworld\n"])
+
+        assert path.read_text(encoding="utf-8") == "hello\n"
+        assert fake_runner.pending_get_text() == 1
+
+    def test_stop_pipe_pane_raises_when_no_poller_exists(self, multiplexer):
+        with pytest.raises(RuntimeError, match="pipe_pane not running for sess:win"):
+            multiplexer.stop_pipe_pane("sess", "win")
+
+    def test_kill_session_stops_the_poller_automatically(
+        self, multiplexer, tmp_path, fake_runner: FakeRunner
+    ):
+        path = tmp_path / "pipe.log"
+        fake_runner.queue_responses(["hello\n"])
+
+        multiplexer.pipe_pane("sess", "win", str(path))
+        assert fake_runner.wait_for_queue_drain(timeout=1.0)
+
+        assert multiplexer.kill_session("sess") is True
+        assert ("sess", "win") not in multiplexer._pollers
+        assert path.read_text(encoding="utf-8") == "hello\n"
+
+    def test_kill_window_stops_the_poller_automatically(
+        self, multiplexer, tmp_path, fake_runner: FakeRunner
+    ):
+        path = tmp_path / "pipe.log"
+        fake_runner.queue_responses(["hello\n"])
+
+        multiplexer.pipe_pane("sess", "win", str(path))
+        assert fake_runner.wait_for_queue_drain(timeout=1.0)
+
+        assert multiplexer.kill_window("sess", "win") is True
+        assert ("sess", "win") not in multiplexer._pollers
+        assert path.read_text(encoding="utf-8") == "hello\n"
