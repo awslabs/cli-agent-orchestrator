@@ -134,6 +134,14 @@ def launch(
                     f"  Agent can execute ANY command (aws, rm, curl, read credentials).\n"
                     f"  Directory: {display_dir}\n"
                 )
+                if provider == "kiro_cli":
+                    # kiro-cli 2.0.1 TUI blocks on an interactive "Yes, I accept"
+                    # consent dialog when --trust-all-tools is set. CAO cannot
+                    # answer it headlessly, so yolo launches use --legacy-ui.
+                    click.echo(
+                        "  Note: kiro_cli will launch in --legacy-ui mode so "
+                        "--trust-all-tools can be applied non-interactively.\n"
+                    )
             else:
                 # Normal launch: show tool summary and confirm
                 tool_summary = format_tool_summary(resolved_allowed_tools)
