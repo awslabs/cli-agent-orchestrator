@@ -1,10 +1,15 @@
 """Unit tests for Codex provider."""
 
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from cli_agent_orchestrator.multiplexers.base import LaunchSpec
+from cli_agent_orchestrator.multiplexers.launch import build_launch_spec
+from cli_agent_orchestrator.multiplexers.tmux import TmuxMultiplexer
+from cli_agent_orchestrator.multiplexers.wezterm import WezTermMultiplexer
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.codex import CodexProvider, ProviderError
 
@@ -14,6 +19,51 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 def load_fixture(filename: str) -> str:
     with open(FIXTURES_DIR / filename, "r") as f:
         return f.read()
+
+
+class FakeWezTermMultiplexer(WezTermMultiplexer):
+    def __init__(self) -> None:
+        self.send_keys = MagicMock()
+        self.send_special_key = MagicMock()
+        self.get_history = MagicMock(return_value="OpenAI Codex (v0.98.0)")
+
+
+class FakeTmuxMultiplexer(TmuxMultiplexer):
+    def __init__(self) -> None:
+        self.send_keys = MagicMock()
+        self.send_special_key = MagicMock()
+        self.get_history = MagicMock(return_value="OpenAI Codex (v0.98.0)")
+
+
+class TestBuildLaunchSpec:
+    @patch("cli_agent_orchestrator.multiplexers.launch.shutil.which")
+    def test_codex_windows_resolves_cmd_shim(self, mock_which):
+        mock_which.return_value = r"C:\Users\marc\scoop\apps\nodejs-lts\current\bin\codex.cmd"
+
+        spec = build_launch_spec("codex", ["codex"], platform="windows")
+
+        assert isinstance(spec, LaunchSpec)
+        assert spec.argv is not None
+        assert spec.argv[0] == r"C:\Users\marc\scoop\apps\nodejs-lts\current\bin\codex.cmd"
+
+    @patch("cli_agent_orchestrator.multiplexers.launch.os.path.exists", return_value=False)
+    @patch("cli_agent_orchestrator.multiplexers.launch.shutil.which", return_value=None)
+    def test_codex_windows_falls_back_to_bare_name(self, mock_which, mock_exists):
+        spec = build_launch_spec("codex", ["codex"], platform="windows")
+
+        assert spec.argv == ("codex",)
+        mock_which.assert_called_once_with("codex.cmd")
+        assert mock_exists.called
+
+    def test_codex_unix_keeps_bare_name(self):
+        spec = build_launch_spec("codex", ["codex"], platform="unix")
+
+        assert spec.argv == ("codex",)
+
+    def test_non_codex_windows_keeps_bare_name(self):
+        spec = build_launch_spec("claude", ["claude"], platform="windows")
+
+        assert spec.argv == ("claude",)
 
 
 class TestCodexProviderInitialization:
@@ -36,7 +86,7 @@ class TestCodexProviderInitialization:
         mock_tmux.send_keys.assert_any_call(
             "test-session",
             "window-0",
-            "codex --yolo --no-alt-screen --disable shell_snapshot",
+            provider._build_codex_command(),
         )
         mock_wait_status.assert_called_once()
 
@@ -49,6 +99,47 @@ class TestCodexProviderInitialization:
 
         with pytest.raises(TimeoutError, match="Shell initialization timed out"):
             provider.initialize()
+
+    @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
+    def test_initialize_skips_warmup_echo_for_direct_spawned_wezterm(
+        self, mock_wait_shell, mock_wait_status, monkeypatch
+    ):
+        mock_wait_status.return_value = True
+        fake_tmux = FakeWezTermMultiplexer()
+        monkeypatch.setattr("cli_agent_orchestrator.providers.codex.tmux_client", fake_tmux)
+
+        provider = CodexProvider(
+            "test1234",
+            "test-session",
+            "window-0",
+            None,
+            launch_spec=LaunchSpec(argv=("codex.cmd",), provider="codex"),
+            direct_spawned=True,
+        )
+        result = provider.initialize()
+
+        assert result is True
+        mock_wait_shell.assert_not_called()
+        fake_tmux.send_keys.assert_not_called()
+        mock_wait_status.assert_called_once()
+
+    @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
+    def test_initialize_runs_warmup_echo_for_tmux(
+        self, mock_wait_shell, mock_wait_status, monkeypatch
+    ):
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        fake_tmux = FakeTmuxMultiplexer()
+        monkeypatch.setattr("cli_agent_orchestrator.providers.codex.tmux_client", fake_tmux)
+
+        provider = CodexProvider("test1234", "test-session", "window-0", None)
+        result = provider.initialize()
+
+        assert result is True
+        mock_wait_shell.assert_called_once()
+        fake_tmux.send_keys.assert_any_call("test-session", "window-0", "echo ready")
 
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
@@ -68,7 +159,26 @@ class TestCodexBuildCommand:
     def test_build_command_no_profile(self):
         provider = CodexProvider("test1234", "test-session", "window-0", None)
         command = provider._build_codex_command()
-        assert command == "codex --yolo --no-alt-screen --disable shell_snapshot"
+        expected = "codex --yolo --no-alt-screen --disable shell_snapshot"
+        if sys.platform == "win32":
+            expected = "codex -c 'hooks=[]' --yolo --no-alt-screen --disable shell_snapshot"
+        assert command == expected
+
+    @patch("cli_agent_orchestrator.providers.codex.sys.platform", "win32")
+    def test_build_command_adds_hooks_override_on_windows(self):
+        provider = CodexProvider("test1234", "test-session", "window-0", None)
+
+        command = provider._build_codex_command()
+
+        assert " -c 'hooks=[]' " in f" {command} "
+
+    @patch("cli_agent_orchestrator.providers.codex.sys.platform", "linux")
+    def test_build_command_omits_hooks_override_on_unix(self):
+        provider = CodexProvider("test1234", "test-session", "window-0", None)
+
+        command = provider._build_codex_command()
+
+        assert "hooks=[]" not in command
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_build_command_with_skill_prompt(self, mock_load_profile):
@@ -104,7 +214,8 @@ class TestCodexBuildCommand:
         command = provider._build_codex_command()
 
         mock_load_profile.assert_called_once_with("code_supervisor")
-        assert "codex --yolo --no-alt-screen --disable shell_snapshot" in command
+        assert "codex" in command
+        assert "--yolo --no-alt-screen --disable shell_snapshot" in command
         assert "-c" in command
         assert "developer_instructions=" in command
         assert "You are a code supervisor agent." in command
@@ -222,7 +333,10 @@ class TestCodexBuildCommand:
         provider = CodexProvider("test1234", "test-session", "window-0", "empty_agent")
         command = provider._build_codex_command()
 
-        assert command == "codex --yolo --no-alt-screen --disable shell_snapshot"
+        expected = "codex --yolo --no-alt-screen --disable shell_snapshot"
+        if sys.platform == "win32":
+            expected = "codex -c 'hooks=[]' --yolo --no-alt-screen --disable shell_snapshot"
+        assert command == expected
         assert "developer_instructions" not in command
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
@@ -236,7 +350,10 @@ class TestCodexBuildCommand:
         provider = CodexProvider("test1234", "test-session", "window-0", "none_agent")
         command = provider._build_codex_command()
 
-        assert command == "codex --yolo --no-alt-screen --disable shell_snapshot"
+        expected = "codex --yolo --no-alt-screen --disable shell_snapshot"
+        if sys.platform == "win32":
+            expected = "codex -c 'hooks=[]' --yolo --no-alt-screen --disable shell_snapshot"
+        assert command == expected
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_build_command_profile_load_failure(self, mock_load_profile):
