@@ -486,6 +486,19 @@ class TestCopilotCliProviderStatusDetection:
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
         assert provider.get_status() == TerminalStatus.PROCESSING
 
+    @patch("cli_agent_orchestrator.providers.copilot_cli.tmux_client")
+    def test_get_status_idle_with_v1031_absolute_path_breadcrumb(self, mock_tmux):
+        """Bare ❯ + absolute-path breadcrumb (CWD outside $HOME) → IDLE."""
+        mock_tmux.get_history.return_value = (
+            " /tmp/pr184-e2e [⎇ pr-184]\n"
+            "────────────────────────────────────────────────────────────────────────────────\n"
+            "❯\n"
+            "────────────────────────────────────────────────────────────────────────────────\n"
+            " autopilot · / commands \u200b                        Claude Sonnet 4.6 · (0%)\n"
+        )
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.IDLE
+
 
 class TestCopilotCliProviderMessageExtraction:
     def test_extract_last_message_from_post_user_lines(self):

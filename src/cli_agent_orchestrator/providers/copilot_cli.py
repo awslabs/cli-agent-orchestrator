@@ -45,7 +45,8 @@ COPILOT_STATUS_BAR_PATTERN = r"^\s*(?:autopilot|plan|interactive)\s*[·•]"
 # Copilot v1.0.31+ cwd breadcrumb: " ~/path [⎇ branch*%]"
 # Older versions appended " model (0x)" which was caught by \(\d+x\); the
 # token/model info moved to the status bar in v1.0.31, leaving only the path.
-COPILOT_CWD_BREADCRUMB_PATTERN = r"^\s+~/.*\["
+# Path can be tilde-prefixed (home) or absolute (e.g. /tmp/...), so allow both.
+COPILOT_CWD_BREADCRUMB_PATTERN = r"^\s+(?:~|/)[^\[]*\["
 PROCESSING_LINE_PATTERN = r"^(?:[●◐◑◒◓◉◎∙]\s*)?.*\besc to cancel\b.*$"
 
 
