@@ -218,9 +218,7 @@ class KiroCliProvider(BaseProvider):
         ):
             if yolo:
                 # Yolo already launched with --legacy-ui; no further fallback.
-                raise TimeoutError(
-                    "Kiro CLI initialization timed out with --legacy-ui (yolo mode)"
-                )
+                raise TimeoutError("Kiro CLI initialization timed out with --legacy-ui (yolo mode)")
             # Non-yolo TUI mode failed — fall back to --legacy-ui
             logger.warning("Kiro CLI TUI initialization timed out, retrying with --legacy-ui")
             # Exit the current session and start fresh with --legacy-ui
