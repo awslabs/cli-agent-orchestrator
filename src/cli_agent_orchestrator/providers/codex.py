@@ -62,8 +62,11 @@ TUI_FOOTER_PATTERN = r"(?:\?\s+for shortcuts|context left|\d+%\s+left)"
 # ASSISTANT_PREFIX_PATTERN and the TUI footer › matches idle prompt).
 TUI_PROGRESS_PATTERN = r"•.*\(\d+s\s*•\s*esc to interrupt\)"
 
-# Workspace trust/approval prompt shown when Codex opens a new directory
-TRUST_PROMPT_PATTERN = r"allow Codex to work in this folder"
+# Workspace trust/approval prompt shown when Codex opens a new directory.
+# Wording verified against Codex CLI v0.123.0 on 2026-04-25; the previous
+# anchor ("allow Codex to work in this folder") no longer appears in current
+# Codex builds and the smoke harness caught the regression.
+TRUST_PROMPT_PATTERN = r"Do you trust the contents of this directory"
 # Codex welcome banner indicating normal startup (no trust prompt)
 CODEX_WELCOME_PATTERN = r"OpenAI Codex"
 
