@@ -51,6 +51,7 @@ def create_terminal_dependencies(monkeypatch):
         MagicMock(return_value=None),
     )
     provider_instance = MagicMock()
+    provider_instance.get_launch_spec.return_value = None
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service.provider_manager.create_provider",
         MagicMock(return_value=provider_instance),
@@ -343,4 +344,29 @@ class TestCreateTerminalLaunchSpec:
             "deadbeef",
             None,
             launch_spec=None,
+        )
+
+    def test_create_terminal_uses_provider_launch_spec_when_not_explicit(
+        self, mock_multiplexer, create_terminal_dependencies
+    ):
+        """When no explicit launch_spec is provided, service should ask the provider."""
+        mock_multiplexer.session_exists.return_value = False
+        provider_instance = create_terminal_dependencies["provider_instance"]
+        spec = LaunchSpec(argv=["codex.cmd", "--yolo"], provider="codex")
+        provider_instance.get_launch_spec.return_value = spec
+
+        create_terminal(
+            provider="codex",
+            agent_profile="developer",
+            session_name="gamma",
+            new_session=True,
+        )
+
+        provider_instance.get_launch_spec.assert_called_once_with(mock_multiplexer)
+        mock_multiplexer.create_session.assert_called_once_with(
+            "cao-gamma",
+            "developer-window",
+            "deadbeef",
+            None,
+            launch_spec=spec,
         )

@@ -23,6 +23,7 @@ and output format to reliably detect status changes.
 from abc import ABC, abstractmethod
 from typing import List, Optional
 
+from cli_agent_orchestrator.multiplexers.base import LaunchSpec
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
 
@@ -180,6 +181,15 @@ class BaseProvider(ABC):
         if system_prompt:
             return f"{system_prompt}\n\n{self._skill_prompt}"
         return self._skill_prompt
+
+    def get_launch_spec(self, multiplexer: object) -> Optional[LaunchSpec]:
+        """Return an optional initial process spawn request for the active multiplexer.
+
+        Providers that need direct process spawn on specific backends can override
+        this. The default path returns None so the backend launches its normal shell.
+        """
+        del multiplexer
+        return None
 
     def _update_status(self, status: TerminalStatus) -> None:
         """Update internal status."""

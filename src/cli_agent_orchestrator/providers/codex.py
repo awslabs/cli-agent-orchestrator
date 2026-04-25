@@ -255,6 +255,14 @@ class CodexProvider(BaseProvider):
             time.sleep(1.0)
         logger.warning("Codex trust prompt handler timed out")
 
+    def get_launch_spec(self, multiplexer: object) -> Optional[LaunchSpec]:
+        """Return a direct-spawn LaunchSpec for WezTerm-backed Codex sessions."""
+        if not isinstance(multiplexer, WezTermMultiplexer):
+            return None
+        if self._launch_spec is None:
+            self._launch_spec = build_launch_spec("codex", self._build_codex_argv())
+        return self._launch_spec
+
     def initialize(self) -> bool:
         """Initialize Codex provider by starting codex command."""
         if self._launch_spec is None:

@@ -56,6 +56,7 @@ class TestCreateTerminal:
 
         assert result.id == "test1234"
         mock_multiplexer.create_session.assert_called_once()
+        mock_provider.get_launch_spec.assert_called_once_with(mock_multiplexer)
         mock_provider.initialize.assert_called_once()
 
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
@@ -93,6 +94,7 @@ class TestCreateTerminal:
         result = create_terminal("kiro_cli", "developer", session_name="cao-existing")
 
         assert result.id == "test1234"
+        mock_provider.get_launch_spec.assert_called_once_with(mock_multiplexer)
         mock_multiplexer.create_window.assert_called_once()
 
     @patch("cli_agent_orchestrator.services.terminal_service.get_multiplexer")

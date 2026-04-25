@@ -113,6 +113,8 @@ def create_terminal(
         TimeoutError: If provider initialization times out
     """
     session_created = False  # tracks whether THIS call created the tmux session
+    multiplexer = None
+    terminal_id = ""
     try:
         # Step 1: Generate unique identifiers
         terminal_id = generate_terminal_id()
@@ -121,53 +123,17 @@ def create_terminal(
             session_name = generate_session_name()
 
         window_name = generate_window_name(agent_profile)
+        multiplexer = get_multiplexer()
 
-        # Step 2: Create tmux session or window
-        if new_session:
-            # Ensure session name has the CAO prefix for identification
-            if not session_name.startswith(SESSION_PREFIX):
-                session_name = f"{SESSION_PREFIX}{session_name}"
-
-            # Prevent duplicate sessions
-            if get_multiplexer().session_exists(session_name):
-                raise ValueError(f"Session '{session_name}' already exists")
-
-            # Create new tmux session with initial window
-            get_multiplexer().create_session(
-                session_name,
-                window_name,
-                terminal_id,
-                working_directory,
-                launch_spec=launch_spec,
-            )
-            session_created = True  # only set after successful creation
-        else:
-            # Add window to existing session
-            if not get_multiplexer().session_exists(session_name):
-                raise ValueError(f"Session '{session_name}' not found")
-            window_name = get_multiplexer().create_window(
-                session_name,
-                window_name,
-                terminal_id,
-                working_directory,
-                launch_spec=launch_spec,
-            )
-
-        # Step 3: Persist terminal metadata to database
-        db_create_terminal(
-            terminal_id, session_name, window_name, provider, agent_profile, allowed_tools
-        )
-
-        # Step 3b: Load the profile once for allowed tool resolution before
-        # provider initialization. The skill catalog is computed only for
-        # providers that consume it at launch time (see RUNTIME_SKILL_PROMPT_PROVIDERS).
+        # Step 2: Load profile and build provider before pane creation so backend-
+        # specific direct-spawn requests (e.g. Codex on WezTerm) can be passed
+        # into create_session/create_window.
         try:
             profile = load_agent_profile(agent_profile)
         except FileNotFoundError:
             profile = None
         skill_prompt = build_skill_catalog() if provider in RUNTIME_SKILL_PROMPT_PROVIDERS else None
 
-        # Step 3c: Resolve allowed_tools from profile if not explicitly provided
         if allowed_tools is None and profile is not None:
             from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
 
@@ -176,12 +142,6 @@ def create_terminal(
                 profile.allowedTools, profile.role, mcp_server_names
             )
 
-        # Step 4: Create and initialize the CLI provider
-        # This starts the agent (e.g., runs "kiro-cli chat --agent developer").
-        # Only runtime-prompt providers (Claude Code, Codex, Gemini, Kimi) receive
-        # the skill catalog here; Kiro (skill:// resources) and OpenCode
-        # (OPENCODE_CONFIG_DIR/skills symlink) discover skills natively; Q and
-        # Copilot get the catalog baked at install time.
         provider_instance = provider_manager.create_provider(
             provider,
             terminal_id,
@@ -192,13 +152,62 @@ def create_terminal(
             skill_prompt=skill_prompt,
             model=profile.model if profile else None,
         )
+        effective_launch_spec = (
+            launch_spec if launch_spec is not None else provider_instance.get_launch_spec(multiplexer)
+        )
+
+        # Step 3: Create tmux session or window
+        if new_session:
+            # Ensure session name has the CAO prefix for identification
+            if not session_name.startswith(SESSION_PREFIX):
+                session_name = f"{SESSION_PREFIX}{session_name}"
+
+            # Prevent duplicate sessions
+            if multiplexer.session_exists(session_name):
+                raise ValueError(f"Session '{session_name}' already exists")
+
+            # Create new tmux session with initial window
+            actual_window_name = multiplexer.create_session(
+                session_name,
+                window_name,
+                terminal_id,
+                working_directory,
+                launch_spec=effective_launch_spec,
+            )
+            session_created = True  # only set after successful creation
+        else:
+            # Add window to existing session
+            if not multiplexer.session_exists(session_name):
+                raise ValueError(f"Session '{session_name}' not found")
+            actual_window_name = multiplexer.create_window(
+                session_name,
+                window_name,
+                terminal_id,
+                working_directory,
+                launch_spec=effective_launch_spec,
+            )
+        if isinstance(actual_window_name, str) and actual_window_name:
+            window_name = actual_window_name
+
+        # Step 4: Persist terminal metadata to database
+        db_create_terminal(
+            terminal_id, session_name, window_name, provider, agent_profile, allowed_tools
+        )
+
+        # Step 5: Initialize the CLI provider.
+        # Only runtime-prompt providers (Claude Code, Codex, Gemini, Kimi) receive
+        # the skill catalog here; Kiro (skill:// resources) and OpenCode
+        # (OPENCODE_CONFIG_DIR/skills symlink) discover skills natively; Q and
+        # Copilot get the catalog baked at install time.
+        provider_instance.session_name = session_name
+        provider_instance.window_name = window_name
         provider_instance.initialize()
 
-        # Step 5: Set up terminal logging via tmux pipe-pane
+        # Step 6: Set up terminal logging via tmux pipe-pane
         # This captures all terminal output to a log file for inbox monitoring
         log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
         log_path.touch()  # Ensure file exists before watching
-        get_multiplexer().pipe_pane(session_name, window_name, str(log_path))
+        multiplexer.pipe_pane(session_name, window_name, str(log_path))
 
         # Build and return the Terminal object
         terminal = Terminal(
@@ -233,9 +242,9 @@ def create_terminal(
             provider_manager.cleanup_provider(terminal_id)
         except Exception:
             pass  # Ignore cleanup errors
-        if session_created and session_name:
+        if session_created and session_name and multiplexer is not None:
             try:
-                get_multiplexer().kill_session(session_name)
+                multiplexer.kill_session(session_name)
             except:
                 pass  # Ignore cleanup errors
         raise

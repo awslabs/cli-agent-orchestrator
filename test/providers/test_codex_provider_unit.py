@@ -58,6 +58,24 @@ class TestBuildLaunchSpec:
 
 
 class TestCodexProviderInitialization:
+    def test_get_launch_spec_returns_direct_spawn_for_wezterm(self):
+        fake_wez = MagicMock(spec=WezTermMultiplexer)
+
+        provider = CodexProvider("test1234", "test-session", "window-0", None)
+
+        spec = provider.get_launch_spec(fake_wez)
+
+        assert isinstance(spec, LaunchSpec)
+        assert spec.provider == "codex"
+        assert spec.argv is not None
+
+    def test_get_launch_spec_returns_none_for_tmux(self):
+        fake_tmux = MagicMock(spec=TmuxMultiplexer)
+
+        provider = CodexProvider("test1234", "test-session", "window-0", None)
+
+        assert provider.get_launch_spec(fake_tmux) is None
+
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     def test_initialize_success(self, mock_wait_shell, mock_wait_status, monkeypatch):
