@@ -6,6 +6,7 @@ pattern matching, and cleanup — targeting >90% code coverage.
 
 import os
 import re
+import sys
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -150,14 +151,15 @@ class TestKimiCliProviderInitialization:
     @patch("cli_agent_orchestrator.providers.kimi_cli.wait_for_shell", return_value=True)
     @patch("cli_agent_orchestrator.providers.kimi_cli.tmux_client")
     def test_initialize_sends_kimi_command(self, mock_tmux, mock_wait_shell, mock_wait_status):
-        """Test that initialize sends the kimi --yolo command with cd and TERM override."""
+        """Test that initialize sends the kimi --yolo command with cd/Set-Location and TERM override."""
         provider = KimiCliProvider("term-1", "session-1", "window-1")
         provider.initialize()
 
         call_args = mock_tmux.send_keys.call_args
         command = call_args[0][2]
-        assert "cd " in command
-        assert "TERM=xterm-256color" in command
+        # Platform-agnostic: POSIX uses "cd ", PowerShell uses "Set-Location"
+        assert "cd " in command or "Set-Location" in command
+        assert "xterm-256color" in command
         assert "kimi --yolo" in command
         provider.cleanup()
 
@@ -545,11 +547,12 @@ class TestKimiCliProviderBuildCommand:
     """Tests for KimiCliProvider._build_kimi_command()."""
 
     def test_build_command_no_profile(self):
-        """Test command without agent profile includes cd, TERM override, and kimi --yolo."""
+        """Test command without agent profile includes cd/Set-Location, TERM override, and kimi --yolo."""
         provider = KimiCliProvider("term-1", "session-1", "window-1")
         command = provider._build_kimi_command()
-        assert "cd " in command
-        assert "TERM=xterm-256color" in command
+        # Platform-agnostic: POSIX uses "cd ", PowerShell uses "Set-Location"
+        assert "cd " in command or "Set-Location" in command
+        assert "xterm-256color" in command
         assert "kimi --yolo" in command
         assert provider._temp_dir is not None
         provider.cleanup()

@@ -3,6 +3,7 @@
 import logging
 import re
 import shlex
+import sys
 import time
 from typing import Optional
 
@@ -13,6 +14,33 @@ from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 
 logger = logging.getLogger(__name__)
+
+
+def _pwsh_join(parts: list) -> str:
+    """Join command parts into a PowerShell-safe command string.
+
+    Equivalent to ``shlex.join()`` but uses PowerShell single-quoted string
+    literals instead of POSIX quoting.  Any embedded single-quote in a value
+    is escaped by doubling (``'`` → ``''``), which is the correct PowerShell
+    escape inside single-quoted strings.
+
+    Args:
+        parts: Sequence of command tokens (executable + arguments).
+
+    Returns:
+        A space-joined string where each part containing spaces or shell
+        metacharacters is wrapped in PowerShell single-quoted literals.
+    """
+    result = []
+    for part in parts:
+        if not part or any(c in part for c in (" ", "\t", '"', "'", "`", "$", "(", ")", "{", "}", ";", "&", "|", "<", ">", "~", "^")):
+            # Wrap in single quotes with internal ' doubled
+            escaped = part.replace("'", "''")
+            result.append(f"'{escaped}'")
+        else:
+            result.append(part)
+    return " ".join(result)
+
 
 # Regex patterns for Codex output analysis
 ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
@@ -210,6 +238,8 @@ class CodexProvider(BaseProvider):
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
+        if sys.platform == "win32":
+            return _pwsh_join(command_parts)
         return shlex.join(command_parts)
 
     def _handle_trust_prompt(self, timeout: float = 20.0) -> None:
