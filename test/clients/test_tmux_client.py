@@ -531,3 +531,120 @@ class TestStopPipePane:
         ]
         with pytest.raises(ValueError, match="not found"):
             tmux.stop_pipe_pane("ses", "nonexistent")
+
+
+# ── _build_windows_env_prefix ────────────────────────────────────────
+# These tests exercise the helper in isolation (no real shell required).
+# The Windows-specific integration behaviour (env actually visible in shell)
+# is guarded by skipif so it only runs on Windows.
+
+
+class TestBuildWindowsEnvPrefix:
+    """Unit tests for _build_windows_env_prefix quoting edge-cases."""
+
+    def test_empty_env_returns_empty_string(self, tmux):
+        result = tmux._build_windows_env_prefix({})
+        assert result == ""
+
+    def test_single_simple_var(self, tmux):
+        result = tmux._build_windows_env_prefix({"FOO": "bar"})
+        assert "$env:FOO = 'bar'" in result
+        assert result.startswith("pwsh -NoProfile -Command ")
+        assert result.endswith("pwsh -NoProfile\"")
+
+    def test_value_with_spaces(self, tmux):
+        result = tmux._build_windows_env_prefix({"MY_VAR": "hello world"})
+        assert "$env:MY_VAR = 'hello world'" in result
+
+    def test_value_with_single_quote_escaped(self, tmux):
+        # Embedded ' must be doubled to '' in PowerShell single-quoted string
+        result = tmux._build_windows_env_prefix({"TZ": "it's fine"})
+        assert "$env:TZ = 'it''s fine'" in result
+
+    def test_value_with_multiple_single_quotes(self, tmux):
+        result = tmux._build_windows_env_prefix({"MSG": "don't won't"})
+        assert "$env:MSG = 'don''t won''t'" in result
+
+    def test_multiple_vars_all_present(self, tmux):
+        env = {"A": "1", "B": "2", "C": "3"}
+        result = tmux._build_windows_env_prefix(env)
+        for k, v in env.items():
+            assert f"$env:{k} = '{v}'" in result
+
+    def test_no_double_quote_interpolation(self, tmux):
+        # Values containing $ must not be treated as PowerShell variables.
+        # Single-quoted strings prevent expansion — just verify $ survives.
+        result = tmux._build_windows_env_prefix({"PATH_EXTRA": "$HOME/bin"})
+        assert "$HOME/bin" in result
+
+    def test_value_with_semicolons(self, tmux):
+        # Semicolons inside a single-quoted string are safe (not separators).
+        result = tmux._build_windows_env_prefix({"FLAGS": "a=1;b=2"})
+        assert "$env:FLAGS = 'a=1;b=2'" in result
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Requires a real PowerShell process — only runs on Windows",
+    )
+    def test_env_visible_in_spawned_pwsh(self, tmux):
+        """Smoke-test: env vars set by the prefix are visible in a child pwsh."""
+        import subprocess
+
+        cmd_str = tmux._build_windows_env_prefix({"_CAO_TEST_VAR": "hello_cao"})
+        # Strip the outer pwsh wrapper and replace the trailing interactive shell
+        # with a one-shot echo so the test terminates.
+        # cmd_str = 'pwsh -NoProfile -Command "$env:X = 'Y'; pwsh -NoProfile"'
+        # Replace the trailing `; pwsh -NoProfile"` with `; Write-Output $env:X"`
+        inner = cmd_str.split(' -Command "', 1)[1].rstrip('"')
+        inner = inner.rsplit("; pwsh -NoProfile", 1)[0]
+        inner += "; Write-Output $env:_CAO_TEST_VAR"
+        result = subprocess.run(
+            ["pwsh", "-NoProfile", "-Command", inner],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        assert "hello_cao" in result.stdout
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="Windows env-prefix injection path only active on win32",
+)
+class TestCreateSessionWindowsEnvInjection:
+    """Integration-level tests for env injection via the pwsh prefix on Windows."""
+
+    @patch("cli_agent_orchestrator.clients.tmux.subprocess")
+    def test_create_session_appends_shell_command_on_windows(self, mock_sp, tmux, tmp_path):
+        """On Windows, create_session appends a pwsh env-prefix as the shell command."""
+        mock_sp.run.side_effect = [
+            _completed("", returncode=0),            # new-session
+            _completed("my-window\n", returncode=0), # list-windows
+        ]
+        tmux.create_session("ses", "my-window", "tid-win", str(tmp_path))
+
+        new_session_call = mock_sp.run.call_args_list[0]
+        cmd = new_session_call[0][0]
+        # Last element should be the pwsh prefix command
+        last_arg = cmd[-1]
+        assert last_arg.startswith("pwsh -NoProfile -Command")
+        # CAO_TERMINAL_ID must be injected
+        assert "CAO_TERMINAL_ID" in last_arg
+        assert "tid-win" in last_arg
+
+    @patch("cli_agent_orchestrator.clients.tmux.subprocess")
+    def test_create_window_appends_shell_command_on_windows(self, mock_sp, tmux, tmp_path):
+        """On Windows, create_window appends a pwsh env-prefix as the shell command."""
+        mock_sp.run.side_effect = [
+            _completed("", returncode=0),                      # has-session
+            _completed("", returncode=0),                      # new-window
+            _completed("agent-window\n", returncode=0),        # list-windows
+        ]
+        tmux.create_window("ses", "agent-window", "tid-win2", str(tmp_path))
+
+        new_window_call = mock_sp.run.call_args_list[1]
+        cmd = new_window_call[0][0]
+        last_arg = cmd[-1]
+        assert last_arg.startswith("pwsh -NoProfile -Command")
+        assert "CAO_TERMINAL_ID" in last_arg
+        assert "tid-win2" in last_arg

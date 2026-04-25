@@ -25,6 +25,7 @@ psmux compatibility notes:
 import logging
 import os
 import subprocess
+import sys
 import time
 import uuid
 from typing import Dict, List, Optional
@@ -140,6 +141,38 @@ class TmuxClient:
 
     # ── internal subprocess helpers ──────────────────────────────────────
 
+    @staticmethod
+    def _build_windows_env_prefix(env: Dict[str, str]) -> str:
+        """Build a PowerShell env-injection prefix for Windows / psmux.
+
+        psmux stores ``-e KEY=VAL`` pairs in the session record but does NOT
+        propagate them into the spawned shell's process environment.  On Windows
+        the workaround is to pass a shell command to ``new-session`` (or
+        ``new-window``) that sets each variable with ``$env:KEY = 'VAL'`` before
+        handing off to the interactive shell.
+
+        Values are wrapped in PowerShell single-quoted string literals.  Any
+        embedded single-quote is escaped by doubling (``'`` → ``''``), which is
+        the correct and safe PowerShell single-quote escape — double-quote
+        interpolation (``"$..."`` expansion) is deliberately avoided.
+
+        Args:
+            env: Mapping of environment variable names to values.
+
+        Returns:
+            A ``pwsh -NoProfile -Command "…; pwsh -NoProfile"`` string suitable
+            for use as the ``[shell-command]`` argument to ``tmux new-session``
+            or ``tmux new-window``.  Returns an empty string when *env* is empty
+            (callers should omit the shell-command argument in that case).
+        """
+        if not env:
+            return ""
+        set_stmts = "; ".join(
+            "$env:{k} = '{v}'".format(k=k, v=v.replace("'", "''"))
+            for k, v in env.items()
+        )
+        return f"pwsh -NoProfile -Command \"{set_stmts}; pwsh -NoProfile\""
+
     def _tmux(self, *args: str, check: bool = False, input: Optional[bytes] = None) -> subprocess.CompletedProcess:  # type: ignore[override]
         """Run a tmux command and return the completed process."""
         return subprocess.run(["tmux", *args], capture_output=True, text=True, check=check, input=input)  # type: ignore[call-overload]
@@ -224,6 +257,10 @@ class TmuxClient:
 
             # Build the new-session command.  Environment variables are passed
             # via repeated ``-e KEY=VALUE`` args (one pair per flag invocation).
+            # On Windows / psmux, ``-e`` sets the session record but does NOT
+            # propagate into the spawned shell process.  We work around this by
+            # prepending a PowerShell env-injection command as the shell-command
+            # argument so that the variables are visible to the spawned shell.
             cmd = [
                 "tmux", "new-session",
                 "-s", session_name,
@@ -233,6 +270,11 @@ class TmuxClient:
             ]
             for k, v in environment.items():
                 cmd += ["-e", f"{k}={v}"]
+
+            if sys.platform == "win32":
+                win_shell = self._build_windows_env_prefix(environment)
+                if win_shell:
+                    cmd.append(win_shell)
 
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode != 0:
@@ -275,6 +317,7 @@ class TmuxClient:
             if not self._session_exists_raw(session_name):
                 raise ValueError(f"Session '{session_name}' not found")
 
+            window_env = {"CAO_TERMINAL_ID": terminal_id}
             cmd = [
                 "tmux", "new-window",
                 "-t", session_name,
@@ -282,6 +325,11 @@ class TmuxClient:
                 "-c", working_directory,
                 "-e", f"CAO_TERMINAL_ID={terminal_id}",
             ]
+            if sys.platform == "win32":
+                win_shell = self._build_windows_env_prefix(window_env)
+                if win_shell:
+                    cmd.append(win_shell)
+
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode != 0:
                 raise RuntimeError(
