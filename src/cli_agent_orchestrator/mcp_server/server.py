@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 import time
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import requests
 from fastmcp import FastMCP
@@ -338,6 +338,40 @@ async def _handoff_impl(
                 terminal_id=terminal_id,
             )
 
+        # Extract session context before cleanup (non-blocking).
+        # Captures what the worker did so the supervisor has structured context.
+        session_context: dict = {}
+        try:
+            from cli_agent_orchestrator.providers.manager import provider_manager
+
+            worker_provider = provider_manager.get_provider(terminal_id)
+            if worker_provider:
+                session_context = await worker_provider.extract_session_context()
+        except NotImplementedError:
+            pass  # Kimi deferred to Phase 3
+        except Exception as e:
+            logger.debug(f"Non-blocking session context extraction failed: {e}")
+
+        # Log task_completed event with session context (non-blocking)
+        try:
+            import json as _json
+
+            from cli_agent_orchestrator.clients.database import get_terminal_metadata as _get_meta
+            from cli_agent_orchestrator.clients.database import log_session_event as _log_evt
+
+            _meta = _get_meta(terminal_id)
+            if _meta:
+                _log_evt(
+                    session_name=_meta["tmux_session"],
+                    terminal_id=terminal_id,
+                    provider=provider,
+                    event_type="task_completed",
+                    summary=f"Task completed by {agent_profile}",
+                    metadata_json=_json.dumps(session_context) if session_context else "{}",
+                )
+        except Exception as e:
+            logger.debug(f"Non-blocking event log failed: {e}")
+
         # Get the response
         response = requests.get(
             f"{API_BASE_URL}/terminals/{terminal_id}/output", params={"mode": "last"}
@@ -351,6 +385,26 @@ async def _handoff_impl(
         response.raise_for_status()
 
         execution_time = time.time() - start_time
+
+        # Log handoff_returned event (non-blocking)
+        try:
+            from cli_agent_orchestrator.clients.database import (
+                get_terminal_metadata,
+                log_session_event,
+            )
+
+            caller_tid = os.environ.get("CAO_TERMINAL_ID", "")
+            caller_meta = get_terminal_metadata(caller_tid) if caller_tid else None
+            session_name = caller_meta["tmux_session"] if caller_meta else ""
+            log_session_event(
+                session_name=session_name,
+                terminal_id=terminal_id,
+                provider=provider,
+                event_type="handoff_returned",
+                summary=f"Handoff to {agent_profile} completed in {execution_time:.2f}s",
+            )
+        except Exception as e:
+            logger.debug(f"Non-blocking event log failed: {e}")
 
         return HandoffResult(
             success=True,
@@ -620,6 +674,15 @@ async def load_skill(
 # Memory Tools
 # =============================================================================
 
+# U5 / SC-6: Explicit disabled message surfaced to agents when the memory
+# subsystem is turned off via `memory.enabled=false` in settings.json.
+# Kept deliberately short + actionable so it shows up verbatim in the tool
+# result and the agent can relay it to the user.
+MEMORY_DISABLED_MESSAGE = (
+    "memory disabled — set memory.enabled=true in "
+    "~/.aws/cli-agent-orchestrator/settings.json to enable"
+)
+
 
 def _get_terminal_context_from_env() -> Optional[Dict[str, Any]]:
     """Build terminal context dict from the calling terminal's CAO_TERMINAL_ID."""
@@ -679,7 +742,10 @@ async def memory_store(
     Use this to persist facts, decisions, user preferences, and project conventions
     that should be available across agent sessions.
     """
-    from cli_agent_orchestrator.services.memory_service import MemoryService
+    from cli_agent_orchestrator.services.memory_service import (
+        MemoryDisabledError,
+        MemoryService,
+    )
 
     try:
         service = MemoryService()
@@ -700,6 +766,8 @@ async def memory_store(
             "file_path": memory.file_path,
             "action": "updated" if memory.created_at != memory.updated_at else "created",
         }
+    except MemoryDisabledError:
+        return {"success": False, "disabled": True, "error": MEMORY_DISABLED_MESSAGE}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -724,6 +792,10 @@ async def memory_recall(
         ge=1,
         le=100,
     ),
+    search_mode: str = Field(
+        default="hybrid",
+        description='Search strategy: "metadata" (key/tag only), "bm25" (full-text content), "hybrid" (metadata first, BM25 to fill remaining slots)',
+    ),
 ) -> Dict[str, Any]:
     """Retrieve memories matching a query and optional filters.
 
@@ -733,15 +805,26 @@ async def memory_recall(
     Use this to check if relevant knowledge already exists before asking the user.
     """
     from cli_agent_orchestrator.services.memory_service import MemoryService
+    from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+    if not is_memory_enabled():
+        return {
+            "success": False,
+            "disabled": True,
+            "error": MEMORY_DISABLED_MESSAGE,
+            "memories": [],
+        }
 
     try:
         service = MemoryService()
         terminal_context = _get_terminal_context_from_env()
+        resolved_mode = search_mode if isinstance(search_mode, str) else "hybrid"
         memories = await service.recall(
             query=query,
             scope=scope,
             memory_type=memory_type,
             limit=limit,
+            search_mode=resolved_mode,
             terminal_context=terminal_context,
         )
         return {
@@ -774,7 +857,10 @@ async def memory_forget(
 
     Deletes the wiki topic file and removes the entry from index.md.
     """
-    from cli_agent_orchestrator.services.memory_service import MemoryService
+    from cli_agent_orchestrator.services.memory_service import (
+        MemoryDisabledError,
+        MemoryService,
+    )
 
     try:
         service = MemoryService()
@@ -789,6 +875,144 @@ async def memory_forget(
             "deleted": deleted,
             "key": key,
             "scope": scope,
+        }
+    except MemoryDisabledError:
+        return {"success": False, "disabled": True, "error": MEMORY_DISABLED_MESSAGE}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def memory_consolidate(
+    keys: List[str] = Field(
+        description="List of memory keys to merge (at least 2). Originals are deleted after merge."
+    ),
+    new_content: str = Field(
+        description="The combined/merged content for the new consolidated memory entry."
+    ),
+    scope: str = Field(
+        default="project",
+        description='Scope of the memories: "global", "project", "session", or "agent"',
+    ),
+    new_key: Optional[str] = Field(
+        default=None,
+        description="Key for the merged entry. Defaults to the first key in the list if omitted.",
+    ),
+    memory_type: str = Field(
+        default="project",
+        description='Type of the merged memory: "user", "feedback", "project", or "reference".',
+    ),
+    tags: str = Field(
+        default="",
+        description="Comma-separated tags for the merged memory entry.",
+    ),
+) -> Dict[str, Any]:
+    """Merge two or more memory entries into one.
+
+    Provide the keys to merge and the combined content.
+    Original entries are deleted; a new entry is created with new_key
+    (or the first key if omitted).
+    Returns { success, merged_from, new_key, scope }.
+    """
+    from cli_agent_orchestrator.services.memory_service import (
+        MemoryDisabledError,
+        MemoryService,
+    )
+
+    if len(keys) < 2:
+        return {"success": False, "error": "At least 2 keys are required for consolidation."}
+
+    resolved_key = new_key if isinstance(new_key, str) else keys[0]
+
+    try:
+        service = MemoryService()
+        terminal_context = _get_terminal_context_from_env()
+
+        # Step 1: Store the merged entry (upserts if key already exists)
+        await service.store(
+            content=new_content,
+            scope=scope,
+            memory_type=memory_type,
+            key=resolved_key,
+            tags=tags,
+            terminal_context=terminal_context,
+        )
+
+        # Step 2: Delete all original keys (except the resolved_key if it was reused)
+        keys_to_delete = [k for k in keys if k != resolved_key]
+        deleted_keys = []
+        errors = []
+        for k in keys_to_delete:
+            try:
+                deleted = await service.forget(
+                    key=k, scope=scope, terminal_context=terminal_context
+                )
+                if deleted:
+                    deleted_keys.append(k)
+                else:
+                    errors.append(f"{k} not found")
+            except Exception as e:
+                errors.append(f"{k} failed: {e}")
+
+        # success only if ALL deletes succeeded
+        success = len(deleted_keys) == len(keys_to_delete)
+        return {
+            "success": success,
+            "merged_from": keys,
+            "deleted_originals": deleted_keys,
+            "errors": errors if errors else None,
+            "new_key": resolved_key,
+            "scope": scope,
+        }
+    except MemoryDisabledError:
+        return {"success": False, "disabled": True, "error": MEMORY_DISABLED_MESSAGE}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def session_context(
+    session_name: Optional[str] = Field(
+        default=None,
+        description="CAO session name. Defaults to current session (CAO_SESSION_NAME env var).",
+    ),
+    limit: int = Field(
+        default=20,
+        description="Maximum number of recent events to return.",
+    ),
+) -> Dict[str, Any]:
+    """Return the event timeline for a CAO session.
+
+    Includes task_started, task_completed, handoff_returned, memory_stored events.
+    Use this to understand what previous agents did before taking over.
+    """
+    from cli_agent_orchestrator.clients.database import get_session_timeline
+
+    # Resolve session_name: use parameter if provided, else CAO_SESSION_NAME env var
+    resolved_name = session_name if isinstance(session_name, str) else None
+    if not resolved_name:
+        resolved_name = os.environ.get("CAO_SESSION_NAME", "")
+    if not resolved_name:
+        return {"success": False, "error": "No session_name provided and CAO_SESSION_NAME not set"}
+
+    # Resolve limit (FieldInfo guard for direct calls)
+    resolved_limit = limit if isinstance(limit, int) and 0 < limit <= 1000 else 20
+
+    try:
+        events = get_session_timeline(resolved_name, limit=resolved_limit)
+        return {
+            "success": True,
+            "session_name": resolved_name,
+            "events": [
+                {
+                    "event_type": e["event_type"],
+                    "terminal_id": e["terminal_id"],
+                    "provider": e["provider"],
+                    "summary": e["summary"],
+                    "created_at": str(e["created_at"]) if e["created_at"] else None,
+                }
+                for e in events
+            ],
         }
     except Exception as e:
         return {"success": False, "error": str(e)}

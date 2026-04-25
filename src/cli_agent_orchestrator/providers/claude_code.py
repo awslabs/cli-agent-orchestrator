@@ -7,7 +7,7 @@ import shlex
 import subprocess
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -329,6 +329,126 @@ class ClaudeCodeProvider(BaseProvider):
         final_answer = re.sub(ANSI_CODE_PATTERN, "", final_answer)
         return final_answer.strip()
 
+    async def extract_session_context(self) -> Dict[str, Any]:
+        """Extract session context from Claude Code terminal output.
+
+        Parses tmux output using Claude Code's ⏺ response markers and
+        ❯/> idle prompts to identify user/assistant turns.
+        """
+        output = tmux_client.get_history(self.session_name, self.window_name)
+        if not output:
+            return {}
+
+        clean = re.sub(ANSI_CODE_PATTERN, "", output)
+
+        # Extract user messages: lines following the idle prompt (❯ or >)
+        user_messages: List[str] = []
+        lines = clean.splitlines()
+        i = 0
+        while i < len(lines):
+            if re.match(r"\s*[>❯][\s\xa0]", lines[i]):
+                # Collect text on and after the prompt line until next marker
+                msg_lines: List[str] = []
+                text_after_prompt = re.sub(r"^\s*[>❯][\s\xa0]*", "", lines[i]).strip()
+                if text_after_prompt:
+                    msg_lines.append(text_after_prompt)
+                i += 1
+                while i < len(lines):
+                    if re.search(RESPONSE_PATTERN, lines[i]) or re.match(
+                        r"\s*[>❯][\s\xa0]", lines[i]
+                    ):
+                        break
+                    if lines[i].strip():
+                        msg_lines.append(lines[i].strip())
+                    i += 1
+                if msg_lines:
+                    user_messages.append(" ".join(msg_lines))
+                continue
+            i += 1
+
+        # Extract last assistant response
+        last_response = ""
+        try:
+            last_response = self.extract_last_message_from_script(output)
+        except ValueError:
+            pass
+
+        return self._build_context_dict(
+            provider_name="claude_code",
+            last_task=user_messages[-1] if user_messages else "",
+            key_decisions=self._extract_decisions(last_response),
+            open_questions=self._extract_questions(user_messages),
+            files_changed=self._extract_file_paths(clean),
+        )
+
+    def get_context_usage_percentage(self) -> Optional[float]:
+        """Parse Claude Code's JSONL transcript for context_usage_percentage.
+
+        Claude Code stores session transcripts in
+        ``~/.claude/projects/{sanitized-cwd}/{uuid}.jsonl``.
+        The ``context_usage_percentage`` field appears in assistant stop
+        events.  Returns the most recent value found, or ``None`` if
+        unavailable.
+        """
+        try:
+            # Get pane working directory via tmux
+            working_dir = tmux_client.get_pane_working_directory(
+                self.session_name, self.window_name
+            )
+            if not working_dir:
+                return None
+
+            # Derive Claude projects path: /foo/bar → -foo-bar
+            claude_home = Path.home() / ".claude" / "projects"
+            sanitized = working_dir.replace("/", "-")
+            projects_dir = claude_home / sanitized
+
+            # Path security: resolve and verify containment under ~/.claude/projects
+            real_claude_home = str(Path(claude_home).resolve())
+            real_projects_dir = str(Path(projects_dir).resolve())
+            if not real_projects_dir.startswith(real_claude_home + "/"):
+                logger.debug(f"Projects dir escapes claude home: {real_projects_dir}")
+                return None
+
+            if not Path(real_projects_dir).is_dir():
+                return None
+
+            # Find most recently modified JSONL file
+            jsonl_files = sorted(
+                Path(real_projects_dir).glob("*.jsonl"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if not jsonl_files:
+                return None
+
+            # Read last 50 lines of the most recent file for efficiency
+            transcript = jsonl_files[0]
+            latest_usage: Optional[float] = None
+            try:
+                with open(transcript, "r", encoding="utf-8") as f:
+                    # Read all lines and take the tail — JSONL files aren't huge
+                    lines = f.readlines()
+                    tail = lines[-50:] if len(lines) > 50 else lines
+                    for line in tail:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            entry = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        pct = entry.get("context_usage_percentage")
+                        if isinstance(pct, (int, float)) and 0.0 <= pct <= 1.0:
+                            latest_usage = float(pct)
+            except OSError:
+                return None
+
+            return latest_usage
+        except Exception as e:
+            logger.debug(f"Failed to read context usage: {e}")
+            return None
+
     def exit_cli(self) -> str:
         """Get the command to exit Claude Code."""
         return "/exit"
@@ -336,3 +456,15 @@ class ClaudeCodeProvider(BaseProvider):
     def cleanup(self) -> None:
         """Clean up Claude Code provider."""
         self._initialized = False
+
+    def register_hooks(
+        self,
+        working_directory: Optional[str],
+        agent_profile: Optional[str],
+    ) -> None:
+        """Install Stop + PreCompact hooks into .claude/settings.local.json."""
+        if not working_directory:
+            return
+        from cli_agent_orchestrator.hooks.registration import register_hooks_claude_code
+
+        register_hooks_claude_code(working_directory)

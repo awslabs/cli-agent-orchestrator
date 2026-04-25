@@ -76,7 +76,14 @@ def register_hooks_claude_code(working_directory: str) -> None:
     if not real_dir.startswith("/"):
         raise ValueError(f"Working directory must be an absolute path: {working_directory}")
 
-    settings_path = Path(real_dir) / ".claude" / "settings.local.json"
+    # Normalize full path and verify containment before any file access.
+    # All filesystem operations use settings_path (built from the checked
+    # normalized string) — matches CodeQL's recommended pattern.
+    settings_str = os.path.normpath(os.path.join(real_dir, ".claude", "settings.local.json"))
+    if not settings_str.startswith(real_dir):
+        raise ValueError(f"Settings path escapes working directory: {settings_str}")
+
+    settings_path = Path(settings_str)
     settings_path.parent.mkdir(parents=True, exist_ok=True)
 
     existing: dict = {}
@@ -195,14 +202,18 @@ def register_hooks_codex(working_directory: str) -> None:
     Args:
         working_directory: The terminal's working directory (where .codex/ lives).
     """
-    # Same PathNormalization + SafeAccessCheck pattern as register_hooks_claude_code.
     if "\x00" in working_directory:
         raise ValueError("Working directory contains null bytes")
     real_dir = os.path.realpath(os.path.abspath(working_directory))
     if not real_dir.startswith("/"):
         raise ValueError(f"Working directory must be an absolute path: {working_directory}")
 
-    hooks_path = Path(real_dir) / ".codex" / "hooks.json"
+    # Normalize full path and verify containment before any file access.
+    hooks_str = os.path.normpath(os.path.join(real_dir, ".codex", "hooks.json"))
+    if not hooks_str.startswith(real_dir):
+        raise ValueError(f"Hooks path escapes working directory: {hooks_str}")
+
+    hooks_path = Path(hooks_str)
     hooks_path.parent.mkdir(parents=True, exist_ok=True)
 
     existing: dict = {}

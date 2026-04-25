@@ -84,6 +84,27 @@ KIRO_AGENTS_DIR = Path(os.environ.get("CAO_AGENTS_DIR", str(Path.home() / ".kiro
 COPILOT_AGENTS_DIR = Path.home() / ".copilot" / "agents"  # Copilot custom agents
 
 # =============================================================================
+# Memory System Configuration
+# =============================================================================
+# Directory for persistent agent memories (context across sessions)
+MEMORY_DIR = CAO_HOME_DIR / "memory"
+
+# Feature flag to enable/disable memory system
+# When enabled, memories are auto-injected into agent prompts on launch
+ENABLE_MEMORY = False  # Default: disabled (opt-in)
+
+# Memory backend type (filesystem, hybrid, hybrid_vectors)
+# - filesystem: Simple markdown files (MVP)
+# - hybrid: Markdown files + SQLite FTS5 index (future)
+# - hybrid_vectors: Hybrid + vector embeddings (future)
+import os
+
+MEMORY_BACKEND = os.getenv("CAO_MEMORY_BACKEND", "filesystem")
+
+# Vector embedding provider for hybrid_vectors backend (future)
+MEMORY_VECTOR_PROVIDER = os.getenv("CAO_MEMORY_VECTOR_PROVIDER", "local")
+
+# =============================================================================
 # Database Configuration
 # =============================================================================
 # SQLite database file path and connection URL
@@ -125,6 +146,16 @@ ALLOWED_HOSTS = [
 # =============================================================================
 # Base directory for all memory wiki files
 MEMORY_BASE_DIR = CAO_HOME_DIR / "memory"
+
+# Per-scope injection caps (SC-2). `get_memory_context_for_terminal` enforces
+# these independently for each scope so a single high-volume scope cannot
+# monopolize the overall budget. Scope precedence is session > project > global.
+# Unused budget from an empty scope is NOT reallocated to other scopes — that
+# would couple scope sizes and defeat the cache-friendly behavior from Phase 2
+# U7. The effective per-scope ceiling is min(MEMORY_SCOPE_BUDGET_CHARS,
+# budget_chars // number_of_scopes_considered).
+MEMORY_MAX_PER_SCOPE = 10
+MEMORY_SCOPE_BUDGET_CHARS = 1000
 
 # =============================================================================
 # Tool Restriction Configuration

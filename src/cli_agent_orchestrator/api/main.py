@@ -306,6 +306,7 @@ async def create_session(
     session_name: Optional[str] = None,
     working_directory: Optional[str] = None,
     allowed_tools: Optional[str] = None,
+    memory_manager: Optional[str] = None,
 ) -> Terminal:
     """Create a new session with exactly one terminal."""
     try:
@@ -320,6 +321,20 @@ async def create_session(
             working_directory=working_directory,
             allowed_tools=allowed_tools_list,
         )
+
+        # Start context-manager agent in the same session (background)
+        if memory_manager == "true":
+            try:
+                terminal_service.create_terminal(
+                    provider=provider,
+                    agent_profile="memory_manager",
+                    session_name=result.session_name,
+                    new_session=False,
+                    working_directory=working_directory,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to start context-manager agent: {e}")
+
         return result
 
     except ValueError as e:

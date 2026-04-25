@@ -18,15 +18,18 @@ Terminal Workflow:
 """
 
 import logging
+import os
 import time
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import Dict, Optional
 
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (
     get_terminal_metadata,
+    log_session_event,
     update_last_active,
 )
 from cli_agent_orchestrator.clients.tmux import tmux_client
@@ -55,9 +58,8 @@ def inject_memory_context(first_message: str, terminal_id: str) -> str:
     Tracks which terminals have already been injected so that only the very
     first user message after init receives the memory block.
 
-    Calls MemoryService.get_memory_context_for_terminal() which returns
-    a formatted <cao-memory>...</cao-memory> block (or empty string if
-    no memories exist). Stateless — no file mutation, no backup/restore.
+    Uses ``get_curated_memory_context()`` which delegates to the context-manager
+    agent when available, falling back to Phase 1 ``get_memory_context_for_terminal()``.
     """
     if terminal_id in _memory_injected_terminals:
         return first_message
@@ -66,12 +68,45 @@ def inject_memory_context(first_message: str, terminal_id: str) -> str:
 
     try:
         svc = MemoryService()
-        context = svc.get_memory_context_for_terminal(terminal_id)
+        context = svc.get_curated_memory_context(terminal_id, task_description=first_message[:200])
         if context:
             return context + "\n\n" + first_message
     except Exception as e:
         logger.warning(f"Failed to inject memory context for terminal {terminal_id}: {e}")
     return first_message
+
+
+def _write_kiro_steering_file(system_prompt: str, working_directory: str) -> None:
+    """Write static agent identity to .kiro/steering/agent-identity.md for Kiro CLI.
+
+    Kiro CLI reads steering files from .kiro/steering/ in the working directory
+    as persistent project-level instructions. Writing the agent profile's system
+    prompt here separates static identity (cacheable, rarely changes) from dynamic
+    memory (the <cao-memory> block injected per-session via the agentSpawn hook).
+
+    The file is written once at terminal creation and is stable across sessions.
+    No backup/restore — the steering file is authoritative for this agent.
+    """
+    if not system_prompt:
+        return
+
+    # Path validation — same pattern as register_hooks_claude_code()
+    if "\x00" in working_directory:
+        raise ValueError("Working directory contains null bytes")
+    real_dir = os.path.realpath(os.path.abspath(working_directory))
+    if not real_dir.startswith("/"):
+        raise ValueError(f"Working directory must be an absolute path: {working_directory}")
+
+    steering_str = os.path.normpath(
+        os.path.join(real_dir, ".kiro", "steering", "agent-identity.md")
+    )
+    if not steering_str.startswith(real_dir + os.sep):
+        raise ValueError(f"Steering path escapes working directory: {steering_str}")
+
+    steering_path = Path(steering_str)
+    steering_path.parent.mkdir(parents=True, exist_ok=True)
+    steering_path.write_text(system_prompt, encoding="utf-8")
+    logger.info(f"Wrote Kiro steering file: {steering_path}")
 
 
 class OutputMode(str, Enum):
@@ -179,22 +214,15 @@ def create_terminal(
             except FileNotFoundError:
                 pass  # Profile not found; no tool restrictions
 
-        # Step 3d: Register provider-specific hooks for memory self-save
-        try:
-            from cli_agent_orchestrator.hooks.registration import (
-                register_hooks_claude_code,
-                register_hooks_codex,
-                register_hooks_kiro,
-            )
-
-            if provider == ProviderType.CLAUDE_CODE.value and working_directory:
-                register_hooks_claude_code(working_directory)
-            elif provider == ProviderType.CODEX.value and working_directory:
-                register_hooks_codex(working_directory)
-            elif provider == ProviderType.KIRO_CLI.value:
-                register_hooks_kiro(agent_profile)
-        except Exception as e:
-            logger.warning(f"Failed to register hooks for terminal {terminal_id}: {e}")
+        # Step 3d: Write static identity to Kiro steering file (Phase 2 U7 cache-aware injection).
+        # Separates static identity (steering file, cacheable) from dynamic memory
+        # (agentSpawn hook injects <cao-memory> per-session).
+        if provider == ProviderType.KIRO_CLI.value and working_directory:
+            try:
+                system_prompt = profile.system_prompt if profile.system_prompt else ""
+                _write_kiro_steering_file(system_prompt, working_directory)
+            except Exception as e:
+                logger.warning(f"Failed to write Kiro steering file: {e}")
 
         # Step 4: Create and initialize the CLI provider
         # This starts the agent (e.g., runs "kiro-cli chat --agent developer")
@@ -210,6 +238,15 @@ def create_terminal(
             allowed_tools,
             skill_prompt=skill_prompt if provider in RUNTIME_SKILL_PROMPT_PROVIDERS else None,
         )
+
+        # Step 4b: Provider-specific hook registration (Phase 2.5 U7).
+        # Each provider owns its hook registration via register_hooks();
+        # default is no-op for providers without hooks.
+        try:
+            provider_instance.register_hooks(working_directory, agent_profile)
+        except Exception as e:
+            logger.warning(f"Failed to register hooks for terminal {terminal_id}: {e}")
+
         provider_instance.initialize()
 
         # Step 5: Set up terminal logging via tmux pipe-pane
@@ -227,6 +264,15 @@ def create_terminal(
             agent_profile=agent_profile,
             status=TerminalStatus.IDLE,
             last_active=datetime.now(),
+        )
+
+        # Log agent_launched event (non-blocking)
+        log_session_event(
+            session_name=session_name,
+            terminal_id=terminal_id,
+            provider=provider,
+            event_type="agent_launched",
+            summary=f"Agent {agent_profile} launched on {provider}",
         )
 
         logger.info(
@@ -321,8 +367,19 @@ def send_input(terminal_id: str, message: str) -> bool:
 
         # Inject memory context into the very first user message after init.
         # Kiro uses the AgentSpawn hook for injection instead to avoid double injection — skip here.
+        is_first_message = terminal_id not in _memory_injected_terminals
         if metadata.get("provider") != ProviderType.KIRO_CLI.value:
             message = inject_memory_context(message, terminal_id)
+
+        # Log task_started on first user message (non-blocking)
+        if is_first_message:
+            log_session_event(
+                session_name=metadata["tmux_session"],
+                terminal_id=terminal_id,
+                provider=metadata["provider"],
+                event_type="task_started",
+                summary=message[:200],
+            )
 
         # Check how many Enter keys the provider needs after paste
         provider = provider_manager.get_provider(terminal_id)

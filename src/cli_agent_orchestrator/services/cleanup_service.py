@@ -1,9 +1,15 @@
 """Cleanup service for old terminals, messages, and logs."""
 
+from __future__ import annotations
+
 import logging
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from cli_agent_orchestrator.services.memory_service import MemoryService
 
 from cli_agent_orchestrator.clients.database import InboxModel, SessionLocal, TerminalModel
 from cli_agent_orchestrator.constants import (
@@ -82,6 +88,7 @@ SESSION_SCOPE_RETENTION_DAYS = 14
 async def cleanup_expired_memories() -> None:
     """Delete expired memories based on tiered retention policy.
 
+    Phase 2: Uses SQLite query instead of file mtime scanning.
     - session-scoped memories (any type): 14 days
     - project/reference type memories: 90 days
     - user/feedback type memories: indefinite (never expire)
@@ -95,36 +102,36 @@ async def cleanup_expired_memories() -> None:
         if not MEMORY_BASE_DIR.exists():
             return
 
-        # Lazy-import to avoid circular imports at module level
         from cli_agent_orchestrator.services.memory_service import MemoryService
 
         memory_service = MemoryService(base_dir=MEMORY_BASE_DIR)
 
-        # Walk project dirs: {MEMORY_BASE_DIR}/{project_dir}/wiki/index.md
-        for index_path in MEMORY_BASE_DIR.glob("*/wiki/index.md"):
-            expired_entries = _find_expired_entries(index_path, now)
-            if not expired_entries:
-                continue
+        # U1.6: Query SQLite for expired entries instead of scanning file mtimes
+        try:
+            from cli_agent_orchestrator.clients.database import get_expired_memory_metadata
 
-            # Extract scope_id from path: .../memory/{scope_id}/wiki/index.md
-            # "global" dir → scope_id=None, project hash dirs → scope_id=hash
-            project_dir_name = index_path.parent.parent.name
-            scope_id = None if project_dir_name == "global" else project_dir_name
-
-            for entry in expired_entries:
+            expired_rows = get_expired_memory_metadata(
+                session_retention_days=SESSION_SCOPE_RETENTION_DAYS,
+                project_retention_days=RETENTION_POLICY.get("project", 90) or 90,
+            )
+            for row in expired_rows:
                 try:
                     await memory_service.forget(
-                        key=entry["key"],
-                        scope=entry["scope"],
-                        scope_id=scope_id,
+                        key=row["key"],
+                        scope=row["scope"],
+                        scope_id=row.get("scope_id"),
                     )
                     expired_count += 1
                     logger.info(
-                        f"Expired memory: key={entry['key']} scope={entry['scope']} "
-                        f"type={entry['memory_type']}"
+                        f"Expired memory: key={row['key']} scope={row['scope']} "
+                        f"type={row['memory_type']}"
                     )
                 except Exception as e:
-                    logger.warning(f"Failed to expire memory key={entry['key']}: {e}")
+                    logger.warning(f"Failed to expire memory key={row['key']}: {e}")
+        except Exception as e:
+            # Fallback to Phase 1 file-based cleanup if SQLite unavailable
+            logger.warning(f"SQLite cleanup query failed, falling back to file scan: {e}")
+            expired_count = await _cleanup_expired_file_fallback(memory_service, now)
 
         if expired_count > 0:
             logger.info(f"Memory cleanup: expired {expired_count} memories")
@@ -136,6 +143,28 @@ async def cleanup_expired_memories() -> None:
 
     except Exception as e:
         logger.error(f"Error during memory cleanup: {e}")
+
+
+async def _cleanup_expired_file_fallback(memory_service: "MemoryService", now: datetime) -> int:
+    """Phase 1 fallback: scan index.md files for expired entries."""
+    expired_count = 0
+    for index_path in MEMORY_BASE_DIR.glob("*/wiki/index.md"):
+        expired_entries = _find_expired_entries(index_path, now)
+        if not expired_entries:
+            continue
+        project_dir_name = index_path.parent.parent.name
+        scope_id = None if project_dir_name == "global" else project_dir_name
+        for entry in expired_entries:
+            try:
+                await memory_service.forget(
+                    key=entry["key"],
+                    scope=entry["scope"],
+                    scope_id=scope_id,
+                )
+                expired_count += 1
+            except Exception as e:
+                logger.warning(f"Failed to expire memory key={entry['key']}: {e}")
+    return expired_count
 
 
 def _find_expired_entries(index_path: Path, now: datetime) -> list[dict]:

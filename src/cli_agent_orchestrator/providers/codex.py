@@ -4,7 +4,7 @@ import logging
 import re
 import shlex
 import time
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -485,6 +485,42 @@ class CodexProvider(BaseProvider):
 
         return final_answer
 
+    async def extract_session_context(self) -> Dict[str, Any]:
+        """Extract session context from Codex CLI terminal output.
+
+        Parses tmux output using Codex's › user prompt and • assistant prefix.
+        """
+        output = tmux_client.get_history(self.session_name, self.window_name)
+        if not output:
+            return {}
+
+        clean = re.sub(ANSI_CODE_PATTERN, "", output)
+
+        # Extract user messages: lines matching › followed by text (not empty prompt)
+        user_messages: List[str] = []
+        for line in clean.splitlines():
+            if re.search(USER_PREFIX_PATTERN, line):
+                text = re.sub(r"^\s*[›>]\s*", "", line).strip()
+                if text and not re.search(r"^You\b", text):
+                    user_messages.append(text)
+                elif re.search(r"^You\b", text):
+                    user_messages.append(re.sub(r"^You\s*", "", text).strip())
+
+        # Extract last assistant response
+        last_response = ""
+        try:
+            last_response = self.extract_last_message_from_script(output)
+        except ValueError:
+            pass
+
+        return self._build_context_dict(
+            provider_name="codex",
+            last_task=user_messages[-1] if user_messages else "",
+            key_decisions=self._extract_decisions(last_response),
+            open_questions=self._extract_questions(user_messages),
+            files_changed=self._extract_file_paths(clean),
+        )
+
     def exit_cli(self) -> str:
         """Get the command to exit Codex CLI."""
         return "/exit"
@@ -492,3 +528,15 @@ class CodexProvider(BaseProvider):
     def cleanup(self) -> None:
         """Clean up Codex CLI provider."""
         self._initialized = False
+
+    def register_hooks(
+        self,
+        working_directory: Optional[str],
+        agent_profile: Optional[str],
+    ) -> None:
+        """Install Codex stop hook into .codex/hooks.json."""
+        if not working_directory:
+            return
+        from cli_agent_orchestrator.hooks.registration import register_hooks_codex
+
+        register_hooks_codex(working_directory)

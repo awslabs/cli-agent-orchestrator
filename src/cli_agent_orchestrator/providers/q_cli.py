@@ -3,7 +3,7 @@
 import logging
 import re
 import shlex
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -164,6 +164,40 @@ class QCliProvider(BaseProvider):
     def get_idle_pattern_for_log(self) -> str:
         """Return Q CLI IDLE prompt pattern for log files."""
         return IDLE_PROMPT_PATTERN_LOG
+
+    async def extract_session_context(self) -> Dict[str, Any]:
+        """Extract session context from Q CLI terminal output.
+
+        Q CLI uses the same green arrow response format as Kiro CLI.
+        """
+        output = tmux_client.get_history(self.session_name, self.window_name)
+        if not output:
+            return {}
+
+        clean = re.sub(ANSI_CODE_PATTERN, "", output)
+
+        # Extract user messages: text after [agent] > prompt
+        user_messages: List[str] = []
+        for line in clean.splitlines():
+            if re.search(self._idle_prompt_pattern, line):
+                text = re.sub(self._idle_prompt_pattern, "", line).strip()
+                if text:
+                    user_messages.append(text)
+
+        # Extract last assistant response
+        last_response = ""
+        try:
+            last_response = self.extract_last_message_from_script(output)
+        except ValueError:
+            pass
+
+        return self._build_context_dict(
+            provider_name="q_cli",
+            last_task=user_messages[-1] if user_messages else "",
+            key_decisions=self._extract_decisions(last_response),
+            open_questions=self._extract_questions(user_messages),
+            files_changed=self._extract_file_paths(clean),
+        )
 
     # TODO: exit_cli should run the tmux.send_keys directly with /exit or ctrl-c twice
     def exit_cli(self) -> str:

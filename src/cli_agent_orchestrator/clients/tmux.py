@@ -139,6 +139,7 @@ class TmuxClient:
                 if k in allowed_vars or not any(k.startswith(p) for p in blocked_prefixes)
             }
             environment["CAO_TERMINAL_ID"] = terminal_id
+            environment["CAO_SESSION_NAME"] = session_name
 
             session = self.server.new_session(
                 session_name=session_name,
@@ -176,7 +177,10 @@ class TmuxClient:
             window = session.new_window(
                 window_name=window_name,
                 start_directory=working_directory,
-                environment={"CAO_TERMINAL_ID": terminal_id},
+                environment={
+                    "CAO_TERMINAL_ID": terminal_id,
+                    "CAO_SESSION_NAME": session_name,
+                },
             )
 
             logger.info(

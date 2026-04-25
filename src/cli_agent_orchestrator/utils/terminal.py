@@ -59,6 +59,30 @@ def wait_for_shell(
     return False
 
 
+def _get_flush_threshold() -> float:
+    """Get the configured memory flush threshold from settings."""
+    try:
+        from cli_agent_orchestrator.services.settings_service import get_memory_settings
+
+        settings = get_memory_settings()
+        threshold = settings.get("flush_threshold", 0.85)
+        if isinstance(threshold, (int, float)) and 0.0 < threshold <= 1.0:
+            return float(threshold)
+    except Exception:
+        pass
+    return 0.85
+
+
+# Track terminals that have already received a flush instruction
+_flush_triggered_terminals: set[str] = set()
+
+FLUSH_MESSAGE = (
+    "IMPORTANT: Context window is nearly full. "
+    "Use memory_store to save all key findings, decisions, "
+    "and preferences before continuing."
+)
+
+
 def wait_until_status(
     provider_instance: "BaseProvider",
     target_status: "TerminalStatus | set[TerminalStatus]",
@@ -75,6 +99,24 @@ def wait_until_status(
         logger.info(f"Waiting for {{{target_str}}}, current status: {status}")
         if status in targets:
             return True
+
+        # Pre-compaction flush: if context window is nearly full, instruct
+        # the agent to save its memory before compaction occurs.
+        if provider_instance.terminal_id not in _flush_triggered_terminals:
+            try:
+                usage = provider_instance.get_context_usage_percentage()
+                if usage is not None and usage > _get_flush_threshold():
+                    logger.info(
+                        f"Context usage {usage:.0%} exceeds threshold for "
+                        f"{provider_instance.terminal_id}, sending flush instruction"
+                    )
+                    from cli_agent_orchestrator.services.terminal_service import send_input
+
+                    send_input(provider_instance.terminal_id, FLUSH_MESSAGE)
+                    _flush_triggered_terminals.add(provider_instance.terminal_id)
+            except Exception as e:
+                logger.debug(f"Non-blocking flush check failed: {e}")
+
         time.sleep(polling_interval)
 
     return False

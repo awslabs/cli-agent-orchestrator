@@ -34,7 +34,7 @@ import re
 import shlex
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -725,6 +725,40 @@ class GeminiCliProvider(BaseProvider):
             raise ValueError("Empty Gemini CLI response - no content found after query")
 
         return "\n".join(response_lines).strip()
+
+    async def extract_session_context(self) -> Dict[str, Any]:
+        """Extract session context from Gemini CLI terminal output.
+
+        Parses tmux output using Gemini's > query prefix and ✦ response prefix.
+        """
+        output = tmux_client.get_history(self.session_name, self.window_name)
+        if not output:
+            return {}
+
+        clean = re.sub(ANSI_CODE_PATTERN, "", output)
+
+        # Extract user messages: lines matching "> query text" inside input boxes
+        user_messages: List[str] = []
+        for line in clean.splitlines():
+            if re.search(QUERY_BOX_PREFIX_PATTERN, line):
+                text = re.sub(r"^\s*>\s+", "", line).strip()
+                if text:
+                    user_messages.append(text)
+
+        # Extract last assistant response
+        last_response = ""
+        try:
+            last_response = self.extract_last_message_from_script(output)
+        except ValueError:
+            pass
+
+        return self._build_context_dict(
+            provider_name="gemini_cli",
+            last_task=user_messages[-1] if user_messages else "",
+            key_decisions=self._extract_decisions(last_response),
+            open_questions=self._extract_questions(user_messages),
+            files_changed=self._extract_file_paths(clean),
+        )
 
     def exit_cli(self) -> str:
         """Get the command to exit Gemini CLI.

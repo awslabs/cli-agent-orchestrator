@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from libtmux.exc import LibTmuxException
 
@@ -472,6 +472,41 @@ class CopilotCliProvider(BaseProvider):
                 return tail
 
         raise ValueError("No provider response content found in terminal output")
+
+    async def extract_session_context(self) -> Dict[str, Any]:
+        """Extract session context from Copilot CLI terminal output.
+
+        Parses tmux output using Copilot's ❯/›/> user prompt and
+        assistant prefix patterns (assistant: or bullet markers).
+        """
+        output = tmux_client.get_history(self.session_name, self.window_name)
+        if not output:
+            return {}
+
+        clean = self._clean(output)
+
+        # Extract user messages
+        user_messages: List[str] = []
+        for line in clean.splitlines():
+            if re.search(USER_PROMPT_LINE_PATTERN, line):
+                text = re.sub(r"^\s*[❯›>]\s+", "", line).strip()
+                if text:
+                    user_messages.append(text)
+
+        # Extract last assistant response
+        last_response = ""
+        try:
+            last_response = self.extract_last_message_from_script(output)
+        except ValueError:
+            pass
+
+        return self._build_context_dict(
+            provider_name="copilot_cli",
+            last_task=user_messages[-1] if user_messages else "",
+            key_decisions=self._extract_decisions(last_response),
+            open_questions=self._extract_questions(user_messages),
+            files_changed=self._extract_file_paths(clean),
+        )
 
     def exit_cli(self) -> str:
         return "/exit"

@@ -70,6 +70,91 @@ def get_extra_agent_dirs() -> List[str]:
     return settings.get("extra_agent_dirs", [])
 
 
+def get_memory_settings() -> Dict[str, Any]:
+    """Get memory-related settings.
+
+    Returns dict like:
+      {"enabled": True, "flush_threshold": 0.85}
+
+    ``enabled`` defaults to ``True`` (opt-out) to preserve current shipping
+    behavior. Setting it to ``False`` disables all memory subsystem
+    operations — see ``is_memory_enabled()``.
+    """
+    settings = _load()
+    defaults: Dict[str, Any] = {"enabled": True, "flush_threshold": 0.85}
+    saved = settings.get("memory", {})
+    result = dict(defaults)
+    result.update(saved)
+    return result
+
+
+def is_memory_enabled() -> bool:
+    """Return True when the memory subsystem is enabled.
+
+    Reads the ``memory.enabled`` flag from settings; defaults to True
+    (opt-out) so existing installations preserve current behavior.
+    """
+    try:
+        value = get_memory_settings().get("enabled", True)
+    except Exception as e:
+        logger.warning(f"Failed to read memory.enabled, defaulting to True: {e}")
+        return True
+    return bool(value)
+
+
+def get_project_id_override() -> Optional[str]:
+    """Return an explicit project identity override, or None when not set.
+
+    Precedence (Phase 2.5 U6):
+        1. ``CAO_PROJECT_ID`` environment variable.
+        2. ``memory.project_id`` nested key in settings.json — matches the
+           ``memory.enabled`` precedent from U5.
+
+    The raw value is returned untouched; validation (whitelist + null-byte
+    reject) happens in ``memory_service._validate_project_id_override`` so a
+    bad value surfaces a clear error at resolve time.
+    """
+    import os as _os
+
+    env_val = _os.environ.get("CAO_PROJECT_ID")
+    if env_val and env_val.strip():
+        return env_val.strip()
+
+    memory_settings = get_memory_settings()
+    val = memory_settings.get("project_id")
+    if isinstance(val, str) and val.strip():
+        return val.strip()
+    return None
+
+
+def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
+    """Update a single memory setting.
+
+    Supported keys:
+        ``enabled`` (bool) — master switch for the memory subsystem.
+        ``flush_threshold`` (float, 0.0 < x ≤ 1.0) — context-usage trigger.
+    """
+    settings = _load()
+    memory = settings.get("memory", {})
+
+    if key == "enabled":
+        if not isinstance(value, bool):
+            raise ValueError(f"enabled must be a bool, got {type(value).__name__}")
+        memory[key] = value
+    elif key == "flush_threshold":
+        fval = float(value)
+        if not (0.0 < fval <= 1.0):
+            raise ValueError(f"flush_threshold must be between 0.0 and 1.0, got {fval}")
+        memory[key] = fval
+    else:
+        raise ValueError(f"Unknown memory setting: {key}")
+
+    settings["memory"] = memory
+    _save(settings)
+    logger.info(f"Updated memory setting: {key}={memory[key]}")
+    return get_memory_settings()
+
+
 def set_extra_agent_dirs(dirs: List[str]) -> List[str]:
     """Set extra agent scan directories."""
     settings = _load()

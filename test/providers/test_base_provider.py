@@ -1,6 +1,6 @@
 """Tests for base provider."""
 
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import pytest
 
@@ -22,6 +22,9 @@ class ConcreteProvider(BaseProvider):
 
     def extract_last_message_from_script(self, script_output: str) -> str:
         return "extracted message"
+
+    async def extract_session_context(self) -> Dict[str, Any]:
+        return {}
 
     def exit_cli(self) -> str:
         return "/exit"

@@ -20,7 +20,7 @@ The provider detects the following terminal states:
 import logging
 import re
 import shlex
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -428,6 +428,47 @@ class KiroCliProvider(BaseProvider):
         final_answer = re.sub(CONTROL_CHAR_PATTERN, "", final_answer)
         return final_answer.strip()
 
+    async def extract_session_context(self) -> Dict[str, Any]:
+        """Extract session context from Kiro CLI terminal output.
+
+        Parses tmux output using Kiro's [agent] > prompt and green arrow
+        response markers (legacy) or TUI separator/credits patterns.
+        """
+        output = tmux_client.get_history(self.session_name, self.window_name)
+        if not output:
+            return {}
+
+        clean = re.sub(ANSI_CODE_PATTERN, "", output)
+
+        # Extract user messages: text after [agent_profile] > prompt
+        user_messages: List[str] = []
+        lines = clean.splitlines()
+        i = 0
+        while i < len(lines):
+            if re.search(self._idle_prompt_pattern, lines[i]):
+                text = re.sub(self._idle_prompt_pattern, "", lines[i]).strip()
+                if text:
+                    user_messages.append(text)
+            elif re.search(NEW_TUI_IDLE_PATTERN, lines[i]):
+                # TUI mode: user message is on the lines after the input prompt
+                pass  # TUI input captured via separator parsing
+            i += 1
+
+        # Extract last assistant response
+        last_response = ""
+        try:
+            last_response = self.extract_last_message_from_script(output)
+        except ValueError:
+            pass
+
+        return self._build_context_dict(
+            provider_name="kiro_cli",
+            last_task=user_messages[-1] if user_messages else "",
+            key_decisions=self._extract_decisions(last_response),
+            open_questions=self._extract_questions(user_messages),
+            files_changed=self._extract_file_paths(clean),
+        )
+
     def get_idle_pattern_for_log(self) -> str:
         """Return Kiro CLI IDLE prompt pattern for log files.
 
@@ -443,3 +484,15 @@ class KiroCliProvider(BaseProvider):
     def cleanup(self) -> None:
         """Clean up Kiro CLI provider."""
         self._initialized = False
+
+    def register_hooks(
+        self,
+        working_directory: Optional[str],
+        agent_profile: Optional[str],
+    ) -> None:
+        """Install agentSpawn + userPromptSubmit hooks into ~/.kiro/agents/{profile}.json."""
+        if not agent_profile:
+            return
+        from cli_agent_orchestrator.hooks.registration import register_hooks_kiro
+
+        register_hooks_kiro(agent_profile)

@@ -33,7 +33,7 @@ import shlex
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -628,6 +628,17 @@ class KimiCliProvider(BaseProvider):
         We use /exit as it's the most reliable and consistent.
         """
         return "/exit"
+
+    async def extract_session_context(self) -> Dict[str, Any]:
+        """Kimi session extraction deferred to Phase 3.
+
+        Kimi CLI has the least-structured session format among supported providers.
+        Full implementation is planned for Phase 3.
+        """
+        raise NotImplementedError(
+            "Kimi session context extraction deferred to Phase 3 — "
+            "Kimi CLI's session format requires additional reverse engineering"
+        )
 
     def cleanup(self) -> None:
         """Clean up Kimi CLI provider resources.

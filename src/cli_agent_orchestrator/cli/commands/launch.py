@@ -42,7 +42,12 @@ PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
     help="[DANGEROUS] Unrestricted tool access AND skip confirmation prompts. "
     "Agent can execute ANY command including aws, rm, curl.",
 )
-def launch(agents, session_name, headless, provider, allowed_tools, auto_approve, yolo):
+@click.option(
+    "--memory",
+    is_flag=True,
+    help="Start a context-manager agent terminal in the session for curated memory injection.",
+)
+def launch(agents, session_name, headless, provider, allowed_tools, auto_approve, yolo, memory):
     """Launch cao session with specified agent profile."""
     try:
         # Validate provider
@@ -129,6 +134,8 @@ def launch(agents, session_name, headless, provider, allowed_tools, auto_approve
         if resolved_allowed_tools:
             # Pass as comma-separated string for query param
             params["allowed_tools"] = ",".join(resolved_allowed_tools)
+        if memory:
+            params["memory_manager"] = "true"
 
         response = requests.post(url, params=params)
         response.raise_for_status()
@@ -137,6 +144,8 @@ def launch(agents, session_name, headless, provider, allowed_tools, auto_approve
 
         click.echo(f"Session created: {terminal['session_name']}")
         click.echo(f"Terminal created: {terminal['name']}")
+        if memory:
+            click.echo("Context-manager agent: starting in background")
 
         # Attach to tmux session unless headless
         if not headless:

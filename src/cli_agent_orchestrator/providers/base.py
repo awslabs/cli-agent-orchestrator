@@ -20,8 +20,9 @@ Each provider must implement pattern matching for its specific CLI's prompt
 and output format to reliably detect status changes.
 """
 
+import re
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
@@ -164,6 +165,128 @@ class BaseProvider(ABC):
         post-task completed.
         """
         pass
+
+    def register_hooks(
+        self,
+        working_directory: Optional[str],
+        agent_profile: Optional[str],
+    ) -> None:
+        """Install provider-specific hooks (memory save, PreCompact, etc.).
+
+        Default is a no-op. Providers that support hooks override this and
+        typically delegate to the thin installers in ``hooks/registration.py``.
+
+        Called by ``terminal_service.create_terminal`` after the provider is
+        instantiated but before ``initialize()``. Failures must not be raised
+        past the caller — the service wraps this call in a try/except and
+        logs a warning so that hook-registration hiccups never block terminal
+        creation.
+        """
+        return
+
+    @abstractmethod
+    async def extract_session_context(self) -> Dict[str, Any]:
+        """Extract structured context from this provider's session.
+
+        Parses the terminal output to build a summary of what happened
+        in this session.  Used by the ``session_context`` MCP tool and
+        the context-manager agent.
+
+        Returns:
+            A dict with keys:
+            - provider:       provider type string
+            - terminal_id:    terminal identifier
+            - last_task:      last user message / task description
+            - key_decisions:  list of key decisions from assistant responses
+            - open_questions: list of open questions from user messages
+            - files_changed:  list of file paths modified during session
+
+            Returns empty dict if no session data is found.
+        """
+        pass
+
+    def get_context_usage_percentage(self) -> Optional[float]:
+        """Return the provider's current context window usage as a float 0.0–1.0.
+
+        Providers that expose context usage metrics (e.g. Claude Code via
+        its JSONL transcript) should override this method.
+
+        Returns:
+            Float between 0.0 and 1.0 representing context usage, or
+            ``None`` if this provider does not expose the metric.
+        """
+        return None
+
+    # ------------------------------------------------------------------
+    # Session context extraction helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_questions(user_messages: List[str]) -> List[str]:
+        """Extract lines containing '?' from user messages."""
+        questions: List[str] = []
+        for msg in user_messages:
+            for line in msg.splitlines():
+                stripped = line.strip()
+                if "?" in stripped and len(stripped) > 5:
+                    questions.append(stripped)
+        return questions[-5:]  # last 5
+
+    @staticmethod
+    def _extract_decisions(assistant_text: str) -> List[str]:
+        """Extract decision-like sentences from assistant output."""
+        decision_indicators = re.compile(
+            r"(?:I(?:'ll| will| have| decided| chose| went with|'m going to)|"
+            r"(?:The |My |Our )?(?:approach|decision|plan|solution|strategy) (?:is|was|will be)|"
+            r"(?:We should|Let's|Going to|Decided to|Chose to))",
+            re.IGNORECASE,
+        )
+        decisions: List[str] = []
+        for line in assistant_text.splitlines():
+            stripped = line.strip()
+            if decision_indicators.search(stripped) and len(stripped) > 10:
+                # Trim to first sentence if very long
+                if len(stripped) > 200:
+                    stripped = stripped[:200] + "..."
+                decisions.append(stripped)
+        return decisions[-10:]  # last 10
+
+    @staticmethod
+    def _extract_file_paths(text: str) -> List[str]:
+        """Extract file paths mentioned in terminal output.
+
+        Looks for common patterns: paths with extensions, tool-use file references.
+        """
+        # Match paths like src/foo/bar.py, ./test.js, /abs/path.ts
+        path_pattern = re.compile(
+            r"(?:^|[\s\"'`(])(" r"(?:\.{0,2}/)?(?:[\w.-]+/)+[\w.-]+\.\w{1,10}" r")"
+        )
+        seen: set[str] = set()
+        paths: List[str] = []
+        for match in path_pattern.finditer(text):
+            p = match.group(1)
+            if p not in seen and not p.startswith("http"):
+                seen.add(p)
+                paths.append(p)
+        return paths[-20:]  # last 20
+
+    def _build_context_dict(
+        self,
+        provider_name: str,
+        last_task: str,
+        key_decisions: List[str],
+        open_questions: List[str],
+        files_changed: List[str],
+    ) -> Dict[str, Any]:
+        """Build the standard session context dict."""
+        return {
+            "provider": provider_name,
+            "terminal_id": self.terminal_id,
+            "last_task": last_task,
+            "key_decisions": key_decisions,
+            "open_questions": open_questions,
+            "files_changed": files_changed,
+        }
 
     def _apply_skill_prompt(self, system_prompt: str) -> str:
         """Append skill catalog text to a system prompt if available.
