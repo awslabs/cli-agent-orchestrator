@@ -54,10 +54,6 @@ Documentation = "https://github.com/awslabs/cli-agent-orchestrator#readme"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.hatch.version]
-path = "src/cli_agent_orchestrator/__init__.py"
-
-
 [tool.hatch.build.targets.wheel]
 packages = ["src/cli_agent_orchestrator"]
 
