@@ -22,13 +22,17 @@ def load_fixture(filename: str) -> str:
 class TestKiroCliProviderInitialization:
     """Test Kiro CLI provider initialization."""
 
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
-    def test_initialize_success(self, mock_tmux, mock_wait_status, mock_wait_shell):
+    def test_initialize_success(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile
+    ):
         """Test successful initialization."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
+        mock_load_profile.side_effect = FileNotFoundError("no profile")
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         result = provider.initialize()
@@ -51,27 +55,35 @@ class TestKiroCliProviderInitialization:
         with pytest.raises(TimeoutError, match="Shell initialization timed out"):
             provider.initialize()
 
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
-    def test_initialize_kiro_cli_timeout(self, mock_tmux, mock_wait_status, mock_wait_shell):
+    def test_initialize_kiro_cli_timeout(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile
+    ):
         """Test initialization fails when both TUI and --legacy-ui timeout."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = False
+        mock_load_profile.side_effect = FileNotFoundError("no profile")
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
 
         with pytest.raises(TimeoutError, match="timed out with TUI and `--legacy-ui`"):
             provider.initialize()
 
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
-    def test_initialize_legacy_ui_fallback(self, mock_tmux, mock_wait_status, mock_wait_shell):
+    def test_initialize_legacy_ui_fallback(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile
+    ):
         """Test fallback to --legacy-ui when TUI initialization fails."""
         mock_wait_shell.return_value = True
         # First call (TUI) fails, second call (--legacy-ui) succeeds
         mock_wait_status.side_effect = [False, True]
+        mock_load_profile.side_effect = FileNotFoundError("no profile")
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         result = provider.initialize()
@@ -90,6 +102,138 @@ class TestKiroCliProviderInitialization:
             "test-session",
             "window-0",
             "kiro-cli chat --legacy-ui --agent developer",
+        )
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_initialize_yolo_forces_legacy_ui_with_trust_all_tools(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile
+    ):
+        """--yolo (allowed_tools=['*']) must launch directly with --legacy-ui + --trust-all-tools.
+
+        kiro-cli 2.0.1 TUI shows a non-bypassable trust-all-tools consent
+        dialog; yolo headless launches must skip the TUI attempt entirely.
+        """
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        mock_load_profile.side_effect = FileNotFoundError("no profile")
+
+        provider = KiroCliProvider(
+            "test1234", "test-session", "window-0", "developer", allowed_tools=["*"]
+        )
+        provider.initialize()
+
+        mock_tmux.send_keys.assert_called_once_with(
+            "test-session",
+            "window-0",
+            "kiro-cli chat --legacy-ui --trust-all-tools --agent developer",
+        )
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_initialize_passes_profile_model(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile
+    ):
+        """profile.model must be forwarded to kiro-cli via --model."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        profile = Mock()
+        profile.model = "claude-opus-4-6"
+        mock_load_profile.return_value = profile
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        provider.initialize()
+
+        mock_tmux.send_keys.assert_called_once_with(
+            "test-session",
+            "window-0",
+            "kiro-cli chat --model claude-opus-4-6 --agent developer",
+        )
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_initialize_yolo_and_model_combine(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile
+    ):
+        """--yolo + profile.model: --legacy-ui + --trust-all-tools + --model, all in one launch."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        profile = Mock()
+        profile.model = "claude-opus-4.6"
+        mock_load_profile.return_value = profile
+
+        provider = KiroCliProvider(
+            "test1234", "test-session", "window-0", "developer", allowed_tools=["*"]
+        )
+        provider.initialize()
+
+        mock_tmux.send_keys.assert_called_once_with(
+            "test-session",
+            "window-0",
+            "kiro-cli chat --legacy-ui --trust-all-tools --model claude-opus-4.6 --agent developer",
+        )
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_initialize_yolo_no_fallback_on_timeout(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile
+    ):
+        """Yolo launch is already --legacy-ui; on timeout, raise — do not re-fall-back.
+
+        Prevents the old double-timeout behavior (TUI timeout → legacy fallback →
+        legacy timeout) which added ~30 seconds before returning the 500 to the caller.
+        """
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = False
+        mock_load_profile.side_effect = FileNotFoundError("no profile")
+
+        provider = KiroCliProvider(
+            "test1234", "test-session", "window-0", "developer", allowed_tools=["*"]
+        )
+
+        with pytest.raises(TimeoutError, match="timed out with --legacy-ui"):
+            provider.initialize()
+
+        # Only one launch attempt — no /exit, no second launch.
+        assert mock_tmux.send_keys.call_count == 1
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_initialize_non_yolo_legacy_ui_fallback_preserves_model(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile
+    ):
+        """Non-yolo TUI timeout → --legacy-ui fallback must preserve --model."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.side_effect = [False, True]
+        profile = Mock()
+        profile.model = "claude-opus-4.6"
+        mock_load_profile.return_value = profile
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        provider.initialize()
+
+        calls = mock_tmux.send_keys.call_args_list
+        assert len(calls) == 3
+        assert calls[0].args == (
+            "test-session",
+            "window-0",
+            "kiro-cli chat --model claude-opus-4.6 --agent developer",
+        )
+        assert calls[1].args == ("test-session", "window-0", "/exit")
+        assert calls[2].args == (
+            "test-session",
+            "window-0",
+            "kiro-cli chat --legacy-ui --model claude-opus-4.6 --agent developer",
         )
 
     def test_initialization_with_different_agent_profiles(self):
