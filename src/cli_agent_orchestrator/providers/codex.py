@@ -7,39 +7,13 @@ import sys
 import time
 from typing import Optional
 
-from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.clients.tmux import pwsh_join, tmux_client
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 
 logger = logging.getLogger(__name__)
-
-
-def _pwsh_join(parts: list) -> str:
-    """Join command parts into a PowerShell-safe command string.
-
-    Equivalent to ``shlex.join()`` but uses PowerShell single-quoted string
-    literals instead of POSIX quoting.  Any embedded single-quote in a value
-    is escaped by doubling (``'`` → ``''``), which is the correct PowerShell
-    escape inside single-quoted strings.
-
-    Args:
-        parts: Sequence of command tokens (executable + arguments).
-
-    Returns:
-        A space-joined string where each part containing spaces or shell
-        metacharacters is wrapped in PowerShell single-quoted literals.
-    """
-    result = []
-    for part in parts:
-        if not part or any(c in part for c in (" ", "\t", '"', "'", "`", "$", "(", ")", "{", "}", ";", "&", "|", "<", ">", "~", "^")):
-            # Wrap in single quotes with internal ' doubled
-            escaped = part.replace("'", "''")
-            result.append(f"'{escaped}'")
-        else:
-            result.append(part)
-    return " ".join(result)
 
 
 # Regex patterns for Codex output analysis
@@ -239,7 +213,7 @@ class CodexProvider(BaseProvider):
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
         if sys.platform == "win32":
-            return _pwsh_join(command_parts)
+            return pwsh_join(command_parts)
         return shlex.join(command_parts)
 
     def _handle_trust_prompt(self, timeout: float = 20.0) -> None:
@@ -262,11 +236,7 @@ class CodexProvider(BaseProvider):
 
             if re.search(TRUST_PROMPT_PATTERN, clean_output):
                 logger.info("Codex workspace trust prompt detected, auto-accepting")
-                session = tmux_client.server.sessions.get(session_name=self.session_name)
-                window = session.windows.get(window_name=self.window_name)
-                pane = window.active_pane
-                if pane:
-                    pane.send_keys("", enter=True)
+                tmux_client.send_keys(self.session_name, self.window_name, "")
                 return
 
             # Check if Codex has fully started (welcome banner visible)

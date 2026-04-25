@@ -37,6 +37,33 @@ from cli_agent_orchestrator.constants import TMUX_HISTORY_LINES
 logger = logging.getLogger(__name__)
 
 
+def pwsh_join(parts: list) -> str:
+    """Join command parts into a PowerShell-safe command string.
+
+    Equivalent to ``shlex.join()`` but uses PowerShell single-quoted string
+    literals instead of POSIX quoting.  Any embedded single-quote in a value
+    is escaped by doubling (``'`` → ``''``), which is the correct PowerShell
+    escape inside single-quoted strings.
+
+    Args:
+        parts: Sequence of command tokens (executable + arguments).
+
+    Returns:
+        A space-joined string where each part containing spaces or shell
+        metacharacters is wrapped in PowerShell single-quoted literals.
+    """
+    result = []
+    for part in parts:
+        if not part or any(
+            c in part
+            for c in (" ", "\t", '"', "'", "`", "$", "(", ")", "{", "}", ";", "&", "|", "<", ">", "~", "^")
+        ):
+            result.append(f"'{part.replace(chr(39), chr(39) * 2)}'")
+        else:
+            result.append(part)
+    return " ".join(result)
+
+
 class TmuxClient:
     """Simplified tmux client for basic operations.
 
@@ -188,39 +215,6 @@ class TmuxClient:
             capture_output=True,
         )
         return result.returncode == 0
-
-    def _list_session_names(self) -> List[str]:
-        """Return a list of current tmux session names.
-
-        Parses the default ``tmux list-sessions`` output because psmux does not
-        honour the ``-F`` format flag for this command.  The default format is::
-
-            NAME: N windows (created DATE) [(attached)]
-
-        Session names cannot contain ``: `` (tmux rejects them), so splitting on
-        the first ``: `` is safe.
-        """
-        result = subprocess.run(["tmux", "list-sessions"], capture_output=True, text=True)
-        if result.returncode != 0:
-            return []
-        names: List[str] = []
-        for line in result.stdout.splitlines():
-            # Each line is "NAME: N windows ..."
-            colon_idx = line.find(": ")
-            if colon_idx > 0:
-                names.append(line[:colon_idx])
-        return names
-
-    def _is_session_attached(self, session_name: str) -> bool:
-        """Return True if the session has attached clients."""
-        result = subprocess.run(["tmux", "list-sessions"], capture_output=True, text=True)
-        if result.returncode != 0:
-            return False
-        for line in result.stdout.splitlines():
-            colon_idx = line.find(": ")
-            if colon_idx > 0 and line[:colon_idx] == session_name:
-                return "(attached)" in line
-        return False
 
     # ── public API ───────────────────────────────────────────────────────
 

@@ -37,29 +37,13 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.clients.tmux import pwsh_join, tmux_client
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 
 logger = logging.getLogger(__name__)
-
-
-def _pwsh_join(parts: list) -> str:
-    """Join command parts into a PowerShell-safe command string.
-
-    Uses PowerShell single-quoted string literals instead of POSIX quoting.
-    Embedded single-quotes are escaped by doubling (``'`` → ``''``).
-    """
-    result = []
-    for part in parts:
-        if not part or any(c in part for c in (" ", "\t", '"', "'", "`", "$", "(", ")", "{", "}", ";", "&", "|", "<", ">", "~", "^")):
-            escaped = part.replace("'", "''")
-            result.append(f"'{escaped}'")
-        else:
-            result.append(part)
-    return " ".join(result)
 
 
 # Custom exception for provider errors
@@ -300,7 +284,7 @@ class GeminiCliProvider(BaseProvider):
             self._write_policy_deny_rules()
 
         if sys.platform == "win32":
-            return _pwsh_join(command_parts)
+            return pwsh_join(command_parts)
         return shlex.join(command_parts)
 
     def _write_policy_deny_rules(self) -> None:
