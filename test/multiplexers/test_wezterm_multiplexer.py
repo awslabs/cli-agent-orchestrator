@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 import threading
 from collections import deque
 from unittest.mock import patch
@@ -10,7 +11,11 @@ from unittest.mock import patch
 import pytest
 
 from cli_agent_orchestrator.multiplexers.base import LaunchSpec
-from cli_agent_orchestrator.multiplexers.wezterm import WezTermMultiplexer
+from cli_agent_orchestrator.multiplexers.wezterm import (
+    WezTermMultiplexer,
+    _default_shell,
+    _ps_single_quote,
+)
 
 
 def _make_result(stdout: str = "", returncode: int = 0) -> subprocess.CompletedProcess[str]:
@@ -97,7 +102,9 @@ def multiplexer(tmp_path, fake_runner: FakeRunner):
 
 
 class TestCreateSession:
-    def test_argv_contains_new_window_cwd_and_terminal_id(self, tmp_path):
+    @pytest.mark.parametrize("platform", ["linux", "win32"])
+    def test_argv_contains_new_window_cwd_and_terminal_id(self, tmp_path, monkeypatch, platform):
+        monkeypatch.setattr(sys, "platform", platform)
         calls: list[list[str]] = []
 
         def runner(argv, env=None):
@@ -118,12 +125,14 @@ class TestCreateSession:
         assert "--new-window" in argv
         assert "--cwd" in argv
         assert str(tmp_path) in argv
-        env_pairs = [
-            argv[i + 1]
-            for i, token in enumerate(argv)
-            if token == "--set-environment" and i + 1 < len(argv)
-        ]
-        assert "CAO_TERMINAL_ID=tid-abc" in env_pairs
+        assert "--" in argv
+        dash_index = argv.index("--")
+        wrapped = argv[dash_index + 1 :]
+        joined = " ".join(wrapped)
+        if platform == "win32":
+            assert "$env:CAO_TERMINAL_ID='tid-abc'" in joined
+        else:
+            assert "CAO_TERMINAL_ID=tid-abc" in wrapped
 
     def test_parses_pane_id_from_stdout(self, tmp_path):
         mux = WezTermMultiplexer(runner=lambda argv, env=None: _spawn_result("99"), wezterm_bin="wezterm")
@@ -137,7 +146,9 @@ class TestCreateSession:
             mux.create_session("ses", "win", "tid", str(tmp_path))
         assert mux._sessions["ses"]["win"] == "77"
 
-    def test_launch_spec_argv_appended_after_double_dash(self, tmp_path):
+    @pytest.mark.parametrize("platform", ["linux", "win32"])
+    def test_launch_spec_argv_appended_after_double_dash(self, tmp_path, monkeypatch, platform):
+        monkeypatch.setattr(sys, "platform", platform)
         calls: list[list[str]] = []
 
         def runner(argv, env=None):
@@ -156,10 +167,18 @@ class TestCreateSession:
             )
 
         argv = calls[0]
-        idx = argv.index("--")
-        assert argv[idx + 1 : idx + 3] == ["codex.cmd", "--yolo"]
+        wrapped = argv[argv.index("--") + 1 :]
+        if platform == "win32":
+            command = wrapped[wrapped.index("-Command") + 1]
+            assert _ps_single_quote("codex.cmd") in command
+            assert _ps_single_quote("--yolo") in command
+        else:
+            env_sep = wrapped.index("--")
+            assert wrapped[env_sep + 1 : env_sep + 3] == ["codex.cmd", "--yolo"]
 
-    def test_launch_spec_env_adds_set_environment(self, tmp_path):
+    @pytest.mark.parametrize("platform", ["linux", "win32"])
+    def test_launch_spec_env_passed_through_wrapper(self, tmp_path, monkeypatch, platform):
+        monkeypatch.setattr(sys, "platform", platform)
         calls: list[list[str]] = []
 
         def runner(argv, env=None):
@@ -178,12 +197,80 @@ class TestCreateSession:
             )
 
         argv = calls[0]
-        env_pairs = [
-            argv[i + 1]
-            for i, token in enumerate(argv)
-            if token == "--set-environment" and i + 1 < len(argv)
-        ]
-        assert "FOO=bar" in env_pairs
+        wrapped = argv[argv.index("--") + 1 :]
+        joined = " ".join(wrapped)
+        if platform == "win32":
+            assert "$env:FOO='bar'" in joined
+        else:
+            assert "FOO=bar" in wrapped
+
+    @pytest.mark.parametrize("platform", ["linux", "win32"])
+    def test_default_shell_used_when_launch_spec_is_none(self, tmp_path, monkeypatch, platform):
+        monkeypatch.setattr(sys, "platform", platform)
+        calls: list[list[str]] = []
+
+        def runner(argv, env=None):
+            del env
+            calls.append(list(argv))
+            return _spawn_result("5")
+
+        mux = WezTermMultiplexer(runner=runner, wezterm_bin="wezterm")
+        with patch.object(mux, "_resolve_and_validate_working_directory", return_value=str(tmp_path)):
+            mux.create_session("ses", "win", "tid", str(tmp_path), launch_spec=None)
+
+        argv = calls[0]
+        wrapped = argv[argv.index("--") + 1 :]
+        shell = _default_shell()
+        if platform == "win32":
+            command = wrapped[wrapped.index("-Command") + 1]
+            assert _ps_single_quote(shell) in command
+            assert "$env:CAO_TERMINAL_ID='tid'" in command
+        else:
+            env_sep = wrapped.index("--")
+            assert wrapped[env_sep + 1 :] == [shell]
+            assert "CAO_TERMINAL_ID=tid" in wrapped
+
+    def test_ps_single_quote_doubles_embedded_single_quote(self):
+        assert _ps_single_quote("it's") == "'it''s'"
+
+    def test_windows_powershell_invocation_shape(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "win32")
+        calls: list[list[str]] = []
+
+        def runner(argv, env=None):
+            del env
+            calls.append(list(argv))
+            return _spawn_result("5")
+
+        mux = WezTermMultiplexer(runner=runner, wezterm_bin="wezterm")
+        with patch.object(mux, "_resolve_and_validate_working_directory", return_value=str(tmp_path)):
+            mux.create_session(
+                "ses",
+                "win",
+                "tid",
+                str(tmp_path),
+                launch_spec=LaunchSpec(argv=["codex.cmd", "--yolo"]),
+            )
+
+        wrapped = calls[0][calls[0].index("--") + 1 :]
+        assert wrapped[:4] == ["powershell.exe", "-NoLogo", "-NoProfile", "-Command"]
+        assert "$args=@(" in wrapped[4]
+
+    def test_unix_env_invocation_shape(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "linux")
+        calls: list[list[str]] = []
+
+        def runner(argv, env=None):
+            del env
+            calls.append(list(argv))
+            return _spawn_result("5")
+
+        mux = WezTermMultiplexer(runner=runner, wezterm_bin="wezterm")
+        with patch.object(mux, "_resolve_and_validate_working_directory", return_value=str(tmp_path)):
+            mux.create_session("ses", "win", "tid", str(tmp_path))
+
+        wrapped = calls[0][calls[0].index("--") + 1 :]
+        assert wrapped[:3] == ["env", "CAO_TERMINAL_ID=tid", "--"]
 
     def test_raises_runtime_error_when_stdout_has_no_pane_id(self, tmp_path):
         mux = WezTermMultiplexer(

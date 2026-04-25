@@ -1,10 +1,33 @@
-"""WezTerm CLI-backed multiplexer implementation."""
+"""WezTerm CLI-backed multiplexer implementation.
+
+WezTerm's ``cli spawn`` command does not support environment injection flags.
+The earlier CAO spike assumed ``--set-environment KEY=VALUE`` existed, but
+that flag is ignored by ``wezterm cli spawn`` and silently drops
+``CAO_TERMINAL_ID`` plus any provider-supplied launch env. Upstream confirmed
+this is not in scope in wezterm/wezterm#6565, and there is no config-side Lua
+hook for ``cli spawn`` that could repair it.
+
+CAO therefore wraps the spawned argv and sets env vars inside that wrapper
+before launching the real target:
+
+- Unix uses ``env KEY=VALUE -- <argv...>``, which exec-replaces cleanly so the
+  target remains pane pid 1.
+- Windows uses ``powershell.exe -Command ...`` because Windows has no
+  ``execve`` equivalent for a direct replace. That leaves PowerShell as the
+  WezTerm child and the target as a grandchild, which is safe for CAO because
+  this multiplexer does not depend on ``wezterm cli list`` or ``process_name``
+  for status. If a future code path does inspect the foreground process name,
+  WezTerm's Windows implementation walks descendants and reports the youngest
+  attached process (``find_youngest()`` in ``mux/src/localpane.rs``), so the
+  actual target should still win once started.
+"""
 
 from __future__ import annotations
 
 import logging
 import os
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -44,6 +67,43 @@ def _default_runner(
     return subprocess.run(
         list(argv), env=env, capture_output=True, text=True, check=False
     )
+
+
+def _default_shell() -> str:
+    if sys.platform == "win32":
+        return os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
+    return os.environ.get("SHELL", "/bin/sh")
+
+
+def _ps_single_quote(value: str) -> str:
+    """Quote a string for a PowerShell single-quoted literal: ' -> ''."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _wrap_with_env(env_vars: Mapping[str, str], argv: Sequence[str]) -> list[str]:
+    if sys.platform == "win32":
+        exe = argv[0]
+        args = list(argv[1:])
+        env_steps = [
+            f"$env:{key}={_ps_single_quote(value)}" for key, value in env_vars.items()
+        ]
+        ps_args = ",".join(_ps_single_quote(arg) for arg in args)
+        command_parts = [f"{step};" for step in env_steps]
+        command_parts.append(f"$args=@({ps_args}); " if args else "$args=@(); ")
+        command_parts.append(f"& {_ps_single_quote(exe)} @args")
+        return [
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-Command",
+            "".join(command_parts),
+        ]
+
+    wrapped = ["env"]
+    wrapped.extend(f"{key}={value}" for key, value in env_vars.items())
+    wrapped.append("--")
+    wrapped.extend(argv)
+    return wrapped
 
 
 class WezTermMultiplexer(BaseMultiplexer):
@@ -94,14 +154,26 @@ class WezTermMultiplexer(BaseMultiplexer):
         terminal_id: str,
         launch_spec: Optional[LaunchSpec],
     ) -> str:
-        cmd: list[str] = [self._bin, "cli", "spawn", "--new-window", "--cwd", working_directory]
-        cmd += ["--set-environment", f"CAO_TERMINAL_ID={terminal_id}"]
+        env_vars: dict[str, str] = {"CAO_TERMINAL_ID": terminal_id}
         if launch_spec is not None and launch_spec.env:
-            for key, value in launch_spec.env.items():
-                cmd += ["--set-environment", f"{key}={value}"]
+            env_vars.update(launch_spec.env)
+
         if launch_spec is not None and launch_spec.argv:
-            cmd.append("--")
-            cmd.extend(launch_spec.argv)
+            target_argv = list(launch_spec.argv)
+        else:
+            target_argv = [_default_shell()]
+
+        wrapped = _wrap_with_env(env_vars, target_argv)
+        cmd: list[str] = [
+            self._bin,
+            "cli",
+            "spawn",
+            "--new-window",
+            "--cwd",
+            working_directory,
+            "--",
+            *wrapped,
+        ]
         # Subprocess call outside lock — blocking I/O must not hold the lock.
         result = self._run(cmd, None)
         raw = result.stdout.strip()
