@@ -1,7 +1,7 @@
 """Provider manager as module singleton with direct terminal_id → provider mapping."""
 
 import logging
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from cli_agent_orchestrator.clients.database import get_terminal_metadata
 from cli_agent_orchestrator.models.provider import ProviderType
@@ -12,6 +12,7 @@ from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
 from cli_agent_orchestrator.providers.gemini_cli import GeminiCliProvider
 from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
+from cli_agent_orchestrator.providers.opencode_cli import OpenCodeCliProvider
 from cli_agent_orchestrator.providers.q_cli import QCliProvider
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,9 @@ class ProviderManager:
         tmux_session: str,
         tmux_window: str,
         agent_profile: Optional[str] = None,
+        allowed_tools: Optional[List[str]] = None,
+        skill_prompt: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> BaseProvider:
         """Create and store provider instance."""
         try:
@@ -37,21 +41,77 @@ class ProviderManager:
             if provider_type == ProviderType.Q_CLI.value:
                 if not agent_profile:
                     raise ValueError("Q CLI provider requires agent_profile parameter")
-                provider = QCliProvider(terminal_id, tmux_session, tmux_window, agent_profile)
+                provider = QCliProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                )
             elif provider_type == ProviderType.KIRO_CLI.value:
                 if not agent_profile:
                     raise ValueError("Kiro CLI provider requires agent_profile parameter")
-                provider = KiroCliProvider(terminal_id, tmux_session, tmux_window, agent_profile)
+                provider = KiroCliProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                )
             elif provider_type == ProviderType.CLAUDE_CODE.value:
-                provider = ClaudeCodeProvider(terminal_id, tmux_session, tmux_window, agent_profile)
+                provider = ClaudeCodeProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    skill_prompt=skill_prompt,
+                )
             elif provider_type == ProviderType.CODEX.value:
-                provider = CodexProvider(terminal_id, tmux_session, tmux_window, agent_profile)
+                provider = CodexProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    skill_prompt=skill_prompt,
+                )
             elif provider_type == ProviderType.COPILOT_CLI.value:
-                provider = CopilotCliProvider(terminal_id, tmux_session, tmux_window, agent_profile)
+                provider = CopilotCliProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    model=model,
+                )
             elif provider_type == ProviderType.GEMINI_CLI.value:
-                provider = GeminiCliProvider(terminal_id, tmux_session, tmux_window, agent_profile)
+                provider = GeminiCliProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    skill_prompt=skill_prompt,
+                )
             elif provider_type == ProviderType.KIMI_CLI.value:
-                provider = KimiCliProvider(terminal_id, tmux_session, tmux_window, agent_profile)
+                provider = KimiCliProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    skill_prompt=skill_prompt,
+                )
+            elif provider_type == ProviderType.OPENCODE_CLI.value:
+                provider = OpenCodeCliProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    model=model,
+                )
             else:
                 raise ValueError(f"Unknown provider type: {provider_type}")
 

@@ -31,9 +31,19 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.constants import SESSION_PREFIX, TERMINAL_LOG_DIR
+from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
+from cli_agent_orchestrator.plugins import (
+    PluginRegistry,
+    PostCreateTerminalEvent,
+    PostKillTerminalEvent,
+    PostSendMessageEvent,
+)
 from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
+from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.skills import build_skill_catalog
 from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
     generate_terminal_id,
@@ -54,12 +64,27 @@ class OutputMode(str, Enum):
     LAST = "last"
 
 
+# Providers that accept a runtime skill_prompt kwarg and append it to the
+# system prompt at launch time.  Other providers deliver skills differently:
+# Kiro (skill:// resources) and OpenCode (OPENCODE_CONFIG_DIR/skills symlink)
+# discover skills natively; Q and Copilot receive a baked catalog at install
+# time.
+RUNTIME_SKILL_PROMPT_PROVIDERS = {
+    ProviderType.CLAUDE_CODE.value,
+    ProviderType.CODEX.value,
+    ProviderType.GEMINI_CLI.value,
+    ProviderType.KIMI_CLI.value,
+}
+
+
 def create_terminal(
     provider: str,
     agent_profile: str,
     session_name: Optional[str] = None,
     new_session: bool = False,
     working_directory: Optional[str] = None,
+    allowed_tools: Optional[list[str]] = None,
+    registry: PluginRegistry | None = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -75,7 +100,7 @@ def create_terminal(
         agent_profile: Name of the agent profile to use
         session_name: Optional custom session name. If not provided, auto-generated.
         new_session: If True, creates a new tmux session. If False, adds to existing.
-        working_directory: Optional working directory for the terminal shell.
+        working_directory: Optional working directory for the terminal shell
 
     Returns:
         Terminal object with all metadata populated
@@ -84,6 +109,7 @@ def create_terminal(
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
         TimeoutError: If provider initialization times out
     """
+    session_created = False  # tracks whether THIS call created the tmux session
     try:
         # Step 1: Generate unique identifiers
         terminal_id = generate_terminal_id()
@@ -105,6 +131,7 @@ def create_terminal(
 
             # Create new tmux session with initial window
             tmux_client.create_session(session_name, window_name, terminal_id, working_directory)
+            session_created = True  # only set after successful creation
         else:
             # Add window to existing session
             if not tmux_client.session_exists(session_name):
@@ -114,12 +141,43 @@ def create_terminal(
             )
 
         # Step 3: Persist terminal metadata to database
-        db_create_terminal(terminal_id, session_name, window_name, provider, agent_profile)
+        db_create_terminal(
+            terminal_id, session_name, window_name, provider, agent_profile, allowed_tools
+        )
+
+        # Step 3b: Load the profile once for allowed tool resolution before
+        # provider initialization. The skill catalog is computed only for
+        # providers that consume it at launch time (see RUNTIME_SKILL_PROMPT_PROVIDERS).
+        try:
+            profile = load_agent_profile(agent_profile)
+        except FileNotFoundError:
+            profile = None
+        skill_prompt = build_skill_catalog() if provider in RUNTIME_SKILL_PROMPT_PROVIDERS else None
+
+        # Step 3c: Resolve allowed_tools from profile if not explicitly provided
+        if allowed_tools is None and profile is not None:
+            from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
+
+            mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
+            allowed_tools = resolve_allowed_tools(
+                profile.allowedTools, profile.role, mcp_server_names
+            )
 
         # Step 4: Create and initialize the CLI provider
-        # This starts the agent (e.g., runs "kiro-cli chat --agent developer")
+        # This starts the agent (e.g., runs "kiro-cli chat --agent developer").
+        # Only runtime-prompt providers (Claude Code, Codex, Gemini, Kimi) receive
+        # the skill catalog here; Kiro (skill:// resources) and OpenCode
+        # (OPENCODE_CONFIG_DIR/skills symlink) discover skills natively; Q and
+        # Copilot get the catalog baked at install time.
         provider_instance = provider_manager.create_provider(
-            provider, terminal_id, session_name, window_name, agent_profile
+            provider,
+            terminal_id,
+            session_name,
+            window_name,
+            agent_profile,
+            allowed_tools,
+            skill_prompt=skill_prompt,
+            model=profile.model if profile else None,
         )
         provider_instance.initialize()
 
@@ -143,6 +201,16 @@ def create_terminal(
         logger.info(
             f"Created terminal: {terminal_id} in session: {session_name} (new_session={new_session})"
         )
+        dispatch_plugin_event(
+            registry,
+            "post_create_terminal",
+            PostCreateTerminalEvent(
+                session_id=terminal.session_name,
+                terminal_id=terminal.id,
+                agent_name=terminal.agent_profile,
+                provider=provider,
+            ),
+        )
         return terminal
 
     except Exception as e:
@@ -152,7 +220,7 @@ def create_terminal(
             provider_manager.cleanup_provider(terminal_id)
         except Exception:
             pass  # Ignore cleanup errors
-        if new_session and session_name:
+        if session_created and session_name:
             try:
                 tmux_client.kill_session(session_name)
             except:
@@ -179,6 +247,7 @@ def get_terminal(terminal_id: str) -> Dict:
             "provider": metadata["provider"],
             "session_name": metadata["tmux_session"],
             "agent_profile": metadata["agent_profile"],
+            "allowed_tools": metadata.get("allowed_tools"),
             "status": status,
             "last_active": metadata["last_active"],
         }
@@ -216,7 +285,13 @@ def get_working_directory(terminal_id: str) -> Optional[str]:
         raise
 
 
-def send_input(terminal_id: str, message: str) -> bool:
+def send_input(
+    terminal_id: str,
+    message: str,
+    registry: PluginRegistry | None = None,
+    sender_id: str | None = None,
+    orchestration_type: OrchestrationType | None = None,
+) -> bool:
     """Send input to terminal via tmux paste buffer.
 
     Uses bracketed paste mode (-p) to bypass TUI hotkey handling. The number
@@ -246,6 +321,18 @@ def send_input(terminal_id: str, message: str) -> bool:
 
         update_last_active(terminal_id)
         logger.info(f"Sent input to terminal: {terminal_id}")
+        if registry is not None and sender_id is not None and orchestration_type is not None:
+            dispatch_plugin_event(
+                registry,
+                "post_send_message",
+                PostSendMessageEvent(
+                    session_id=metadata["tmux_session"],
+                    sender=sender_id,
+                    receiver=terminal_id,
+                    message=message,
+                    orchestration_type=orchestration_type,
+                ),
+            )
         return True
 
     except Exception as e:
@@ -292,20 +379,33 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
     retries extraction with 10 s delays between attempts.  This handles
     TUI-based providers (e.g. Gemini CLI's Ink renderer) whose notification
     spinners can temporarily obscure response text in the tmux capture buffer.
+
+    If the provider exposes an ``extraction_tail_lines`` attribute, the
+    history capture for LAST mode uses that value instead of the default
+    ``TMUX_HISTORY_LINES``. Status-check captures are unaffected (they go
+    through get_status directly). A single capture-pane call is made per
+    get_output invocation.
     """
     try:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        full_output = tmux_client.get_history(metadata["tmux_session"], metadata["tmux_window"])
-
         if mode == OutputMode.FULL:
-            return full_output
+            return tmux_client.get_history(metadata["tmux_session"], metadata["tmux_window"])
         elif mode == OutputMode.LAST:
             provider = provider_manager.get_provider(terminal_id)
             if provider is None:
                 raise ValueError(f"Provider not found for terminal {terminal_id}")
+
+            # Capability check: providers that need deeper scrollback for extraction
+            # opt in by defining ``extraction_tail_lines``. Base providers don't.
+            extract_lines = getattr(provider, "extraction_tail_lines", None)
+            full_output = tmux_client.get_history(
+                metadata["tmux_session"],
+                metadata["tmux_window"],
+                tail_lines=extract_lines,
+            )
 
             retries = provider.extraction_retries
             last_err: Exception | None = None
@@ -314,7 +414,9 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
                     if attempt > 0:
                         time.sleep(10.0)
                         full_output = tmux_client.get_history(
-                            metadata["tmux_session"], metadata["tmux_window"]
+                            metadata["tmux_session"],
+                            metadata["tmux_window"],
+                            tail_lines=extract_lines,
                         )
                     return provider.extract_last_message_from_script(full_output)
                 except ValueError as exc:
@@ -333,23 +435,39 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
         raise
 
 
-def delete_terminal(terminal_id: str) -> bool:
-    """Delete terminal."""
+def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) -> bool:
+    """Delete terminal and kill its tmux window."""
     try:
         # Get metadata before deletion
         metadata = get_terminal_metadata(terminal_id)
 
-        # Stop pipe-pane
         if metadata:
+            # Stop pipe-pane logging
             try:
                 tmux_client.stop_pipe_pane(metadata["tmux_session"], metadata["tmux_window"])
             except Exception as e:
                 logger.warning(f"Failed to stop pipe-pane for {terminal_id}: {e}")
 
-        # Existing cleanup
+            # Kill the tmux window (this terminates the agent process)
+            try:
+                tmux_client.kill_window(metadata["tmux_session"], metadata["tmux_window"])
+            except Exception as e:
+                logger.warning(f"Failed to kill tmux window for {terminal_id}: {e}")
+
+        # Cleanup provider state and database record
         provider_manager.cleanup_provider(terminal_id)
         deleted = db_delete_terminal(terminal_id)
         logger.info(f"Deleted terminal: {terminal_id}")
+        if deleted and metadata:
+            dispatch_plugin_event(
+                registry,
+                "post_kill_terminal",
+                PostKillTerminalEvent(
+                    session_id=metadata["tmux_session"],
+                    terminal_id=terminal_id,
+                    agent_name=metadata.get("agent_profile"),
+                ),
+            )
         return deleted
 
     except Exception as e:

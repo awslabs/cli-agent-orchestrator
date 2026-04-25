@@ -22,6 +22,7 @@ class AgentProfile(BaseModel):
     description: str
     provider: Optional[str] = None  # Provider override (e.g. "claude_code", "kiro_cli")
     system_prompt: Optional[str] = None  # The markdown content
+    role: Optional[str] = None  # "supervisor", "developer", "reviewer"
 
     # Q CLI agent fields (all optional, will be passed through to JSON)
     prompt: Optional[str] = None

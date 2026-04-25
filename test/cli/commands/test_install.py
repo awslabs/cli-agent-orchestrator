@@ -1,5 +1,6 @@
 """Tests for the install CLI command."""
 
+import json
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -9,6 +10,17 @@ import pytest
 from click.testing import CliRunner
 
 from cli_agent_orchestrator.cli.commands.install import _download_agent, install
+from cli_agent_orchestrator.models.agent_profile import AgentProfile
+from cli_agent_orchestrator.models.kiro_agent import KiroAgentConfig
+from cli_agent_orchestrator.utils.skill_injection import refresh_agent_json_prompt
+
+
+def _create_skill(folder: Path, name: str, description: str, body: str = "# Skill\n\nBody") -> None:
+    """Create a skill folder with SKILL.md and optional content."""
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "SKILL.md").write_text(
+        "---\n" f"name: {name}\n" f"description: {description}\n" "---\n\n" f"{body}\n"
+    )
 
 
 class TestDownloadAgent:
@@ -106,7 +118,7 @@ class TestInstallCommand:
         profile.model = None
         return profile
 
-    @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
+    @patch("cli_agent_orchestrator.cli.commands.install.parse_agent_profile_text")
     @patch("cli_agent_orchestrator.cli.commands.install.AGENT_CONTEXT_DIR")
     @patch("cli_agent_orchestrator.cli.commands.install.KIRO_AGENTS_DIR")
     @patch("cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR")
@@ -148,10 +160,10 @@ class TestInstallCommand:
                 result = runner.invoke(install, ["test-agent", "--provider", "kiro_cli"])
 
                 # Should not fail (may have issues with file writes in test env)
-                mock_load.assert_called_once_with("test-agent")
+                mock_load.assert_called_once()
 
     @patch("cli_agent_orchestrator.cli.commands.install._download_agent")
-    @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
+    @patch("cli_agent_orchestrator.cli.commands.install.parse_agent_profile_text")
     def test_install_from_url(self, mock_load, mock_download, runner, mock_agent_profile):
         """Test installing agent from URL."""
         mock_download.return_value = "downloaded-agent"
@@ -163,7 +175,7 @@ class TestInstallCommand:
 
     @patch("cli_agent_orchestrator.cli.commands.install.Path")
     @patch("cli_agent_orchestrator.cli.commands.install._download_agent")
-    @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
+    @patch("cli_agent_orchestrator.cli.commands.install.parse_agent_profile_text")
     def test_install_from_file_path(
         self, mock_load, mock_download, mock_path, runner, mock_agent_profile
     ):
@@ -197,17 +209,33 @@ class TestInstallCommand:
         assert "Error" in result.output
         assert "Failed to download agent" in result.output
 
-    @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
-    def test_install_general_error(self, mock_load, runner):
+    @patch("cli_agent_orchestrator.cli.commands.install.parse_agent_profile_text")
+    @patch("cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR")
+    def test_install_general_error(self, mock_local_store, mock_parse, runner):
         """Test installing agent with general error."""
-        mock_load.side_effect = Exception("Unexpected error")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            local_path = tmppath / "local"
+            local_path.mkdir(parents=True, exist_ok=True)
+            (local_path / "test-agent.md").write_text("# Test")
+            mock_local_store.__truediv__ = lambda self, x: local_path / x
+            mock_parse.side_effect = Exception("Unexpected error")
 
-        result = runner.invoke(install, ["test-agent"])
+            result = runner.invoke(install, ["test-agent"])
 
-        assert "Error" in result.output
-        assert "Failed to install agent" in result.output
+            assert "Error" in result.output
+            assert "Failed to install agent" in result.output
 
-    @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
+    def test_install_help_describes_env_workflow(self, runner):
+        """Help text should describe env file storage, ${VAR} syntax, and an example."""
+        result = runner.invoke(install, ["--help"])
+
+        assert result.exit_code == 0
+        assert "~/.aws/cli-agent-orchestrator/.env" in result.output
+        assert "${VAR}" in result.output
+        assert "API_TOKEN=my-secret-token" in result.output
+
+    @patch("cli_agent_orchestrator.cli.commands.install.parse_agent_profile_text")
     @patch("cli_agent_orchestrator.cli.commands.install.AGENT_CONTEXT_DIR")
     @patch("cli_agent_orchestrator.cli.commands.install.Q_AGENTS_DIR")
     @patch("cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR")
@@ -237,9 +265,9 @@ class TestInstallCommand:
 
             result = runner.invoke(install, ["test-agent", "--provider", "q_cli"])
 
-            mock_load.assert_called_once_with("test-agent")
+            mock_load.assert_called_once()
 
-    @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
+    @patch("cli_agent_orchestrator.cli.commands.install.parse_agent_profile_text")
     @patch("cli_agent_orchestrator.cli.commands.install.AGENT_CONTEXT_DIR")
     @patch("cli_agent_orchestrator.cli.commands.install.KIRO_AGENTS_DIR")
     @patch("cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR")
@@ -281,9 +309,9 @@ class TestInstallCommand:
 
             result = runner.invoke(install, ["test-agent", "--provider", "kiro_cli"])
 
-            mock_load.assert_called_once_with("test-agent")
+            mock_load.assert_called_once()
 
-    @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
+    @patch("cli_agent_orchestrator.cli.commands.install.parse_agent_profile_text")
     @patch("cli_agent_orchestrator.cli.commands.install.AGENT_CONTEXT_DIR")
     @patch("cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR")
     def test_install_without_provider_specific_config(
@@ -310,7 +338,7 @@ class TestInstallCommand:
 
             assert "installed successfully" in result.output
 
-    @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
+    @patch("cli_agent_orchestrator.cli.commands.install.parse_agent_profile_text")
     @patch("cli_agent_orchestrator.cli.commands.install.AGENT_CONTEXT_DIR")
     @patch("cli_agent_orchestrator.cli.commands.install.COPILOT_AGENTS_DIR")
     @patch("cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR")
@@ -357,7 +385,7 @@ class TestInstallCommand:
             assert post.metadata["description"] == "Test agent description"
             assert "Test system prompt" in post.content
 
-    @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
+    @patch("cli_agent_orchestrator.cli.commands.install.parse_agent_profile_text")
     @patch("cli_agent_orchestrator.cli.commands.install.AGENT_CONTEXT_DIR")
     @patch("cli_agent_orchestrator.cli.commands.install.COPILOT_AGENTS_DIR")
     @patch("cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR")
@@ -398,3 +426,423 @@ class TestInstallCommand:
 
             assert "Failed to install agent" in result.output
             assert "has no usable prompt content for Copilot" in result.output
+
+
+class TestInstallCommandEnvFlags:
+    """Tests for install-time env var injection."""
+
+    @pytest.fixture
+    def runner(self):
+        """Create a CLI test runner."""
+        return CliRunner()
+
+    @pytest.fixture
+    def install_paths(self, tmp_path, monkeypatch):
+        """Patch install-related filesystem paths into a temp workspace."""
+        local_store_dir = tmp_path / "agent-store"
+        context_dir = tmp_path / "agent-context"
+        kiro_dir = tmp_path / "kiro"
+        q_dir = tmp_path / "q"
+        env_file = tmp_path / ".env"
+
+        local_store_dir.mkdir()
+        context_dir.mkdir()
+        kiro_dir.mkdir()
+        q_dir.mkdir()
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR", local_store_dir
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.cli.commands.install.AGENT_CONTEXT_DIR", context_dir
+        )
+        monkeypatch.setattr("cli_agent_orchestrator.cli.commands.install.KIRO_AGENTS_DIR", kiro_dir)
+        monkeypatch.setattr("cli_agent_orchestrator.cli.commands.install.Q_AGENTS_DIR", q_dir)
+        monkeypatch.setattr("cli_agent_orchestrator.cli.commands.install.CAO_ENV_FILE", env_file)
+        monkeypatch.setattr("cli_agent_orchestrator.utils.env.CAO_ENV_FILE", env_file)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR", local_store_dir
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs", lambda: {}
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", lambda: []
+        )
+
+        return {
+            "local_store_dir": local_store_dir,
+            "context_dir": context_dir,
+            "kiro_dir": kiro_dir,
+            "q_dir": q_dir,
+            "env_file": env_file,
+        }
+
+    @staticmethod
+    def _write_profile(profile_path: Path, body: str) -> None:
+        """Write a local profile with env placeholders."""
+        profile_path.write_text(
+            "---\n"
+            "name: test-agent\n"
+            "description: Test agent\n"
+            "mcpServers:\n"
+            "  service:\n"
+            "    command: service-mcp\n"
+            "    env:\n"
+            "      API_TOKEN: ${API_TOKEN}\n"
+            "      BASE_URL: ${BASE_URL}\n"
+            "      URL: ${URL}\n"
+            "---\n"
+            f"{body}\n"
+        )
+
+    def test_install_with_env_writes_env_file_and_resolves_provider_config(
+        self, runner, install_paths
+    ):
+        """--env should persist to .env, resolve in provider config, but NOT in context file."""
+        profile_path = install_paths["local_store_dir"] / "test-agent.md"
+        self._write_profile(profile_path, "Token: ${API_TOKEN}")
+
+        result = runner.invoke(
+            install,
+            [
+                "test-agent",
+                "--provider",
+                "kiro_cli",
+                "--env",
+                "API_TOKEN=secret-token",
+            ],
+        )
+
+        assert result.exit_code == 0
+        assert install_paths["env_file"].read_text() == "API_TOKEN='secret-token'\n"
+        assert f"✓ Set 1 env var(s) in {install_paths['env_file']}" in result.output
+
+        # Context file keeps placeholders (secrets stay in .env)
+        context_text = (install_paths["context_dir"] / "test-agent.md").read_text()
+        assert "${API_TOKEN}" in context_text
+        assert "secret-token" not in context_text
+
+        # Provider config has resolved values (Kiro can't read .env)
+        kiro_agent_file = install_paths["kiro_dir"] / "test-agent.json"
+        kiro_config = json.loads(kiro_agent_file.read_text())
+        assert kiro_config["mcpServers"]["service"]["env"]["API_TOKEN"] == "secret-token"
+
+    def test_install_with_multiple_env_flags_writes_all_values(self, runner, install_paths):
+        """Multiple --env flags should all be written before profile resolution."""
+        profile_path = install_paths["local_store_dir"] / "test-agent.md"
+        self._write_profile(profile_path, "Token: ${API_TOKEN}\nBase URL: ${BASE_URL}")
+
+        result = runner.invoke(
+            install,
+            [
+                "test-agent",
+                "--provider",
+                "kiro_cli",
+                "--env",
+                "API_TOKEN=secret-token",
+                "--env",
+                "BASE_URL=http://localhost:27124",
+            ],
+        )
+
+        context_text = (install_paths["context_dir"] / "test-agent.md").read_text()
+
+        assert result.exit_code == 0
+        assert "API_TOKEN='secret-token'" in install_paths["env_file"].read_text()
+        assert "BASE_URL='http://localhost:27124'" in install_paths["env_file"].read_text()
+        # Context file keeps placeholders
+        assert "${API_TOKEN}" in context_text
+        assert "${BASE_URL}" in context_text
+        assert f"✓ Set 2 env var(s) in {install_paths['env_file']}" in result.output
+
+    def test_install_with_env_value_containing_equals_preserves_full_value(
+        self, runner, install_paths
+    ):
+        """The first equals sign splits the assignment and later ones remain in the value."""
+        profile_path = install_paths["local_store_dir"] / "test-agent.md"
+        self._write_profile(profile_path, "URL: ${URL}")
+
+        result = runner.invoke(
+            install,
+            [
+                "test-agent",
+                "--provider",
+                "q_cli",
+                "--env",
+                "URL=http://host?a=b",
+            ],
+        )
+
+        context_text = (install_paths["context_dir"] / "test-agent.md").read_text()
+        q_agent_file = install_paths["q_dir"] / "test-agent.json"
+        q_config = json.loads(q_agent_file.read_text())
+
+        assert result.exit_code == 0
+        assert "URL='http://host?a=b'" in install_paths["env_file"].read_text()
+        # Context file keeps placeholder
+        assert "${URL}" in context_text
+        # Provider config has resolved value
+        assert q_config["mcpServers"]["service"]["env"]["URL"] == "http://host?a=b"
+
+    def test_install_with_invalid_env_format_returns_click_error(self, runner, install_paths):
+        """Assignments without '=' should fail validation with a user-friendly error."""
+        profile_path = install_paths["local_store_dir"] / "test-agent.md"
+        self._write_profile(profile_path, "Token: ${API_TOKEN}")
+
+        result = runner.invoke(install, ["test-agent", "--env", "INVALID_FORMAT"])
+
+        assert result.exit_code == 2
+        assert "Invalid value for --env" in result.output
+        assert "Expected format KEY=VALUE" in result.output
+        assert not install_paths["env_file"].exists()
+
+    def test_install_with_empty_env_key_returns_click_error(self, runner, install_paths):
+        """Assignments with an empty key should fail validation."""
+        profile_path = install_paths["local_store_dir"] / "test-agent.md"
+        self._write_profile(profile_path, "Token: ${API_TOKEN}")
+
+        result = runner.invoke(install, ["test-agent", "--env", "=value"])
+
+        assert result.exit_code == 2
+        assert "Invalid value for --env" in result.output
+        assert "Key must not be empty" in result.output
+        assert not install_paths["env_file"].exists()
+
+    def test_install_without_env_does_not_modify_env_file(self, runner, install_paths):
+        """Install should not create or update the env file when --env is omitted."""
+        profile_path = install_paths["local_store_dir"] / "test-agent.md"
+        profile_path.write_text(
+            "---\nname: test-agent\ndescription: Test agent\n---\nPlain system prompt\n"
+        )
+
+        result = runner.invoke(install, ["test-agent", "--provider", "kiro_cli"])
+
+        assert result.exit_code == 0
+        assert not install_paths["env_file"].exists()
+        assert "Set 1 env var" not in result.output
+
+    def test_install_warns_about_unresolved_env_vars(self, runner, install_paths):
+        """Unresolved ${VAR} placeholders should trigger a stderr warning."""
+        profile_path = install_paths["local_store_dir"] / "test-agent.md"
+        self._write_profile(profile_path, "Token: ${API_TOKEN}")
+
+        result = runner.invoke(
+            install,
+            ["test-agent", "--provider", "kiro_cli", "--env", "API_TOKEN=secret"],
+        )
+
+        assert result.exit_code == 0
+        # API_TOKEN is set, but BASE_URL and URL are not
+        assert "Unresolved env var(s)" in result.output
+        assert "BASE_URL" in result.output
+        assert "URL" in result.output
+        assert "API_TOKEN" not in result.output.split("Unresolved")[1]
+
+    def test_install_no_warning_when_all_env_vars_resolved(self, runner, install_paths):
+        """No warning when every placeholder has a value in .env."""
+        profile_path = install_paths["local_store_dir"] / "test-agent.md"
+        profile_path.write_text(
+            "---\nname: test-agent\ndescription: Test agent\n"
+            "mcpServers:\n  svc:\n    command: svc\n    env:\n"
+            "      KEY: ${KEY}\n---\nPrompt\n"
+        )
+
+        result = runner.invoke(
+            install,
+            ["test-agent", "--provider", "kiro_cli", "--env", "KEY=value"],
+        )
+
+        assert result.exit_code == 0
+        assert "Unresolved" not in result.output
+
+    def test_install_no_warning_when_profile_has_no_placeholders(self, runner, install_paths):
+        """Profiles without any ${VAR} syntax should not trigger a warning."""
+        profile_path = install_paths["local_store_dir"] / "test-agent.md"
+        profile_path.write_text(
+            "---\nname: test-agent\ndescription: Test agent\n---\nPlain prompt\n"
+        )
+
+        result = runner.invoke(install, ["test-agent", "--provider", "kiro_cli"])
+
+        assert result.exit_code == 0
+        assert "Unresolved" not in result.output
+
+    def test_install_end_to_end_keeps_placeholders_in_context_file(
+        self, runner, install_paths, tmp_path
+    ):
+        """Context file should preserve ${VAR} placeholders; secrets stay in .env."""
+        install_paths["env_file"].write_text(
+            "API_TOKEN=integration-secret\nSERVICE_URL=http://127.0.0.1:27124\n"
+        )
+        source_profile = tmp_path / "service-agent.md"
+        source_profile.write_text(
+            "---\n"
+            "name: service-agent\n"
+            "description: Integration test profile\n"
+            "mcpServers:\n"
+            "  service:\n"
+            "    command: service-mcp\n"
+            "    env:\n"
+            "      API_TOKEN: ${API_TOKEN}\n"
+            "      SERVICE_URL: ${SERVICE_URL}\n"
+            "---\n"
+            "Use the service endpoint at ${SERVICE_URL}.\n"
+        )
+
+        result = runner.invoke(install, [str(source_profile), "--provider", "claude_code"])
+
+        installed_profile = install_paths["context_dir"] / "service-agent.md"
+        installed_text = installed_profile.read_text()
+
+        assert result.exit_code == 0
+        assert "${API_TOKEN}" in installed_text
+        assert "${SERVICE_URL}" in installed_text
+        assert "integration-secret" not in installed_text
+
+
+class TestInstallSkillCatalogBaking:
+    """Tests for baked skill catalog injection during install."""
+
+    @pytest.fixture
+    def runner(self):
+        """Create a CLI test runner."""
+        return CliRunner()
+
+    @pytest.fixture
+    def install_workspace(self, tmp_path, monkeypatch):
+        """Patch install and skills paths into a temp workspace."""
+        local_store_dir = tmp_path / "agent-store"
+        context_dir = tmp_path / "agent-context"
+        kiro_dir = tmp_path / "kiro"
+        q_dir = tmp_path / "q"
+        skills_dir = tmp_path / "skills"
+
+        local_store_dir.mkdir()
+        context_dir.mkdir()
+        kiro_dir.mkdir()
+        q_dir.mkdir()
+        skills_dir.mkdir()
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR", local_store_dir
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.cli.commands.install.AGENT_CONTEXT_DIR", context_dir
+        )
+        monkeypatch.setattr("cli_agent_orchestrator.cli.commands.install.KIRO_AGENTS_DIR", kiro_dir)
+        monkeypatch.setattr("cli_agent_orchestrator.cli.commands.install.Q_AGENTS_DIR", q_dir)
+        monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", skills_dir)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs", lambda: {}
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", lambda: []
+        )
+
+        return {
+            "local_store_dir": local_store_dir,
+            "context_dir": context_dir,
+            "kiro_dir": kiro_dir,
+            "q_dir": q_dir,
+            "skills_dir": skills_dir,
+        }
+
+    @staticmethod
+    def _write_profile(profile_path: Path, frontmatter_body: str, system_prompt: str) -> None:
+        """Write a local markdown profile for install tests."""
+        profile_path.write_text(f"---\n{frontmatter_body}---\n{system_prompt}\n", encoding="utf-8")
+
+    def test_install_kiro_uses_skill_resources_not_baked_prompt(self, runner, install_workspace):
+        """Kiro installs should use skill:// glob in resources instead of baking catalog into prompt."""
+        _create_skill(
+            install_workspace["skills_dir"] / "python-testing",
+            "python-testing",
+            "Pytest conventions",
+        )
+        self._write_profile(
+            install_workspace["local_store_dir"] / "test-agent.md",
+            "name: test-agent\ndescription: Test agent\nprompt: Build things\n",
+            "System prompt",
+        )
+
+        result = runner.invoke(install, ["test-agent", "--provider", "kiro_cli"])
+
+        assert result.exit_code == 0
+        agent_json = json.loads((install_workspace["kiro_dir"] / "test-agent.json").read_text())
+        # Prompt should be the raw profile prompt without skill catalog
+        assert agent_json["prompt"] == "Build things"
+        assert "Available Skills" not in agent_json["prompt"]
+        # Resources should contain the skill:// glob
+        skill_resources = [r for r in agent_json["resources"] if r.startswith("skill://")]
+        assert len(skill_resources) == 1
+        assert skill_resources[0].endswith("/**/SKILL.md")
+
+    def test_install_q_bakes_catalog_into_prompt(self, runner, install_workspace):
+        """Q installs should bake the global skill catalog into the JSON prompt."""
+        _create_skill(
+            install_workspace["skills_dir"] / "python-testing",
+            "python-testing",
+            "Pytest conventions",
+        )
+        self._write_profile(
+            install_workspace["local_store_dir"] / "test-agent.md",
+            "name: test-agent\ndescription: Test agent\nprompt: Build things\n",
+            "System prompt",
+        )
+
+        result = runner.invoke(install, ["test-agent", "--provider", "q_cli"])
+
+        assert result.exit_code == 0
+        agent_json = json.loads((install_workspace["q_dir"] / "test-agent.json").read_text())
+        assert agent_json["prompt"].startswith("Build things\n\n## Available Skills")
+        assert "python-testing" in agent_json["prompt"]
+
+    def test_install_kiro_omits_prompt_field_when_profile_prompt_is_empty(
+        self, runner, install_workspace
+    ):
+        """Empty profile prompt should omit prompt field; skill:// glob still in resources."""
+        self._write_profile(
+            install_workspace["local_store_dir"] / "test-agent.md",
+            "name: test-agent\ndescription: Test agent\n",
+            "System prompt",
+        )
+
+        result = runner.invoke(install, ["test-agent", "--provider", "kiro_cli"])
+
+        assert result.exit_code == 0
+        agent_path = install_workspace["kiro_dir"] / "test-agent.json"
+        agent_json = json.loads(agent_path.read_text())
+        assert "prompt" not in agent_json
+        # skill:// glob should still be present in resources
+        skill_resources = [r for r in agent_json["resources"] if r.startswith("skill://")]
+        assert len(skill_resources) == 1
+
+    def test_install_non_ascii_prompt_round_trips_through_refresh_without_byte_drift(
+        self, runner, install_workspace
+    ):
+        """Non-ASCII prompt content should survive install and refresh with byte-identical JSON."""
+        _create_skill(
+            install_workspace["skills_dir"] / "unicode-skill",
+            "unicode-skill",
+            "Unicode skill",
+        )
+        self._write_profile(
+            install_workspace["local_store_dir"] / "unicode-agent.md",
+            "name: unicode-agent\ndescription: Test agent\nprompt: こんにちは 🚀\n",
+            "System prompt",
+        )
+
+        result = runner.invoke(install, ["unicode-agent", "--provider", "q_cli"])
+
+        assert result.exit_code == 0
+        agent_path = install_workspace["q_dir"] / "unicode-agent.json"
+        before_refresh = agent_path.read_bytes()
+
+        refreshed = refresh_agent_json_prompt(
+            agent_path,
+            AgentProfile(name="unicode-agent", description="Test agent", prompt="こんにちは 🚀"),
+        )
+
+        assert refreshed is True
+        assert agent_path.read_bytes() == before_refresh

@@ -76,6 +76,11 @@ class TmuxClient:
         if working_directory is None:
             working_directory = os.getcwd()
 
+        # Expand ~ to the server's home directory so clients can use
+        # portable paths like ~/q/my-project without knowing the server's
+        # actual home path (e.g., /home/user vs /Users/user).
+        working_directory = os.path.expanduser(working_directory)
+
         # Step 1: Canonicalize the path via realpath to resolve symlinks
         # and .. sequences.  os.path.realpath is recognized by CodeQL as a
         # PathNormalization (transitions taint to NormalizedUnchecked).
@@ -120,7 +125,24 @@ class TmuxClient:
         try:
             working_directory = self._resolve_and_validate_working_directory(working_directory)
 
-            environment = os.environ.copy()
+            # Filter out provider env vars that would cause "nested session"
+            # errors when CAO itself runs inside a provider (e.g. Claude Code).
+            # Preserve CLAUDE_CODE_USE_* and CLAUDE_CODE_SKIP_* vars needed
+            # for provider authentication (Bedrock, Vertex AI, Foundry).
+            blocked_prefixes = ("CLAUDE", "CODEX_")
+            allowed_vars = {
+                "CLAUDE_CODE_USE_BEDROCK",
+                "CLAUDE_CODE_USE_VERTEX",
+                "CLAUDE_CODE_USE_FOUNDRY",
+                "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+                "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+                "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+            }
+            environment = {
+                k: v
+                for k, v in os.environ.items()
+                if k in allowed_vars or not any(k.startswith(p) for p in blocked_prefixes)
+            }
             environment["CAO_TERMINAL_ID"] = terminal_id
 
             session = self.server.new_session(
@@ -392,6 +414,22 @@ class TmuxClient:
             return False
         except Exception as e:
             logger.error(f"Failed to kill session {session_name}: {e}")
+            return False
+
+    def kill_window(self, session_name: str, window_name: str) -> bool:
+        """Kill a specific tmux window within a session."""
+        try:
+            session = self.server.sessions.get(session_name=session_name)
+            if not session:
+                return False
+            window = session.windows.get(window_name=window_name)
+            if window:
+                window.kill()
+                logger.info(f"Killed tmux window: {session_name}:{window_name}")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Failed to kill window {session_name}:{window_name}: {e}")
             return False
 
     def session_exists(self, session_name: str) -> bool:

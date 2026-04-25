@@ -192,7 +192,7 @@ class TestLogFileHandler:
 
         handler.on_modified(event)
 
-        mock_check_send.assert_called_once_with("test-terminal")
+        mock_check_send.assert_called_once_with("test-terminal", registry=None)
 
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_handle_log_change_no_pending_messages(self, mock_get_messages):

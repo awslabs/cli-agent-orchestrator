@@ -65,6 +65,26 @@ class TestBaseProvider:
             provider._update_status(status)
             assert provider.status == status
 
+    def test_apply_skill_prompt_appends(self):
+        """Test _apply_skill_prompt appends skill text to base prompt."""
+        provider = ConcreteProvider(
+            "term-123", "session-1", "window-0", skill_prompt="## Skills\n- skill1"
+        )
+        result = provider._apply_skill_prompt("Base prompt")
+        assert result == "Base prompt\n\n## Skills\n- skill1"
+
+    def test_apply_skill_prompt_no_skill(self):
+        """Test _apply_skill_prompt returns original when no skill_prompt."""
+        provider = ConcreteProvider("term-123", "session-1", "window-0")
+        result = provider._apply_skill_prompt("Base prompt")
+        assert result == "Base prompt"
+
+    def test_apply_skill_prompt_empty_base(self):
+        """Test _apply_skill_prompt with empty base and skill_prompt present."""
+        provider = ConcreteProvider("term-123", "session-1", "window-0", skill_prompt="## Skills")
+        result = provider._apply_skill_prompt("")
+        assert result == "## Skills"
+
     def test_abstract_methods_implemented(self):
         """Test that concrete implementation works."""
         provider = ConcreteProvider("term-123", "session-1", "window-0")
