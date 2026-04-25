@@ -103,6 +103,7 @@ Before using CAO, install at least one supported CLI agent tool:
 | **Gemini CLI** | [Provider docs](docs/gemini-cli.md) · [Installation](https://github.com/google-gemini/gemini-cli) | Google AI API key |
 | **Kimi CLI** | [Provider docs](docs/kimi-cli.md) · [Installation](https://platform.moonshot.cn/docs/kimi-cli) | Moonshot API key |
 | **GitHub Copilot CLI** | [Provider docs](docs/copilot-cli.md) · [Installation](https://github.com/features/copilot/cli) | GitHub auth |
+| **OpenCode CLI** *(experimental — single-agent only, [#203](https://github.com/awslabs/cli-agent-orchestrator/issues/203))* | [Provider docs](docs/opencode-cli.md) · [Installation](https://opencode.ai) | Per-model API key |
 | **Q CLI** | [Installation](https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/command-line.html) | AWS credentials |
 
 ## Quick Start
@@ -151,6 +152,7 @@ cao launch --agents code_supervisor --provider codex
 cao launch --agents code_supervisor --provider gemini_cli
 cao launch --agents code_supervisor --provider kimi_cli
 cao launch --agents code_supervisor --provider copilot_cli
+cao launch --agents code_supervisor --provider opencode_cli
 # Unrestricted access + skip confirmation (DANGEROUS)
 cao launch --agents code_supervisor --yolo
 ```
@@ -194,6 +196,41 @@ cao shutdown --session <session-name>
 **List all windows (Ctrl+b, w):**
 
 ![Tmux Window Selector](./docs/assets/tmux_all_windows.png)
+
+
+## Session Management
+
+CAO provides CLI commands for managing sessions programmatically — useful for scripting, CI pipelines, or headless operation.
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `cao session list` | List active sessions |
+| `cao session status <name>` | Show conductor status and last output |
+| `cao session status <name> --workers` | Include worker terminal statuses |
+| `cao session send <name> "msg"` | Send message and wait for completion |
+| `cao session send <name> "msg" --async` | Fire-and-forget without waiting |
+| `cao session send <name> "msg" --timeout N` | Wait up to N seconds |
+| `cao shutdown --session <name>` | Shut down a session |
+
+### Headless Launch
+
+```bash
+cao launch --agents supervisor --headless --yolo \
+  --session-name my-task --working-directory '/path/to/project' "Your task here"
+```
+
+Add `--async` to send the message and return immediately without waiting for completion:
+
+```bash
+cao launch --agents supervisor --headless --async --yolo \
+  --session-name my-task --working-directory '/path/to/project' "Your task here"
+```
+
+> **Note:** Session names are automatically prefixed with `cao-`. Use the prefixed form (e.g., `cao-my-task`) when referencing sessions in commands like `cao session send` and `cao shutdown`.
+
+For full details, see the [Session Management skill](skills/cao-session-management/SKILL.md).
 
 ## Web UI
 
