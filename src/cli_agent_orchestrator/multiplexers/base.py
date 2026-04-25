@@ -104,9 +104,14 @@ class BaseMultiplexer(ABC):
         #   2. SafeAccessCheck (startswith guard) → sanitized
         # CodeQL recognizes str.startswith() as a SafeAccessCheck; when
         # the true branch flows to filesystem ops, the path is cleared.
-        # The "/" prefix is always true after realpath(), but this
-        # explicit guard satisfies CodeQL and rejects relative paths.
-        if not real_path.startswith("/"):
+        # Both prefixes are always true after realpath() on their respective
+        # platforms; the explicit guard satisfies CodeQL and rejects relative
+        # paths. Unix uses "/"; Windows drive paths look like "C:\..." after
+        # abspath/realpath, so the second clause covers Win32.
+        if not (
+            real_path.startswith("/")
+            or (len(real_path) >= 3 and real_path[1:3] == ":\\")
+        ):
             raise ValueError(f"Working directory must be an absolute path: {working_directory}")
 
         # Step 3: Block sensitive system directories.
