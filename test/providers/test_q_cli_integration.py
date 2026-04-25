@@ -2,6 +2,7 @@
 
 import json
 import shutil
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -414,6 +415,10 @@ class TestQCliProviderHandoffIntegration:
             tmux_client.kill_session(test_session_name)
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Requires a running tmux server; tmux is not available on Windows",
+)
 class TestQCliProviderWorkingDirectory:
     """Integration tests for working directory functionality."""
 
@@ -464,6 +469,10 @@ class TestQCliProviderWorkingDirectory:
 
         assert actual_dir == str(subdir.resolve())
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="Creating symlinks on Windows requires Developer Mode or elevated privileges",
+    )
     def test_symlink_resolution(self, test_session_name, cleanup_session, home_tmp_path):
         """Test that symlinks are resolved to real paths."""
         # Create real directory and symlink
