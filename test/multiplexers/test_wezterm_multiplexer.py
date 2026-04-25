@@ -13,8 +13,11 @@ import pytest
 from cli_agent_orchestrator.multiplexers.base import LaunchSpec
 from cli_agent_orchestrator.multiplexers.wezterm import (
     WezTermMultiplexer,
+    _default_runner,
     _default_shell,
+    _normalize_wezterm_bin,
     _ps_single_quote,
+    _resolve_powershell_bin,
 )
 
 
@@ -220,12 +223,17 @@ class TestCreateSession:
 
         argv = calls[0]
         wrapped = argv[argv.index("--") + 1 :]
-        shell = _default_shell()
         if platform == "win32":
+            # No-LaunchSpec path on Windows must NOT spawn a child shell.
+            # Single pwsh with -NoExit sets env and stays interactive.
+            assert "-NoExit" in wrapped
             command = wrapped[wrapped.index("-Command") + 1]
-            assert _ps_single_quote(shell) in command
             assert "$env:CAO_TERMINAL_ID='tid'" in command
+            # No `& 'shell' @args` invocation — only env-set statements.
+            assert "& " not in command
+            assert "@args" not in command
         else:
+            shell = _default_shell()
             env_sep = wrapped.index("--")
             assert wrapped[env_sep + 1 :] == [shell]
             assert "CAO_TERMINAL_ID=tid" in wrapped
@@ -235,6 +243,9 @@ class TestCreateSession:
 
     def test_windows_powershell_invocation_shape(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sys, "platform", "win32")
+        # Pin the resolved PowerShell binary so this test is deterministic
+        # regardless of whether pwsh is installed on the test host.
+        monkeypatch.setenv("CAO_POWERSHELL_BIN", "powershell.exe")
         calls: list[list[str]] = []
 
         def runner(argv, env=None):
@@ -898,3 +909,186 @@ class TestPipePane:
         fake_runner.queue_responses(["hello\n"])
         multiplexer.pipe_pane("sess", "win", str(path))
         multiplexer.stop_pipe_pane("sess", "win")
+
+
+class TestNormalizeWezTermBin:
+    """``wezterm-gui`` lacks the ``cli`` subcommand — it must be rewritten
+    to its CLI sibling at construction time so users who set
+    ``WEZTERM_EXECUTABLE`` to the GUI binary still get a working multiplexer.
+    """
+
+    def test_bare_gui_exe_rewritten(self):
+        assert _normalize_wezterm_bin("wezterm-gui.exe") == "wezterm.exe"
+
+    def test_bare_gui_unix_rewritten(self):
+        assert _normalize_wezterm_bin("wezterm-gui") == "wezterm"
+
+    def test_windows_path_rewritten_preserving_directory(self):
+        from pathlib import Path
+
+        result = _normalize_wezterm_bin(r"C:\Tools\WezTerm\wezterm-gui.exe")
+        assert Path(result) == Path(r"C:\Tools\WezTerm\wezterm.exe")
+
+    def test_unix_path_rewritten_preserving_directory(self):
+        from pathlib import Path
+
+        result = _normalize_wezterm_bin("/usr/local/bin/wezterm-gui")
+        assert Path(result) == Path("/usr/local/bin/wezterm")
+
+    def test_match_is_case_insensitive(self):
+        from pathlib import Path
+
+        # Windows users may have mixed-case file names
+        result = _normalize_wezterm_bin("WEZTERM-GUI.EXE")
+        # Output is the canonical lowercase form; FS lookup is case-insensitive on win32
+        assert Path(result).name.lower() == "wezterm.exe"
+
+    def test_already_cli_binary_unchanged(self):
+        assert _normalize_wezterm_bin("wezterm.exe") == "wezterm.exe"
+        assert _normalize_wezterm_bin("wezterm") == "wezterm"
+        assert (
+            _normalize_wezterm_bin(r"C:\Tools\WezTerm\wezterm.exe")
+            == r"C:\Tools\WezTerm\wezterm.exe"
+        )
+
+    def test_unrelated_binary_unchanged(self):
+        assert _normalize_wezterm_bin("/opt/bin/something-else") == "/opt/bin/something-else"
+
+    def test_mux_server_binary_unchanged(self):
+        # wezterm-mux-server is a distinct binary, not the GUI — leave it alone.
+        from pathlib import Path
+
+        result = _normalize_wezterm_bin(r"C:\Tools\WezTerm\wezterm-mux-server.exe")
+        assert Path(result) == Path(r"C:\Tools\WezTerm\wezterm-mux-server.exe")
+
+    def test_constructor_normalizes_explicit_wezterm_bin(self):
+        from pathlib import Path
+
+        mux = WezTermMultiplexer(
+            runner=lambda argv, env=None: _spawn_result(),
+            wezterm_bin=r"C:\Tools\WezTerm\wezterm-gui.exe",
+        )
+        assert Path(mux._bin) == Path(r"C:\Tools\WezTerm\wezterm.exe")
+
+    def test_constructor_normalizes_env_var(self, monkeypatch):
+        from pathlib import Path
+
+        monkeypatch.setenv(
+            "WEZTERM_EXECUTABLE", r"C:\Tools\WezTerm\wezterm-gui.exe"
+        )
+        mux = WezTermMultiplexer(runner=lambda argv, env=None: _spawn_result())
+        assert Path(mux._bin) == Path(r"C:\Tools\WezTerm\wezterm.exe")
+
+    def test_constructor_logs_warning_on_rewrite(self, monkeypatch, caplog):
+        import logging
+
+        monkeypatch.setenv(
+            "WEZTERM_EXECUTABLE", r"C:\Tools\WezTerm\wezterm-gui.exe"
+        )
+        with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.multiplexers.wezterm"):
+            WezTermMultiplexer(runner=lambda argv, env=None: _spawn_result())
+        assert any("GUI binary" in rec.message for rec in caplog.records)
+
+    def test_constructor_no_warning_when_already_cli(self, monkeypatch, caplog):
+        import logging
+
+        monkeypatch.setenv("WEZTERM_EXECUTABLE", "wezterm.exe")
+        with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.multiplexers.wezterm"):
+            WezTermMultiplexer(runner=lambda argv, env=None: _spawn_result())
+        assert not any("GUI binary" in rec.message for rec in caplog.records)
+
+
+class TestDefaultRunner:
+    """The default subprocess runner must force UTF-8 decoding so wezterm
+    output (UTF-8 by default) does not crash subprocess._readerthread when
+    Python's locale codepage is cp1252 (the Windows default)."""
+
+    def test_runner_uses_utf8_with_replace_errors(self, monkeypatch):
+        captured: dict = {}
+
+        def fake_run(args, **kwargs):
+            captured["args"] = args
+            captured.update(kwargs)
+            return _make_result(stdout="ok\n")
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.multiplexers.wezterm.subprocess.run", fake_run
+        )
+        _default_runner(["wezterm", "cli", "list"])
+
+        assert captured["text"] is True
+        assert captured["encoding"] == "utf-8"
+        assert captured["errors"] == "replace"
+        assert captured["capture_output"] is True
+        assert captured["check"] is False
+        assert captured["args"] == ["wezterm", "cli", "list"]
+
+    def test_runner_survives_non_cp1252_bytes_end_to_end(self):
+        """Integration: spawn a real subprocess that writes raw 0x9d (the byte
+        that crashed cao-server) and verify the runner decodes successfully."""
+        # 0x9d is unmapped in cp1252; with text=True and locale encoding it
+        # would raise UnicodeDecodeError. With UTF-8 + replace it becomes U+FFFD.
+        script = (
+            "import sys; sys.stdout.buffer.write(b'pre\\x9dpost'); sys.stdout.flush()"
+        )
+        result = _default_runner([sys.executable, "-c", script])
+        assert result.returncode == 0
+        assert result.stdout.startswith("pre")
+        assert result.stdout.endswith("post")
+
+
+class TestResolvePowerShellBin:
+    """The env-injection wrapper on Windows must prefer pwsh.exe (UTF-8)
+    over powershell.exe (cp1252-bound on non-English Windows)."""
+
+    def test_explicit_override_wins(self, monkeypatch):
+        monkeypatch.setenv("CAO_POWERSHELL_BIN", r"C:\custom\my-pwsh.exe")
+        assert _resolve_powershell_bin() == r"C:\custom\my-pwsh.exe"
+
+    def test_override_takes_precedence_over_pwsh_on_path(self, monkeypatch):
+        monkeypatch.setenv("CAO_POWERSHELL_BIN", "forced.exe")
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.multiplexers.wezterm.shutil.which",
+            lambda name: r"C:\Program Files\PowerShell\7\pwsh.exe",
+        )
+        assert _resolve_powershell_bin() == "forced.exe"
+
+    def test_prefers_pwsh_when_available(self, monkeypatch):
+        monkeypatch.delenv("CAO_POWERSHELL_BIN", raising=False)
+
+        def fake_which(name: str):
+            if name in ("pwsh", "pwsh.exe"):
+                return r"C:\Program Files\PowerShell\7\pwsh.exe"
+            return None
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.multiplexers.wezterm.shutil.which", fake_which
+        )
+        assert _resolve_powershell_bin() == r"C:\Program Files\PowerShell\7\pwsh.exe"
+
+    def test_falls_back_to_windows_powershell_when_pwsh_missing(self, monkeypatch):
+        monkeypatch.delenv("CAO_POWERSHELL_BIN", raising=False)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.multiplexers.wezterm.shutil.which", lambda _name: None
+        )
+        assert _resolve_powershell_bin() == "powershell.exe"
+
+    def test_wrap_with_env_uses_resolved_bin_on_win32(self, monkeypatch):
+        from cli_agent_orchestrator.multiplexers.wezterm import _wrap_with_env
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setenv("CAO_POWERSHELL_BIN", "my-pwsh.exe")
+        wrapped = _wrap_with_env({"CAO_TERMINAL_ID": "tid"}, ["claude.cmd"])
+        assert wrapped[0] == "my-pwsh.exe"
+        assert wrapped[1:4] == ["-NoLogo", "-NoProfile", "-Command"]
+
+    def test_default_shell_on_win32_is_powershell_not_cmd(self, monkeypatch):
+        """Regression: COMSPEC (cmd.exe) must NOT be the pane's inner shell.
+        The PowerShell wrapper exists only to inject env vars; the inner
+        shell the agent sees should be pwsh/powershell so the user isn't
+        dropped into cmd.exe."""
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setenv("COMSPEC", r"C:\Windows\System32\cmd.exe")
+        monkeypatch.setenv("CAO_POWERSHELL_BIN", "pwsh.exe")
+        assert _default_shell() == "pwsh.exe"
+        assert "cmd.exe" not in _default_shell().lower()

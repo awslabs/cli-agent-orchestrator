@@ -383,3 +383,19 @@ Stretch:
 - Non-tmux, non-WezTerm backends.
 - Gemini WezTerm MVP wiring unless the binary/runtime blocker clears quickly during Phase 3.
 - UX-only tmux attachment commands in CLI/API paths (`attach-session`, `display-message`) beyond what is needed to keep the core agent orchestration working.
+
+## 10. Phase 2 follow-ups (deferred, must fix proper)
+- **`api/main.py::terminal_ws` is tmux-only.** The WebSocket terminal-stream
+  endpoint imports `fcntl`/`pty`/`termios` and shells out to
+  `tmux -u attach-session`, reading `metadata["tmux_session"]` /
+  `metadata["tmux_window"]`. As of the Layer-1 stopgap (this branch) the
+  Unix-only imports are lazy and a `4501` close is returned on Windows so
+  `cao-server` can boot. Proper fix:
+  1. Route through the `BaseMultiplexer` abstraction (new
+     `attach_stream(terminal_id) -> AsyncIterable[bytes]` or similar).
+  2. Implement for `TmuxMultiplexer` using the existing PTY+attach path.
+  3. For `WezTermMultiplexer`: decide between
+     (a) no-op + clean 501 (panes are already the user's GUI, no need to
+     stream) or (b) `wezterm cli get-text` polling fallback for the Web UI.
+  4. Drop the `sys.platform == "win32"` short-circuit once (1)–(3) land.
+  Tracked as the immediate sequel to current Phase 2 multiplexer work.

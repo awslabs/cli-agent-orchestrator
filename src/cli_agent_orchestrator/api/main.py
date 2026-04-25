@@ -1,15 +1,13 @@
 """Single FastAPI entry point for all HTTP routes."""
 
 import asyncio
-import fcntl
 import json
 import logging
 import os
-import pty
 import signal
 import struct
 import subprocess
-import termios
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Dict, List, Optional, cast
@@ -653,6 +651,24 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
         return
 
     await websocket.accept()
+
+    # PRJ-042 Layer-1 stopgap: this endpoint is a tmux-attach-over-PTY
+    # bridge that requires fcntl/pty/termios (Unix-only) and a tmux
+    # session under the hood. Under the WezTerm multiplexer there is
+    # no equivalent attach-into-PTY model. Short-circuit on Windows
+    # so the rest of cao-server can run; proper multiplexer-aware
+    # streaming is tracked as a Phase 2 follow-up in
+    # docs/PLAN-phase2.md §9.
+    if sys.platform == "win32":
+        await websocket.close(
+            code=4501,
+            reason="Terminal WS streaming is tmux-only and not implemented on Windows",
+        )
+        return
+
+    import fcntl
+    import pty
+    import termios
 
     metadata = get_terminal_metadata(terminal_id)
     if not metadata:

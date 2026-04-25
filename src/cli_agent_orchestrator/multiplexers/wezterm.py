@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -64,14 +66,33 @@ class _PollerState:
 def _default_runner(
     argv: Sequence[str], env: Optional[Mapping[str, str]] = None
 ) -> subprocess.CompletedProcess[str]:
+    # WezTerm CLI emits UTF-8 (Rust). Without explicit encoding, Python's
+    # subprocess reader thread uses the locale codepage (cp1252 on Windows),
+    # which crashes with UnicodeDecodeError on any non-Latin-1 byte such as
+    # box-drawing characters in pane snapshots. Force UTF-8 with replacement
+    # so the multiplexer never dies on a stray byte.
     return subprocess.run(
-        list(argv), env=env, capture_output=True, text=True, check=False
+        list(argv),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        encoding="utf-8",
+        errors="replace",
     )
 
 
 def _default_shell() -> str:
+    """Return the shell to spawn inside a wezterm pane when no LaunchSpec
+    is given. On Windows we deliberately do *not* return ``COMSPEC``
+    (= ``cmd.exe``); we prefer pwsh.exe (or Windows PowerShell) so the
+    pane the user/agent sees is a modern UTF-8 shell. The PowerShell
+    wrapper that injects ``CAO_TERMINAL_ID`` exists only because WezTerm's
+    ``cli spawn --set-environment`` is broken upstream — it should not
+    be exposing a cmd.exe child to the agent on top of that.
+    """
     if sys.platform == "win32":
-        return os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
+        return _resolve_powershell_bin()
     return os.environ.get("SHELL", "/bin/sh")
 
 
@@ -80,29 +101,100 @@ def _ps_single_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def _wrap_with_env(env_vars: Mapping[str, str], argv: Sequence[str]) -> list[str]:
+def _resolve_powershell_bin() -> str:
+    """Pick the PowerShell binary used to wrap WezTerm CLI spawns on Windows.
+
+    Prefers PowerShell 7+ (``pwsh.exe``) over Windows PowerShell 5.1
+    (``powershell.exe``). PS 7+ defaults to UTF-8, while PS 5.1 follows
+    the locale codepage (cp1252 on Spanish Windows etc.) which mangles
+    non-ASCII characters in env values, paste payloads, and provider
+    output. Honors ``CAO_POWERSHELL_BIN`` for explicit override.
+    """
+    override = os.environ.get("CAO_POWERSHELL_BIN")
+    if override:
+        return override
+    pwsh = shutil.which("pwsh") or shutil.which("pwsh.exe")
+    if pwsh:
+        return pwsh
+    return "powershell.exe"
+
+
+_GUI_BASENAME = re.compile(r"(?i)^wezterm-gui(\.exe)?$")
+
+
+def _normalize_wezterm_bin(bin_path: str) -> str:
+    """Rewrite a ``wezterm-gui[.exe]`` path to its CLI sibling ``wezterm[.exe]``.
+
+    The WezTerm distribution ships two binaries side-by-side: ``wezterm.exe``
+    (multiplexer with the ``cli`` subcommand) and ``wezterm-gui.exe`` (the GUI
+    front-end which does *not* expose ``cli``). Users frequently set
+    ``WEZTERM_EXECUTABLE`` to the GUI binary because the GUI is what they
+    launch interactively, but ``wezterm cli spawn ...`` only works against
+    ``wezterm.exe``. Rewriting here turns a confusing ``WinError 2`` /
+    ``unrecognized subcommand 'cli'`` into a no-op at construction time.
+    """
+    p = Path(bin_path)
+    new_name = _GUI_BASENAME.sub(r"wezterm\1", p.name)
+    if new_name == p.name:
+        return bin_path
+    return str(p.with_name(new_name))
+
+
+def _wrap_with_env(
+    env_vars: Mapping[str, str], argv: Optional[Sequence[str]]
+) -> list[str]:
+    """Build a wezterm-cli-spawn target argv that injects ``env_vars`` and
+    then either runs ``argv`` (when given) or stays as an interactive shell
+    (when ``argv`` is None).
+
+    The wrapper exists only because ``wezterm cli spawn --set-environment``
+    is a no-op (upstream wezterm/wezterm#6565). Without this trampoline,
+    ``CAO_TERMINAL_ID`` and any provider-supplied launch env would be
+    silently dropped. We deliberately keep it to a *single* shell layer:
+
+    * Windows + interactive: ``pwsh -NoExit -Command "<env-set>"`` — one
+      pwsh process becomes the pane shell.
+    * Windows + target argv: ``pwsh -Command "<env-set>; & '<exe>' <args>"``
+      — one pwsh execs the target; pane closes when the target exits.
+    * Unix: ``env K=V -- <argv-or-shell>`` — ``env`` exec-replaces, so the
+      actual target/shell is pane PID 1.
+    """
     if sys.platform == "win32":
-        exe = argv[0]
-        args = list(argv[1:])
         env_steps = [
             f"$env:{key}={_ps_single_quote(value)}" for key, value in env_vars.items()
         ]
+        ps_bin = _resolve_powershell_bin()
+        if not argv:
+            # Interactive shell — same pwsh sets env and stays alive.
+            env_command = "; ".join(env_steps) if env_steps else ""
+            return [
+                ps_bin,
+                "-NoLogo",
+                "-NoProfile",
+                "-NoExit",
+                "-Command",
+                env_command,
+            ]
+        # Target argv — pwsh sets env then execs target; exits on target exit.
+        exe = argv[0]
+        args = list(argv[1:])
         ps_args = ",".join(_ps_single_quote(arg) for arg in args)
         command_parts = [f"{step};" for step in env_steps]
         command_parts.append(f"$args=@({ps_args}); " if args else "$args=@(); ")
         command_parts.append(f"& {_ps_single_quote(exe)} @args")
         return [
-            "powershell.exe",
+            ps_bin,
             "-NoLogo",
             "-NoProfile",
             "-Command",
             "".join(command_parts),
         ]
 
+    target = list(argv) if argv else [_default_shell()]
     wrapped = ["env"]
     wrapped.extend(f"{key}={value}" for key, value in env_vars.items())
     wrapped.append("--")
-    wrapped.extend(argv)
+    wrapped.extend(target)
     return wrapped
 
 
@@ -132,7 +224,18 @@ class WezTermMultiplexer(BaseMultiplexer):
         clock_sleep: Optional[Callable[[float], None]] = None,
     ) -> None:
         self._run: WezTermRunner = runner or _default_runner
-        self._bin: str = wezterm_bin or os.environ.get("WEZTERM_EXECUTABLE") or "wezterm"
+        resolved_bin = wezterm_bin or os.environ.get("WEZTERM_EXECUTABLE") or "wezterm"
+        normalized_bin = _normalize_wezterm_bin(resolved_bin)
+        if normalized_bin != resolved_bin:
+            logger.warning(
+                "WEZTERM_EXECUTABLE points to the GUI binary (%s); "
+                "rewriting to its CLI sibling %s. wezterm-gui has no `cli` "
+                "subcommand. Set WEZTERM_EXECUTABLE to the wezterm[.exe] "
+                "path to silence this warning.",
+                resolved_bin,
+                normalized_bin,
+            )
+        self._bin: str = normalized_bin
         self._sessions: dict[str, dict[str, str]] = {}
         self._pollers: dict[tuple[str, str], _PollerState] = {}
         self._poll_interval = poll_interval
@@ -158,10 +261,9 @@ class WezTermMultiplexer(BaseMultiplexer):
         if launch_spec is not None and launch_spec.env:
             env_vars.update(launch_spec.env)
 
+        target_argv: Optional[list[str]] = None
         if launch_spec is not None and launch_spec.argv:
             target_argv = list(launch_spec.argv)
-        else:
-            target_argv = [_default_shell()]
 
         wrapped = _wrap_with_env(env_vars, target_argv)
         cmd: list[str] = [
