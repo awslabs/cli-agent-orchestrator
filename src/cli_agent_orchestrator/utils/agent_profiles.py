@@ -20,8 +20,9 @@ def _validate_agent_name(agent_name: str) -> None:
         raise ValueError(f"Invalid agent name '{agent_name}': must not contain '/', '\\', or '..'")
 
 
-def _scan_directory(directory: Path, source_label: str, profiles: Dict[str, Dict]) -> None:
+def _scan_directory(directory: "Path | str", source_label: str, profiles: Dict[str, Dict]) -> None:
     """Scan a directory for agent profiles (.md files, .json files, or subdirectories)."""
+    directory = Path(directory)
     if not directory.exists():
         return
     for item in directory.iterdir():
@@ -115,8 +116,11 @@ def list_agent_profiles() -> List[Dict]:
         _scan_directory(path, label, profiles)
 
     # 4. Extra user-added directories
+    # Pass extra_dir as a raw string (not wrapped in Path) so callers that
+    # mock _scan_directory can compare the directory argument against the
+    # original string value regardless of platform path normalisation.
     for extra_dir in get_extra_agent_dirs():
-        _scan_directory(Path(extra_dir), "custom", profiles)
+        _scan_directory(extra_dir, "custom", profiles)
 
     return sorted(profiles.values(), key=lambda p: p["name"])
 
