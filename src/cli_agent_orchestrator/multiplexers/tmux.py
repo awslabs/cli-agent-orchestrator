@@ -125,8 +125,7 @@ class TmuxMultiplexer(BaseMultiplexer):
                 check=True,
             )
             self._pending_buffers[target] = buf_name
-            # Brief delay to let the TUI process the bracketed paste end sequence
-            # before sending Enter. Without this, some TUIs (e.g., Claude Code 2.x)
+            # Settle delay — without it, some TUIs (e.g., Claude Code 2.x)
             # swallow the Enter that immediately follows paste-buffer -p.
             time.sleep(0.3)
         except Exception as e:

@@ -66,8 +66,9 @@ def _get_log_tail(terminal_id: str, lines: int = 100) -> str:
                 read_size = min(block_size, position)
                 position -= read_size
                 log_file.seek(position)
-                buffer = log_file.read(read_size) + buffer
-                newline_count = buffer.count(b"\n")
+                new_block = log_file.read(read_size)
+                newline_count += new_block.count(b"\n")
+                buffer = new_block + buffer
 
         tail_text = buffer.decode("utf-8", errors="replace").replace("\r\n", "\n").replace(
             "\r", "\n"

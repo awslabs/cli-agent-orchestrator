@@ -14,19 +14,28 @@ from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider, Pro
 _PATCH_SETTINGS = patch.object(ClaudeCodeProvider, "_ensure_skip_bypass_prompt_setting")
 
 
+def _make_get_multiplexer_patch(mock_mux):
+    """Return a callable that get_multiplexer() calls will resolve to mock_mux."""
+    return lambda: mock_mux
+
+
 class TestClaudeCodeProviderInitialization:
     """Tests for ClaudeCodeProvider initialization."""
 
     @_PATCH_SETTINGS
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_initialize_success(self, mock_tmux, mock_wait_status, mock_wait_shell, _):
+    def test_initialize_success(self, mock_wait_status, mock_wait_shell, _, monkeypatch):
         """Test successful initialization."""
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
         # First call is the pre-launch snapshot, subsequent calls return Claude output
-        mock_tmux.get_history.side_effect = [
+        mock_mux.get_history.side_effect = [
             "",
             "Welcome to Claude Code v2.0",
             "Welcome to Claude Code v2.0",
@@ -39,12 +48,16 @@ class TestClaudeCodeProviderInitialization:
         assert result is True
         assert provider._initialized is True
         mock_wait_shell.assert_called_once()
-        mock_tmux.send_keys.assert_called_once()
+        mock_mux.send_keys.assert_called_once()
 
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_initialize_shell_timeout(self, mock_tmux, mock_wait_shell):
+    def test_initialize_shell_timeout(self, mock_wait_shell, monkeypatch):
         """Test initialization with shell timeout."""
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
         mock_wait_shell.return_value = False
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
@@ -55,13 +68,17 @@ class TestClaudeCodeProviderInitialization:
     @_PATCH_SETTINGS
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_initialize_timeout(self, mock_tmux, mock_wait_status, mock_wait_shell, _):
+    def test_initialize_timeout(self, mock_wait_status, mock_wait_shell, _, monkeypatch):
         """Test initialization timeout when no Claude markers appear."""
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = False
         # Snapshot and loop return the same content → no new Claude markers
-        mock_tmux.get_history.return_value = "some shell output"
+        mock_mux.get_history.return_value = "some shell output"
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
 
@@ -77,14 +94,18 @@ class TestClaudeCodeProviderInitialization:
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
     def test_initialize_with_agent_profile(
-        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load, _
+        self, mock_wait_status, mock_wait_shell, mock_load, _, monkeypatch
     ):
         """Test initialization with agent profile."""
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
-        mock_tmux.get_history.side_effect = [
+        mock_mux.get_history.side_effect = [
             "",
             "Welcome to Claude Code v2.0",
             "Welcome to Claude Code v2.0",
@@ -105,9 +126,13 @@ class TestClaudeCodeProviderInitialization:
     @_PATCH_SETTINGS
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_initialize_with_invalid_agent_profile(self, mock_tmux, mock_load, mock_wait_shell, _):
+    def test_initialize_with_invalid_agent_profile(self, mock_load, mock_wait_shell, _, monkeypatch):
         """Test initialization with invalid agent profile."""
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
         mock_wait_shell.return_value = True
         mock_load.side_effect = FileNotFoundError("Profile not found")
 
@@ -120,14 +145,18 @@ class TestClaudeCodeProviderInitialization:
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
     def test_initialize_with_mcp_servers(
-        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load, _
+        self, mock_wait_status, mock_wait_shell, mock_load, _, monkeypatch
     ):
         """Test initialization with MCP servers in profile."""
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
-        mock_tmux.get_history.side_effect = [
+        mock_mux.get_history.side_effect = [
             "",
             "Welcome to Claude Code v2.0",
             "Welcome to Claude Code v2.0",
@@ -147,12 +176,16 @@ class TestClaudeCodeProviderInitialization:
     @_PATCH_SETTINGS
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_initialize_sends_claude_command(self, mock_tmux, mock_wait_status, mock_wait_shell, _):
-        """Test that initialize sends the 'claude' command to tmux."""
+    def test_initialize_sends_claude_command(self, mock_wait_status, mock_wait_shell, _, monkeypatch):
+        """Test that initialize sends the 'claude' command to the multiplexer."""
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
-        mock_tmux.get_history.side_effect = [
+        mock_mux.get_history.side_effect = [
             "",
             "Welcome to Claude Code v2.0",
             "Welcome to Claude Code v2.0",
@@ -162,7 +195,7 @@ class TestClaudeCodeProviderInitialization:
         with patch.object(provider, "get_status", return_value=TerminalStatus.IDLE):
             provider.initialize()
 
-        call_args = mock_tmux.send_keys.call_args
+        call_args = mock_mux.send_keys.call_args
         assert call_args[0][0] == "test-session"
         assert call_args[0][1] == "window-0"
         assert "claude --dangerously-skip-permissions" in call_args[0][2]
@@ -171,30 +204,42 @@ class TestClaudeCodeProviderInitialization:
 class TestClaudeCodeProviderStatusDetection:
     """Tests for ClaudeCodeProvider status detection."""
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_idle_old_prompt(self, mock_tmux):
+    def test_get_status_idle_old_prompt(self, monkeypatch):
         """Test IDLE status detection with old '>' prompt."""
-        mock_tmux.get_history.return_value = "> "
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = "> "
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         status = provider.get_status()
 
         assert status == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_idle_new_prompt(self, mock_tmux):
+    def test_get_status_idle_new_prompt(self, monkeypatch):
         """Test IDLE status detection with new '❯' prompt."""
-        mock_tmux.get_history.return_value = "❯ "
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = "❯ "
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         status = provider.get_status()
 
         assert status == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_idle_with_ansi_codes(self, mock_tmux):
+    def test_get_status_idle_with_ansi_codes(self, monkeypatch):
         """Test IDLE status detection with ANSI codes around prompt."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "\x1b[2m\x1b[38;2;136;136;136m────────────\n"
             '\x1b[0m❯ \x1b[7mT\x1b[0;2mry\x1b[0m \x1b[2m"hello"\x1b[0m\n'
             "\x1b[2m\x1b[38;2;136;136;136m────────────\x1b[0m"
@@ -205,50 +250,70 @@ class TestClaudeCodeProviderStatusDetection:
 
         assert status == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_completed(self, mock_tmux):
+    def test_get_status_completed(self, monkeypatch):
         """Test COMPLETED status detection."""
-        mock_tmux.get_history.return_value = "⏺ Here is the response\n> "
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = "⏺ Here is the response\n> "
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         status = provider.get_status()
 
         assert status == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_completed_with_new_prompt(self, mock_tmux):
+    def test_get_status_completed_with_new_prompt(self, monkeypatch):
         """Test COMPLETED status detection with new '❯' prompt."""
-        mock_tmux.get_history.return_value = "⏺ Here is the response\n❯ "
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = "⏺ Here is the response\n❯ "
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         status = provider.get_status()
 
         assert status == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_processing(self, mock_tmux):
+    def test_get_status_processing(self, monkeypatch):
         """Test PROCESSING status detection."""
-        mock_tmux.get_history.return_value = "✶ Processing… (esc to interrupt)"
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = "✶ Processing… (esc to interrupt)"
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         status = provider.get_status()
 
         assert status == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_processing_minimal_spinner(self, mock_tmux):
+    def test_get_status_processing_minimal_spinner(self, monkeypatch):
         """Test PROCESSING detection with minimal spinner format (no parenthesized text)."""
-        mock_tmux.get_history.return_value = "✻ Orbiting…"
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = "✻ Orbiting…"
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         status = provider.get_status()
 
         assert status == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_processing_beats_stale_completed(self, mock_tmux):
+    def test_get_status_processing_beats_stale_completed(self, monkeypatch):
         """Test that PROCESSING is detected even when stale ⏺ and ❯ markers are in scrollback."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "⏺ Previous response from init\n"
             "❯ user task message\n"
             "⏺ Let me read the file\n"
@@ -260,10 +325,14 @@ class TestClaudeCodeProviderStatusDetection:
 
         assert status == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_completed_despite_stale_spinner_in_scrollback(self, mock_tmux):
+    def test_get_status_completed_despite_stale_spinner_in_scrollback(self, monkeypatch):
         """Stale spinner in scrollback must not block COMPLETED detection (#104)."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "✻ Orbiting…\n"
             "⏺ Previous response\n"
             "❯ user sent new task\n"
@@ -274,20 +343,28 @@ class TestClaudeCodeProviderStatusDetection:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         assert provider.get_status() == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_idle_despite_stale_spinner_in_scrollback(self, mock_tmux):
+    def test_get_status_idle_despite_stale_spinner_in_scrollback(self, monkeypatch):
         """Stale spinner in scrollback must not block IDLE detection (#104)."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "✶ Processing… (esc to interrupt)\n" "Some previous output\n" "❯ "
         )
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         assert provider.get_status() == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_processing_spinner_before_separator(self, mock_tmux):
+    def test_get_status_processing_spinner_before_separator(self, monkeypatch):
         """Spinner immediately before ──────── separator → PROCESSING (structural check)."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "❯ do the task\n"
             "⏺ Let me read the file\n"
             "✢ Thinking…\n"
@@ -298,19 +375,27 @@ class TestClaudeCodeProviderStatusDetection:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         assert provider.get_status() == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_completed_no_spinner_before_separator(self, mock_tmux):
+    def test_get_status_completed_no_spinner_before_separator(self, monkeypatch):
         """Response text (no spinner) before separator → COMPLETED, not PROCESSING."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "❯ do the task\n" "⏺ Here is the completed response\n" "────────────────────────\n" "❯ "
         )
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         assert provider.get_status() == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_stale_spinner_far_back_not_processing(self, mock_tmux):
+    def test_get_status_stale_spinner_far_back_not_processing(self, monkeypatch):
         """Stale spinner far back in scrollback + current separator with no spinner → COMPLETED."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "✢ Thinking…\n"
             "⏺ Old response from first task line 1\n"
             "Old response from first task line 2\n"
@@ -325,17 +410,25 @@ class TestClaudeCodeProviderStatusDetection:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         assert provider.get_status() == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_processing_no_separator_yet(self, mock_tmux):
+    def test_get_status_processing_no_separator_yet(self, monkeypatch):
         """Early execution with spinner but no separator yet → position fallback PROCESSING."""
-        mock_tmux.get_history.return_value = "✻ Orbiting…"
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = "✻ Orbiting…"
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         assert provider.get_status() == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_processing_ansi_separator(self, mock_tmux):
+    def test_get_status_processing_ansi_separator(self, monkeypatch):
         """Spinner before separator with ANSI colour codes on separator → PROCESSING."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "❯ do the task\n"
             "⏺ Reading file…\n"
             "✽ Cooking…\n"
@@ -346,19 +439,27 @@ class TestClaudeCodeProviderStatusDetection:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         assert provider.get_status() == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_processing_middle_dot_spinner(self, mock_tmux):
+    def test_get_status_processing_middle_dot_spinner(self, monkeypatch):
         """New · Swirling… spinner variant → PROCESSING via structural check."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "❯ do the task\n" "· Swirling…\n" "\n" "────────────────────────\n" "❯ "
         )
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         assert provider.get_status() == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_idle_not_false_processing_from_status_bar(self, mock_tmux):
+    def test_get_status_idle_not_false_processing_from_status_bar(self, monkeypatch):
         """Status bar '· latest:…' must not false-positive as PROCESSING."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "Claude Code v2.1.63\n"
             "────────────────────\n"
             "❯ \n"
@@ -368,10 +469,14 @@ class TestClaudeCodeProviderStatusDetection:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         assert provider.get_status() == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_waiting_user_answer(self, mock_tmux):
+    def test_get_status_waiting_user_answer(self, monkeypatch):
         """Test WAITING_USER_ANSWER status detection."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "❯ 1. Option one\n"
             "  2. Option two\n"
             "Enter to select · ↑/↓ to navigate · Esc to cancel"
@@ -382,10 +487,14 @@ class TestClaudeCodeProviderStatusDetection:
 
         assert status == TerminalStatus.WAITING_USER_ANSWER
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_stale_scrollback_not_waiting_user_answer(self, mock_tmux):
+    def test_get_status_stale_scrollback_not_waiting_user_answer(self, monkeypatch):
         """Stale numbered scrollback without the active footer must not block input."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "❯ 1. Option one\n" "  2. Option two\n" "⏺ Selection handled earlier\n" "❯ "
         )
 
@@ -395,40 +504,56 @@ class TestClaudeCodeProviderStatusDetection:
         assert status != TerminalStatus.WAITING_USER_ANSWER
         assert status == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_error_empty(self, mock_tmux):
+    def test_get_status_error_empty(self, monkeypatch):
         """Test ERROR status with empty output."""
-        mock_tmux.get_history.return_value = ""
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = ""
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         status = provider.get_status()
 
         assert status == TerminalStatus.ERROR
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_error_unrecognized(self, mock_tmux):
+    def test_get_status_error_unrecognized(self, monkeypatch):
         """Test ERROR status with unrecognized output."""
-        mock_tmux.get_history.return_value = "Some random output without patterns"
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = "Some random output without patterns"
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         status = provider.get_status()
 
         assert status == TerminalStatus.ERROR
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_with_tail_lines(self, mock_tmux):
+    def test_get_status_with_tail_lines(self, monkeypatch):
         """Test status detection with tail_lines parameter."""
-        mock_tmux.get_history.return_value = "> "
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = "> "
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         provider.get_status(tail_lines=50)
 
-        mock_tmux.get_history.assert_called_with("test-session", "window-0", tail_lines=50)
+        mock_mux.get_history.assert_called_with("test-session", "window-0", tail_lines=50)
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_completed_after_compaction_not_false_processing(self, mock_tmux):
+    def test_get_status_completed_after_compaction_not_false_processing(self, monkeypatch):
         """Compaction spinner before its own separator, then more output; last sep has no spinner → COMPLETED."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "❯ do the task\n"
             "⏺ Starting work…\n"
             "✢ Compacting conversation…\n"
@@ -440,10 +565,14 @@ class TestClaudeCodeProviderStatusDetection:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         assert provider.get_status() == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_processing_after_compaction_when_still_running(self, mock_tmux):
+    def test_get_status_processing_after_compaction_when_still_running(self, monkeypatch):
         """Spinner before the last separator (agent resumes after compaction) → PROCESSING."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "❯ do the task\n"
             "✢ Compacting conversation…\n"
             "────────────────────────\n"
@@ -455,10 +584,14 @@ class TestClaudeCodeProviderStatusDetection:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         assert provider.get_status() == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_completed_after_exit_not_false_processing(self, mock_tmux):
+    def test_get_status_completed_after_exit_not_false_processing(self, monkeypatch):
         """Spinner → sep (task done) → /exit → second sep; spinner NOT before last sep → not PROCESSING."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "❯ do the task\n"
             "⏺ Working on it…\n"
             "✻ Orbiting…\n"
@@ -691,45 +824,61 @@ class TestClaudeCodeProviderModelFlag:
 class TestClaudeCodeProviderStartupPrompts:
     """Tests for Claude Code startup prompt handling (trust + bypass)."""
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_handle_startup_prompts_detected_and_accepted(self, mock_tmux):
+    def test_handle_startup_prompts_detected_and_accepted(self, monkeypatch):
         """Test that trust prompt is detected and auto-accepted."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "\x1b[1m❯\x1b[0m 1. Yes, I trust this folder\n  2. No, don't trust\n"
         )
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         provider._handle_startup_prompts(timeout=2.0)
 
-        mock_tmux.send_special_key.assert_called_once_with("test-session", "window-0", "Enter")
+        mock_mux.send_special_key.assert_called_once_with("test-session", "window-0", "Enter")
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_handle_startup_prompts_not_needed(self, mock_tmux):
+    def test_handle_startup_prompts_not_needed(self, monkeypatch):
         """Test early return when Claude Code starts without prompts."""
-        mock_tmux.get_history.return_value = "Welcome to Claude Code v2.1.0"
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = "Welcome to Claude Code v2.1.0"
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         provider._handle_startup_prompts(timeout=2.0)
 
-        mock_tmux.server.sessions.get.assert_not_called()
+        mock_mux.send_special_key.assert_not_called()
 
-    @patch("cli_agent_orchestrator.providers.claude_code.time")
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_handle_startup_prompts_timeout(self, mock_tmux, mock_time):
+    def test_handle_startup_prompts_timeout(self, monkeypatch):
         """Test startup prompt handler times out gracefully."""
-        mock_tmux.get_history.return_value = "Loading..."
-        mock_time.time.side_effect = [0.0, 0.0, 25.0]
-        mock_time.sleep = MagicMock()
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        # Return output that matches no known prompt pattern so the loop runs
+        # until the timeout. Use a very short timeout so the test is fast.
+        mock_mux.get_history.return_value = "Loading..."
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider._handle_startup_prompts(timeout=20.0)
+        # Use a real tiny timeout — loop will exhaust immediately.
+        provider._handle_startup_prompts(timeout=0.01)
 
-        mock_tmux.send_special_key.assert_not_called()
+        mock_mux.send_special_key.assert_not_called()
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_handle_startup_prompts_empty_output_then_detected(self, mock_tmux):
+    def test_handle_startup_prompts_empty_output_then_detected(self, monkeypatch):
         """Test trust prompt detection after initially empty output."""
-        mock_tmux.get_history.side_effect = [
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.side_effect = [
             "",
             "❯ 1. Yes, I trust this folder\n  2. No",
         ]
@@ -737,13 +886,17 @@ class TestClaudeCodeProviderStartupPrompts:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         provider._handle_startup_prompts(timeout=5.0)
 
-        mock_tmux.send_special_key.assert_called_once_with("test-session", "window-0", "Enter")
+        mock_mux.send_special_key.assert_called_once_with("test-session", "window-0", "Enter")
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_handle_bypass_prompt_detected_and_accepted(self, mock_tmux):
+    def test_handle_bypass_prompt_detected_and_accepted(self, monkeypatch):
         """Test that bypass permissions prompt is detected and auto-accepted."""
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
         # First poll: bypass prompt; second poll: welcome banner (after dismissal)
-        mock_tmux.get_history.side_effect = [
+        mock_mux.get_history.side_effect = [
             "WARNING: Claude Code running in Bypass Permissions mode\n"
             "❯ 1. No, exit\n  2. Yes, I accept\n",
             "Welcome to Claude Code v2.1.74",
@@ -752,18 +905,22 @@ class TestClaudeCodeProviderStartupPrompts:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         provider._handle_startup_prompts(timeout=5.0)
 
-        calls = mock_tmux.send_special_key.call_args_list
+        calls = mock_mux.send_special_key.call_args_list
         assert len(calls) == 2
         assert calls[0].args == ("test-session", "window-0", "\x1b[B")
         assert calls[0].kwargs == {"literal": True}
         assert calls[1].args == ("test-session", "window-0", "Enter")
         assert calls[1].kwargs == {}
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_handle_bypass_then_trust_prompt(self, mock_tmux):
+    def test_handle_bypass_then_trust_prompt(self, monkeypatch):
         """Test that bypass prompt is handled, then trust prompt follows."""
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
         # Poll 1: bypass prompt; Poll 2: trust prompt (after bypass dismissed)
-        mock_tmux.get_history.side_effect = [
+        mock_mux.get_history.side_effect = [
             "WARNING: Bypass Permissions mode\n❯ 1. No, exit\n  2. Yes, I accept\n",
             "❯ 1. Yes, I trust this folder\n  2. No",
         ]
@@ -771,7 +928,7 @@ class TestClaudeCodeProviderStartupPrompts:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         provider._handle_startup_prompts(timeout=5.0)
 
-        calls = mock_tmux.send_special_key.call_args_list
+        calls = mock_mux.send_special_key.call_args_list
         assert len(calls) == 3
         assert calls[0].args == ("test-session", "window-0", "\x1b[B")
         assert calls[0].kwargs == {"literal": True}
@@ -780,10 +937,14 @@ class TestClaudeCodeProviderStartupPrompts:
         assert calls[2].args == ("test-session", "window-0", "Enter")
         assert calls[2].kwargs == {}
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_trust_prompt_not_waiting_user_answer(self, mock_tmux):
+    def test_get_status_trust_prompt_not_waiting_user_answer(self, monkeypatch):
         """Test that trust prompt is NOT detected as WAITING_USER_ANSWER."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "❯ 1. Yes, I trust this folder\n"
             "  2. No, don't trust this folder\n"
             "Enter to select · ↑/↓ to navigate · Esc to cancel"
@@ -794,10 +955,14 @@ class TestClaudeCodeProviderStartupPrompts:
 
         assert status != TerminalStatus.WAITING_USER_ANSWER
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_get_status_bypass_prompt_not_waiting_user_answer(self, mock_tmux):
+    def test_get_status_bypass_prompt_not_waiting_user_answer(self, monkeypatch):
         """Test that bypass prompt is NOT detected as WAITING_USER_ANSWER."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "WARNING: Bypass Permissions mode\n"
             "❯ 1. No, exit\n"
             "  2. Yes, I accept\n"
@@ -812,28 +977,26 @@ class TestClaudeCodeProviderStartupPrompts:
     @_PATCH_SETTINGS
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
     def test_initialize_calls_handle_startup_prompts(
-        self, mock_tmux, mock_wait_status, mock_wait_shell, _
+        self, mock_wait_status, mock_wait_shell, _, monkeypatch
     ):
         """Test that initialize calls _handle_startup_prompts."""
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
         trust_output = "❯ 1. Yes, I trust this folder\n  2. No"
-        mock_tmux.get_history.side_effect = ["", trust_output, trust_output]
-        mock_session = MagicMock()
-        mock_window = MagicMock()
-        mock_pane = MagicMock()
-        mock_tmux.server.sessions.get.return_value = mock_session
-        mock_session.windows.get.return_value = mock_window
-        mock_window.active_pane = mock_pane
+        mock_mux.get_history.side_effect = ["", trust_output, trust_output]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         with patch.object(provider, "get_status", return_value=TerminalStatus.IDLE):
             result = provider.initialize()
 
         assert result is True
-        mock_tmux.send_special_key.assert_called_with("test-session", "window-0", "Enter")
+        mock_mux.send_special_key.assert_called_with("test-session", "window-0", "Enter")
 
 
 class TestClaudeCodeProviderSettings:

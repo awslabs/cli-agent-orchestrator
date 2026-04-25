@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.multiplexers import get_multiplexer
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -191,7 +191,7 @@ class ClaudeCodeProvider(BaseProvider):
         start_time = time.time()
         bypass_accepted = False
         while time.time() - start_time < timeout:
-            output = tmux_client.get_history(self.session_name, self.window_name)
+            output = get_multiplexer().get_history(self.session_name, self.window_name)
             if not output:
                 time.sleep(1.0)
                 continue
@@ -205,14 +205,14 @@ class ClaudeCodeProvider(BaseProvider):
                 # Send raw Down arrow escape sequence (-l for literal) to move
                 # cursor to "Yes, I accept", then Enter to confirm.
                 # tmux send-keys "Down" doesn't work with Claude's Ink TUI.
-                tmux_client.send_special_key(
+                get_multiplexer().send_special_key(
                     self.session_name,
                     self.window_name,
                     "\x1b[B",
                     literal=True,
                 )
                 time.sleep(0.5)
-                tmux_client.send_special_key(self.session_name, self.window_name, "Enter")
+                get_multiplexer().send_special_key(self.session_name, self.window_name, "Enter")
                 bypass_accepted = True
                 time.sleep(1.0)
                 continue  # Trust prompt may follow
@@ -220,7 +220,7 @@ class ClaudeCodeProvider(BaseProvider):
             # 2) Handle workspace trust prompt
             if re.search(TRUST_PROMPT_PATTERN, clean_output):
                 logger.info("Workspace trust prompt detected, auto-accepting")
-                tmux_client.send_special_key(self.session_name, self.window_name, "Enter")
+                get_multiplexer().send_special_key(self.session_name, self.window_name, "Enter")
                 return
 
             # 3) Claude Code fully started — no prompts needed
@@ -237,7 +237,7 @@ class ClaudeCodeProvider(BaseProvider):
     def initialize(self) -> bool:
         """Initialize Claude Code provider by starting claude command."""
         # Wait for shell prompt to appear in the tmux window
-        if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
+        if not wait_for_shell(get_multiplexer(), self.session_name, self.window_name, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
         # Prevent bypass permissions dialog from appearing (settings-based fix).
@@ -251,10 +251,10 @@ class ClaudeCodeProvider(BaseProvider):
         # from Claude Code's own ❯ REPL prompt — they are visually identical
         # after ANSI stripping, so without a snapshot, status detection can
         # falsely return IDLE on the old shell prompt before claude even starts.
-        pre_launch_snapshot = tmux_client.get_history(self.session_name, self.window_name) or ""
+        pre_launch_snapshot = get_multiplexer().get_history(self.session_name, self.window_name) or ""
 
-        # Send Claude Code command using tmux client
-        tmux_client.send_keys(self.session_name, self.window_name, command)
+        # Send Claude Code command using multiplexer
+        get_multiplexer().send_keys(self.session_name, self.window_name, command)
 
         # Handle startup prompts (bypass permissions + workspace trust)
         self._handle_startup_prompts(timeout=20.0)
@@ -268,7 +268,7 @@ class ClaudeCodeProvider(BaseProvider):
         # ❯ prompt triggers an immediate IDLE return before claude starts.
         deadline = time.time() + 30.0
         while time.time() < deadline:
-            current_output = tmux_client.get_history(self.session_name, self.window_name) or ""
+            current_output = get_multiplexer().get_history(self.session_name, self.window_name) or ""
             new_content = current_output[len(pre_launch_snapshot) :]
             # Claude-specific startup markers that cannot come from the shell:
             # the ──────── separator, bypass/trust prompt text, or "Claude Code"
@@ -322,7 +322,7 @@ class ClaudeCodeProvider(BaseProvider):
         See: https://github.com/awslabs/cli-agent-orchestrator/issues/104
         """
 
-        output = tmux_client.get_history(self.session_name, self.window_name, tail_lines=tail_lines)
+        output = get_multiplexer().get_history(self.session_name, self.window_name, tail_lines=tail_lines)
 
         if not output:
             return TerminalStatus.ERROR

@@ -1,8 +1,8 @@
 """Deprecated re-export shim for the legacy TmuxClient location.
 
 The real implementation now lives in
-``cli_agent_orchestrator.multiplexers.tmux``. This shim keeps existing
-imports working until Task 4 wires the runtime backend selector.
+``cli_agent_orchestrator.multiplexers.tmux``; new code should use
+``get_multiplexer()`` instead of this shim.
 """
 
 from __future__ import annotations

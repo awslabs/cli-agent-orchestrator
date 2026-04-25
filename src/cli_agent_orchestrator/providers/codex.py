@@ -3,14 +3,13 @@
 import logging
 import re
 import shlex
-import sys
 import time
 from typing import Optional
 
-from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.multiplexers import get_multiplexer
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.multiplexers.base import LaunchSpec
-from cli_agent_orchestrator.multiplexers.launch import build_launch_spec
+from cli_agent_orchestrator.multiplexers.launch import build_launch_spec, default_platform
 from cli_agent_orchestrator.multiplexers.wezterm import WezTermMultiplexer
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -126,19 +125,17 @@ class CodexProvider(BaseProvider):
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
         launch_spec: Optional[LaunchSpec] = None,
-        direct_spawned: bool = False,
     ):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
         self._launch_spec = launch_spec
-        self._direct_spawned = direct_spawned
 
     def _build_codex_argv(self) -> list[str]:
         """Build raw Codex argv for launch-spec use and shell command templating."""
         flags = ["--yolo", "--no-alt-screen", "--disable", "shell_snapshot"]
-        if sys.platform == "win32":
+        if default_platform() == "windows":
             flags = ["-c", "hooks=[]", *flags]
         return ["codex", *flags]
 
@@ -237,7 +234,7 @@ class CodexProvider(BaseProvider):
         """
         start_time = time.time()
         while time.time() - start_time < timeout:
-            output = tmux_client.get_history(self.session_name, self.window_name)
+            output = get_multiplexer().get_history(self.session_name, self.window_name)
             if not output:
                 time.sleep(1.0)
                 continue
@@ -247,7 +244,7 @@ class CodexProvider(BaseProvider):
 
             if re.search(TRUST_PROMPT_PATTERN, clean_output):
                 logger.info("Codex workspace trust prompt detected, auto-accepting")
-                tmux_client.send_special_key(self.session_name, self.window_name, "Enter")
+                get_multiplexer().send_special_key(self.session_name, self.window_name, "Enter")
                 return
 
             # Check if Codex has fully started (welcome banner visible)
@@ -263,25 +260,20 @@ class CodexProvider(BaseProvider):
         if self._launch_spec is None:
             self._launch_spec = build_launch_spec("codex", self._build_codex_argv())
 
-        direct_spawned_wezterm = self._direct_spawned and isinstance(tmux_client, WezTermMultiplexer)
+        direct_spawned_wezterm = isinstance(get_multiplexer(), WezTermMultiplexer)
 
         if not direct_spawned_wezterm:
-            if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
+            if not wait_for_shell(get_multiplexer(), self.session_name, self.window_name, timeout=10.0):
                 raise TimeoutError("Shell initialization timed out after 10 seconds")
 
-            # Send a warm-up command before launching codex.
-            # Codex exits immediately in freshly-created tmux sessions where the shell
-            # has not yet processed a full interactive command cycle.
-            tmux_client.send_keys(self.session_name, self.window_name, "echo ready")
+            # Warm-up command — codex exits immediately in freshly-created
+            # tmux sessions where the shell hasn't completed an interactive
+            # command cycle yet.
+            get_multiplexer().send_keys(self.session_name, self.window_name, "echo ready")
             time.sleep(2.0)
 
-            # Build command with flags and agent profile (developer_instructions).
-            # --no-alt-screen: run in inline mode so output stays in normal scrollback,
-            #   making tmux capture-pane reliable.
-            # --disable shell_snapshot: avoid TTY input conflicts (SIGTTIN) in tmux
-            #   caused by the shell_snapshot subprocess inheriting stdin.
             command = self._build_codex_command()
-            tmux_client.send_keys(self.session_name, self.window_name, command)
+            get_multiplexer().send_keys(self.session_name, self.window_name, command)
 
         # Handle workspace trust prompt if it appears (new/untrusted directories)
         self._handle_trust_prompt(timeout=20.0)
@@ -299,7 +291,7 @@ class CodexProvider(BaseProvider):
 
     def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
         """Get Codex status by analyzing terminal output."""
-        output = tmux_client.get_history(self.session_name, self.window_name, tail_lines=tail_lines)
+        output = get_multiplexer().get_history(self.session_name, self.window_name, tail_lines=tail_lines)
 
         if not output:
             return TerminalStatus.ERROR

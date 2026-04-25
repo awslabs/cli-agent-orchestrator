@@ -35,8 +35,7 @@ def get_multiplexer() -> BaseMultiplexer:
     if backend == "tmux":
         return TmuxMultiplexer()
 
-    # Lazy import: WezTermMultiplexer may not exist yet during development,
-    # and tmux-only environments should still import this package cleanly.
+    # Lazy import: tmux-only environments avoid loading the WezTerm module.
     from cli_agent_orchestrator.multiplexers.wezterm import WezTermMultiplexer
 
     return WezTermMultiplexer()

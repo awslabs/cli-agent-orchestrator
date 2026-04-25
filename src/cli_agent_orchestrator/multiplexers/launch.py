@@ -9,8 +9,13 @@ from typing import Literal, Sequence
 
 from cli_agent_orchestrator.multiplexers.base import LaunchSpec
 
+# Avoid importing ProviderType from providers.manager to prevent circular imports
+# (multiplexers.launch → providers.manager → multiplexers.launch).  Use a module-level
+# constant instead so this string only appears once and a typo is caught at definition.
+_PROVIDER_KEY_CODEX = "codex"
 
-def _default_platform() -> Literal["windows", "unix"]:
+
+def default_platform() -> Literal["windows", "unix"]:
     return "windows" if sys.platform == "win32" else "unix"
 
 
@@ -33,7 +38,6 @@ def build_launch_spec(
     command_argv: Sequence[str],
     *,
     platform: Literal["windows", "unix"] | None = None,
-    working_directory: str | None = None,
 ) -> LaunchSpec:
     """Resolve a LaunchSpec for a provider on the current (or stated) platform.
 
@@ -47,14 +51,12 @@ def build_launch_spec(
 
     On non-Windows: trust shell PATH (use ``command_argv[0]`` verbatim).
     """
-    del working_directory
-
-    resolved_platform = platform or _default_platform()
+    resolved_platform = platform or default_platform()
     argv = tuple(command_argv)
     if not argv:
         raise ValueError("command_argv must not be empty")
 
-    if provider != "codex" or resolved_platform != "windows":
+    if provider != _PROVIDER_KEY_CODEX or resolved_platform != "windows":
         return LaunchSpec(argv=argv, provider=provider)
 
     override = os.environ.get("CAO_CODEX_BIN")

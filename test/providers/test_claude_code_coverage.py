@@ -11,14 +11,24 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
-@pytest.fixture
-def provider():
-    """Create a ClaudeCodeProvider with mocked dependencies."""
-    with patch("cli_agent_orchestrator.providers.claude_code.tmux_client"):
-        from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+def _make_get_multiplexer_patch(mock_mux):
+    """Return a callable that get_multiplexer() calls resolve to mock_mux."""
+    return lambda: mock_mux
 
-        p = ClaudeCodeProvider("tid1", "ses", "win", "test-agent")
-        yield p
+
+@pytest.fixture
+def provider(monkeypatch):
+    """Create a ClaudeCodeProvider with mocked multiplexer."""
+    mock_mux = MagicMock()
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.claude_code.get_multiplexer",
+        _make_get_multiplexer_patch(mock_mux),
+    )
+    from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+
+    p = ClaudeCodeProvider("tid1", "ses", "win", "test-agent")
+    p._mock_mux = mock_mux
+    yield p
 
 
 class TestBuildCommandMcpServerModelDump:
@@ -50,50 +60,46 @@ class TestBuildCommandMcpServerModelDump:
 class TestHandleStartupPromptsBranches:
     """Test _handle_startup_prompts branches."""
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_bypass_permissions_prompt(self, mock_tmux, provider):
+    def test_bypass_permissions_prompt(self, provider):
         """Detects bypass permissions prompt and sends Down + Enter."""
-        mock_tmux.get_history.return_value = (
+        provider._mock_mux.get_history.return_value = (
             "⚠ Bypass Permissions mode\n" "1. No, exit\n" "2. Yes, I accept\n"
         )
 
         provider._handle_startup_prompts(timeout=1.0)
 
-        calls = mock_tmux.send_special_key.call_args_list
+        calls = provider._mock_mux.send_special_key.call_args_list
         assert len(calls) == 2
         assert calls[0].args == ("ses", "win", "\x1b[B")
         assert calls[0].kwargs == {"literal": True}
         assert calls[1].args == ("ses", "win", "Enter")
         assert calls[1].kwargs == {}
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_idle_prompt_detected_early_return(self, mock_tmux, provider):
+    def test_idle_prompt_detected_early_return(self, provider):
         """When idle prompt is visible, returns immediately without sending keys."""
         from cli_agent_orchestrator.providers.claude_code import IDLE_PROMPT_PATTERN
 
-        mock_tmux.get_history.return_value = "❯ "
+        provider._mock_mux.get_history.return_value = "❯ "
 
         provider._handle_startup_prompts(timeout=1.0)
 
         # No exception means early return worked
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_welcome_banner_detected_early_return(self, mock_tmux, provider):
+    def test_welcome_banner_detected_early_return(self, provider):
         """When welcome banner is visible, returns immediately."""
-        mock_tmux.get_history.return_value = "Welcome to Claude Code v2.5.0"
+        provider._mock_mux.get_history.return_value = "Welcome to Claude Code v2.5.0"
 
         provider._handle_startup_prompts(timeout=1.0)
 
-    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_trust_prompt_detected(self, mock_tmux, provider):
+    def test_trust_prompt_detected(self, provider):
         """Trust prompt sends Enter to accept."""
-        mock_tmux.get_history.return_value = (
+        provider._mock_mux.get_history.return_value = (
             "Do you trust the files in this folder?\n" "❯ Yes, I trust this folder"
         )
 
         provider._handle_startup_prompts(timeout=1.0)
 
-        mock_tmux.send_special_key.assert_called_once_with("ses", "win", "Enter")
+        provider._mock_mux.send_special_key.assert_called_once_with("ses", "win", "Enter")
 
 
 class TestDatabaseListAllTerminals:

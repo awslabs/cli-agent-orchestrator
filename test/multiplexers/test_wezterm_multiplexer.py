@@ -135,7 +135,7 @@ class TestCreateSession:
         mux = WezTermMultiplexer(runner=lambda argv, env=None: _spawn_result("77"), wezterm_bin="wezterm")
         with patch.object(mux, "_resolve_and_validate_working_directory", return_value=str(tmp_path)):
             mux.create_session("ses", "win", "tid", str(tmp_path))
-        assert mux._sessions["ses"]["win"]["pane_id"] == "77"
+        assert mux._sessions["ses"]["win"] == "77"
 
     def test_launch_spec_argv_appended_after_double_dash(self, tmp_path):
         calls: list[list[str]] = []
@@ -210,7 +210,7 @@ class TestCreateWindow:
         with patch.object(mux, "_resolve_and_validate_working_directory", return_value=str(tmp_path)):
             mux.create_session("ses", "win1", "tid1", str(tmp_path))
             mux.create_window("ses", "win2", "tid2", str(tmp_path))
-        assert mux._sessions["ses"]["win2"]["pane_id"] == "55"
+        assert mux._sessions["ses"]["win2"] == "55"
 
     def test_create_window_uses_new_window_flag(self, tmp_path):
         calls: list[list[str]] = []
@@ -251,7 +251,7 @@ class TestPasteText:
 
     def test_raises_when_pane_not_found(self):
         mux = WezTermMultiplexer(runner=lambda argv, env=None: _spawn_result(), wezterm_bin="wezterm")
-        with pytest.raises(RuntimeError, match="not found"):
+        with pytest.raises(KeyError, match="not found"):
             mux._paste_text("missing_ses", "missing_win", "text")
 
 
@@ -440,6 +440,14 @@ class TestSendSpecialKey:
         argv = calls[0]
         assert argv[argv.index("--") + 1] == "\x1b[A"
 
+    def test_send_special_key_unknown_name_raises_actionable_keyerror(self, tmp_path):
+        mux = WezTermMultiplexer(runner=lambda argv, env=None: _spawn_result("54"), wezterm_bin="wezterm")
+        with patch.object(mux, "_resolve_and_validate_working_directory", return_value=str(tmp_path)):
+            mux.create_session("ses", "win", "tid", str(tmp_path))
+
+        with pytest.raises(KeyError, match="Unknown special key"):
+            mux.send_special_key("ses", "win", "NotAKey")
+
 
 class TestGetHistory:
     def test_calls_get_text_without_escapes(self, tmp_path):
@@ -486,7 +494,7 @@ class TestGetHistory:
 
     def test_raises_when_pane_not_found(self):
         mux = WezTermMultiplexer(runner=lambda argv, env=None: _spawn_result(), wezterm_bin="wezterm")
-        with pytest.raises(RuntimeError, match="not found"):
+        with pytest.raises(KeyError, match="not found"):
             mux.get_history("missing_ses", "missing_win")
 
 
@@ -603,7 +611,7 @@ class TestPipePane:
             clock_sleep=lambda *_: None,
         )
 
-        with pytest.raises(RuntimeError, match="pane not found"):
+        with pytest.raises(KeyError, match="pane not found"):
             mux.pipe_pane("missing", "win", str(tmp_path / "pipe.log"))
 
     def test_pipe_pane_raises_if_already_running(self, multiplexer, tmp_path):
@@ -676,11 +684,18 @@ class TestPipePane:
         multiplexer.pipe_pane("sess", "win", str(path))
         assert fake_runner.wait_for_queue_drain(timeout=1.0)
 
-        state = multiplexer._pollers[("sess", "win")]
-        state.thread.join(timeout=1.0)
-        assert not state.thread.is_alive()
-        multiplexer.stop_pipe_pane("sess", "win")
+        # After the thread exits due to RuntimeError from _get_pane_text, the
+        # _poll_loop finally-block self-cleans the registry entry.
+        state = multiplexer._pollers.get(("sess", "win"))
+        if state is not None:
+            state.thread.join(timeout=1.0)
+        # After the thread has cleaned itself up, the registry entry is gone.
+        import time as _time
+        deadline = _time.monotonic() + 1.0
+        while _time.monotonic() < deadline and ("sess", "win") in multiplexer._pollers:
+            _time.sleep(0.01)
 
+        assert ("sess", "win") not in multiplexer._pollers
         assert path.read_text(encoding="utf-8") == "hello\n"
 
     def test_stop_pipe_pane_cancels_thread_and_prevents_further_writes(
@@ -727,3 +742,72 @@ class TestPipePane:
         assert multiplexer.kill_window("sess", "win") is True
         assert ("sess", "win") not in multiplexer._pollers
         assert path.read_text(encoding="utf-8") == "hello\n"
+
+    def test_stop_pipe_pane_timeout_keeps_zombie_registry_entry(
+        self, multiplexer, tmp_path
+    ):
+        """Zombie poller (join timeout) keeps its registry entry to block double-write.
+
+        When stop_pipe_pane() times out waiting for the thread, the entry must
+        remain so that a subsequent pipe_pane() call raises RuntimeError rather
+        than starting a second thread writing to the same log file concurrently.
+
+        We inject a synthetic _PollerState with a mock thread that reports
+        is_alive()=True after join(), so there are no real threads racing
+        against the registry check.
+        """
+        from unittest.mock import MagicMock as _MagicMock
+        from cli_agent_orchestrator.multiplexers.wezterm import _PollerState
+
+        path = tmp_path / "pipe.log"
+        path.touch()
+
+        # Build a mock thread that always appears alive (join is a no-op).
+        mock_thread = _MagicMock(spec=threading.Thread)
+        mock_thread.is_alive.return_value = True  # simulates join timeout
+        mock_thread.join.return_value = None       # join returns immediately
+
+        stop_event = threading.Event()
+        state = _PollerState(thread=mock_thread, stop_event=stop_event)
+        key = ("sess", "win")
+        multiplexer._pollers[key] = state
+
+        multiplexer.stop_pipe_pane("sess", "win")
+
+        # Registry entry must still be present (zombie kept in place).
+        assert key in multiplexer._pollers
+
+        # A subsequent pipe_pane call must raise, not start a second thread.
+        with pytest.raises(RuntimeError, match="pipe_pane already running for sess:win"):
+            multiplexer.pipe_pane("sess", "win", str(path))
+
+        # Cleanup: remove the synthetic entry so the fixture teardown doesn't fail.
+        del multiplexer._pollers[key]
+
+    def test_poll_loop_self_cleans_on_pane_disappearing(
+        self, multiplexer, tmp_path, fake_runner: FakeRunner
+    ):
+        """When _get_pane_text raises, _poll_loop's finally block removes the registry entry.
+
+        This verifies that a zombie that eventually exits cleans its own entry
+        so that a new pipe_pane() call can succeed afterward.
+        """
+        path = tmp_path / "pipe.log"
+        # First response writes content; second raises to simulate pane gone.
+        fake_runner.queue_responses(["hello\n", RuntimeError("pane gone")])
+
+        multiplexer.pipe_pane("sess", "win", str(path))
+        assert fake_runner.wait_for_queue_drain(timeout=1.0)
+
+        # Wait for the thread to exit and self-clean.
+        import time as _time
+        deadline = _time.monotonic() + 2.0
+        while _time.monotonic() < deadline and ("sess", "win") in multiplexer._pollers:
+            _time.sleep(0.01)
+
+        assert ("sess", "win") not in multiplexer._pollers
+
+        # Now pipe_pane can be called again without raising.
+        fake_runner.queue_responses(["hello\n"])
+        multiplexer.pipe_pane("sess", "win", str(path))
+        multiplexer.stop_pipe_pane("sess", "win")

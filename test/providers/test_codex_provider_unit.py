@@ -21,18 +21,9 @@ def load_fixture(filename: str) -> str:
         return f.read()
 
 
-class FakeWezTermMultiplexer(WezTermMultiplexer):
-    def __init__(self) -> None:
-        self.send_keys = MagicMock()
-        self.send_special_key = MagicMock()
-        self.get_history = MagicMock(return_value="OpenAI Codex (v0.98.0)")
-
-
-class FakeTmuxMultiplexer(TmuxMultiplexer):
-    def __init__(self) -> None:
-        self.send_keys = MagicMock()
-        self.send_special_key = MagicMock()
-        self.get_history = MagicMock(return_value="OpenAI Codex (v0.98.0)")
+def _make_get_multiplexer_patch(mock_mux):
+    """Return a callable that get_multiplexer() calls resolve to mock_mux."""
+    return lambda: mock_mux
 
 
 class TestBuildLaunchSpec:
@@ -69,11 +60,15 @@ class TestBuildLaunchSpec:
 class TestCodexProviderInitialization:
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_initialize_success(self, mock_tmux, mock_wait_shell, mock_wait_status):
+    def test_initialize_success(self, mock_wait_shell, mock_wait_status, monkeypatch):
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
-        mock_tmux.get_history.return_value = "OpenAI Codex (v0.98.0)"
+        mock_mux.get_history.return_value = "OpenAI Codex (v0.98.0)"
 
         provider = CodexProvider("test1234", "test-session", "window-0", None)
         result = provider.initialize()
@@ -81,9 +76,9 @@ class TestCodexProviderInitialization:
         assert result is True
         mock_wait_shell.assert_called_once()
         # Two send_keys calls: warm-up echo + codex with tmux-compatible flags
-        assert mock_tmux.send_keys.call_count == 2
-        mock_tmux.send_keys.assert_any_call("test-session", "window-0", "echo ready")
-        mock_tmux.send_keys.assert_any_call(
+        assert mock_mux.send_keys.call_count == 2
+        mock_mux.send_keys.assert_any_call("test-session", "window-0", "echo ready")
+        mock_mux.send_keys.assert_any_call(
             "test-session",
             "window-0",
             provider._build_codex_command(),
@@ -91,8 +86,12 @@ class TestCodexProviderInitialization:
         mock_wait_status.assert_called_once()
 
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_initialize_shell_timeout(self, mock_tmux, mock_wait_shell):
+    def test_initialize_shell_timeout(self, mock_wait_shell, monkeypatch):
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
         mock_wait_shell.return_value = False
 
         provider = CodexProvider("test1234", "test-session", "window-0", None)
@@ -106,8 +105,14 @@ class TestCodexProviderInitialization:
         self, mock_wait_shell, mock_wait_status, monkeypatch
     ):
         mock_wait_status.return_value = True
-        fake_tmux = FakeWezTermMultiplexer()
-        monkeypatch.setattr("cli_agent_orchestrator.providers.codex.tmux_client", fake_tmux)
+        # get_multiplexer() returns a WezTermMultiplexer instance → skips warm-up
+        fake_wez = MagicMock(spec=WezTermMultiplexer)
+        # _handle_trust_prompt calls get_multiplexer().get_history() → must return str
+        fake_wez.get_history.return_value = "OpenAI Codex (v0.98.0)"
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            lambda: fake_wez,
+        )
 
         provider = CodexProvider(
             "test1234",
@@ -115,13 +120,12 @@ class TestCodexProviderInitialization:
             "window-0",
             None,
             launch_spec=LaunchSpec(argv=("codex.cmd",), provider="codex"),
-            direct_spawned=True,
         )
         result = provider.initialize()
 
         assert result is True
         mock_wait_shell.assert_not_called()
-        fake_tmux.send_keys.assert_not_called()
+        fake_wez.send_keys.assert_not_called()
         mock_wait_status.assert_called_once()
 
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
@@ -131,8 +135,14 @@ class TestCodexProviderInitialization:
     ):
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
-        fake_tmux = FakeTmuxMultiplexer()
-        monkeypatch.setattr("cli_agent_orchestrator.providers.codex.tmux_client", fake_tmux)
+        # get_multiplexer() returns a TmuxMultiplexer instance → runs warm-up
+        fake_tmux = MagicMock(spec=TmuxMultiplexer)
+        # _handle_trust_prompt calls get_multiplexer().get_history() → must return str
+        fake_tmux.get_history.return_value = "OpenAI Codex (v0.98.0)"
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            lambda: fake_tmux,
+        )
 
         provider = CodexProvider("test1234", "test-session", "window-0", None)
         result = provider.initialize()
@@ -143,11 +153,15 @@ class TestCodexProviderInitialization:
 
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_initialize_codex_timeout(self, mock_tmux, mock_wait_shell, mock_wait_status):
+    def test_initialize_codex_timeout(self, mock_wait_shell, mock_wait_status, monkeypatch):
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = False
-        mock_tmux.get_history.return_value = "OpenAI Codex (v0.98.0)"
+        mock_mux.get_history.return_value = "OpenAI Codex (v0.98.0)"
 
         provider = CodexProvider("test1234", "test-session", "window-0", None)
 
@@ -164,7 +178,7 @@ class TestCodexBuildCommand:
             expected = "codex -c 'hooks=[]' --yolo --no-alt-screen --disable shell_snapshot"
         assert command == expected
 
-    @patch("cli_agent_orchestrator.providers.codex.sys.platform", "win32")
+    @patch("cli_agent_orchestrator.multiplexers.launch.sys.platform", "win32")
     def test_build_command_adds_hooks_override_on_windows(self):
         provider = CodexProvider("test1234", "test-session", "window-0", None)
 
@@ -172,7 +186,7 @@ class TestCodexBuildCommand:
 
         assert " -c 'hooks=[]' " in f" {command} "
 
-    @patch("cli_agent_orchestrator.providers.codex.sys.platform", "linux")
+    @patch("cli_agent_orchestrator.multiplexers.launch.sys.platform", "linux")
     def test_build_command_omits_hooks_override_on_unix(self):
         provider = CodexProvider("test1234", "test-session", "window-0", None)
 
@@ -367,13 +381,17 @@ class TestCodexBuildCommand:
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
     def test_initialize_with_agent_profile(
-        self, mock_tmux, mock_load_profile, mock_wait_shell, mock_wait_status
+        self, mock_load_profile, mock_wait_shell, mock_wait_status, monkeypatch
     ):
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
-        mock_tmux.get_history.return_value = "OpenAI Codex (v0.98.0)"
+        mock_mux.get_history.return_value = "OpenAI Codex (v0.98.0)"
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.system_prompt = "You are a supervisor."
@@ -385,7 +403,7 @@ class TestCodexBuildCommand:
 
         assert result is True
         # The second send_keys call should contain developer_instructions
-        codex_call = mock_tmux.send_keys.call_args_list[1]
+        codex_call = mock_mux.send_keys.call_args_list[1]
         assert "developer_instructions=" in codex_call.args[2]
         assert "You are a supervisor." in codex_call.args[2]
 
@@ -421,76 +439,105 @@ class TestCodexProviderModelFlag:
 
 
 class TestCodexProviderStatusDetection:
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_idle(self, mock_tmux):
-        mock_tmux.get_history.return_value = load_fixture("codex_idle_output.txt")
+    def test_get_status_idle(self, monkeypatch):
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = load_fixture("codex_idle_output.txt")
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         status = provider.get_status()
 
         assert status == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_completed(self, mock_tmux):
-        mock_tmux.get_history.return_value = load_fixture("codex_completed_output.txt")
+    def test_get_status_completed(self, monkeypatch):
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = load_fixture("codex_completed_output.txt")
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         status = provider.get_status()
 
         assert status == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_processing(self, mock_tmux):
-        mock_tmux.get_history.return_value = load_fixture("codex_processing_output.txt")
+    def test_get_status_processing(self, monkeypatch):
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = load_fixture("codex_processing_output.txt")
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         status = provider.get_status()
 
         assert status == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_waiting_user_answer(self, mock_tmux):
-        mock_tmux.get_history.return_value = load_fixture("codex_permission_output.txt")
+    def test_get_status_waiting_user_answer(self, monkeypatch):
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = load_fixture("codex_permission_output.txt")
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         status = provider.get_status()
 
         assert status == TerminalStatus.WAITING_USER_ANSWER
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_error(self, mock_tmux):
-        mock_tmux.get_history.return_value = load_fixture("codex_error_output.txt")
+    def test_get_status_error(self, monkeypatch):
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = load_fixture("codex_error_output.txt")
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         status = provider.get_status()
 
         assert status == TerminalStatus.ERROR
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_empty_output(self, mock_tmux):
-        mock_tmux.get_history.return_value = ""
+    def test_get_status_empty_output(self, monkeypatch):
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = ""
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         status = provider.get_status()
 
         assert status == TerminalStatus.ERROR
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_with_tail_lines(self, mock_tmux):
-        mock_tmux.get_history.return_value = load_fixture("codex_idle_output.txt")
+    def test_get_status_with_tail_lines(self, monkeypatch):
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = load_fixture("codex_idle_output.txt")
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         status = provider.get_status(tail_lines=50)
 
         assert status == TerminalStatus.IDLE
-        mock_tmux.get_history.assert_called_once_with("test-session", "window-0", tail_lines=50)
+        mock_mux.get_history.assert_called_once_with("test-session", "window-0", tail_lines=50)
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_processing_when_old_prompt_present(self, mock_tmux):
-        # If the captured history contains an earlier prompt but the *latest* output is processing,
-        # we should report PROCESSING. The old prompt should be far enough from the bottom
-        # (more than IDLE_PROMPT_TAIL_LINES) to avoid false idle detection.
-        mock_tmux.get_history.return_value = (
+    def test_get_status_processing_when_old_prompt_present(self, monkeypatch):
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "Welcome to Codex\n"
             "❯ \n"
             "You Fix the failing tests\n"
@@ -506,11 +553,13 @@ class TestCodexProviderStatusDetection:
 
         assert status == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_not_error_on_failed_in_message(self, mock_tmux):
-        # "failed" is commonly used in normal assistant output; it should not automatically
-        # force ERROR.
-        mock_tmux.get_history.return_value = (
+    def test_get_status_not_error_on_failed_in_message(self, monkeypatch):
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "You Explain why the test failed\n"
             "assistant: The test failed because the assertion is incorrect.\n"
             "\n"
@@ -522,31 +571,39 @@ class TestCodexProviderStatusDetection:
 
         assert status == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_idle_if_no_assistant_after_last_user(self, mock_tmux):
-        # If there is a user message but no assistant response after it, we should not
-        # treat the session as COMPLETED.
-        mock_tmux.get_history.return_value = "assistant: Welcome\n" "You Do the thing\n" "\n" "❯ \n"
+    def test_get_status_idle_if_no_assistant_after_last_user(self, monkeypatch):
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = "assistant: Welcome\n" "You Do the thing\n" "\n" "❯ \n"
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         status = provider.get_status()
 
         assert status == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_processing_when_no_prompt_and_no_keywords(self, mock_tmux):
-        # Codex output may not always include explicit "thinking/processing" keywords.
-        # Without an idle prompt at the end, we should assume it's still processing.
-        mock_tmux.get_history.return_value = "You Run the command\nWorking...\n"
+    def test_get_status_processing_when_no_prompt_and_no_keywords(self, monkeypatch):
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = "You Run the command\nWorking...\n"
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         status = provider.get_status()
 
         assert status == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_not_error_when_assistant_mentions_error_text(self, mock_tmux):
-        mock_tmux.get_history.return_value = (
+    def test_get_status_not_error_when_assistant_mentions_error_text(self, monkeypatch):
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "You Explain the failure\n"
             "assistant: Here's an example error:\n"
             "Error: example only\n"
@@ -559,9 +616,13 @@ class TestCodexProviderStatusDetection:
 
         assert status == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_not_waiting_when_assistant_mentions_approval_text(self, mock_tmux):
-        mock_tmux.get_history.return_value = (
+    def test_get_status_not_waiting_when_assistant_mentions_approval_text(self, monkeypatch):
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "You Explain approvals\n"
             "assistant: You might see this prompt:\n"
             "Approve this command? [y/n]\n"
@@ -574,37 +635,53 @@ class TestCodexProviderStatusDetection:
 
         assert status == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_error_when_error_after_user_and_prompt(self, mock_tmux):
-        mock_tmux.get_history.return_value = "You Run thing\nError: failed\n\n❯ \n"
+    def test_get_status_error_when_error_after_user_and_prompt(self, monkeypatch):
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = "You Run thing\nError: failed\n\n❯ \n"
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         status = provider.get_status()
 
         assert status == TerminalStatus.ERROR
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_waiting_user_answer_when_no_user_prefix(self, mock_tmux):
-        mock_tmux.get_history.return_value = "Approve this command? [y/n]\n"
+    def test_get_status_waiting_user_answer_when_no_user_prefix(self, monkeypatch):
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = "Approve this command? [y/n]\n"
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         status = provider.get_status()
 
         assert status == TerminalStatus.WAITING_USER_ANSWER
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_error_when_no_user_prefix(self, mock_tmux):
-        mock_tmux.get_history.return_value = "Error: something failed\n"
+    def test_get_status_error_when_no_user_prefix(self, monkeypatch):
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = "Error: something failed\n"
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         status = provider.get_status()
 
         assert status == TerminalStatus.ERROR
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_idle_tui_with_status_bar(self, mock_tmux):
+    def test_get_status_idle_tui_with_status_bar(self, monkeypatch):
         """Test IDLE detection with realistic TUI output (status bar after prompt)."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "╭───────────────────────────────────────────╮\n"
             "│ >_ OpenAI Codex (v0.98.0)                 │\n"
             "│ model: gpt-5.3-codex high                 │\n"
@@ -620,10 +697,14 @@ class TestCodexProviderStatusDetection:
 
         assert status == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_completed_tui_with_status_bar(self, mock_tmux):
+    def test_get_status_completed_tui_with_status_bar(self, monkeypatch):
         """Test COMPLETED detection with TUI output (status bar after prompt)."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "You Fix the bug\n"
             "assistant: I've fixed the issue in main.py.\n"
             "\n"
@@ -640,10 +721,14 @@ class TestCodexProviderStatusDetection:
 class TestCodexBulletFormatStatusDetection:
     """Tests for Codex's real interactive output format using › prompt and • bullets."""
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_completed_bullet_format(self, mock_tmux):
+    def test_get_status_completed_bullet_format(self, monkeypatch):
         """COMPLETED when › user message followed by • response and idle prompt."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "› what is your role?\n"
             "• I am the Coding Supervisor Agent.\n"
             "• I coordinate tasks between developer and reviewer agents.\n"
@@ -656,10 +741,14 @@ class TestCodexBulletFormatStatusDetection:
 
         assert status == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_processing_bullet_format(self, mock_tmux):
+    def test_get_status_processing_bullet_format(self, monkeypatch):
         """PROCESSING when • response started but no idle prompt at bottom."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "› fix the failing tests\n"
             "• Let me look at the test files.\n"
             "Reading src/test_main.py...\n"
@@ -674,20 +763,28 @@ class TestCodexBulletFormatStatusDetection:
 
         assert status == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_idle_bullet_format_no_response(self, mock_tmux):
+    def test_get_status_idle_bullet_format_no_response(self, monkeypatch):
         """IDLE when › user message but no • response yet and idle prompt at bottom."""
-        mock_tmux.get_history.return_value = "› hello\n\n› \n"
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = "› hello\n\n› \n"
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         status = provider.get_status()
 
         assert status == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_completed_bullet_with_code_block(self, mock_tmux):
+    def test_get_status_completed_bullet_with_code_block(self, monkeypatch):
         """COMPLETED with • response containing code blocks."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "› show me a function\n"
             "• Here's the function:\n"
             "\n"
@@ -706,20 +803,28 @@ class TestCodexBulletFormatStatusDetection:
 
         assert status == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_error_not_masked_by_bullet_pattern(self, mock_tmux):
+    def test_get_status_error_not_masked_by_bullet_pattern(self, monkeypatch):
         """ERROR still detected when no • response and error after › user message."""
-        mock_tmux.get_history.return_value = "› do something\nError: connection refused\n"
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = "› do something\nError: connection refused\n"
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         status = provider.get_status()
 
         assert status == TerminalStatus.ERROR
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_completed_multi_turn_bullet(self, mock_tmux):
+    def test_get_status_completed_multi_turn_bullet(self, monkeypatch):
         """COMPLETED uses last user message in multi-turn bullet format."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "› first question\n"
             "• First answer.\n"
             "\n"
@@ -734,10 +839,14 @@ class TestCodexBulletFormatStatusDetection:
 
         assert status == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_completed_bullet_with_tui_status_bar(self, mock_tmux):
+    def test_get_status_completed_bullet_with_tui_status_bar(self, monkeypatch):
         """COMPLETED with bullet format and TUI status bar after prompt."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "› fix the bug\n"
             "• I've fixed the issue in main.py by correcting the import.\n"
             "\n"
@@ -750,10 +859,14 @@ class TestCodexBulletFormatStatusDetection:
 
         assert status == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_processing_tui_spinner(self, mock_tmux):
+    def test_get_status_processing_tui_spinner(self, monkeypatch):
         """PROCESSING when TUI shows • Working spinner, not false COMPLETED."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "› [CAO Handoff] Supervisor terminal ID: sup-123. Do the task.\n"
             "\n"
             "• Working (0s • esc to interrupt)\n"
@@ -768,10 +881,14 @@ class TestCodexBulletFormatStatusDetection:
 
         assert status == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_processing_tui_thinking_spinner(self, mock_tmux):
+    def test_get_status_processing_tui_thinking_spinner(self, monkeypatch):
         """PROCESSING when TUI shows • Thinking spinner."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "› Implement feature X\n"
             "\n"
             "• Thinking (3s • esc to interrupt)\n"
@@ -786,10 +903,14 @@ class TestCodexBulletFormatStatusDetection:
 
         assert status == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_processing_dynamic_spinner_text(self, mock_tmux):
+    def test_get_status_processing_dynamic_spinner_text(self, monkeypatch):
         """PROCESSING when TUI shows spinner with dynamic prefix text."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "› [CAO Handoff] Do the task.\n"
             "\n"
             "• Creating /tmp/file.py\n"
@@ -808,18 +929,16 @@ class TestCodexBulletFormatStatusDetection:
 
 
 class TestCodexV0111FooterFormat:
-    """Tests for Codex v0.111.0+ TUI footer format.
+    """Tests for Codex v0.111.0+ TUI footer format."""
 
-    v0.111.0 (PR #13202 'tui: restore draft footer hints') changed the footer:
-    - Old: "› Use /skills to list available skills\\n  ? for shortcuts  100% context left"
-    - New: "› Find and fix a bug in @filename\\n  gpt-5.3-codex high · 100% left · ~/path"
-    The new format uses "N% left" instead of "N% context left" and removes "? for shortcuts".
-    """
-
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_idle_v0111_footer(self, mock_tmux):
+    def test_get_status_idle_v0111_footer(self, monkeypatch):
         """IDLE with v0.111.0 footer format (no '? for shortcuts')."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "╭───────────────────────────────────────────╮\n"
             "│ >_ OpenAI Codex (v0.111.0)                │\n"
             "│ model: gpt-5.3-codex high                 │\n"
@@ -837,10 +956,14 @@ class TestCodexV0111FooterFormat:
 
         assert status == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_completed_v0111_footer(self, mock_tmux):
+    def test_get_status_completed_v0111_footer(self, monkeypatch):
         """COMPLETED with v0.111.0 footer (suggestion hint must not be treated as user input)."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "› fix the bug\n"
             "• I've fixed the issue in main.py by correcting the import.\n"
             "\n"
@@ -854,10 +977,14 @@ class TestCodexV0111FooterFormat:
 
         assert status == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_completed_v0111_multi_turn(self, mock_tmux):
+    def test_get_status_completed_v0111_multi_turn(self, monkeypatch):
         """COMPLETED in multi-turn with v0.111.0 footer."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "› first question\n"
             "• First answer.\n"
             "\n"
@@ -874,10 +1001,14 @@ class TestCodexV0111FooterFormat:
 
         assert status == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_processing_v0111_spinner(self, mock_tmux):
+    def test_get_status_processing_v0111_spinner(self, monkeypatch):
         """PROCESSING when TUI shows spinner with v0.111.0 footer."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "› [CAO Handoff] Do the task.\n"
             "\n"
             "• Working (0s • esc to interrupt)\n"
@@ -1105,10 +1236,14 @@ class TestCodexProviderMisc:
 class TestCodexProviderTrustPrompt:
     """Tests for Codex workspace trust prompt handling."""
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_handle_trust_prompt_detected_and_accepted(self, mock_tmux):
+    def test_handle_trust_prompt_detected_and_accepted(self, monkeypatch):
         """Test that trust prompt is detected and auto-accepted."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "> You are running Codex in /Users/test/project\n"
             "\n"
             "  Since this folder is version controlled, you may wish to "
@@ -1121,22 +1256,30 @@ class TestCodexProviderTrustPrompt:
         provider = CodexProvider("test1234", "test-session", "window-0")
         provider._handle_trust_prompt(timeout=2.0)
 
-        mock_tmux.send_special_key.assert_called_once_with("test-session", "window-0", "Enter")
+        mock_mux.send_special_key.assert_called_once_with("test-session", "window-0", "Enter")
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_handle_trust_prompt_not_needed(self, mock_tmux):
+    def test_handle_trust_prompt_not_needed(self, monkeypatch):
         """Test early return when Codex starts without trust prompt."""
-        mock_tmux.get_history.return_value = "OpenAI Codex (v0.98.0)\n› "
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = "OpenAI Codex (v0.98.0)\n› "
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         provider._handle_trust_prompt(timeout=2.0)
 
-        mock_tmux.send_special_key.assert_not_called()
+        mock_mux.send_special_key.assert_not_called()
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_get_status_trust_prompt_is_waiting_user_answer(self, mock_tmux):
+    def test_get_status_trust_prompt_is_waiting_user_answer(self, monkeypatch):
         """Test that trust prompt reports WAITING_USER_ANSWER, not PROCESSING."""
-        mock_tmux.get_history.return_value = (
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
+        mock_mux.get_history.return_value = (
             "> You are running Codex in /Users/test/project\n"
             "allow Codex to work in this folder without asking for approval.\n"
             "› 1. Yes\n"
@@ -1150,12 +1293,16 @@ class TestCodexProviderTrustPrompt:
 
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_initialize_with_trust_prompt(self, mock_tmux, mock_wait_shell, mock_wait_status):
+    def test_initialize_with_trust_prompt(self, mock_wait_shell, mock_wait_status, monkeypatch):
         """Test that initialize handles trust prompt during startup."""
+        mock_mux = MagicMock()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.codex.get_multiplexer",
+            _make_get_multiplexer_patch(mock_mux),
+        )
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
-        mock_tmux.get_history.return_value = (
+        mock_mux.get_history.return_value = (
             "allow Codex to work in this folder without asking for approval.\n"
         )
 
@@ -1163,4 +1310,4 @@ class TestCodexProviderTrustPrompt:
         result = provider.initialize()
 
         assert result is True
-        mock_tmux.send_special_key.assert_called_with("test-session", "window-0", "Enter")
+        mock_mux.send_special_key.assert_called_with("test-session", "window-0", "Enter")
