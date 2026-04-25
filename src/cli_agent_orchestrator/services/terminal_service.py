@@ -65,8 +65,10 @@ class OutputMode(str, Enum):
 
 
 # Providers that accept a runtime skill_prompt kwarg and append it to the
-# system prompt at launch time.  Kiro receives skills via native skill://
-# resources; Q and Copilot receive skills via baked prompts at install time.
+# system prompt at launch time.  Other providers deliver skills differently:
+# Kiro (skill:// resources) and OpenCode (OPENCODE_CONFIG_DIR/skills symlink)
+# discover skills natively; Q and Copilot receive a baked catalog at install
+# time.
 RUNTIME_SKILL_PROMPT_PROVIDERS = {
     ProviderType.CLAUDE_CODE.value,
     ProviderType.CODEX.value,
@@ -107,6 +109,7 @@ def create_terminal(
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
         TimeoutError: If provider initialization times out
     """
+    session_created = False  # tracks whether THIS call created the tmux session
     try:
         # Step 1: Generate unique identifiers
         terminal_id = generate_terminal_id()
@@ -128,6 +131,7 @@ def create_terminal(
 
             # Create new tmux session with initial window
             tmux_client.create_session(session_name, window_name, terminal_id, working_directory)
+            session_created = True  # only set after successful creation
         else:
             # Add window to existing session
             if not tmux_client.session_exists(session_name):
@@ -142,13 +146,13 @@ def create_terminal(
         )
 
         # Step 3b: Load the profile once for allowed tool resolution before
-        # provider initialization. The skill catalog is global and does not
-        # depend on profile contents.
+        # provider initialization. The skill catalog is computed only for
+        # providers that consume it at launch time (see RUNTIME_SKILL_PROMPT_PROVIDERS).
         try:
             profile = load_agent_profile(agent_profile)
         except FileNotFoundError:
             profile = None
-        skill_prompt = build_skill_catalog()
+        skill_prompt = build_skill_catalog() if provider in RUNTIME_SKILL_PROMPT_PROVIDERS else None
 
         # Step 3c: Resolve allowed_tools from profile if not explicitly provided
         if allowed_tools is None and profile is not None:
@@ -160,10 +164,11 @@ def create_terminal(
             )
 
         # Step 4: Create and initialize the CLI provider
-        # This starts the agent (e.g., runs "kiro-cli chat --agent developer")
+        # This starts the agent (e.g., runs "kiro-cli chat --agent developer").
         # Only runtime-prompt providers (Claude Code, Codex, Gemini, Kimi) receive
-        # the skill catalog; Kiro uses native skill:// resources, Q and Copilot
-        # get it baked at install time.
+        # the skill catalog here; Kiro (skill:// resources) and OpenCode
+        # (OPENCODE_CONFIG_DIR/skills symlink) discover skills natively; Q and
+        # Copilot get the catalog baked at install time.
         provider_instance = provider_manager.create_provider(
             provider,
             terminal_id,
@@ -171,7 +176,7 @@ def create_terminal(
             window_name,
             agent_profile,
             allowed_tools,
-            skill_prompt=skill_prompt if provider in RUNTIME_SKILL_PROMPT_PROVIDERS else None,
+            skill_prompt=skill_prompt,
             model=profile.model if profile else None,
         )
         provider_instance.initialize()
@@ -215,7 +220,7 @@ def create_terminal(
             provider_manager.cleanup_provider(terminal_id)
         except Exception:
             pass  # Ignore cleanup errors
-        if new_session and session_name:
+        if session_created and session_name:
             try:
                 tmux_client.kill_session(session_name)
             except:
@@ -374,20 +379,33 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
     retries extraction with 10 s delays between attempts.  This handles
     TUI-based providers (e.g. Gemini CLI's Ink renderer) whose notification
     spinners can temporarily obscure response text in the tmux capture buffer.
+
+    If the provider exposes an ``extraction_tail_lines`` attribute, the
+    history capture for LAST mode uses that value instead of the default
+    ``TMUX_HISTORY_LINES``. Status-check captures are unaffected (they go
+    through get_status directly). A single capture-pane call is made per
+    get_output invocation.
     """
     try:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        full_output = tmux_client.get_history(metadata["tmux_session"], metadata["tmux_window"])
-
         if mode == OutputMode.FULL:
-            return full_output
+            return tmux_client.get_history(metadata["tmux_session"], metadata["tmux_window"])
         elif mode == OutputMode.LAST:
             provider = provider_manager.get_provider(terminal_id)
             if provider is None:
                 raise ValueError(f"Provider not found for terminal {terminal_id}")
+
+            # Capability check: providers that need deeper scrollback for extraction
+            # opt in by defining ``extraction_tail_lines``. Base providers don't.
+            extract_lines = getattr(provider, "extraction_tail_lines", None)
+            full_output = tmux_client.get_history(
+                metadata["tmux_session"],
+                metadata["tmux_window"],
+                tail_lines=extract_lines,
+            )
 
             retries = provider.extraction_retries
             last_err: Exception | None = None
@@ -396,7 +414,9 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
                     if attempt > 0:
                         time.sleep(10.0)
                         full_output = tmux_client.get_history(
-                            metadata["tmux_session"], metadata["tmux_window"]
+                            metadata["tmux_session"],
+                            metadata["tmux_window"],
+                            tail_lines=extract_lines,
                         )
                     return provider.extract_last_message_from_script(full_output)
                 except ValueError as exc:

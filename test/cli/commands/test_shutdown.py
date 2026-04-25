@@ -1,8 +1,9 @@
 """Tests for the shutdown CLI command."""
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 from click.testing import CliRunner
 
 from cli_agent_orchestrator.cli.commands.shutdown import shutdown
@@ -30,15 +31,18 @@ class TestShutdownCommand:
         assert result.exit_code != 0
         assert "Cannot use --all and --session together" in result.output
 
-    @patch("cli_agent_orchestrator.cli.commands.shutdown.list_sessions")
-    @patch("cli_agent_orchestrator.cli.commands.shutdown.delete_session")
-    def test_shutdown_all_success(self, mock_delete, mock_list, runner):
+    @patch("cli_agent_orchestrator.cli.commands.shutdown.requests.get")
+    @patch("cli_agent_orchestrator.cli.commands.shutdown.requests.delete")
+    def test_shutdown_all_success(self, mock_delete, mock_get, runner):
         """Test shutdown all sessions successfully."""
-        mock_list.return_value = [
-            {"id": "cao-session1"},
-            {"id": "cao-session2"},
-        ]
-        mock_delete.return_value = None
+        mock_get.return_value = MagicMock(
+            status_code=200,
+            json=lambda: [
+                {"name": "cao-session1"},
+                {"name": "cao-session2"},
+            ],
+        )
+        mock_delete.return_value = MagicMock(status_code=200)
 
         result = runner.invoke(shutdown, ["--all"])
 
@@ -47,51 +51,94 @@ class TestShutdownCommand:
         assert "Shutdown session 'cao-session2'" in result.output
         assert mock_delete.call_count == 2
 
-    @patch("cli_agent_orchestrator.cli.commands.shutdown.list_sessions")
-    def test_shutdown_all_no_sessions(self, mock_list, runner):
+    @patch("cli_agent_orchestrator.cli.commands.shutdown.requests.get")
+    def test_shutdown_all_no_sessions(self, mock_get, runner):
         """Test shutdown all when no sessions exist."""
-        mock_list.return_value = []
+        mock_get.return_value = MagicMock(status_code=200, json=lambda: [])
 
         result = runner.invoke(shutdown, ["--all"])
 
         assert result.exit_code == 0
         assert "No cao sessions found to shutdown" in result.output
 
-    @patch("cli_agent_orchestrator.cli.commands.shutdown.delete_session")
+    @patch("cli_agent_orchestrator.cli.commands.shutdown.requests.delete")
     def test_shutdown_specific_session(self, mock_delete, runner):
         """Test shutdown specific session."""
-        mock_delete.return_value = None
+        mock_delete.return_value = MagicMock(status_code=200)
 
         result = runner.invoke(shutdown, ["--session", "cao-test"])
 
         assert result.exit_code == 0
         assert "Shutdown session 'cao-test'" in result.output
-        mock_delete.assert_called_once_with("cao-test")
 
-    @patch("cli_agent_orchestrator.cli.commands.shutdown.delete_session")
-    def test_shutdown_session_error(self, mock_delete, runner):
-        """Test shutdown session with error."""
-        mock_delete.side_effect = Exception("Session not found")
-
-        result = runner.invoke(shutdown, ["--session", "cao-nonexistent"])
-
-        assert result.exit_code == 0  # Command completes but reports error
-        assert "Error shutting down session 'cao-nonexistent'" in result.output
-        assert "Session not found" in result.output
-
-    @patch("cli_agent_orchestrator.cli.commands.shutdown.list_sessions")
-    @patch("cli_agent_orchestrator.cli.commands.shutdown.delete_session")
-    def test_shutdown_all_partial_failure(self, mock_delete, mock_list, runner):
-        """Test shutdown all with partial failure."""
-        mock_list.return_value = [
-            {"id": "cao-session1"},
-            {"id": "cao-session2"},
-        ]
-        # First call succeeds, second fails
-        mock_delete.side_effect = [None, Exception("Error deleting session")]
+    @patch("cli_agent_orchestrator.cli.commands.shutdown.requests.get")
+    def test_shutdown_all_server_not_running(self, mock_get, runner):
+        """Test shutdown all when server is not running raises ClickException."""
+        mock_get.side_effect = requests.exceptions.ConnectionError("Connection refused")
 
         result = runner.invoke(shutdown, ["--all"])
 
+        assert result.exit_code != 0
+        assert "Failed to connect to cao-server" in result.output
+
+    @patch("cli_agent_orchestrator.cli.commands.shutdown.requests.delete")
+    def test_shutdown_session_server_not_running(self, mock_delete, runner):
+        """Test shutdown specific session when server is not running raises ClickException."""
+        mock_delete.side_effect = requests.exceptions.ConnectionError("Connection refused")
+
+        result = runner.invoke(shutdown, ["--session", "cao-test"])
+
+        assert result.exit_code != 0
+        assert "Failed to connect to cao-server" in result.output
+
+    @patch("cli_agent_orchestrator.cli.commands.shutdown.requests.delete")
+    def test_shutdown_session_404_already_removed(self, mock_delete, runner):
+        """Test delete returns 404 — warns and continues without error."""
+        mock_delete.return_value = MagicMock(status_code=404)
+
+        result = runner.invoke(shutdown, ["--session", "cao-gone"])
+
         assert result.exit_code == 0
-        assert "Shutdown session 'cao-session1'" in result.output
-        assert "Error shutting down session 'cao-session2'" in result.output
+        assert "already removed" in result.output
+        assert "Shutdown session" not in result.output
+
+    @patch("cli_agent_orchestrator.cli.commands.shutdown.requests.get")
+    @patch("cli_agent_orchestrator.cli.commands.shutdown.requests.delete")
+    def test_shutdown_all_partial_failure(self, mock_delete, mock_get, runner):
+        """Test --all continues on per-session failures, reporting mixed results."""
+        mock_get.return_value = MagicMock(
+            status_code=200,
+            json=lambda: [
+                {"name": "session-1"},
+                {"name": "session-2"},
+                {"name": "session-3"},
+            ],
+        )
+        ok_response = MagicMock(status_code=200)
+        err_response = MagicMock(status_code=500)
+        err_response.raise_for_status.side_effect = requests.exceptions.HTTPError(
+            "500 Server Error"
+        )
+        mock_delete.side_effect = [ok_response, err_response, ok_response]
+
+        result = runner.invoke(shutdown, ["--all"])
+
+        assert mock_delete.call_count == 3
+        assert result.exit_code == 0
+        assert "Shutdown session 'session-1'" in result.output
+        assert "Shutdown session 'session-3'" in result.output
+        assert "Failed to connect to cao-server" in result.output
+
+    @patch("cli_agent_orchestrator.cli.commands.shutdown.requests.delete")
+    def test_shutdown_session_http_error(self, mock_delete, runner):
+        """Test delete returns 500 — raises ClickException."""
+        mock_response = MagicMock(status_code=500)
+        mock_response.raise_for_status.side_effect = requests.exceptions.HTTPError(
+            "500 Server Error"
+        )
+        mock_delete.return_value = mock_response
+
+        result = runner.invoke(shutdown, ["--session", "cao-test"])
+
+        assert result.exit_code != 0
+        assert "Failed to connect to cao-server" in result.output
