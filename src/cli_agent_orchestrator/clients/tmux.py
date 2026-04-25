@@ -1,25 +1,10 @@
-"""Simplified tmux client as module singleton.
+"""Subprocess-based tmux client; supports psmux on Windows.
 
-Implemented with direct subprocess calls to the tmux/psmux binary so that
-psmux (a tmux-compatible multiplexer for Windows) is fully supported.
-
-libtmux relies on the ``-F`` format flag being honoured by the server binary.
-psmux 3.3 does not honour ``-F`` for ``list-sessions`` and ignores it when the
-flag and its argument are concatenated (``-F#{field}`` vs ``-F #{field}``),
-which caused libtmux to return empty session lists and then raise
-``TmuxObjectDoesNotExist`` (observed as ``zip() argument 2 is shorter`` in
-older libtmux versions).  Replacing the libtmux session-management layer with
-direct subprocess calls avoids this entirely.
-
-psmux compatibility notes:
-- ``list-sessions`` does NOT honour ``-F``.  Session names are parsed from the
-  default output: ``NAME: N windows (created DATE) [(attached)]``.
-- ``list-windows -F FIELD`` works when ``-F`` and the format are *separate*
-  argv entries (space-separated), but not when concatenated inline.
-- ``has-session -t NAME`` works, but the ``=`` exact-match prefix (used by
-  libtmux when ``exact=True``) is not supported; we call it without ``=``.
-- ``new-session -P -F FIELD`` works with space-separated args.
-- ``display-message -p -t TARGET FIELD`` works correctly.
+Uses direct subprocess calls instead of libtmux so that psmux (a
+tmux-compatible multiplexer for Windows) is fully supported.  libtmux relies
+on ``-F`` format-flag conventions that psmux 3.3 does not honour, which caused
+empty session lists and crashes.  See PR #207 for full psmux compatibility
+notes.
 """
 
 import logging
@@ -37,31 +22,13 @@ from cli_agent_orchestrator.constants import TMUX_HISTORY_LINES
 logger = logging.getLogger(__name__)
 
 
-def pwsh_join(parts: list) -> str:
-    """Join command parts into a PowerShell-safe command string.
+def pwsh_join(parts: list[str]) -> str:
+    """Join argv into a PowerShell command line.
 
-    Equivalent to ``shlex.join()`` but uses PowerShell single-quoted string
-    literals instead of POSIX quoting.  Any embedded single-quote in a value
-    is escaped by doubling (``'`` → ``''``), which is the correct PowerShell
-    escape inside single-quoted strings.
-
-    Args:
-        parts: Sequence of command tokens (executable + arguments).
-
-    Returns:
-        A space-joined string where each part containing spaces or shell
-        metacharacters is wrapped in PowerShell single-quoted literals.
+    Each part is wrapped in a PowerShell single-quoted string literal.
+    Embedded single quotes are doubled — the escape rule inside '...' in PS.
     """
-    result = []
-    for part in parts:
-        if not part or any(
-            c in part
-            for c in (" ", "\t", '"', "'", "`", "$", "(", ")", "{", "}", ";", "&", "|", "<", ">", "~", "^")
-        ):
-            result.append(f"'{part.replace(chr(39), chr(39) * 2)}'")
-        else:
-            result.append(part)
-    return " ".join(result)
+    return " ".join("'" + p.replace("'", "''") + "'" for p in parts)
 
 
 class TmuxClient:
@@ -200,16 +167,14 @@ class TmuxClient:
         )
         return f"pwsh -NoProfile -Command \"{set_stmts}; pwsh -NoProfile\""
 
-    def _tmux(self, *args: str, check: bool = False, input: Optional[bytes] = None) -> subprocess.CompletedProcess:  # type: ignore[override]
-        """Run a tmux command and return the completed process."""
-        return subprocess.run(["tmux", *args], capture_output=True, text=True, check=check, input=input)  # type: ignore[call-overload]
+    def _run(self, *args: str, check: bool = False) -> subprocess.CompletedProcess:
+        """Run a tmux subcommand, capturing stdout/stderr as text."""
+        return subprocess.run(["tmux", *args], capture_output=True, text=True, check=check)
 
     def _session_exists_raw(self, session_name: str) -> bool:
-        """Return True if a tmux session with the given name exists.
-
-        Uses ``tmux has-session -t NAME`` (without the ``=`` exact-match prefix
-        that libtmux appends, which psmux does not support).
-        """
+        """Return True if a tmux session with the given name exists."""
+        # psmux-workaround: omits the ``=`` exact-match prefix that libtmux
+        # uses (``-t =NAME``) because psmux does not support it.
         result = subprocess.run(
             ["tmux", "has-session", "-t", session_name],
             capture_output=True,
@@ -251,10 +216,8 @@ class TmuxClient:
 
             # Build the new-session command.  Environment variables are passed
             # via repeated ``-e KEY=VALUE`` args (one pair per flag invocation).
-            # On Windows / psmux, ``-e`` sets the session record but does NOT
-            # propagate into the spawned shell process.  We work around this by
-            # prepending a PowerShell env-injection command as the shell-command
-            # argument so that the variables are visible to the spawned shell.
+            # psmux-workaround: ``-e`` sets the session record but does NOT
+            # propagate into the spawned shell process; inject via a pwsh prefix.
             cmd = [
                 "tmux", "new-session",
                 "-s", session_name,
@@ -281,14 +244,9 @@ class TmuxClient:
                 f" in directory: {working_directory}"
             )
 
-            # Retrieve the actual window name from tmux (psmux may normalise it).
-            # ``list-windows -F #{window_name}`` works with psmux when -F and the
-            # format string are separate argv entries.
-            lw = subprocess.run(
-                ["tmux", "list-windows", "-t", session_name, "-F", "#{window_name}"],
-                capture_output=True,
-                text=True,
-            )
+            # psmux-workaround: -F and format string must be separate argv entries;
+            # concatenated form (``-F#{field}``) is silently ignored by psmux.
+            lw = self._run("list-windows", "-t", session_name, "-F", "#{window_name}")
             first_window = lw.stdout.splitlines()[0].strip() if lw.stdout.strip() else None
             if first_window is None:
                 raise ValueError(f"Window name is None for session {session_name}")
@@ -331,11 +289,8 @@ class TmuxClient:
                 )
 
             # Retrieve the actual window name
-            lw = subprocess.run(
-                ["tmux", "list-windows", "-t", session_name, "-F", "#{window_name}"],
-                capture_output=True,
-                text=True,
-            )
+            # psmux-workaround: -F and format string must be separate argv entries.
+            lw = self._run("list-windows", "-t", session_name, "-F", "#{window_name}")
             # The newly created window is the last one in the list
             names = [n.strip() for n in lw.stdout.splitlines() if n.strip()]
             actual_name = next((n for n in reversed(names) if n == window_name), None)
@@ -431,17 +386,15 @@ class TmuxClient:
             if not self._session_exists_raw(session_name):
                 raise ValueError(f"Session '{session_name}' not found")
 
-            # Verify the window exists
-            lw = subprocess.run(
-                ["tmux", "list-windows", "-t", session_name, "-F", "#{window_name}"],
-                capture_output=True,
-                text=True,
-            )
+            # psmux-workaround: -F and format string must be separate argv entries.
+            lw = self._run("list-windows", "-t", session_name, "-F", "#{window_name}")
             window_names = [n.strip() for n in lw.stdout.splitlines() if n.strip()]
             if window_name not in window_names:
                 raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
 
             target = f"{session_name}:{window_name}"
+            # psmux-workaround: use a fixed buffer name; psmux has a numeric buffer
+            # stack and ignores the ``-b NAME`` flag, so named buffers are not reliable.
             buf_name = "cao_paste"
 
             # Load text into tmux buffer
@@ -491,12 +444,8 @@ class TmuxClient:
             if not self._session_exists_raw(session_name):
                 raise ValueError(f"Session '{session_name}' not found")
 
-            # Verify the window exists
-            lw = subprocess.run(
-                ["tmux", "list-windows", "-t", session_name, "-F", "#{window_name}"],
-                capture_output=True,
-                text=True,
-            )
+            # psmux-workaround: -F and format string must be separate argv entries.
+            lw = self._run("list-windows", "-t", session_name, "-F", "#{window_name}")
             window_names = [n.strip() for n in lw.stdout.splitlines() if n.strip()]
             if window_name not in window_names:
                 raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
@@ -525,23 +474,15 @@ class TmuxClient:
             if not self._session_exists_raw(session_name):
                 raise ValueError(f"Session '{session_name}' not found")
 
-            # Verify the window exists
-            lw = subprocess.run(
-                ["tmux", "list-windows", "-t", session_name, "-F", "#{window_name}"],
-                capture_output=True,
-                text=True,
-            )
+            # psmux-workaround: -F and format string must be separate argv entries.
+            lw = self._run("list-windows", "-t", session_name, "-F", "#{window_name}")
             window_names = [n.strip() for n in lw.stdout.splitlines() if n.strip()]
             if window_name not in window_names:
                 raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
 
             lines = tail_lines if tail_lines is not None else TMUX_HISTORY_LINES
             target = f"{session_name}:{window_name}"
-            result = subprocess.run(
-                ["tmux", "capture-pane", "-t", target, "-e", "-p", "-S", f"-{lines}"],
-                capture_output=True,
-                text=True,
-            )
+            result = self._run("capture-pane", "-t", target, "-e", "-p", "-S", f"-{lines}")
             return result.stdout if result.stdout else ""
         except Exception as e:
             logger.error(f"Failed to get history from {session_name}:{window_name}: {e}")
@@ -550,7 +491,9 @@ class TmuxClient:
     def list_sessions(self) -> List[Dict[str, str]]:
         """List all tmux sessions."""
         try:
-            result = subprocess.run(["tmux", "list-sessions"], capture_output=True, text=True)
+            # psmux-workaround: ``list-sessions -F FORMAT`` is ignored; session names
+            # are parsed from the default human-readable output instead.
+            result = self._run("list-sessions")
             if result.returncode != 0:
                 return []
 
@@ -579,10 +522,9 @@ class TmuxClient:
             if not self._session_exists_raw(session_name):
                 return []
 
-            result = subprocess.run(
-                ["tmux", "list-windows", "-t", session_name, "-F", "#{window_name}|#{window_index}"],
-                capture_output=True,
-                text=True,
+            # psmux-workaround: -F and format string must be separate argv entries.
+            result = self._run(
+                "list-windows", "-t", session_name, "-F", "#{window_name}|#{window_index}"
             )
             if result.returncode != 0:
                 return []
@@ -603,11 +545,7 @@ class TmuxClient:
         try:
             if not self._session_exists_raw(session_name):
                 return False
-            result = subprocess.run(
-                ["tmux", "kill-session", "-t", session_name],
-                capture_output=True,
-                text=True,
-            )
+            result = self._run("kill-session", "-t", session_name)
             if result.returncode == 0:
                 logger.info(f"Killed tmux session: {session_name}")
                 return True
@@ -622,21 +560,14 @@ class TmuxClient:
             if not self._session_exists_raw(session_name):
                 return False
 
-            lw = subprocess.run(
-                ["tmux", "list-windows", "-t", session_name, "-F", "#{window_name}"],
-                capture_output=True,
-                text=True,
-            )
+            # psmux-workaround: -F and format string must be separate argv entries.
+            lw = self._run("list-windows", "-t", session_name, "-F", "#{window_name}")
             window_names = [n.strip() for n in lw.stdout.splitlines() if n.strip()]
             if window_name not in window_names:
                 return False
 
             target = f"{session_name}:{window_name}"
-            result = subprocess.run(
-                ["tmux", "kill-window", "-t", target],
-                capture_output=True,
-                text=True,
-            )
+            result = self._run("kill-window", "-t", target)
             if result.returncode == 0:
                 logger.info(f"Killed tmux window: {session_name}:{window_name}")
                 return True
@@ -658,21 +589,14 @@ class TmuxClient:
             if not self._session_exists_raw(session_name):
                 return None
 
-            lw = subprocess.run(
-                ["tmux", "list-windows", "-t", session_name, "-F", "#{window_name}"],
-                capture_output=True,
-                text=True,
-            )
+            # psmux-workaround: -F and format string must be separate argv entries.
+            lw = self._run("list-windows", "-t", session_name, "-F", "#{window_name}")
             window_names = [n.strip() for n in lw.stdout.splitlines() if n.strip()]
             if window_name not in window_names:
                 return None
 
             target = f"{session_name}:{window_name}"
-            result = subprocess.run(
-                ["tmux", "display-message", "-p", "-t", target, "#{pane_current_path}"],
-                capture_output=True,
-                text=True,
-            )
+            result = self._run("display-message", "-p", "-t", target, "#{pane_current_path}")
             if result.stdout:
                 return result.stdout.strip()
             return None
@@ -692,21 +616,14 @@ class TmuxClient:
             if not self._session_exists_raw(session_name):
                 raise ValueError(f"Session '{session_name}' not found")
 
-            lw = subprocess.run(
-                ["tmux", "list-windows", "-t", session_name, "-F", "#{window_name}"],
-                capture_output=True,
-                text=True,
-            )
+            # psmux-workaround: -F and format string must be separate argv entries.
+            lw = self._run("list-windows", "-t", session_name, "-F", "#{window_name}")
             window_names = [n.strip() for n in lw.stdout.splitlines() if n.strip()]
             if window_name not in window_names:
                 raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
 
             target = f"{session_name}:{window_name}"
-            result = subprocess.run(
-                ["tmux", "pipe-pane", "-t", target, "-o", f"cat >> {file_path}"],
-                capture_output=True,
-                text=True,
-            )
+            result = self._run("pipe-pane", "-t", target, "-o", f"cat >> {file_path}")
             if result.returncode != 0:
                 raise RuntimeError(
                     f"tmux pipe-pane failed (exit {result.returncode}): {result.stderr.strip()}"
@@ -727,22 +644,14 @@ class TmuxClient:
             if not self._session_exists_raw(session_name):
                 raise ValueError(f"Session '{session_name}' not found")
 
-            lw = subprocess.run(
-                ["tmux", "list-windows", "-t", session_name, "-F", "#{window_name}"],
-                capture_output=True,
-                text=True,
-            )
+            # psmux-workaround: -F and format string must be separate argv entries.
+            lw = self._run("list-windows", "-t", session_name, "-F", "#{window_name}")
             window_names = [n.strip() for n in lw.stdout.splitlines() if n.strip()]
             if window_name not in window_names:
                 raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
 
             target = f"{session_name}:{window_name}"
-            subprocess.run(
-                ["tmux", "pipe-pane", "-t", target],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
+            self._run("pipe-pane", "-t", target, check=True)
             logger.info(f"Stopped pipe-pane for {session_name}:{window_name}")
         except Exception as e:
             logger.error(f"Failed to stop pipe-pane for {session_name}:{window_name}: {e}")
