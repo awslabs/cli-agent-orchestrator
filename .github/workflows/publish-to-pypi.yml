@@ -73,6 +73,9 @@ jobs:
 
   smoke-test:
     name: Install from TestPyPI and verify entry points
+    # Only runs on Release-triggered publishes. Manual workflow_dispatch
+    # skips the smoke-test because we have no tagged version to pin against.
+    if: github.event_name == 'release'
     needs: publish-testpypi
     runs-on: ubuntu-latest
     steps:
@@ -80,16 +83,21 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Wait for TestPyPI index propagation
-        run: sleep 30
-
-      - name: Install from TestPyPI
+      - name: Install from TestPyPI (retry while index propagates)
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          pip install \
-            --index-url https://test.pypi.org/simple/ \
-            --extra-index-url https://pypi.org/simple/ \
-            "cli-agent-orchestrator==${VERSION}"
+          for attempt in 1 2 3 4 5 6; do
+            if pip install \
+                --index-url https://test.pypi.org/simple/ \
+                --extra-index-url https://pypi.org/simple/ \
+                "cli-agent-orchestrator==${VERSION}"; then
+              exit 0
+            fi
+            echo "Attempt ${attempt} failed; sleeping 15s before retry..."
+            sleep 15
+          done
+          echo "TestPyPI install failed after 6 attempts (90s total)"
+          exit 1
 
       - name: Verify entry points
         run: |
