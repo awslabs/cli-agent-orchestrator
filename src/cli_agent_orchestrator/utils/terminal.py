@@ -6,6 +6,7 @@ import uuid
 from typing import TYPE_CHECKING, Union
 
 import httpx
+import requests
 
 from cli_agent_orchestrator.constants import API_BASE_URL, SESSION_PREFIX
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -120,6 +121,33 @@ def wait_until_status(
         time.sleep(polling_interval)
 
     return False
+
+
+def poll_until_done(terminal_id: str, timeout: float, polling_interval: float = 1.0) -> None:
+    """Poll terminal status until completed/error or timeout.
+
+    Raises click.ClickException on error, timeout, or request failure.
+    """
+    import click
+
+    start = time.time()
+    while True:
+        elapsed = time.time() - start
+        if elapsed > timeout:
+            raise click.ClickException(
+                f"Timed out after {int(elapsed)}s waiting for terminal {terminal_id}"
+            )
+        try:
+            resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}")
+            resp.raise_for_status()
+            status = resp.json().get("status")
+            if status == TerminalStatus.COMPLETED.value:
+                return
+            if status == TerminalStatus.ERROR.value:
+                raise click.ClickException("Terminal reached ERROR status")
+        except requests.exceptions.RequestException as e:
+            raise click.ClickException(f"Failed to poll terminal status: {e}")
+        time.sleep(polling_interval)
 
 
 def wait_until_terminal_status(

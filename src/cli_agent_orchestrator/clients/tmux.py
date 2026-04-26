@@ -76,6 +76,11 @@ class TmuxClient:
         if working_directory is None:
             working_directory = os.getcwd()
 
+        # Expand ~ to the server's home directory so clients can use
+        # portable paths like ~/q/my-project without knowing the server's
+        # actual home path (e.g., /home/user vs /Users/user).
+        working_directory = os.path.expanduser(working_directory)
+
         # Step 1: Canonicalize the path via realpath to resolve symlinks
         # and .. sequences.  os.path.realpath is recognized by CodeQL as a
         # PathNormalization (transitions taint to NormalizedUnchecked).

@@ -22,13 +22,17 @@ def load_fixture(filename: str) -> str:
 class TestKiroCliProviderInitialization:
     """Test Kiro CLI provider initialization."""
 
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
-    def test_initialize_success(self, mock_tmux, mock_wait_status, mock_wait_shell):
+    def test_initialize_success(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile
+    ):
         """Test successful initialization."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
+        mock_load_profile.side_effect = FileNotFoundError("no profile")
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         result = provider.initialize()
@@ -51,27 +55,35 @@ class TestKiroCliProviderInitialization:
         with pytest.raises(TimeoutError, match="Shell initialization timed out"):
             provider.initialize()
 
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
-    def test_initialize_kiro_cli_timeout(self, mock_tmux, mock_wait_status, mock_wait_shell):
+    def test_initialize_kiro_cli_timeout(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile
+    ):
         """Test initialization fails when both TUI and --legacy-ui timeout."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = False
+        mock_load_profile.side_effect = FileNotFoundError("no profile")
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
 
         with pytest.raises(TimeoutError, match="timed out with TUI and `--legacy-ui`"):
             provider.initialize()
 
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
-    def test_initialize_legacy_ui_fallback(self, mock_tmux, mock_wait_status, mock_wait_shell):
+    def test_initialize_legacy_ui_fallback(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile
+    ):
         """Test fallback to --legacy-ui when TUI initialization fails."""
         mock_wait_shell.return_value = True
         # First call (TUI) fails, second call (--legacy-ui) succeeds
         mock_wait_status.side_effect = [False, True]
+        mock_load_profile.side_effect = FileNotFoundError("no profile")
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         result = provider.initialize()
@@ -90,6 +102,138 @@ class TestKiroCliProviderInitialization:
             "test-session",
             "window-0",
             "kiro-cli chat --legacy-ui --agent developer",
+        )
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_initialize_yolo_forces_legacy_ui_with_trust_all_tools(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile
+    ):
+        """--yolo (allowed_tools=['*']) must launch directly with --legacy-ui + --trust-all-tools.
+
+        kiro-cli 2.0.1 TUI shows a non-bypassable trust-all-tools consent
+        dialog; yolo headless launches must skip the TUI attempt entirely.
+        """
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        mock_load_profile.side_effect = FileNotFoundError("no profile")
+
+        provider = KiroCliProvider(
+            "test1234", "test-session", "window-0", "developer", allowed_tools=["*"]
+        )
+        provider.initialize()
+
+        mock_tmux.send_keys.assert_called_once_with(
+            "test-session",
+            "window-0",
+            "kiro-cli chat --legacy-ui --trust-all-tools --agent developer",
+        )
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_initialize_passes_profile_model(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile
+    ):
+        """profile.model must be forwarded to kiro-cli via --model."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        profile = Mock()
+        profile.model = "claude-opus-4-6"
+        mock_load_profile.return_value = profile
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        provider.initialize()
+
+        mock_tmux.send_keys.assert_called_once_with(
+            "test-session",
+            "window-0",
+            "kiro-cli chat --model claude-opus-4-6 --agent developer",
+        )
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_initialize_yolo_and_model_combine(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile
+    ):
+        """--yolo + profile.model: --legacy-ui + --trust-all-tools + --model, all in one launch."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        profile = Mock()
+        profile.model = "claude-opus-4.6"
+        mock_load_profile.return_value = profile
+
+        provider = KiroCliProvider(
+            "test1234", "test-session", "window-0", "developer", allowed_tools=["*"]
+        )
+        provider.initialize()
+
+        mock_tmux.send_keys.assert_called_once_with(
+            "test-session",
+            "window-0",
+            "kiro-cli chat --legacy-ui --trust-all-tools --model claude-opus-4.6 --agent developer",
+        )
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_initialize_yolo_no_fallback_on_timeout(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile
+    ):
+        """Yolo launch is already --legacy-ui; on timeout, raise — do not re-fall-back.
+
+        Prevents the old double-timeout behavior (TUI timeout → legacy fallback →
+        legacy timeout) which added ~30 seconds before returning the 500 to the caller.
+        """
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = False
+        mock_load_profile.side_effect = FileNotFoundError("no profile")
+
+        provider = KiroCliProvider(
+            "test1234", "test-session", "window-0", "developer", allowed_tools=["*"]
+        )
+
+        with pytest.raises(TimeoutError, match="timed out with --legacy-ui"):
+            provider.initialize()
+
+        # Only one launch attempt — no /exit, no second launch.
+        assert mock_tmux.send_keys.call_count == 1
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_initialize_non_yolo_legacy_ui_fallback_preserves_model(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load_profile
+    ):
+        """Non-yolo TUI timeout → --legacy-ui fallback must preserve --model."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.side_effect = [False, True]
+        profile = Mock()
+        profile.model = "claude-opus-4.6"
+        mock_load_profile.return_value = profile
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        provider.initialize()
+
+        calls = mock_tmux.send_keys.call_args_list
+        assert len(calls) == 3
+        assert calls[0].args == (
+            "test-session",
+            "window-0",
+            "kiro-cli chat --model claude-opus-4.6 --agent developer",
+        )
+        assert calls[1].args == ("test-session", "window-0", "/exit")
+        assert calls[2].args == (
+            "test-session",
+            "window-0",
+            "kiro-cli chat --legacy-ui --model claude-opus-4.6 --agent developer",
         )
 
     def test_initialization_with_different_agent_profiles(self):
@@ -409,6 +553,83 @@ class TestKiroCliProviderMessageExtraction:
         assert "More response content" in message
         assert "How can I help?" not in message
         assert "User message" not in message
+
+    def test_paste_enter_count_returns_one(self):
+        """Kiro CLI submits on single Enter after bracketed paste."""
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        assert provider.paste_enter_count == 1
+
+    def test_extract_slash_command_output(self):
+        """Test extraction of slash command output (no green arrow)."""
+        output = (
+            "[developer] 5% λ > /context add foo.py\n"
+            "Added foo.py to context\n"
+            "[developer] 5% λ > "
+        )
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        message = provider.extract_last_message_from_script(output)
+
+        assert "Added foo.py to context" in message
+        assert "/context" not in message
+
+    def test_extract_slash_command_after_prior_response(self):
+        """Test slash command extraction when prior LLM response exists in buffer."""
+        output = (
+            "[developer] 4% λ > explain this\n"
+            "> Here is the explanation\n"
+            "The code does X, Y, Z\n"
+            "[developer] 5% λ > /compact\n"
+            "Compacting conversation...\n"
+            "Reduced from 50k to 10k tokens\n"
+            "[developer] 5% λ > "
+        )
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        message = provider.extract_last_message_from_script(output)
+
+        assert "Compacting conversation" in message
+        assert "Reduced from 50k to 10k tokens" in message
+        assert "explanation" not in message
+        assert "/compact" not in message
+
+    def test_extract_slash_command_multiline_output(self):
+        """Test extraction of slash command with multi-line output."""
+        output = (
+            "[developer] 5% λ > /compact\n"
+            "Compacting conversation...\n"
+            "Reduced from 50k to 10k tokens\n"
+            "[developer] 5% λ > "
+        )
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        message = provider.extract_last_message_from_script(output)
+
+        assert "Compacting conversation" in message
+        assert "Reduced from 50k to 10k tokens" in message
+        assert "/compact" not in message
+
+    def test_extract_slash_command_no_output(self):
+        """Test slash command with no output still raises ValueError."""
+        output = "[developer] 5% λ > /some-command\n" "[developer] 5% λ > "
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+
+        with pytest.raises(ValueError, match="No Kiro CLI response found"):
+            provider.extract_last_message_from_script(output)
+
+    def test_extract_no_arrow_no_slash_raises(self):
+        """No green arrow + no slash command = ValueError, not silent garbage."""
+        output = (
+            "[developer] 5% λ > some regular text\n"
+            "some output between prompts\n"
+            "[developer] 5% λ > "
+        )
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+
+        with pytest.raises(ValueError):
+            provider.extract_last_message_from_script(output)
 
 
 class TestKiroCliProviderRegexPatterns:
@@ -943,8 +1164,34 @@ class TestKiroCliTuiMode:
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
 
-        with pytest.raises(ValueError, match="no separator before Credits"):
+        with pytest.raises(ValueError, match="no separator found near Credits"):
             provider.extract_last_message_from_script(output)
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_tui_extraction_kiro2_forward_scan(self, mock_tmux):
+        """Test extraction exercises the Kiro 2.0 forward scan path.
+
+        Layout: two Credits lines (prev turn + current turn), separator ONLY after
+        the second Credits line. The forward scan from prev_credits_idx+1 to
+        credits_idx finds no separator (separator_idx stays None), then the
+        forward scan from credits_idx+1 finds the separator, triggering the
+        separator_idx > credits_idx branch which extracts prev_credits_idx+1:credits_idx.
+        """
+        output = (
+            "▸ Credits: 0.10 • Time: 1s\n"  # prev turn Credits (prev_credits_idx=0)
+            "  Content between turns\n"  # content for current turn
+            "\n"
+            "  Agent response here.\n"
+            "\n"
+            "▸ Credits: 0.24 • Time: 3s\n"  # current turn Credits (credits_idx=5)
+            "────────────────────────────────────────────────────\n"  # separator AFTER credits
+            "developer · auto · 3%\n"
+            " Ask a question or describe a task ↵"
+        )
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        message = provider.extract_last_message_from_script(output)
+        assert "Agent response here." in message
+        assert "Content between turns" not in message
 
     def test_tui_credits_pattern(self):
         """Test TUI Credits pattern matches expected formats."""
@@ -1020,7 +1267,12 @@ class TestKiroCliTuiMode:
 
     @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
     def test_tui_kiro_is_working_takes_priority(self, mock_tmux):
-        """Test 'Kiro is working' returns PROCESSING even if idle prompt is also present."""
+        """Test 'Kiro is working' after idle prompt still returns PROCESSING.
+
+        Idle prompt appears BEFORE 'Kiro is working' in the buffer — the agent
+        started a new task after the previous idle.  The last 'Kiro is working'
+        has no idle prompt after it, so the result must be PROCESSING.
+        """
         mock_tmux.get_history.return_value = (
             "developer · auto · ◔ 3%\n"
             " Ask a question or describe a task ↵\n"
@@ -1030,8 +1282,71 @@ class TestKiroCliTuiMode:
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         status = provider.get_status()
 
-        # "Kiro is working" is checked before idle prompt — PROCESSING wins
+        # idle prompt is BEFORE "Kiro is working" → no idle after last working → PROCESSING
         assert status == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_tui_stale_kiro_is_working_before_idle_yields_idle(self, mock_tmux):
+        """Test that a stale 'Kiro is working' line does not block IDLE detection.
+
+        Kiro TUI redraws in-place.  After the agent finishes the buffer retains
+        the old 'Kiro is working' ghost text above the newly rendered idle prompt.
+        The fix: only return PROCESSING when no idle prompt appears *after* the
+        last 'Kiro is working' occurrence.
+        """
+        mock_tmux.get_history.return_value = (
+            "────────────────────────────────────────────────────\n"
+            " Kiro is working\n"
+            "────────────────────────────────────────────────────\n"
+            "developer · auto · ◔ 0%\n"
+            " Ask a question or describe a task ↵\n"
+        )
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_tui_stale_kiro_is_working_with_credits_yields_completed(self, mock_tmux):
+        """Test COMPLETED when stale 'Kiro is working' precedes credits + idle prompt.
+
+        After a successful response the buffer may contain:
+          1. stale 'Kiro is working' from the in-progress render
+          2. '▸ Credits:' completion marker
+          3. idle prompt
+
+        The stale ghost text must not block the COMPLETED detection.
+        """
+        mock_tmux.get_history.return_value = (
+            " Kiro is working\n"
+            "────────────────────────────────────────────────────\n"
+            "> Here is the result you asked for.\n"
+            "▸ Credits: 0.05 • Time: 3s\n"
+            "developer · auto · ◔ 0%\n"
+            " Ask a question or describe a task ↵\n"
+        )
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_tui_multiple_stale_kiro_is_working_lines_yield_idle(self, mock_tmux):
+        """Test that multiple stale 'Kiro is working' lines all before the idle
+        prompt still resolve to IDLE (uses the *last* working-line position)."""
+        mock_tmux.get_history.return_value = (
+            " Kiro is working\n"
+            " Kiro is working\n"
+            "developer · auto · ◔ 0%\n"
+            " Ask a question or describe a task ↵\n"
+        )
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.IDLE
 
     @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
     def test_tui_permission_prompt_detection(self, mock_tmux):

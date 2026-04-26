@@ -35,6 +35,7 @@ class TestHandoffMessageContext:
         # Verify _send_direct_input was called with the handoff prefix
         mock_send.assert_called_once()
         sent_message = mock_send.call_args[0][1]
+        assert mock_send.call_args[0][2] == "handoff"
         assert sent_message.startswith("[CAO Handoff]")
         assert "supervisor-abc123" in sent_message
         assert "Implement hello world" in sent_message
@@ -61,6 +62,7 @@ class TestHandoffMessageContext:
         # Verify message was sent unchanged
         mock_send.assert_called_once()
         sent_message = mock_send.call_args[0][1]
+        assert mock_send.call_args[0][2] == "handoff"
         assert sent_message == "Implement hello world"
 
     @patch("cli_agent_orchestrator.mcp_server.server._send_direct_input")
@@ -83,6 +85,7 @@ class TestHandoffMessageContext:
 
         mock_send.assert_called_once()
         sent_message = mock_send.call_args[0][1]
+        assert mock_send.call_args[0][2] == "handoff"
         assert sent_message == "Implement hello world"
 
     @patch("cli_agent_orchestrator.mcp_server.server._send_direct_input")
@@ -107,6 +110,7 @@ class TestHandoffMessageContext:
                 asyncio.run(_handoff_impl("developer", "Build feature X"))
 
         sent_message = mock_send.call_args[0][1]
+        assert mock_send.call_args[0][2] == "handoff"
         assert "sup-xyz789" in sent_message
         assert "Build feature X" in sent_message
 
@@ -130,6 +134,7 @@ class TestHandoffMessageContext:
                 asyncio.run(_handoff_impl("developer", "Do task"))
 
         sent_message = mock_send.call_args[0][1]
+        assert mock_send.call_args[0][2] == "handoff"
         assert "unknown" in sent_message
         assert "[CAO Handoff]" in sent_message
         assert "Do task" in sent_message
@@ -155,4 +160,5 @@ class TestHandoffMessageContext:
                 asyncio.run(_handoff_impl("developer", original))
 
         sent_message = mock_send.call_args[0][1]
+        assert mock_send.call_args[0][2] == "handoff"
         assert sent_message.endswith(original)

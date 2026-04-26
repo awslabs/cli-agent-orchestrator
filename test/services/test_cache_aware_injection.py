@@ -26,6 +26,7 @@ def _make_mock_profile(system_prompt: str = "You are a test agent.", name: str =
     profile.mcpServers = None
     profile.allowedTools = None
     profile.role = None
+    profile.model = None
     return profile
 
 

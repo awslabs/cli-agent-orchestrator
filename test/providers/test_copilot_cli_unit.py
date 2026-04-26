@@ -126,6 +126,78 @@ class TestCopilotCliProviderCommand:
         assert parts[parts.index("--add-dir") + 1]
 
 
+class TestCopilotCliProviderModelFlag:
+    """Tests that the model kwarg is forwarded to Copilot CLI via --model.
+
+    The Copilot provider takes the model value directly from the constructor
+    (populated by terminal_service from the already-loaded AgentProfile) to
+    avoid re-loading the profile.
+    """
+
+    @patch("cli_agent_orchestrator.providers.copilot_cli.CopilotCliProvider._supports_flag")
+    @patch(
+        "cli_agent_orchestrator.providers.copilot_cli.CopilotCliProvider._build_runtime_mcp_config"
+    )
+    @patch("cli_agent_orchestrator.providers.copilot_cli.tmux_client")
+    @patch.dict("os.environ", {}, clear=True)
+    def test_command_appends_model_when_set(self, mock_tmux, mock_build_mcp, mock_supports_flag):
+        mock_supports_flag.return_value = True
+        mock_build_mcp.return_value = '{"mcpServers":{"cao-mcp-server":{"command":"x"}}}'
+        mock_tmux.get_pane_working_directory.return_value = "/tmp/project"
+
+        provider = CopilotCliProvider(
+            "test1234",
+            "test-session",
+            "window-0",
+            agent_profile="repo-agent",
+            model="claude-sonnet-4.5",
+        )
+        parts = shlex.split(provider._command())
+
+        assert "--model" in parts
+        assert parts[parts.index("--model") + 1] == "claude-sonnet-4.5"
+
+    @patch("cli_agent_orchestrator.providers.copilot_cli.CopilotCliProvider._supports_flag")
+    @patch(
+        "cli_agent_orchestrator.providers.copilot_cli.CopilotCliProvider._build_runtime_mcp_config"
+    )
+    @patch("cli_agent_orchestrator.providers.copilot_cli.tmux_client")
+    @patch.dict("os.environ", {}, clear=True)
+    def test_command_omits_model_when_unset(self, mock_tmux, mock_build_mcp, mock_supports_flag):
+        mock_supports_flag.return_value = True
+        mock_build_mcp.return_value = '{"mcpServers":{"cao-mcp-server":{"command":"x"}}}'
+        mock_tmux.get_pane_working_directory.return_value = "/tmp/project"
+
+        provider = CopilotCliProvider(
+            "test1234", "test-session", "window-0", agent_profile="repo-agent"
+        )
+        parts = shlex.split(provider._command())
+
+        assert "--model" not in parts
+
+    @patch("cli_agent_orchestrator.providers.copilot_cli.CopilotCliProvider._supports_flag")
+    @patch(
+        "cli_agent_orchestrator.providers.copilot_cli.CopilotCliProvider._build_runtime_mcp_config"
+    )
+    @patch("cli_agent_orchestrator.providers.copilot_cli.tmux_client")
+    @patch.dict("os.environ", {}, clear=True)
+    def test_command_omits_model_when_no_agent_profile(
+        self, mock_tmux, mock_build_mcp, mock_supports_flag
+    ):
+        # --model is only meaningful alongside --agent; without an agent
+        # profile the flag is not emitted even if a model is passed.
+        mock_supports_flag.return_value = True
+        mock_build_mcp.return_value = '{"mcpServers":{"cao-mcp-server":{"command":"x"}}}'
+        mock_tmux.get_pane_working_directory.return_value = "/tmp/project"
+
+        provider = CopilotCliProvider(
+            "test1234", "test-session", "window-0", model="claude-sonnet-4.5"
+        )
+        parts = shlex.split(provider._command())
+
+        assert "--model" not in parts
+
+
 class TestCopilotCliProviderInitialization:
     @patch("cli_agent_orchestrator.providers.copilot_cli.wait_for_shell")
     def test_initialize_shell_timeout(self, mock_wait_shell):
@@ -336,6 +408,96 @@ class TestCopilotCliProviderStatusDetection:
         mock_tmux.get_history.return_value = "❯ refactor this\nassistant: note\nError: sample\n❯ "
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
         assert provider.get_status() == TerminalStatus.COMPLETED
+
+    # ------------------------------------------------------------------
+    # Copilot v1.0.31+ layout: bare ❯ followed by the status bar line
+    # ------------------------------------------------------------------
+
+    @patch("cli_agent_orchestrator.providers.copilot_cli.tmux_client")
+    def test_get_status_idle_with_v1031_autopilot_status_bar(self, mock_tmux):
+        """Bare ❯ + 'autopilot · / commands ...' status bar → IDLE (no prior user turn)."""
+        mock_tmux.get_history.return_value = (
+            "● Selected custom agent: developer\n"
+            "\n"
+            "● Environment loaded: 3 custom instructions, 1 hook, 2 MCP servers\n"
+            "\n"
+            " ~/repo [⎇ main*%]\n"
+            "────────────────────────────────────────────────────────────────────────────────\n"
+            "❯\n"
+            "────────────────────────────────────────────────────────────────────────────────\n"
+            " autopilot · / commands \u200b                        Claude Sonnet 4.6 · (0%)\n"
+        )
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.copilot_cli.tmux_client")
+    def test_get_status_idle_with_v1031_plan_status_bar(self, mock_tmux):
+        """Bare ❯ + 'plan · / commands ...' status bar → IDLE."""
+        mock_tmux.get_history.return_value = (
+            " ~/repo [⎇ main]\n"
+            "────────────────────────────────────────────────────────────────────────────────\n"
+            "❯\n"
+            "────────────────────────────────────────────────────────────────────────────────\n"
+            " plan · / commands \u200b                             Claude Sonnet 4.6 · (0%)\n"
+        )
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.copilot_cli.tmux_client")
+    def test_get_status_idle_with_v1031_interactive_status_bar(self, mock_tmux):
+        """Bare ❯ + 'interactive · / commands ...' status bar → IDLE."""
+        mock_tmux.get_history.return_value = (
+            " ~/repo [⎇ main]\n"
+            "────────────────────────────────────────────────────────────────────────────────\n"
+            "❯\n"
+            "────────────────────────────────────────────────────────────────────────────────\n"
+            " interactive · / commands \u200b                      Claude Sonnet 4.6 · (0%)\n"
+        )
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.copilot_cli.tmux_client")
+    def test_get_status_completed_with_v1031_status_bar_after_user_turn(self, mock_tmux):
+        """User turn + agent response + bare ❯ + status bar → COMPLETED."""
+        mock_tmux.get_history.return_value = (
+            "❯ fix the bug\n"
+            "● Edit src/main.py (+3 -1)\n"
+            " ~/repo [⎇ main*%]\n"
+            "────────────────────────────────────────────────────────────────────────────────\n"
+            "❯\n"
+            "────────────────────────────────────────────────────────────────────────────────\n"
+            " autopilot · / commands \u200b                        Claude Sonnet 4.6 · (0%)\n"
+        )
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.copilot_cli.tmux_client")
+    def test_get_status_processing_with_spinner_and_v1031_status_bar(self, mock_tmux):
+        """Spinner line present alongside status bar → still PROCESSING."""
+        mock_tmux.get_history.return_value = (
+            "❯ refactor utils.py\n"
+            "∙ Thinking (Esc to cancel)\n"
+            " ~/repo [⎇ main*%]\n"
+            "────────────────────────────────────────────────────────────────────────────────\n"
+            "❯\n"
+            "────────────────────────────────────────────────────────────────────────────────\n"
+            " autopilot · / commands \u200b                        Claude Sonnet 4.6 · (0%)\n"
+        )
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.copilot_cli.tmux_client")
+    def test_get_status_idle_with_v1031_absolute_path_breadcrumb(self, mock_tmux):
+        """Bare ❯ + absolute-path breadcrumb (CWD outside $HOME) → IDLE."""
+        mock_tmux.get_history.return_value = (
+            " /tmp/pr184-e2e [⎇ pr-184]\n"
+            "────────────────────────────────────────────────────────────────────────────────\n"
+            "❯\n"
+            "────────────────────────────────────────────────────────────────────────────────\n"
+            " autopilot · / commands \u200b                        Claude Sonnet 4.6 · (0%)\n"
+        )
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.IDLE
 
 
 class TestCopilotCliProviderMessageExtraction:

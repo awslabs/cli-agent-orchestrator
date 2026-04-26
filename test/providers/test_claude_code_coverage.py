@@ -35,6 +35,7 @@ class TestBuildCommandMcpServerModelDump:
         }
         # isinstance(mock_mcp, dict) returns False, so the model_dump branch triggers
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = "Test prompt"
         mock_profile.mcpServers = {"my-mcp": mock_mcp}
         mock_profile.allowedTools = None

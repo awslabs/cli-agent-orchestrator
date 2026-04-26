@@ -280,6 +280,119 @@ class TestCreateTerminal:
 
         assert mock_provider_manager.create_provider.call_args.kwargs["skill_prompt"] is None
 
+    @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.build_skill_catalog")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    def test_build_skill_catalog_called_for_runtime_prompt_provider(
+        self,
+        mock_load_profile,
+        mock_build_skill_catalog,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_log_dir,
+    ):
+        """build_skill_catalog() is called exactly once for runtime-prompt providers."""
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = False
+        mock_load_profile.return_value = AgentProfile(
+            name="developer", description="Developer", system_prompt="You are the developer."
+        )
+        mock_build_skill_catalog.return_value = "## Available Skills\n\n- skill-a"
+        mock_provider_manager.create_provider.return_value = MagicMock()
+        mock_log_dir.__truediv__.return_value = MagicMock()
+
+        create_terminal("claude_code", "developer", new_session=True)
+
+        mock_build_skill_catalog.assert_called_once_with()
+
+    @pytest.mark.parametrize("provider_name", ["opencode_cli", "kiro_cli", "q_cli", "copilot_cli"])
+    @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.build_skill_catalog")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    def test_build_skill_catalog_not_called_for_native_or_baked_provider(
+        self,
+        mock_load_profile,
+        mock_build_skill_catalog,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_log_dir,
+        provider_name,
+    ):
+        """build_skill_catalog() is never called for providers that deliver skills natively or
+        at install time — OpenCode (symlink), Kiro (skill:// resources), Q, Copilot."""
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = False
+        mock_load_profile.return_value = AgentProfile(
+            name="developer", description="Developer", system_prompt="Base prompt"
+        )
+        mock_provider_manager.create_provider.return_value = MagicMock()
+        mock_log_dir.__truediv__.return_value = MagicMock()
+
+        create_terminal(provider_name, "developer", new_session=True)
+
+        mock_build_skill_catalog.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    def test_create_terminal_profile_not_found(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_log_dir,
+    ):
+        """Terminal creation succeeds when agent profile is not in CAO store (e.g. JSON-only profiles)."""
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "my-agent-abcd"
+        mock_tmux.session_exists.return_value = False
+        mock_load_profile.side_effect = FileNotFoundError("Agent profile not found: my-agent")
+        mock_provider = MagicMock()
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_log_path = MagicMock()
+        mock_log_dir.__truediv__.return_value = mock_log_path
+
+        result = create_terminal("kiro_cli", "my-agent", new_session=True)
+
+        assert result.id == "test1234"
+        mock_provider.initialize.assert_called_once()
+        # allowed_tools should be None since profile was not found
+        assert mock_provider_manager.create_provider.call_args.kwargs.get("allowed_tools") is None
+
 
 class TestGetTerminal:
     """Tests for get_terminal function."""

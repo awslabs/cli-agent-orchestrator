@@ -194,6 +194,9 @@ class KimiCliProvider(BaseProvider):
             try:
                 profile = load_agent_profile(self._agent_profile)
 
+                if profile.model:
+                    command_parts.extend(["--model", profile.model])
+
                 # Build agent file from profile's system prompt.
                 # Kimi uses YAML agent files with a system_prompt_path pointing
                 # to a markdown file. We create both in the temp directory.

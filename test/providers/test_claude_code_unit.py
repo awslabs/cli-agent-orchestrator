@@ -25,17 +25,21 @@ class TestClaudeCodeProviderInitialization:
         """Test successful initialization."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
-        # _handle_startup_prompts needs get_history to return a string
-        mock_tmux.get_history.return_value = "Welcome to Claude Code v2.0"
+        # First call is the pre-launch snapshot, subsequent calls return Claude output
+        mock_tmux.get_history.side_effect = [
+            "",
+            "Welcome to Claude Code v2.0",
+            "Welcome to Claude Code v2.0",
+        ]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        result = provider.initialize()
+        with patch.object(provider, "get_status", return_value=TerminalStatus.IDLE):
+            result = provider.initialize()
 
         assert result is True
         assert provider._initialized is True
         mock_wait_shell.assert_called_once()
         mock_tmux.send_keys.assert_called_once()
-        mock_wait_status.assert_called_once()
 
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
@@ -53,15 +57,21 @@ class TestClaudeCodeProviderInitialization:
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
     def test_initialize_timeout(self, mock_tmux, mock_wait_status, mock_wait_shell, _):
-        """Test initialization timeout."""
+        """Test initialization timeout when no Claude markers appear."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = False
-        mock_tmux.get_history.return_value = "Welcome to Claude Code v2.0"
+        # Snapshot and loop return the same content → no new Claude markers
+        mock_tmux.get_history.return_value = "some shell output"
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
 
-        with pytest.raises(TimeoutError, match="Claude Code initialization timed out"):
-            provider.initialize()
+        with (
+            patch.object(provider, "_handle_startup_prompts"),
+            patch("cli_agent_orchestrator.providers.claude_code.time.time", side_effect=[0, 31]),
+            patch("cli_agent_orchestrator.providers.claude_code.time.sleep"),
+        ):
+            with pytest.raises(TimeoutError, match="Claude Code initialization timed out"):
+                provider.initialize()
 
     @_PATCH_SETTINGS
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
@@ -74,14 +84,20 @@ class TestClaudeCodeProviderInitialization:
         """Test initialization with agent profile."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
-        mock_tmux.get_history.return_value = "Welcome to Claude Code v2.0"
+        mock_tmux.get_history.side_effect = [
+            "",
+            "Welcome to Claude Code v2.0",
+            "Welcome to Claude Code v2.0",
+        ]
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = "Test system prompt"
         mock_profile.mcpServers = None
         mock_load.return_value = mock_profile
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0", "test-agent")
-        result = provider.initialize()
+        with patch.object(provider, "get_status", return_value=TerminalStatus.IDLE):
+            result = provider.initialize()
 
         assert result is True
         mock_load.assert_called_once_with("test-agent")
@@ -111,14 +127,20 @@ class TestClaudeCodeProviderInitialization:
         """Test initialization with MCP servers in profile."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
-        mock_tmux.get_history.return_value = "Welcome to Claude Code v2.0"
+        mock_tmux.get_history.side_effect = [
+            "",
+            "Welcome to Claude Code v2.0",
+            "Welcome to Claude Code v2.0",
+        ]
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {"server1": {"command": "test", "args": ["--flag"]}}
         mock_load.return_value = mock_profile
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0", "test-agent")
-        result = provider.initialize()
+        with patch.object(provider, "get_status", return_value=TerminalStatus.IDLE):
+            result = provider.initialize()
 
         assert result is True
 
@@ -130,10 +152,15 @@ class TestClaudeCodeProviderInitialization:
         """Test that initialize sends the 'claude' command to tmux."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
-        mock_tmux.get_history.return_value = "Welcome to Claude Code v2.0"
+        mock_tmux.get_history.side_effect = [
+            "",
+            "Welcome to Claude Code v2.0",
+            "Welcome to Claude Code v2.0",
+        ]
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        provider.initialize()
+        with patch.object(provider, "get_status", return_value=TerminalStatus.IDLE):
+            provider.initialize()
 
         call_args = mock_tmux.send_keys.call_args
         assert call_args[0][0] == "test-session"
@@ -234,6 +261,101 @@ class TestClaudeCodeProviderStatusDetection:
         assert status == TerminalStatus.PROCESSING
 
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_get_status_completed_despite_stale_spinner_in_scrollback(self, mock_tmux):
+        """Stale spinner in scrollback must not block COMPLETED detection (#104)."""
+        mock_tmux.get_history.return_value = (
+            "✻ Orbiting…\n"
+            "⏺ Previous response\n"
+            "❯ user sent new task\n"
+            "⏺ Completed response\n"
+            "❯ "
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_get_status_idle_despite_stale_spinner_in_scrollback(self, mock_tmux):
+        """Stale spinner in scrollback must not block IDLE detection (#104)."""
+        mock_tmux.get_history.return_value = (
+            "✶ Processing… (esc to interrupt)\n" "Some previous output\n" "❯ "
+        )
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_get_status_processing_spinner_before_separator(self, mock_tmux):
+        """Spinner immediately before ──────── separator → PROCESSING (structural check)."""
+        mock_tmux.get_history.return_value = (
+            "❯ do the task\n"
+            "⏺ Let me read the file\n"
+            "✢ Thinking…\n"
+            "\n"
+            "────────────────────────\n"
+            "❯ "
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_get_status_completed_no_spinner_before_separator(self, mock_tmux):
+        """Response text (no spinner) before separator → COMPLETED, not PROCESSING."""
+        mock_tmux.get_history.return_value = (
+            "❯ do the task\n" "⏺ Here is the completed response\n" "────────────────────────\n" "❯ "
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_get_status_stale_spinner_far_back_not_processing(self, mock_tmux):
+        """Stale spinner far back in scrollback + current separator with no spinner → COMPLETED."""
+        mock_tmux.get_history.return_value = (
+            "✢ Thinking…\n"
+            "⏺ Old response from first task line 1\n"
+            "Old response from first task line 2\n"
+            "Old response from first task line 3\n"
+            "Old response from first task line 4\n"
+            "────────────────────────\n"
+            "❯ second task\n"
+            "⏺ Completed second response\n"
+            "────────────────────────\n"
+            "❯ "
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_get_status_processing_no_separator_yet(self, mock_tmux):
+        """Early execution with spinner but no separator yet → position fallback PROCESSING."""
+        mock_tmux.get_history.return_value = "✻ Orbiting…"
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_get_status_processing_ansi_separator(self, mock_tmux):
+        """Spinner before separator with ANSI colour codes on separator → PROCESSING."""
+        mock_tmux.get_history.return_value = (
+            "❯ do the task\n"
+            "⏺ Reading file…\n"
+            "✽ Cooking…\n"
+            "\n"
+            "\x1b[38;5;244m────────────────────────\x1b[0m\n"
+            "❯ "
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_get_status_processing_middle_dot_spinner(self, mock_tmux):
+        """New · Swirling… spinner variant → PROCESSING via structural check."""
+        mock_tmux.get_history.return_value = (
+            "❯ do the task\n" "· Swirling…\n" "\n" "────────────────────────\n" "❯ "
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
     def test_get_status_idle_not_false_processing_from_status_bar(self, mock_tmux):
         """Status bar '· latest:…' must not false-positive as PROCESSING."""
         mock_tmux.get_history.return_value = (
@@ -302,6 +424,52 @@ class TestClaudeCodeProviderStatusDetection:
         provider.get_status(tail_lines=50)
 
         mock_tmux.get_history.assert_called_with("test-session", "window-0", tail_lines=50)
+
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_get_status_completed_after_compaction_not_false_processing(self, mock_tmux):
+        """Compaction spinner before its own separator, then more output; last sep has no spinner → COMPLETED."""
+        mock_tmux.get_history.return_value = (
+            "❯ do the task\n"
+            "⏺ Starting work…\n"
+            "✢ Compacting conversation…\n"
+            "────────────────────────\n"
+            "⏺ Here is the completed response\n"
+            "────────────────────────\n"
+            "❯ "
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_get_status_processing_after_compaction_when_still_running(self, mock_tmux):
+        """Spinner before the last separator (agent resumes after compaction) → PROCESSING."""
+        mock_tmux.get_history.return_value = (
+            "❯ do the task\n"
+            "✢ Compacting conversation…\n"
+            "────────────────────────\n"
+            "⏺ Resuming work…\n"
+            "✻ Orbiting…\n"
+            "────────────────────────\n"
+            "❯ "
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_get_status_completed_after_exit_not_false_processing(self, mock_tmux):
+        """Spinner → sep (task done) → /exit → second sep; spinner NOT before last sep → not PROCESSING."""
+        mock_tmux.get_history.return_value = (
+            "❯ do the task\n"
+            "⏺ Working on it…\n"
+            "✻ Orbiting…\n"
+            "────────────────────────\n"
+            "❯ /exit\n"
+            "⏺ Goodbye!\n"
+            "────────────────────────\n"
+            "❯ "
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status() != TerminalStatus.PROCESSING
 
 
 class TestClaudeCodeProviderMessageExtraction:
@@ -398,6 +566,7 @@ class TestClaudeCodeProviderMisc:
     def test_build_claude_command_with_system_prompt(self, mock_load):
         """Test building Claude command with system prompt."""
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = "Test prompt\nwith newlines"
         mock_profile.mcpServers = None
         mock_load.return_value = mock_profile
@@ -412,6 +581,7 @@ class TestClaudeCodeProviderMisc:
     def test_build_command_mcp_injects_terminal_id(self, mock_load):
         """Test that _build_claude_command injects CAO_TERMINAL_ID into MCP server env."""
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {
             "cao-mcp-server": {"command": "cao-mcp-server", "args": ["--port", "8080"]}
@@ -436,6 +606,7 @@ class TestClaudeCodeProviderMisc:
     def test_build_command_mcp_preserves_existing_env(self, mock_load):
         """Test that existing env vars in MCP config are preserved when injecting CAO_TERMINAL_ID."""
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {
             "my-server": {
@@ -464,6 +635,7 @@ class TestClaudeCodeProviderMisc:
     def test_build_command_mcp_does_not_override_existing_terminal_id(self, mock_load):
         """Test that an existing CAO_TERMINAL_ID in MCP env is NOT overwritten."""
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {
             "my-server": {
@@ -484,6 +656,36 @@ class TestClaudeCodeProviderMisc:
         server_env = mcp_data["mcpServers"]["my-server"]["env"]
         # Should keep the user-provided value, NOT overwrite with term-99
         assert server_env["CAO_TERMINAL_ID"] == "user-provided-id"
+
+
+class TestClaudeCodeProviderModelFlag:
+    """Tests that profile.model is forwarded to Claude Code via --model."""
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_build_command_appends_model_when_set(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = "sonnet"
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent")
+        command = provider._build_claude_command()
+
+        assert "--model sonnet" in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_build_command_omits_model_when_unset(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent")
+        command = provider._build_claude_command()
+
+        assert "--model" not in command
 
 
 class TestClaudeCodeProviderStartupPrompts:
@@ -650,7 +852,8 @@ class TestClaudeCodeProviderStartupPrompts:
         """Test that initialize calls _handle_startup_prompts."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
-        mock_tmux.get_history.return_value = "❯ 1. Yes, I trust this folder\n  2. No"
+        trust_output = "❯ 1. Yes, I trust this folder\n  2. No"
+        mock_tmux.get_history.side_effect = ["", trust_output, trust_output]
         mock_session = MagicMock()
         mock_window = MagicMock()
         mock_pane = MagicMock()
@@ -659,7 +862,8 @@ class TestClaudeCodeProviderStartupPrompts:
         mock_window.active_pane = mock_pane
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        result = provider.initialize()
+        with patch.object(provider, "get_status", return_value=TerminalStatus.IDLE):
+            result = provider.initialize()
 
         assert result is True
         mock_pane.send_keys.assert_called_with("", enter=True)
