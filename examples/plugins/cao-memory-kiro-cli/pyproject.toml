@@ -1,0 +1,15 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cao-memory-kiro-cli"
+version = "0.1.0"
+description = "Kiro CLI memory-injection plugin for CLI Agent Orchestrator"
+requires-python = ">=3.10"
+dependencies = [
+    "cli-agent-orchestrator",
+]
+
+[project.entry-points."cao.plugins"]
+kiro_cli_memory = "cao_memory_kiro_cli.plugin:KiroCliMemoryPlugin"
