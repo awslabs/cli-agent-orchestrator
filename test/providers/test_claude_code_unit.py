@@ -19,7 +19,7 @@ class TestClaudeCodeProviderInitialization:
 
     @_PATCH_SETTINGS
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
+    @patch("cli_agent_orchestrator.utils.terminal.wait_until_status")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
     def test_initialize_success(self, mock_tmux, mock_wait_status, mock_wait_shell, _):
         """Test successful initialization."""
@@ -54,7 +54,7 @@ class TestClaudeCodeProviderInitialization:
 
     @_PATCH_SETTINGS
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
+    @patch("cli_agent_orchestrator.utils.terminal.wait_until_status")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
     def test_initialize_timeout(self, mock_tmux, mock_wait_status, mock_wait_shell, _):
         """Test initialization timeout when no Claude markers appear."""
@@ -76,7 +76,7 @@ class TestClaudeCodeProviderInitialization:
     @_PATCH_SETTINGS
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
+    @patch("cli_agent_orchestrator.utils.terminal.wait_until_status")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
     def test_initialize_with_agent_profile(
         self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load, _
@@ -119,7 +119,7 @@ class TestClaudeCodeProviderInitialization:
     @_PATCH_SETTINGS
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
+    @patch("cli_agent_orchestrator.utils.terminal.wait_until_status")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
     def test_initialize_with_mcp_servers(
         self, mock_tmux, mock_wait_status, mock_wait_shell, mock_load, _
@@ -146,7 +146,7 @@ class TestClaudeCodeProviderInitialization:
 
     @_PATCH_SETTINGS
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
+    @patch("cli_agent_orchestrator.utils.terminal.wait_until_status")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
     def test_initialize_sends_claude_command(self, mock_tmux, mock_wait_status, mock_wait_shell, _):
         """Test that initialize sends the 'claude' command to tmux."""
@@ -844,7 +844,7 @@ class TestClaudeCodeProviderStartupPrompts:
 
     @_PATCH_SETTINGS
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
+    @patch("cli_agent_orchestrator.utils.terminal.wait_until_status")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
     def test_initialize_calls_handle_startup_prompts(
         self, mock_tmux, mock_wait_status, mock_wait_shell, _

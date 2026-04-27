@@ -28,6 +28,10 @@ dependencies = [
 "cao-server" = "cli_agent_orchestrator.api.main:main"
 "cao-mcp-server" = "cli_agent_orchestrator.mcp_server.server:main"
 
+[project.entry-points."cao.plugins"]
+claude_code_memory = "cli_agent_orchestrator.plugins.builtin.claude_code_memory:ClaudeCodeMemoryPlugin"
+kiro_cli_memory = "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory:KiroCliMemoryPlugin"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

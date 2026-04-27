@@ -3,13 +3,13 @@
 from pathlib import Path
 
 import pytest
-from cao_memory_kiro_cli.plugin import (
+
+from cli_agent_orchestrator.plugins import PostCreateTerminalEvent
+from cli_agent_orchestrator.plugins.builtin.kiro_cli_memory import (
     MEMORY_FILENAME,
     STEERING_SUBDIR,
     KiroCliMemoryPlugin,
 )
-
-from cli_agent_orchestrator.plugins import PostCreateTerminalEvent
 
 
 def _event(provider: str = "kiro_cli", terminal_id: str = "t1") -> PostCreateTerminalEvent:
@@ -21,11 +21,9 @@ def _event(provider: str = "kiro_cli", terminal_id: str = "t1") -> PostCreateTer
     )
 
 
-def _install_metadata_and_cwd(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def _install_metadata_and_cwd(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(
-        "cao_memory_kiro_cli.plugin.get_terminal_metadata",
+        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.get_terminal_metadata",
         lambda terminal_id: {
             "tmux_session": "cao-test-session",
             "tmux_window": "developer-abcd",
@@ -33,7 +31,7 @@ def _install_metadata_and_cwd(
         },
     )
     monkeypatch.setattr(
-        "cao_memory_kiro_cli.plugin.tmux_client.get_pane_working_directory",
+        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.tmux_client.get_pane_working_directory",
         lambda session, window: str(tmp_path),
     )
 
@@ -46,7 +44,7 @@ async def test_ignores_non_kiro_cli_providers(
 
     called: list[str] = []
     monkeypatch.setattr(
-        "cao_memory_kiro_cli.plugin.get_terminal_metadata",
+        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.get_terminal_metadata",
         lambda terminal_id: called.append(terminal_id) or None,
     )
 
@@ -69,7 +67,7 @@ async def test_writes_steering_file_on_post_create_terminal(
             return "<cao-memory>\n## Context\n- stan prefers pytest\n</cao-memory>"
 
     monkeypatch.setattr(
-        "cao_memory_kiro_cli.plugin.MemoryService",
+        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.MemoryService",
         lambda: FakeMemoryService(),
     )
 
@@ -101,7 +99,7 @@ async def test_overwrites_previous_memory_file(
             return "<cao-memory>fresh</cao-memory>"
 
     monkeypatch.setattr(
-        "cao_memory_kiro_cli.plugin.MemoryService",
+        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.MemoryService",
         lambda: FakeMemoryService(),
     )
 
@@ -131,7 +129,7 @@ async def test_does_not_touch_agent_identity_steering_file(
             return "<cao-memory>hi</cao-memory>"
 
     monkeypatch.setattr(
-        "cao_memory_kiro_cli.plugin.MemoryService",
+        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.MemoryService",
         lambda: FakeMemoryService(),
     )
 
@@ -150,7 +148,7 @@ async def test_skips_write_when_memory_context_empty(
 
     _install_metadata_and_cwd(monkeypatch, tmp_path)
     monkeypatch.setattr(
-        "cao_memory_kiro_cli.plugin.MemoryService",
+        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.MemoryService",
         lambda: type("F", (), {"get_memory_context_for_terminal": lambda self, t: ""})(),
     )
 
@@ -175,12 +173,14 @@ async def test_memory_fetch_failure_is_logged_not_raised(
             raise RuntimeError("db on fire")
 
     monkeypatch.setattr(
-        "cao_memory_kiro_cli.plugin.MemoryService",
+        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.MemoryService",
         lambda: ExplodingMemoryService(),
     )
 
     plugin = KiroCliMemoryPlugin()
-    with caplog.at_level("WARNING", logger="cao_memory_kiro_cli.plugin"):
+    with caplog.at_level(
+        "WARNING", logger="cli_agent_orchestrator.plugins.builtin.kiro_cli_memory"
+    ):
         await plugin.on_post_create_terminal(_event())
 
     assert not (tmp_path / STEERING_SUBDIR).exists()
@@ -194,14 +194,16 @@ async def test_missing_terminal_metadata_short_circuits(
     """No metadata → no write, no crash, no MemoryService call."""
 
     monkeypatch.setattr(
-        "cao_memory_kiro_cli.plugin.get_terminal_metadata",
+        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.get_terminal_metadata",
         lambda terminal_id: None,
     )
 
     def _boom(*args, **kwargs):
         raise AssertionError("MemoryService must not be constructed when metadata missing")
 
-    monkeypatch.setattr("cao_memory_kiro_cli.plugin.MemoryService", _boom)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.MemoryService", _boom
+    )
 
     plugin = KiroCliMemoryPlugin()
     await plugin.on_post_create_terminal(_event())
@@ -222,7 +224,7 @@ async def test_path_containment_guard_rejects_symlink_escape(
     (real_cwd / ".kiro").symlink_to(sibling, target_is_directory=True)
 
     monkeypatch.setattr(
-        "cao_memory_kiro_cli.plugin.get_terminal_metadata",
+        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.get_terminal_metadata",
         lambda terminal_id: {
             "tmux_session": "cao-test-session",
             "tmux_window": "developer-abcd",
@@ -230,7 +232,7 @@ async def test_path_containment_guard_rejects_symlink_escape(
         },
     )
     monkeypatch.setattr(
-        "cao_memory_kiro_cli.plugin.tmux_client.get_pane_working_directory",
+        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.tmux_client.get_pane_working_directory",
         lambda session, window: str(real_cwd),
     )
 
@@ -239,7 +241,7 @@ async def test_path_containment_guard_rejects_symlink_escape(
             return "<cao-memory>NEW</cao-memory>"
 
     monkeypatch.setattr(
-        "cao_memory_kiro_cli.plugin.MemoryService",
+        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.MemoryService",
         lambda: FakeMemoryService(),
     )
 

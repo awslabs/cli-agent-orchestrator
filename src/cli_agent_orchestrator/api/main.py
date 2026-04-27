@@ -135,14 +135,6 @@ async def lifespan(app: FastAPI):
     await registry.load()
     app.state.plugin_registry = registry
 
-    # Install hook scripts to ~/.aws/cli-agent-orchestrator/hooks/ (idempotent)
-    try:
-        from cli_agent_orchestrator.hooks.registration import install_hooks
-
-        install_hooks()
-    except Exception as e:
-        logger.warning(f"Failed to install hook scripts: {e}")
-
     # Run cleanup in background
     asyncio.create_task(asyncio.to_thread(cleanup_old_data))
     asyncio.create_task(cleanup_expired_memories())

@@ -13,7 +13,7 @@ from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
-from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
+from cli_agent_orchestrator.utils.terminal import wait_for_shell
 
 logger = logging.getLogger(__name__)
 
@@ -552,15 +552,3 @@ class ClaudeCodeProvider(BaseProvider):
     def cleanup(self) -> None:
         """Clean up Claude Code provider."""
         self._initialized = False
-
-    def register_hooks(
-        self,
-        working_directory: Optional[str],
-        agent_profile: Optional[str],
-    ) -> None:
-        """Install Stop + PreCompact hooks into .claude/settings.local.json."""
-        if not working_directory:
-            return
-        from cli_agent_orchestrator.hooks.registration import register_hooks_claude_code
-
-        register_hooks_claude_code(working_directory)

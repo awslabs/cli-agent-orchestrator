@@ -171,16 +171,17 @@ class BaseProvider(ABC):
         working_directory: Optional[str],
         agent_profile: Optional[str],
     ) -> None:
-        """Install provider-specific hooks (memory save, PreCompact, etc.).
+        """Install provider-specific hooks.
 
-        Default is a no-op. Providers that support hooks override this and
-        typically delegate to the thin installers in ``hooks/registration.py``.
+        Default is a no-op. After the plugin migration, memory-context
+        injection is handled by plugins listening on ``post_create_terminal``
+        (see ``plugins/builtin/``). This hook remains on ``BaseProvider`` so
+        ``terminal_service.create_terminal`` can still call it uniformly and
+        future providers can opt in without a ladder.
 
-        Called by ``terminal_service.create_terminal`` after the provider is
-        instantiated but before ``initialize()``. Failures must not be raised
-        past the caller — the service wraps this call in a try/except and
-        logs a warning so that hook-registration hiccups never block terminal
-        creation.
+        Failures must not be raised past the caller — the service wraps this
+        call in a try/except and logs a warning so that hook-registration
+        hiccups never block terminal creation.
         """
         return
 

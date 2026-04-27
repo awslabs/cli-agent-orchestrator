@@ -3,13 +3,13 @@
 from pathlib import Path
 
 import pytest
-from cao_memory_claude_code.plugin import (
+
+from cli_agent_orchestrator.plugins import PostCreateTerminalEvent
+from cli_agent_orchestrator.plugins.builtin.claude_code_memory import (
     BEGIN_MARKER,
     END_MARKER,
     ClaudeCodeMemoryPlugin,
 )
-
-from cli_agent_orchestrator.plugins import PostCreateTerminalEvent
 
 
 def _event(provider: str = "claude_code", terminal_id: str = "t1") -> PostCreateTerminalEvent:
@@ -29,7 +29,7 @@ async def test_ignores_non_claude_code_providers(
 
     called: list[str] = []
     monkeypatch.setattr(
-        "cao_memory_claude_code.plugin.get_terminal_metadata",
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.get_terminal_metadata",
         lambda terminal_id: called.append(terminal_id) or None,
     )
 
@@ -48,7 +48,7 @@ async def test_writes_memory_block_on_post_create_terminal(
     """On a claude_code terminal, the plugin should write the memory block."""
 
     monkeypatch.setattr(
-        "cao_memory_claude_code.plugin.get_terminal_metadata",
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.get_terminal_metadata",
         lambda terminal_id: {
             "tmux_session": "cao-test-session",
             "tmux_window": "developer-abcd",
@@ -56,7 +56,7 @@ async def test_writes_memory_block_on_post_create_terminal(
         },
     )
     monkeypatch.setattr(
-        "cao_memory_claude_code.plugin.tmux_client.get_pane_working_directory",
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.tmux_client.get_pane_working_directory",
         lambda session, window: str(tmp_path),
     )
 
@@ -65,7 +65,7 @@ async def test_writes_memory_block_on_post_create_terminal(
             return "<cao-memory>\n## Context\n- stan prefers pytest\n</cao-memory>"
 
     monkeypatch.setattr(
-        "cao_memory_claude_code.plugin.MemoryService",
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.MemoryService",
         lambda: FakeMemoryService(),
     )
 
@@ -98,7 +98,7 @@ async def test_replaces_existing_memory_block_on_rerun(
     )
 
     monkeypatch.setattr(
-        "cao_memory_claude_code.plugin.get_terminal_metadata",
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.get_terminal_metadata",
         lambda terminal_id: {
             "tmux_session": "cao-test-session",
             "tmux_window": "developer-abcd",
@@ -106,7 +106,7 @@ async def test_replaces_existing_memory_block_on_rerun(
         },
     )
     monkeypatch.setattr(
-        "cao_memory_claude_code.plugin.tmux_client.get_pane_working_directory",
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.tmux_client.get_pane_working_directory",
         lambda session, window: str(tmp_path),
     )
 
@@ -115,7 +115,7 @@ async def test_replaces_existing_memory_block_on_rerun(
             return "<cao-memory>NEW</cao-memory>"
 
     monkeypatch.setattr(
-        "cao_memory_claude_code.plugin.MemoryService",
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.MemoryService",
         lambda: FakeMemoryService(),
     )
 
@@ -137,7 +137,7 @@ async def test_skips_write_when_memory_context_empty(
     """Empty memory context must NOT create or modify CLAUDE.md."""
 
     monkeypatch.setattr(
-        "cao_memory_claude_code.plugin.get_terminal_metadata",
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.get_terminal_metadata",
         lambda terminal_id: {
             "tmux_session": "cao-test-session",
             "tmux_window": "developer-abcd",
@@ -145,11 +145,11 @@ async def test_skips_write_when_memory_context_empty(
         },
     )
     monkeypatch.setattr(
-        "cao_memory_claude_code.plugin.tmux_client.get_pane_working_directory",
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.tmux_client.get_pane_working_directory",
         lambda session, window: str(tmp_path),
     )
     monkeypatch.setattr(
-        "cao_memory_claude_code.plugin.MemoryService",
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.MemoryService",
         lambda: type("F", (), {"get_memory_context_for_terminal": lambda self, t: ""})(),
     )
 
@@ -168,7 +168,7 @@ async def test_memory_fetch_failure_is_logged_not_raised(
     """Memory-service exceptions must be caught and logged."""
 
     monkeypatch.setattr(
-        "cao_memory_claude_code.plugin.get_terminal_metadata",
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.get_terminal_metadata",
         lambda terminal_id: {
             "tmux_session": "cao-test-session",
             "tmux_window": "developer-abcd",
@@ -176,7 +176,7 @@ async def test_memory_fetch_failure_is_logged_not_raised(
         },
     )
     monkeypatch.setattr(
-        "cao_memory_claude_code.plugin.tmux_client.get_pane_working_directory",
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.tmux_client.get_pane_working_directory",
         lambda session, window: str(tmp_path),
     )
 
@@ -185,12 +185,14 @@ async def test_memory_fetch_failure_is_logged_not_raised(
             raise RuntimeError("db on fire")
 
     monkeypatch.setattr(
-        "cao_memory_claude_code.plugin.MemoryService",
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.MemoryService",
         lambda: ExplodingMemoryService(),
     )
 
     plugin = ClaudeCodeMemoryPlugin()
-    with caplog.at_level("WARNING", logger="cao_memory_claude_code.plugin"):
+    with caplog.at_level(
+        "WARNING", logger="cli_agent_orchestrator.plugins.builtin.claude_code_memory"
+    ):
         await plugin.on_post_create_terminal(_event())
 
     assert not (tmp_path / ".claude").exists()
@@ -204,7 +206,7 @@ async def test_missing_terminal_metadata_short_circuits(
     """No metadata → no write, no crash."""
 
     monkeypatch.setattr(
-        "cao_memory_claude_code.plugin.get_terminal_metadata",
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.get_terminal_metadata",
         lambda terminal_id: None,
     )
 
@@ -212,7 +214,9 @@ async def test_missing_terminal_metadata_short_circuits(
     def _boom(*args, **kwargs):
         raise AssertionError("MemoryService must not be constructed when metadata missing")
 
-    monkeypatch.setattr("cao_memory_claude_code.plugin.MemoryService", _boom)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.MemoryService", _boom
+    )
 
     plugin = ClaudeCodeMemoryPlugin()
     await plugin.on_post_create_terminal(_event())
@@ -241,7 +245,7 @@ async def test_path_containment_guard_rejects_escape(
     (real_cwd / ".claude").symlink_to(sibling, target_is_directory=True)
 
     monkeypatch.setattr(
-        "cao_memory_claude_code.plugin.get_terminal_metadata",
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.get_terminal_metadata",
         lambda terminal_id: {
             "tmux_session": "cao-test-session",
             "tmux_window": "developer-abcd",
@@ -249,7 +253,7 @@ async def test_path_containment_guard_rejects_escape(
         },
     )
     monkeypatch.setattr(
-        "cao_memory_claude_code.plugin.tmux_client.get_pane_working_directory",
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.tmux_client.get_pane_working_directory",
         lambda session, window: str(real_cwd),
     )
 
@@ -258,7 +262,7 @@ async def test_path_containment_guard_rejects_escape(
             return "<cao-memory>NEW</cao-memory>"
 
     monkeypatch.setattr(
-        "cao_memory_claude_code.plugin.MemoryService",
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.MemoryService",
         lambda: FakeMemoryService(),
     )
 

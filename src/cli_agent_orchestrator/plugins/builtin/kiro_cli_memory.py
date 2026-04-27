@@ -1,4 +1,4 @@
-"""Kiro CLI memory-injection plugin.
+"""Kiro CLI memory-injection plugin (built-in).
 
 Writes the CAO memory context to ``.kiro/steering/cao-memory.md`` in the
 terminal's working directory on ``post_create_terminal``. Replaces the
@@ -52,7 +52,7 @@ class KiroCliMemoryPlugin(CaoPlugin):
             working_directory = self._resolve_working_directory(event)
         except Exception as exc:
             logger.warning(
-                "cao-memory-kiro-cli: could not resolve working dir for %s: %s",
+                "kiro_cli_memory: could not resolve working dir for %s: %s",
                 event.terminal_id,
                 exc,
             )
@@ -60,18 +60,16 @@ class KiroCliMemoryPlugin(CaoPlugin):
 
         if not working_directory:
             logger.debug(
-                "cao-memory-kiro-cli: no working directory for %s; skipping",
+                "kiro_cli_memory: no working directory for %s; skipping",
                 event.terminal_id,
             )
             return
 
         try:
-            context_block = MemoryService().get_memory_context_for_terminal(
-                event.terminal_id
-            )
+            context_block = MemoryService().get_memory_context_for_terminal(event.terminal_id)
         except Exception as exc:
             logger.warning(
-                "cao-memory-kiro-cli: memory fetch failed for %s: %s",
+                "kiro_cli_memory: memory fetch failed for %s: %s",
                 event.terminal_id,
                 exc,
             )
@@ -79,7 +77,7 @@ class KiroCliMemoryPlugin(CaoPlugin):
 
         if not context_block:
             logger.debug(
-                "cao-memory-kiro-cli: no memory context for %s; skipping write",
+                "kiro_cli_memory: no memory context for %s; skipping write",
                 event.terminal_id,
             )
             return
@@ -88,7 +86,7 @@ class KiroCliMemoryPlugin(CaoPlugin):
             target = self._validated_target_path(working_directory)
         except ValueError as exc:
             logger.warning(
-                "cao-memory-kiro-cli: path validation rejected %s: %s",
+                "kiro_cli_memory: path validation rejected %s: %s",
                 working_directory,
                 exc,
             )
@@ -99,7 +97,7 @@ class KiroCliMemoryPlugin(CaoPlugin):
             target.write_text(context_block + "\n", encoding="utf-8")
         except Exception as exc:
             logger.warning(
-                "cao-memory-kiro-cli: write failed for %s: %s",
+                "kiro_cli_memory: write failed for %s: %s",
                 target,
                 exc,
             )
@@ -107,9 +105,7 @@ class KiroCliMemoryPlugin(CaoPlugin):
     # ------------------------------------------------------------------
     # helpers
 
-    def _resolve_working_directory(
-        self, event: PostCreateTerminalEvent
-    ) -> str | None:
+    def _resolve_working_directory(self, event: PostCreateTerminalEvent) -> str | None:
         """Look up the tmux pane's working directory for the terminal."""
 
         metadata = get_terminal_metadata(event.terminal_id)
@@ -138,7 +134,5 @@ class KiroCliMemoryPlugin(CaoPlugin):
         base_str = str(base)
         target_str = str(target)
         if target_str != base_str and not target_str.startswith(base_str + os.sep):
-            raise ValueError(
-                f"target {target_str} escapes working directory {base_str}"
-            )
+            raise ValueError(f"target {target_str} escapes working directory {base_str}")
         return target

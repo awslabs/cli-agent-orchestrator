@@ -588,14 +588,3 @@ class KiroCliProvider(BaseProvider):
         """Clean up Kiro CLI provider."""
         self._initialized = False
 
-    def register_hooks(
-        self,
-        working_directory: Optional[str],
-        agent_profile: Optional[str],
-    ) -> None:
-        """Install agentSpawn + userPromptSubmit hooks into ~/.kiro/agents/{profile}.json."""
-        if not agent_profile:
-            return
-        from cli_agent_orchestrator.hooks.registration import register_hooks_kiro
-
-        register_hooks_kiro(agent_profile)

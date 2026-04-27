@@ -1,4 +1,4 @@
-"""Claude Code memory-injection plugin.
+"""Claude Code memory-injection plugin (built-in).
 
 Writes the CAO memory context block into ``.claude/CLAUDE.md`` of the
 terminal's working directory on ``post_create_terminal``. Replaces the
@@ -52,7 +52,7 @@ class ClaudeCodeMemoryPlugin(CaoPlugin):
             working_directory = self._resolve_working_directory(event)
         except Exception as exc:
             logger.warning(
-                "cao-memory-claude-code: could not resolve working dir for %s: %s",
+                "claude_code_memory: could not resolve working dir for %s: %s",
                 event.terminal_id,
                 exc,
             )
@@ -60,18 +60,16 @@ class ClaudeCodeMemoryPlugin(CaoPlugin):
 
         if not working_directory:
             logger.debug(
-                "cao-memory-claude-code: no working directory for %s; skipping",
+                "claude_code_memory: no working directory for %s; skipping",
                 event.terminal_id,
             )
             return
 
         try:
-            context_block = MemoryService().get_memory_context_for_terminal(
-                event.terminal_id
-            )
+            context_block = MemoryService().get_memory_context_for_terminal(event.terminal_id)
         except Exception as exc:
             logger.warning(
-                "cao-memory-claude-code: memory fetch failed for %s: %s",
+                "claude_code_memory: memory fetch failed for %s: %s",
                 event.terminal_id,
                 exc,
             )
@@ -79,7 +77,7 @@ class ClaudeCodeMemoryPlugin(CaoPlugin):
 
         if not context_block:
             logger.debug(
-                "cao-memory-claude-code: no memory context for %s; skipping write",
+                "claude_code_memory: no memory context for %s; skipping write",
                 event.terminal_id,
             )
             return
@@ -88,7 +86,7 @@ class ClaudeCodeMemoryPlugin(CaoPlugin):
             target = self._validated_target_path(working_directory)
         except ValueError as exc:
             logger.warning(
-                "cao-memory-claude-code: path validation rejected %s: %s",
+                "claude_code_memory: path validation rejected %s: %s",
                 working_directory,
                 exc,
             )
@@ -98,7 +96,7 @@ class ClaudeCodeMemoryPlugin(CaoPlugin):
             self._write_block(target, context_block)
         except Exception as exc:
             logger.warning(
-                "cao-memory-claude-code: write failed for %s: %s",
+                "claude_code_memory: write failed for %s: %s",
                 target,
                 exc,
             )
@@ -106,9 +104,7 @@ class ClaudeCodeMemoryPlugin(CaoPlugin):
     # ------------------------------------------------------------------
     # helpers
 
-    def _resolve_working_directory(
-        self, event: PostCreateTerminalEvent
-    ) -> str | None:
+    def _resolve_working_directory(self, event: PostCreateTerminalEvent) -> str | None:
         """Look up the tmux pane's working directory for the terminal."""
 
         metadata = get_terminal_metadata(event.terminal_id)
@@ -134,9 +130,7 @@ class ClaudeCodeMemoryPlugin(CaoPlugin):
         base_str = str(base)
         target_str = str(target)
         if target_str != base_str and not target_str.startswith(base_str + os.sep):
-            raise ValueError(
-                f"target {target_str} escapes working directory {base_str}"
-            )
+            raise ValueError(f"target {target_str} escapes working directory {base_str}")
         return target
 
     def _write_block(self, target: Path, context_block: str) -> None:
@@ -148,9 +142,7 @@ class ClaudeCodeMemoryPlugin(CaoPlugin):
         stripped = self._strip_existing_block(existing)
 
         separator = "" if not stripped or stripped.endswith("\n") else "\n"
-        new_content = (
-            f"{stripped}{separator}{BEGIN_MARKER}\n{context_block}\n{END_MARKER}\n"
-        )
+        new_content = f"{stripped}{separator}{BEGIN_MARKER}\n{context_block}\n{END_MARKER}\n"
         target.write_text(new_content, encoding="utf-8")
 
     @staticmethod

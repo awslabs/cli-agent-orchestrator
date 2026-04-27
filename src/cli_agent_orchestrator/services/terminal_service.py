@@ -98,7 +98,7 @@ def _write_kiro_steering_file(system_prompt: str, working_directory: str) -> Non
     if not system_prompt:
         return
 
-    # Path validation — same pattern as register_hooks_claude_code()
+    # Path validation — realpath + containment, same pattern as plugin writers
     if "\x00" in working_directory:
         raise ValueError("Working directory contains null bytes")
     real_dir = os.path.realpath(os.path.abspath(working_directory))
@@ -254,9 +254,9 @@ def create_terminal(
             model=profile.model if profile else None,
         )
 
-        # Step 4b: Provider-specific hook registration (Phase 2.5 U7).
-        # Each provider owns its hook registration via register_hooks();
-        # default is no-op for providers without hooks.
+        # Step 4b: Provider-specific hook registration.
+        # Default is a no-op on BaseProvider after the plugin migration;
+        # call is kept so future providers can opt in without a ladder.
         try:
             provider_instance.register_hooks(working_directory, agent_profile)
         except Exception as e:

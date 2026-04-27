@@ -13,7 +13,6 @@ if TYPE_CHECKING:
 
 from cli_agent_orchestrator.clients.database import InboxModel, SessionLocal, TerminalModel
 from cli_agent_orchestrator.constants import (
-    CAO_HOME_DIR,
     LOG_DIR,
     MEMORY_BASE_DIR,
     RETENTION_DAYS,
@@ -138,9 +137,6 @@ async def cleanup_expired_memories() -> None:
         else:
             logger.debug("Memory cleanup: no expired memories found")
 
-        # Clean up stale stop-hook flag files (crash recovery)
-        _cleanup_stale_hook_flags(now)
-
     except Exception as e:
         logger.error(f"Error during memory cleanup: {e}")
 
@@ -235,37 +231,3 @@ def _find_expired_entries(index_path: Path, now: datetime) -> list[dict]:
             )
 
     return expired
-
-
-# =============================================================================
-# Stale hook flag file cleanup
-# =============================================================================
-
-HOOK_FLAG_STALE_MINUTES = 5
-
-
-def _cleanup_stale_hook_flags(now: datetime) -> None:
-    """Remove stale stop-hook flag files left behind by crashed agents.
-
-    Flag files are at ~/.aws/cli-agent-orchestrator/hooks/.cao_stop_hook_active_*
-    They should be short-lived; anything older than 5 minutes is stale.
-    """
-    hooks_dir = CAO_HOME_DIR / "hooks"
-    if not hooks_dir.exists():
-        return
-
-    cutoff = now - timedelta(minutes=HOOK_FLAG_STALE_MINUTES)
-    stale_count = 0
-
-    for flag_file in hooks_dir.glob(".cao_stop_hook_active_*"):
-        try:
-            mtime = datetime.fromtimestamp(flag_file.stat().st_mtime, tz=timezone.utc)
-            if mtime < cutoff:
-                flag_file.unlink()
-                stale_count += 1
-                logger.debug(f"Removed stale hook flag: {flag_file.name}")
-        except OSError:
-            pass  # File already removed — idempotent
-
-    if stale_count > 0:
-        logger.info(f"Removed {stale_count} stale hook flag file(s)")
