@@ -531,15 +531,3 @@ class CodexProvider(BaseProvider):
     def cleanup(self) -> None:
         """Clean up Codex CLI provider."""
         self._initialized = False
-
-    def register_hooks(
-        self,
-        working_directory: Optional[str],
-        agent_profile: Optional[str],
-    ) -> None:
-        """Install Codex stop hook into .codex/hooks.json."""
-        if not working_directory:
-            return
-        from cli_agent_orchestrator.hooks.registration import register_hooks_codex
-
-        register_hooks_codex(working_directory)

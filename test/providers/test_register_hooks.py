@@ -81,20 +81,6 @@ class TestClaudeCodeRegisterHooks:
         called.assert_not_called()
 
 
-class TestCodexRegisterHooks:
-    def test_delegates_to_register_hooks_codex(self, mocker) -> None:
-        called = mocker.patch("cli_agent_orchestrator.hooks.registration.register_hooks_codex")
-        provider = CodexProvider("term-cx", "sess", "win")
-        provider.register_hooks("/workspace/project", "dev")
-        called.assert_called_once_with("/workspace/project")
-
-    def test_skips_when_no_working_directory(self, mocker) -> None:
-        called = mocker.patch("cli_agent_orchestrator.hooks.registration.register_hooks_codex")
-        provider = CodexProvider("term-cx", "sess", "win")
-        provider.register_hooks(None, "dev")
-        called.assert_not_called()
-
-
 class TestKiroRegisterHooks:
     def test_delegates_to_register_hooks_kiro(self, mocker) -> None:
         called = mocker.patch("cli_agent_orchestrator.hooks.registration.register_hooks_kiro")
@@ -114,7 +100,7 @@ class TestHookLessProviders:
 
     @pytest.mark.parametrize(
         "provider_cls",
-        [QCliProvider, CopilotCliProvider, GeminiCliProvider, KimiCliProvider],
+        [QCliProvider, CopilotCliProvider, GeminiCliProvider, KimiCliProvider, CodexProvider],
     )
     def test_default_noop(self, provider_cls) -> None:
         provider = provider_cls("term-x", "sess", "win", agent_profile="dev")
@@ -124,7 +110,7 @@ class TestHookLessProviders:
 
     @pytest.mark.parametrize(
         "provider_cls",
-        [QCliProvider, CopilotCliProvider, GeminiCliProvider, KimiCliProvider],
+        [QCliProvider, CopilotCliProvider, GeminiCliProvider, KimiCliProvider, CodexProvider],
     )
     def test_does_not_override_register_hooks(self, provider_cls) -> None:
         """Guard against accidentally shadowing the default with a stub."""

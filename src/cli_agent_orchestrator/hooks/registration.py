@@ -196,41 +196,6 @@ def register_hooks_kiro(agent_profile: str) -> None:
     logger.info(f"Registered CAO hooks in {config_path}")
 
 
-def register_hooks_codex(working_directory: str) -> None:
-    """Merge CAO stop hook into .codex/hooks.json for Codex.
-
-    Args:
-        working_directory: The terminal's working directory (where .codex/ lives).
-    """
-    if "\x00" in working_directory:
-        raise ValueError("Working directory contains null bytes")
-    real_dir = os.path.realpath(os.path.abspath(working_directory))
-    if not real_dir.startswith("/"):
-        raise ValueError(f"Working directory must be an absolute path: {working_directory}")
-
-    # Normalize full path and verify containment before any file access.
-    hooks_str = os.path.normpath(os.path.join(real_dir, ".codex", "hooks.json"))
-    if not hooks_str.startswith(real_dir):
-        raise ValueError(f"Hooks path escapes working directory: {hooks_str}")
-
-    hooks_path = Path(hooks_str)
-    hooks_path.parent.mkdir(parents=True, exist_ok=True)
-
-    existing: dict = {}
-    if hooks_path.exists():
-        try:
-            existing = json.loads(hooks_path.read_text())
-        except (json.JSONDecodeError, OSError):
-            logger.warning(f"Could not parse {hooks_path}, starting fresh")
-
-    # Only set stop hook if not already configured
-    if "stop" not in existing:
-        existing["stop"] = str(STOP_HOOK_PATH)
-
-    hooks_path.write_text(json.dumps(existing, indent=2) + "\n")
-    logger.info(f"Registered CAO hooks in {hooks_path}")
-
-
 def _hook_entry_exists(hook_list: list, command_path: str) -> bool:
     """Check if a hook entry with the given command path already exists.
 
