@@ -1,0 +1,130 @@
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment (manual dispatch only)'
+        required: true
+        type: choice
+        options:
+          - testpypi
+          - pypi
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build wheel and sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build Web UI
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Stage Web UI into package
+        run: |
+          mkdir -p src/cli_agent_orchestrator/web_ui
+          cp -r web/dist/. src/cli_agent_orchestrator/web_ui/
+
+      - uses: astral-sh/setup-uv@v4
+
+      - name: Build
+        run: uv build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish-testpypi:
+    name: Publish to TestPyPI
+    if: github.event_name == 'release' || github.event.inputs.environment == 'testpypi'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/cli-agent-orchestrator
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  smoke-test:
+    name: Install from TestPyPI and verify entry points
+    # Only runs on Release-triggered publishes. Manual workflow_dispatch
+    # skips the smoke-test because we have no tagged version to pin against.
+    if: github.event_name == 'release'
+    needs: publish-testpypi
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install from TestPyPI (retry while index propagates)
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          for attempt in 1 2 3 4 5 6; do
+            if pip install \
+                --index-url https://test.pypi.org/simple/ \
+                --extra-index-url https://pypi.org/simple/ \
+                "cli-agent-orchestrator==${VERSION}"; then
+              exit 0
+            fi
+            echo "Attempt ${attempt} failed; sleeping 15s before retry..."
+            sleep 15
+          done
+          echo "TestPyPI install failed after 6 attempts (90s total)"
+          exit 1
+
+      - name: Verify entry points
+        run: |
+          cao --help
+          cao-server --help
+          cao-mcp-server --help
+
+  publish-pypi:
+    name: Publish to PyPI (maintainer-approved)
+    needs: [build, smoke-test]
+    if: |
+      always() &&
+      needs.build.result == 'success' &&
+      (
+        (github.event_name == 'release' && needs.smoke-test.result == 'success') ||
+        (github.event.inputs.environment == 'pypi' && needs.smoke-test.result == 'skipped')
+      )
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/cli-agent-orchestrator
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
