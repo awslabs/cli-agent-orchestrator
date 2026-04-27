@@ -631,6 +631,10 @@ See [SECURITY.md](SECURITY.md) for vulnerability reporting, security scanning, a
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on contributing to this project.
 
+## Releases
+
+CAO publishes to [PyPI](https://pypi.org/project/cli-agent-orchestrator/) via an OIDC-authenticated GitHub Actions pipeline (TestPyPI → smoke test → maintainer-approved prod). See [docs/RELEASING.md](docs/RELEASING.md) for the cut-a-release runbook, one-time setup, and troubleshooting.
+
 ## License
 
 This project is licensed under the Apache-2.0 License.
