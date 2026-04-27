@@ -11,7 +11,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
-from cli_agent_orchestrator.api.main import app, flow_daemon
+from cli_agent_orchestrator.api.main import app, flow_daemon, opencode_inbox_delivery_daemon
 from cli_agent_orchestrator.models.terminal import Terminal
 from cli_agent_orchestrator.utils.skills import SkillNameError
 
@@ -846,6 +846,33 @@ class TestFlowDaemon:
             assert mock_svc.execute_flow.call_count == 2
 
 
+class TestOpenCodeInboxDeliveryDaemon:
+    """Tests for the OpenCode inbox delivery poller task."""
+
+    @pytest.mark.asyncio
+    async def test_poller_runs_one_iteration_then_cancels(self):
+        """Poller sleeps, runs the sync poll in a thread, then handles cancellation."""
+        sleep_calls = 0
+        registry = MagicMock()
+        mock_to_thread = AsyncMock()
+
+        async def fake_sleep(_seconds):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls > 1:
+                raise asyncio.CancelledError
+
+        with (
+            patch("asyncio.sleep", new=fake_sleep),
+            patch("asyncio.to_thread", mock_to_thread),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await opencode_inbox_delivery_daemon(registry)
+
+        mock_to_thread.assert_awaited_once()
+        assert mock_to_thread.await_args.args[1] is registry
+
+
 # ── lifespan ─────────────────────────────────────────────────────────
 
 
@@ -859,6 +886,9 @@ class TestLifespan:
 
         mock_observer = MagicMock()
 
+        async def fake_daemon():
+            await asyncio.sleep(3600)
+
         with (
             patch("cli_agent_orchestrator.api.main.setup_logging"),
             patch("cli_agent_orchestrator.api.main.init_db"),
@@ -867,10 +897,7 @@ class TestLifespan:
                 "cli_agent_orchestrator.api.main.PollingObserver",
                 return_value=mock_observer,
             ),
-            patch(
-                "cli_agent_orchestrator.api.main.flow_daemon",
-                return_value=asyncio.sleep(0),
-            ),
+            patch("cli_agent_orchestrator.api.main.flow_daemon", fake_daemon),
         ):
             async with lifespan(app):
                 # Inside the lifespan — startup completed
