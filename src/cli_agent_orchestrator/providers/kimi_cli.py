@@ -31,6 +31,7 @@ import os
 import re
 import shlex
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -265,8 +266,19 @@ class KimiCliProvider(BaseProvider):
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
-        # cd to unique temp dir (per-directory lock) + set TERM for tmux compatibility
+        # cd to unique temp dir (per-directory lock) + set TERM for tmux compatibility.
+        # On Unix: POSIX inline env assignment (TERM=xterm-256color cmd).
+        # On Windows/PowerShell: $env:KEY = 'VAL'; Set-Location; cmd.
         kimi_cmd = shlex.join(command_parts)
+        if sys.platform == "win32":
+            # PowerShell equivalent: set env var, change directory, run command.
+            # shlex.quote() is POSIX-only; use a single-quoted PS literal for the path.
+            ps_path = self._temp_dir.replace("'", "''")
+            return (
+                f"$env:TERM = 'xterm-256color'; "
+                f"Set-Location '{ps_path}'; "
+                f"{kimi_cmd}"
+            )
         return f"cd {shlex.quote(self._temp_dir)} && TERM=xterm-256color {kimi_cmd}"
 
     @classmethod

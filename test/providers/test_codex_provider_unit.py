@@ -36,7 +36,7 @@ class TestCodexProviderInitialization:
         mock_tmux.send_keys.assert_any_call(
             "test-session",
             "window-0",
-            "codex --yolo --no-alt-screen --disable shell_snapshot",
+            "'codex' '--yolo' '--no-alt-screen' '--disable' 'shell_snapshot'",
         )
         mock_wait_status.assert_called_once()
 
@@ -68,7 +68,7 @@ class TestCodexBuildCommand:
     def test_build_command_no_profile(self):
         provider = CodexProvider("test1234", "test-session", "window-0", None)
         command = provider._build_codex_command()
-        assert command == "codex --yolo --no-alt-screen --disable shell_snapshot"
+        assert command == "'codex' '--yolo' '--no-alt-screen' '--disable' 'shell_snapshot'"
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_build_command_with_skill_prompt(self, mock_load_profile):
@@ -104,7 +104,7 @@ class TestCodexBuildCommand:
         command = provider._build_codex_command()
 
         mock_load_profile.assert_called_once_with("code_supervisor")
-        assert "codex --yolo --no-alt-screen --disable shell_snapshot" in command
+        assert "'codex' '--yolo' '--no-alt-screen' '--disable' 'shell_snapshot'" in command
         assert "-c" in command
         assert "developer_instructions=" in command
         assert "You are a code supervisor agent." in command
@@ -222,7 +222,7 @@ class TestCodexBuildCommand:
         provider = CodexProvider("test1234", "test-session", "window-0", "empty_agent")
         command = provider._build_codex_command()
 
-        assert command == "codex --yolo --no-alt-screen --disable shell_snapshot"
+        assert command == "'codex' '--yolo' '--no-alt-screen' '--disable' 'shell_snapshot'"
         assert "developer_instructions" not in command
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
@@ -236,7 +236,7 @@ class TestCodexBuildCommand:
         provider = CodexProvider("test1234", "test-session", "window-0", "none_agent")
         command = provider._build_codex_command()
 
-        assert command == "codex --yolo --no-alt-screen --disable shell_snapshot"
+        assert command == "'codex' '--yolo' '--no-alt-screen' '--disable' 'shell_snapshot'"
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_build_command_profile_load_failure(self, mock_load_profile):
@@ -287,7 +287,7 @@ class TestCodexProviderModelFlag:
         provider = CodexProvider("tid", "sess", "win", "agent")
         command = provider._build_codex_command()
 
-        assert "--model gpt-5" in command
+        assert "'--model' 'gpt-5'" in command
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_build_command_omits_model_when_unset(self, mock_load):
@@ -1000,17 +1000,11 @@ class TestCodexProviderTrustPrompt:
             "› 1. Yes, allow Codex to work in this folder without asking for approval\n"
             "  2. No, ask me to approve edits and commands\n"
         )
-        mock_session = MagicMock()
-        mock_window = MagicMock()
-        mock_pane = MagicMock()
-        mock_tmux.server.sessions.get.return_value = mock_session
-        mock_session.windows.get.return_value = mock_window
-        mock_window.active_pane = mock_pane
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         provider._handle_trust_prompt(timeout=2.0)
 
-        mock_pane.send_keys.assert_called_once_with("", enter=True)
+        mock_tmux.send_keys.assert_called_once_with("test-session", "window-0", "")
 
     @patch("cli_agent_orchestrator.providers.codex.tmux_client")
     def test_handle_trust_prompt_not_needed(self, mock_tmux):
@@ -1020,7 +1014,7 @@ class TestCodexProviderTrustPrompt:
         provider = CodexProvider("test1234", "test-session", "window-0")
         provider._handle_trust_prompt(timeout=2.0)
 
-        mock_tmux.server.sessions.get.assert_not_called()
+        mock_tmux.send_keys.assert_not_called()
 
     @patch("cli_agent_orchestrator.providers.codex.tmux_client")
     def test_get_status_trust_prompt_is_waiting_user_answer(self, mock_tmux):
@@ -1047,15 +1041,9 @@ class TestCodexProviderTrustPrompt:
         mock_tmux.get_history.return_value = (
             "allow Codex to work in this folder without asking for approval.\n"
         )
-        mock_session = MagicMock()
-        mock_window = MagicMock()
-        mock_pane = MagicMock()
-        mock_tmux.server.sessions.get.return_value = mock_session
-        mock_session.windows.get.return_value = mock_window
-        mock_window.active_pane = mock_pane
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         result = provider.initialize()
 
         assert result is True
-        mock_pane.send_keys.assert_called_with("", enter=True)
+        mock_tmux.send_keys.assert_called_with("test-session", "window-0", "")
