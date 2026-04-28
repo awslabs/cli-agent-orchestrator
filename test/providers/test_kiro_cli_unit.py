@@ -1372,6 +1372,53 @@ class TestKiroCliTuiMode:
         assert re.search(TUI_PROCESSING_PATTERN, " Kiro is working ")
         assert not re.search(TUI_PROCESSING_PATTERN, "Kiro is idle")
 
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_tui_initializing_yields_processing_despite_idle_placeholder(self, mock_tmux):
+        """Test PROCESSING while Kiro TUI is initializing.
+
+        The new TUI renders the idle-prompt placeholder ("Ask a question or
+        describe a task") before the "● Initializing..." phase completes.
+        Without the TUI_INITIALIZING_PATTERN check, get_status() would return
+        IDLE ~1s after launch and the first user message would be sent before
+        Kiro can accept input (issue #211).
+        """
+        mock_tmux.get_history.return_value = (
+            "● Initializing...\n"
+            "────────────────────────────────────────────────────\n"
+            "agent-ops · auto · ◔ 0%\n"
+            " Ask a question or describe a task ↵\n"
+        )
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "agent-ops")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_tui_initializing_cleared_allows_idle(self, mock_tmux):
+        """After init completes, Kiro clears 'Initializing...' and IDLE resolves."""
+        mock_tmux.get_history.return_value = (
+            "────────────────────────────────────────────────────\n"
+            "agent-ops · auto · ◔ 0%\n"
+            " Ask a question or describe a task ↵\n"
+        )
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "agent-ops")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.IDLE
+
+    def test_tui_initializing_pattern(self):
+        """Test TUI initializing pattern matches expected format."""
+        from cli_agent_orchestrator.providers.kiro_cli import TUI_INITIALIZING_PATTERN
+
+        assert re.search(TUI_INITIALIZING_PATTERN, "● Initializing...")
+        assert re.search(TUI_INITIALIZING_PATTERN, "Initializing...")
+        assert re.search(TUI_INITIALIZING_PATTERN, " Initializing... ")
+        # Must require three dots to avoid matching the word alone
+        assert not re.search(TUI_INITIALIZING_PATTERN, "Initializing")
+        assert not re.search(TUI_INITIALIZING_PATTERN, "Initialized")
+
     def test_tui_permission_pattern(self):
         """Test TUI permission pattern matches expected formats."""
         from cli_agent_orchestrator.providers.kiro_cli import TUI_PERMISSION_PATTERN
