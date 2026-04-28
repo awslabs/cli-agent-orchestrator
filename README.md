@@ -65,6 +65,8 @@ python3 --version   # Should be 3.10 or higher
 bash <(curl -s https://raw.githubusercontent.com/awslabs/cli-agent-orchestrator/refs/heads/main/tmux-install.sh)
 ```
 
+> **Windows:** On Windows, use [psmux](https://github.com/vivainio/psmux) instead of tmux. psmux >= 3.3.4 is required (earlier versions miss compatibility fixes used by this client).
+
 ### 3. Install uv
 
 ```bash
