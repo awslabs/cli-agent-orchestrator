@@ -37,6 +37,8 @@ jobs:
 
       - name: Bump version and generate changelog
         id: bump
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python scripts/bump_version.py ${{ inputs.bump }}
           VERSION=$(grep '^version = ' pyproject.toml | head -1 | cut -d'"' -f2)
