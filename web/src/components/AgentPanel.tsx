@@ -10,7 +10,14 @@ import { TerminalMeta } from '../api'
 import { StatusBadge } from './StatusBadge'
 import { OutputViewer } from './OutputViewer'
 
-const FALLBACK_PROVIDERS = ['kiro_cli', 'claude_code', 'q_cli', 'codex', 'gemini_cli', 'kimi_cli', 'copilot_cli']
+const FALLBACK_PROVIDERS = ['kiro_cli', 'claude_code', 'q_cli', 'codex', 'gemini_cli', 'kimi_cli', 'copilot_cli', 'opencode_cli']
+
+// Minimal display-label helper. Keeps existing provider labels unchanged
+// while rendering opencode_cli as the friendlier "opencode".
+function providerLabel(name: string): string {
+  if (name === 'opencode_cli') return 'opencode'
+  return name.replace(/_/g, ' ')
+}
 
 const SOURCE_LABELS: Record<string, string> = {
   'built-in': 'Built-in',
@@ -284,7 +291,7 @@ export function AgentPanel() {
                     placeholder="Select provider..."
                     options={(providers.length > 0 ? providers : FALLBACK_PROVIDERS.map(n => ({ name: n, binary: '', installed: true }))).map(p => ({
                       value: p.name,
-                      label: p.name.replace(/_/g, ' '),
+                      label: providerLabel(p.name),
                       sublabel: !p.installed ? 'Not installed' : undefined,
                       disabled: !p.installed,
                     }))}
@@ -528,7 +535,7 @@ export function AgentPanel() {
                   placeholder="Select provider..."
                   options={(providers.length > 0 ? providers : FALLBACK_PROVIDERS.map(n => ({ name: n, binary: '', installed: true }))).map(p => ({
                     value: p.name,
-                    label: p.name.replace(/_/g, ' '),
+                    label: providerLabel(p.name),
                     sublabel: !p.installed ? 'Not installed' : undefined,
                     disabled: !p.installed,
                   }))}

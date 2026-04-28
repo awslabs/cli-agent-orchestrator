@@ -37,7 +37,10 @@ describe('API wrapper', () => {
   })
 
   it('listProviders fetches /agents/providers', async () => {
-    const providers = [{ name: 'kiro_cli', binary: 'kiro-cli', installed: true }]
+    const providers = [
+      { name: 'kiro_cli', binary: 'kiro-cli', installed: true },
+      { name: 'opencode_cli', binary: 'opencode', installed: false },
+    ]
     mockResponse(providers)
     const result = await api.listProviders()
     expect(result).toEqual(providers)
