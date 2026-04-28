@@ -76,22 +76,16 @@ source $HOME/.local/bin/env   # Add uv to PATH (or restart your shell)
 
 ### 4. Install CLI Agent Orchestrator
 
-Install the latest stable release from PyPI:
+```bash
+uv tool install git+https://github.com/awslabs/cli-agent-orchestrator.git@main --upgrade
+```
+
+#### 4.1 Install via PyPI (Optional): 
+
+Install from PyPI:
 
 ```bash
 uv tool install cli-agent-orchestrator --upgrade
-```
-
-Verify:
-
-```bash
-cao --help
-```
-
-To install directly from GitHub:
-
-```bash
-uv tool install git+https://github.com/awslabs/cli-agent-orchestrator.git@main --upgrade
 ```
 
 ### Development Setup
