@@ -3,7 +3,7 @@ import { render, screen } from '@testing-library/react'
 import { StatusBadge } from '../components/StatusBadge'
 import { ErrorBoundary } from '../components/ErrorBoundary'
 import { ConfirmModal } from '../components/ConfirmModal'
-import { providerLabel, FALLBACK_PROVIDERS } from '../components/AgentPanel'
+import { FALLBACK_PROVIDERS } from '../components/AgentPanel'
 
 describe('StatusBadge', () => {
   it('renders idle status', () => {
@@ -142,24 +142,6 @@ describe('ConfirmModal', () => {
   })
 })
 
-describe('providerLabel', () => {
-  it('renders opencode_cli as "opencode"', () => {
-    expect(providerLabel('opencode_cli')).toBe('opencode')
-  })
-
-  it('keeps existing underscore-to-space behavior for kiro_cli', () => {
-    expect(providerLabel('kiro_cli')).toBe('kiro cli')
-  })
-
-  it('keeps existing behavior for claude_code', () => {
-    expect(providerLabel('claude_code')).toBe('claude code')
-  })
-
-  it('keeps existing behavior for providers without underscores', () => {
-    expect(providerLabel('codex')).toBe('codex')
-  })
-})
-
 describe('FALLBACK_PROVIDERS', () => {
   it('includes opencode_cli', () => {
     expect(FALLBACK_PROVIDERS).toContain('opencode_cli')
@@ -172,16 +154,17 @@ describe('FALLBACK_PROVIDERS', () => {
     }
   })
 
-  it('maps to enabled select options with correct label', () => {
+  it('maps to enabled select options with default underscore label', () => {
     // Simulates the fallback option construction used in AgentPanel
     const options = FALLBACK_PROVIDERS.map(n => ({
       value: n,
-      label: providerLabel(n),
+      label: n.replace(/_/g, ' '),
       disabled: false,
     }))
     const opencodeOption = options.find(o => o.value === 'opencode_cli')
     expect(opencodeOption).toBeDefined()
-    expect(opencodeOption!.label).toBe('opencode')
+    // opencode_cli uses the default underscore-to-space replacement
+    expect(opencodeOption!.label).toBe('opencode cli')
     expect(opencodeOption!.disabled).toBe(false)
 
     const kiroOption = options.find(o => o.value === 'kiro_cli')
