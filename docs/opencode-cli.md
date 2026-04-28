@@ -1,6 +1,6 @@
 # OpenCode CLI Provider
 
-> ⚠️ **Experimental — single-agent flows only.** Multi-agent orchestration (assign / send_message back to a supervisor) is **not yet reliable** on `opencode_cli`: the supervisor's inbox can deadlock with `pending` messages after its turn settles. Single-agent and pure handoff workflows are unaffected. Tracking: [#203](https://github.com/awslabs/cli-agent-orchestrator/issues/203).
+> ⚠️ **Experimental.** Multi-agent orchestration (`assign` / `send_message` back to a supervisor) now uses a temporary OpenCode-specific inbox polling fallback for [#203](https://github.com/awslabs/cli-agent-orchestrator/issues/203). This prevents pending supervisor inbox messages from getting stuck after the OpenCode TUI settles, but delivery is still not fully unified with the immediate and watchdog paths until [#115](https://github.com/awslabs/cli-agent-orchestrator/pull/115) replaces them with a single coordinator.
 
 ## Overview
 
@@ -209,7 +209,7 @@ cao install my_agent --provider opencode_cli
 cao launch --agents my_agent --provider opencode_cli
 ```
 
-CAO's tracking issue for providing a runtime bypass (either via the temp-agent workaround or by consuming an upstream TUI flag once it ships): see the README's *experimental — single-agent only* notice.
+Runtime permission bypass support remains unavailable for OpenCode's TUI mode. CAO can revisit this either with a temp-agent workaround or by consuming an upstream TUI flag once one ships.
 
 ### Project-local `opencode.json` override
 
