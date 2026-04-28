@@ -4,12 +4,14 @@ import json
 
 import httpx
 import pytest
-
 from cao_discord.plugin import DiscordPlugin
+
 from cli_agent_orchestrator.plugins import PostSendMessageEvent
 
 
-def _timeout_values(plugin: DiscordPlugin) -> tuple[float | None, float | None, float | None, float | None]:
+def _timeout_values(
+    plugin: DiscordPlugin,
+) -> tuple[float | None, float | None, float | None, float | None]:
     """Return the configured timeout values from the plugin's HTTP client."""
 
     timeout = plugin._client.timeout

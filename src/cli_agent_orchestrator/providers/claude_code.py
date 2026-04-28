@@ -34,18 +34,11 @@ RESPONSE_PATTERN = r"⏺(?:\x1b\[[0-9;]*m)*\s+"  # Handle any ANSI codes between
 # - Minimal format: "✻ Orbiting…" (no parenthesized status)
 # Common: spinner char + text + ellipsis, optionally followed by parenthesized status
 PROCESSING_PATTERN = r"[✶✢✽✻✳·].*\u2026"
-# Structural PROCESSING indicator: a spinner line (spinner char + … ) immediately
-# before the ──────── separator line that Claude Code draws before the input prompt.
-# Requires a known spinner character on the same line as … to avoid false-positives
-# from response text or tool outputs that happen to contain … .
-# Allows 0–2 blank lines between the spinner and the separator.
-# The separator line starts with an ANSI colour code (\x1b[38;5;244m) before the
-# box-drawing characters (U+2500), so the pattern skips that prefix explicitly.
-#
-# Processing: "✻ Skedaddling…\n\n────────\n❯ " → spinner+… before separator → PROCESSING
-# Idle/done: "⏺ response text\n────────\n❯ " → no spinner before separator → not PROCESSING
-# Stale spinner: "✢ Thinking…" far back in scrollback, current separator has
-# no spinner immediately before it → not PROCESSING
+# Structural PROCESSING indicator (reference pattern — get_status uses an
+# inline last-separator-anchored version to avoid false positives from
+# mid-conversation compaction events like "✢ Compacting conversation…"):
+# a spinner line (spinner char + … ) immediately before the ────────
+# separator, allowing 0–2 blank lines between them.
 THINKING_BEFORE_SEPARATOR_PATTERN = re.compile(
     r"[^\n]*[✶✢✽✻✳·][^\n]*\u2026[^\n]*\n(?:[^\n]*\n){0,2}(?:\x1b\[[0-9;]*m)*\u2500{20,}",
     re.MULTILINE,
@@ -254,6 +247,13 @@ class ClaudeCodeProvider(BaseProvider):
         # Build properly escaped command string
         command = self._build_claude_command()
 
+        # Snapshot current pane content before sending the command.
+        # We use this to distinguish the pre-existing shell ❯ prompt (zsh/bash)
+        # from Claude Code's own ❯ REPL prompt — they are visually identical
+        # after ANSI stripping, so without a snapshot, status detection can
+        # falsely return IDLE on the old shell prompt before claude even starts.
+        pre_launch_snapshot = tmux_client.get_history(self.session_name, self.window_name) or ""
+
         # Send Claude Code command using tmux client
         tmux_client.send_keys(self.session_name, self.window_name, command)
 
@@ -263,12 +263,28 @@ class ClaudeCodeProvider(BaseProvider):
         # Wait for Claude Code prompt to be ready.
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
         # message that get_status() interprets as a completed response.
-        if not wait_until_status(
-            self,
-            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-            timeout=30.0,
-            polling_interval=1.0,
-        ):
+        #
+        # We require that new content appeared beyond the pre-launch snapshot
+        # before accepting IDLE, to avoid the false-positive where the old zsh
+        # ❯ prompt triggers an immediate IDLE return before claude starts.
+        deadline = time.time() + 30.0
+        while time.time() < deadline:
+            current_output = tmux_client.get_history(self.session_name, self.window_name) or ""
+            new_content = current_output[len(pre_launch_snapshot) :]
+            # Claude-specific startup markers that cannot come from the shell:
+            # the ──────── separator, bypass/trust prompt text, or "Claude Code"
+            claude_started = bool(
+                re.search(r"\u2500{20,}", new_content)
+                or re.search(
+                    r"bypass permissions|trust this folder|Claude Code", new_content, re.IGNORECASE
+                )
+            )
+            if claude_started:
+                status = self.get_status()
+                if status in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}:
+                    break
+            time.sleep(1.0)
+        else:
             raise TimeoutError("Claude Code initialization timed out after 30 seconds")
 
         self._initialized = True
@@ -312,11 +328,22 @@ class ClaudeCodeProvider(BaseProvider):
         if not output:
             return TerminalStatus.ERROR
 
-        # PRIMARY PROCESSING check: structural — thinking line immediately
-        # before the ──────── separator. Catches ALL spinner variants (including
-        # newer "· Swirling…" format) and is immune to the ❯ position problem.
-        if THINKING_BEFORE_SEPARATOR_PATTERN.search(output):
-            return TerminalStatus.PROCESSING
+        # PRIMARY PROCESSING check: walk backwards from the *last* separator.
+        # If we encounter a spinner line (spinner char + …) before we encounter
+        # another separator, the agent is actively processing.
+        # If we hit another separator first, the spinner belongs to a previously
+        # completed task — covers two distinct false-positive patterns:
+        # 1. Mid-conversation compaction: "✢ Compacting…" → sep → more output → last sep
+        # 2. Post-exit: live spinner → sep (task done) → ❯ /exit → last sep (exit menu)
+        _sep_re = re.compile(r"(?:\x1b\[[0-9;]*m)*\u2500{20,}")
+        _sep_positions = [m.start() for m in _sep_re.finditer(output)]
+        if _sep_positions:
+            pre_sep_lines = output[: _sep_positions[-1]].rstrip("\n").split("\n")
+            for line in reversed(pre_sep_lines):
+                if re.search(r"[✶✢✽✻✳·][^\n]*\u2026", line):
+                    return TerminalStatus.PROCESSING  # spinner before another separator
+                if _sep_re.search(line):
+                    break  # hit another separator first — spinner is from a completed task
 
         # Find the LAST occurrence of each marker for fallback position checks.
         last_processing = None

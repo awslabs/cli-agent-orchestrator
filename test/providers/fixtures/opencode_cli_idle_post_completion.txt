@@ -1,0 +1,42 @@
+
+
+  ┃                                                                                                                                           New session - 2026-04-21T04:07:43.
+  ┃  say hello in 3 words                                                                                                                     416Z
+  ┃
+                                                                                                                                              Context
+  ┃  Thinking: The user is asking me to say hello in 3 words. This is a simple request that doesn't require any tools.                        26,534 tokens
+                                                                                                                                              13% used
+     Hello there, friend!                                                                                                                     $0.00 spent
+
+     ▣  Build · Big Pickle · 7.2s                                                                                                             LSP
+                                                                                                                                              LSPs will activate as files are read
+  ┃
+  ┃  read /etc/hostname and tell me what it says
+  ┃
+
+  ┃  Thinking: The user wants me to read the /etc/hostname file and tell them what's in it. I'll use the read tool to do this.
+
+     → Read /etc/hostname
+
+     ▣  Build · Big Pickle
+
+
+
+
+
+                                                                                                                                                ⬖ Getting started                ✕
+
+                                                                                                                                                  OpenCode includes free models
+                                                                                                                                                  so you can start immediately.
+
+                                                                                                                                                  Connect from 75+ providers to
+                                                                                                                                                  use other models, including
+                                                                                                                                                  Claude, GPT, Gemini etc
+
+  ┃                                                                                                                                               Connect provider        /connect
+  ┃
+  ┃
+  ┃  Build · Big Pickle OpenCode Zen                                                                                                          /tmp/cao-opencode-probe-cwd
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+                                                                                                              26.5K (13%)  ctrl+p commands    • OpenCode 1.14.19
+

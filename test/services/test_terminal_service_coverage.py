@@ -193,6 +193,96 @@ class TestCreateTerminalCleanup:
         assert args[0][0] == "cao-myses"
 
 
+class TestCreateTerminalSessionCleanupGuard:
+    """Regression tests for session_created guard (fix/terminal-service-session-cleanup).
+
+    Ensures cleanup only kills sessions that THIS call actually created,
+    preventing destruction of pre-existing sessions on error.
+    """
+
+    @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.generate_window_name", return_value="w1"
+    )
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.generate_terminal_id",
+        return_value="tid1",
+    )
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    def test_no_kill_session_when_session_already_exists(
+        self,
+        mock_load_profile,
+        mock_tid,
+        mock_wname,
+        mock_db_create,
+        mock_pm,
+        mock_tmux,
+        mock_log_dir,
+    ):
+        """When session already exists, cleanup must NOT kill the pre-existing session."""
+        from cli_agent_orchestrator.services.terminal_service import create_terminal
+
+        mock_tmux.session_exists.return_value = True  # session already exists
+
+        with pytest.raises(ValueError, match="already exists"):
+            create_terminal(
+                provider="kiro_cli",
+                agent_profile="dev",
+                session_name="cao-foo",
+                new_session=True,
+                allowed_tools=["*"],
+            )
+
+        mock_tmux.kill_session.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.generate_window_name", return_value="w1"
+    )
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.generate_terminal_id",
+        return_value="tid1",
+    )
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    def test_kill_session_when_we_created_it_and_later_step_fails(
+        self,
+        mock_load_profile,
+        mock_tid,
+        mock_wname,
+        mock_db_create,
+        mock_pm,
+        mock_tmux,
+        mock_log_dir,
+    ):
+        """When we successfully created the session but a later step fails, cleanup SHOULD kill it."""
+        from cli_agent_orchestrator.services.terminal_service import create_terminal
+
+        mock_tmux.session_exists.return_value = False
+        mock_tmux.create_session.return_value = "w1"
+        mock_load_profile.return_value = AgentProfile(name="dev", description="Dev")
+
+        mock_provider = MagicMock()
+        mock_provider.initialize.side_effect = Exception("provider init failed")
+        mock_pm.create_provider.return_value = mock_provider
+
+        with pytest.raises(Exception, match="provider init failed"):
+            create_terminal(
+                provider="kiro_cli",
+                agent_profile="dev",
+                session_name="test-ses",
+                new_session=True,
+                allowed_tools=["*"],
+            )
+
+        mock_tmux.kill_session.assert_called_once()
+
+
 class TestDeleteTerminal:
     """Test delete_terminal coverage including pipe-pane and kill_window."""
 

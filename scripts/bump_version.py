@@ -4,6 +4,7 @@
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
@@ -32,11 +33,29 @@ def update_pyproject(new_version: str) -> None:
 
 
 def generate_changelog(new_version: str) -> None:
-    subprocess.run(
-        ["git-cliff", "--tag", f"v{new_version}", "-o", "CHANGELOG.md"],
-        cwd=ROOT,
-        check=True,
-    )
+    # git-cliff calls the GitHub API when [remote.github] is configured in
+    # cliff.toml. Transient 502s / rate-limit bumps bubble up as non-zero
+    # exit. Retry 3x with 10s backoff to ride through transient hiccups;
+    # authenticated requests (via GITHUB_TOKEN env in CI) make this rare.
+    last_err: subprocess.CalledProcessError | None = None
+    for attempt in range(3):
+        try:
+            subprocess.run(
+                ["git-cliff", "--tag", f"v{new_version}", "-o", "CHANGELOG.md"],
+                cwd=ROOT,
+                check=True,
+            )
+            return
+        except subprocess.CalledProcessError as e:
+            last_err = e
+            if attempt < 2:
+                print(
+                    f"git-cliff attempt {attempt + 1} failed; retrying in 10s...",
+                    file=sys.stderr,
+                )
+                time.sleep(10)
+    assert last_err is not None
+    raise last_err
 
 
 def main() -> None:

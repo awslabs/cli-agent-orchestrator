@@ -120,6 +120,13 @@ def require_copilot():
         pytest.skip("copilot CLI not installed")
 
 
+@pytest.fixture()
+def require_opencode():
+    """Skip test if opencode binary is not available."""
+    if not _cli_available("opencode"):
+        pytest.skip("opencode CLI not installed")
+
+
 def create_terminal(
     provider: str,
     agent_profile: str,
