@@ -24,6 +24,7 @@ const SOURCE_LABELS: Record<string, string> = {
   'local': 'Local',
   'kiro': 'Kiro',
   'q_cli': 'Q CLI',
+  'opencode_cli': 'opencode',
 }
 
 export function AgentPanel() {
