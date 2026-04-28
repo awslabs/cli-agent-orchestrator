@@ -34,11 +34,7 @@ jobs:
         run: |
           npm ci
           npm run build
-
-      - name: Stage Web UI into package
-        run: |
-          mkdir -p src/cli_agent_orchestrator/web_ui
-          cp -r web/dist/. src/cli_agent_orchestrator/web_ui/
+          # vite.config.ts writes directly to ../src/cli_agent_orchestrator/web_ui/
 
       - uses: astral-sh/setup-uv@v4
 
