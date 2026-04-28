@@ -3,6 +3,7 @@ import { render, screen } from '@testing-library/react'
 import { StatusBadge } from '../components/StatusBadge'
 import { ErrorBoundary } from '../components/ErrorBoundary'
 import { ConfirmModal } from '../components/ConfirmModal'
+import { providerLabel, FALLBACK_PROVIDERS } from '../components/AgentPanel'
 
 describe('StatusBadge', () => {
   it('renders idle status', () => {
@@ -138,5 +139,61 @@ describe('ConfirmModal', () => {
     )
     const button = screen.getByText('Closing...').closest('button')
     expect(button).toBeDisabled()
+  })
+})
+
+describe('providerLabel', () => {
+  it('renders opencode_cli as "opencode"', () => {
+    expect(providerLabel('opencode_cli')).toBe('opencode')
+  })
+
+  it('keeps existing underscore-to-space behavior for kiro_cli', () => {
+    expect(providerLabel('kiro_cli')).toBe('kiro cli')
+  })
+
+  it('keeps existing behavior for claude_code', () => {
+    expect(providerLabel('claude_code')).toBe('claude code')
+  })
+
+  it('keeps existing behavior for providers without underscores', () => {
+    expect(providerLabel('codex')).toBe('codex')
+  })
+})
+
+describe('FALLBACK_PROVIDERS', () => {
+  it('includes opencode_cli', () => {
+    expect(FALLBACK_PROVIDERS).toContain('opencode_cli')
+  })
+
+  it('includes all known providers', () => {
+    const expected = ['kiro_cli', 'claude_code', 'q_cli', 'codex', 'gemini_cli', 'kimi_cli', 'copilot_cli', 'opencode_cli']
+    for (const p of expected) {
+      expect(FALLBACK_PROVIDERS).toContain(p)
+    }
+  })
+
+  it('maps to enabled select options with correct label', () => {
+    // Simulates the fallback option construction used in AgentPanel
+    const options = FALLBACK_PROVIDERS.map(n => ({
+      value: n,
+      label: providerLabel(n),
+      disabled: false,
+    }))
+    const opencodeOption = options.find(o => o.value === 'opencode_cli')
+    expect(opencodeOption).toBeDefined()
+    expect(opencodeOption!.label).toBe('opencode')
+    expect(opencodeOption!.disabled).toBe(false)
+
+    const kiroOption = options.find(o => o.value === 'kiro_cli')
+    expect(kiroOption).toBeDefined()
+    expect(kiroOption!.label).toBe('kiro cli')
+  })
+
+  it('provides an opencode_cli option on empty providers', () => {
+    // Simulates: when providers.length === 0, fallback is used
+    const noProviders: any[] = []
+    const effective = noProviders.length > 0 ? noProviders : FALLBACK_PROVIDERS.map(n => ({ name: n, binary: '', installed: true }))
+    const names = effective.map(p => p.name)
+    expect(names).toContain('opencode_cli')
   })
 })

@@ -56,6 +56,26 @@ describe('API wrapper', () => {
     )
   })
 
+  it('createSession sends POST with opencode_cli provider', async () => {
+    const terminal = { id: 't2', name: 'dev', provider: 'opencode_cli', session_name: 's2' }
+    mockResponse(terminal)
+    await api.createSession('opencode_cli', 'developer')
+    expect(mockFetch).toHaveBeenCalledWith(
+      expect.stringContaining('/sessions?provider=opencode_cli&agent_profile=developer'),
+      expect.objectContaining({ method: 'POST' })
+    )
+  })
+
+  it('addTerminalToSession sends POST with opencode_cli provider', async () => {
+    const terminal = { id: 't3', name: 'dev', provider: 'opencode_cli', session_name: 's1' }
+    mockResponse(terminal)
+    await api.addTerminalToSession('s1', 'opencode_cli', 'developer')
+    expect(mockFetch).toHaveBeenCalledWith(
+      expect.stringContaining('/sessions/s1/terminals?provider=opencode_cli&agent_profile=developer'),
+      expect.objectContaining({ method: 'POST' })
+    )
+  })
+
   it('createSession includes working directory when provided', async () => {
     mockResponse({ id: 't1' })
     await api.createSession('kiro_cli', 'developer', undefined, '/home/user/project')
