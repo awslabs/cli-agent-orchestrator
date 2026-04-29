@@ -1,6 +1,7 @@
 """Tests for TmuxClient methods (mocked libtmux — no real tmux required)."""
 
 import os
+import sys
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -33,14 +34,27 @@ class TestResolveAndValidateWorkingDirectory:
         result = tmux._resolve_and_validate_working_directory(str(tmp_path))
         assert result == os.path.realpath(str(tmp_path))
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="Unix blocked-path list (/,/etc) has no Windows equivalent; "
+               "path resolves to drive root or does not exist on Windows",
+    )
     def test_blocked_root(self, tmux):
         with pytest.raises(ValueError, match="blocked system path"):
             tmux._resolve_and_validate_working_directory("/")
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="/etc does not exist on Windows so the error is 'does not exist', not 'blocked'",
+    )
     def test_blocked_etc(self, tmux):
         with pytest.raises(ValueError, match="blocked system path"):
             tmux._resolve_and_validate_working_directory("/etc")
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="/nonexistent/dir/xyz is a relative path on Windows (no drive letter)",
+    )
     def test_nonexistent_directory(self, tmux):
         with pytest.raises(ValueError, match="does not exist"):
             tmux._resolve_and_validate_working_directory("/nonexistent/dir/xyz")

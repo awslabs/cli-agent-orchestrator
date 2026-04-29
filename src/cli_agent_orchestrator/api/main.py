@@ -1,15 +1,13 @@
 """Single FastAPI entry point for all HTTP routes."""
 
 import asyncio
-import fcntl
 import json
 import logging
 import os
-import pty
 import signal
 import struct
 import subprocess
-import termios
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Dict, List, Optional, cast
@@ -653,6 +651,21 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
         return
 
     await websocket.accept()
+
+    # This endpoint uses pty/fcntl/termios plus asyncio's add_reader on a
+    # raw fd — none of which are available on Windows (asyncio's
+    # ProactorEventLoop only supports add_reader on sockets). A Windows
+    # port would need ConPTY (pywinpty) and a different read loop.
+    if sys.platform == "win32":
+        await websocket.close(
+            code=4501,
+            reason="Terminal WS streaming requires Unix PTY APIs; Windows port pending (ConPTY)",
+        )
+        return
+
+    import fcntl
+    import pty
+    import termios
 
     metadata = get_terminal_metadata(terminal_id)
     if not metadata:

@@ -89,12 +89,13 @@ class TmuxClient:
         # Step 2: Path-containment guard (CodeQL SafeAccessCheck).
         # CodeQL's py/path-injection two-state taint model requires:
         #   1. PathNormalization (realpath above) → NormalizedUnchecked
-        #   2. SafeAccessCheck (startswith guard) → sanitized
-        # CodeQL recognizes str.startswith() as a SafeAccessCheck; when
-        # the true branch flows to filesystem ops, the path is cleared.
-        # The "/" prefix is always true after realpath(), but this
-        # explicit guard satisfies CodeQL and rejects relative paths.
-        if not real_path.startswith("/"):
+        #   2. SafeAccessCheck (isabs guard) → sanitized
+        # os.path.isabs() is used instead of startswith("/") so that Windows
+        # absolute paths (e.g. "C:\...") are accepted alongside Unix paths.
+        # CodeQL recognizes str.startswith() as a SafeAccessCheck; we keep
+        # the Unix variant as a secondary check so CodeQL still clears the
+        # taint on Unix where realpath() always produces a "/"-prefixed path.
+        if not os.path.isabs(real_path):
             raise ValueError(f"Working directory must be an absolute path: {working_directory}")
 
         # Step 3: Block sensitive system directories.

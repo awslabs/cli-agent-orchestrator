@@ -17,7 +17,7 @@ def setup_logging() -> None:
     logging.basicConfig(
         level=log_level,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        handlers=[logging.FileHandler(log_file)],
+        handlers=[logging.FileHandler(log_file, delay=True)],
     )
 
     print(f"Server logs: {log_file}")

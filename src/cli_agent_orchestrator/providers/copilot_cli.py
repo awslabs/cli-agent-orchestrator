@@ -134,7 +134,12 @@ class CopilotCliProvider(BaseProvider):
         return False
 
     def _command(self) -> str:
-        config_dir = Path.home() / ".copilot"
+        try:
+            config_dir = Path.home() / ".copilot"
+        except RuntimeError:
+            # HOME / USERPROFILE not set (e.g. in sandboxed test environments);
+            # fall back to a relative sentinel so the flag is still present.
+            config_dir = Path(".copilot")
 
         command_parts = ["copilot", "--allow-all"]
 
