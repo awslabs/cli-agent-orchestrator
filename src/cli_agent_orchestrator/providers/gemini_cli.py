@@ -32,11 +32,12 @@ import logging
 import os
 import re
 import shlex
+import sys
 import time
 from pathlib import Path
 from typing import Optional
 
-from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.clients.tmux import pwsh_join, tmux_client
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -282,6 +283,8 @@ class GeminiCliProvider(BaseProvider):
         if self._allowed_tools and "*" not in self._allowed_tools:
             self._write_policy_deny_rules()
 
+        if sys.platform == "win32":
+            return pwsh_join(command_parts)
         return shlex.join(command_parts)
 
     def _write_policy_deny_rules(self) -> None:

@@ -87,16 +87,10 @@ class TestHandleStartupPromptsBranches:
         mock_tmux.get_history.return_value = (
             "Do you trust the files in this folder?\n" "❯ Yes, I trust this folder"
         )
-        mock_pane = MagicMock()
-        mock_window = MagicMock()
-        mock_window.active_pane = mock_pane
-        mock_session = MagicMock()
-        mock_session.windows.get.return_value = mock_window
-        mock_tmux.server.sessions.get.return_value = mock_session
 
         provider._handle_startup_prompts(timeout=1.0)
 
-        mock_pane.send_keys.assert_called_once_with("", enter=True)
+        mock_tmux.send_keys.assert_called_once_with("ses", "win", "")
 
 
 class TestDatabaseListAllTerminals:
