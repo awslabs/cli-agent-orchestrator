@@ -88,6 +88,11 @@ Install from PyPI:
 uv tool install cli-agent-orchestrator --upgrade
 ```
 
+Install a specific version: 
+```bash
+uv tool install cli-agent-orchestrator==2.1.1
+```
+
 ### Development Setup
 
 For local development, clone the repo and install with `uv sync`:
