@@ -62,6 +62,9 @@ def _load_skill_folder(skill_path: Path) -> Tuple[SkillMetadata, str]:
         raise FileNotFoundError(f"Missing SKILL.md in skill folder: {skill_path}")
 
     metadata, content = _parse_skill_file(skill_file)
+    # Validate the name from SKILL.md before comparing it to the folder name;
+    # this ensures path-traversal names are caught with the expected error message.
+    validate_skill_name(metadata.name)
     if skill_path.name != metadata.name:
         raise ValueError(
             f"Skill folder name '{skill_path.name}' does not match skill name '{metadata.name}'"

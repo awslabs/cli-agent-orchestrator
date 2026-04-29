@@ -1,6 +1,7 @@
 """Unit tests for TMux client working directory methods."""
 
 import os
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, PropertyMock, patch
 
@@ -30,6 +31,10 @@ class TestTmuxClientWorkingDirectory:
                     result = client._resolve_and_validate_working_directory(None)
                     assert result == "/home/user/project"
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="Creating symlinks on Windows requires Developer Mode or elevated privileges",
+    )
     def test_resolve_symlinks(self, tmp_path):
         """Test that symlinks are resolved to real paths."""
         client = TmuxClient()
@@ -238,6 +243,10 @@ class TestTmuxClientWorkingDirectory:
             with pytest.raises(ValueError, match="blocked system path"):
                 client._resolve_and_validate_working_directory("/some/link")
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="Creating symlinks on Windows requires Developer Mode or elevated privileges",
+    )
     def test_resolve_symlinked_home_directory(self, tmp_path):
         """Test that a symlinked home directory works (AWS /local/home pattern)."""
         client = TmuxClient()
@@ -255,6 +264,10 @@ class TestTmuxClientWorkingDirectory:
         result = client._resolve_and_validate_working_directory(str(project_dir))
         assert result == str(project_dir.resolve())
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="Creating symlinks on Windows requires Developer Mode or elevated privileges",
+    )
     def test_resolve_symlinked_home_via_symlink_path(self, tmp_path):
         """Test passing the symlink path when home is symlinked."""
         client = TmuxClient()

@@ -1,6 +1,7 @@
 """Unit tests for the opencode.json read-modify-write helper."""
 
 import json
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -40,6 +41,10 @@ class TestEnsureSkillsSymlink:
         monkeypatch.setattr(cfg_module, "SKILLS_DIR", skills_dir)
         return {"config_dir": config_dir, "skills_dir": skills_dir}
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="Creating symlinks on Windows requires Developer Mode or elevated privileges",
+    )
     def test_creates_symlink_when_target_missing(self, symlink_env):
         config_dir = symlink_env["config_dir"]
         skills_dir = symlink_env["skills_dir"]
@@ -50,6 +55,10 @@ class TestEnsureSkillsSymlink:
         assert target.is_symlink()
         assert target.resolve() == skills_dir.resolve()
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="Creating symlinks on Windows requires Developer Mode or elevated privileges",
+    )
     def test_noop_when_correct_symlink_exists(self, symlink_env):
         config_dir = symlink_env["config_dir"]
         skills_dir = symlink_env["skills_dir"]
@@ -83,6 +92,10 @@ class TestEnsureSkillsSymlink:
         assert any("not a symlink" in rec.message for rec in caplog.records)
         assert target.is_dir() and not target.is_symlink()
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="Creating symlinks on Windows requires Developer Mode or elevated privileges",
+    )
     def test_warns_and_skips_when_symlink_points_elsewhere(self, symlink_env, caplog):
         config_dir = symlink_env["config_dir"]
         other_dir = symlink_env["config_dir"].parent / "other_skills"
