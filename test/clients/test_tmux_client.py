@@ -25,6 +25,65 @@ def _completed(stdout: str = "", returncode: int = 0, stderr: str = "") -> Magic
     return m
 
 
+# ── encoding regression ──────────────────────────────────────────────
+
+
+class TestSubprocessEncoding:
+    """Ensure all text-decoding subprocess.run calls use encoding='utf-8'.
+
+    On Windows, the default locale encoding is cp1252.  psmux/tmux and the
+    agents we drive emit UTF-8; without an explicit encoding the box-drawing
+    characters (e.g. U+2500 ─) used by Claude Code's TUI are mis-decoded as
+    cp1252 mojibake, breaking the init-detection regex.
+    """
+
+    @patch("cli_agent_orchestrator.clients.tmux.subprocess")
+    def test_run_helper_uses_utf8(self, mock_sp, tmux):
+        """_run() must pass encoding='utf-8' to subprocess.run."""
+        mock_sp.run.return_value = _completed("ses1|0\n", returncode=0)
+        tmux.list_sessions()
+
+        _, kwargs = mock_sp.run.call_args
+        assert kwargs.get("encoding") == "utf-8", (
+            "_run() must use encoding='utf-8' (not the locale default)"
+        )
+
+    @patch("cli_agent_orchestrator.clients.tmux.subprocess")
+    def test_create_session_uses_utf8(self, mock_sp, tmux, tmp_path):
+        """create_session()'s explicit subprocess.run must pass encoding='utf-8'."""
+        mock_sp.run.side_effect = [
+            _completed("", returncode=0),           # new-session
+            _completed("", returncode=0),           # set-window-option via _run
+            _completed("", returncode=0),           # rename-window via _run
+            _completed("win\n", returncode=0),      # list-windows via _run
+        ]
+        tmux.create_session("ses", "win", "tid1", str(tmp_path))
+
+        # First call is the explicit new-session subprocess.run
+        _, kwargs = mock_sp.run.call_args_list[0]
+        assert kwargs.get("encoding") == "utf-8", (
+            "create_session() must use encoding='utf-8' on the new-session call"
+        )
+
+    @patch("cli_agent_orchestrator.clients.tmux.subprocess")
+    def test_create_window_uses_utf8(self, mock_sp, tmux, tmp_path):
+        """create_window()'s explicit subprocess.run must pass encoding='utf-8'."""
+        mock_sp.run.side_effect = [
+            _completed("", returncode=0),           # has-session
+            _completed("", returncode=0),           # new-window
+            _completed("", returncode=0),           # set-window-option via _run
+            _completed("", returncode=0),           # rename-window via _run
+            _completed("win\n", returncode=0),      # list-windows via _run
+        ]
+        tmux.create_window("ses", "win", "tid1", str(tmp_path))
+
+        # Second call is the explicit new-window subprocess.run
+        _, kwargs = mock_sp.run.call_args_list[1]
+        assert kwargs.get("encoding") == "utf-8", (
+            "create_window() must use encoding='utf-8' on the new-window call"
+        )
+
+
 # ── _resolve_and_validate_working_directory ──────────────────────────
 
 
@@ -73,6 +132,8 @@ class TestCreateSession:
         # new-session succeeds, list-windows returns one window
         mock_sp.run.side_effect = [
             _completed("", returncode=0),            # new-session
+            _completed("", returncode=0),            # set-window-option (psmux-workaround)
+            _completed("", returncode=0),            # rename-window (psmux-workaround)
             _completed("my-window\n", returncode=0), # list-windows
         ]
         result = tmux.create_session("ses", "my-window", "tid1", str(tmp_path))
@@ -83,6 +144,8 @@ class TestCreateSession:
         # new-session succeeds, list-windows returns empty
         mock_sp.run.side_effect = [
             _completed("", returncode=0),  # new-session
+            _completed("", returncode=0),  # set-window-option (psmux-workaround)
+            _completed("", returncode=0),  # rename-window (psmux-workaround)
             _completed("", returncode=0),  # list-windows (empty)
         ]
         with pytest.raises(ValueError, match="Window name is None"):
@@ -96,6 +159,104 @@ class TestCreateSession:
         with pytest.raises(RuntimeError, match="tmux error"):
             tmux.create_session("ses", "w", "tid1", str(tmp_path))
 
+    @patch("cli_agent_orchestrator.clients.tmux.subprocess")
+    def test_create_session_filters_non_posix_env_names(self, mock_sp, tmux, tmp_path):
+        """Windows env vars with invalid POSIX names must not appear in -e args."""
+        mock_sp.run.side_effect = [
+            _completed("", returncode=0),            # new-session
+            _completed("", returncode=0),            # set-window-option (psmux-workaround)
+            _completed("", returncode=0),            # rename-window (psmux-workaround)
+            _completed("win\n", returncode=0),       # list-windows
+        ]
+        fake_env = {
+            "MY_VAR": "test",
+            "PROGRAMFILES(X86)": "C:\\Program Files (x86)",
+            "ASL.LOG": "Destination=file",
+            "COMMONPROGRAMFILES(ARM)": "C:\\Program Files (ARM)",
+        }
+        with patch.dict("os.environ", fake_env, clear=True):
+            tmux.create_session("ses", "win", "tid-posix", str(tmp_path))
+
+        new_session_call = mock_sp.run.call_args_list[0]
+        argv = new_session_call[0][0]  # positional first arg is the cmd list
+
+        # POSIX-valid names must be present
+        assert "-e" in argv
+        assert any(a == "MY_VAR=test" for a in argv), "MY_VAR should be forwarded"
+        assert any(a.startswith("CAO_TERMINAL_ID=") for a in argv), "CAO_TERMINAL_ID should be forwarded"
+
+        # Non-POSIX names must be absent
+        assert not any("PROGRAMFILES(X86)" in a for a in argv), "PROGRAMFILES(X86) must be filtered"
+        assert not any("ASL.LOG" in a for a in argv), "ASL.LOG must be filtered"
+        assert not any("COMMONPROGRAMFILES(ARM)" in a for a in argv), "COMMONPROGRAMFILES(ARM) must be filtered"
+
+    @patch("cli_agent_orchestrator.clients.tmux.subprocess")
+    def test_create_session_disables_auto_rename_and_renames_window(self, mock_sp, tmux, tmp_path):
+        """After new-session, set-window-option automatic-rename off and rename-window must be called.
+
+        psmux 3.3.4 immediately overwrites the -n NAME with the active process
+        name. We defensively disable auto-rename and re-assert the name so that
+        CAO's (session, window_name) registry lookups always succeed.
+        """
+        mock_sp.run.side_effect = [
+            _completed("", returncode=0),            # new-session
+            _completed("", returncode=0),            # set-window-option
+            _completed("", returncode=0),            # rename-window
+            _completed("my-win\n", returncode=0),    # list-windows
+        ]
+        tmux.create_session("ses", "my-win", "tid1", str(tmp_path))
+
+        calls = mock_sp.run.call_args_list
+        cmds = [c[0][0] for c in calls]
+
+        assert any(
+            "set-window-option" in cmd and "ses:0" in cmd
+            and "automatic-rename" in cmd and "off" in cmd
+            for cmd in cmds
+        ), "set-window-option automatic-rename off must be called with target ses:0"
+
+        assert any(
+            "rename-window" in cmd and "ses:0" in cmd and "my-win" in cmd
+            for cmd in cmds
+        ), "rename-window must be called with target ses:0 and the intended name"
+
+    @patch("cli_agent_orchestrator.clients.tmux.subprocess")
+    def test_create_session_strips_trailing_backslash_from_env_values(self, mock_sp, tmux, tmp_path):
+        """Env values ending in backslash must have trailing backslashes stripped.
+
+        psmux 3.3.4 misparses Windows argv when an -e KEY=VAL value contains
+        spaces AND ends with `\\` — it swallows all subsequent -e flags into
+        that value. Strip trailing backslashes before building -e args so that
+        CAO_TERMINAL_ID (appended last) is always delivered to the spawned agent.
+        """
+        mock_sp.run.side_effect = [
+            _completed("", returncode=0),       # new-session
+            _completed("", returncode=0),       # set-window-option (psmux-workaround)
+            _completed("", returncode=0),       # rename-window (psmux-workaround)
+            _completed("win\n", returncode=0),  # list-windows
+        ]
+        fake_env = {
+            "TRAILING_BS_VAR": "C:\\Foo\\Bar\\",
+            "NORMAL_VAR": "hello",
+        }
+        with patch.dict("os.environ", fake_env, clear=True):
+            tmux.create_session("ses", "win", "abc123", str(tmp_path))
+
+        argv = mock_sp.run.call_args_list[0][0][0]
+
+        # Trailing backslash must be stripped
+        assert any(a == "TRAILING_BS_VAR=C:\\Foo\\Bar" for a in argv), (
+            "Trailing backslash must be stripped from env values"
+        )
+        # Value without trailing backslash must be unchanged
+        assert any(a == "NORMAL_VAR=hello" for a in argv), (
+            "Values without trailing backslash must be forwarded unchanged"
+        )
+        # CAO_TERMINAL_ID must still be present (not swallowed)
+        assert any(a == "CAO_TERMINAL_ID=abc123" for a in argv), (
+            "CAO_TERMINAL_ID must be present in -e args even after path-like values"
+        )
+
 
 # ── create_window ────────────────────────────────────────────────────
 
@@ -106,10 +267,43 @@ class TestCreateWindow:
         mock_sp.run.side_effect = [
             _completed("", returncode=0),                        # has-session
             _completed("", returncode=0),                        # new-window
+            _completed("", returncode=0),                        # set-window-option (psmux-workaround)
+            _completed("", returncode=0),                        # rename-window (psmux-workaround)
             _completed("agent-window\n", returncode=0),          # list-windows
         ]
         result = tmux.create_window("ses", "agent-window", "tid2", str(tmp_path))
         assert result == "agent-window"
+
+    @patch("cli_agent_orchestrator.clients.tmux.subprocess")
+    def test_create_window_disables_auto_rename_and_renames_window(self, mock_sp, tmux, tmp_path):
+        """After new-window, set-window-option automatic-rename off and rename-window must be called.
+
+        psmux 3.3.4 immediately overwrites the -n NAME with the active process
+        name. We target the new window via ':^' (last window) and re-assert the
+        intended name so that CAO's registry lookups always succeed.
+        """
+        mock_sp.run.side_effect = [
+            _completed("", returncode=0),                   # has-session
+            _completed("", returncode=0),                   # new-window
+            _completed("", returncode=0),                   # set-window-option
+            _completed("", returncode=0),                   # rename-window
+            _completed("agent-win\n", returncode=0),        # list-windows
+        ]
+        tmux.create_window("ses", "agent-win", "tid2", str(tmp_path))
+
+        calls = mock_sp.run.call_args_list
+        cmds = [c[0][0] for c in calls]
+
+        assert any(
+            "set-window-option" in cmd and "ses:^" in cmd
+            and "automatic-rename" in cmd and "off" in cmd
+            for cmd in cmds
+        ), "set-window-option automatic-rename off must be called with target ses:^"
+
+        assert any(
+            "rename-window" in cmd and "ses:^" in cmd and "agent-win" in cmd
+            for cmd in cmds
+        ), "rename-window must be called with target ses:^ and the intended name"
 
     @patch("cli_agent_orchestrator.clients.tmux.subprocess")
     def test_create_window_session_not_found(self, mock_sp, tmux, tmp_path):
@@ -122,6 +316,8 @@ class TestCreateWindow:
         mock_sp.run.side_effect = [
             _completed("", returncode=0),   # has-session
             _completed("", returncode=0),   # new-window
+            _completed("", returncode=0),   # set-window-option (psmux-workaround)
+            _completed("", returncode=0),   # rename-window (psmux-workaround)
             _completed("", returncode=0),   # list-windows (empty)
         ]
         with pytest.raises(ValueError, match="Window name is None"):
@@ -132,40 +328,89 @@ class TestCreateWindow:
 
 
 class TestSendKeys:
+    @patch("cli_agent_orchestrator.clients.tmux.sys")
     @patch("cli_agent_orchestrator.clients.tmux.time")
     @patch("cli_agent_orchestrator.clients.tmux.subprocess")
-    def test_send_keys_success(self, mock_subprocess, mock_time, tmux):
+    def test_send_keys_success_unix(self, mock_subprocess, mock_time, mock_sys, tmux):
+        mock_sys.platform = "linux"
         mock_subprocess.run.return_value = MagicMock(returncode=0)
         tmux.send_keys("ses", "win", "hello", enter_count=1)
 
         # load-buffer, paste-buffer, send-keys Enter, delete-buffer
         assert mock_subprocess.run.call_count == 4
 
+    @patch("cli_agent_orchestrator.clients.tmux.sys")
     @patch("cli_agent_orchestrator.clients.tmux.time")
     @patch("cli_agent_orchestrator.clients.tmux.subprocess")
-    def test_send_keys_multiple_enters(self, mock_subprocess, mock_time, tmux):
+    def test_send_keys_multiple_enters_unix(self, mock_subprocess, mock_time, mock_sys, tmux):
+        mock_sys.platform = "linux"
         mock_subprocess.run.return_value = MagicMock(returncode=0)
         tmux.send_keys("ses", "win", "hello", enter_count=3)
 
         # load-buffer + paste-buffer + 3 send-keys Enter + delete-buffer = 6
         assert mock_subprocess.run.call_count == 6
 
+    @patch("cli_agent_orchestrator.clients.tmux.sys")
     @patch("cli_agent_orchestrator.clients.tmux.time")
     @patch("cli_agent_orchestrator.clients.tmux.subprocess")
-    def test_send_keys_raises_on_failure(self, mock_subprocess, mock_time, tmux):
+    def test_send_keys_raises_on_failure(self, mock_subprocess, mock_time, mock_sys, tmux):
+        mock_sys.platform = "linux"
         mock_subprocess.run.side_effect = Exception("tmux send failed")
 
         with pytest.raises(Exception, match="tmux send failed"):
             tmux.send_keys("ses", "win", "hello")
+
+    @patch("cli_agent_orchestrator.clients.tmux.sys")
+    @patch("cli_agent_orchestrator.clients.tmux.time")
+    @patch("cli_agent_orchestrator.clients.tmux.subprocess")
+    def test_send_keys_windows_uses_send_keys_literal(self, mock_subprocess, mock_time, mock_sys, tmux):
+        """On Windows, send_keys() must use send-keys -l and skip load/paste-buffer."""
+        mock_sys.platform = "win32"
+        mock_subprocess.run.return_value = MagicMock(returncode=0)
+        tmux.send_keys("ses", "win", "hello", enter_count=1)
+
+        calls = mock_subprocess.run.call_args_list
+        cmds = [c[0][0] for c in calls]
+
+        # send-keys -l must be called with the literal text
+        assert any(
+            "send-keys" in cmd and "-l" in cmd and "hello" in cmd
+            for cmd in cmds
+        ), "Expected send-keys -l <text> call on Windows"
+
+        # load-buffer and paste-buffer must NOT be called
+        assert not any("load-buffer" in cmd for cmd in cmds), "load-buffer must not be called on Windows"
+        assert not any("paste-buffer" in cmd for cmd in cmds), "paste-buffer must not be called on Windows"
+
+    @patch("cli_agent_orchestrator.clients.tmux.sys")
+    @patch("cli_agent_orchestrator.clients.tmux.time")
+    @patch("cli_agent_orchestrator.clients.tmux.subprocess")
+    def test_send_keys_unix_uses_paste_buffer(self, mock_subprocess, mock_time, mock_sys, tmux):
+        """On Unix, send_keys() must use the paste-buffer flow, not send-keys -l."""
+        mock_sys.platform = "linux"
+        mock_subprocess.run.return_value = MagicMock(returncode=0)
+        tmux.send_keys("ses", "win", "hello", enter_count=1)
+
+        calls = mock_subprocess.run.call_args_list
+        cmds = [c[0][0] for c in calls]
+
+        assert any("load-buffer" in cmd for cmd in cmds), "load-buffer must be called on Unix"
+        assert any("paste-buffer" in cmd for cmd in cmds), "paste-buffer must be called on Unix"
+        assert not any(
+            "send-keys" in cmd and "-l" in cmd
+            for cmd in cmds
+        ), "send-keys -l must not be called on Unix"
 
 
 # ── send_keys_via_paste ──────────────────────────────────────────────
 
 
 class TestSendKeysViaPaste:
+    @patch("cli_agent_orchestrator.clients.tmux.sys")
     @patch("cli_agent_orchestrator.clients.tmux.time")
     @patch("cli_agent_orchestrator.clients.tmux.subprocess")
-    def test_send_keys_via_paste_success(self, mock_sp, mock_time, tmux):
+    def test_send_keys_via_paste_success_unix(self, mock_sp, mock_time, mock_sys, tmux):
+        mock_sys.platform = "linux"
         mock_sp.run.side_effect = [
             _completed("", returncode=0),           # has-session
             _completed("win\n", returncode=0),       # list-windows
@@ -201,6 +446,65 @@ class TestSendKeysViaPaste:
         ]
         with pytest.raises(ValueError, match="not found"):
             tmux.send_keys_via_paste("ses", "nonexistent", "hello")
+
+    @patch("cli_agent_orchestrator.clients.tmux.sys")
+    @patch("cli_agent_orchestrator.clients.tmux.time")
+    @patch("cli_agent_orchestrator.clients.tmux.subprocess")
+    def test_send_keys_via_paste_windows_uses_send_keys_literal(self, mock_sp, mock_time, mock_sys, tmux):
+        """On Windows, send_keys_via_paste() must use send-keys -l and skip set/paste-buffer."""
+        mock_sys.platform = "win32"
+        mock_sp.run.side_effect = [
+            _completed("", returncode=0),           # has-session
+            _completed("win\n", returncode=0),       # list-windows
+            _completed("", returncode=0),            # send-keys -l
+            _completed("", returncode=0),            # send-keys C-m
+        ]
+        tmux.send_keys_via_paste("ses", "win", "hello")
+
+        calls = mock_sp.run.call_args_list
+        cmds = [c[0][0] for c in calls]
+
+        # send-keys -l must be called with the literal text
+        assert any(
+            "send-keys" in cmd and "-l" in cmd and "hello" in cmd
+            for cmd in cmds
+        ), "Expected send-keys -l <text> call on Windows"
+
+        # C-m must still be sent
+        assert any(
+            "send-keys" in cmd and "C-m" in cmd
+            for cmd in cmds
+        ), "Expected send-keys C-m on Windows"
+
+        # set-buffer and paste-buffer must NOT be called
+        assert not any("set-buffer" in cmd for cmd in cmds), "set-buffer must not be called on Windows"
+        assert not any("paste-buffer" in cmd for cmd in cmds), "paste-buffer must not be called on Windows"
+
+    @patch("cli_agent_orchestrator.clients.tmux.sys")
+    @patch("cli_agent_orchestrator.clients.tmux.time")
+    @patch("cli_agent_orchestrator.clients.tmux.subprocess")
+    def test_send_keys_via_paste_unix_uses_paste_buffer(self, mock_sp, mock_time, mock_sys, tmux):
+        """On Unix, send_keys_via_paste() must use the set-buffer + paste-buffer flow."""
+        mock_sys.platform = "linux"
+        mock_sp.run.side_effect = [
+            _completed("", returncode=0),           # has-session
+            _completed("win\n", returncode=0),       # list-windows
+            _completed("", returncode=0),            # set-buffer
+            _completed("", returncode=0),            # paste-buffer
+            _completed("", returncode=0),            # send-keys C-m
+            _completed("", returncode=0),            # delete-buffer
+        ]
+        tmux.send_keys_via_paste("ses", "win", "hello")
+
+        calls = mock_sp.run.call_args_list
+        cmds = [c[0][0] for c in calls]
+
+        assert any("set-buffer" in cmd for cmd in cmds), "set-buffer must be called on Unix"
+        assert any("paste-buffer" in cmd for cmd in cmds), "paste-buffer must be called on Unix"
+        assert not any(
+            "send-keys" in cmd and "-l" in cmd
+            for cmd in cmds
+        ), "send-keys -l must not be called on Unix"
 
 
 # ── send_special_key ─────────────────────────────────────────────────
@@ -531,5 +835,58 @@ class TestStopPipePane:
         ]
         with pytest.raises(ValueError, match="not found"):
             tmux.stop_pipe_pane("ses", "nonexistent")
+
+
+# ── pwsh_join ────────────────────────────────────────────────────────
+
+
+class TestPwshJoin:
+    """Unit tests for the pwsh_join() helper.
+
+    The critical invariant: the output must start with '& ' so that
+    PowerShell treats the first token as a command name rather than
+    a string expression.  Without '&', pwsh raises ParserError on the
+    second quoted token and the launched command never starts.
+    """
+
+    def test_prepends_call_operator(self):
+        """Output must start with '& ' unconditionally."""
+        from cli_agent_orchestrator.clients.tmux import pwsh_join
+
+        result = pwsh_join(["claude", "--dangerously-skip-permissions"])
+        assert result.startswith("& "), (
+            "pwsh_join must prepend '& ' so PowerShell invokes the command"
+        )
+
+    def test_basic_command_and_args(self):
+        """Each token is single-quoted and joined with spaces after '& '."""
+        from cli_agent_orchestrator.clients.tmux import pwsh_join
+
+        result = pwsh_join(["claude", "--flag", "value"])
+        assert result == "& 'claude' '--flag' 'value'"
+
+    def test_single_token(self):
+        """A single-element list still gets the '& ' prefix."""
+        from cli_agent_orchestrator.clients.tmux import pwsh_join
+
+        result = pwsh_join(["codex"])
+        assert result == "& 'codex'"
+
+    def test_embedded_single_quote_is_doubled(self):
+        """Single quotes inside a token are doubled (PowerShell escape rule)."""
+        from cli_agent_orchestrator.clients.tmux import pwsh_join
+
+        result = pwsh_join(["--prompt", "it's alive"])
+        assert "it''s alive" in result
+        # The call operator must still be present
+        assert result.startswith("& ")
+
+    def test_order_preserved(self):
+        """Tokens appear in the same order as the input list."""
+        from cli_agent_orchestrator.clients.tmux import pwsh_join
+
+        parts = ["cmd", "a", "b", "c"]
+        result = pwsh_join(parts)
+        assert result == "& 'cmd' 'a' 'b' 'c'"
 
 

@@ -142,7 +142,7 @@ class TestGeminiCliProviderInitialization:
         # Command should be plain gemini launch (no chained mcp add)
         call_args = mock_tmux.send_keys.call_args_list[1]
         command = call_args[0][2]
-        assert command == "'gemini' '--yolo' '--sandbox' 'false'"
+        assert command == "& 'gemini' '--yolo' '--sandbox' 'false'"
         assert "cao-mcp-server" in provider._mcp_server_names
 
     @patch("cli_agent_orchestrator.providers.gemini_cli.time")
@@ -160,7 +160,7 @@ class TestGeminiCliProviderInitialization:
         # First call: warm-up echo
         assert mock_tmux.send_keys.call_args_list[0][0][2] == "echo CAO_SHELL_READY"
         # Second call: gemini command
-        assert mock_tmux.send_keys.call_args_list[1][0][2] == "'gemini' '--yolo' '--sandbox' 'false'"
+        assert mock_tmux.send_keys.call_args_list[1][0][2] == "& 'gemini' '--yolo' '--sandbox' 'false'"
 
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
     def test_initialize_with_invalid_profile(self, mock_load):
@@ -706,10 +706,10 @@ class TestGeminiCliProviderBuildCommand:
     """Tests for GeminiCliProvider._build_gemini_command()."""
 
     def test_build_command_no_profile(self):
-        """Test command without agent profile is ''gemini' '--yolo' '--sandbox' 'false''."""
+        """Test command without agent profile is '& 'gemini' '--yolo' '--sandbox' 'false''."""
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
         command = provider._build_gemini_command()
-        assert command == "'gemini' '--yolo' '--sandbox' 'false'"
+        assert command == "& 'gemini' '--yolo' '--sandbox' 'false'"
 
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
     def test_build_command_with_mcp_config(self, mock_load, tmp_path):
@@ -728,7 +728,7 @@ class TestGeminiCliProviderBuildCommand:
             command = provider._build_gemini_command()
 
         # Command should be plain gemini launch (MCP configured via settings.json)
-        assert command == "'gemini' '--yolo' '--sandbox' 'false'"
+        assert command == "& 'gemini' '--yolo' '--sandbox' 'false'"
         # MCP server should be tracked for cleanup
         assert "test-server" in provider._mcp_server_names
         # Verify settings.json was written
@@ -758,7 +758,7 @@ class TestGeminiCliProviderBuildCommand:
             provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
             command = provider._build_gemini_command()
 
-        assert command == "'gemini' '--yolo' '--sandbox' 'false'"
+        assert command == "& 'gemini' '--yolo' '--sandbox' 'false'"
         import json
 
         settings = json.loads((settings_dir / "settings.json").read_text())
@@ -872,7 +872,7 @@ class TestGeminiCliProviderBuildCommand:
             command = provider._build_gemini_command()
 
         # Command should be plain gemini launch (no && chaining)
-        assert command == "'gemini' '--yolo' '--sandbox' 'false'"
+        assert command == "& 'gemini' '--yolo' '--sandbox' 'false'"
         assert " && " not in command
         assert len(provider._mcp_server_names) == 2
         # Both servers written to settings.json

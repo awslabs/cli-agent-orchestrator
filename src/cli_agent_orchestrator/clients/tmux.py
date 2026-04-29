@@ -9,7 +9,9 @@ notes.
 
 import logging
 import os
+import re
 import subprocess
+import sys
 import time
 import uuid
 from typing import Dict, List, Optional
@@ -21,13 +23,43 @@ from cli_agent_orchestrator.constants import TMUX_HISTORY_LINES
 logger = logging.getLogger(__name__)
 
 
+# POSIX env-var name rule: [A-Za-z_][A-Za-z0-9_]*
+# Used to filter os.environ before passing -e KEY=VAL to tmux/psmux.
+_POSIX_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
 def pwsh_join(parts: list[str]) -> str:
-    """Join argv into a PowerShell command line.
+    """Join argv into a PowerShell command line that can be invoked.
+
+    Returns a string of the form ``& 'cmd' 'arg1' 'arg2' …`` so the result
+    is unconditionally invocable in PowerShell.  Without the ``&`` call
+    operator, pwsh treats ``'cmd'`` as a string expression rather than a
+    command name and refuses to execute it (ParserError on the second token).
 
     Each part is wrapped in a PowerShell single-quoted string literal.
     Embedded single quotes are doubled — the escape rule inside '...' in PS.
     """
-    return " ".join("'" + p.replace("'", "''") + "'" for p in parts)
+    quoted = " ".join("'" + p.replace("'", "''") + "'" for p in parts)
+    return f"& {quoted}"
+
+
+# PSReadLine handler that skips every subsequent input line from being added
+# to the per-user history file (~ConsoleHost_history.txt).  Sent once per
+# pwsh prompt so CAO-injected warm-ups and agent launch commands don't
+# pollute the user's interactive history.  The setter line itself is logged
+# (handler change applies to the NEXT line, not the line that sets it).
+_PWSH_HISTORY_GUARD = "Set-PSReadLineOption -AddToHistoryHandler { 'SkipAdding' }"
+
+
+def disable_pwsh_history(tmux_client: "TmuxClient", session_name: str, window_name: str) -> None:
+    """Configure the pwsh prompt in the given window to skip history-adding.
+
+    No-op on non-Windows platforms.  Must be called when a live pwsh prompt
+    is ready in the target window — typically right after wait_for_shell.
+    """
+    if sys.platform != "win32":
+        return
+    tmux_client.send_keys(session_name, window_name, _PWSH_HISTORY_GUARD)
 
 
 class TmuxClient:
@@ -136,7 +168,9 @@ class TmuxClient:
 
     def _run(self, *args: str, check: bool = False) -> subprocess.CompletedProcess:
         """Run a tmux subcommand, capturing stdout/stderr as text."""
-        return subprocess.run(["tmux", *args], capture_output=True, text=True, check=check)
+        return subprocess.run(
+            ["tmux", *args], capture_output=True, text=True, encoding="utf-8", check=check
+        )
 
     def _session_exists_raw(self, session_name: str) -> bool:
         """Return True if a tmux session with the given name exists."""
@@ -179,6 +213,17 @@ class TmuxClient:
             }
             environment["CAO_TERMINAL_ID"] = terminal_id
 
+            # Drop env names that violate POSIX rules. Windows os.environ contains
+            # entries like PROGRAMFILES(X86) and ASL.LOG that tmux/psmux reject with
+            # "invalid -e: invalid environment variable name".
+            environment = {k: v for k, v in environment.items() if _POSIX_ENV_NAME.match(k)}
+
+            # psmux-workaround: psmux 3.3.4 misparses Windows argv when an env value
+            # ends in `\` and contains spaces — silently swallows subsequent -e flags
+            # (psmux/psmux issue: argv parser drops -e args after backslash+spaces).
+            # Strip trailing backslashes; lossless for path-like values on Windows.
+            environment = {k: v.rstrip("\\") for k, v in environment.items()}
+
             # Build the new-session command.  Environment variables are passed
             # via repeated ``-e KEY=VALUE`` args (one pair per flag invocation).
             cmd = [
@@ -191,11 +236,21 @@ class TmuxClient:
             for k, v in environment.items():
                 cmd += ["-e", f"{k}={v}"]
 
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
             if result.returncode != 0:
                 raise RuntimeError(
                     f"tmux new-session failed (exit {result.returncode}): {result.stderr.strip()}"
                 )
+
+            # psmux-workaround: psmux 3.3.4 ignores tmux's rule that an explicit
+            # -n NAME implicitly disables automatic-rename for that window.  It
+            # immediately overwrites the name with the active process (e.g. `python`,
+            # `pwsh`), which breaks CAO's (session, window_name) registry lookups.
+            # Disable automatic-rename and re-assert the name right after creation.
+            # No-op on real tmux (which already gets this right).
+            # Filed upstream: psmux/psmux — "automatic-rename overrides -n NAME".
+            self._run("set-window-option", "-t", f"{session_name}:0", "automatic-rename", "off")
+            self._run("rename-window", "-t", f"{session_name}:0", window_name)
 
             logger.info(
                 f"Created tmux session: {session_name} with window: {window_name}"
@@ -233,11 +288,22 @@ class TmuxClient:
                 "-e", f"CAO_TERMINAL_ID={terminal_id}",
             ]
 
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
             if result.returncode != 0:
                 raise RuntimeError(
                     f"tmux new-window failed (exit {result.returncode}): {result.stderr.strip()}"
                 )
+
+            # psmux-workaround: psmux 3.3.4 ignores tmux's rule that an explicit
+            # -n NAME implicitly disables automatic-rename for that window.  It
+            # immediately overwrites the name with the active process (e.g. `python`,
+            # `pwsh`), which breaks CAO's (session, window_name) registry lookups.
+            # Target the new window via `:^` (last window in the session) — new-window
+            # always appends, so the last entry is the one we just created.
+            # No-op on real tmux (which already gets this right).
+            # Filed upstream: psmux/psmux — "automatic-rename overrides -n NAME".
+            self._run("set-window-option", "-t", f"{session_name}:^", "automatic-rename", "off")
+            self._run("rename-window", "-t", f"{session_name}:^", window_name)
 
             # Retrieve the actual window name
             lw = self._run("list-windows", "-t", session_name, "-F", "#{window_name}")
@@ -278,41 +344,67 @@ class TmuxClient:
                 requiring 2 Enters to submit.
         """
         target = f"{session_name}:{window_name}"
-        buf_name = f"cao_{uuid.uuid4().hex[:8]}"
-        try:
-            logger.info(f"send_keys: {target} - keys: {keys}")
-            subprocess.run(
-                ["tmux", "load-buffer", "-b", buf_name, "-"],
-                input=keys.encode(),
-                check=True,
-            )
-            subprocess.run(
-                ["tmux", "paste-buffer", "-p", "-b", buf_name, "-t", target],
-                check=True,
-            )
-            # Brief delay to let the TUI process the bracketed paste end sequence
-            # before sending Enter. Without this, some TUIs (e.g., Claude Code 2.x)
-            # swallow the Enter that immediately follows paste-buffer -p.
-            time.sleep(0.3)
-            for i in range(enter_count):
-                if i > 0:
-                    # Delay between Enter presses for TUIs that need time to
-                    # process the previous Enter (e.g., Ink adding a newline)
-                    # before the next Enter triggers form submission.
-                    time.sleep(0.5)
+        logger.info(f"send_keys: {target} - keys: {keys}")
+        if sys.platform == "win32":
+            # psmux-workaround: paste-buffer is broken on psmux as of 3.3.4 — the
+            # buffer is stored correctly but never delivered to the pane. Use
+            # send-keys -l (literal) as a fallback. Remove once psmux/psmux#264
+            # is fixed and a binary release is available.
+            try:
                 subprocess.run(
-                    ["tmux", "send-keys", "-t", target, "Enter"],
+                    ["tmux", "send-keys", "-t", target, "-l", keys],
                     check=True,
                 )
-            logger.debug(f"Sent keys to {target}")
-        except Exception as e:
-            logger.error(f"Failed to send keys to {target}: {e}")
-            raise
-        finally:
-            subprocess.run(
-                ["tmux", "delete-buffer", "-b", buf_name],
-                check=False,
-            )
+                time.sleep(0.3)
+                for i in range(enter_count):
+                    if i > 0:
+                        # Delay between Enter presses for TUIs that need time to
+                        # process the previous Enter (e.g., Ink adding a newline)
+                        # before the next Enter triggers form submission.
+                        time.sleep(0.5)
+                    subprocess.run(
+                        ["tmux", "send-keys", "-t", target, "Enter"],
+                        check=True,
+                    )
+                logger.debug(f"Sent keys to {target}")
+            except Exception as e:
+                logger.error(f"Failed to send keys to {target}: {e}")
+                raise
+        else:
+            buf_name = f"cao_{uuid.uuid4().hex[:8]}"
+            try:
+                subprocess.run(
+                    ["tmux", "load-buffer", "-b", buf_name, "-"],
+                    input=keys.encode(),
+                    check=True,
+                )
+                subprocess.run(
+                    ["tmux", "paste-buffer", "-p", "-b", buf_name, "-t", target],
+                    check=True,
+                )
+                # Brief delay to let the TUI process the bracketed paste end sequence
+                # before sending Enter. Without this, some TUIs (e.g., Claude Code 2.x)
+                # swallow the Enter that immediately follows paste-buffer -p.
+                time.sleep(0.3)
+                for i in range(enter_count):
+                    if i > 0:
+                        # Delay between Enter presses for TUIs that need time to
+                        # process the previous Enter (e.g., Ink adding a newline)
+                        # before the next Enter triggers form submission.
+                        time.sleep(0.5)
+                    subprocess.run(
+                        ["tmux", "send-keys", "-t", target, "Enter"],
+                        check=True,
+                    )
+                logger.debug(f"Sent keys to {target}")
+            except Exception as e:
+                logger.error(f"Failed to send keys to {target}: {e}")
+                raise
+            finally:
+                subprocess.run(
+                    ["tmux", "delete-buffer", "-b", buf_name],
+                    check=False,
+                )
 
     def send_keys_via_paste(self, session_name: str, window_name: str, text: str) -> None:
         """Send text to window via tmux paste buffer with bracketed paste mode.
@@ -342,32 +434,51 @@ class TmuxClient:
                 raise ValueError(f"Window '{window_name}' not found in session '{session_name}'")
 
             target = f"{session_name}:{window_name}"
-            buf_name = f"cao_{uuid.uuid4().hex}"
 
-            # Load text into tmux buffer
-            subprocess.run(
-                ["tmux", "set-buffer", "-b", buf_name, text],
-                check=True,
-            )
+            if sys.platform == "win32":
+                # psmux-workaround: paste-buffer is broken on psmux as of 3.3.4 — the
+                # buffer is stored correctly but never delivered to the pane. Use
+                # send-keys -l (literal) as a fallback. Remove once psmux/psmux#264
+                # is fixed and a binary release is available.
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", target, "-l", text],
+                    check=True,
+                )
 
-            # Paste with bracketed paste mode (-p flag).
-            # This wraps the text in \x1b[200~ ... \x1b[201~ escape sequences,
-            # telling the TUI "this is pasted text" so it bypasses hotkey handling.
-            subprocess.run(
-                ["tmux", "paste-buffer", "-p", "-b", buf_name, "-t", target],
-                check=True,
-            )
+                time.sleep(0.3)
 
-            time.sleep(0.3)
+                # Send Enter to submit the pasted text
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", target, "C-m"],
+                    check=True,
+                )
+            else:
+                buf_name = f"cao_{uuid.uuid4().hex}"
 
-            # Send Enter to submit the pasted text
-            subprocess.run(
-                ["tmux", "send-keys", "-t", target, "C-m"],
-                check=True,
-            )
+                # Load text into tmux buffer
+                subprocess.run(
+                    ["tmux", "set-buffer", "-b", buf_name, text],
+                    check=True,
+                )
 
-            # Clean up the paste buffer
-            subprocess.run(["tmux", "delete-buffer", "-b", buf_name], check=False)
+                # Paste with bracketed paste mode (-p flag).
+                # This wraps the text in \x1b[200~ ... \x1b[201~ escape sequences,
+                # telling the TUI "this is pasted text" so it bypasses hotkey handling.
+                subprocess.run(
+                    ["tmux", "paste-buffer", "-p", "-b", buf_name, "-t", target],
+                    check=True,
+                )
+
+                time.sleep(0.3)
+
+                # Send Enter to submit the pasted text
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", target, "C-m"],
+                    check=True,
+                )
+
+                # Clean up the paste buffer
+                subprocess.run(["tmux", "delete-buffer", "-b", buf_name], check=False)
 
             logger.debug(f"Sent text via paste to {session_name}:{window_name}")
         except Exception as e:

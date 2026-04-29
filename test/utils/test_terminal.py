@@ -101,6 +101,49 @@ class TestWaitForShell:
 
         assert result is False
 
+    def test_wait_for_shell_disables_pwsh_history_on_windows(self):
+        """On Windows, success path sends the PSReadLine SkipAdding setter."""
+        mock_tmux = MagicMock()
+        mock_tmux.get_history.side_effect = ["prompt >", "prompt >"]
+
+        with patch("cli_agent_orchestrator.clients.tmux.sys.platform", "win32"):
+            result = wait_for_shell(
+                mock_tmux, "test-session", "window-0", timeout=2.0, polling_interval=0.1
+            )
+
+        assert result is True
+        mock_tmux.send_keys.assert_called_once_with(
+            "test-session",
+            "window-0",
+            "Set-PSReadLineOption -AddToHistoryHandler { 'SkipAdding' }",
+        )
+
+    def test_wait_for_shell_no_pwsh_history_call_on_unix(self):
+        """On non-Windows, the success path does not send the PSReadLine setter."""
+        mock_tmux = MagicMock()
+        mock_tmux.get_history.side_effect = ["prompt $", "prompt $"]
+
+        with patch("cli_agent_orchestrator.clients.tmux.sys.platform", "linux"):
+            result = wait_for_shell(
+                mock_tmux, "test-session", "window-0", timeout=2.0, polling_interval=0.1
+            )
+
+        assert result is True
+        mock_tmux.send_keys.assert_not_called()
+
+    def test_wait_for_shell_no_pwsh_history_call_on_timeout(self):
+        """Timeout path must not send the PSReadLine setter — no live prompt assumed."""
+        mock_tmux = MagicMock()
+        mock_tmux.get_history.return_value = ""
+
+        with patch("cli_agent_orchestrator.clients.tmux.sys.platform", "win32"):
+            result = wait_for_shell(
+                mock_tmux, "test-session", "window-0", timeout=0.5, polling_interval=0.1
+            )
+
+        assert result is False
+        mock_tmux.send_keys.assert_not_called()
+
 
 class TestWaitUntilStatus:
     """Tests for wait_until_status function."""
