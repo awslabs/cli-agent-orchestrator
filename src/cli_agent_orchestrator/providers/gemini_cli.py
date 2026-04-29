@@ -33,11 +33,12 @@ import os
 import re
 import shlex
 import shutil
+import sys
 import time
 from pathlib import Path
 from typing import Optional
 
-from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.clients.tmux import pwsh_join, tmux_client
 from cli_agent_orchestrator.constants import GEMINI_WORKSPACES_DIR
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
@@ -321,11 +322,14 @@ class GeminiCliProvider(BaseProvider):
         if self._allowed_tools and "*" not in self._allowed_tools:
             self._write_policy_deny_rules()
 
-        launch = shlex.join(command_parts)
+        launch = pwsh_join(command_parts) if sys.platform == "win32" else shlex.join(command_parts)
         if self._gemini_workspace is not None:
             # `cd` into the isolated workspace so Gemini's hierarchical GEMINI.md
-            # lookup picks up the per-terminal file first. Use `&&` so a failed
-            # cd aborts rather than launching gemini in an unexpected directory.
+            # lookup picks up the per-terminal file first. Use a platform-native
+            # directory change so launch still works under PowerShell on Windows.
+            if sys.platform == "win32":
+                ps_workspace = str(self._gemini_workspace).replace("'", "''")
+                return f"Set-Location '{ps_workspace}'; {launch}"
             return f"cd {shlex.quote(str(self._gemini_workspace))} && {launch}"
         return launch
 

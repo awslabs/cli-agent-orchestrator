@@ -10,6 +10,15 @@ import pytest
 from cli_agent_orchestrator.clients.tmux import TmuxClient
 
 
+def _completed(stdout: str = "", returncode: int = 0, stderr: str = "") -> MagicMock:
+    """Build a mock subprocess.CompletedProcess."""
+    m = MagicMock()
+    m.stdout = stdout
+    m.returncode = returncode
+    m.stderr = stderr
+    return m
+
+
 class TestTmuxClientWorkingDirectory:
     """Test TMux client working directory functionality."""
 
@@ -59,54 +68,51 @@ class TestTmuxClientWorkingDirectory:
         with pytest.raises(ValueError, match="Working directory does not exist"):
             client._resolve_and_validate_working_directory(fake_path)
 
-    def test_get_pane_working_directory_success(self):
+    @patch("cli_agent_orchestrator.clients.tmux.subprocess")
+    def test_get_pane_working_directory_success(self, mock_sp):
         """Test successful working directory retrieval."""
-        # Setup mocks (use the fixture's mock_server)
-        mock_session = Mock()
-        mock_window = Mock()
-        mock_pane = Mock()
-
-        self.mock_server.sessions.get.return_value = mock_session
-        mock_session.windows.get.return_value = mock_window
-        type(mock_window).active_pane = PropertyMock(return_value=mock_pane)
-
-        # Mock pane.cmd() to return working directory
-        mock_result = Mock()
-        mock_result.stdout = ["/home/user/project"]
-        mock_pane.cmd.return_value = mock_result
+        mock_sp.run.side_effect = [
+            _completed("", returncode=0),                       # has-session
+            _completed("test-window\n", returncode=0),          # list-windows
+            _completed("/home/user/project\n", returncode=0),   # display-message
+        ]
 
         client = TmuxClient()
         result = client.get_pane_working_directory("test-session", "test-window")
 
         assert result == "/home/user/project"
-        mock_pane.cmd.assert_called_once_with("display-message", "-p", "#{pane_current_path}")
+        # display-message call uses #{pane_current_path} format
+        dm_call = mock_sp.run.call_args_list[2]
+        assert "display-message" in dm_call[0][0]
+        assert "#{pane_current_path}" in dm_call[0][0]
 
-    def test_get_pane_working_directory_session_not_found(self):
+    @patch("cli_agent_orchestrator.clients.tmux.subprocess")
+    def test_get_pane_working_directory_session_not_found(self, mock_sp):
         """Test returns None when session not found."""
-        self.mock_server.sessions.get.return_value = None
+        mock_sp.run.return_value = _completed("", returncode=1)  # has-session fails
 
         client = TmuxClient()
         result = client.get_pane_working_directory("nonexistent", "window")
 
         assert result is None
 
-    def test_get_pane_working_directory_handles_exception(self):
+    @patch("cli_agent_orchestrator.clients.tmux.subprocess")
+    def test_get_pane_working_directory_handles_exception(self, mock_sp):
         """Test exception handling returns None."""
-        self.mock_server.sessions.get.side_effect = Exception("Connection error")
+        mock_sp.run.side_effect = Exception("Connection error")
 
         client = TmuxClient()
         result = client.get_pane_working_directory("session", "window")
 
         assert result is None
 
-    def test_create_session_with_working_directory(self):
+    @patch("cli_agent_orchestrator.clients.tmux.subprocess")
+    def test_create_session_with_working_directory(self, mock_sp):
         """Test create_session passes working_directory to tmux."""
-        mock_session = Mock()
-        mock_window = Mock()
-        mock_window.name = "test-window"
-        mock_session.windows = [mock_window]
-
-        self.mock_server.new_session.return_value = mock_session
+        mock_sp.run.side_effect = [
+            _completed("", returncode=0),              # new-session
+            _completed("test-window\n", returncode=0), # list-windows
+        ]
 
         client = TmuxClient()
         with patch("os.path.isdir", return_value=True):
@@ -116,18 +122,19 @@ class TestTmuxClientWorkingDirectory:
                 )
 
         assert result == "test-window"
-        self.mock_server.new_session.assert_called_once()
-        call_args = self.mock_server.new_session.call_args
-        assert call_args[1]["start_directory"] == "/home/user/test/dir"
+        # new-session call should include -c and the working directory
+        ns_call = mock_sp.run.call_args_list[0]
+        cmd = ns_call[0][0]
+        assert "-c" in cmd
+        assert "/home/user/test/dir" in cmd
 
-    def test_create_session_defaults_working_directory(self):
-        """Test create_session with None working_directory."""
-        mock_session = Mock()
-        mock_window = Mock()
-        mock_window.name = "test-window"
-        mock_session.windows = [mock_window]
-
-        self.mock_server.new_session.return_value = mock_session
+    @patch("cli_agent_orchestrator.clients.tmux.subprocess")
+    def test_create_session_defaults_working_directory(self, mock_sp):
+        """Test create_session with None working_directory uses cwd."""
+        mock_sp.run.side_effect = [
+            _completed("", returncode=0),              # new-session
+            _completed("test-window\n", returncode=0), # list-windows
+        ]
 
         client = TmuxClient()
         with patch("os.getcwd", return_value="/home/user/project"):
@@ -138,18 +145,18 @@ class TestTmuxClientWorkingDirectory:
                     )
 
         assert result == "test-window"
-        self.mock_server.new_session.assert_called_once()
-        call_args = self.mock_server.new_session.call_args
-        assert call_args[1]["start_directory"] == "/home/user/project"
+        ns_call = mock_sp.run.call_args_list[0]
+        cmd = ns_call[0][0]
+        assert "-c" in cmd
+        assert "/home/user/project" in cmd
 
-    def test_create_session_expands_tilde_in_working_directory(self):
+    @patch("cli_agent_orchestrator.clients.tmux.subprocess")
+    def test_create_session_expands_tilde_in_working_directory(self, mock_sp):
         """Test create_session expands ~ to home directory for remote clients."""
-        mock_session = Mock()
-        mock_window = Mock()
-        mock_window.name = "test-window"
-        mock_session.windows = [mock_window]
-
-        self.mock_server.new_session.return_value = mock_session
+        mock_sp.run.side_effect = [
+            _completed("", returncode=0),              # new-session
+            _completed("test-window\n", returncode=0), # list-windows
+        ]
 
         client = TmuxClient()
         with patch("os.path.expanduser", return_value="/home/user/q/my-project"):
@@ -160,17 +167,18 @@ class TestTmuxClientWorkingDirectory:
                     )
 
         assert result == "test-window"
-        call_args = self.mock_server.new_session.call_args
-        assert call_args[1]["start_directory"] == "/home/user/q/my-project"
+        ns_call = mock_sp.run.call_args_list[0]
+        cmd = ns_call[0][0]
+        assert "/home/user/q/my-project" in cmd
 
-    def test_create_window_with_working_directory(self):
+    @patch("cli_agent_orchestrator.clients.tmux.subprocess")
+    def test_create_window_with_working_directory(self, mock_sp):
         """Test create_window passes working_directory to tmux."""
-        mock_session = Mock()
-        mock_window = Mock()
-        mock_window.name = "test-window"
-
-        self.mock_server.sessions.get.return_value = mock_session
-        mock_session.new_window.return_value = mock_window
+        mock_sp.run.side_effect = [
+            _completed("", returncode=0),              # has-session
+            _completed("", returncode=0),              # new-window
+            _completed("test-window\n", returncode=0), # list-windows
+        ]
 
         client = TmuxClient()
         with patch("os.path.isdir", return_value=True):
@@ -180,9 +188,11 @@ class TestTmuxClientWorkingDirectory:
                 )
 
         assert result == "test-window"
-        mock_session.new_window.assert_called_once()
-        call_args = mock_session.new_window.call_args
-        assert call_args[1]["start_directory"] == "/home/user/test/dir"
+        # new-window call should include -c and the working directory
+        nw_call = mock_sp.run.call_args_list[1]
+        cmd = nw_call[0][0]
+        assert "-c" in cmd
+        assert "/home/user/test/dir" in cmd
 
     def test_resolve_home_directory_itself(self):
         """Test that home directory itself is allowed."""
@@ -288,30 +298,27 @@ class TestTmuxClientWorkingDirectory:
         # Both resolve to the real path
         assert result == str(project_dir.resolve())
 
-    def test_get_pane_working_directory_window_not_found(self):
+    @patch("cli_agent_orchestrator.clients.tmux.subprocess")
+    def test_get_pane_working_directory_window_not_found(self, mock_sp):
         """Test returns None when window not found."""
-        mock_session = Mock()
-        self.mock_server.sessions.get.return_value = mock_session
-        mock_session.windows.get.return_value = None
+        mock_sp.run.side_effect = [
+            _completed("", returncode=0),           # has-session
+            _completed("other\n", returncode=0),    # list-windows (different window)
+        ]
 
         client = TmuxClient()
         result = client.get_pane_working_directory("test-session", "nonexistent-window")
 
         assert result is None
 
-    def test_get_pane_working_directory_no_stdout(self):
-        """Test returns None when pane.cmd returns no stdout."""
-        mock_session = Mock()
-        mock_window = Mock()
-        mock_pane = Mock()
-
-        self.mock_server.sessions.get.return_value = mock_session
-        mock_session.windows.get.return_value = mock_window
-        type(mock_window).active_pane = PropertyMock(return_value=mock_pane)
-
-        mock_result = Mock()
-        mock_result.stdout = []
-        mock_pane.cmd.return_value = mock_result
+    @patch("cli_agent_orchestrator.clients.tmux.subprocess")
+    def test_get_pane_working_directory_no_stdout(self, mock_sp):
+        """Test returns None when display-message returns empty stdout."""
+        mock_sp.run.side_effect = [
+            _completed("", returncode=0),              # has-session
+            _completed("test-window\n", returncode=0), # list-windows
+            _completed("", returncode=0),              # display-message (empty)
+        ]
 
         client = TmuxClient()
         result = client.get_pane_working_directory("test-session", "test-window")

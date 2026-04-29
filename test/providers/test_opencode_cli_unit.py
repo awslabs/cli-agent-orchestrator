@@ -1,6 +1,7 @@
 """Unit tests for the OpenCode CLI provider."""
 
 import re
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
@@ -420,12 +421,13 @@ class TestInitialize:
         provider = make_provider()
         provider.initialize()
         sent_cmd = mock_tmux.send_keys.call_args[0][2]
-        assert "OPENCODE_DISABLE_AUTOUPDATE=1" in sent_cmd
-        assert "OPENCODE_DISABLE_MOUSE=1" in sent_cmd
-        assert "OPENCODE_CLIENT=cao" in sent_cmd
-        assert "TERM=xterm-256color" in sent_cmd
-        assert "OPENCODE_CONFIG=" in sent_cmd
-        assert "OPENCODE_CONFIG_DIR=" in sent_cmd
+        # Platform-agnostic: POSIX uses KEY=VAL prefix; PowerShell uses $env:KEY = 'VAL'
+        assert "OPENCODE_DISABLE_AUTOUPDATE" in sent_cmd
+        assert "OPENCODE_DISABLE_MOUSE" in sent_cmd
+        assert "OPENCODE_CLIENT" in sent_cmd
+        assert "xterm-256color" in sent_cmd
+        assert "OPENCODE_CONFIG" in sent_cmd
+        assert "OPENCODE_CONFIG_DIR" in sent_cmd
 
 
 # ---------------------------------------------------------------------------

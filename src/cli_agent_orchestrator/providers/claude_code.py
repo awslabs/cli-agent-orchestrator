@@ -5,6 +5,7 @@ import logging
 import re
 import shlex
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -138,9 +139,13 @@ class ClaudeCodeProvider(BaseProvider):
         # When cao-server runs inside a Claude Code session, CLAUDE* env vars
         # leak into spawned tmux panes (via the tmux server's global env).
         # Claude Code detects these and refuses to start ("nested session").
-        # Unset all matching vars except CLAUDE_CODE_USE_* and
-        # CLAUDE_CODE_SKIP_*_AUTH (needed for provider authentication:
-        # Bedrock, Vertex AI, Foundry).
+        #
+        # On Unix: unset them with a POSIX shell one-liner before exec.
+        # On Windows: psmux already filters CLAUDE* vars at session-creation
+        # time (create_session builds environment without them), so no shell
+        # unset is needed — just return the command string directly.
+        if sys.platform == "win32":
+            return claude_cmd
         unset_cmd = (
             "unset $(env | sed -n 's/^\\(CLAUDE[A-Z_]*\\)=.*/\\1/p'"
             " | grep -v -E 'CLAUDE_CODE_USE_(BEDROCK|VERTEX|FOUNDRY)"
@@ -217,11 +222,7 @@ class ClaudeCodeProvider(BaseProvider):
             # 2) Handle workspace trust prompt
             if re.search(TRUST_PROMPT_PATTERN, clean_output):
                 logger.info("Workspace trust prompt detected, auto-accepting")
-                session = tmux_client.server.sessions.get(session_name=self.session_name)
-                window = session.windows.get(window_name=self.window_name)
-                pane = window.active_pane
-                if pane:
-                    pane.send_keys("", enter=True)
+                tmux_client.send_keys(self.session_name, self.window_name, "")
                 return
 
             # 3) Claude Code fully started — no prompts needed
