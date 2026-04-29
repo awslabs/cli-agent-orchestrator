@@ -74,6 +74,14 @@ TUI_CREDITS_PATTERN = r"▸\s*Credits:\s*[\d.]+"
 # TUI processing indicator: ghost text shown while agent is working
 TUI_PROCESSING_PATTERN = r"Kiro is working"
 
+# TUI initialization indicator: shown during startup before chat is ready.
+# Kiro TUI renders the idle prompt placeholder ("Ask a question or describe
+# a task") *before* the "● Initializing..." phase completes, which caused a
+# premature IDLE verdict. "Initializing..." is cleared by Kiro once startup
+# finishes, so its presence unconditionally means PROCESSING (unlike the
+# "Kiro is working" ghost text, which can linger as stale after a redraw).
+TUI_INITIALIZING_PATTERN = r"Initializing\.\.\."
+
 # TUI permission prompt: shown instead of legacy [y/n/t] format.
 # Requires all three options together to avoid false positives on "Yes"/"No" in agent output.
 TUI_PERMISSION_PATTERN = r"Yes\s+No\s+Always [Aa]llow"
@@ -267,6 +275,15 @@ class KiroCliProvider(BaseProvider):
         # Strip ANSI codes once for all pattern matching
         # This simplifies regex patterns and improves reliability
         clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
+
+        # Check 0: TUI startup — the new TUI renders the idle-prompt
+        # placeholder ("Ask a question or describe a task") before the
+        # "● Initializing..." phase completes, so a naive idle match would
+        # declare IDLE ~1s into launch and the first user message would be
+        # dropped. "Initializing..." is always cleared once init finishes, so
+        # its presence unconditionally means PROCESSING.
+        if re.search(TUI_INITIALIZING_PATTERN, clean_output):
+            return TerminalStatus.PROCESSING
 
         # Check 1: Detect idle prompts early — required for the position-aware
         # processing check below.
