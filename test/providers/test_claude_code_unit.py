@@ -145,11 +145,15 @@ class TestClaudeCodeProviderInitialization:
         assert result is True
 
     @_PATCH_SETTINGS
+    @patch("cli_agent_orchestrator.providers.claude_code.sys")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_initialize_sends_claude_command(self, mock_tmux, mock_wait_status, mock_wait_shell, _):
-        """Test that initialize sends the 'claude' command to tmux."""
+    def test_initialize_sends_claude_command(
+        self, mock_tmux, mock_wait_status, mock_wait_shell, mock_sys, _
+    ):
+        """Test that initialize sends the 'claude' command to tmux (Linux path)."""
+        mock_sys.platform = "linux"
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
         mock_tmux.get_history.side_effect = [
@@ -555,8 +559,10 @@ class TestClaudeCodeProviderMisc:
 
         assert provider._initialized is False
 
-    def test_build_claude_command_no_profile(self):
-        """Test building Claude command without profile."""
+    @patch("cli_agent_orchestrator.providers.claude_code.sys")
+    def test_build_claude_command_no_profile(self, mock_sys):
+        """Test building Claude command without profile (Linux path)."""
+        mock_sys.platform = "linux"
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         command = provider._build_claude_command()
 
@@ -577,9 +583,11 @@ class TestClaudeCodeProviderMisc:
         assert "claude" in command
         assert "--append-system-prompt" in command
 
+    @patch("cli_agent_orchestrator.providers.claude_code.sys")
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
-    def test_build_command_mcp_injects_terminal_id(self, mock_load):
-        """Test that _build_claude_command injects CAO_TERMINAL_ID into MCP server env."""
+    def test_build_command_mcp_injects_terminal_id(self, mock_load, mock_sys):
+        """Test that _build_claude_command injects CAO_TERMINAL_ID into MCP server env (Linux path)."""
+        mock_sys.platform = "linux"
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.system_prompt = None
@@ -602,9 +610,11 @@ class TestClaudeCodeProviderMisc:
         server_env = mcp_data["mcpServers"]["cao-mcp-server"]["env"]
         assert server_env["CAO_TERMINAL_ID"] == "term-42"
 
+    @patch("cli_agent_orchestrator.providers.claude_code.sys")
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
-    def test_build_command_mcp_preserves_existing_env(self, mock_load):
-        """Test that existing env vars in MCP config are preserved when injecting CAO_TERMINAL_ID."""
+    def test_build_command_mcp_preserves_existing_env(self, mock_load, mock_sys):
+        """Test that existing env vars in MCP config are preserved when injecting CAO_TERMINAL_ID (Linux path)."""
+        mock_sys.platform = "linux"
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.system_prompt = None
@@ -631,9 +641,11 @@ class TestClaudeCodeProviderMisc:
         # CAO_TERMINAL_ID added
         assert server_env["CAO_TERMINAL_ID"] == "term-99"
 
+    @patch("cli_agent_orchestrator.providers.claude_code.sys")
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
-    def test_build_command_mcp_does_not_override_existing_terminal_id(self, mock_load):
-        """Test that an existing CAO_TERMINAL_ID in MCP env is NOT overwritten."""
+    def test_build_command_mcp_does_not_override_existing_terminal_id(self, mock_load, mock_sys):
+        """Test that an existing CAO_TERMINAL_ID in MCP env is NOT overwritten (Linux path)."""
+        mock_sys.platform = "linux"
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.system_prompt = None
@@ -661,8 +673,10 @@ class TestClaudeCodeProviderMisc:
 class TestClaudeCodeProviderModelFlag:
     """Tests that profile.model is forwarded to Claude Code via --model."""
 
+    @patch("cli_agent_orchestrator.providers.claude_code.sys")
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
-    def test_build_command_appends_model_when_set(self, mock_load):
+    def test_build_command_appends_model_when_set(self, mock_load, mock_sys):
+        mock_sys.platform = "linux"
         mock_profile = MagicMock()
         mock_profile.model = "sonnet"
         mock_profile.system_prompt = None
@@ -686,6 +700,55 @@ class TestClaudeCodeProviderModelFlag:
         command = provider._build_claude_command()
 
         assert "--model" not in command
+
+
+class TestBuildClaudeCommandWindows:
+    """Tests for _build_claude_command on Windows (pwsh_join escaping)."""
+
+    @patch("cli_agent_orchestrator.providers.claude_code.sys")
+    def test_windows_uses_pwsh_join_no_bash_escapes(self, mock_sys):
+        """On Windows, _build_claude_command returns pwsh_join output.
+
+        Verifies that the POSIX bash escape sequence '"'"' does NOT appear
+        and that PowerShell single-quote doubling is used instead.
+        The apostrophe in the system prompt is the canary — bash escaping
+        would produce '"'"' sequences; pwsh_join doubles it to ''.
+        """
+        mock_sys.platform = "win32"
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        command = provider._build_claude_command()
+
+        # pwsh_join prefixes & and wraps each token in single quotes
+        assert command.startswith("& 'claude'")
+        # No unset prefix on Windows
+        assert "unset" not in command
+        # No bash-style POSIX escapes
+        assert "'\"'\"'" not in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.sys")
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_windows_apostrophe_in_prompt_uses_doubled_quote(self, mock_load, mock_sys):
+        """Apostrophe in system prompt is doubled ('') in pwsh_join output, not bash-escaped.
+
+        This is the live-reproduced bug: shlex.join produced '"'"' sequences that
+        PowerShell partially recovered but leaked a stray ' as the first TUI input.
+        """
+        mock_sys.platform = "win32"
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = "skill's content"
+        mock_profile.mcpServers = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0", "test-agent")
+        command = provider._build_claude_command()
+
+        # pwsh_join doubles the apostrophe inside '...' strings
+        assert "''" in command
+        # bash-style escape must NOT appear
+        assert "'\"'\"'" not in command
+        # The literal content survives (doubled quote inside single-quoted string)
+        assert "skill''s content" in command
 
 
 class TestClaudeCodeProviderStartupPrompts:

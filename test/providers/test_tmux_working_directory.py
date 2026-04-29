@@ -111,6 +111,8 @@ class TestTmuxClientWorkingDirectory:
         """Test create_session passes working_directory to tmux."""
         mock_sp.run.side_effect = [
             _completed("", returncode=0),              # new-session
+            _completed("", returncode=0),              # set-window-option (psmux-workaround)
+            _completed("", returncode=0),              # rename-window (psmux-workaround)
             _completed("test-window\n", returncode=0), # list-windows
         ]
 
@@ -133,6 +135,8 @@ class TestTmuxClientWorkingDirectory:
         """Test create_session with None working_directory uses cwd."""
         mock_sp.run.side_effect = [
             _completed("", returncode=0),              # new-session
+            _completed("", returncode=0),              # set-window-option (psmux-workaround)
+            _completed("", returncode=0),              # rename-window (psmux-workaround)
             _completed("test-window\n", returncode=0), # list-windows
         ]
 
@@ -155,6 +159,8 @@ class TestTmuxClientWorkingDirectory:
         """Test create_session expands ~ to home directory for remote clients."""
         mock_sp.run.side_effect = [
             _completed("", returncode=0),              # new-session
+            _completed("", returncode=0),              # set-window-option (psmux-workaround)
+            _completed("", returncode=0),              # rename-window (psmux-workaround)
             _completed("test-window\n", returncode=0), # list-windows
         ]
 
@@ -177,6 +183,8 @@ class TestTmuxClientWorkingDirectory:
         mock_sp.run.side_effect = [
             _completed("", returncode=0),              # has-session
             _completed("", returncode=0),              # new-window
+            _completed("", returncode=0),              # set-window-option (psmux-workaround)
+            _completed("", returncode=0),              # rename-window (psmux-workaround)
             _completed("test-window\n", returncode=0), # list-windows
         ]
 
