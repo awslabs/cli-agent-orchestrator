@@ -1,5 +1,7 @@
 # CLI Agent Orchestrator
 
+[![PyPI version](https://img.shields.io/pypi/v/cli-agent-orchestrator.svg)](https://pypi.org/project/cli-agent-orchestrator/)
+[![Python versions](https://img.shields.io/pypi/pyversions/cli-agent-orchestrator.svg)](https://pypi.org/project/cli-agent-orchestrator/)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/awslabs/cli-agent-orchestrator)
 
 CLI Agent Orchestrator(CAO, pronounced as "kay-oh"), is a lightweight orchestration system for managing multiple AI agent sessions in tmux terminals. Enables Multi-agent collaboration via MCP server.
@@ -78,6 +80,20 @@ source $HOME/.local/bin/env   # Add uv to PATH (or restart your shell)
 uv tool install git+https://github.com/awslabs/cli-agent-orchestrator.git@main --upgrade
 ```
 
+#### 4.1 Install via PyPI (Optional)
+
+Install the latest release from PyPI:
+
+```bash
+uv tool install cli-agent-orchestrator --upgrade
+```
+
+To pin a specific version:
+
+```bash
+uv tool install cli-agent-orchestrator==2.1.0
+```
+
 ### Development Setup
 
 For local development, clone the repo and install with `uv sync`:
@@ -103,7 +119,7 @@ Before using CAO, install at least one supported CLI agent tool:
 | **Gemini CLI** | [Provider docs](docs/gemini-cli.md) · [Installation](https://github.com/google-gemini/gemini-cli) | Google AI API key |
 | **Kimi CLI** | [Provider docs](docs/kimi-cli.md) · [Installation](https://platform.moonshot.cn/docs/kimi-cli) | Moonshot API key |
 | **GitHub Copilot CLI** | [Provider docs](docs/copilot-cli.md) · [Installation](https://github.com/features/copilot/cli) | GitHub auth |
-| **OpenCode CLI** *(experimental — single-agent only, [#203](https://github.com/awslabs/cli-agent-orchestrator/issues/203))* | [Provider docs](docs/opencode-cli.md) · [Installation](https://opencode.ai) | Per-model API key |
+| **OpenCode CLI** *(experimental — temporary inbox polling fallback for multi-agent callbacks, [#203](https://github.com/awslabs/cli-agent-orchestrator/issues/203))* | [Provider docs](docs/opencode-cli.md) · [Installation](https://opencode.ai) | Per-model API key |
 | **Q CLI** | [Installation](https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/command-line.html) | AWS credentials |
 
 ## Quick Start
@@ -630,6 +646,10 @@ See [SECURITY.md](SECURITY.md) for vulnerability reporting, security scanning, a
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on contributing to this project.
+
+## Releases
+
+CAO publishes to [PyPI](https://pypi.org/project/cli-agent-orchestrator/) via an OIDC-authenticated GitHub Actions pipeline (TestPyPI → smoke test → maintainer-approved prod). See [docs/RELEASING.md](docs/RELEASING.md) for the cut-a-release runbook, one-time setup, and troubleshooting.
 
 ## License
 

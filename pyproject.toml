@@ -1,9 +1,26 @@
 [project]
 name = "cli-agent-orchestrator"
-version = "2.0.0"
+version = "2.1.1"
 description = "CLI Agent Orchestrator"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [
+    { name = "AWS Labs" },
+]
+keywords = ["ai", "agents", "orchestration", "multi-agent", "tmux", "mcp", "cli", "codex", "claude-code", "kiro", "kimi", "gemini"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries",
+]
 dependencies = [
     "fastapi>=0.104.0",
     "fastmcp>=2.14.0",
@@ -26,6 +43,12 @@ dependencies = [
 "cao" = "cli_agent_orchestrator.cli.main:cli"
 "cao-server" = "cli_agent_orchestrator.api.main:main"
 "cao-mcp-server" = "cli_agent_orchestrator.mcp_server.server:main"
+
+[project.urls]
+Homepage = "https://github.com/awslabs/cli-agent-orchestrator"
+Repository = "https://github.com/awslabs/cli-agent-orchestrator"
+Issues = "https://github.com/awslabs/cli-agent-orchestrator/issues"
+Documentation = "https://github.com/awslabs/cli-agent-orchestrator#readme"
 
 [build-system]
 requires = ["hatchling"]
@@ -60,7 +83,7 @@ profile = "black"
 line_length = 100
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "2.1.1"
 strict = true
 warn_return_any = true
 warn_unused_configs = true

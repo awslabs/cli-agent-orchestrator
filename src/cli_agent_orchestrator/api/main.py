@@ -83,6 +83,17 @@ async def flow_daemon():
         await asyncio.sleep(60)
 
 
+async def opencode_inbox_delivery_daemon(registry: PluginRegistry) -> None:
+    """Background task to wake OpenCode inbox delivery for pending messages."""
+    logger.info("OpenCode inbox delivery poller started")
+    while True:
+        await asyncio.sleep(INBOX_POLLING_INTERVAL)
+        try:
+            await asyncio.to_thread(inbox_service.poll_opencode_pending_messages, registry)
+        except Exception:
+            logger.exception("OpenCode inbox delivery poller error")
+
+
 # Response Models
 class TerminalOutputResponse(BaseModel):
     output: str
@@ -138,6 +149,10 @@ async def lifespan(app: FastAPI):
     # Start flow daemon as background task
     daemon_task = asyncio.create_task(flow_daemon())
 
+    # Start temporary OpenCode inbox poller. GH #115 tracks replacing this
+    # provider-specific wakeup path with a unified delivery engine.
+    opencode_inbox_task = asyncio.create_task(opencode_inbox_delivery_daemon(registry))
+
     # Start inbox watcher
     inbox_observer = PollingObserver(timeout=INBOX_POLLING_INTERVAL)
     inbox_observer.schedule(LogFileHandler(registry), str(TERMINAL_LOG_DIR), recursive=False)
@@ -155,6 +170,13 @@ async def lifespan(app: FastAPI):
     daemon_task.cancel()
     try:
         await daemon_task
+    except asyncio.CancelledError:
+        pass
+
+    # Cancel OpenCode inbox poller on shutdown
+    opencode_inbox_task.cancel()
+    try:
+        await opencode_inbox_task
     except asyncio.CancelledError:
         pass
 
@@ -224,6 +246,7 @@ async def list_providers_endpoint() -> List[Dict]:
         "gemini_cli": "gemini",
         "kimi_cli": "kimi",
         "copilot_cli": "copilot",
+        "opencode_cli": "opencode",
     }
     result = []
     for provider, binary in provider_binaries.items():
