@@ -94,7 +94,7 @@ class TestAgentProviders:
 
         assert response.status_code == 200
         data = response.json()
-        assert len(data) == 7
+        assert len(data) == 8
         names = [p["name"] for p in data]
         assert "kiro_cli" in names
         assert "claude_code" in names
@@ -103,6 +103,7 @@ class TestAgentProviders:
         assert "gemini_cli" in names
         assert "kimi_cli" in names
         assert "copilot_cli" in names
+        assert "opencode_cli" in names
         for p in data:
             assert p["installed"] is True
 
@@ -135,6 +136,7 @@ class TestAgentProviders:
         assert providers_dict["gemini_cli"]["installed"] is False
         assert providers_dict["kimi_cli"]["installed"] is False
         assert providers_dict["copilot_cli"]["installed"] is False
+        assert providers_dict["opencode_cli"]["installed"] is False
 
     def test_list_providers_has_binary_field(self, client):
         """Each provider entry has correct binary name."""
@@ -150,6 +152,7 @@ class TestAgentProviders:
         assert providers_dict["gemini_cli"]["binary"] == "gemini"
         assert providers_dict["kimi_cli"]["binary"] == "kimi"
         assert providers_dict["copilot_cli"]["binary"] == "copilot"
+        assert providers_dict["opencode_cli"]["binary"] == "opencode"
 
 
 # ── Skills endpoint ──────────────────────────────────────────────────

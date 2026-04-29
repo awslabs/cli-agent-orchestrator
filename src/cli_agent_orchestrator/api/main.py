@@ -246,6 +246,7 @@ async def list_providers_endpoint() -> List[Dict]:
         "gemini_cli": "gemini",
         "kimi_cli": "kimi",
         "copilot_cli": "copilot",
+        "opencode_cli": "opencode",
     }
     result = []
     for provider, binary in provider_binaries.items():
