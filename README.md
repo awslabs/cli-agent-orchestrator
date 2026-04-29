@@ -1,5 +1,7 @@
 # CLI Agent Orchestrator
 
+[![PyPI version](https://img.shields.io/pypi/v/cli-agent-orchestrator.svg)](https://pypi.org/project/cli-agent-orchestrator/)
+[![Python versions](https://img.shields.io/pypi/pyversions/cli-agent-orchestrator.svg)](https://pypi.org/project/cli-agent-orchestrator/)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/awslabs/cli-agent-orchestrator)
 
 CLI Agent Orchestrator(CAO, pronounced as "kay-oh"), is a lightweight orchestration system for managing multiple AI agent sessions in tmux terminals. Enables Multi-agent collaboration via MCP server.
@@ -76,6 +78,20 @@ source $HOME/.local/bin/env   # Add uv to PATH (or restart your shell)
 
 ```bash
 uv tool install git+https://github.com/awslabs/cli-agent-orchestrator.git@main --upgrade
+```
+
+#### 4.1 Install via PyPI (Optional)
+
+Install the latest release from PyPI:
+
+```bash
+uv tool install cli-agent-orchestrator --upgrade
+```
+
+To pin a specific version:
+
+```bash
+uv tool install cli-agent-orchestrator==2.1.0
 ```
 
 ### Development Setup
