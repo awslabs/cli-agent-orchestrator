@@ -78,6 +78,27 @@ class TestCreateSession:
         with pytest.raises(Exception, match="tmux error"):
             tmux.create_session("ses", "w", "tid1", str(tmp_path))
 
+    def test_create_session_uses_explicit_dimensions(self, tmux, tmp_path):
+        """Guard against regressing the kiro-cli 2.1.x SIGWINCH-repaint bug (#216).
+
+        Default detached pane is 80x24. When the user attaches, tmux resizes
+        the pane to their real terminal size and kiro-cli 2.1.x fails to
+        repaint (blank screen, input silently dropped). Creating the pane at
+        220x50 makes the attach-time resize a no-op or shrink, which kiro
+        handles correctly.
+        """
+        mock_window = MagicMock()
+        mock_window.name = "my-window"
+        mock_session = MagicMock()
+        mock_session.windows = [mock_window]
+        tmux.server.new_session.return_value = mock_session
+
+        tmux.create_session("ses", "my-window", "tid1", str(tmp_path))
+
+        kwargs = tmux.server.new_session.call_args.kwargs
+        assert kwargs.get("x") == 220
+        assert kwargs.get("y") == 50
+
 
 # ── create_window ────────────────────────────────────────────────────
 

@@ -25,6 +25,7 @@ PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
     "gemini_cli",
     "kimi_cli",
     "kiro_cli",
+    "opencode_cli",
 }
 
 
@@ -80,6 +81,7 @@ def launch(
     """Launch cao session with specified agent profile."""
     try:
         display_dir = working_directory or os.path.realpath(os.getcwd())
+        explicit_provider = provider is not None  # True only when --provider was passed
 
         # Resolve allowedTools: --yolo > --allowed-tools CLI > profile/role defaults
         from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -134,6 +136,27 @@ def launch(
                     f"  Agent can execute ANY command (aws, rm, curl, read credentials).\n"
                     f"  Directory: {display_dir}\n"
                 )
+                if provider == "kiro_cli":
+                    # kiro-cli 2.0.1 TUI blocks on an interactive "Yes, I accept"
+                    # consent dialog when --trust-all-tools is set. CAO cannot
+                    # answer it headlessly, so yolo launches use --legacy-ui.
+                    click.echo(
+                        "  Note: kiro_cli will launch in --legacy-ui mode so "
+                        "--trust-all-tools can be applied non-interactively.\n"
+                    )
+                elif provider == "opencode_cli":
+                    # opencode's TUI has no runtime skip-permissions flag
+                    # (tracked upstream in sst/opencode#8463). Permissions are
+                    # install-time only, so --yolo cannot loosen them here.
+                    click.echo(
+                        click.style(
+                            "  Note: --yolo has no runtime effect on opencode_cli.\n"
+                            "  Permissions are set at cao install time. To get unrestricted\n"
+                            "  access, set 'allowedTools: [\"*\"]' in the profile and re-run\n"
+                            "  'cao install'. See docs/opencode-cli.md for details.\n",
+                            fg="yellow",
+                        )
+                    )
             else:
                 # Normal launch: show tool summary and confirm
                 tool_summary = format_tool_summary(resolved_allowed_tools)
@@ -163,10 +186,11 @@ def launch(
         # provided. When omitted, the server defaults to its own CWD.
         url = f"http://{SERVER_HOST}:{SERVER_PORT}/sessions"
         params = {
-            "provider": provider,
             "agent_profile": agents,
             "working_directory": working_directory or os.getcwd(),
         }
+        if explicit_provider:
+            params["provider"] = provider
         if session_name:
             params["session_name"] = session_name
         if resolved_allowed_tools:

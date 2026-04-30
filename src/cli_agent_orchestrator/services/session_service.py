@@ -37,12 +37,13 @@ from cli_agent_orchestrator.plugins import (
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
 from cli_agent_orchestrator.services.terminal_service import create_terminal
+from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 
 logger = logging.getLogger(__name__)
 
 
 def create_session(
-    provider: str,
+    provider: str | None,
     agent_profile: str,
     session_name: str | None = None,
     working_directory: str | None = None,
@@ -50,9 +51,13 @@ def create_session(
     registry: PluginRegistry | None = None,
 ) -> Terminal:
     """Create a new session by creating its initial terminal."""
+    if provider is None:
+        resolved_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
+    else:
+        resolved_provider = provider
 
     terminal = create_terminal(
-        provider=provider,
+        provider=resolved_provider,
         agent_profile=agent_profile,
         session_name=session_name,
         new_session=True,

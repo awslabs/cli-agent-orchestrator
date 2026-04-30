@@ -484,7 +484,7 @@ def test_launch_headless_message_poll_processing_then_completed():
 
 
 def test_launch_honors_profile_provider_when_flag_not_given():
-    """Test that profile.provider is used when --provider is not passed."""
+    """When --provider is not passed, provider is omitted from POST params (server resolves it)."""
     runner = CliRunner()
 
     with (
@@ -510,4 +510,5 @@ def test_launch_honors_profile_provider_when_flag_not_given():
         assert result.exit_code == 0
         mock_resolve.assert_called_once()
         params = mock_post.call_args.kwargs["params"]
-        assert params["provider"] == "claude_code"
+        # provider is NOT sent — server-side resolution handles it
+        assert "provider" not in params
