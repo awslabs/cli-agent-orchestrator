@@ -16,13 +16,16 @@ def test_launch_passes_cwd_by_default():
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run") as mock_subprocess,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
 
         mock_post.return_value.json.return_value = {
             "session_name": "test-session",
+            "id": "test-terminal-id",
             "name": "test-terminal",
         }
         mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
 
         result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
 
@@ -40,13 +43,16 @@ def test_launch_passes_explicit_working_directory():
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run") as mock_subprocess,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
 
         mock_post.return_value.json.return_value = {
             "session_name": "test-session",
+            "id": "test-terminal-id",
             "name": "test-terminal",
         }
         mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
 
         result = runner.invoke(
             launch,
@@ -127,12 +133,15 @@ def test_launch_with_session_name():
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run") as mock_subprocess,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
         mock_post.return_value.json.return_value = {
             "session_name": "custom-session",
+            "id": "test-terminal-id",
             "name": "test-terminal",
         }
         mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
 
         result = runner.invoke(
             launch, ["--agents", "test-agent", "--session-name", "custom-session", "--yolo"]
@@ -192,6 +201,78 @@ def test_launch_headless_mode():
         assert result.exit_code == 0
         # In headless mode, subprocess.run should not be called
         mock_subprocess.assert_not_called()
+
+
+def test_launch_non_headless_waits_for_idle_before_attach():
+    """Non-headless launch must wait for IDLE/COMPLETED before tmux attach.
+
+    Regression guard for #220: attaching before the TUI finishes initializing
+    races with input-handler wiring and silently drops keystrokes. The wait
+    must be called with the terminal id before subprocess.run.
+    """
+    runner = CliRunner()
+
+    call_order = []
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run") as mock_subprocess,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+
+        def record_wait(*a, **kw):
+            call_order.append("wait")
+            return True
+
+        def record_attach(*a, **kw):
+            call_order.append("attach")
+
+        mock_wait.side_effect = record_wait
+        mock_subprocess.side_effect = record_attach
+
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
+
+        assert result.exit_code == 0
+        mock_wait.assert_called_once()
+        wait_args = mock_wait.call_args
+        assert wait_args.args[0] == "test-terminal-id"
+        assert call_order == ["wait", "attach"]
+
+
+def test_launch_non_headless_attaches_even_if_wait_times_out():
+    """Non-headless launch warns but still attaches if the idle wait times out.
+
+    The wait is advisory: orphaning the session in tmux (by refusing to attach)
+    would be worse than letting the user inspect a slow-initializing session.
+    """
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run") as mock_subprocess,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = False
+
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
+
+        assert result.exit_code == 0
+        assert "did not reach idle within 120s" in result.output
+        mock_subprocess.assert_called_once()
+        attach_cmd = mock_subprocess.call_args.args[0]
+        assert attach_cmd[:2] == ["tmux", "attach-session"]
 
 
 def test_launch_workspace_confirmation_accepted():
@@ -290,12 +371,15 @@ def test_launch_yolo_sets_unrestricted_allowed_tools():
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run") as mock_subprocess,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
         mock_post.return_value.json.return_value = {
             "session_name": "test-session",
+            "id": "test-terminal-id",
             "name": "test-terminal",
         }
         mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
 
         result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
 

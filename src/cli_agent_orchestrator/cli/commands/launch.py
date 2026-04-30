@@ -205,8 +205,26 @@ def launch(
         click.echo(f"Session created: {terminal['session_name']}")
         click.echo(f"Terminal created: {terminal['name']}")
 
-        # Attach to tmux session unless headless
+        # Attach to tmux session unless headless. Wait for the provider to
+        # finish initializing first — otherwise tmux attach races with the
+        # TUI's input handler wiring, resizes the pty mid-init, and the TUI
+        # silently drops keystrokes. See issue #220. The wait is advisory:
+        # if it times out we still attach so the user can inspect the
+        # half-initialized session rather than orphan it in tmux.
         if not headless:
+            ready = wait_until_terminal_status(
+                terminal["id"],
+                {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+                timeout=120,
+            )
+            if not ready:
+                click.echo(
+                    click.style(
+                        f"  Warning: {terminal['id']} did not reach idle within 120s — "
+                        "attaching anyway; input may be unreliable until init completes.",
+                        fg="yellow",
+                    )
+                )
             subprocess.run(["tmux", "attach-session", "-t", terminal["session_name"]])
         elif message:
             ready = wait_until_terminal_status(
