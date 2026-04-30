@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 
 def create_session(
-    provider: str,
+    provider: str | None,
     agent_profile: str,
     session_name: str | None = None,
     working_directory: str | None = None,
@@ -51,7 +51,10 @@ def create_session(
     registry: PluginRegistry | None = None,
 ) -> Terminal:
     """Create a new session by creating its initial terminal."""
-    resolved_provider = resolve_provider(agent_profile, fallback_provider=provider)
+    if provider is None:
+        resolved_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
+    else:
+        resolved_provider = provider
 
     terminal = create_terminal(
         provider=resolved_provider,

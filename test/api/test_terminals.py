@@ -415,7 +415,7 @@ class TestCrossProviderResolution:
     while create_session always uses the explicit provider parameter."""
 
     def test_create_terminal_uses_profile_provider(self, client):
-        """create_terminal_in_session should resolve provider from agent profile."""
+        """create_terminal_in_session should resolve provider from agent profile when omitted."""
         with (
             patch("cli_agent_orchestrator.api.main.resolve_provider") as mock_resolve,
             patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
@@ -432,13 +432,12 @@ class TestCrossProviderResolution:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
-                    "provider": "kiro_cli",
                     "agent_profile": "developer",
                 },
             )
 
             assert response.status_code == 201
-            # Verify resolve_provider was called with the fallback
+            # Verify resolve_provider was called with the default fallback
             mock_resolve.assert_called_once_with("developer", fallback_provider="kiro_cli")
             # Verify terminal_service got the resolved provider
             call_kwargs = mock_svc.create_terminal.call_args.kwargs
@@ -512,7 +511,6 @@ class TestCrossProviderResolution:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
-                    "provider": "kiro_cli",
                     "agent_profile": "developer",
                 },
             )

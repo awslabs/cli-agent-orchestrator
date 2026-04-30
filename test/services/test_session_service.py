@@ -18,20 +18,35 @@ class TestCreateSession:
     @patch("cli_agent_orchestrator.services.session_service.dispatch_plugin_event")
     @patch("cli_agent_orchestrator.services.session_service.create_terminal")
     @patch("cli_agent_orchestrator.services.session_service.resolve_provider")
-    def test_create_session_resolves_provider_from_profile(
+    def test_create_session_resolves_provider_when_omitted(
         self, mock_resolve, mock_create_terminal, mock_dispatch
     ):
-        """Test that create_session calls resolve_provider so profile.provider is honoured."""
+        """When provider is None, resolve_provider is called and its result forwarded."""
         mock_resolve.return_value = "claude_code"
+        mock_terminal = MagicMock()
+        mock_terminal.session_name = "cao-test"
+        mock_create_terminal.return_value = mock_terminal
+
+        create_session(provider=None, agent_profile="my_agent")
+
+        mock_resolve.assert_called_once_with("my_agent", fallback_provider="kiro_cli")
+        assert mock_create_terminal.call_args.kwargs["provider"] == "claude_code"
+
+    @patch("cli_agent_orchestrator.services.session_service.dispatch_plugin_event")
+    @patch("cli_agent_orchestrator.services.session_service.create_terminal")
+    @patch("cli_agent_orchestrator.services.session_service.resolve_provider")
+    def test_create_session_uses_explicit_provider(
+        self, mock_resolve, mock_create_terminal, mock_dispatch
+    ):
+        """When provider is explicitly passed, resolve_provider is NOT called."""
         mock_terminal = MagicMock()
         mock_terminal.session_name = "cao-test"
         mock_create_terminal.return_value = mock_terminal
 
         create_session(provider="kiro_cli", agent_profile="my_agent")
 
-        mock_resolve.assert_called_once_with("my_agent", fallback_provider="kiro_cli")
-        mock_create_terminal.assert_called_once()
-        assert mock_create_terminal.call_args.kwargs["provider"] == "claude_code"
+        mock_resolve.assert_not_called()
+        assert mock_create_terminal.call_args.kwargs["provider"] == "kiro_cli"
 
 
 class TestListSessions:
