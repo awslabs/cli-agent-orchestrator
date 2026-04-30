@@ -324,8 +324,8 @@ async def get_skill_content(name: str) -> SkillContentResponse:
 @app.post("/sessions", response_model=Terminal, status_code=status.HTTP_201_CREATED)
 async def create_session(
     request: Request,
-    provider: str,
     agent_profile: str,
+    provider: Optional[str] = None,
     session_name: Optional[str] = None,
     working_directory: Optional[str] = None,
     allowed_tools: Optional[str] = None,
@@ -400,14 +400,17 @@ async def delete_session(request: Request, session_name: str) -> Dict:
 async def create_terminal_in_session(
     request: Request,
     session_name: str,
-    provider: str,
     agent_profile: str,
+    provider: Optional[str] = None,
     working_directory: Optional[str] = None,
     allowed_tools: Optional[str] = None,
 ) -> Terminal:
     """Create additional terminal in existing session."""
     try:
-        resolved_provider = resolve_provider(agent_profile, fallback_provider=provider)
+        if provider is None:
+            resolved_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
+        else:
+            resolved_provider = provider
 
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
