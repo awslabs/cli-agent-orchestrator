@@ -42,6 +42,7 @@ export const useStore = create<Store>((set, get) => ({
     try {
       const sessions = await api.listSessions()
       const prev = get()
+      if (sessions.length === 0 && prev.sessions.length > 0) return
       if (!prev.connected || !jsonEqual(prev.sessions, sessions)) {
         set({ sessions, connected: true })
       }
