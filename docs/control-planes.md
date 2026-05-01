@@ -44,7 +44,7 @@ A set of `cao session <verb>` commands (`list`, `status`, `send`, plus `cao laun
 - **Strength:** universal — works from bash, Python, `subprocess`, any agent framework, any external tool that can run a command. Zero protocol requirements on the caller.
 - **When to use:**
   - Scripting, CI pipelines, headless jobs.
-  - An external AI assistant that does not speak MCP — e.g. [OpenClaw](https://www.digitalocean.com/resources/articles/what-is-openclaw), a custom Strands agent, a shell function.
+  - An external AI assistant that does not speak MCP — e.g. [OpenClaw](https://github.com/openclaw/openclaw) or [Hermes Agent](https://github.com/NousResearch/hermes-agent). Any assistant that supports shell-callable skills should work.
   - Quick one-shots where spinning up an MCP client is overkill.
 
 See [Session Management](../README.md#session-management) in the README for the command reference.

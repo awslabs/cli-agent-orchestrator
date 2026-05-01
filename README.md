@@ -281,6 +281,8 @@ Add `--async` to return immediately without waiting for completion.
 
 For the command reference and the agent-facing skill, see the [Session Management skill](skills/cao-session-management/SKILL.md).
 
+Because `cao session` is just shell commands, any AI assistant that supports shell-callable skills should be able to drive CAO this way — e.g. Claude Code, Kiro CLI, [OpenClaw](https://github.com/openclaw/openclaw), or [Hermes Agent](https://github.com/NousResearch/hermes-agent).
+
 ### CAO Ops MCP Server
 
 `cao-ops-mcp` exposes the same management operations as structured MCP tools for a primary agent (Claude Code, Claude Desktop, etc.). It is the MCP-flavoured equivalent of `cao session` — pick `cao-ops-mcp` when your caller speaks MCP, `cao session` otherwise.
