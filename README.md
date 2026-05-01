@@ -1,27 +1,42 @@
-# CLI Agent Orchestrator
+# CLI Agent Orchestrator (CAO)
 
 [![PyPI version](https://img.shields.io/pypi/v/cli-agent-orchestrator.svg)](https://pypi.org/project/cli-agent-orchestrator/)
 [![Python versions](https://img.shields.io/pypi/pyversions/cli-agent-orchestrator.svg)](https://pypi.org/project/cli-agent-orchestrator/)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/awslabs/cli-agent-orchestrator)
 
-CLI Agent Orchestrator (CAO, pronounced "kay-oh") is a lightweight orchestration system for managing multiple AI agent sessions in tmux terminals. Enables multi-agent collaboration via MCP server.
+**CLI Agent Orchestrator (CAO)** is an open-source multi-agent orchestration framework for AI coding CLIs — Claude Code, Kiro CLI, Codex CLI, Gemini CLI, Kimi CLI, GitHub Copilot CLI, OpenCode, and Amazon Q Developer CLI. CAO runs each agent in an isolated tmux session and coordinates them with a supervisor–worker pattern over the Model Context Protocol (MCP), so one supervisor agent can delegate tasks to multiple specialist agents in parallel, sequentially, or as a swarm.
+
+## What is CAO?
+
+CAO (pronounced "kay-oh") is a lightweight local orchestrator that sits between you and the CLI coding agents you already use. Instead of running a single agent at a time, CAO lets a supervisor agent launch, message, and coordinate multiple worker agents — each one a real CLI tool (Claude Code, Kiro, Codex, etc.) running in its own tmux terminal. Agents communicate through three MCP-exposed primitives (**handoff**, **assign**, **send_message**) and are managed via a CLI, a bundled Web UI, or an MCP management server. Because every agent is a full CLI process, CAO preserves tool behaviour, auth, and advanced features (Claude Code sub-agents, Q CLI custom agents, etc.) that a raw API wrapper cannot.
+
+## Common use cases
+
+- **Parallel code review / implementation** — supervisor assigns N reviewers to review N files concurrently, then merges their findings.
+- **Cross-provider workflows** — supervisor on one CLI (e.g. Kiro), worker on another (e.g. Claude Code), per-profile provider selection.
+- **Scheduled agent runs** — cron-style "every morning at 9am" triggers via [Flows](docs/flows.md).
+- **Headless agent execution in CI** — `cao launch --headless --async` to run tasks unattended.
+- **Multi-agent swarms with HITL** — humans can attach to any tmux session to intervene or steer.
+- **Agent-driven agent management** — a primary agent uses [`cao-ops-mcp`](#cao-ops-mcp-server) to spawn and monitor CAO sessions from its own chat loop.
 
 ## Hierarchical Multi-Agent System
 
-CAO implements a hierarchical multi-agent system that enables complex problem-solving through specialized division of CLI developer agents.
+CAO implements a hierarchical multi-agent system — one supervisor agent delegates to specialised worker agents rather than running everything in a single context.
 
-![CAO Architecture](./docs/assets/cao_architecture.png)
+![CAO architecture: supervisor agent delegating to worker agents in isolated tmux sessions via MCP](./docs/assets/cao_architecture.png)
 
 ### Key Features
 
-* **Hierarchical orchestration** – A supervisor agent coordinates workflow management and task delegation to specialized worker agents. The supervisor maintains overall project context while workers focus on their domains of expertise.
-* **Session-based isolation** – Each agent operates in an isolated tmux session, giving proper context separation while still enabling communication through Model Context Protocol (MCP) servers.
-* **Three orchestration patterns** – **Handoff** (synchronous task transfer with wait-for-completion), **Assign** (asynchronous task spawning for parallel execution), and **Send Message** (direct communication with existing agents). See [Multi-Agent Orchestration](#multi-agent-orchestration).
-* **Flow — scheduled runs** – Automated execution of workflows at specified intervals using cron-like scheduling. See [docs/flows.md](docs/flows.md).
-* **Context preservation** – The supervisor provides only necessary context to each worker, avoiding context pollution.
-* **Direct worker interaction** – Users can interact directly with worker agents to provide additional steering — real-time guidance and course correction, distinguishing CAO from traditional sub-agent features.
-* **Tool restrictions** – Control what each agent can do through `role` and `allowedTools`. Built-in roles (`supervisor`, `developer`, `reviewer`) give sensible defaults; `allowedTools` gives fine-grained override. See [docs/tool-restrictions.md](docs/tool-restrictions.md).
-* **Advanced CLI integration** – CAO agents have full access to advanced features of the underlying CLI, such as the [sub-agents](https://docs.claude.com/en/docs/claude-code/sub-agents) feature of Claude Code and [Custom Agent](https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/command-line-custom-agents.html) of Amazon Q Developer CLI.
+- **Hierarchical supervisor–worker orchestration** — a supervisor agent coordinates and delegates; workers focus on their domain. Preserves overall context without polluting workers.
+- **Session isolation via tmux** — every agent runs in its own tmux session. Clean context separation, real PTY access, humans can `tmux attach` to steer at any time.
+- **Three orchestration primitives over MCP** — `handoff` (sync, wait for completion), `assign` (async, fire-and-forget), `send_message` (inbox delivery between agents). See [Multi-Agent Orchestration](#multi-agent-orchestration).
+- **Cross-provider mixing** — run workers on different CLIs in the same session. Pin a profile to a provider via agent frontmatter. See [Cross-Provider Orchestration](#cross-provider-orchestration).
+- **Scheduled flows** — cron-like scheduling for unattended agent runs. See [docs/flows.md](docs/flows.md).
+- **Web UI, CLI, and MCP control planes** — manage sessions from the browser, `cao session` commands, or the `cao-ops-mcp` server. See [docs/control-planes.md](docs/control-planes.md).
+- **Tool restrictions per agent** — `role` + `allowedTools` in the profile, translated to each provider's native enforcement (5 of 7 providers support hard enforcement). See [docs/tool-restrictions.md](docs/tool-restrictions.md).
+- **Direct worker steering** — unlike traditional "sub-agent" features, you can attach to a running worker and intervene mid-task.
+- **Full CLI feature access** — agents keep native CLI features: Claude Code [sub-agents](https://docs.claude.com/en/docs/claude-code/sub-agents), Amazon Q Developer [Custom Agent](https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/command-line-custom-agents.html), provider-native auth, etc.
+- **Plugin system for outbound events** — forward inter-agent messages to Discord, Slack, Telegram, or any webhook target. See [Plugins](#plugins).
 
 For detailed project structure and architecture, see [CODEBASE.md](CODEBASE.md).
 
@@ -74,12 +89,16 @@ source $HOME/.local/bin/env   # Add uv to PATH (or restart your shell)
 uv tool install git+https://github.com/awslabs/cli-agent-orchestrator.git@main --upgrade
 ```
 
-Or from PyPI:
+This pulls the latest `main` commit and includes the pre-built Web UI inside the wheel, so **you do not need Node.js or `npm install` to use CAO**. Node.js is only required if you plan to run the frontend in dev mode (hot-reload) or rebuild the bundle yourself — see [docs/web-ui.md](docs/web-ui.md).
+
+#### Install from PyPI (optional)
+
+PyPI publishes tagged releases only, so it will lag behind `main` between releases. Prefer the `git+` install above if you want the latest fixes.
 
 ```bash
 uv tool install cli-agent-orchestrator --upgrade
 
-# Pin a specific version
+# Pin a specific release
 uv tool install cli-agent-orchestrator==2.1.0
 ```
 
@@ -155,7 +174,7 @@ All agent sessions run in tmux — you can `tmux attach -t <session-name>` to wa
 
 ## Web UI
 
-CAO ships a bundled web dashboard for managing agents, terminals, and flows from the browser. With the default install you just need `cao-server` running:
+CAO ships a bundled web dashboard for managing agents, terminals, and flows from the browser. The pre-built UI is packaged inside the wheel, so there is nothing extra to install — just start the server:
 
 ```bash
 cao-server
@@ -165,7 +184,7 @@ Then open http://localhost:9889.
 
 ![CAO Web UI](https://github.com/user-attachments/assets/e7db9261-62b1-4422-b9f5-6fe5f65bdea4)
 
-For development mode (hot-reload), remote access over SSH, rebuilding the frontend, and Node.js requirements, see [docs/web-ui.md](docs/web-ui.md). For frontend architecture, see [web/README.md](web/README.md).
+For hot-reload dev mode, remote access over SSH, and rebuilding the frontend from source (only these require Node.js), see [docs/web-ui.md](docs/web-ui.md). For frontend architecture, see [web/README.md](web/README.md).
 
 ## Multi-Agent Orchestration
 

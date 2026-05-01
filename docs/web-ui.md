@@ -4,9 +4,16 @@ CAO includes a web dashboard for managing agents, terminals, and flows from the 
 
 ![CAO Web UI](https://github.com/user-attachments/assets/e7db9261-62b1-4422-b9f5-6fe5f65bdea4)
 
-## Additional requirements
+## When you need Node.js
 
-- **Node.js 18+** — required for the frontend dev server and Codex CLI.
+The pre-built Web UI is bundled inside the CAO wheel (at `src/cli_agent_orchestrator/web_ui/`), so a regular `uv tool install` ships everything you need. **You do not need Node.js or `npm install` to use the Web UI.**
+
+Node.js 18+ is only required if you want to:
+
+- Run the frontend dev server for hot-reload development (Option A below), or
+- Rebuild the bundle from source.
+
+Install Node only if one of those applies:
 
 ```bash
 # macOS (Homebrew)
@@ -20,7 +27,7 @@ sudo apt-get install -y nodejs
 sudo dnf install nodejs20
 
 # Verify
-node --version   # Should be 18 or higher
+node --version   # 18 or higher
 ```
 
 ## Starting the Web UI
