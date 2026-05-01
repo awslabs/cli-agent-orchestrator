@@ -124,3 +124,51 @@ class TestSessionConstants:
         from cli_agent_orchestrator.constants import SESSION_PREFIX
 
         assert SESSION_PREFIX == "cao-"
+
+
+class TestOpenCodeConstants:
+    """Tests for OpenCode provider path constants."""
+
+    def test_opencode_config_dir_resolves_correctly(self):
+        from pathlib import Path
+
+        from cli_agent_orchestrator.constants import OPENCODE_CONFIG_DIR
+
+        assert OPENCODE_CONFIG_DIR == Path.home() / ".aws" / "opencode"
+
+    def test_opencode_agents_dir_is_under_config_dir(self):
+        from cli_agent_orchestrator.constants import OPENCODE_AGENTS_DIR, OPENCODE_CONFIG_DIR
+
+        assert OPENCODE_AGENTS_DIR == OPENCODE_CONFIG_DIR / "agents"
+
+    def test_opencode_config_file_is_json(self):
+        from cli_agent_orchestrator.constants import OPENCODE_CONFIG_DIR, OPENCODE_CONFIG_FILE
+
+        assert OPENCODE_CONFIG_FILE == OPENCODE_CONFIG_DIR / "opencode.json"
+        assert OPENCODE_CONFIG_FILE.suffix == ".json"
+
+    def test_opencode_config_dir_is_pathlib_path(self):
+        from pathlib import Path
+
+        from cli_agent_orchestrator.constants import OPENCODE_CONFIG_DIR
+
+        assert isinstance(OPENCODE_CONFIG_DIR, Path)
+
+    def test_opencode_cli_in_providers_list(self):
+        from cli_agent_orchestrator.constants import PROVIDERS
+
+        assert "opencode_cli" in PROVIDERS
+
+
+class TestOpenCodeProviderType:
+    """Tests for OPENCODE_CLI entry in ProviderType enum."""
+
+    def test_opencode_cli_enum_value(self):
+        from cli_agent_orchestrator.models.provider import ProviderType
+
+        assert ProviderType.OPENCODE_CLI.value == "opencode_cli"
+
+    def test_opencode_cli_importable(self):
+        from cli_agent_orchestrator.models.provider import ProviderType
+
+        assert hasattr(ProviderType, "OPENCODE_CLI")

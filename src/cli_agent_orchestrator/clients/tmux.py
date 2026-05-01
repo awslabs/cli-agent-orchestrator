@@ -76,6 +76,11 @@ class TmuxClient:
         if working_directory is None:
             working_directory = os.getcwd()
 
+        # Expand ~ to the server's home directory so clients can use
+        # portable paths like ~/q/my-project without knowing the server's
+        # actual home path (e.g., /home/user vs /Users/user).
+        working_directory = os.path.expanduser(working_directory)
+
         # Step 1: Canonicalize the path via realpath to resolve symlinks
         # and .. sequences.  os.path.realpath is recognized by CodeQL as a
         # PathNormalization (transitions taint to NormalizedUnchecked).
@@ -140,12 +145,21 @@ class TmuxClient:
             }
             environment["CAO_TERMINAL_ID"] = terminal_id
 
+            # Explicit 220x50 pane size avoids the default 80x24 that tmux
+            # assigns to detached sessions. kiro-cli 2.1.x's TUI v2 fails to
+            # repaint after a SIGWINCH from the attach-time resize (80x24 →
+            # user's real terminal): the screen goes blank and input is
+            # silently dropped. Starting at a larger size makes the attach
+            # resize a no-op/shrink, which kiro handles correctly. All other
+            # providers tolerate wider panes. See issue #216.
             session = self.server.new_session(
                 session_name=session_name,
                 window_name=window_name,
                 start_directory=working_directory,
                 detach=True,
                 environment=environment,
+                x=220,
+                y=50,
             )
             logger.info(
                 f"Created tmux session: {session_name} with window: {window_name} in directory: {working_directory}"

@@ -425,6 +425,52 @@ class TestClaudeCodeProviderStatusDetection:
 
         mock_tmux.get_history.assert_called_with("test-session", "window-0", tail_lines=50)
 
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_get_status_completed_after_compaction_not_false_processing(self, mock_tmux):
+        """Compaction spinner before its own separator, then more output; last sep has no spinner → COMPLETED."""
+        mock_tmux.get_history.return_value = (
+            "❯ do the task\n"
+            "⏺ Starting work…\n"
+            "✢ Compacting conversation…\n"
+            "────────────────────────\n"
+            "⏺ Here is the completed response\n"
+            "────────────────────────\n"
+            "❯ "
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_get_status_processing_after_compaction_when_still_running(self, mock_tmux):
+        """Spinner before the last separator (agent resumes after compaction) → PROCESSING."""
+        mock_tmux.get_history.return_value = (
+            "❯ do the task\n"
+            "✢ Compacting conversation…\n"
+            "────────────────────────\n"
+            "⏺ Resuming work…\n"
+            "✻ Orbiting…\n"
+            "────────────────────────\n"
+            "❯ "
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status() == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_get_status_completed_after_exit_not_false_processing(self, mock_tmux):
+        """Spinner → sep (task done) → /exit → second sep; spinner NOT before last sep → not PROCESSING."""
+        mock_tmux.get_history.return_value = (
+            "❯ do the task\n"
+            "⏺ Working on it…\n"
+            "✻ Orbiting…\n"
+            "────────────────────────\n"
+            "❯ /exit\n"
+            "⏺ Goodbye!\n"
+            "────────────────────────\n"
+            "❯ "
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status() != TerminalStatus.PROCESSING
+
 
 class TestClaudeCodeProviderMessageExtraction:
     """Tests for ClaudeCodeProvider message extraction."""

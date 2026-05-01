@@ -13,11 +13,13 @@ from cli_agent_orchestrator.constants import (
     COPILOT_AGENTS_DIR,
     KIRO_AGENTS_DIR,
     LOCAL_AGENT_STORE_DIR,
+    OPENCODE_AGENTS_DIR,
     Q_AGENTS_DIR,
     SKILLS_DIR,
 )
 from cli_agent_orchestrator.models.copilot_agent import CopilotAgentConfig
 from cli_agent_orchestrator.models.kiro_agent import KiroAgentConfig
+from cli_agent_orchestrator.models.opencode_agent import OpenCodeAgentConfig
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.q_agent import QAgentConfig
 from cli_agent_orchestrator.utils.agent_profiles import (
@@ -25,6 +27,15 @@ from cli_agent_orchestrator.utils.agent_profiles import (
     parse_agent_profile_text,
 )
 from cli_agent_orchestrator.utils.env import resolve_env_vars, set_env_var
+from cli_agent_orchestrator.utils.opencode_config import (
+    ensure_skills_symlink,
+    remove_agent_tools,
+    to_opencode_agent_id,
+    translate_mcp_server_config,
+    upsert_agent_tools,
+    upsert_mcp_server,
+)
+from cli_agent_orchestrator.utils.opencode_permissions import cao_tools_to_opencode_permission
 from cli_agent_orchestrator.utils.skill_injection import compose_agent_prompt
 from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
 
@@ -215,6 +226,42 @@ def install_agent(
                 ),
                 encoding="utf-8",
             )
+
+        elif provider == ProviderType.OPENCODE_CLI.value:
+            OPENCODE_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+            ensure_skills_symlink()
+            # OpenCode discovers skills natively from OPENCODE_CONFIG_DIR/skills,
+            # so the installed system prompt should not embed the CAO skill catalog.
+            body = profile.system_prompt or profile.prompt or ""
+            opencode_agent_config = OpenCodeAgentConfig(
+                description=profile.description,
+                mode="all",
+                permission=cao_tools_to_opencode_permission(allowed_tools),
+            )
+            agent_id = to_opencode_agent_id(profile.name)
+            agent_file = OPENCODE_AGENTS_DIR / f"{agent_id}.md"
+            agent_file.write_text(
+                frontmatter.dumps(
+                    frontmatter.Post(
+                        body.rstrip() if body else "",
+                        **opencode_agent_config.model_dump(exclude_none=True),
+                    )
+                ),
+                encoding="utf-8",
+            )
+
+            # OpenCode uses a shared opencode.json for MCP declarations. Keep
+            # top-level MCP entries default-denied, then re-enable them only
+            # for the installed agent. A reinstall without MCP removes stale
+            # per-agent grants.
+            if profile.mcpServers:
+                mcp_names = list(profile.mcpServers.keys())
+                for mcp_name, mcp_cfg in profile.mcpServers.items():
+                    opencode_mcp_cfg = translate_mcp_server_config(dict(mcp_cfg))
+                    upsert_mcp_server(mcp_name, opencode_mcp_cfg)
+                upsert_agent_tools(agent_id, mcp_names)
+            else:
+                remove_agent_tools(agent_id)
 
         return InstallResult(
             success=True,

@@ -28,9 +28,14 @@ from pathlib import Path
 
 from watchdog.events import FileModifiedEvent, FileSystemEventHandler
 
-from cli_agent_orchestrator.clients.database import get_pending_messages, update_message_status
+from cli_agent_orchestrator.clients.database import (
+    get_pending_messages,
+    list_pending_receiver_ids_by_provider,
+    update_message_status,
+)
 from cli_agent_orchestrator.constants import TERMINAL_LOG_DIR
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
+from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.manager import provider_manager
@@ -130,6 +135,24 @@ def check_and_send_pending_messages(
         logger.error(f"Failed to send message {message.id} to {terminal_id}: {e}")
         update_message_status(message.id, MessageStatus.FAILED)
         raise
+
+
+def poll_opencode_pending_messages(registry: PluginRegistry | None = None) -> None:
+    """Poll OpenCode terminals for pending inbox messages.
+
+    This is a temporary OpenCode-specific wakeup path for providers whose
+    pipe-pane logs do not change after the TUI settles. It intentionally reuses
+    the existing delivery helper and inherits its known duplicate-wakeup race
+    with immediate and watchdog delivery paths. GH #115 tracks replacing these
+    paths with a single coordinated delivery engine.
+    """
+    receiver_ids = list_pending_receiver_ids_by_provider(ProviderType.OPENCODE_CLI.value)
+
+    for terminal_id in receiver_ids:
+        try:
+            check_and_send_pending_messages(terminal_id, registry=registry)
+        except Exception as e:
+            logger.debug(f"OpenCode inbox poll failed for {terminal_id}: {e}")
 
 
 class LogFileHandler(FileSystemEventHandler):

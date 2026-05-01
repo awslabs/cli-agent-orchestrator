@@ -1,5 +1,7 @@
 # CLI Agent Orchestrator
 
+[![PyPI version](https://img.shields.io/pypi/v/cli-agent-orchestrator.svg)](https://pypi.org/project/cli-agent-orchestrator/)
+[![Python versions](https://img.shields.io/pypi/pyversions/cli-agent-orchestrator.svg)](https://pypi.org/project/cli-agent-orchestrator/)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/awslabs/cli-agent-orchestrator)
 
 CLI Agent Orchestrator(CAO, pronounced as "kay-oh"), is a lightweight orchestration system for managing multiple AI agent sessions in tmux terminals. Enables Multi-agent collaboration via MCP server.
@@ -78,6 +80,20 @@ source $HOME/.local/bin/env   # Add uv to PATH (or restart your shell)
 uv tool install git+https://github.com/awslabs/cli-agent-orchestrator.git@main --upgrade
 ```
 
+#### 4.1 Install via PyPI (Optional)
+
+Install the latest release from PyPI:
+
+```bash
+uv tool install cli-agent-orchestrator --upgrade
+```
+
+To pin a specific version:
+
+```bash
+uv tool install cli-agent-orchestrator==2.1.0
+```
+
 ### Development Setup
 
 For local development, clone the repo and install with `uv sync`:
@@ -103,6 +119,7 @@ Before using CAO, install at least one supported CLI agent tool:
 | **Gemini CLI** | [Provider docs](docs/gemini-cli.md) · [Installation](https://github.com/google-gemini/gemini-cli) | Google AI API key |
 | **Kimi CLI** | [Provider docs](docs/kimi-cli.md) · [Installation](https://platform.moonshot.cn/docs/kimi-cli) | Moonshot API key |
 | **GitHub Copilot CLI** | [Provider docs](docs/copilot-cli.md) · [Installation](https://github.com/features/copilot/cli) | GitHub auth |
+| **OpenCode CLI** *(experimental — temporary inbox polling fallback for multi-agent callbacks, [#203](https://github.com/awslabs/cli-agent-orchestrator/issues/203))* | [Provider docs](docs/opencode-cli.md) · [Installation](https://opencode.ai) | Per-model API key |
 | **Q CLI** | [Installation](https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/command-line.html) | AWS credentials |
 
 ## Quick Start
@@ -151,6 +168,7 @@ cao launch --agents code_supervisor --provider codex
 cao launch --agents code_supervisor --provider gemini_cli
 cao launch --agents code_supervisor --provider kimi_cli
 cao launch --agents code_supervisor --provider copilot_cli
+cao launch --agents code_supervisor --provider opencode_cli
 # Unrestricted access + skip confirmation (DANGEROUS)
 cao launch --agents code_supervisor --yolo
 ```
@@ -194,6 +212,41 @@ cao shutdown --session <session-name>
 **List all windows (Ctrl+b, w):**
 
 ![Tmux Window Selector](./docs/assets/tmux_all_windows.png)
+
+
+## Session Management
+
+CAO provides CLI commands for managing sessions programmatically — useful for scripting, CI pipelines, or headless operation.
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `cao session list` | List active sessions |
+| `cao session status <name>` | Show conductor status and last output |
+| `cao session status <name> --workers` | Include worker terminal statuses |
+| `cao session send <name> "msg"` | Send message and wait for completion |
+| `cao session send <name> "msg" --async` | Fire-and-forget without waiting |
+| `cao session send <name> "msg" --timeout N` | Wait up to N seconds |
+| `cao shutdown --session <name>` | Shut down a session |
+
+### Headless Launch
+
+```bash
+cao launch --agents supervisor --headless --yolo \
+  --session-name my-task --working-directory '/path/to/project' "Your task here"
+```
+
+Add `--async` to send the message and return immediately without waiting for completion:
+
+```bash
+cao launch --agents supervisor --headless --async --yolo \
+  --session-name my-task --working-directory '/path/to/project' "Your task here"
+```
+
+> **Note:** Session names are automatically prefixed with `cao-`. Use the prefixed form (e.g., `cao-my-task`) when referencing sessions in commands like `cao session send` and `cao shutdown`.
+
+For full details, see the [Session Management skill](skills/cao-session-management/SKILL.md).
 
 ## Web UI
 
@@ -667,6 +720,10 @@ See [SECURITY.md](SECURITY.md) for vulnerability reporting, security scanning, a
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on contributing to this project.
+
+## Releases
+
+CAO publishes to [PyPI](https://pypi.org/project/cli-agent-orchestrator/) via an OIDC-authenticated GitHub Actions pipeline (TestPyPI → smoke test → maintainer-approved prod). See [docs/RELEASING.md](docs/RELEASING.md) for the cut-a-release runbook, one-time setup, and troubleshooting.
 
 ## License
 

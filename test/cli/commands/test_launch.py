@@ -1,7 +1,7 @@
 """Tests for launch command."""
 
 import os
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from click.testing import CliRunner
@@ -16,26 +16,104 @@ def test_launch_passes_cwd_by_default():
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run") as mock_subprocess,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
 
-        # Mock successful API response
         mock_post.return_value.json.return_value = {
             "session_name": "test-session",
+            "id": "test-terminal-id",
             "name": "test-terminal",
         }
         mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
 
-        # Run the command (--yolo to skip workspace confirmation)
         result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
 
-        # Verify the command succeeded
         assert result.exit_code == 0
-
-        # Verify requests.post was called with working_directory parameter
         mock_post.assert_called_once()
         params = mock_post.call_args.kwargs["params"]
         assert "working_directory" in params
         assert params["working_directory"] == os.path.realpath(os.getcwd())
+
+
+def test_launch_passes_explicit_working_directory():
+    """Test that --working-directory is passed to the API when provided."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run") as mock_subprocess,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+    ):
+
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
+
+        result = runner.invoke(
+            launch,
+            [
+                "--agents",
+                "test-agent",
+                "--yolo",
+                "--working-directory",
+                "/remote/path",
+            ],
+        )
+
+        assert result.exit_code == 0
+        params = mock_post.call_args.kwargs["params"]
+        assert params["working_directory"] == "/remote/path"
+
+
+def test_launch_headless_message_sends_to_terminal():
+    """Test headless mode with message waits for IDLE then sends and polls for output."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+        patch("cli_agent_orchestrator.cli.commands.launch.time.sleep"),
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
+
+        poll_resp = MagicMock()
+        poll_resp.raise_for_status.return_value = None
+        poll_resp.json.return_value = {"status": "completed"}
+
+        output_resp = MagicMock()
+        output_resp.raise_for_status.return_value = None
+        output_resp.json.return_value = {"output": "task done"}
+
+        mock_get.side_effect = [poll_resp, output_resp]
+
+        result = runner.invoke(
+            launch,
+            [
+                "--agents",
+                "test-agent",
+                "--headless",
+                "--yolo",
+                "do something",
+            ],
+        )
+
+        assert result.exit_code == 0
+        assert "task done" in result.output
+        mock_wait.assert_called_once()
+        # Two POST calls: create session + send message
+        assert mock_post.call_count == 2
 
 
 def test_launch_invalid_provider():
@@ -55,12 +133,15 @@ def test_launch_with_session_name():
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run") as mock_subprocess,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
         mock_post.return_value.json.return_value = {
             "session_name": "custom-session",
+            "id": "test-terminal-id",
             "name": "test-terminal",
         }
         mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
 
         result = runner.invoke(
             launch, ["--agents", "test-agent", "--session-name", "custom-session", "--yolo"]
@@ -120,6 +201,78 @@ def test_launch_headless_mode():
         assert result.exit_code == 0
         # In headless mode, subprocess.run should not be called
         mock_subprocess.assert_not_called()
+
+
+def test_launch_non_headless_waits_for_idle_before_attach():
+    """Non-headless launch must wait for IDLE/COMPLETED before tmux attach.
+
+    Regression guard for #220: attaching before the TUI finishes initializing
+    races with input-handler wiring and silently drops keystrokes. The wait
+    must be called with the terminal id before subprocess.run.
+    """
+    runner = CliRunner()
+
+    call_order = []
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run") as mock_subprocess,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+
+        def record_wait(*a, **kw):
+            call_order.append("wait")
+            return True
+
+        def record_attach(*a, **kw):
+            call_order.append("attach")
+
+        mock_wait.side_effect = record_wait
+        mock_subprocess.side_effect = record_attach
+
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
+
+        assert result.exit_code == 0
+        mock_wait.assert_called_once()
+        wait_args = mock_wait.call_args
+        assert wait_args.args[0] == "test-terminal-id"
+        assert call_order == ["wait", "attach"]
+
+
+def test_launch_non_headless_attaches_even_if_wait_times_out():
+    """Non-headless launch warns but still attaches if the idle wait times out.
+
+    The wait is advisory: orphaning the session in tmux (by refusing to attach)
+    would be worse than letting the user inspect a slow-initializing session.
+    """
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run") as mock_subprocess,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = False
+
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
+
+        assert result.exit_code == 0
+        assert "did not reach idle within 120s" in result.output
+        mock_subprocess.assert_called_once()
+        attach_cmd = mock_subprocess.call_args.args[0]
+        assert attach_cmd[:2] == ["tmux", "attach-session"]
 
 
 def test_launch_workspace_confirmation_accepted():
@@ -218,12 +371,15 @@ def test_launch_yolo_sets_unrestricted_allowed_tools():
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
         patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run") as mock_subprocess,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
         mock_post.return_value.json.return_value = {
             "session_name": "test-session",
+            "id": "test-terminal-id",
             "name": "test-terminal",
         }
         mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
 
         result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
 
@@ -293,3 +449,150 @@ def test_launch_builtin_profile_resolves_role_defaults():
         params = call_args.kwargs["params"]
         # Supervisor should only have MCP server tools
         assert "@cao-mcp-server" in params["allowed_tools"]
+
+
+def test_launch_headless_message_conductor_not_ready():
+    """Test headless+message raises when conductor does not become ready."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = False
+
+        result = runner.invoke(
+            launch,
+            [
+                "--agents",
+                "test-agent",
+                "--headless",
+                "--yolo",
+                "do something",
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert "did not become ready" in result.output
+
+
+def test_launch_headless_message_poll_error_status():
+    """Test headless+message raises when terminal reaches error status during poll."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+        patch("cli_agent_orchestrator.cli.commands.launch.time.sleep"),
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
+
+        poll_resp = MagicMock()
+        poll_resp.raise_for_status.return_value = None
+        poll_resp.json.return_value = {"status": "error"}
+        mock_get.return_value = poll_resp
+
+        result = runner.invoke(
+            launch,
+            [
+                "--agents",
+                "test-agent",
+                "--headless",
+                "--yolo",
+                "do something",
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert "ERROR" in result.output
+
+
+def test_launch_headless_message_poll_processing_then_completed():
+    """Test headless+message poll loop sleeps when status is processing before completing."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.get") as mock_get,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+        patch("cli_agent_orchestrator.cli.commands.launch.time.sleep"),
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
+
+        processing_resp = MagicMock()
+        processing_resp.raise_for_status.return_value = None
+        processing_resp.json.return_value = {"status": "processing"}
+
+        completed_resp = MagicMock()
+        completed_resp.raise_for_status.return_value = None
+        completed_resp.json.return_value = {"status": "completed"}
+
+        output_resp = MagicMock()
+        output_resp.raise_for_status.return_value = None
+        output_resp.json.return_value = {"output": "done"}
+
+        mock_get.side_effect = [processing_resp, completed_resp, output_resp]
+
+        result = runner.invoke(
+            launch,
+            [
+                "--agents",
+                "test-agent",
+                "--headless",
+                "--yolo",
+                "do something",
+            ],
+        )
+
+        assert result.exit_code == 0
+        assert "done" in result.output
+
+
+def test_launch_honors_profile_provider_when_flag_not_given():
+    """When --provider is not passed, provider is omitted from POST params (server resolves it)."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run"),
+        patch(
+            "cli_agent_orchestrator.utils.agent_profiles.resolve_provider",
+            return_value="claude_code",
+        ) as mock_resolve,
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+
+        result = runner.invoke(
+            launch,
+            ["--agents", "code_supervisor", "--headless"],
+            input="y\n",
+        )
+
+        assert result.exit_code == 0
+        mock_resolve.assert_called_once()
+        params = mock_post.call_args.kwargs["params"]
+        # provider is NOT sent — server-side resolution handles it
+        assert "provider" not in params

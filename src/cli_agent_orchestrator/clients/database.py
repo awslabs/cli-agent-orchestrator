@@ -191,6 +191,22 @@ def list_all_terminals() -> List[Dict[str, Any]]:
         ]
 
 
+def list_pending_receiver_ids_by_provider(provider: str) -> List[str]:
+    """List receiver terminal IDs with pending messages for a specific provider."""
+    with SessionLocal() as db:
+        rows = (
+            db.query(InboxModel.receiver_id)
+            .join(TerminalModel, TerminalModel.id == InboxModel.receiver_id)
+            .filter(
+                TerminalModel.provider == provider,
+                InboxModel.status == MessageStatus.PENDING.value,
+            )
+            .distinct()
+            .all()
+        )
+        return [row[0] for row in rows]
+
+
 def delete_terminal(terminal_id: str) -> bool:
     """Delete terminal metadata."""
     with SessionLocal() as db:
