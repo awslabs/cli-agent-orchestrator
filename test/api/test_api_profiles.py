@@ -120,6 +120,16 @@ class TestInstallAgentProfileEndpoint:
         assert response.status_code == 400
         assert response.json()["detail"] == "Agent profile not found: missing"
 
+    def test_returns_400_for_invalid_provider(self, client) -> None:
+        """Invalid providers should be rejected by the install service."""
+        response = client.post(
+            "/agents/profiles/install",
+            json={"source": "developer", "provider": "bad_provider"},
+        )
+
+        assert response.status_code == 400
+        assert "Invalid provider 'bad_provider'" in response.json()["detail"]
+
     def test_returns_422_for_malformed_env_vars(self, client) -> None:
         """Env vars with the wrong type should be rejected by Pydantic validation."""
         response = client.post(

@@ -264,6 +264,17 @@ class TestInstallAgent:
             success=False, message="Agent profile not found: missing-agent"
         )
 
+    def test_install_returns_failure_for_invalid_provider(
+        self, install_paths: dict[str, Path]
+    ) -> None:
+        """Unknown providers should fail before any source or env side effects."""
+        result = install_agent("missing-agent", "bad_provider", {"API_TOKEN": "secret"})
+
+        assert result.success is False
+        assert result.message.startswith("Invalid provider 'bad_provider'.")
+        assert "kiro_cli" in result.message
+        assert not install_paths["env_file"].exists()
+
     def test_install_returns_failure_for_download_errors(
         self, install_paths: dict[str, Path]
     ) -> None:

@@ -120,6 +120,16 @@ def install_agent(
 ) -> InstallResult:
     """Install an agent profile for the requested provider."""
     try:
+        valid_providers = [provider_type.value for provider_type in ProviderType]
+        if provider not in valid_providers:
+            return InstallResult(
+                success=False,
+                message=(
+                    f"Invalid provider '{provider}'. "
+                    f"Valid providers: {', '.join(valid_providers)}"
+                ),
+            )
+
         if source.startswith(("http://", "https://")):
             agent_name = _download_agent(source)
             source_kind: Literal["url", "file", "name"] = "url"
