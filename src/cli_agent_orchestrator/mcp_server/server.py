@@ -14,6 +14,7 @@ from cli_agent_orchestrator.constants import API_BASE_URL, DEFAULT_PROVIDER
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 from cli_agent_orchestrator.utils.terminal import generate_session_name, wait_until_terminal_status
 
 logger = logging.getLogger(__name__)
@@ -124,7 +125,8 @@ def _create_terminal(
         response.raise_for_status()
         terminal_metadata = response.json()
 
-        provider = terminal_metadata["provider"]
+        # Treat the supervisor provider as a fallback, not an explicit override.
+        provider = resolve_provider(agent_profile, fallback_provider=terminal_metadata["provider"])
         session_name = terminal_metadata["session_name"]
         parent_allowed_tools = terminal_metadata.get("allowed_tools")
 
@@ -163,6 +165,7 @@ def _create_terminal(
     else:
         # Create new session with terminal
         session_name = generate_session_name()
+        provider = resolve_provider(agent_profile, fallback_provider=provider)
         params = {
             "provider": provider,
             "agent_profile": agent_profile,

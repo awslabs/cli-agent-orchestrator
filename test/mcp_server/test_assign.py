@@ -1,11 +1,98 @@
 """Tests for assign MCP tool."""
 
 import os
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+from cli_agent_orchestrator.constants import API_BASE_URL
 from cli_agent_orchestrator.mcp_server.server import _build_assign_description
+
+
+class TestCreateTerminalProviderResolution:
+    """Tests for provider resolution used by dispatched worker terminals."""
+
+    @patch(
+        "cli_agent_orchestrator.mcp_server.server._resolve_child_allowed_tools", return_value=None
+    )
+    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="claude_code")
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_existing_session_respects_child_profile_provider(
+        self, mock_requests, mock_resolve_provider, mock_allowed_tools
+    ):
+        """Worker profile provider should override the supervisor provider."""
+        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+
+        metadata_response = MagicMock()
+        metadata_response.json.return_value = {
+            "provider": "kiro_cli",
+            "session_name": "cao-session",
+            "allowed_tools": None,
+        }
+        metadata_response.raise_for_status.return_value = None
+
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-1", "provider": "claude_code"}
+        post_response.raise_for_status.return_value = None
+
+        mock_requests.get.return_value = metadata_response
+        mock_requests.post.return_value = post_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "supervisor-1"}):
+            terminal_id, provider = _create_terminal("reviewer", "/repo")
+
+        assert terminal_id == "worker-1"
+        assert provider == "claude_code"
+        mock_resolve_provider.assert_called_once_with("reviewer", fallback_provider="kiro_cli")
+        mock_requests.post.assert_called_once_with(
+            f"{API_BASE_URL}/sessions/cao-session/terminals",
+            params={
+                "provider": "claude_code",
+                "agent_profile": "reviewer",
+                "working_directory": "/repo",
+            },
+        )
+
+    @patch(
+        "cli_agent_orchestrator.mcp_server.server._resolve_child_allowed_tools", return_value=None
+    )
+    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="kiro_cli")
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_existing_session_falls_back_to_supervisor_provider(
+        self, mock_requests, mock_resolve_provider, mock_allowed_tools
+    ):
+        """Worker without a provider should inherit the supervisor provider."""
+        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+
+        metadata_response = MagicMock()
+        metadata_response.json.return_value = {
+            "provider": "kiro_cli",
+            "session_name": "cao-session",
+            "allowed_tools": None,
+        }
+        metadata_response.raise_for_status.return_value = None
+
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-2", "provider": "kiro_cli"}
+        post_response.raise_for_status.return_value = None
+
+        mock_requests.get.return_value = metadata_response
+        mock_requests.post.return_value = post_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "supervisor-1"}):
+            terminal_id, provider = _create_terminal("reviewer", "/repo")
+
+        assert terminal_id == "worker-2"
+        assert provider == "kiro_cli"
+        mock_resolve_provider.assert_called_once_with("reviewer", fallback_provider="kiro_cli")
+        mock_requests.post.assert_called_once_with(
+            f"{API_BASE_URL}/sessions/cao-session/terminals",
+            params={
+                "provider": "kiro_cli",
+                "agent_profile": "reviewer",
+                "working_directory": "/repo",
+            },
+        )
 
 
 class TestAssignSenderIdInjection:
