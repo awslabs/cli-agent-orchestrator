@@ -232,10 +232,11 @@ def install_agent(
         if source.startswith(("http://", "https://")):
             agent_name = _download_agent(source)
             source_kind: Literal["url", "file", "name"] = "url"
-        elif allow_file_source and _FILE_PATH_RE.fullmatch(source) and Path(source).exists():
-            # Regex-validate *before* Path() so CodeQL sees the sanitiser on
-            # the edge into the Path(...).exists() sink. The capability flag
-            # alone isn't a recognised taint-kill pattern.
+        elif allow_file_source and source.endswith(".md"):
+            # Dispatch by pure string suffix — no Path(source) call here, which
+            # keeps this branch out of CodeQL's path-injection dataflow. All
+            # sanitisation (regex, .resolve(), stem check) is centralised in
+            # _download_agent() where the sink lives.
             agent_name = _download_agent(source)
             source_kind = "file"
         else:

@@ -163,38 +163,9 @@ jobs:
           fail-on-severity: high
           deny-licenses: GPL-3.0, AGPL-3.0
 
-  codeql:
-    name: CodeQL Analysis
-    runs-on: ubuntu-latest
-    # Run on every PR and main push so taint-analysis alerts surface as CI
-    # failures instead of waiting for the repo-level "default setup" schedule.
-    permissions:
-      contents: read
-      security-events: write
-      actions: read
-
-    strategy:
-      fail-fast: false
-      matrix:
-        language: [python, javascript-typescript]
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
-        with:
-          languages: ${{ matrix.language }}
-          # security-and-quality widens beyond the default `security-extended`
-          # to also pick up things like `py/request-without-timeout` that were
-          # hiding behind the SSRF alert.
-          queries: security-and-quality
-
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@v3
-
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
-        with:
-          category: "/language:${{ matrix.language }}"
+# NOTE: CodeQL runs via GitHub's "default setup" (visible as the `Analyze (...)`
+# checks on every PR). Adding a workflow-based CodeQL job here would conflict
+# with default setup ("CodeQL analyses from advanced configurations cannot be
+# processed when the default setup is enabled") and fail uploads. To widen the
+# query suite beyond the default, toggle default setup off in
+# Settings → Code security → CodeQL default setup and re-add a workflow job.
