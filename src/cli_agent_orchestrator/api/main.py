@@ -263,7 +263,14 @@ async def get_agent_profile_endpoint(name: str) -> Dict:
 
 @app.post("/agents/profiles/install")
 async def install_agent_profile_endpoint(request: InstallAgentProfileRequest) -> InstallResult:
-    """Install an agent profile for a target provider."""
+    """Install an agent profile for a target provider.
+
+    HTTP (and transitively ``cao-ops-mcp``, which calls this endpoint) is an
+    untrusted surface. ``install_agent()`` only accepts bare profile names or
+    https:// URLs; local filesystem paths are handled by the CLI entry point
+    alone. A remote caller therefore cannot coerce the server into reading
+    arbitrary ``.md`` files from disk.
+    """
     result = install_agent(
         source=request.source,
         provider=request.provider,

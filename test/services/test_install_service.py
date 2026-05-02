@@ -158,6 +158,7 @@ class TestInstallAgent:
         """URL sources should be downloaded into the local store and installed for Q CLI."""
         mock_response = MagicMock()
         mock_response.text = _profile_text(name="downloaded-agent")
+        mock_response.is_redirect = False
         mock_response.raise_for_status.return_value = None
 
         with patch(
@@ -165,7 +166,7 @@ class TestInstallAgent:
             return_value=mock_response,
         ) as mock_get:
             result = install_agent(
-                "https://example.com/downloaded-agent.md",
+                "https://raw.githubusercontent.com/org/repo/main/downloaded-agent.md",
                 "q_cli",
                 {"API_TOKEN": "secret-token"},
             )
@@ -174,25 +175,33 @@ class TestInstallAgent:
         assert result.agent_name == "downloaded-agent"
         assert result.source_kind == "url"
         assert result.unresolved_vars == ["BASE_URL"]
-        mock_get.assert_called_once_with("https://example.com/downloaded-agent.md")
+        mock_get.assert_called_once_with(
+            "https://raw.githubusercontent.com/org/repo/main/downloaded-agent.md",
+            timeout=(5, 30),
+            allow_redirects=False,
+        )
         assert (install_paths["local_store_dir"] / "downloaded-agent.md").exists()
 
         q_config = json.loads((install_paths["q_dir"] / "downloaded-agent.json").read_text())
         assert q_config["mcpServers"]["service"]["env"]["API_TOKEN"] == "secret-token"
         assert q_config["mcpServers"]["service"]["env"]["BASE_URL"] == "${BASE_URL}"
 
-    def test_install_from_path_copies_profile_and_writes_copilot_config(
-        self, install_paths: dict[str, Path], tmp_path: Path
+    def test_install_from_local_store_writes_copilot_config(
+        self, install_paths: dict[str, Path]
     ) -> None:
-        """File path sources should be copied to local store and converted for Copilot."""
-        source_profile = tmp_path / "copilot-agent.md"
-        source_profile.write_text(_profile_text(name="copilot-agent"), encoding="utf-8")
+        """Bare names resolved from the local store should be converted for Copilot.
 
-        result = install_agent(str(source_profile), "copilot_cli", {"API_TOKEN": "secret-token"})
+        File-path handling moved to the CLI (``_copy_local_profile_to_store``)
+        so the service only ever sees the bare stem. That's the shape under
+        test here.
+        """
+        local_profile = install_paths["local_store_dir"] / "copilot-agent.md"
+        local_profile.write_text(_profile_text(name="copilot-agent"), encoding="utf-8")
+
+        result = install_agent("copilot-agent", "copilot_cli", {"API_TOKEN": "secret-token"})
 
         assert result.success is True
-        assert result.source_kind == "file"
-        assert (install_paths["local_store_dir"] / "copilot-agent.md").exists()
+        assert result.source_kind == "name"
         agent_file = install_paths["copilot_dir"] / "copilot-agent.agent.md"
         assert agent_file.exists()
         post = frontmatter.loads(agent_file.read_text(encoding="utf-8"))
@@ -283,22 +292,25 @@ class TestInstallAgent:
             "cli_agent_orchestrator.services.install_service.requests.get",
             side_effect=requests.RequestException("boom"),
         ):
-            result = install_agent("https://example.com/missing-agent.md", "q_cli")
+            result = install_agent(
+                "https://raw.githubusercontent.com/org/repo/main/missing-agent.md",
+                "q_cli",
+            )
 
         assert result.success is False
         assert result.message == "Failed to download agent: boom"
 
     def test_install_returns_failure_when_copilot_prompt_missing(
-        self, install_paths: dict[str, Path], tmp_path: Path
+        self, install_paths: dict[str, Path]
     ) -> None:
         """Copilot installs should fail when both system_prompt and prompt are empty."""
-        source_profile = tmp_path / "empty-copilot.md"
-        source_profile.write_text(
+        local_profile = install_paths["local_store_dir"] / "empty-copilot.md"
+        local_profile.write_text(
             "---\nname: empty-copilot\ndescription: Test agent\nprompt: '   '\n---\n   \n",
             encoding="utf-8",
         )
 
-        result = install_agent(str(source_profile), "copilot_cli")
+        result = install_agent("empty-copilot", "copilot_cli")
 
         assert result.success is False
         assert "has no usable prompt content for Copilot" in result.message
@@ -307,28 +319,24 @@ class TestInstallAgent:
         """URL sources must point at a .md file."""
         mock_response = MagicMock()
         mock_response.text = "not a profile"
+        mock_response.is_redirect = False
         mock_response.raise_for_status.return_value = None
 
         with patch(
             "cli_agent_orchestrator.services.install_service.requests.get",
             return_value=mock_response,
         ):
-            result = install_agent("https://example.com/agent.txt", "kiro_cli")
+            result = install_agent(
+                "https://raw.githubusercontent.com/org/repo/main/agent.txt",
+                "kiro_cli",
+            )
 
         assert result.success is False
-        assert result.message == "Failed to install agent: URL must point to a .md file"
-
-    def test_install_rejects_file_path_without_md_suffix(
-        self, install_paths: dict[str, Path], tmp_path: Path
-    ) -> None:
-        """File path sources must end in .md."""
-        source_file = tmp_path / "agent.txt"
-        source_file.write_text("not a profile", encoding="utf-8")
-
-        result = install_agent(str(source_file), "kiro_cli")
-
-        assert result.success is False
-        assert result.message == "Failed to install agent: File must be a .md file"
+        # Path regex is the first sanitiser on the URL branch and rejects non-.md
+        # paths before the explicit suffix check is reached. Either message is a
+        # correct failure — assert on the stable prefix.
+        assert "Failed to install agent:" in result.message
+        assert ".md" in result.message
 
     def test_install_returns_failure_for_unexpected_errors(
         self, install_paths: dict[str, Path]
@@ -346,6 +354,104 @@ class TestInstallAgent:
         assert result.success is False
         assert "Failed to install agent" in result.message
         assert "Unexpected error" in result.message
+
+
+class TestInstallAgentHardening:
+    """Tests covering the SSRF / path-injection hardening on install_agent."""
+
+    def test_rejects_http_url(self, install_paths: dict[str, Path]) -> None:
+        result = install_agent(
+            "http://raw.githubusercontent.com/org/repo/main/agent.md", "kiro_cli"
+        )
+        assert result.success is False
+        assert "https://" in result.message
+
+    def test_rejects_url_with_disallowed_host(self, install_paths: dict[str, Path]) -> None:
+        result = install_agent("https://evil.example.com/agent.md", "kiro_cli")
+        assert result.success is False
+        assert "not in the allowed downloader hosts" in result.message
+
+    def test_rejects_url_with_traversal_filename(self, install_paths: dict[str, Path]) -> None:
+        result = install_agent(
+            "https://raw.githubusercontent.com/x/..%2Fetc%2Fpasswd.md",
+            "kiro_cli",
+        )
+        assert result.success is False
+
+    def test_rejects_url_redirect_response(self, install_paths: dict[str, Path]) -> None:
+        mock_response = MagicMock()
+        mock_response.is_redirect = True
+        with patch(
+            "cli_agent_orchestrator.services.install_service.requests.get",
+            return_value=mock_response,
+        ):
+            result = install_agent(
+                "https://raw.githubusercontent.com/org/repo/main/agent.md",
+                "kiro_cli",
+            )
+        assert result.success is False
+        assert "Redirects are not allowed" in result.message
+
+    def test_env_var_extends_host_allowlist(
+        self, install_paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CAO_PROFILE_ALLOWED_HOSTS", "profiles.internal.corp")
+        mock_response = MagicMock()
+        mock_response.text = _profile_text(name="corp-agent")
+        mock_response.is_redirect = False
+        mock_response.raise_for_status.return_value = None
+
+        with patch(
+            "cli_agent_orchestrator.services.install_service.requests.get",
+            return_value=mock_response,
+        ):
+            result = install_agent("https://profiles.internal.corp/corp-agent.md", "kiro_cli")
+
+        assert result.success is True
+        assert result.agent_name == "corp-agent"
+
+    def test_service_rejects_local_file_path(
+        self, install_paths: dict[str, Path], tmp_path: Path
+    ) -> None:
+        """install_agent() rejects every file-path-shaped source.
+
+        File handling lives in the CLI entry point only. Any caller into the
+        service layer (HTTP, MCP, direct) that passes a filesystem path must
+        be refused — otherwise the HTTP-reachable surface could be coerced
+        into reading arbitrary ``.md`` files from the server's disk.
+        """
+        source_profile = tmp_path / "developer.md"
+        source_profile.write_text(_profile_text(name="developer"), encoding="utf-8")
+
+        result = install_agent(str(source_profile), "kiro_cli")
+
+        assert result.success is False
+        # Absolute paths contain `/`, which fails _PROFILE_NAME_RE. The URL
+        # branch only fires for http(s):// prefixes, so a bare /tmp/... path
+        # lands on the name branch and is rejected there.
+        assert "Invalid profile name" in result.message
+
+    def test_rejects_profile_name_with_traversal(self, install_paths: dict[str, Path]) -> None:
+        result = install_agent("../../etc/passwd", "kiro_cli")
+        assert result.success is False
+        assert "Invalid profile name" in result.message
+
+    def test_rejects_profile_name_with_slash(self, install_paths: dict[str, Path]) -> None:
+        result = install_agent("foo/bar", "kiro_cli")
+        assert result.success is False
+        assert "Invalid profile name" in result.message
+
+    def test_rejects_traversal_shaped_source(self, install_paths: dict[str, Path]) -> None:
+        """Traversal-looking strings hit the service and are refused.
+
+        ``../../etc/passwd.md`` is neither a valid profile name (slashes and
+        dots fail ``_PROFILE_NAME_RE``) nor a URL (no scheme), so the service
+        layer rejects it at the boundary. File-path handling — if any — must
+        happen inside the CLI entry point before the service sees the string.
+        """
+        for traversal in ("../../etc/passwd.md", "/tmp/foo/../etc/passwd.md"):
+            result = install_agent(traversal, "kiro_cli")
+            assert result.success is False
 
 
 def _create_skill(folder: Path, name: str, description: str, body: str = "# Skill\n\nBody") -> None:
@@ -640,15 +746,15 @@ class TestInstallAgentEnvBehaviour:
         assert result.unresolved_vars is None
 
     def test_install_end_to_end_keeps_placeholders_in_context_file(
-        self, install_paths: dict[str, Path], tmp_path: Path
+        self, install_paths: dict[str, Path]
     ) -> None:
         """Context file must preserve ${VAR} placeholders; resolved secrets must not appear."""
         install_paths["env_file"].write_text(
             "API_TOKEN=integration-secret\nSERVICE_URL=http://127.0.0.1:27124\n",
             encoding="utf-8",
         )
-        source_profile = tmp_path / "service-agent.md"
-        source_profile.write_text(
+        local_profile = install_paths["local_store_dir"] / "service-agent.md"
+        local_profile.write_text(
             "---\n"
             "name: service-agent\n"
             "description: Integration test profile\n"
@@ -663,7 +769,7 @@ class TestInstallAgentEnvBehaviour:
             encoding="utf-8",
         )
 
-        result = install_agent(str(source_profile), "claude_code")
+        result = install_agent("service-agent", "claude_code")
 
         assert result.success is True
         installed_text = (install_paths["context_dir"] / "service-agent.md").read_text(
