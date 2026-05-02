@@ -37,7 +37,7 @@ def info():
             try:
                 # Call API to get session details
                 url = f"http://{SERVER_HOST}:{SERVER_PORT}/sessions/{session_name}"
-                response = requests.get(url)
+                response = requests.get(url, timeout=(3, 5))
 
                 if response.status_code == 200:
                     data = response.json()
@@ -48,6 +48,8 @@ def info():
                     click.echo(
                         f"Session ID: {session_name} (Warning: Session not found in CAO server)"
                     )
+            except requests.exceptions.Timeout:
+                click.echo(f"Session ID: {session_name} (Warning: Request to CAO server timed out)")
             except requests.exceptions.RequestException:
                 click.echo(f"Session ID: {session_name} (Warning: Could not connect to CAO server)")
         else:
