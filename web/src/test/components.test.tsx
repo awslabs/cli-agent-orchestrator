@@ -1,9 +1,23 @@
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { StatusBadge } from '../components/StatusBadge'
 import { ErrorBoundary } from '../components/ErrorBoundary'
 import { ConfirmModal } from '../components/ConfirmModal'
 import { FALLBACK_PROVIDERS } from '../components/AgentPanel'
+import { ProfilesPanel } from '../components/ProfilesPanel'
+import { api } from '../api'
+
+vi.mock('../api', () => ({
+  api: {
+    listProfiles: vi.fn(),
+  },
+}))
+
+const mockProfiles = [
+  { name: 'code_supervisor', description: 'Supervisor Agent', source: 'built-in' },
+  { name: 'developer', description: 'Developer Agent', source: 'installed' },
+  { name: 'reviewer', description: 'Reviewer Agent', source: 'kiro' },
+]
 
 describe('StatusBadge', () => {
   it('renders idle status', () => {
@@ -178,5 +192,82 @@ describe('FALLBACK_PROVIDERS', () => {
     const effective = noProviders.length > 0 ? noProviders : FALLBACK_PROVIDERS.map(n => ({ name: n, binary: '', installed: true }))
     const names = effective.map(p => p.name)
     expect(names).toContain('opencode_cli')
+  })
+})
+
+describe('ProfilesPanel', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('shows loading state before data arrives', () => {
+    vi.mocked(api.listProfiles).mockReturnValue(new Promise(() => {}))
+    render(<ProfilesPanel />)
+    expect(screen.getByText('Loading profiles...')).toBeInTheDocument()
+  })
+
+  it('shows empty state when API returns []', async () => {
+    vi.mocked(api.listProfiles).mockResolvedValue([])
+    render(<ProfilesPanel />)
+    await waitFor(() => {
+      expect(screen.getByText('No profiles found.')).toBeInTheDocument()
+    })
+    expect(screen.getByText(/cao install/)).toBeInTheDocument()
+  })
+
+  it('renders each profile with name, description, and source badge', async () => {
+    vi.mocked(api.listProfiles).mockResolvedValue(mockProfiles)
+    render(<ProfilesPanel />)
+    await waitFor(() => {
+      expect(screen.getByText('code_supervisor')).toBeInTheDocument()
+    })
+    expect(screen.getByText('developer')).toBeInTheDocument()
+    expect(screen.getByText('reviewer')).toBeInTheDocument()
+    expect(screen.getByText('built-in')).toBeInTheDocument()
+    expect(screen.getByText('installed')).toBeInTheDocument()
+    expect(screen.getByText('kiro')).toBeInTheDocument()
+  })
+
+  it('clicking a row expands it; clicking again collapses; only one expanded at a time', async () => {
+    vi.mocked(api.listProfiles).mockResolvedValue(mockProfiles)
+    render(<ProfilesPanel />)
+    await waitFor(() => {
+      expect(screen.getByText('code_supervisor')).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByText('code_supervisor'))
+    expect(screen.getByText('Supervisor Agent')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByText('developer'))
+    expect(screen.getByText('Developer Agent')).toBeInTheDocument()
+    expect(screen.queryByText('Supervisor Agent')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByText('developer'))
+    expect(screen.queryByText('Developer Agent')).not.toBeInTheDocument()
+  })
+
+  it('source badge uses blue for built-in and emerald otherwise', async () => {
+    vi.mocked(api.listProfiles).mockResolvedValue(mockProfiles)
+    render(<ProfilesPanel />)
+    await waitFor(() => {
+      expect(screen.getByText('code_supervisor')).toBeInTheDocument()
+    })
+
+    expect(screen.getByText('built-in').className).toMatch(/bg-blue/)
+    expect(screen.getByText('installed').className).toMatch(/bg-emerald/)
+    expect(screen.getByText('kiro').className).toMatch(/bg-emerald/)
+  })
+
+  it('filters out profiles with "managed by AIM" in description', async () => {
+    const profilesWithAIM = [
+      ...mockProfiles,
+      { name: 'aim_agent', description: 'This agent is managed by AIM', source: 'built-in' },
+    ]
+    vi.mocked(api.listProfiles).mockResolvedValue(profilesWithAIM)
+    render(<ProfilesPanel />)
+    await waitFor(() => {
+      expect(screen.getByText('code_supervisor')).toBeInTheDocument()
+    })
+    expect(screen.queryByText('aim_agent')).not.toBeInTheDocument()
   })
 })

@@ -1,17 +1,33 @@
 import { useState, useEffect } from 'react'
 import { api, AgentProfileInfo } from '../api'
+import { useStore } from '../store'
 import { Package, ChevronDown, ChevronRight } from 'lucide-react'
 
+const SOURCE_BADGE = {
+  blue: 'bg-blue-900/50 text-blue-400',
+  green: 'bg-emerald-900/50 text-emerald-400',
+}
+
 export function ProfilesPanel() {
+  const { showSnackbar } = useStore()
   const [profiles, setProfiles] = useState<AgentProfileInfo[]>([])
   const [loading, setLoading] = useState(true)
   const [expanded, setExpanded] = useState<string | null>(null)
 
+  const fetchProfiles = async () => {
+    try {
+      const all = await api.listProfiles()
+      setProfiles(all.filter(p => !p.description.includes('managed by AIM')))
+    } catch {
+      showSnackbar({ type: 'error', message: 'Failed to load profiles' })
+      setProfiles([])
+    } finally {
+      setLoading(false)
+    }
+  }
+
   useEffect(() => {
-    api.listProfiles()
-      .then(all => setProfiles(all.filter(p => !p.description.includes('managed by AIM'))))
-      .catch(() => {})
-      .finally(() => setLoading(false))
+    fetchProfiles()
   }, [])
 
   if (loading) {
@@ -49,9 +65,7 @@ export function ProfilesPanel() {
                     )}
                     <Package size={14} className="text-blue-400 shrink-0" />
                     <span className="text-sm text-gray-200 font-medium truncate">{p.name}</span>
-                    <span className={`text-xs px-2 py-0.5 rounded-full shrink-0 ${
-                      p.source === 'built-in' ? 'bg-blue-900/50 text-blue-400' : 'bg-emerald-900/50 text-emerald-400'
-                    }`}>
+                    <span className={`text-xs px-2 py-0.5 rounded-full shrink-0 ${p.source === 'built-in' ? SOURCE_BADGE.blue : SOURCE_BADGE.green}`}>
                       {p.source}
                     </span>
                   </div>
@@ -61,16 +75,8 @@ export function ProfilesPanel() {
                   <div className="px-4 pb-4 border-t border-gray-700/30 pt-3">
                     <div className="space-y-2 text-sm">
                       <div>
-                        <span className="text-gray-500">Name: </span>
-                        <span className="text-gray-200">{p.name}</span>
-                      </div>
-                      <div>
                         <span className="text-gray-500">Description: </span>
                         <span className="text-gray-200">{p.description || '—'}</span>
-                      </div>
-                      <div>
-                        <span className="text-gray-500">Source: </span>
-                        <span className="text-gray-200">{p.source}</span>
                       </div>
                     </div>
                   </div>
