@@ -60,16 +60,6 @@ class InstallResult(BaseModel):
 # CodeQL also recognises this regex as a path-injection sanitiser.
 _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
-# Local filesystem paths to .md profiles (CLI only). Allows relative, absolute,
-# and ~ paths with typical path chars, but the leading negative lookahead
-# forbids any `..` anywhere in the string, which was the actual weakness
-# CodeQL flagged on an earlier revision: the prior character-class-only regex
-# matched "../../etc/passwd.md" because `.` and `/` are both in the class.
-# CodeQL recognises fullmatch against this pattern as a path-injection
-# sanitiser because the disallowed-`..` assertion constrains the resolved
-# path to stay below the caller's cwd/home rather than escaping upward.
-_FILE_PATH_RE = re.compile(r"^(?!.*\.\.)[A-Za-z0-9_./~\-]{1,512}\.md$")
-
 # URL path component for allowlisted hosts. Each segment must start with an
 # alphanumeric, which forbids "..", "." and hidden segments — and by extension
 # any traversal sequence. Used to rebuild a safe URL from validated parts,
@@ -101,77 +91,60 @@ def _allowed_download_hosts() -> frozenset:
 
 
 def _download_agent(source: str) -> str:
-    """Download or copy an agent profile into the local agent store."""
+    """Download an agent profile from an https:// URL into the local store.
+
+    File-path handling deliberately does NOT live in this module: only the CLI
+    has legitimate filesystem trust, and keeping Path(user_input) out of the
+    HTTP-reachable layer closes an entire class of py/path-injection alerts
+    (CodeQL #49/#61 kept reopening while this lived here). The CLI entry point
+    copies local files into LOCAL_AGENT_STORE_DIR itself and then calls
+    install_agent() with the bare stem, which flows through the "name" branch.
+    """
     LOCAL_AGENT_STORE_DIR.mkdir(parents=True, exist_ok=True)
 
-    if source.startswith(("http://", "https://")):
-        # SSRF hardening: narrow what a caller-provided URL can reach before any
-        # network I/O happens. https-only rules out http://169.254.169.254/...;
-        # the host allowlist rules out arbitrary internal services; the path
-        # regex rules out crafted paths that would write outside the store.
-        parsed = urlparse(source)
-        if parsed.scheme != "https":
-            raise ValueError("Profile URL must use https://")
-        host = (parsed.hostname or "").lower()
-        allowed_hosts = _allowed_download_hosts()
-        if host not in allowed_hosts:
-            raise ValueError(
-                f"Host '{host}' is not in the allowed downloader hosts. "
-                "Set CAO_PROFILE_ALLOWED_HOSTS to extend the allowlist."
-            )
-        # Reject any URL that carries a query string, fragment, or userinfo —
-        # none of them are meaningful for a static .md fetch and each is an
-        # SSRF foothold (credentials encoded in @, redirect targets in ?next=).
-        if parsed.query or parsed.fragment or parsed.username or parsed.password:
-            raise ValueError("Profile URL must not include query, fragment, or userinfo.")
-        if not _SAFE_URL_PATH_RE.fullmatch(parsed.path):
-            raise ValueError("URL path must match /segment/.../file.md with no traversal segments.")
-        filename = parsed.path.rsplit("/", 1)[-1]
-        if not _PROFILE_NAME_RE.fullmatch(filename[: -len(".md")]):
-            raise ValueError("URL filename stem must match [A-Za-z0-9_-]{1,64}")
+    # SSRF hardening: narrow what a caller-provided URL can reach before any
+    # network I/O happens. https-only rules out http://169.254.169.254/...;
+    # the host allowlist rules out arbitrary internal services; the path
+    # regex rules out crafted paths that would write outside the store.
+    parsed = urlparse(source)
+    if parsed.scheme != "https":
+        raise ValueError("Profile URL must use https://")
+    host = (parsed.hostname or "").lower()
+    allowed_hosts = _allowed_download_hosts()
+    if host not in allowed_hosts:
+        raise ValueError(
+            f"Host '{host}' is not in the allowed downloader hosts. "
+            "Set CAO_PROFILE_ALLOWED_HOSTS to extend the allowlist."
+        )
+    # Reject any URL that carries a query string, fragment, or userinfo —
+    # none of them are meaningful for a static .md fetch and each is an
+    # SSRF foothold (credentials encoded in @, redirect targets in ?next=).
+    if parsed.query or parsed.fragment or parsed.username or parsed.password:
+        raise ValueError("Profile URL must not include query, fragment, or userinfo.")
+    if not _SAFE_URL_PATH_RE.fullmatch(parsed.path):
+        raise ValueError("URL path must match /segment/.../file.md with no traversal segments.")
+    filename = parsed.path.rsplit("/", 1)[-1]
+    if not _PROFILE_NAME_RE.fullmatch(filename[: -len(".md")]):
+        raise ValueError("URL filename stem must match [A-Za-z0-9_-]{1,64}")
 
-        # Look up the canonical host from the allowlist instead of passing the
-        # parsed host back through. Belt-and-braces: even if a caller smuggled
-        # an odd Unicode codepoint that normalised into a known host name,
-        # `safe_host` is guaranteed to be a literal from our trust root.
-        safe_host = next(h for h in allowed_hosts if h == host)
-        safe_url = f"https://{safe_host}{parsed.path}"
+    # Look up the canonical host from the allowlist instead of passing the
+    # parsed host back through. Belt-and-braces: even if a caller smuggled
+    # an odd Unicode codepoint that normalised into a known host name,
+    # `safe_host` is guaranteed to be a literal from our trust root.
+    safe_host = next(h for h in allowed_hosts if h == host)
+    safe_url = f"https://{safe_host}{parsed.path}"
 
-        # allow_redirects=False + explicit is_redirect check: an allowlisted
-        # host could otherwise 302 us to an internal target (IMDS, admin panel)
-        # and the allowlist would never see the hop.
-        response = requests.get(safe_url, timeout=_HTTP_TIMEOUT, allow_redirects=False)
-        if response.is_redirect:
-            raise ValueError("Redirects are not allowed for profile downloads.")
-        response.raise_for_status()
+    # allow_redirects=False + explicit is_redirect check: an allowlisted
+    # host could otherwise 302 us to an internal target (IMDS, admin panel)
+    # and the allowlist would never see the hop.
+    response = requests.get(safe_url, timeout=_HTTP_TIMEOUT, allow_redirects=False)
+    if response.is_redirect:
+        raise ValueError("Redirects are not allowed for profile downloads.")
+    response.raise_for_status()
 
-        dest_file = LOCAL_AGENT_STORE_DIR / filename
-        dest_file.write_text(response.text, encoding="utf-8")
-        return dest_file.stem
-
-    # File-path branch is only reachable when install_agent() was called with
-    # allow_file_source=True (CLI). Validate the string shape *before* touching
-    # Path() — CodeQL only recognises a regex fullmatch as a path-injection
-    # sanitiser if it sits on the data-flow edge ahead of the sink.
-    if not _FILE_PATH_RE.fullmatch(source):
-        raise ValueError("File path must be a .md file matching [A-Za-z0-9_./~-]{1,512}.")
-    source_path = Path(source).resolve()
-    if source_path.exists():
-        if source_path.suffix != ".md":
-            raise ValueError("File must be a .md file")
-        if not _PROFILE_NAME_RE.fullmatch(source_path.stem):
-            raise ValueError(f"File stem '{source_path.stem}' must match [A-Za-z0-9_-]{{1,64}}")
-
-        # Reconstruct the destination path from the validated stem rather than
-        # reusing source_path.name. Even though .resolve() + stem regex already
-        # constrain the name, building from the regex-validated string gives
-        # CodeQL a clean literal-flow edge into the Path() sink.
-        safe_name = f"{source_path.stem}.md"
-        dest_file = LOCAL_AGENT_STORE_DIR / safe_name
-        dest_file.write_text(source_path.read_text(encoding="utf-8"), encoding="utf-8")
-        return dest_file.stem
-
-    raise FileNotFoundError(f"Source not found: {source}")
+    dest_file = LOCAL_AGENT_STORE_DIR / filename
+    dest_file.write_text(response.text, encoding="utf-8")
+    return dest_file.stem
 
 
 def parse_env_assignment(env_assignment: str) -> Tuple[str, str]:
@@ -211,16 +184,16 @@ def install_agent(
     source: str,
     provider: str,
     env_vars: Optional[Dict[str, str]] = None,
-    *,
-    allow_file_source: bool = True,
 ) -> InstallResult:
     """Install an agent profile for the requested provider.
 
-    ``allow_file_source`` is the capability flag that distinguishes trusted
-    (CLI) from untrusted (HTTP / MCP) callers. Passing True means the caller
-    already owns the local filesystem; passing False blocks the file-path
-    branch so a remote caller cannot drive the server into reading arbitrary
-    ``.md`` files from disk (CodeQL py/path-injection).
+    ``source`` must be either an https:// URL on the allowlist or a bare
+    profile name matching ``_PROFILE_NAME_RE``. Local ``.md`` file paths
+    are deliberately NOT accepted here — the CLI copies user files into
+    the local store itself and then calls this function with the resulting
+    bare stem. This split is what lets the HTTP/MCP surface share this
+    function safely: every caller reaches the same two sanitised shapes,
+    and no call site constructs ``Path(user_input)`` through this module.
     """
     try:
         valid_providers = [provider_type.value for provider_type in ProviderType]
@@ -235,14 +208,7 @@ def install_agent(
 
         if source.startswith(("http://", "https://")):
             agent_name = _download_agent(source)
-            source_kind: Literal["url", "file", "name"] = "url"
-        elif allow_file_source and source.endswith(".md"):
-            # Dispatch by pure string suffix — no Path(source) call here, which
-            # keeps this branch out of CodeQL's path-injection dataflow. All
-            # sanitisation (regex, .resolve(), stem check) is centralised in
-            # _download_agent() where the sink lives.
-            agent_name = _download_agent(source)
-            source_kind = "file"
+            source_kind: Literal["url", "name"] = "url"
         else:
             # `source` is treated as a bare profile name and feeds
             # _read_agent_profile_source() which builds Path objects from it.

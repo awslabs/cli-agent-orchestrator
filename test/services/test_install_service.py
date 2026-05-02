@@ -186,18 +186,22 @@ class TestInstallAgent:
         assert q_config["mcpServers"]["service"]["env"]["API_TOKEN"] == "secret-token"
         assert q_config["mcpServers"]["service"]["env"]["BASE_URL"] == "${BASE_URL}"
 
-    def test_install_from_path_copies_profile_and_writes_copilot_config(
-        self, install_paths: dict[str, Path], tmp_path: Path
+    def test_install_from_local_store_writes_copilot_config(
+        self, install_paths: dict[str, Path]
     ) -> None:
-        """File path sources should be copied to local store and converted for Copilot."""
-        source_profile = tmp_path / "copilot-agent.md"
-        source_profile.write_text(_profile_text(name="copilot-agent"), encoding="utf-8")
+        """Bare names resolved from the local store should be converted for Copilot.
 
-        result = install_agent(str(source_profile), "copilot_cli", {"API_TOKEN": "secret-token"})
+        File-path handling moved to the CLI (``_copy_local_profile_to_store``)
+        so the service only ever sees the bare stem. That's the shape under
+        test here.
+        """
+        local_profile = install_paths["local_store_dir"] / "copilot-agent.md"
+        local_profile.write_text(_profile_text(name="copilot-agent"), encoding="utf-8")
+
+        result = install_agent("copilot-agent", "copilot_cli", {"API_TOKEN": "secret-token"})
 
         assert result.success is True
-        assert result.source_kind == "file"
-        assert (install_paths["local_store_dir"] / "copilot-agent.md").exists()
+        assert result.source_kind == "name"
         agent_file = install_paths["copilot_dir"] / "copilot-agent.agent.md"
         assert agent_file.exists()
         post = frontmatter.loads(agent_file.read_text(encoding="utf-8"))
@@ -297,16 +301,16 @@ class TestInstallAgent:
         assert result.message == "Failed to download agent: boom"
 
     def test_install_returns_failure_when_copilot_prompt_missing(
-        self, install_paths: dict[str, Path], tmp_path: Path
+        self, install_paths: dict[str, Path]
     ) -> None:
         """Copilot installs should fail when both system_prompt and prompt are empty."""
-        source_profile = tmp_path / "empty-copilot.md"
-        source_profile.write_text(
+        local_profile = install_paths["local_store_dir"] / "empty-copilot.md"
+        local_profile.write_text(
             "---\nname: empty-copilot\ndescription: Test agent\nprompt: '   '\n---\n   \n",
             encoding="utf-8",
         )
 
-        result = install_agent(str(source_profile), "copilot_cli")
+        result = install_agent("empty-copilot", "copilot_cli")
 
         assert result.success is False
         assert "has no usable prompt content for Copilot" in result.message
@@ -333,24 +337,6 @@ class TestInstallAgent:
         # correct failure — assert on the stable prefix.
         assert "Failed to install agent:" in result.message
         assert ".md" in result.message
-
-    def test_install_rejects_file_path_without_md_suffix(
-        self, install_paths: dict[str, Path], tmp_path: Path
-    ) -> None:
-        """File path sources must end in .md."""
-        source_file = tmp_path / "agent.txt"
-        source_file.write_text("not a profile", encoding="utf-8")
-
-        result = install_agent(str(source_file), "kiro_cli")
-
-        assert result.success is False
-        # `_FILE_PATH_RE` enforces the .md suffix at the `install_agent` boundary
-        # before the file branch is reached. A non-.md path fails the regex and
-        # falls through to the bare-profile-name branch, which returns this
-        # structured error. Either error is a correct rejection of a non-.md
-        # source; we just confirm the caller got a failure and that .md is
-        # mentioned somewhere in the error surface.
-        assert ".md" in result.message or "Invalid profile name" in result.message
 
     def test_install_returns_failure_for_unexpected_errors(
         self, install_paths: dict[str, Path]
@@ -424,16 +410,25 @@ class TestInstallAgentHardening:
         assert result.success is True
         assert result.agent_name == "corp-agent"
 
-    def test_api_mode_rejects_local_file_path(
+    def test_service_rejects_local_file_path(
         self, install_paths: dict[str, Path], tmp_path: Path
     ) -> None:
-        """allow_file_source=False (API/MCP) must reject local filesystem paths."""
+        """install_agent() rejects every file-path-shaped source.
+
+        File handling lives in the CLI entry point only. Any caller into the
+        service layer (HTTP, MCP, direct) that passes a filesystem path must
+        be refused — otherwise the HTTP-reachable surface could be coerced
+        into reading arbitrary ``.md`` files from the server's disk.
+        """
         source_profile = tmp_path / "developer.md"
         source_profile.write_text(_profile_text(name="developer"), encoding="utf-8")
 
-        result = install_agent(str(source_profile), "kiro_cli", allow_file_source=False)
+        result = install_agent(str(source_profile), "kiro_cli")
 
         assert result.success is False
+        # Absolute paths contain `/`, which fails _PROFILE_NAME_RE. The URL
+        # branch only fires for http(s):// prefixes, so a bare /tmp/... path
+        # lands on the name branch and is rejected there.
         assert "Invalid profile name" in result.message
 
     def test_rejects_profile_name_with_traversal(self, install_paths: dict[str, Path]) -> None:
@@ -446,28 +441,17 @@ class TestInstallAgentHardening:
         assert result.success is False
         assert "Invalid profile name" in result.message
 
-    def test_rejects_file_path_with_traversal(self, install_paths: dict[str, Path]) -> None:
-        """File paths containing `..` must be rejected before Path() construction.
+    def test_rejects_traversal_shaped_source(self, install_paths: dict[str, Path]) -> None:
+        """Traversal-looking strings hit the service and are refused.
 
-        The earlier character-class-only regex matched `../../etc/passwd.md`
-        because `.` and `/` were both in the class; CodeQL flagged it
-        correctly as a path-injection sink (alert #61). The tightened
-        negative-lookahead regex closes that without losing legitimate
-        `./`, `/abs/`, or `~/` paths.
+        ``../../etc/passwd.md`` is neither a valid profile name (slashes and
+        dots fail ``_PROFILE_NAME_RE``) nor a URL (no scheme), so the service
+        layer rejects it at the boundary. File-path handling — if any — must
+        happen inside the CLI entry point before the service sees the string.
         """
-        result = install_agent("../../etc/passwd.md", "kiro_cli")
-        assert result.success is False
-        # Exact error surface depends on which sanitiser fires first
-        # (the `.md`-suffix dispatch sends this to _download_agent, which
-        # rejects it via _FILE_PATH_RE). Either way, the install fails.
-        assert result.success is False
-
-    def test_rejects_file_path_with_embedded_traversal(
-        self, install_paths: dict[str, Path]
-    ) -> None:
-        """Traversal segments anywhere in the path are rejected, not just prefix."""
-        result = install_agent("/tmp/foo/../etc/passwd.md", "kiro_cli")
-        assert result.success is False
+        for traversal in ("../../etc/passwd.md", "/tmp/foo/../etc/passwd.md"):
+            result = install_agent(traversal, "kiro_cli")
+            assert result.success is False
 
 
 def _create_skill(folder: Path, name: str, description: str, body: str = "# Skill\n\nBody") -> None:
@@ -762,15 +746,15 @@ class TestInstallAgentEnvBehaviour:
         assert result.unresolved_vars is None
 
     def test_install_end_to_end_keeps_placeholders_in_context_file(
-        self, install_paths: dict[str, Path], tmp_path: Path
+        self, install_paths: dict[str, Path]
     ) -> None:
         """Context file must preserve ${VAR} placeholders; resolved secrets must not appear."""
         install_paths["env_file"].write_text(
             "API_TOKEN=integration-secret\nSERVICE_URL=http://127.0.0.1:27124\n",
             encoding="utf-8",
         )
-        source_profile = tmp_path / "service-agent.md"
-        source_profile.write_text(
+        local_profile = install_paths["local_store_dir"] / "service-agent.md"
+        local_profile.write_text(
             "---\n"
             "name: service-agent\n"
             "description: Integration test profile\n"
@@ -785,7 +769,7 @@ class TestInstallAgentEnvBehaviour:
             encoding="utf-8",
         )
 
-        result = install_agent(str(source_profile), "claude_code")
+        result = install_agent("service-agent", "claude_code")
 
         assert result.success is True
         installed_text = (install_paths["context_dir"] / "service-agent.md").read_text(
