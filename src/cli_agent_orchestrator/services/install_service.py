@@ -54,8 +54,26 @@ class InstallResult(BaseModel):
     source_kind: Optional[Literal["url", "file", "name"]] = None
 
 
+# Profile names are used as filesystem path segments under LOCAL_AGENT_STORE_DIR
+# and provider agent dirs. Restricting to [A-Za-z0-9_-] with a 64-char cap blocks
+# traversal ("../etc/passwd"), separators, and absolute paths at the boundary.
+# CodeQL also recognises this regex as a path-injection sanitiser.
 _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
+# Local filesystem paths to .md profiles (CLI only). Allows relative and
+# absolute paths with typical path chars, but forbids shell metacharacters
+# and embedded URL schemes. Must be validated *before* Path() construction
+# so CodeQL sees the sanitiser ahead of the sink.
+_FILE_PATH_RE = re.compile(r"^[A-Za-z0-9_./~\-]{1,512}\.md$")
+
+# URL path component for allowlisted hosts. Each segment must start with an
+# alphanumeric, which forbids "..", "." and hidden segments — and by extension
+# any traversal sequence. Used to rebuild a safe URL from validated parts,
+# which is the CodeQL-recognised SSRF sanitisation pattern.
+_SAFE_URL_PATH_RE = re.compile(r"^(/[A-Za-z0-9_][A-Za-z0-9_.-]*)+\.md$")
+
+# SSRF guard: only fetch profiles from hosts we explicitly trust. Operators can
+# extend via CAO_PROFILE_ALLOWED_HOSTS (e.g. an internal profile mirror).
 _DEFAULT_ALLOWED_HOSTS = frozenset(
     {
         "github.com",
@@ -63,7 +81,10 @@ _DEFAULT_ALLOWED_HOSTS = frozenset(
     }
 )
 
-_HTTP_TIMEOUT = (5, 30)  # (connect, read) seconds
+# (connect, read) seconds. Tighter than a single-number timeout: 5s connect fails
+# fast on a dead/hostile IP; 30s read leaves room for flaky residential networks
+# without letting a slow-loris peer tie up a cao-server worker indefinitely.
+_HTTP_TIMEOUT = (5, 30)
 
 
 def _allowed_download_hosts() -> frozenset:
@@ -80,22 +101,42 @@ def _download_agent(source: str) -> str:
     LOCAL_AGENT_STORE_DIR.mkdir(parents=True, exist_ok=True)
 
     if source.startswith(("http://", "https://")):
+        # SSRF hardening: narrow what a caller-provided URL can reach before any
+        # network I/O happens. https-only rules out http://169.254.169.254/...;
+        # the host allowlist rules out arbitrary internal services; the path
+        # regex rules out crafted paths that would write outside the store.
         parsed = urlparse(source)
         if parsed.scheme != "https":
             raise ValueError("Profile URL must use https://")
         host = (parsed.hostname or "").lower()
-        if host not in _allowed_download_hosts():
+        allowed_hosts = _allowed_download_hosts()
+        if host not in allowed_hosts:
             raise ValueError(
                 f"Host '{host}' is not in the allowed downloader hosts. "
                 "Set CAO_PROFILE_ALLOWED_HOSTS to extend the allowlist."
             )
-        filename = Path(parsed.path).name
-        if not filename.endswith(".md"):
-            raise ValueError("URL must point to a .md file")
-        if not _PROFILE_NAME_RE.fullmatch(Path(filename).stem):
+        # Reject any URL that carries a query string, fragment, or userinfo —
+        # none of them are meaningful for a static .md fetch and each is an
+        # SSRF foothold (credentials encoded in @, redirect targets in ?next=).
+        if parsed.query or parsed.fragment or parsed.username or parsed.password:
+            raise ValueError("Profile URL must not include query, fragment, or userinfo.")
+        if not _SAFE_URL_PATH_RE.fullmatch(parsed.path):
+            raise ValueError("URL path must match /segment/.../file.md with no traversal segments.")
+        filename = parsed.path.rsplit("/", 1)[-1]
+        if not _PROFILE_NAME_RE.fullmatch(filename[: -len(".md")]):
             raise ValueError("URL filename stem must match [A-Za-z0-9_-]{1,64}")
 
-        response = requests.get(source, timeout=_HTTP_TIMEOUT, allow_redirects=False)
+        # Look up the canonical host from the allowlist instead of passing the
+        # parsed host back through. Belt-and-braces: even if a caller smuggled
+        # an odd Unicode codepoint that normalised into a known host name,
+        # `safe_host` is guaranteed to be a literal from our trust root.
+        safe_host = next(h for h in allowed_hosts if h == host)
+        safe_url = f"https://{safe_host}{parsed.path}"
+
+        # allow_redirects=False + explicit is_redirect check: an allowlisted
+        # host could otherwise 302 us to an internal target (IMDS, admin panel)
+        # and the allowlist would never see the hop.
+        response = requests.get(safe_url, timeout=_HTTP_TIMEOUT, allow_redirects=False)
         if response.is_redirect:
             raise ValueError("Redirects are not allowed for profile downloads.")
         response.raise_for_status()
@@ -104,6 +145,12 @@ def _download_agent(source: str) -> str:
         dest_file.write_text(response.text, encoding="utf-8")
         return dest_file.stem
 
+    # File-path branch is only reachable when install_agent() was called with
+    # allow_file_source=True (CLI). Validate the string shape *before* touching
+    # Path() — CodeQL only recognises a regex fullmatch as a path-injection
+    # sanitiser if it sits on the data-flow edge ahead of the sink.
+    if not _FILE_PATH_RE.fullmatch(source):
+        raise ValueError("File path must be a .md file matching [A-Za-z0-9_./~-]{1,512}.")
     source_path = Path(source).resolve()
     if source_path.exists():
         if source_path.suffix != ".md":
@@ -111,7 +158,12 @@ def _download_agent(source: str) -> str:
         if not _PROFILE_NAME_RE.fullmatch(source_path.stem):
             raise ValueError(f"File stem '{source_path.stem}' must match [A-Za-z0-9_-]{{1,64}}")
 
-        dest_file = LOCAL_AGENT_STORE_DIR / source_path.name
+        # Reconstruct the destination path from the validated stem rather than
+        # reusing source_path.name. Even though .resolve() + stem regex already
+        # constrain the name, building from the regex-validated string gives
+        # CodeQL a clean literal-flow edge into the Path() sink.
+        safe_name = f"{source_path.stem}.md"
+        dest_file = LOCAL_AGENT_STORE_DIR / safe_name
         dest_file.write_text(source_path.read_text(encoding="utf-8"), encoding="utf-8")
         return dest_file.stem
 
@@ -160,10 +212,11 @@ def install_agent(
 ) -> InstallResult:
     """Install an agent profile for the requested provider.
 
-    ``allow_file_source`` controls whether ``source`` may refer to a local
-    filesystem path. CLI callers leave this True (the user owns the local
-    filesystem); HTTP/MCP callers must pass False so a remote caller cannot
-    coerce the server into reading arbitrary files.
+    ``allow_file_source`` is the capability flag that distinguishes trusted
+    (CLI) from untrusted (HTTP / MCP) callers. Passing True means the caller
+    already owns the local filesystem; passing False blocks the file-path
+    branch so a remote caller cannot drive the server into reading arbitrary
+    ``.md`` files from disk (CodeQL py/path-injection).
     """
     try:
         valid_providers = [provider_type.value for provider_type in ProviderType]
@@ -179,10 +232,17 @@ def install_agent(
         if source.startswith(("http://", "https://")):
             agent_name = _download_agent(source)
             source_kind: Literal["url", "file", "name"] = "url"
-        elif allow_file_source and Path(source).exists():
+        elif allow_file_source and _FILE_PATH_RE.fullmatch(source) and Path(source).exists():
+            # Regex-validate *before* Path() so CodeQL sees the sanitiser on
+            # the edge into the Path(...).exists() sink. The capability flag
+            # alone isn't a recognised taint-kill pattern.
             agent_name = _download_agent(source)
             source_kind = "file"
         else:
+            # `source` is treated as a bare profile name and feeds
+            # _read_agent_profile_source() which builds Path objects from it.
+            # Enforce the sanitiser at the boundary so every downstream sink
+            # (agent_profiles.py and the provider-dir loop) sees safe input.
             if not _PROFILE_NAME_RE.fullmatch(source):
                 return InstallResult(
                     success=False,
