@@ -766,42 +766,46 @@ class TestGeminiCliProviderBuildCommand:
         assert settings["mcpServers"]["my-server"]["args"] == ["server.js"]
         assert settings["mcpServers"]["my-server"]["env"]["CAO_TERMINAL_ID"] == "term-1"
 
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
-    def test_build_command_profile_no_mcp(self, mock_load, mock_tmux, tmp_path):
-        """Test command with profile writes GEMINI.md and uses short -i acknowledgment."""
+    def test_build_command_profile_no_mcp(self, mock_load, tmp_path):
+        """Test command writes GEMINI.md in a per-terminal workspace and cds into it."""
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.name = "developer"
         mock_profile.system_prompt = "You are a developer"
         mock_profile.mcpServers = None
         mock_load.return_value = mock_profile
-        mock_tmux.get_pane_working_directory.return_value = str(tmp_path)
 
-        provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
-        command = provider._build_gemini_command()
+        with patch(
+            "cli_agent_orchestrator.providers.gemini_cli.GEMINI_WORKSPACES_DIR",
+            tmp_path / "gemini-workspaces",
+        ):
+            provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
+            command = provider._build_gemini_command()
 
-        # GEMINI.md written with full system prompt
-        gemini_md = tmp_path / "GEMINI.md"
+        workspace = tmp_path / "gemini-workspaces" / "term-1"
+        gemini_md = workspace / "GEMINI.md"
         assert gemini_md.exists()
-        assert gemini_md.read_text() == "You are a developer"
-        assert provider._gemini_md_path == str(gemini_md)
+        assert gemini_md.read_text(encoding="utf-8") == "You are a developer"
+        assert provider._gemini_workspace == workspace
+        # Launcher cd's into the workspace before exec'ing gemini.
+        assert command.startswith(f"cd {workspace} && gemini")
         # Short -i acknowledgment (not the full system prompt)
         assert "-i" in command
         assert "developer" in command
         assert "GEMINI.md" in command
-        # Full system prompt should NOT be in the command (it's in GEMINI.md)
+        # Full system prompt must stay in GEMINI.md, not in the command.
         assert "You are a developer" not in command
 
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
-    def test_build_command_system_prompt_backs_up_existing_gemini_md(
-        self, mock_load, mock_tmux, tmp_path
-    ):
-        """Test GEMINI.md backup when user already has one in the working directory."""
-        # Create an existing GEMINI.md
-        existing_md = tmp_path / "GEMINI.md"
-        existing_md.write_text("User's existing instructions")
+    def test_build_command_does_not_touch_user_gemini_md(self, mock_load, tmp_path):
+        """Each terminal writes to its own workspace — never to the user's cwd."""
+        # Simulate a GEMINI.md already sitting in what was previously treated as
+        # the working directory. The fix is that we never look at cwd at all.
+        user_project = tmp_path / "user_project"
+        user_project.mkdir()
+        user_gemini = user_project / "GEMINI.md"
+        user_gemini.write_text("User's real instructions")
 
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -809,39 +813,45 @@ class TestGeminiCliProviderBuildCommand:
         mock_profile.system_prompt = "Supervisor agent prompt"
         mock_profile.mcpServers = None
         mock_load.return_value = mock_profile
-        mock_tmux.get_pane_working_directory.return_value = str(tmp_path)
 
-        provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
-        command = provider._build_gemini_command()
+        with patch(
+            "cli_agent_orchestrator.providers.gemini_cli.GEMINI_WORKSPACES_DIR",
+            tmp_path / "gemini-workspaces",
+        ):
+            provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
+            provider._build_gemini_command()
 
-        # -i flag with short acknowledgment
-        assert "-i" in command
-        # GEMINI.md backed up and overwritten with full system prompt
-        assert existing_md.read_text() == "Supervisor agent prompt"
-        backup = tmp_path / "GEMINI.md.cao_backup"
-        assert backup.exists()
-        assert backup.read_text() == "User's existing instructions"
-        assert provider._gemini_md_backup_path == str(backup)
+        # User's GEMINI.md must be untouched.
+        assert user_gemini.read_text() == "User's real instructions"
+        # Provider wrote its own prompt to its isolated workspace.
+        workspace_md = tmp_path / "gemini-workspaces" / "term-1" / "GEMINI.md"
+        assert workspace_md.read_text(encoding="utf-8") == "Supervisor agent prompt"
 
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
-    def test_build_command_system_prompt_no_working_dir(self, mock_load, mock_tmux):
-        """Test -i flag still used when working dir unavailable (GEMINI.md skipped)."""
+    def test_build_command_parallel_terminals_do_not_collide(self, mock_load, tmp_path):
+        """Two terminals built concurrently get distinct workspaces, not a shared one."""
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.name = "developer"
-        mock_profile.system_prompt = "You are a developer"
         mock_profile.mcpServers = None
         mock_load.return_value = mock_profile
-        mock_tmux.get_pane_working_directory.return_value = None
 
-        provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
-        command = provider._build_gemini_command()
+        with patch(
+            "cli_agent_orchestrator.providers.gemini_cli.GEMINI_WORKSPACES_DIR",
+            tmp_path / "gemini-workspaces",
+        ):
+            mock_profile.system_prompt = "Prompt A"
+            provider_a = GeminiCliProvider("term-A", "session-A", "window-A", agent_profile="dev")
+            provider_a._build_gemini_command()
 
-        # -i flag with short acknowledgment (GEMINI.md skipped since no working dir)
-        assert "-i" in command
-        assert "developer" in command
-        assert provider._gemini_md_path is None
+            mock_profile.system_prompt = "Prompt B"
+            provider_b = GeminiCliProvider("term-B", "session-B", "window-B", agent_profile="dev")
+            provider_b._build_gemini_command()
+
+        md_a = tmp_path / "gemini-workspaces" / "term-A" / "GEMINI.md"
+        md_b = tmp_path / "gemini-workspaces" / "term-B" / "GEMINI.md"
+        assert md_a.read_text(encoding="utf-8") == "Prompt A"
+        assert md_b.read_text(encoding="utf-8") == "Prompt B"
 
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
     def test_build_command_profile_error(self, mock_load):
@@ -996,36 +1006,28 @@ class TestGeminiCliProviderMisc:
         assert provider._mcp_server_names == []
         assert provider._initialized is False
 
-    def test_cleanup_removes_gemini_md(self, tmp_path):
-        """Test cleanup removes GEMINI.md file created for system prompt."""
-        gemini_md = tmp_path / "GEMINI.md"
-        gemini_md.write_text("Supervisor agent prompt")
+    def test_cleanup_removes_workspace_directory(self, tmp_path):
+        """Test cleanup removes the per-terminal workspace directory and its contents."""
+        workspace = tmp_path / "gemini-workspaces" / "term-1"
+        workspace.mkdir(parents=True)
+        (workspace / "GEMINI.md").write_text("Supervisor agent prompt")
+        # Arbitrary extra file in the workspace — cleanup should blow it all away.
+        (workspace / "stray.log").write_text("ephemeral")
 
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
-        provider._gemini_md_path = str(gemini_md)
+        provider._gemini_workspace = workspace
         provider.cleanup()
 
-        assert not gemini_md.exists()
-        assert provider._gemini_md_path is None
+        assert not workspace.exists()
+        assert provider._gemini_workspace is None
 
-    def test_cleanup_restores_backup_gemini_md(self, tmp_path):
-        """Test cleanup restores user's original GEMINI.md from backup."""
-        gemini_md = tmp_path / "GEMINI.md"
-        gemini_md.write_text("CAO injected prompt")
-        backup = tmp_path / "GEMINI.md.cao_backup"
-        backup.write_text("User's original instructions")
-
+    def test_cleanup_is_idempotent_when_workspace_missing(self, tmp_path):
+        """Cleanup must not raise when the workspace was already removed."""
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
-        provider._gemini_md_path = str(gemini_md)
-        provider._gemini_md_backup_path = str(backup)
+        provider._gemini_workspace = tmp_path / "does_not_exist"
+        # Should not raise.
         provider.cleanup()
-
-        # Original restored, backup removed
-        assert gemini_md.exists()
-        assert gemini_md.read_text() == "User's original instructions"
-        assert not backup.exists()
-        assert provider._gemini_md_path is None
-        assert provider._gemini_md_backup_path is None
+        assert provider._gemini_workspace is None
 
     def test_provider_inherits_base(self):
         """Test provider inherits from BaseProvider."""
@@ -1040,8 +1042,7 @@ class TestGeminiCliProviderMisc:
         assert provider._initialized is False
         assert provider._agent_profile is None
         assert provider._mcp_server_names == []
-        assert provider._gemini_md_path is None
-        assert provider._gemini_md_backup_path is None
+        assert provider._gemini_workspace is None
         assert provider.terminal_id == "term-1"
         assert provider.session_name == "session-1"
         assert provider.window_name == "window-1"
