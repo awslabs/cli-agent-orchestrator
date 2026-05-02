@@ -13,7 +13,6 @@ Run:
     uv run pytest -m e2e test/e2e/test_skills.py -v -k ClaudeCode
 """
 
-import os
 import subprocess
 import time
 import uuid
@@ -27,7 +26,7 @@ import pytest
 import requests
 
 from cli_agent_orchestrator.cli.commands.init import seed_default_skills
-from cli_agent_orchestrator.constants import API_BASE_URL
+from cli_agent_orchestrator.constants import API_BASE_URL, GEMINI_WORKSPACES_DIR
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -98,10 +97,11 @@ def _run_skill_injection_test(provider: str, agent_profile: str):
         # The catalog is global in Phase 1, so any installed skill should appear.
         if provider == "gemini_cli":
             # Gemini writes the full system prompt (including the skill catalog)
-            # to GEMINI.md in the working directory rather than embedding it in
-            # the CLI command — the command carries only a short role-acknowledge
-            # prompt via -i. Read GEMINI.md directly.
-            payload = _read_gemini_md()
+            # to GEMINI.md inside a per-terminal workspace under
+            # GEMINI_WORKSPACES_DIR / <terminal_id>/. The CLI command carries
+            # only a short role-acknowledge prompt via -i. Read the workspace
+            # GEMINI.md directly.
+            payload = _read_gemini_md(terminal_id)
             source = "GEMINI.md"
         else:
             # Capture the full tmux scrollback (capture-pane -S - reads from the
@@ -129,18 +129,19 @@ def _run_skill_injection_test(provider: str, agent_profile: str):
             cleanup_terminal(terminal_id, actual_session)
 
 
-def _read_gemini_md() -> str:
-    """Read GEMINI.md from the current working directory.
+def _read_gemini_md(terminal_id: str) -> str:
+    """Read GEMINI.md from the per-terminal Gemini workspace.
 
     The Gemini CLI provider writes its system prompt (including the injected
-    skill catalog) to ``GEMINI.md`` in the pane's working directory, which is
-    the same directory the test runs from. Returns empty string if the file
-    does not exist so the caller can produce a useful assertion error.
+    skill catalog) into an isolated per-terminal workspace under
+    ``GEMINI_WORKSPACES_DIR / <terminal_id>/GEMINI.md`` to avoid races with
+    parallel gemini sessions sharing the project cwd. Returns an empty string
+    if the file does not exist so the caller can produce a useful assertion
+    error.
     """
-    path = os.path.join(os.getcwd(), "GEMINI.md")
+    path = GEMINI_WORKSPACES_DIR / terminal_id / "GEMINI.md"
     try:
-        with open(path, encoding="utf-8") as f:
-            return f.read()
+        return path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return ""
 

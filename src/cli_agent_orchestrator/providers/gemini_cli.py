@@ -140,6 +140,41 @@ ERROR_PATTERN = (
 )
 
 
+def _ensure_workspaces_parent_trusted() -> None:
+    """Register ``GEMINI_WORKSPACES_DIR`` as TRUST_PARENT in ``trustedFolders.json``.
+
+    Gemini CLI 0.40+ shows a blocking interactive "Do you trust the files in
+    this folder?" prompt the first time it sees an unknown directory. Our
+    per-terminal workspaces are fresh UUID directories gemini has never
+    encountered, so without this bootstrap every gemini launch would hang at
+    that prompt. Registering the parent once with ``TRUST_PARENT`` covers all
+    current and future per-terminal subdirectories in a single entry.
+
+    Idempotent: reads the existing JSON, only rewrites if the entry is
+    missing or has a weaker trust value. Safe to call on every provider
+    initialization.
+    """
+    trust_file = Path.home() / ".gemini" / "trustedFolders.json"
+    parent = str(GEMINI_WORKSPACES_DIR)
+    try:
+        if trust_file.exists():
+            with open(trust_file) as f:
+                trust_map = json.load(f)
+        else:
+            trust_file.parent.mkdir(parents=True, exist_ok=True)
+            trust_map = {}
+        if trust_map.get(parent) == "TRUST_PARENT":
+            return
+        trust_map[parent] = "TRUST_PARENT"
+        with open(trust_file, "w") as f:
+            json.dump(trust_map, f, indent=2)
+    except Exception as e:
+        # Non-fatal: if we can't pre-trust, the gemini launch will show the
+        # interactive prompt and the caller will see it as an init timeout.
+        # Log so the failure mode is diagnosable.
+        logger.warning(f"Failed to register {parent} in gemini trustedFolders.json: {e}")
+
+
 class GeminiCliProvider(BaseProvider):
     """Provider for Gemini CLI tool integration.
 
@@ -244,6 +279,11 @@ class GeminiCliProvider(BaseProvider):
                     # user's real GEMINI.md in the project. The launcher below
                     # `cd`s into this workspace before exec'ing gemini so the
                     # hierarchical GEMINI.md lookup resolves here first.
+                    # Gemini 0.40+ blocks on a "Do you trust this folder?"
+                    # prompt for unknown directories; pre-register the parent
+                    # with TRUST_PARENT so every per-terminal workspace is
+                    # trusted on first launch.
+                    _ensure_workspaces_parent_trusted()
                     workspace = GEMINI_WORKSPACES_DIR / self.terminal_id
                     workspace.mkdir(parents=True, exist_ok=True)
                     (workspace / "GEMINI.md").write_text(system_prompt, encoding="utf-8")
@@ -653,13 +693,23 @@ class GeminiCliProvider(BaseProvider):
             raise ValueError("No Gemini CLI user query found - no > prefix detected")
 
         # Find the response start after the last query box.
-        # Strategy: skip past the query box bottom border (▄▄▄), then look
-        # for the first ✦ response line or tool call box. If the ✦ is not
+        # Strategy: skip past the query box closing border, then look for
+        # the first ✦ response line or tool call box. If the ✦ is not
         # found (Gemini's Ink TUI may overwrite responses during redraw),
         # use all content after the query box border as fallback.
+        #
+        # Query box layout (reading top-to-bottom in the capture):
+        #   ▄▄▄…   opening border (▄ = LOWER HALF BLOCK)
+        #   >       query text
+        #   ▀▀▀…   closing border (▀ = UPPER HALF BLOCK)
+        # So the line immediately following the query is a ▀ row and is
+        # matched by INPUT_BOX_TOP_PATTERN. Looking for INPUT_BOX_BOTTOM_PATTERN
+        # would skip all the way to the ▄ opening border of the idle prompt
+        # box at the bottom of the screen — past the entire response — which
+        # is exactly why extraction returned empty on gemini-cli 0.40.x.
         query_box_end = last_query_idx + 1
         for i in range(last_query_idx + 1, len(clean_lines)):
-            if re.search(INPUT_BOX_BOTTOM_PATTERN, clean_lines[i]):
+            if re.search(INPUT_BOX_TOP_PATTERN, clean_lines[i]):
                 query_box_end = i + 1
                 break
 
