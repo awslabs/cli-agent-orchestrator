@@ -171,7 +171,6 @@ class TestInstallCommand:
         assert "must match" in result.output
         mock_install.assert_not_called()
 
-
     def test_install_failure_prints_error(self, runner: CliRunner) -> None:
         """Service failures should be surfaced as CLI errors without raising."""
         with patch(
