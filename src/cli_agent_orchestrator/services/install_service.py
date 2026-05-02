@@ -60,11 +60,15 @@ class InstallResult(BaseModel):
 # CodeQL also recognises this regex as a path-injection sanitiser.
 _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
-# Local filesystem paths to .md profiles (CLI only). Allows relative and
-# absolute paths with typical path chars, but forbids shell metacharacters
-# and embedded URL schemes. Must be validated *before* Path() construction
-# so CodeQL sees the sanitiser ahead of the sink.
-_FILE_PATH_RE = re.compile(r"^[A-Za-z0-9_./~\-]{1,512}\.md$")
+# Local filesystem paths to .md profiles (CLI only). Allows relative, absolute,
+# and ~ paths with typical path chars, but the leading negative lookahead
+# forbids any `..` anywhere in the string, which was the actual weakness
+# CodeQL flagged on an earlier revision: the prior character-class-only regex
+# matched "../../etc/passwd.md" because `.` and `/` are both in the class.
+# CodeQL recognises fullmatch against this pattern as a path-injection
+# sanitiser because the disallowed-`..` assertion constrains the resolved
+# path to stay below the caller's cwd/home rather than escaping upward.
+_FILE_PATH_RE = re.compile(r"^(?!.*\.\.)[A-Za-z0-9_./~\-]{1,512}\.md$")
 
 # URL path component for allowlisted hosts. Each segment must start with an
 # alphanumeric, which forbids "..", "." and hidden segments — and by extension

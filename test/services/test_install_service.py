@@ -446,6 +446,29 @@ class TestInstallAgentHardening:
         assert result.success is False
         assert "Invalid profile name" in result.message
 
+    def test_rejects_file_path_with_traversal(self, install_paths: dict[str, Path]) -> None:
+        """File paths containing `..` must be rejected before Path() construction.
+
+        The earlier character-class-only regex matched `../../etc/passwd.md`
+        because `.` and `/` were both in the class; CodeQL flagged it
+        correctly as a path-injection sink (alert #61). The tightened
+        negative-lookahead regex closes that without losing legitimate
+        `./`, `/abs/`, or `~/` paths.
+        """
+        result = install_agent("../../etc/passwd.md", "kiro_cli")
+        assert result.success is False
+        # Exact error surface depends on which sanitiser fires first
+        # (the `.md`-suffix dispatch sends this to _download_agent, which
+        # rejects it via _FILE_PATH_RE). Either way, the install fails.
+        assert result.success is False
+
+    def test_rejects_file_path_with_embedded_traversal(
+        self, install_paths: dict[str, Path]
+    ) -> None:
+        """Traversal segments anywhere in the path are rejected, not just prefix."""
+        result = install_agent("/tmp/foo/../etc/passwd.md", "kiro_cli")
+        assert result.success is False
+
 
 def _create_skill(folder: Path, name: str, description: str, body: str = "# Skill\n\nBody") -> None:
     """Create a skill folder with SKILL.md for catalog-baking tests."""
