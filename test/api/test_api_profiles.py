@@ -104,6 +104,7 @@ class TestInstallAgentProfileEndpoint:
                 "API_TOKEN": "secret-token",
                 "BASE_URL": "http://localhost:27124",
             },
+            allow_file_source=False,
         )
 
     def test_returns_400_for_invalid_source(self, client) -> None:

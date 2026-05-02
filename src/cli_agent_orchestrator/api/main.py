@@ -268,6 +268,7 @@ async def install_agent_profile_endpoint(request: InstallAgentProfileRequest) ->
         source=request.source,
         provider=request.provider,
         env_vars=request.env_vars,
+        allow_file_source=False,
     )
     if not result.success:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=result.message)

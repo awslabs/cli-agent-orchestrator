@@ -1,8 +1,10 @@
 """Service helpers for installing agent profiles."""
 
+import os
 import re
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Tuple
+from urllib.parse import urlparse
 
 import frontmatter
 import requests  # type: ignore[import-untyped]
@@ -52,26 +54,62 @@ class InstallResult(BaseModel):
     source_kind: Optional[Literal["url", "file", "name"]] = None
 
 
+_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+_DEFAULT_ALLOWED_HOSTS = frozenset(
+    {
+        "github.com",
+        "raw.githubusercontent.com",
+    }
+)
+
+_HTTP_TIMEOUT = (5, 30)  # (connect, read) seconds
+
+
+def _allowed_download_hosts() -> frozenset:
+    override = os.environ.get("CAO_PROFILE_ALLOWED_HOSTS")
+    if override:
+        hosts = {h.strip().lower() for h in override.split(",") if h.strip()}
+        if hosts:
+            return frozenset(hosts)
+    return _DEFAULT_ALLOWED_HOSTS
+
+
 def _download_agent(source: str) -> str:
     """Download or copy an agent profile into the local agent store."""
     LOCAL_AGENT_STORE_DIR.mkdir(parents=True, exist_ok=True)
 
     if source.startswith(("http://", "https://")):
-        response = requests.get(source)
-        response.raise_for_status()
-
-        filename = Path(source).name
+        parsed = urlparse(source)
+        if parsed.scheme != "https":
+            raise ValueError("Profile URL must use https://")
+        host = (parsed.hostname or "").lower()
+        if host not in _allowed_download_hosts():
+            raise ValueError(
+                f"Host '{host}' is not in the allowed downloader hosts. "
+                "Set CAO_PROFILE_ALLOWED_HOSTS to extend the allowlist."
+            )
+        filename = Path(parsed.path).name
         if not filename.endswith(".md"):
             raise ValueError("URL must point to a .md file")
+        if not _PROFILE_NAME_RE.fullmatch(Path(filename).stem):
+            raise ValueError("URL filename stem must match [A-Za-z0-9_-]{1,64}")
+
+        response = requests.get(source, timeout=_HTTP_TIMEOUT, allow_redirects=False)
+        if response.is_redirect:
+            raise ValueError("Redirects are not allowed for profile downloads.")
+        response.raise_for_status()
 
         dest_file = LOCAL_AGENT_STORE_DIR / filename
         dest_file.write_text(response.text, encoding="utf-8")
         return dest_file.stem
 
-    source_path = Path(source)
+    source_path = Path(source).resolve()
     if source_path.exists():
         if source_path.suffix != ".md":
             raise ValueError("File must be a .md file")
+        if not _PROFILE_NAME_RE.fullmatch(source_path.stem):
+            raise ValueError(f"File stem '{source_path.stem}' must match [A-Za-z0-9_-]{{1,64}}")
 
         dest_file = LOCAL_AGENT_STORE_DIR / source_path.name
         dest_file.write_text(source_path.read_text(encoding="utf-8"), encoding="utf-8")
@@ -117,8 +155,16 @@ def install_agent(
     source: str,
     provider: str,
     env_vars: Optional[Dict[str, str]] = None,
+    *,
+    allow_file_source: bool = True,
 ) -> InstallResult:
-    """Install an agent profile for the requested provider."""
+    """Install an agent profile for the requested provider.
+
+    ``allow_file_source`` controls whether ``source`` may refer to a local
+    filesystem path. CLI callers leave this True (the user owns the local
+    filesystem); HTTP/MCP callers must pass False so a remote caller cannot
+    coerce the server into reading arbitrary files.
+    """
     try:
         valid_providers = [provider_type.value for provider_type in ProviderType]
         if provider not in valid_providers:
@@ -133,10 +179,19 @@ def install_agent(
         if source.startswith(("http://", "https://")):
             agent_name = _download_agent(source)
             source_kind: Literal["url", "file", "name"] = "url"
-        elif Path(source).exists():
+        elif allow_file_source and Path(source).exists():
             agent_name = _download_agent(source)
             source_kind = "file"
         else:
+            if not _PROFILE_NAME_RE.fullmatch(source):
+                return InstallResult(
+                    success=False,
+                    message=(
+                        f"Invalid profile name '{source}'. "
+                        "Expected a name matching [A-Za-z0-9_-]{1,64}, "
+                        "an https:// URL, or (CLI only) a local .md file path."
+                    ),
+                )
             agent_name = source
             source_kind = "name"
 

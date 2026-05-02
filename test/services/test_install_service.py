@@ -158,6 +158,7 @@ class TestInstallAgent:
         """URL sources should be downloaded into the local store and installed for Q CLI."""
         mock_response = MagicMock()
         mock_response.text = _profile_text(name="downloaded-agent")
+        mock_response.is_redirect = False
         mock_response.raise_for_status.return_value = None
 
         with patch(
@@ -165,7 +166,7 @@ class TestInstallAgent:
             return_value=mock_response,
         ) as mock_get:
             result = install_agent(
-                "https://example.com/downloaded-agent.md",
+                "https://raw.githubusercontent.com/org/repo/main/downloaded-agent.md",
                 "q_cli",
                 {"API_TOKEN": "secret-token"},
             )
@@ -174,7 +175,11 @@ class TestInstallAgent:
         assert result.agent_name == "downloaded-agent"
         assert result.source_kind == "url"
         assert result.unresolved_vars == ["BASE_URL"]
-        mock_get.assert_called_once_with("https://example.com/downloaded-agent.md")
+        mock_get.assert_called_once_with(
+            "https://raw.githubusercontent.com/org/repo/main/downloaded-agent.md",
+            timeout=(5, 30),
+            allow_redirects=False,
+        )
         assert (install_paths["local_store_dir"] / "downloaded-agent.md").exists()
 
         q_config = json.loads((install_paths["q_dir"] / "downloaded-agent.json").read_text())
@@ -283,7 +288,10 @@ class TestInstallAgent:
             "cli_agent_orchestrator.services.install_service.requests.get",
             side_effect=requests.RequestException("boom"),
         ):
-            result = install_agent("https://example.com/missing-agent.md", "q_cli")
+            result = install_agent(
+                "https://raw.githubusercontent.com/org/repo/main/missing-agent.md",
+                "q_cli",
+            )
 
         assert result.success is False
         assert result.message == "Failed to download agent: boom"
@@ -307,13 +315,17 @@ class TestInstallAgent:
         """URL sources must point at a .md file."""
         mock_response = MagicMock()
         mock_response.text = "not a profile"
+        mock_response.is_redirect = False
         mock_response.raise_for_status.return_value = None
 
         with patch(
             "cli_agent_orchestrator.services.install_service.requests.get",
             return_value=mock_response,
         ):
-            result = install_agent("https://example.com/agent.txt", "kiro_cli")
+            result = install_agent(
+                "https://raw.githubusercontent.com/org/repo/main/agent.txt",
+                "kiro_cli",
+            )
 
         assert result.success is False
         assert result.message == "Failed to install agent: URL must point to a .md file"
@@ -346,6 +358,83 @@ class TestInstallAgent:
         assert result.success is False
         assert "Failed to install agent" in result.message
         assert "Unexpected error" in result.message
+
+
+class TestInstallAgentHardening:
+    """Tests covering the SSRF / path-injection hardening on install_agent."""
+
+    def test_rejects_http_url(self, install_paths: dict[str, Path]) -> None:
+        result = install_agent(
+            "http://raw.githubusercontent.com/org/repo/main/agent.md", "kiro_cli"
+        )
+        assert result.success is False
+        assert "https://" in result.message
+
+    def test_rejects_url_with_disallowed_host(self, install_paths: dict[str, Path]) -> None:
+        result = install_agent("https://evil.example.com/agent.md", "kiro_cli")
+        assert result.success is False
+        assert "not in the allowed downloader hosts" in result.message
+
+    def test_rejects_url_with_traversal_filename(self, install_paths: dict[str, Path]) -> None:
+        result = install_agent(
+            "https://raw.githubusercontent.com/x/..%2Fetc%2Fpasswd.md",
+            "kiro_cli",
+        )
+        assert result.success is False
+
+    def test_rejects_url_redirect_response(self, install_paths: dict[str, Path]) -> None:
+        mock_response = MagicMock()
+        mock_response.is_redirect = True
+        with patch(
+            "cli_agent_orchestrator.services.install_service.requests.get",
+            return_value=mock_response,
+        ):
+            result = install_agent(
+                "https://raw.githubusercontent.com/org/repo/main/agent.md",
+                "kiro_cli",
+            )
+        assert result.success is False
+        assert "Redirects are not allowed" in result.message
+
+    def test_env_var_extends_host_allowlist(
+        self, install_paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CAO_PROFILE_ALLOWED_HOSTS", "profiles.internal.corp")
+        mock_response = MagicMock()
+        mock_response.text = _profile_text(name="corp-agent")
+        mock_response.is_redirect = False
+        mock_response.raise_for_status.return_value = None
+
+        with patch(
+            "cli_agent_orchestrator.services.install_service.requests.get",
+            return_value=mock_response,
+        ):
+            result = install_agent("https://profiles.internal.corp/corp-agent.md", "kiro_cli")
+
+        assert result.success is True
+        assert result.agent_name == "corp-agent"
+
+    def test_api_mode_rejects_local_file_path(
+        self, install_paths: dict[str, Path], tmp_path: Path
+    ) -> None:
+        """allow_file_source=False (API/MCP) must reject local filesystem paths."""
+        source_profile = tmp_path / "developer.md"
+        source_profile.write_text(_profile_text(name="developer"), encoding="utf-8")
+
+        result = install_agent(str(source_profile), "kiro_cli", allow_file_source=False)
+
+        assert result.success is False
+        assert "Invalid profile name" in result.message
+
+    def test_rejects_profile_name_with_traversal(self, install_paths: dict[str, Path]) -> None:
+        result = install_agent("../../etc/passwd", "kiro_cli")
+        assert result.success is False
+        assert "Invalid profile name" in result.message
+
+    def test_rejects_profile_name_with_slash(self, install_paths: dict[str, Path]) -> None:
+        result = install_agent("foo/bar", "kiro_cli")
+        assert result.success is False
+        assert "Invalid profile name" in result.message
 
 
 def _create_skill(folder: Path, name: str, description: str, body: str = "# Skill\n\nBody") -> None:
