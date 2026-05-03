@@ -189,7 +189,7 @@ async def get_profile_details(
 
 @mcp.tool()
 async def install_profile(
-    source: Annotated[str, Field(description="Agent name, file path, or URL to install")],
+    source: Annotated[str, Field(description="Agent name or https:// URL to install")],
     provider: Annotated[
         str,
         Field(description="Target provider for the installed profile"),
@@ -203,15 +203,15 @@ async def install_profile(
 
     ## Source Resolution
 
-    The source is resolved in order:
-    1. URL (http:// or https://) — downloaded into the local agent store
-    2. Existing file on disk — copied into the local agent store
-    3. Agent name — looked up in local store, provider dirs, then built-in store
+    Remote callers (HTTP API / MCP) may install by either:
+    1. https:// URL from an allow-listed host (``github.com``,
+       ``raw.githubusercontent.com`` by default; extend via the
+       ``CAO_PROFILE_ALLOWED_HOSTS`` env var on ``cao-server``).
+    2. Profile name matching ``[A-Za-z0-9_-]{1,64}`` — looked up in the local
+       store, provider dirs, then the built-in store.
 
-    Path resolution checks the current working directory, so a bare agent
-    name that collides with a file or directory in CWD will route to path
-    resolution and fail. Use an explicit ``./`` prefix for file paths, or
-    ensure agent names do not collide with CWD contents.
+    Installing by local filesystem path is CLI-only and is rejected from the
+    HTTP API and this MCP tool.
 
     ## Provider Config
 
@@ -220,7 +220,7 @@ async def install_profile(
     - claude_code, codex: context file only, no provider-specific config
 
     Args:
-        source: Agent name, file path, or URL
+        source: Agent name or https:// URL from an allow-listed host
         provider: Target provider (default: kiro_cli)
         env_vars: Optional env vars written to the managed .env before install
 

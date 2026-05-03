@@ -1,8 +1,10 @@
 """Service helpers for installing agent profiles."""
 
+import os
 import re
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Tuple
+from urllib.parse import urlparse
 
 import frontmatter
 import requests  # type: ignore[import-untyped]
@@ -52,32 +54,97 @@ class InstallResult(BaseModel):
     source_kind: Optional[Literal["url", "file", "name"]] = None
 
 
+# Profile names are used as filesystem path segments under LOCAL_AGENT_STORE_DIR
+# and provider agent dirs. Restricting to [A-Za-z0-9_-] with a 64-char cap blocks
+# traversal ("../etc/passwd"), separators, and absolute paths at the boundary.
+# CodeQL also recognises this regex as a path-injection sanitiser.
+_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+# URL path component for allowlisted hosts. Each segment must start with an
+# alphanumeric, which forbids "..", "." and hidden segments — and by extension
+# any traversal sequence. Used to rebuild a safe URL from validated parts,
+# which is the CodeQL-recognised SSRF sanitisation pattern.
+_SAFE_URL_PATH_RE = re.compile(r"^(/[A-Za-z0-9_][A-Za-z0-9_.-]*)+\.md$")
+
+# SSRF guard: only fetch profiles from hosts we explicitly trust. Operators can
+# extend via CAO_PROFILE_ALLOWED_HOSTS (e.g. an internal profile mirror).
+_DEFAULT_ALLOWED_HOSTS = frozenset(
+    {
+        "github.com",
+        "raw.githubusercontent.com",
+    }
+)
+
+# (connect, read) seconds. Tighter than a single-number timeout: 5s connect fails
+# fast on a dead/hostile IP; 30s read leaves room for flaky residential networks
+# without letting a slow-loris peer tie up a cao-server worker indefinitely.
+_HTTP_TIMEOUT = (5, 30)
+
+
+def _allowed_download_hosts() -> frozenset:
+    override = os.environ.get("CAO_PROFILE_ALLOWED_HOSTS")
+    if override:
+        hosts = {h.strip().lower() for h in override.split(",") if h.strip()}
+        if hosts:
+            return frozenset(hosts)
+    return _DEFAULT_ALLOWED_HOSTS
+
+
 def _download_agent(source: str) -> str:
-    """Download or copy an agent profile into the local agent store."""
+    """Download an agent profile from an https:// URL into the local store.
+
+    File-path handling deliberately does NOT live in this module: only the CLI
+    has legitimate filesystem trust, and keeping Path(user_input) out of the
+    HTTP-reachable layer closes an entire class of py/path-injection alerts
+    (CodeQL #49/#61 kept reopening while this lived here). The CLI entry point
+    copies local files into LOCAL_AGENT_STORE_DIR itself and then calls
+    install_agent() with the bare stem, which flows through the "name" branch.
+    """
     LOCAL_AGENT_STORE_DIR.mkdir(parents=True, exist_ok=True)
 
-    if source.startswith(("http://", "https://")):
-        response = requests.get(source)
-        response.raise_for_status()
+    # SSRF hardening: narrow what a caller-provided URL can reach before any
+    # network I/O happens. https-only rules out http://169.254.169.254/...;
+    # the host allowlist rules out arbitrary internal services; the path
+    # regex rules out crafted paths that would write outside the store.
+    parsed = urlparse(source)
+    if parsed.scheme != "https":
+        raise ValueError("Profile URL must use https://")
+    host = (parsed.hostname or "").lower()
+    allowed_hosts = _allowed_download_hosts()
+    if host not in allowed_hosts:
+        raise ValueError(
+            f"Host '{host}' is not in the allowed downloader hosts. "
+            "Set CAO_PROFILE_ALLOWED_HOSTS to extend the allowlist."
+        )
+    # Reject any URL that carries a query string, fragment, or userinfo —
+    # none of them are meaningful for a static .md fetch and each is an
+    # SSRF foothold (credentials encoded in @, redirect targets in ?next=).
+    if parsed.query or parsed.fragment or parsed.username or parsed.password:
+        raise ValueError("Profile URL must not include query, fragment, or userinfo.")
+    if not _SAFE_URL_PATH_RE.fullmatch(parsed.path):
+        raise ValueError("URL path must match /segment/.../file.md with no traversal segments.")
+    filename = parsed.path.rsplit("/", 1)[-1]
+    if not _PROFILE_NAME_RE.fullmatch(filename[: -len(".md")]):
+        raise ValueError("URL filename stem must match [A-Za-z0-9_-]{1,64}")
 
-        filename = Path(source).name
-        if not filename.endswith(".md"):
-            raise ValueError("URL must point to a .md file")
+    # Look up the canonical host from the allowlist instead of passing the
+    # parsed host back through. Belt-and-braces: even if a caller smuggled
+    # an odd Unicode codepoint that normalised into a known host name,
+    # `safe_host` is guaranteed to be a literal from our trust root.
+    safe_host = next(h for h in allowed_hosts if h == host)
+    safe_url = f"https://{safe_host}{parsed.path}"
 
-        dest_file = LOCAL_AGENT_STORE_DIR / filename
-        dest_file.write_text(response.text, encoding="utf-8")
-        return dest_file.stem
+    # allow_redirects=False + explicit is_redirect check: an allowlisted
+    # host could otherwise 302 us to an internal target (IMDS, admin panel)
+    # and the allowlist would never see the hop.
+    response = requests.get(safe_url, timeout=_HTTP_TIMEOUT, allow_redirects=False)
+    if response.is_redirect:
+        raise ValueError("Redirects are not allowed for profile downloads.")
+    response.raise_for_status()
 
-    source_path = Path(source)
-    if source_path.exists():
-        if source_path.suffix != ".md":
-            raise ValueError("File must be a .md file")
-
-        dest_file = LOCAL_AGENT_STORE_DIR / source_path.name
-        dest_file.write_text(source_path.read_text(encoding="utf-8"), encoding="utf-8")
-        return dest_file.stem
-
-    raise FileNotFoundError(f"Source not found: {source}")
+    dest_file = LOCAL_AGENT_STORE_DIR / filename
+    dest_file.write_text(response.text, encoding="utf-8")
+    return dest_file.stem
 
 
 def parse_env_assignment(env_assignment: str) -> Tuple[str, str]:
@@ -118,7 +185,16 @@ def install_agent(
     provider: str,
     env_vars: Optional[Dict[str, str]] = None,
 ) -> InstallResult:
-    """Install an agent profile for the requested provider."""
+    """Install an agent profile for the requested provider.
+
+    ``source`` must be either an https:// URL on the allowlist or a bare
+    profile name matching ``_PROFILE_NAME_RE``. Local ``.md`` file paths
+    are deliberately NOT accepted here — the CLI copies user files into
+    the local store itself and then calls this function with the resulting
+    bare stem. This split is what lets the HTTP/MCP surface share this
+    function safely: every caller reaches the same two sanitised shapes,
+    and no call site constructs ``Path(user_input)`` through this module.
+    """
     try:
         valid_providers = [provider_type.value for provider_type in ProviderType]
         if provider not in valid_providers:
@@ -132,11 +208,21 @@ def install_agent(
 
         if source.startswith(("http://", "https://")):
             agent_name = _download_agent(source)
-            source_kind: Literal["url", "file", "name"] = "url"
-        elif Path(source).exists():
-            agent_name = _download_agent(source)
-            source_kind = "file"
+            source_kind: Literal["url", "name"] = "url"
         else:
+            # `source` is treated as a bare profile name and feeds
+            # _read_agent_profile_source() which builds Path objects from it.
+            # Enforce the sanitiser at the boundary so every downstream sink
+            # (agent_profiles.py and the provider-dir loop) sees safe input.
+            if not _PROFILE_NAME_RE.fullmatch(source):
+                return InstallResult(
+                    success=False,
+                    message=(
+                        f"Invalid profile name '{source}'. "
+                        "Expected a name matching [A-Za-z0-9_-]{1,64}, "
+                        "an https:// URL, or (CLI only) a local .md file path."
+                    ),
+                )
             agent_name = source
             source_kind = "name"
 
