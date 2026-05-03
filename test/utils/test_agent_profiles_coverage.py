@@ -106,135 +106,165 @@ class TestScanDirectory:
 
 
 class TestLoadAgentProfileFromProviderDirs:
-    """Test load_agent_profile searching provider and extra directories."""
+    """Test load_agent_profile searching provider and extra directories.
 
-    @patch("cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", return_value=[])
-    @patch("cli_agent_orchestrator.services.settings_service.get_agent_dirs")
-    @patch("cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR")
-    def test_load_from_provider_flat_file(self, mock_local, mock_get_dirs, mock_extra, tmp_path):
+    These tests exercise the real _read_agent_profile_source path so the
+    _safe_join traversal guard is covered end-to-end. The local store is
+    pointed at an empty tmp directory so lookups fall through to the
+    provider / extra / built-in stores the test cares about.
+    """
+
+    @staticmethod
+    def _empty_local(tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR",
+            tmp_path / "empty-local",
+        )
+
+    def test_load_from_provider_flat_file(self, tmp_path, monkeypatch):
         from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 
-        # Local store doesn't have it
-        mock_local_path = MagicMock(spec=Path)
-        mock_local_path.exists.return_value = False
-        mock_local.__truediv__.return_value = mock_local_path
-
-        # Provider dir has flat .md file
-        agent_md = tmp_path / "my-agent.md"
-        agent_md.write_text("---\nname: my-agent\ndescription: Provider agent\n---\nPrompt")
-        mock_get_dirs.return_value = {"kiro_cli": str(tmp_path)}
+        self._empty_local(tmp_path, monkeypatch)
+        provider_dir = tmp_path / "provider"
+        provider_dir.mkdir()
+        (provider_dir / "my-agent.md").write_text(
+            "---\nname: my-agent\ndescription: Provider agent\n---\nPrompt"
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+            lambda: {"kiro_cli": str(provider_dir)},
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", lambda: []
+        )
 
         result = load_agent_profile("my-agent")
 
         assert result.name == "my-agent"
         assert result.description == "Provider agent"
 
-    @patch("cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", return_value=[])
-    @patch("cli_agent_orchestrator.services.settings_service.get_agent_dirs")
-    @patch("cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR")
-    def test_load_from_provider_directory_style(
-        self, mock_local, mock_get_dirs, mock_extra, tmp_path
-    ):
+    def test_load_from_provider_directory_style(self, tmp_path, monkeypatch):
         from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 
-        mock_local_path = MagicMock(spec=Path)
-        mock_local_path.exists.return_value = False
-        mock_local.__truediv__.return_value = mock_local_path
-
-        # Provider dir has directory-style: my-agent/agent.md
-        (tmp_path / "my-agent").mkdir()
-        (tmp_path / "my-agent" / "agent.md").write_text("---\ndescription: Dir agent\n---\nPrompt")
-        mock_get_dirs.return_value = {"kiro_cli": str(tmp_path)}
+        self._empty_local(tmp_path, monkeypatch)
+        provider_dir = tmp_path / "provider"
+        (provider_dir / "my-agent").mkdir(parents=True)
+        (provider_dir / "my-agent" / "agent.md").write_text(
+            "---\ndescription: Dir agent\n---\nPrompt"
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+            lambda: {"kiro_cli": str(provider_dir)},
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", lambda: []
+        )
 
         result = load_agent_profile("my-agent")
 
         assert result.name == "my-agent"  # Filled in because missing from frontmatter
         assert result.description == "Dir agent"
 
-    @patch("cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs")
-    @patch("cli_agent_orchestrator.services.settings_service.get_agent_dirs", return_value={})
-    @patch("cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR")
-    def test_load_from_extra_dirs_flat(self, mock_local, mock_get_dirs, mock_extra, tmp_path):
+    def test_load_from_extra_dirs_flat(self, tmp_path, monkeypatch):
         from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 
-        mock_local_path = MagicMock(spec=Path)
-        mock_local_path.exists.return_value = False
-        mock_local.__truediv__.return_value = mock_local_path
-
-        # Extra dir has the agent
-        agent_md = tmp_path / "custom-agent.md"
-        agent_md.write_text("---\nname: custom-agent\ndescription: Custom\n---\nPrompt")
-        mock_extra.return_value = [str(tmp_path)]
+        self._empty_local(tmp_path, monkeypatch)
+        extra = tmp_path / "extra"
+        extra.mkdir()
+        (extra / "custom-agent.md").write_text(
+            "---\nname: custom-agent\ndescription: Custom\n---\nPrompt"
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs", lambda: {}
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs",
+            lambda: [str(extra)],
+        )
 
         result = load_agent_profile("custom-agent")
 
         assert result.name == "custom-agent"
 
-    @patch("cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs")
-    @patch("cli_agent_orchestrator.services.settings_service.get_agent_dirs", return_value={})
-    @patch("cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR")
-    def test_load_from_extra_dirs_directory_style(
-        self, mock_local, mock_get_dirs, mock_extra, tmp_path
-    ):
+    def test_load_from_extra_dirs_directory_style(self, tmp_path, monkeypatch):
         from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 
-        mock_local_path = MagicMock(spec=Path)
-        mock_local_path.exists.return_value = False
-        mock_local.__truediv__.return_value = mock_local_path
-
-        (tmp_path / "dir-agent").mkdir()
-        (tmp_path / "dir-agent" / "agent.md").write_text("---\ndescription: Dir style\n---\nPrompt")
-        mock_extra.return_value = [str(tmp_path)]
+        self._empty_local(tmp_path, monkeypatch)
+        extra = tmp_path / "extra"
+        (extra / "dir-agent").mkdir(parents=True)
+        (extra / "dir-agent" / "agent.md").write_text("---\ndescription: Dir style\n---\nPrompt")
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs", lambda: {}
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs",
+            lambda: [str(extra)],
+        )
 
         result = load_agent_profile("dir-agent")
 
         assert result.name == "dir-agent"
 
-    @patch("cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs")
-    @patch("cli_agent_orchestrator.services.settings_service.get_agent_dirs")
-    @patch("cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR")
-    def test_skips_nonexistent_provider_dir(self, mock_local, mock_get_dirs, mock_extra, tmp_path):
+    def test_skips_nonexistent_provider_dir(self, tmp_path, monkeypatch):
         from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 
-        mock_local_path = MagicMock(spec=Path)
-        mock_local_path.exists.return_value = False
-        mock_local.__truediv__.return_value = mock_local_path
+        self._empty_local(tmp_path, monkeypatch)
+        empty_builtin = tmp_path / "builtin"
+        empty_builtin.mkdir()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.resources.files",
+            lambda _pkg: empty_builtin,
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+            lambda: {"kiro_cli": str(tmp_path / "does-not-exist")},
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs",
+            lambda: [str(tmp_path / "also-missing")],
+        )
 
-        # Provider dir doesn't exist
-        mock_get_dirs.return_value = {"kiro_cli": "/nonexistent/path/xyz"}
-
-        # Extra dir also doesn't exist
-        mock_extra.return_value = ["/also/nonexistent"]
-
-        # Should fall through to built-in store and raise FileNotFoundError
         with pytest.raises(FileNotFoundError, match="Agent profile not found"):
             load_agent_profile("missing-agent")
 
-    @patch("cli_agent_orchestrator.utils.agent_profiles.resources")
-    @patch("cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", return_value=[])
-    @patch("cli_agent_orchestrator.services.settings_service.get_agent_dirs", return_value={})
-    @patch("cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR")
-    def test_builtin_fills_missing_name_and_description(
-        self, mock_local, mock_get_dirs, mock_extra, mock_resources
-    ):
+    def test_builtin_fills_missing_name_and_description(self, tmp_path, monkeypatch):
         from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 
-        mock_local_path = MagicMock(spec=Path)
-        mock_local_path.exists.return_value = False
-        mock_local.__truediv__.return_value = mock_local_path
-
-        # Built-in store has profile without name/description in frontmatter
-        mock_profile_file = MagicMock()
-        mock_profile_file.is_file.return_value = True
-        mock_profile_file.read_text.return_value = "---\n---\nJust a prompt"
-        mock_agent_store = MagicMock()
-        mock_agent_store.__truediv__.return_value = mock_profile_file
-        mock_resources.files.return_value = mock_agent_store
+        self._empty_local(tmp_path, monkeypatch)
+        builtin = tmp_path / "builtin"
+        builtin.mkdir()
+        (builtin / "bare-agent.md").write_text("---\n---\nJust a prompt")
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.resources.files",
+            lambda _pkg: builtin,
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs", lambda: {}
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", lambda: []
+        )
 
         result = load_agent_profile("bare-agent")
 
         assert result.name == "bare-agent"
         assert result.description == ""
+
+    def test_safe_join_rejects_traversal_segment(self, tmp_path, monkeypatch):
+        """_validate_agent_name rejects '..'; _safe_join is the second line of defence."""
+        from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+
+        self._empty_local(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs", lambda: {}
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", lambda: []
+        )
+
+        # ValueError comes from _validate_agent_name; traversal never reaches the filesystem.
+        with pytest.raises(ValueError, match="Invalid agent name"):
+            load_agent_profile("../escaped")
 
 
 class TestListAgentProfilesEdgeCases:
