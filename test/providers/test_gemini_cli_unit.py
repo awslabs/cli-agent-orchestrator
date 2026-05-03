@@ -30,6 +30,7 @@ from cli_agent_orchestrator.providers.gemini_cli import (
     YOLO_INDICATOR_PATTERN,
     GeminiCliProvider,
     ProviderError,
+    _ensure_workspaces_parent_trusted,
 )
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -534,10 +535,12 @@ class TestGeminiCliProviderMessageExtraction:
     def test_extract_message_empty_response(self):
         """Test ValueError on empty response after query."""
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
+        # Query box in gemini-cli 0.40.x: ▄ above, ▀ below. Idle prompt box at
+        # bottom mirrors: ▄ above, ▀ below.
         output = (
-            "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
-            " > test message\n"
             "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n"
+            " > test message\n"
+            "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
             " *   Type your message or @path/to/file\n"
         )
         with pytest.raises(ValueError, match="Empty Gemini CLI response"):
@@ -547,16 +550,16 @@ class TestGeminiCliProviderMessageExtraction:
         """Test that input box borders, status bar, YOLO indicator are filtered."""
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
         output = (
-            "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
-            " > say hello\n"
             "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n"
+            " > say hello\n"
+            "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
             "  Responding with gemini-3-flash-preview\n"
             "✦ Hello! How can I help?\n"
             "\n"
             "                                YOLO mode (ctrl + y to toggle)\n"
-            "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
-            " *   Type your message or @path/to/file\n"
             "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n"
+            " *   Type your message or @path/to/file\n"
+            "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
             " .../dir (main)   no sandbox   Auto (Gemini 3) /model | 100 MB\n"
         )
         result = provider.extract_last_message_from_script(output)
@@ -573,13 +576,13 @@ class TestGeminiCliProviderMessageExtraction:
         """Test extraction picks content from last user query."""
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
         output = (
-            "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
+            "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n"
             " > first question\n"
-            "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n"
-            "✦ First answer\n"
             "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
-            " > second question\n"
+            "✦ First answer\n"
             "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n"
+            " > second question\n"
+            "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
             "✦ Second answer\n"
             " *   Type your message or @path/to/file\n"
         )
@@ -590,9 +593,9 @@ class TestGeminiCliProviderMessageExtraction:
         """Test extraction works when there's no trailing idle prompt."""
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
         output = (
-            "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
-            " > what is python?\n"
             "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n"
+            " > what is python?\n"
+            "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
             "✦ Python is a programming language.\n"
             "✦ It supports multiple paradigms.\n"
         )
@@ -604,9 +607,9 @@ class TestGeminiCliProviderMessageExtraction:
         """Test extraction includes tool call box content."""
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
         output = (
-            "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
-            " > read the file\n"
             "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n"
+            " > read the file\n"
+            "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
             "✦ Let me read the file.\n"
             "╭──────────────────────────────╮\n"
             "│ ✓  ReadFile test.txt          │\n"
@@ -625,9 +628,9 @@ class TestGeminiCliProviderMessageExtraction:
         """
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
         output = (
-            "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
-            " > hello\n"
             "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n"
+            " > hello\n"
+            "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
             "✦ Hello there!\n"
             " .../dir (main)   no sandbox   Auto (Gemini 3) /model | 100 MB\n"
             " *   Type your message or @path/to/file\n"
@@ -641,9 +644,9 @@ class TestGeminiCliProviderMessageExtraction:
         """Test that processing spinner lines are filtered from extracted response."""
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
         output = (
-            "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
-            " > create a report\n"
             "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n"
+            " > create a report\n"
+            "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
             "  Responding with gemini-3-flash-preview\n"
             "✦ Here is the report:\n"
             "✦ Summary section content.\n"
@@ -660,9 +663,9 @@ class TestGeminiCliProviderMessageExtraction:
         """Test extraction strips ANSI codes correctly."""
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
         output = (
-            "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
-            " \x1b[38;2;203;166;247m> \x1b[38;2;108;112;134mhello\x1b[39m\n"
             "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n"
+            " \x1b[38;2;203;166;247m> \x1b[38;2;108;112;134mhello\x1b[39m\n"
+            "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
             "\x1b[38;2;203;166;247m✦ \x1b[39mHi there!\n"
             " \x1b[38;2;243;139;168m*\x1b[39m   Type your message\n"
         )
@@ -673,15 +676,15 @@ class TestGeminiCliProviderMessageExtraction:
         """Test extraction skips wrapped query text inside the query box.
 
         When a long query wraps in the input box, only the first line gets
-        the > prefix. Continuation lines (between ▀ and ▄ borders) must not
+        the > prefix. Continuation lines (between ▄ and ▀ borders) must not
         be included in the extracted response.
         """
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
         output = (
-            "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
+            "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n"
             " > Analyze Dataset A: [1, 2, 3, 4, 5]. Calculate mean, median, and standard\n"
             "   deviation. Present your analysis results directly.\n"
-            "▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄\n"
+            "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n"
             "  Responding with gemini-3-flash-preview\n"
             "✦ Here is the analysis of Dataset A:\n"
             "✦ - Mean: 3.0\n"
@@ -766,42 +769,52 @@ class TestGeminiCliProviderBuildCommand:
         assert settings["mcpServers"]["my-server"]["args"] == ["server.js"]
         assert settings["mcpServers"]["my-server"]["env"]["CAO_TERMINAL_ID"] == "term-1"
 
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
-    def test_build_command_profile_no_mcp(self, mock_load, mock_tmux, tmp_path):
-        """Test command with profile writes GEMINI.md and uses short -i acknowledgment."""
+    def test_build_command_profile_no_mcp(self, mock_load, tmp_path):
+        """Test command writes GEMINI.md in a per-terminal workspace and cds into it."""
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.name = "developer"
         mock_profile.system_prompt = "You are a developer"
         mock_profile.mcpServers = None
         mock_load.return_value = mock_profile
-        mock_tmux.get_pane_working_directory.return_value = str(tmp_path)
 
-        provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
-        command = provider._build_gemini_command()
+        with (
+            patch(
+                "cli_agent_orchestrator.providers.gemini_cli.GEMINI_WORKSPACES_DIR",
+                tmp_path / "gemini-workspaces",
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.gemini_cli.Path.home",
+                return_value=tmp_path,
+            ),
+        ):
+            provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
+            command = provider._build_gemini_command()
 
-        # GEMINI.md written with full system prompt
-        gemini_md = tmp_path / "GEMINI.md"
+        workspace = tmp_path / "gemini-workspaces" / "term-1"
+        gemini_md = workspace / "GEMINI.md"
         assert gemini_md.exists()
-        assert gemini_md.read_text() == "You are a developer"
-        assert provider._gemini_md_path == str(gemini_md)
+        assert gemini_md.read_text(encoding="utf-8") == "You are a developer"
+        assert provider._gemini_workspace == workspace
+        # Launcher cd's into the workspace before exec'ing gemini.
+        assert command.startswith(f"cd {workspace} && gemini")
         # Short -i acknowledgment (not the full system prompt)
         assert "-i" in command
         assert "developer" in command
         assert "GEMINI.md" in command
-        # Full system prompt should NOT be in the command (it's in GEMINI.md)
+        # Full system prompt must stay in GEMINI.md, not in the command.
         assert "You are a developer" not in command
 
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
-    def test_build_command_system_prompt_backs_up_existing_gemini_md(
-        self, mock_load, mock_tmux, tmp_path
-    ):
-        """Test GEMINI.md backup when user already has one in the working directory."""
-        # Create an existing GEMINI.md
-        existing_md = tmp_path / "GEMINI.md"
-        existing_md.write_text("User's existing instructions")
+    def test_build_command_does_not_touch_user_gemini_md(self, mock_load, tmp_path):
+        """Each terminal writes to its own workspace — never to the user's cwd."""
+        # Simulate a GEMINI.md already sitting in what was previously treated as
+        # the working directory. The fix is that we never look at cwd at all.
+        user_project = tmp_path / "user_project"
+        user_project.mkdir()
+        user_gemini = user_project / "GEMINI.md"
+        user_gemini.write_text("User's real instructions")
 
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -809,39 +822,57 @@ class TestGeminiCliProviderBuildCommand:
         mock_profile.system_prompt = "Supervisor agent prompt"
         mock_profile.mcpServers = None
         mock_load.return_value = mock_profile
-        mock_tmux.get_pane_working_directory.return_value = str(tmp_path)
 
-        provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
-        command = provider._build_gemini_command()
+        with (
+            patch(
+                "cli_agent_orchestrator.providers.gemini_cli.GEMINI_WORKSPACES_DIR",
+                tmp_path / "gemini-workspaces",
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.gemini_cli.Path.home",
+                return_value=tmp_path,
+            ),
+        ):
+            provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
+            provider._build_gemini_command()
 
-        # -i flag with short acknowledgment
-        assert "-i" in command
-        # GEMINI.md backed up and overwritten with full system prompt
-        assert existing_md.read_text() == "Supervisor agent prompt"
-        backup = tmp_path / "GEMINI.md.cao_backup"
-        assert backup.exists()
-        assert backup.read_text() == "User's existing instructions"
-        assert provider._gemini_md_backup_path == str(backup)
+        # User's GEMINI.md must be untouched.
+        assert user_gemini.read_text() == "User's real instructions"
+        # Provider wrote its own prompt to its isolated workspace.
+        workspace_md = tmp_path / "gemini-workspaces" / "term-1" / "GEMINI.md"
+        assert workspace_md.read_text(encoding="utf-8") == "Supervisor agent prompt"
 
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
-    def test_build_command_system_prompt_no_working_dir(self, mock_load, mock_tmux):
-        """Test -i flag still used when working dir unavailable (GEMINI.md skipped)."""
+    def test_build_command_parallel_terminals_do_not_collide(self, mock_load, tmp_path):
+        """Two terminals built concurrently get distinct workspaces, not a shared one."""
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.name = "developer"
-        mock_profile.system_prompt = "You are a developer"
         mock_profile.mcpServers = None
         mock_load.return_value = mock_profile
-        mock_tmux.get_pane_working_directory.return_value = None
 
-        provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
-        command = provider._build_gemini_command()
+        with (
+            patch(
+                "cli_agent_orchestrator.providers.gemini_cli.GEMINI_WORKSPACES_DIR",
+                tmp_path / "gemini-workspaces",
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.gemini_cli.Path.home",
+                return_value=tmp_path,
+            ),
+        ):
+            mock_profile.system_prompt = "Prompt A"
+            provider_a = GeminiCliProvider("term-A", "session-A", "window-A", agent_profile="dev")
+            provider_a._build_gemini_command()
 
-        # -i flag with short acknowledgment (GEMINI.md skipped since no working dir)
-        assert "-i" in command
-        assert "developer" in command
-        assert provider._gemini_md_path is None
+            mock_profile.system_prompt = "Prompt B"
+            provider_b = GeminiCliProvider("term-B", "session-B", "window-B", agent_profile="dev")
+            provider_b._build_gemini_command()
+
+        md_a = tmp_path / "gemini-workspaces" / "term-A" / "GEMINI.md"
+        md_b = tmp_path / "gemini-workspaces" / "term-B" / "GEMINI.md"
+        assert md_a.read_text(encoding="utf-8") == "Prompt A"
+        assert md_b.read_text(encoding="utf-8") == "Prompt B"
 
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
     def test_build_command_profile_error(self, mock_load):
@@ -881,6 +912,122 @@ class TestGeminiCliProviderBuildCommand:
         settings = json.loads((settings_dir / "settings.json").read_text())
         assert "server-a" in settings["mcpServers"]
         assert "server-b" in settings["mcpServers"]
+
+
+# =============================================================================
+# Trust-bootstrap tests (_ensure_workspaces_parent_trusted)
+# =============================================================================
+
+
+class TestEnsureWorkspacesParentTrusted:
+    """Tests for the Gemini trustedFolders.json bootstrap helper.
+
+    Gemini CLI 0.40+ blocks every new-folder launch on an interactive
+    "Do you trust the files in this folder?" prompt. Registering the
+    per-terminal workspaces parent with TRUST_PARENT pre-approves every
+    current and future subdirectory in a single entry.
+    """
+
+    def test_creates_trustedfolders_when_missing(self, tmp_path):
+        """No existing ~/.gemini/trustedFolders.json — helper creates it."""
+        workspaces = tmp_path / "cao" / "gemini-workspaces"
+        with (
+            patch(
+                "cli_agent_orchestrator.providers.gemini_cli.GEMINI_WORKSPACES_DIR",
+                workspaces,
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.gemini_cli.Path.home",
+                return_value=tmp_path,
+            ),
+        ):
+            _ensure_workspaces_parent_trusted()
+
+        import json as _json
+
+        trust_file = tmp_path / ".gemini" / "trustedFolders.json"
+        assert trust_file.exists()
+        data = _json.loads(trust_file.read_text())
+        assert data[str(workspaces)] == "TRUST_PARENT"
+
+    def test_preserves_existing_entries(self, tmp_path):
+        """Existing entries (e.g., user's other trusted dirs) must be preserved."""
+        import json as _json
+
+        gemini_dir = tmp_path / ".gemini"
+        gemini_dir.mkdir()
+        trust_file = gemini_dir / "trustedFolders.json"
+        trust_file.write_text(_json.dumps({"/Users/someone/repo": "TRUST_FOLDER"}, indent=2))
+
+        workspaces = tmp_path / "cao" / "gemini-workspaces"
+        with (
+            patch(
+                "cli_agent_orchestrator.providers.gemini_cli.GEMINI_WORKSPACES_DIR",
+                workspaces,
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.gemini_cli.Path.home",
+                return_value=tmp_path,
+            ),
+        ):
+            _ensure_workspaces_parent_trusted()
+
+        data = _json.loads(trust_file.read_text())
+        assert data["/Users/someone/repo"] == "TRUST_FOLDER"
+        assert data[str(workspaces)] == "TRUST_PARENT"
+
+    def test_is_idempotent_when_already_trusted(self, tmp_path):
+        """Entry already present — helper must be a no-op (no rewrite)."""
+        import json as _json
+
+        gemini_dir = tmp_path / ".gemini"
+        gemini_dir.mkdir()
+        workspaces = tmp_path / "cao" / "gemini-workspaces"
+        trust_file = gemini_dir / "trustedFolders.json"
+        trust_file.write_text(_json.dumps({str(workspaces): "TRUST_PARENT"}, indent=2))
+        mtime_before = trust_file.stat().st_mtime_ns
+
+        with (
+            patch(
+                "cli_agent_orchestrator.providers.gemini_cli.GEMINI_WORKSPACES_DIR",
+                workspaces,
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.gemini_cli.Path.home",
+                return_value=tmp_path,
+            ),
+        ):
+            _ensure_workspaces_parent_trusted()
+
+        # File not rewritten — mtime unchanged.
+        assert trust_file.stat().st_mtime_ns == mtime_before
+
+    def test_non_fatal_on_io_error(self, tmp_path, caplog):
+        """An unwritable trustedFolders.json must not raise — just log."""
+        import logging
+
+        gemini_dir = tmp_path / ".gemini"
+        gemini_dir.mkdir()
+        trust_file = gemini_dir / "trustedFolders.json"
+        # Write invalid JSON so json.load raises.
+        trust_file.write_text("{not valid json")
+
+        workspaces = tmp_path / "cao" / "gemini-workspaces"
+        with (
+            patch(
+                "cli_agent_orchestrator.providers.gemini_cli.GEMINI_WORKSPACES_DIR",
+                workspaces,
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.gemini_cli.Path.home",
+                return_value=tmp_path,
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            # Must not raise.
+            _ensure_workspaces_parent_trusted()
+
+        assert any("trustedFolders.json" in rec.getMessage() for rec in caplog.records)
 
 
 # =============================================================================
@@ -996,36 +1143,28 @@ class TestGeminiCliProviderMisc:
         assert provider._mcp_server_names == []
         assert provider._initialized is False
 
-    def test_cleanup_removes_gemini_md(self, tmp_path):
-        """Test cleanup removes GEMINI.md file created for system prompt."""
-        gemini_md = tmp_path / "GEMINI.md"
-        gemini_md.write_text("Supervisor agent prompt")
+    def test_cleanup_removes_workspace_directory(self, tmp_path):
+        """Test cleanup removes the per-terminal workspace directory and its contents."""
+        workspace = tmp_path / "gemini-workspaces" / "term-1"
+        workspace.mkdir(parents=True)
+        (workspace / "GEMINI.md").write_text("Supervisor agent prompt")
+        # Arbitrary extra file in the workspace — cleanup should blow it all away.
+        (workspace / "stray.log").write_text("ephemeral")
 
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
-        provider._gemini_md_path = str(gemini_md)
+        provider._gemini_workspace = workspace
         provider.cleanup()
 
-        assert not gemini_md.exists()
-        assert provider._gemini_md_path is None
+        assert not workspace.exists()
+        assert provider._gemini_workspace is None
 
-    def test_cleanup_restores_backup_gemini_md(self, tmp_path):
-        """Test cleanup restores user's original GEMINI.md from backup."""
-        gemini_md = tmp_path / "GEMINI.md"
-        gemini_md.write_text("CAO injected prompt")
-        backup = tmp_path / "GEMINI.md.cao_backup"
-        backup.write_text("User's original instructions")
-
+    def test_cleanup_is_idempotent_when_workspace_missing(self, tmp_path):
+        """Cleanup must not raise when the workspace was already removed."""
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
-        provider._gemini_md_path = str(gemini_md)
-        provider._gemini_md_backup_path = str(backup)
+        provider._gemini_workspace = tmp_path / "does_not_exist"
+        # Should not raise.
         provider.cleanup()
-
-        # Original restored, backup removed
-        assert gemini_md.exists()
-        assert gemini_md.read_text() == "User's original instructions"
-        assert not backup.exists()
-        assert provider._gemini_md_path is None
-        assert provider._gemini_md_backup_path is None
+        assert provider._gemini_workspace is None
 
     def test_provider_inherits_base(self):
         """Test provider inherits from BaseProvider."""
@@ -1040,8 +1179,7 @@ class TestGeminiCliProviderMisc:
         assert provider._initialized is False
         assert provider._agent_profile is None
         assert provider._mcp_server_names == []
-        assert provider._gemini_md_path is None
-        assert provider._gemini_md_backup_path is None
+        assert provider._gemini_workspace is None
         assert provider.terminal_id == "term-1"
         assert provider.session_name == "session-1"
         assert provider.window_name == "window-1"

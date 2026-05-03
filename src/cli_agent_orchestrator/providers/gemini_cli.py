@@ -32,11 +32,13 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import time
 from pathlib import Path
 from typing import Optional
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.constants import GEMINI_WORKSPACES_DIR
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -138,6 +140,41 @@ ERROR_PATTERN = (
 )
 
 
+def _ensure_workspaces_parent_trusted() -> None:
+    """Register ``GEMINI_WORKSPACES_DIR`` as TRUST_PARENT in ``trustedFolders.json``.
+
+    Gemini CLI 0.40+ shows a blocking interactive "Do you trust the files in
+    this folder?" prompt the first time it sees an unknown directory. Our
+    per-terminal workspaces are fresh UUID directories gemini has never
+    encountered, so without this bootstrap every gemini launch would hang at
+    that prompt. Registering the parent once with ``TRUST_PARENT`` covers all
+    current and future per-terminal subdirectories in a single entry.
+
+    Idempotent: reads the existing JSON, only rewrites if the entry is
+    missing or has a weaker trust value. Safe to call on every provider
+    initialization.
+    """
+    trust_file = Path.home() / ".gemini" / "trustedFolders.json"
+    parent = str(GEMINI_WORKSPACES_DIR)
+    try:
+        if trust_file.exists():
+            with open(trust_file) as f:
+                trust_map = json.load(f)
+        else:
+            trust_file.parent.mkdir(parents=True, exist_ok=True)
+            trust_map = {}
+        if trust_map.get(parent) == "TRUST_PARENT":
+            return
+        trust_map[parent] = "TRUST_PARENT"
+        with open(trust_file, "w") as f:
+            json.dump(trust_map, f, indent=2)
+    except Exception as e:
+        # Non-fatal: if we can't pre-trust, the gemini launch will show the
+        # interactive prompt and the caller will see it as an init timeout.
+        # Log so the failure mode is diagnosable.
+        logger.warning(f"Failed to register {parent} in gemini trustedFolders.json: {e}")
+
+
 class GeminiCliProvider(BaseProvider):
     """Provider for Gemini CLI tool integration.
 
@@ -178,13 +215,12 @@ class GeminiCliProvider(BaseProvider):
         # Track MCP servers that were registered in ~/.gemini/settings.json
         # so they can be removed during cleanup.
         self._mcp_server_names: list[str] = []
-        # Path to GEMINI.md file created for system prompt injection.
-        # Gemini CLI reads GEMINI.md from the working directory for
-        # project-level instructions. We create this file during
-        # initialization and remove it during cleanup.
-        self._gemini_md_path: Optional[str] = None
-        # Backup path for existing GEMINI.md (restored during cleanup).
-        self._gemini_md_backup_path: Optional[str] = None
+        # Per-terminal workspace directory (under GEMINI_WORKSPACES_DIR) used as
+        # the gemini process cwd so GEMINI.md writes don't collide between
+        # parallel terminals, and so nothing is ever written into the user's
+        # project root. Populated by _build_gemini_command when the profile
+        # has a system prompt; removed during cleanup.
+        self._gemini_workspace: Optional[Path] = None
         # Path to Policy Engine TOML file for tool restrictions (cleaned up on exit).
         self._policy_path: Optional[str] = None
 
@@ -236,19 +272,22 @@ class GeminiCliProvider(BaseProvider):
                 system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
                 system_prompt = self._apply_skill_prompt(system_prompt)
                 if system_prompt:
-                    # Write full system prompt to GEMINI.md for persistent context.
-                    working_dir = tmux_client.get_pane_working_directory(
-                        self.session_name, self.window_name
-                    )
-                    if working_dir:
-                        gemini_md_path = os.path.join(working_dir, "GEMINI.md")
-                        backup_path = gemini_md_path + ".cao_backup"
-                        if os.path.exists(gemini_md_path):
-                            os.rename(gemini_md_path, backup_path)
-                            self._gemini_md_backup_path = backup_path
-                        with open(gemini_md_path, "w") as f:
-                            f.write(system_prompt)
-                        self._gemini_md_path = gemini_md_path
+                    # Write the system prompt to a per-terminal GEMINI.md inside
+                    # a dedicated workspace directory. This isolates concurrent
+                    # terminals (which would otherwise share cwd = repo root and
+                    # clobber each other) and guarantees we never touch the
+                    # user's real GEMINI.md in the project. The launcher below
+                    # `cd`s into this workspace before exec'ing gemini so the
+                    # hierarchical GEMINI.md lookup resolves here first.
+                    # Gemini 0.40+ blocks on a "Do you trust this folder?"
+                    # prompt for unknown directories; pre-register the parent
+                    # with TRUST_PARENT so every per-terminal workspace is
+                    # trusted on first launch.
+                    _ensure_workspaces_parent_trusted()
+                    workspace = GEMINI_WORKSPACES_DIR / self.terminal_id
+                    workspace.mkdir(parents=True, exist_ok=True)
+                    (workspace / "GEMINI.md").write_text(system_prompt, encoding="utf-8")
+                    self._gemini_workspace = workspace
 
                     # Short -i prompt to adopt the role without triggering exploration.
                     # Gemini reads GEMINI.md automatically; -i just confirms adoption.
@@ -282,7 +321,13 @@ class GeminiCliProvider(BaseProvider):
         if self._allowed_tools and "*" not in self._allowed_tools:
             self._write_policy_deny_rules()
 
-        return shlex.join(command_parts)
+        launch = shlex.join(command_parts)
+        if self._gemini_workspace is not None:
+            # `cd` into the isolated workspace so Gemini's hierarchical GEMINI.md
+            # lookup picks up the per-terminal file first. Use `&&` so a failed
+            # cd aborts rather than launching gemini in an unexpected directory.
+            return f"cd {shlex.quote(str(self._gemini_workspace))} && {launch}"
+        return launch
 
     def _write_policy_deny_rules(self) -> None:
         """Write Policy Engine TOML deny rules to ~/.gemini/policies/.
@@ -648,13 +693,23 @@ class GeminiCliProvider(BaseProvider):
             raise ValueError("No Gemini CLI user query found - no > prefix detected")
 
         # Find the response start after the last query box.
-        # Strategy: skip past the query box bottom border (▄▄▄), then look
-        # for the first ✦ response line or tool call box. If the ✦ is not
+        # Strategy: skip past the query box closing border, then look for
+        # the first ✦ response line or tool call box. If the ✦ is not
         # found (Gemini's Ink TUI may overwrite responses during redraw),
         # use all content after the query box border as fallback.
+        #
+        # Query box layout (reading top-to-bottom in the capture):
+        #   ▄▄▄…   opening border (▄ = LOWER HALF BLOCK)
+        #   >       query text
+        #   ▀▀▀…   closing border (▀ = UPPER HALF BLOCK)
+        # So the line immediately following the query is a ▀ row and is
+        # matched by INPUT_BOX_TOP_PATTERN. Looking for INPUT_BOX_BOTTOM_PATTERN
+        # would skip all the way to the ▄ opening border of the idle prompt
+        # box at the bottom of the screen — past the entire response — which
+        # is exactly why extraction returned empty on gemini-cli 0.40.x.
         query_box_end = last_query_idx + 1
         for i in range(last_query_idx + 1, len(clean_lines)):
-            if re.search(INPUT_BOX_BOTTOM_PATTERN, clean_lines[i]):
+            if re.search(INPUT_BOX_TOP_PATTERN, clean_lines[i]):
                 query_box_end = i + 1
                 break
 
@@ -740,25 +795,22 @@ class GeminiCliProvider(BaseProvider):
     def cleanup(self) -> None:
         """Clean up Gemini CLI provider resources.
 
-        Removes MCP servers from ~/.gemini/settings.json, removes the GEMINI.md
-        file created for system prompt injection (or restores the user's original
-        if one existed), and resets state.
+        Removes MCP servers from ~/.gemini/settings.json, removes the
+        per-terminal Gemini workspace directory (containing GEMINI.md),
+        and resets state.
         """
         # Remove MCP servers from settings.json and policy deny rules
         self._unregister_mcp_servers()
         self._remove_policy_deny_rules()
 
-        # Remove GEMINI.md created for system prompt injection.
-        # If the user had an existing GEMINI.md, restore it from backup.
-        if self._gemini_md_path and os.path.exists(self._gemini_md_path):
+        # Remove the per-terminal workspace directory that held GEMINI.md.
+        # Because the workspace is unique to this terminal (keyed on terminal_id),
+        # there's no risk of touching the user's own GEMINI.md in their project.
+        if self._gemini_workspace is not None:
             try:
-                os.remove(self._gemini_md_path)
-                if self._gemini_md_backup_path and os.path.exists(self._gemini_md_backup_path):
-                    os.rename(self._gemini_md_backup_path, self._gemini_md_path)
-                    logger.info(f"Restored original GEMINI.md from backup")
+                shutil.rmtree(self._gemini_workspace, ignore_errors=True)
             except Exception as e:
-                logger.warning(f"Failed to clean up GEMINI.md: {e}")
-        self._gemini_md_path = None
-        self._gemini_md_backup_path = None
+                logger.warning(f"Failed to remove Gemini workspace {self._gemini_workspace}: {e}")
+        self._gemini_workspace = None
 
         self._initialized = False
