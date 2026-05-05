@@ -252,8 +252,8 @@ class TestProfileTools:
 class TestSessionLifecycleTools:
     """Tests for session lifecycle tools."""
 
-    async def test_launch_session_returns_success_with_session_identifiers(self) -> None:
-        """Launching a session should return session_name and terminal_id immediately."""
+    async def test_launch_session_omits_provider_when_not_explicit(self) -> None:
+        """Omitted provider should let the session API resolve the profile provider."""
         with (
             patch(
                 "cli_agent_orchestrator.ops_mcp_server.server.generate_session_name",
@@ -266,7 +266,6 @@ class TestSessionLifecycleTools:
         ):
             result = await _launch_session_impl(
                 agent_profile="developer",
-                provider="kiro_cli",
                 allowed_tools=["fs_read", "execute_bash"],
             )
 
@@ -280,7 +279,6 @@ class TestSessionLifecycleTools:
             "post",
             "http://127.0.0.1:9889/sessions",
             params={
-                "provider": "kiro_cli",
                 "agent_profile": "developer",
                 "session_name": "cao-generated",
                 "allowed_tools": "fs_read,execute_bash",

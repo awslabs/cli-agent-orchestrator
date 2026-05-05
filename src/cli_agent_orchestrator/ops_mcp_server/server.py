@@ -92,7 +92,7 @@ def _serialize_allowed_tools(allowed_tools: Optional[List[str]]) -> Optional[str
 
 async def _launch_session_impl(
     agent_profile: str,
-    provider: str = DEFAULT_PROVIDER,
+    provider: Optional[str] = None,
     session_name: Optional[str] = None,
     working_directory: Optional[str] = None,
     allowed_tools: Optional[List[str]] = None,
@@ -100,10 +100,11 @@ async def _launch_session_impl(
     """Create a new CAO session and return the session identifiers."""
     resolved_session_name = session_name or generate_session_name()
     params: Dict[str, Any] = {
-        "provider": provider,
         "agent_profile": agent_profile,
         "session_name": resolved_session_name,
     }
+    if provider is not None:
+        params["provider"] = provider
     if working_directory:
         params["working_directory"] = working_directory
 
@@ -248,9 +249,9 @@ async def install_profile(
 async def launch_session(
     agent_profile: Annotated[str, Field(description="The agent profile to launch")],
     provider: Annotated[
-        str,
+        Optional[str],
         Field(description="The provider to use for the launched session"),
-    ] = DEFAULT_PROVIDER,
+    ] = None,
     session_name: Annotated[
         Optional[str],
         Field(description="Optional custom CAO session name"),
@@ -272,7 +273,7 @@ async def launch_session(
 
     Args:
         agent_profile: Agent profile for the new session
-        provider: CLI provider (default: kiro_cli)
+        provider: CLI provider (default: profile provider or kiro_cli)
         session_name: Optional custom session name (auto-generated if omitted)
         working_directory: Optional working directory for the session
         allowed_tools: Optional list of tool restrictions
