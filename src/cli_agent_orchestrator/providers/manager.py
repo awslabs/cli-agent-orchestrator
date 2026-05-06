@@ -156,6 +156,9 @@ class ProviderManager:
             metadata["tmux_window"],
             metadata["agent_profile"],
         )
+        # Restore shell_command baseline from DB so get_status() can detect kiro exit
+        if metadata.get("shell_command") and hasattr(provider, "_shell_command"):
+            provider._shell_command = metadata["shell_command"]
         logger.info(f"Created provider on-demand for terminal {terminal_id}")
         return provider
 

@@ -205,7 +205,12 @@ class TmuxClient:
             raise
 
     def send_keys(
-        self, session_name: str, window_name: str, keys: str, enter_count: int = 1
+        self,
+        session_name: str,
+        window_name: str,
+        keys: str,
+        enter_count: int = 1,
+        force_bracketed_paste: bool = False,
     ) -> None:
         """Send keys to window using tmux paste-buffer for instant delivery.
 
@@ -221,18 +226,34 @@ class TmuxClient:
             enter_count: Number of Enter keys to send after pasting (default 1).
                 Some TUIs enter multi-line mode after bracketed paste,
                 requiring 2 Enters to submit.
+            force_bracketed_paste: If True, unconditionally wrap content in
+                bracketed paste sequences (\x1b[200~...\x1b[201~) instead of
+                relying on paste-buffer -p. Use for message delivery to TUIs.
+                Do NOT use for shell commands sent to bash during initialization
+                (bash 4.x does not support bracketed paste and will inject the
+                escape sequences literally into the command line).
         """
         target = f"{session_name}:{window_name}"
         buf_name = f"cao_{uuid.uuid4().hex[:8]}"
         try:
             logger.info(f"send_keys: {target} - keys: {keys}")
+            if force_bracketed_paste:
+                # Wrap unconditionally and use -r (no newline→CR conversion).
+                # paste-buffer -p only adds bracketed sequences if tmux tracks
+                # ?2004h for the pane — some TUIs (e.g. current Kiro) don't
+                # send ?2004h so -p is a no-op and \n becomes CR (Enter).
+                buf_content = b"\x1b[200~" + keys.encode() + b"\x1b[201~"
+                paste_flags = ["-r"]
+            else:
+                buf_content = keys.encode()
+                paste_flags = ["-p"]
             subprocess.run(
                 ["tmux", "load-buffer", "-b", buf_name, "-"],
-                input=keys.encode(),
+                input=buf_content,
                 check=True,
             )
             subprocess.run(
-                ["tmux", "paste-buffer", "-p", "-b", buf_name, "-t", target],
+                ["tmux", "paste-buffer"] + paste_flags + ["-b", buf_name, "-t", target],
                 check=True,
             )
             # Brief delay to let the TUI process the bracketed paste end sequence
@@ -469,6 +490,25 @@ class TmuxClient:
             return None
         except Exception as e:
             logger.error(f"Failed to get working directory for {session_name}:{window_name}: {e}")
+            return None
+
+    def get_pane_current_command(self, session_name: str, window_name: str) -> Optional[str]:
+        """Get the current foreground command running in a pane."""
+        try:
+            session = self.server.sessions.get(session_name=session_name)
+            if not session:
+                return None
+            window = session.windows.get(window_name=window_name)
+            if not window:
+                return None
+            pane = window.active_pane
+            if pane:
+                result = pane.cmd("display-message", "-p", "#{pane_current_command}")
+                if result.stdout:
+                    return result.stdout[0].strip()
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get pane command for {session_name}:{window_name}: {e}")
             return None
 
     def pipe_pane(self, session_name: str, window_name: str, file_path: str) -> None:
