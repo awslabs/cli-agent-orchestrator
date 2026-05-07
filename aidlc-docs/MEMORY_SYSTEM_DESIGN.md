@@ -203,7 +203,7 @@ class MemoryService:
         terminal_context: Optional[dict] = None,
     ) -> bool:
         """Remove a memory. Deletes SQLite row + removes entry from wiki file + updates index.md.
-        Internal use only in Phase 1; exposed as MCP tool in Phase 2."""
+        Shipped as the `memory_forget` MCP tool in Phase 1 (PR #179)."""
 
     def resolve_scope_id(
         self,
@@ -433,7 +433,7 @@ Memory cleanup is added to the existing `cleanup_service.py` as a scheduled task
     - Delete the SQLite row.
 3. Log a summary of expired entries to `~/.aws/cli-agent-orchestrator/logs/memory/YYYY-MM-DD.md` (append-only audit log).
 
-`user` and `feedback` memories are never deleted by automated cleanup. They can only be removed via `memory_forget` (Phase 2 MCP tool) or future CLI commands.
+`user` and `feedback` memories are never deleted by automated cleanup. They can only be removed via the `memory_forget` MCP tool (Phase 1) or `cao memory delete` / `cao memory clear` CLI commands.
 
 
 ## REST API Endpoints
@@ -579,7 +579,7 @@ Phase 1 should not pre-optimize for the following Phase 2 additions:
 
 - **`SessionEventModel` + event logging** — append-only event table (task_started, task_completed, handoff_returned, memory_stored) in `database.py`. Required by context-manager and `session_context` tool.
 - **Context-manager agent** — dedicated background agent (same provider as supervisor) spawned via `cao launch --memory`. Reads `index.md` + token metadata, selects relevant articles, produces curated injection block at each handoff.
-- **`memory_forget` and `memory_consolidate` MCP tools** — exposed to agents in Phase 2. `forget` is an internal-only method in Phase 1.
+- **`memory_consolidate` MCP tool** — exposed to agents in Phase 2. (`memory_forget` shipped in Phase 1 — see PR #179.)
 - **`extract_session_context()` on BaseProvider** — new abstract method for extracting structured context from provider-native session files. Implementations for Claude Code, Gemini, Kiro, Codex, Copilot.
 - **`session_context` MCP tool** — returns event timeline for cross-provider resumption.
 - **Wiki compilation (LLM-powered)** — Phase 2 replaces Phase 1's simple append with LLM-powered merging of entries into coherent articles with cross-references (Phase 3 for full Karpathy pattern).

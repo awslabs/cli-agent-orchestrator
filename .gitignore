@@ -48,3 +48,6 @@ context/
 
 # Worktrees
 .worktrees
+
+# Local test runbooks (not shipped)
+MEMORY_TESTING.md

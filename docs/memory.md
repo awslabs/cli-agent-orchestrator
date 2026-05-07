@@ -137,7 +137,27 @@ Registered in `~/.kiro/agents/{profile}.json` at terminal creation:
 - **`agentSpawn`**: injects memory context at agent startup (via CAO API)
 - **`userPromptSubmit`**: fires a save reminder every 15 user prompts
 
-Hook scripts are installed to `~/.aws/cli-agent-orchestrator/hooks/` on server startup.
+### Codex
+
+Codex has no native hook system comparable to Claude Code or Kiro. Agents running on Codex
+rely on **instruction-based save reminders** — the `## Memory Protocol` section in the
+agent profile (see `code_supervisor.md`, `developer.md`, `reviewer.md`) prompts the model
+to call `memory_store` at decision points without a runtime hook. Memory *injection* at
+session start still works via the universal `<cao-memory>` prepend on the first user
+message (same path as Gemini, Kimi, Copilot).
+
+### Other providers (Gemini, Kimi, Copilot)
+
+Instruction-only, same as Codex. No provider-native hooks are registered. Memory
+injection happens via the `<cao-memory>` prepend on the first user message.
+
+### Plugin architecture
+
+Provider-specific memory hooks (Claude Code, Kiro CLI) ship as entry-point plugins under
+`src/cli_agent_orchestrator/plugins/builtin/`. Each provider's `register_hooks()` method
+is a no-op by default (inherited from `BaseProvider`); Claude Code and Kiro CLI override
+it to install their respective hook scripts. This decouples hook registration from
+`terminal_service.py` and keeps non-CAO Claude Code sessions hook-free.
 
 ## Storage Layout
 
@@ -182,16 +202,43 @@ Cleanup runs automatically in the background when `cao-server` starts.
 
 ## Adding Memory Instructions to an Agent Profile
 
-Add a `## Memory` section to the agent's system prompt:
+Add a `## Memory` section to the agent's system prompt. Two levels of guidance are
+supported; pick one based on how aggressively you want the agent to exercise memory.
+
+### Minimal (default template)
+
+Use this for most agent profiles. It's the shipped guidance on the built-in
+`code_supervisor`, `developer`, and `reviewer` profiles:
 
 ```markdown
 ## Memory
 
-When you discover something worth remembering — user preferences, project conventions,
-important decisions, recurring corrections — store it immediately using the `memory_store`
-CAO tool. Keep each memory to 1–2 sentences. Store decisions and conclusions, not conversation.
-Use `memory_recall` to check if you already know something before asking the user.
+1. ALWAYS use `memory_recall` to check for existing knowledge before asking the user.
+2. ALWAYS use `memory_store` immediately when you discover user preferences, project
+   conventions, important decisions, or recurring corrections.
+3. ALWAYS keep memories to 1–2 sentences. Store decisions and conclusions, not conversation.
 
-Note: `memory_store` and `memory_recall` are CAO's cross-provider memory tools, distinct from
-any provider-native memory system.
+Note: `memory_store` and `memory_recall` are CAO's cross-provider memory tools, distinct
+from any provider-native memory system. Default `scope` is `project`; use `global` for
+cross-project user preferences and `session` for ephemeral notes.
 ```
+
+### Aggressive (test-harness / dogfood)
+
+Use this to force dense memory traffic when stress-testing the subsystem or when
+operating a multi-agent team where cross-agent recall is load-bearing. Adds concrete
+store/recall triggers plus mandatory session-start and session-end rituals.
+
+Reference template: `~/.aws/cli-agent-orchestrator/agent-store/code-supervisor-local.md`,
+`developer-local.md`, `reviewer-local.md`. These profiles carry a `## Memory Protocol
+(MANDATORY — test harness mode)` section with:
+- Layer 1 — six store triggers (decisions, user preferences, schemas, constraints,
+  bug root-causes, worker-delegation context) and five recall triggers.
+- Layer 2 — mandatory session-start ritual: first action must be `memory_recall` for
+  project + user scope, followed by a prescribed "recalled memory" block.
+- Layer 3 — mandatory session-end ritual: final message must emit a "memory delta" block
+  followed by confirming `memory_store` / `memory_forget` calls in the same turn.
+
+The aggressive profile is intentionally noisier and exists to stress-test injection caps
+(U2), round-trip invariants (U3), and cross-agent recall. Do not use it as the default
+for end-user agent profiles without tuning.
