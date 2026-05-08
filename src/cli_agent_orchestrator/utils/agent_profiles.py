@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 from importlib import resources
 from pathlib import Path
 from typing import Dict, List
@@ -206,6 +207,10 @@ def list_agent_profiles() -> List[Dict]:
 
 def parse_agent_profile_text(resolved_text: str, profile_name: str) -> AgentProfile:
     """Parse an AgentProfile from already-resolved markdown text."""
+    # Strip leading HTML comments before the YAML frontmatter fence.
+    # Some profile generators (e.g. AIM) prepend <!-- ... --> blocks that
+    # prevent python-frontmatter from detecting the opening '---' delimiter.
+    resolved_text = re.sub(r"^<!--.*?-->\s*", "", resolved_text, flags=re.DOTALL)
     profile_data = frontmatter.loads(resolved_text)
     meta = profile_data.metadata
     meta["system_prompt"] = profile_data.content.strip()
