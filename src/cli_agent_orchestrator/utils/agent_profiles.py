@@ -1,5 +1,6 @@
 """Agent profile utilities."""
 
+import json
 import logging
 from importlib import resources
 from pathlib import Path
@@ -81,6 +82,61 @@ def _scan_directory(directory: Path, source_label: str, profiles: Dict[str, Dict
                 }
 
 
+def _discover_claude_plugin_agent_dirs() -> List[Path]:
+    """Walk Claude Code marketplaces and return agent dirs from enabled plugins."""
+    settings_path = Path.home() / ".claude" / "settings.json"
+    try:
+        data = json.loads(settings_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        if settings_path.exists():
+            logger.warning("Failed to read %s", settings_path)
+        return []
+
+    marketplaces = data.get("extraKnownMarketplaces", {})
+    enabled_plugins = data.get("enabledPlugins", {})
+    if not marketplaces:
+        return []
+
+    agent_dirs: List[Path] = []
+    for mkt_name, mkt_config in marketplaces.items():
+        source = mkt_config.get("source", {})
+        if source.get("source") != "directory":
+            continue
+        mkt_path = Path(source.get("path", ""))
+        if not mkt_path.is_dir():
+            continue
+
+        marketplace_json = mkt_path / ".claude-plugin" / "marketplace.json"
+        try:
+            mkt_data = json.loads(marketplace_json.read_text())
+        except (json.JSONDecodeError, OSError):
+            logger.warning("Failed to read %s", marketplace_json)
+            continue
+
+        resolved_mkt = mkt_path.resolve()
+        for plugin in mkt_data.get("plugins", []):
+            plugin_name = plugin.get("name", "")
+            if not enabled_plugins.get(f"{plugin_name}@{mkt_name}", False):
+                continue
+            plugin_source = plugin.get("source", "")
+            plugin_dir = (mkt_path / plugin_source).resolve()
+            # Path containment check
+            try:
+                plugin_dir.relative_to(resolved_mkt)
+            except ValueError:
+                logger.warning(
+                    "Plugin path %s escapes marketplace root %s — skipping",
+                    plugin_dir,
+                    resolved_mkt,
+                )
+                continue
+            agents_dir = plugin_dir / "agents"
+            if agents_dir.is_dir():
+                agent_dirs.append(agents_dir)
+
+    return agent_dirs
+
+
 def list_agent_profiles() -> List[Dict]:
     """Discover all available agent profiles from all configured directories.
 
@@ -137,7 +193,11 @@ def list_agent_profiles() -> List[Dict]:
             continue
         _scan_directory(path, label, profiles)
 
-    # 4. Extra user-added directories
+    # 4. Claude Code plugin marketplace directories
+    for plugin_agents_dir in _discover_claude_plugin_agent_dirs():
+        _scan_directory(plugin_agents_dir, "claude_plugin", profiles)
+
+    # 5. Extra user-added directories
     for extra_dir in get_extra_agent_dirs():
         _scan_directory(Path(extra_dir), "custom", profiles)
 
@@ -199,6 +259,11 @@ def _read_agent_profile_source(agent_name: str) -> str:
 
     for dir_path in get_agent_dirs().values():
         found = _lookup_in_directory(Path(dir_path))
+        if found is not None:
+            return found
+
+    for plugin_agents_dir in _discover_claude_plugin_agent_dirs():
+        found = _lookup_in_directory(plugin_agents_dir)
         if found is not None:
             return found
 

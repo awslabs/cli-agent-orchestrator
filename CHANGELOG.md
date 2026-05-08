@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [Unreleased]
+
+### Added
+
+- Auto-discover agents from enabled Claude Code plugin marketplaces (`~/.claude/settings.json → extraKnownMarketplaces`). Default `agent_dirs.claude_code` path changed from `~/.aws/cli-agent-orchestrator/agent-store` to `~/.claude/agents/`; users with a saved `agent_dirs.claude_code` are unaffected.
+
 ## [2.1.1] - 2026-04-28
 
 ### Added
