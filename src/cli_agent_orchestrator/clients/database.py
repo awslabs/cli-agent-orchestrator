@@ -27,6 +27,7 @@ class TerminalModel(Base):
     provider = Column(String, nullable=False)  # "q_cli", "claude_code"
     agent_profile = Column(String)  # "developer", "reviewer" (optional)
     allowed_tools = Column(String, nullable=True)  # JSON-encoded list of CAO tool names
+    shell_command = Column(String, nullable=True)  # shell process name captured before kiro launch
     last_active = Column(DateTime, default=datetime.now)
 
 
@@ -72,7 +73,7 @@ def init_db() -> None:
 
 
 def _migrate_add_allowed_tools() -> None:
-    """Add allowed_tools column to terminals table if missing (schema migration)."""
+    """Add allowed_tools and shell_command columns to terminals table if missing (schema migration)."""
     import sqlite3
 
     from cli_agent_orchestrator.constants import DATABASE_FILE
@@ -85,6 +86,10 @@ def _migrate_add_allowed_tools() -> None:
             conn.execute("ALTER TABLE terminals ADD COLUMN allowed_tools TEXT")
             conn.commit()
             logger.info("Migration: added allowed_tools column to terminals table")
+        if "shell_command" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN shell_command TEXT")
+            conn.commit()
+            logger.info("Migration: added shell_command column to terminals table")
         conn.close()
     except Exception as e:
         logger.warning(f"Migration check for allowed_tools failed: {e}")
@@ -97,6 +102,7 @@ def create_terminal(
     provider: str,
     agent_profile: Optional[str] = None,
     allowed_tools: Optional[List[str]] = None,
+    shell_command: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record."""
     import json as _json
@@ -109,6 +115,7 @@ def create_terminal(
             provider=provider,
             agent_profile=agent_profile,
             allowed_tools=_json.dumps(allowed_tools) if allowed_tools else None,
+            shell_command=shell_command,
         )
         db.add(terminal)
         db.commit()
@@ -119,6 +126,7 @@ def create_terminal(
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
             "allowed_tools": allowed_tools,
+            "shell_command": terminal.shell_command,
         }
 
 
@@ -142,6 +150,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
             "allowed_tools": allowed_tools,
+            "shell_command": terminal.shell_command,
             "last_active": terminal.last_active,
         }
 
@@ -169,6 +178,17 @@ def update_last_active(terminal_id: str) -> bool:
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if terminal:
             terminal.last_active = datetime.now()
+            db.commit()
+            return True
+        return False
+
+
+def update_terminal_shell_command(terminal_id: str, shell_command: str) -> bool:
+    """Update the shell_command baseline for a terminal."""
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if terminal:
+            terminal.shell_command = shell_command
             db.commit()
             return True
         return False

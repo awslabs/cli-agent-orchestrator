@@ -490,7 +490,11 @@ class TestSendInput:
 
         assert result is True
         mock_tmux.send_keys.assert_called_once_with(
-            "cao-session", "developer-abcd", "test message", enter_count=2
+            "cao-session",
+            "developer-abcd",
+            "test message",
+            enter_count=2,
+            force_bracketed_paste=True,
         )
         mock_update.assert_called_once_with("test1234")
 

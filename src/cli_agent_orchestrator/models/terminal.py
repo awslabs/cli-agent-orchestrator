@@ -31,6 +31,9 @@ class Terminal(BaseModel):
     session_name: str = Field(..., description="Session name")
     agent_profile: Optional[str] = Field(None, description="Agent profile")
     allowed_tools: Optional[List[str]] = Field(None, description="Allowed CAO tools")
+    shell_command: Optional[str] = Field(
+        None, description="Shell process name captured before kiro launch"
+    )
     status: Optional[TerminalStatus] = Field(
         None, description="Current terminal status (live only)"
     )

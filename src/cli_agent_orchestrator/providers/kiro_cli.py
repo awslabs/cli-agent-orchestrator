@@ -144,6 +144,7 @@ class KiroCliProvider(BaseProvider):
 
         # New TUI header pattern: "agent_name · model · ◔ N%"
         self._new_tui_header_pattern = rf"{re.escape(self._agent_profile)}\s+·\s+.*·\s+◔\s*\d+%"
+        self._shell_command: Optional[str] = None
 
     @property
     def paste_enter_count(self) -> int:
@@ -186,6 +187,11 @@ class KiroCliProvider(BaseProvider):
         # This ensures the terminal is ready before we send commands
         if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
+
+        # Capture the shell process name before launching kiro — used later to detect kiro exit
+        self._shell_command = tmux_client.get_pane_current_command(
+            self.session_name, self.window_name
+        )
 
         # Step 2: Start the Kiro CLI chat session.
         #
@@ -306,8 +312,16 @@ class KiroCliProvider(BaseProvider):
             if not idle_after_working:
                 return TerminalStatus.PROCESSING
 
-        # Check 3: If no idle prompt found at all the agent is still processing
+        # Check 3: If no idle prompt found, determine if kiro is still running.
+        # Compare current pane command against the shell captured before kiro launched.
+        # If they match, kiro has exited and the shell is showing again → IDLE.
         if not has_idle_prompt and not has_new_tui_idle:
+            if self._shell_command:
+                current_cmd = tmux_client.get_pane_current_command(
+                    self.session_name, self.window_name
+                )
+                if current_cmd == self._shell_command:
+                    return TerminalStatus.IDLE
             return TerminalStatus.PROCESSING
 
         # Check 2: Look for known error messages in the output
@@ -366,6 +380,10 @@ class KiroCliProvider(BaseProvider):
             for prompt in new_tui_idle_matches:
                 if prompt.start() > last_credits_pos:
                     logger.debug("get_status: returning COMPLETED (TUI credits)")
+                    return TerminalStatus.COMPLETED
+            for prompt in old_idle_matches:
+                if prompt.start() > last_credits_pos:
+                    logger.debug("get_status: returning COMPLETED (TUI credits + legacy idle)")
                     return TerminalStatus.COMPLETED
             # Credits marker found but no idle prompt after it — still processing
             return TerminalStatus.PROCESSING

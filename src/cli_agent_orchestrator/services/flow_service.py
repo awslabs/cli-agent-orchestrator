@@ -12,18 +12,26 @@ from apscheduler.triggers.cron import CronTrigger  # type: ignore
 
 from cli_agent_orchestrator.clients.database import create_flow as db_create_flow
 from cli_agent_orchestrator.clients.database import delete_flow as db_delete_flow
+from cli_agent_orchestrator.clients.database import (
+    delete_terminals_by_session,
+)
 from cli_agent_orchestrator.clients.database import get_flow as db_get_flow
 from cli_agent_orchestrator.clients.database import get_flows_to_run as db_get_flows_to_run
 from cli_agent_orchestrator.clients.database import list_flows as db_list_flows
+from cli_agent_orchestrator.clients.database import (
+    list_terminals_by_session,
+)
 from cli_agent_orchestrator.clients.database import update_flow_enabled as db_update_flow_enabled
 from cli_agent_orchestrator.clients.database import (
     update_flow_run_times as db_update_flow_run_times,
 )
+from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.constants import DEFAULT_PROVIDER, PROVIDERS
 from cli_agent_orchestrator.models.flow import Flow
+from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.terminal_service import create_terminal, send_input
 from cli_agent_orchestrator.utils.template import render_template
-from cli_agent_orchestrator.utils.terminal import generate_session_name
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +160,13 @@ def enable_flow(name: str) -> bool:
     return True
 
 
+def _is_terminal_busy(terminal_id: str) -> bool:
+    try:
+        return provider_manager.get_provider(terminal_id).get_status() == TerminalStatus.PROCESSING
+    except Exception:
+        return False
+
+
 def execute_flow(name: str) -> bool:
     """Execute flow: run script, render prompt, launch session."""
     try:
@@ -211,7 +226,20 @@ def execute_flow(name: str) -> bool:
         rendered_prompt = render_template(prompt_template, output_dict)
 
         # Launch session
-        session_name = generate_session_name()
+        session_name = f"cao-flow-{flow.name}"
+        if tmux_client.session_exists(session_name):
+            terminals = list_terminals_by_session(session_name)
+            # Only check the conductor terminal (matching the flow's agent profile)
+            # for busy status. Worker terminals spawned by the conductor may have
+            # stale status after /exit and should not block flow recycling.
+            conductor_terminals = [
+                t for t in terminals if t.get("agent_profile") == flow.agent_profile
+            ]
+            if any(_is_terminal_busy(t["id"]) for t in conductor_terminals):
+                logger.info(f"Flow {name}: session {session_name} is busy, skipping")
+                return False
+            tmux_client.kill_session(session_name)
+            delete_terminals_by_session(session_name)
         terminal = create_terminal(
             session_name=session_name,
             provider=flow.provider,

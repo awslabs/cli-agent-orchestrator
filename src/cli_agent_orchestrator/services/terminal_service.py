@@ -28,6 +28,7 @@ from cli_agent_orchestrator.clients.database import delete_terminal as db_delete
 from cli_agent_orchestrator.clients.database import (
     get_terminal_metadata,
     update_last_active,
+    update_terminal_shell_command,
 )
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.constants import SESSION_PREFIX, TERMINAL_LOG_DIR
@@ -181,6 +182,13 @@ def create_terminal(
         )
         provider_instance.initialize()
 
+        # Persist shell_command baseline if the provider captured one
+        shell_command = getattr(provider_instance, "_shell_command", None)
+        if not isinstance(shell_command, str):
+            shell_command = None
+        if shell_command:
+            update_terminal_shell_command(terminal_id, shell_command)
+
         # Step 5: Set up terminal logging via tmux pipe-pane
         # This captures all terminal output to a log file for inbox monitoring
         log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
@@ -194,6 +202,7 @@ def create_terminal(
             provider=ProviderType(provider),
             session_name=session_name,
             agent_profile=agent_profile,
+            shell_command=shell_command,
             status=TerminalStatus.IDLE,
             last_active=datetime.now(),
         )
@@ -309,7 +318,11 @@ def send_input(
         enter_count = provider.paste_enter_count if provider else 1
 
         tmux_client.send_keys(
-            metadata["tmux_session"], metadata["tmux_window"], message, enter_count=enter_count
+            metadata["tmux_session"],
+            metadata["tmux_window"],
+            message,
+            enter_count=enter_count,
+            force_bracketed_paste=True,
         )
 
         # Notify the provider that external input was received.
