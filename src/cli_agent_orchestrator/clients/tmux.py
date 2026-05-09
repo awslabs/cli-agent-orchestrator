@@ -178,6 +178,7 @@ class TmuxClient:
         window_name: str,
         terminal_id: str,
         working_directory: Optional[str] = None,
+        window_shell: Optional[str] = None,
     ) -> str:
         """Create window in session and return window name."""
         try:
@@ -187,11 +188,15 @@ class TmuxClient:
             if not session:
                 raise ValueError(f"Session '{session_name}' not found")
 
-            window = session.new_window(
-                window_name=window_name,
-                start_directory=working_directory,
-                environment={"CAO_TERMINAL_ID": terminal_id},
-            )
+            kwargs: dict = {
+                "window_name": window_name,
+                "start_directory": working_directory,
+                "environment": {"CAO_TERMINAL_ID": terminal_id},
+            }
+            if window_shell:
+                kwargs["window_shell"] = window_shell
+
+            window = session.new_window(**kwargs)
 
             logger.info(
                 f"Created window '{window.name}' in session '{session_name}' in directory: {working_directory}"
@@ -366,7 +371,12 @@ class TmuxClient:
             raise
 
     def get_history(
-        self, session_name: str, window_name: str, tail_lines: Optional[int] = None
+        self,
+        session_name: str,
+        window_name: str,
+        tail_lines: Optional[int] = None,
+        strip_escapes: bool = False,
+        full_history: bool = False,
     ) -> str:
         """Get window history.
 
@@ -374,6 +384,8 @@ class TmuxClient:
             session_name: Name of tmux session
             window_name: Name of window in session
             tail_lines: Number of lines to capture from end (default: TMUX_HISTORY_LINES)
+            strip_escapes: If True, capture plain text without ANSI escape sequences
+            full_history: If True, capture entire scrollback buffer (overrides tail_lines)
         """
         try:
             session = self.server.sessions.get(session_name=session_name)
@@ -386,8 +398,15 @@ class TmuxClient:
 
             # Use cmd to run capture-pane with -e (escape sequences) and -p (print) flags
             pane = window.panes[0]
-            lines = tail_lines if tail_lines is not None else TMUX_HISTORY_LINES
-            result = pane.cmd("capture-pane", "-e", "-p", "-S", f"-{lines}")
+            if full_history:
+                # "-S -" captures from the start of the scrollback buffer
+                flags = ["-p", "-S", "-"]
+            else:
+                lines = tail_lines if tail_lines is not None else TMUX_HISTORY_LINES
+                flags = ["-p", "-S", f"-{lines}"]
+            if not strip_escapes:
+                flags = ["-e"] + flags
+            result = pane.cmd("capture-pane", *flags)
             # Join all lines with newlines to get complete output
             return "\n".join(result.stdout) if result.stdout else ""
         except Exception as e:
