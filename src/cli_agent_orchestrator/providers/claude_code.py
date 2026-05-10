@@ -5,11 +5,12 @@ import logging
 import re
 import shlex
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Optional
 
-from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.clients.tmux import pwsh_join, tmux_client
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -131,16 +132,21 @@ class ClaudeCodeProvider(BaseProvider):
             for tool in disallowed:
                 command_parts.extend(["--disallowedTools", tool])
 
-        # Use shlex.join() for proper shell escaping of all arguments
-        # This correctly handles multiline strings, quotes, and special characters
-        claude_cmd = shlex.join(command_parts)
-
         # When cao-server runs inside a Claude Code session, CLAUDE* env vars
         # leak into spawned tmux panes (via the tmux server's global env).
         # Claude Code detects these and refuses to start ("nested session").
-        # Unset all matching vars except CLAUDE_CODE_USE_* and
-        # CLAUDE_CODE_SKIP_*_AUTH (needed for provider authentication:
-        # Bedrock, Vertex AI, Foundry).
+        #
+        # On Windows: psmux already filters CLAUDE* vars at session-creation
+        # time (create_session builds environment without them), so no shell
+        # unset is needed.  Use pwsh_join for PowerShell-correct escaping —
+        # shlex.join produces POSIX bash escapes ('"'"' sequences) that
+        # PowerShell only partially recovers via adjacent-string concatenation,
+        # leaking stray ' chars into the spawned TUI as initial input.
+        if sys.platform == "win32":
+            return pwsh_join(command_parts)
+
+        # Unix: shlex.join + unset prefix.
+        claude_cmd = shlex.join(command_parts)
         unset_cmd = (
             "unset $(env | sed -n 's/^\\(CLAUDE[A-Z_]*\\)=.*/\\1/p'"
             " | grep -v -E 'CLAUDE_CODE_USE_(BEDROCK|VERTEX|FOUNDRY)"
@@ -217,11 +223,7 @@ class ClaudeCodeProvider(BaseProvider):
             # 2) Handle workspace trust prompt
             if re.search(TRUST_PROMPT_PATTERN, clean_output):
                 logger.info("Workspace trust prompt detected, auto-accepting")
-                session = tmux_client.server.sessions.get(session_name=self.session_name)
-                window = session.windows.get(window_name=self.window_name)
-                pane = window.active_pane
-                if pane:
-                    pane.send_keys("", enter=True)
+                tmux_client.send_keys(self.session_name, self.window_name, "")
                 return
 
             # 3) Claude Code fully started — no prompts needed

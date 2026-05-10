@@ -236,5 +236,20 @@ def _is_cao_managed_resource_uri(resource: str, context_dir: Path) -> bool:
     if parsed.scheme != "file":
         return False
 
-    resource_path = Path(unquote(parsed.path)).resolve(strict=False)
+    path_str = unquote(parsed.path)
+
+    # On Windows, f"file://{windows_path}" (e.g. produced by str(Path(...))) puts
+    # the entire Windows path (including drive letter and backslashes) into netloc
+    # rather than path, leaving path empty.  Recover the path from netloc in that
+    # case.
+    if not path_str and parsed.netloc:
+        path_str = parsed.netloc + (parsed.path or "")
+
+    # A proper Windows file URI has the form file:///C:/... so urlparse yields
+    # path="/C:/...".  Strip the leading "/" before the drive letter so that
+    # Path() interprets it as an absolute Windows path (e.g. "C:/...").
+    if path_str and len(path_str) > 2 and path_str[1].isalpha() and path_str[2] in ":/":
+        path_str = path_str[1:]
+
+    resource_path = Path(path_str).resolve(strict=False)
     return resource_path.is_relative_to(context_dir)

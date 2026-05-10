@@ -1,6 +1,9 @@
 """Tests for CAO environment variable utilities."""
 
 import os
+import sys
+
+import pytest
 
 from cli_agent_orchestrator.utils import env as env_utils
 
@@ -89,6 +92,10 @@ def test_set_env_var_creates_file_when_missing(tmp_path, monkeypatch):
     assert env_utils.load_env_vars() == {"API_KEY": "secret"}
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows NTFS does not honour POSIX chmod bits; st_mode never equals 0o600",
+)
 def test_set_env_var_creates_file_with_owner_only_permissions(tmp_path, monkeypatch):
     """Newly created env files must be owner-readable/writable only (0600)."""
     env_file = tmp_path / ".env"

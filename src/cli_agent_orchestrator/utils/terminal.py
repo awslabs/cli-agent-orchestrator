@@ -41,7 +41,15 @@ def wait_for_shell(
     timeout: float = 10.0,
     polling_interval: float = 0.5,
 ) -> bool:
-    """Wait for shell to be ready by checking if output is stable (2 consecutive reads are the same and non-empty)."""
+    """Wait for shell to be ready by checking if output is stable (2 consecutive reads are the same and non-empty).
+
+    On Windows, once the shell is detected ready, sends a one-shot
+    ``Set-PSReadLineOption -AddToHistoryHandler { 'SkipAdding' }`` so that
+    subsequent CAO-injected commands (warm-ups, agent launch) don't pollute
+    the user's persistent PSReadLine history file.
+    """
+    from cli_agent_orchestrator.clients.tmux import disable_pwsh_history
+
     logger.info(f"Waiting for shell to be ready in {session_name}:{window_name}...")
     start_time = time.time()
     previous_output = None
@@ -51,6 +59,7 @@ def wait_for_shell(
 
         if output and output.strip() and previous_output is not None and output == previous_output:
             logger.info(f"Shell ready")
+            disable_pwsh_history(tmux_client, session_name, window_name)
             return True
 
         previous_output = output

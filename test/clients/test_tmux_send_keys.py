@@ -27,6 +27,14 @@ def mock_uuid():
         yield mock
 
 
+@pytest.fixture(autouse=True)
+def force_unix_platform():
+    """Pin sys.platform to linux so all tests exercise the paste-buffer path."""
+    with patch("cli_agent_orchestrator.clients.tmux.sys") as mock_sys:
+        mock_sys.platform = "linux"
+        yield mock_sys
+
+
 class TestSendKeys:
     """Tests for the paste-buffer based send_keys implementation."""
 

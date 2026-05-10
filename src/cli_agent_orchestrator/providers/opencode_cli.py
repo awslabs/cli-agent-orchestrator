@@ -20,6 +20,7 @@ The provider detects the following terminal states:
 import logging
 import re
 import shlex
+import sys
 from typing import Optional
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
@@ -155,23 +156,42 @@ class OpenCodeCliProvider(BaseProvider):
         return True
 
     def _build_launch_command(self) -> str:
-        """Build the inline-env opencode launch command string."""
-        env_pairs = [
-            f"OPENCODE_CONFIG={OPENCODE_CONFIG_FILE}",
-            f"OPENCODE_CONFIG_DIR={OPENCODE_CONFIG_DIR}",
-            "OPENCODE_DISABLE_AUTOUPDATE=1",
-            "OPENCODE_DISABLE_MOUSE=1",
-            "OPENCODE_DISABLE_TERMINAL_TITLE=1",
-            "OPENCODE_CLIENT=cao",
-            "TERM=xterm-256color",
-        ]
+        """Build the inline-env opencode launch command string.
+
+        On Unix the env vars are prepended as ``KEY=VAL`` shell words before the
+        command (POSIX inline assignment syntax).  On Windows / PowerShell this
+        syntax is not valid; instead we emit a ``$env:KEY = 'VAL'; …`` prefix
+        followed by the bare command so that PowerShell sets the variables for
+        the child process.
+        """
+        env_dict = {
+            "OPENCODE_CONFIG": str(OPENCODE_CONFIG_FILE),
+            "OPENCODE_CONFIG_DIR": str(OPENCODE_CONFIG_DIR),
+            "OPENCODE_DISABLE_AUTOUPDATE": "1",
+            "OPENCODE_DISABLE_MOUSE": "1",
+            "OPENCODE_DISABLE_TERMINAL_TITLE": "1",
+            "OPENCODE_CLIENT": "cao",
+            "TERM": "xterm-256color",
+        }
         cmd_parts = ["opencode"]
         if self._agent_profile:
             cmd_parts += ["--agent", self._agent_profile]
         if self._model:
             cmd_parts += ["--model", self._model]
-        # env vars are shell words; join cmd parts with shlex for proper quoting
-        return " ".join(env_pairs) + " " + shlex.join(cmd_parts)
+        cmd_str = shlex.join(cmd_parts)
+
+        if sys.platform == "win32":
+            # PowerShell inline env: $env:KEY = 'VAL'; …; <command>
+            # Single-quote literals: embedded ' is escaped by doubling.
+            set_stmts = "; ".join(
+                "$env:{k} = '{v}'".format(k=k, v=v.replace("'", "''"))
+                for k, v in env_dict.items()
+            )
+            return f"{set_stmts}; {cmd_str}"
+
+        # Unix: KEY=VAL prefix (POSIX inline assignment)
+        env_pairs = [f"{k}={v}" for k, v in env_dict.items()]
+        return " ".join(env_pairs) + " " + cmd_str
 
     def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
         """Detect current TUI state from the tmux capture buffer.
