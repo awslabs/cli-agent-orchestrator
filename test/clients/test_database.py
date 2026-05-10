@@ -32,6 +32,7 @@ from cli_agent_orchestrator.clients.database import (
     update_flow_run_times,
     update_last_active,
     update_message_status,
+    update_terminal_shell_command,
 )
 from cli_agent_orchestrator.models.inbox import MessageStatus
 
@@ -120,6 +121,41 @@ class TestTerminalOperations:
         update_last_active("test123")
 
         mock_session.commit.assert_called_once()
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_update_terminal_shell_command(self, mock_session_class):
+        """Test updating shell_command baseline for a terminal."""
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_terminal = MagicMock()
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = mock_terminal
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        result = update_terminal_shell_command("test123", "bash")
+
+        assert result is True
+        assert mock_terminal.shell_command == "bash"
+        mock_session.commit.assert_called_once()
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_update_terminal_shell_command_not_found(self, mock_session_class):
+        """Test updating shell_command for a terminal that doesn't exist."""
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = None
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        result = update_terminal_shell_command("nonexistent", "bash")
+
+        assert result is False
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_delete_terminal(self, mock_session_class):

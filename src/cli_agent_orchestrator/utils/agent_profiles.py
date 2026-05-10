@@ -20,6 +20,29 @@ def _validate_agent_name(agent_name: str) -> None:
         raise ValueError(f"Invalid agent name '{agent_name}': must not contain '/', '\\', or '..'")
 
 
+def _safe_join(root: Path, *parts: str) -> Path | None:
+    """Join ``parts`` under ``root`` and return the path only if it stays inside ``root``.
+
+    Normalises the result with ``resolve()`` and confirms containment via
+    ``relative_to(root.resolve())``. Returns ``None`` when the joined path
+    would escape the root (e.g., due to an absolute component, traversal
+    segments, or a symlink that points outside). Callers should treat a
+    ``None`` result as "not found" rather than raising, so lookups across
+    multiple configured roots can fall through cleanly.
+
+    This is defence-in-depth alongside ``_validate_agent_name``: the name
+    check rejects traversal-style inputs up front, and this helper refuses
+    to touch the filesystem if anything slipped through.
+    """
+    resolved_root = root.resolve()
+    candidate = root.joinpath(*parts).resolve()
+    try:
+        candidate.relative_to(resolved_root)
+    except ValueError:
+        return None
+    return candidate
+
+
 def _scan_directory(directory: Path, source_label: str, profiles: Dict[str, Dict]) -> None:
     """Scan a directory for agent profiles (.md files, .json files, or subdirectories)."""
     if not directory.exists():
@@ -154,35 +177,42 @@ def _read_agent_profile_source(agent_name: str) -> str:
         get_extra_agent_dirs,
     )
 
-    local_profile = LOCAL_AGENT_STORE_DIR / f"{agent_name}.md"
-    if local_profile.exists():
+    # Every filesystem read below goes through _safe_join so the path is
+    # normalised and verified to stay inside its configured root. This is
+    # belt-and-braces on top of _validate_agent_name above — the name check
+    # rejects obvious traversal inputs, and _safe_join additionally blocks
+    # anything that sneaks past (e.g. symlinks resolving outside the root).
+    local_profile = _safe_join(LOCAL_AGENT_STORE_DIR, f"{agent_name}.md")
+    if local_profile is not None and local_profile.exists():
         return local_profile.read_text(encoding="utf-8")
 
-    for dir_path in get_agent_dirs().values():
-        directory = Path(dir_path)
+    def _lookup_in_directory(directory: Path) -> str | None:
         if not directory.exists():
-            continue
-        flat = directory / f"{agent_name}.md"
-        if flat.exists():
+            return None
+        flat = _safe_join(directory, f"{agent_name}.md")
+        if flat is not None and flat.exists():
             return flat.read_text(encoding="utf-8")
-        nested = directory / agent_name / "agent.md"
-        if nested.exists():
+        nested = _safe_join(directory, agent_name, "agent.md")
+        if nested is not None and nested.exists():
             return nested.read_text(encoding="utf-8")
+        return None
+
+    for dir_path in get_agent_dirs().values():
+        found = _lookup_in_directory(Path(dir_path))
+        if found is not None:
+            return found
 
     for extra_dir in get_extra_agent_dirs():
-        directory = Path(extra_dir)
-        if not directory.exists():
-            continue
-        flat = directory / f"{agent_name}.md"
-        if flat.exists():
-            return flat.read_text(encoding="utf-8")
-        nested = directory / agent_name / "agent.md"
-        if nested.exists():
-            return nested.read_text(encoding="utf-8")
+        found = _lookup_in_directory(Path(extra_dir))
+        if found is not None:
+            return found
 
+    # Built-in store is inside the installed package — the traversable API
+    # still concatenates agent_name as a single segment, so validate the
+    # result's name before reading.
     agent_store = resources.files("cli_agent_orchestrator.agent_store")
     built_in = agent_store / f"{agent_name}.md"
-    if built_in.is_file():
+    if built_in.name == f"{agent_name}.md" and built_in.is_file():
         return built_in.read_text(encoding="utf-8")
 
     raise FileNotFoundError(f"Agent profile not found: {agent_name}")
