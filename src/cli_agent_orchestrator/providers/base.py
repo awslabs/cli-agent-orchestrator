@@ -65,6 +65,20 @@ class BaseProvider(ABC):
         self._status = TerminalStatus.IDLE
         self._allowed_tools: Optional[List[str]] = allowed_tools
         self._skill_prompt: Optional[str] = skill_prompt
+        self._shell_baseline: Optional[str] = None
+
+    @property
+    def shell_baseline(self) -> Optional[str]:
+        """Shell process name captured before the CLI tool launched.
+
+        Used by providers to detect when the CLI tool has exited and the
+        shell is showing again (current pane command matches this baseline).
+        """
+        return self._shell_baseline
+
+    @shell_baseline.setter
+    def shell_baseline(self, value: Optional[str]) -> None:
+        self._shell_baseline = value
 
     @property
     def status(self) -> TerminalStatus:

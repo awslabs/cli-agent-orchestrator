@@ -1480,3 +1480,44 @@ class TestKiroCliTuiMode:
         # Should extract second turn only
         assert "Second answer" in message
         assert "First answer" not in message
+
+
+class TestKiroCliCheck3ShellBaseline:
+    """Tests for Check 3: shell-baseline IDLE detection."""
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_check3_shell_match_returns_idle(self, mock_tmux):
+        """No idle prompt + current command matches shell_baseline → IDLE."""
+        mock_tmux.get_history.return_value = "Some processing output without idle prompt"
+        mock_tmux.get_pane_current_command.return_value = "bash"
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        provider.shell_baseline = "bash"
+        status = provider.get_status()
+
+        assert status == TerminalStatus.IDLE
+        mock_tmux.get_pane_current_command.assert_called_once_with("test-session", "window-0")
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_check3_shell_mismatch_returns_processing(self, mock_tmux):
+        """No idle prompt + current command differs from shell_baseline → PROCESSING."""
+        mock_tmux.get_history.return_value = "Some processing output without idle prompt"
+        mock_tmux.get_pane_current_command.return_value = "kiro"
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        provider.shell_baseline = "bash"
+        status = provider.get_status()
+
+        assert status == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_check3_no_baseline_returns_processing_without_pane_query(self, mock_tmux):
+        """No idle prompt + shell_baseline is None → PROCESSING, no pane command query."""
+        mock_tmux.get_history.return_value = "Some processing output without idle prompt"
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        # shell_baseline defaults to None
+        status = provider.get_status()
+
+        assert status == TerminalStatus.PROCESSING
+        mock_tmux.get_pane_current_command.assert_not_called()
