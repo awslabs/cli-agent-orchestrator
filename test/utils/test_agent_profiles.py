@@ -286,11 +286,12 @@ class TestListAgentProfiles:
 
     @patch("cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", return_value=[])
     @patch("cli_agent_orchestrator.services.settings_service.get_agent_dirs", return_value={})
+    @patch("cli_agent_orchestrator.utils.agent_profiles._discover_claude_plugin_agent_dirs", return_value=[])
     @patch("cli_agent_orchestrator.utils.agent_profiles._scan_directory")
     @patch("cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR")
     @patch("cli_agent_orchestrator.utils.agent_profiles.resources")
     def test_list_agent_profiles_includes_builtin_profiles(
-        self, mock_resources, mock_local_dir, mock_scan, mock_get_agent_dirs, mock_get_extra_dirs
+        self, mock_resources, mock_local_dir, mock_scan, mock_discover, mock_get_agent_dirs, mock_get_extra_dirs
     ):
         """Test that built-in profiles are included and marked with source 'built-in'."""
         from cli_agent_orchestrator.utils.agent_profiles import list_agent_profiles
@@ -406,11 +407,12 @@ class TestListAgentProfiles:
 
     @patch("cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", return_value=[])
     @patch("cli_agent_orchestrator.services.settings_service.get_agent_dirs", return_value={})
+    @patch("cli_agent_orchestrator.utils.agent_profiles._discover_claude_plugin_agent_dirs", return_value=[])
     @patch("cli_agent_orchestrator.utils.agent_profiles._scan_directory")
     @patch("cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR")
     @patch("cli_agent_orchestrator.utils.agent_profiles.resources")
     def test_list_agent_profiles_returns_sorted_by_name(
-        self, mock_resources, mock_local_dir, mock_scan, mock_get_agent_dirs, mock_get_extra_dirs
+        self, mock_resources, mock_local_dir, mock_scan, mock_discover, mock_get_agent_dirs, mock_get_extra_dirs
     ):
         """Test that returned profiles are sorted alphabetically by name."""
         from cli_agent_orchestrator.utils.agent_profiles import list_agent_profiles

@@ -1,6 +1,7 @@
 """Tests for Claude Code plugin marketplace auto-discovery."""
 
 import json
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -136,7 +137,9 @@ class TestDiscoverClaudePluginAgentDirs:
         )
         result = _discover_claude_plugin_agent_dirs()
         assert len(result) == 1
-        assert result[0] == (mkt_path / "myplugin" / "agents").resolve()
+        agents_dir, plugin_root = result[0]
+        assert agents_dir == (mkt_path / "myplugin" / "agents").resolve()
+        assert plugin_root == mkt_path.resolve()
 
     def test_plugin_enabled_agents_dir_missing(self, tmp_path, monkeypatch):
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
@@ -438,11 +441,11 @@ class TestDiscoverEdgeCases:
         dup_profile = next(p for p in profiles if p["name"] == "dup")
         assert dup_profile["description"] == "from alpha"
 
-    def test_symlink_escape_in_agents_dir(self, tmp_path, monkeypatch):
-        """Symlink inside agents/ pointing outside plugin root — file is still served.
+    def test_symlink_escape_in_agents_dir(self, tmp_path, monkeypatch, caplog):
+        """Symlink inside agents/ pointing outside plugin root — file is now blocked.
 
-        Note: containment check is on the plugin dir, not individual agent files.
-        This test documents current behavior (no per-file containment).
+        Per-file containment check rejects files that resolve outside the
+        marketplace root.
         """
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
         claude_dir = tmp_path / ".claude"
@@ -477,7 +480,7 @@ class TestDiscoverEdgeCases:
         # The agents dir IS returned (plugin dir containment passes)
         result = _discover_claude_plugin_agent_dirs()
         assert len(result) == 1
-        # The symlinked file IS scanned (no per-file containment check)
+        # The symlinked file is now blocked by per-file containment
         from unittest.mock import MagicMock
 
         monkeypatch.setattr(
@@ -496,9 +499,14 @@ class TestDiscoverEdgeCases:
             "cli_agent_orchestrator.utils.agent_profiles.resources.files",
             lambda _pkg: mock_store,
         )
-        profiles = list_agent_profiles()
+
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            profiles = list_agent_profiles()
         names = {p["name"] for p in profiles}
-        assert "evil" in names  # DEFECT: symlink escape not blocked at agent-file level
+        assert "evil" not in names
+        assert "resolves outside plugin root" in caplog.text
 
 
 class TestReadAgentProfileSourcePluginIntegration:
@@ -555,3 +563,126 @@ class TestReadAgentProfileSourcePluginIntegration:
         )
         with pytest.raises(FileNotFoundError):
             _read_agent_profile_source("nonexistent-agent")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks require elevated privileges on Windows")
+class TestPluginPerFileContainment:
+    """Tests for per-file path containment in plugin agent scanning."""
+
+    def test_symlink_outside_plugin_root_rejected(self, tmp_path, monkeypatch, caplog):
+        """Symlink inside agents/ pointing outside marketplace root is skipped with warning."""
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir(parents=True)
+        mkt_path = tmp_path / "mkt"
+        mkt_path.mkdir()
+        (mkt_path / ".claude-plugin").mkdir()
+        (mkt_path / ".claude-plugin" / "marketplace.json").write_text(
+            json.dumps(
+                {"name": "aim", "plugins": [{"name": "p1", "source": "./p1", "version": "1"}]}
+            )
+        )
+        agents_dir = mkt_path / "p1" / "agents"
+        agents_dir.mkdir(parents=True)
+        # Real file inside plugin root
+        (agents_dir / "safe.md").write_text("---\nname: safe\ndescription: Safe\n---\nOK")
+        # Symlink escaping to outside
+        external = tmp_path / "outside"
+        external.mkdir()
+        (external / "escape.md").write_text("---\nname: escape\ndescription: Bad\n---\nEvil")
+        (agents_dir / "escape.md").symlink_to(external / "escape.md")
+
+        (claude_dir / "settings.json").write_text(
+            json.dumps(
+                {
+                    "extraKnownMarketplaces": {
+                        "aim": {"source": {"path": str(mkt_path), "source": "directory"}}
+                    },
+                    "enabledPlugins": {"p1@aim": True},
+                }
+            )
+        )
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR",
+            tmp_path / "empty-local",
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs", lambda: {}
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", lambda: []
+        )
+        from unittest.mock import MagicMock
+
+        mock_store = MagicMock()
+        mock_store.iterdir.return_value = []
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.resources.files",
+            lambda _pkg: mock_store,
+        )
+
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            profiles = list_agent_profiles()
+        names = {p["name"] for p in profiles}
+        assert "safe" in names
+        assert "escape" not in names
+        assert "resolves outside plugin root" in caplog.text
+
+    def test_symlink_within_plugin_root_accepted(self, tmp_path, monkeypatch):
+        """Symlink inside agents/ pointing within marketplace root is accepted."""
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir(parents=True)
+        mkt_path = tmp_path / "mkt"
+        mkt_path.mkdir()
+        (mkt_path / ".claude-plugin").mkdir()
+        (mkt_path / ".claude-plugin" / "marketplace.json").write_text(
+            json.dumps(
+                {"name": "aim", "plugins": [{"name": "p1", "source": "./p1", "version": "1"}]}
+            )
+        )
+        agents_dir = mkt_path / "p1" / "agents"
+        agents_dir.mkdir(parents=True)
+        # Real file
+        (agents_dir / "real.md").write_text("---\nname: real\ndescription: Real\n---\nBody")
+        # Symlink within the marketplace root (points to sibling)
+        (agents_dir / "alias.md").symlink_to(agents_dir / "real.md")
+
+        (claude_dir / "settings.json").write_text(
+            json.dumps(
+                {
+                    "extraKnownMarketplaces": {
+                        "aim": {"source": {"path": str(mkt_path), "source": "directory"}}
+                    },
+                    "enabledPlugins": {"p1@aim": True},
+                }
+            )
+        )
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR",
+            tmp_path / "empty-local",
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs", lambda: {}
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", lambda: []
+        )
+        from unittest.mock import MagicMock
+
+        mock_store = MagicMock()
+        mock_store.iterdir.return_value = []
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.resources.files",
+            lambda _pkg: mock_store,
+        )
+
+        profiles = list_agent_profiles()
+        names = {p["name"] for p in profiles}
+        # Both real and alias are within the root, both accepted
+        assert "real" in names
+        assert "alias" in names

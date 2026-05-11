@@ -83,8 +83,73 @@ def _scan_directory(directory: Path, source_label: str, profiles: Dict[str, Dict
                 }
 
 
-def _discover_claude_plugin_agent_dirs() -> List[Path]:
-    """Walk Claude Code marketplaces and return agent dirs from enabled plugins."""
+def _is_path_contained(path: Path, root: Path) -> bool:
+    """Return True if *path* resolves to a location inside *root*."""
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _scan_plugin_directory(
+    directory: Path, source_label: str, profiles: Dict[str, Dict], plugin_root: Path
+) -> None:
+    """Scan a plugin directory with per-file path containment validation.
+
+    Like ``_scan_directory`` but skips any entry whose resolved path escapes
+    *plugin_root*. This prevents symlinks inside a plugin's agents/ directory
+    from exposing files outside the plugin tree.
+    """
+    if not directory.exists():
+        return
+    resolved_root = plugin_root.resolve()
+    for item in directory.iterdir():
+        if not _is_path_contained(item, resolved_root):
+            logger.warning(
+                "Plugin agent file %s resolves outside plugin root %s — skipping",
+                item,
+                resolved_root,
+            )
+            continue
+        if item.is_dir():
+            profile_name = item.name
+            desc = ""
+            agent_md = item / "agent.md"
+            if agent_md.exists() and _is_path_contained(agent_md, resolved_root):
+                try:
+                    data = frontmatter.loads(agent_md.read_text())
+                    desc = data.metadata.get("description", "")
+                except Exception:
+                    pass
+            if profile_name not in profiles:
+                profiles[profile_name] = {
+                    "name": profile_name,
+                    "description": desc,
+                    "source": source_label,
+                }
+        elif item.suffix == ".md" and item.is_file():
+            profile_name = item.stem
+            desc = ""
+            try:
+                data = frontmatter.loads(item.read_text())
+                desc = data.metadata.get("description", "")
+            except Exception:
+                pass
+            if profile_name not in profiles:
+                profiles[profile_name] = {
+                    "name": profile_name,
+                    "description": desc,
+                    "source": source_label,
+                }
+
+
+def _discover_claude_plugin_agent_dirs() -> List[tuple[Path, Path]]:
+    """Walk Claude Code marketplaces and return agent dirs from enabled plugins.
+
+    Returns a list of ``(agents_dir, marketplace_root)`` tuples so callers can
+    perform per-file path containment against the marketplace root.
+    """
     settings_path = Path.home() / ".claude" / "settings.json"
     try:
         data = json.loads(settings_path.read_text())
@@ -98,7 +163,7 @@ def _discover_claude_plugin_agent_dirs() -> List[Path]:
     if not marketplaces:
         return []
 
-    agent_dirs: List[Path] = []
+    agent_dirs: List[tuple[Path, Path]] = []
     for mkt_name, mkt_config in marketplaces.items():
         source = mkt_config.get("source", {})
         if source.get("source") != "directory":
@@ -133,7 +198,7 @@ def _discover_claude_plugin_agent_dirs() -> List[Path]:
                 continue
             agents_dir = plugin_dir / "agents"
             if agents_dir.is_dir():
-                agent_dirs.append(agents_dir)
+                agent_dirs.append((agents_dir, resolved_mkt))
 
     return agent_dirs
 
@@ -195,8 +260,8 @@ def list_agent_profiles() -> List[Dict]:
         _scan_directory(path, label, profiles)
 
     # 4. Claude Code plugin marketplace directories
-    for plugin_agents_dir in _discover_claude_plugin_agent_dirs():
-        _scan_directory(plugin_agents_dir, "claude_plugin", profiles)
+    for plugin_agents_dir, plugin_root in _discover_claude_plugin_agent_dirs():
+        _scan_plugin_directory(plugin_agents_dir, "claude_plugin", profiles, plugin_root)
 
     # 5. Extra user-added directories
     for extra_dir in get_extra_agent_dirs():
@@ -267,10 +332,21 @@ def _read_agent_profile_source(agent_name: str) -> str:
         if found is not None:
             return found
 
-    for plugin_agents_dir in _discover_claude_plugin_agent_dirs():
+    for plugin_agents_dir, plugin_root in _discover_claude_plugin_agent_dirs():
         found = _lookup_in_directory(plugin_agents_dir)
         if found is not None:
-            return found
+            # Verify the resolved file stays inside the plugin root
+            flat = _safe_join(plugin_agents_dir, f"{agent_name}.md")
+            nested = _safe_join(plugin_agents_dir, agent_name, "agent.md")
+            candidate = flat if (flat is not None and flat.exists()) else nested
+            if candidate is not None and _is_path_contained(candidate, plugin_root):
+                return found
+            logger.warning(
+                "Plugin agent file for '%s' resolves outside plugin root %s — skipping",
+                agent_name,
+                plugin_root,
+            )
+            continue
 
     for extra_dir in get_extra_agent_dirs():
         found = _lookup_in_directory(Path(extra_dir))
