@@ -2,10 +2,11 @@
 
 import json
 import logging
+import os
 import re
 from importlib import resources
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 import frontmatter
 
@@ -144,26 +145,71 @@ def _scan_plugin_directory(
                 }
 
 
-def _discover_claude_plugin_agent_dirs() -> List[tuple[Path, Path]]:
+_PLUGIN_DIR_CACHE: Optional[Dict] = None
+
+
+def _reset_plugin_discovery_cache() -> None:
+    """Clear the plugin discovery cache. Intended for test use only."""
+    global _PLUGIN_DIR_CACHE
+    _PLUGIN_DIR_CACHE = None
+
+
+def _get_mtime(path: Path) -> Optional[float]:
+    """Return mtime of *path*, or None if it cannot be stat'd."""
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return None
+
+
+def _discover_claude_plugin_agent_dirs() -> List[Tuple[Path, Path]]:
     """Walk Claude Code marketplaces and return agent dirs from enabled plugins.
 
     Returns a list of ``(agents_dir, marketplace_root)`` tuples so callers can
     perform per-file path containment against the marketplace root.
+
+    Results are cached at module level and invalidated when the mtime of
+    settings.json or any marketplace.json changes.
     """
+    global _PLUGIN_DIR_CACHE
+
     settings_path = Path.home() / ".claude" / "settings.json"
+    settings_mtime = _get_mtime(settings_path)
+
+    # Fast path: if settings.json mtime hasn't changed, check full cache key
+    if _PLUGIN_DIR_CACHE is not None and _PLUGIN_DIR_CACHE["settings_mtime"] == settings_mtime:
+        # Verify marketplace.json mtimes haven't changed either
+        if all(_get_mtime(p) == m for p, m in _PLUGIN_DIR_CACHE["marketplace_mtimes"]):
+            return _PLUGIN_DIR_CACHE["value"]
+
+    # Cache miss — perform full discovery
+    result, marketplace_mtimes = _compute_plugin_discovery(settings_path)
+    _PLUGIN_DIR_CACHE = {
+        "settings_mtime": settings_mtime,
+        "marketplace_mtimes": marketplace_mtimes,
+        "value": result,
+    }
+    return result
+
+
+def _compute_plugin_discovery(
+    settings_path: Path,
+) -> Tuple[List[Tuple[Path, Path]], List[Tuple[Path, Optional[float]]]]:
+    """Perform the actual plugin discovery and return (result, marketplace_mtimes)."""
     try:
         data = json.loads(settings_path.read_text())
     except (json.JSONDecodeError, OSError):
         if settings_path.exists():
             logger.warning("Failed to read %s", settings_path)
-        return []
+        return [], []
 
     marketplaces = data.get("extraKnownMarketplaces", {})
     enabled_plugins = data.get("enabledPlugins", {})
     if not marketplaces:
-        return []
+        return [], []
 
-    agent_dirs: List[tuple[Path, Path]] = []
+    agent_dirs: List[Tuple[Path, Path]] = []
+    marketplace_mtimes: List[Tuple[Path, Optional[float]]] = []
     for mkt_name, mkt_config in marketplaces.items():
         source = mkt_config.get("source", {})
         if source.get("source") != "directory":
@@ -173,6 +219,7 @@ def _discover_claude_plugin_agent_dirs() -> List[tuple[Path, Path]]:
             continue
 
         marketplace_json = mkt_path / ".claude-plugin" / "marketplace.json"
+        marketplace_mtimes.append((marketplace_json, _get_mtime(marketplace_json)))
         try:
             mkt_data = json.loads(marketplace_json.read_text())
         except (json.JSONDecodeError, OSError):
@@ -200,7 +247,7 @@ def _discover_claude_plugin_agent_dirs() -> List[tuple[Path, Path]]:
             if agents_dir.is_dir():
                 agent_dirs.append((agents_dir, resolved_mkt))
 
-    return agent_dirs
+    return agent_dirs, marketplace_mtimes
 
 
 def list_agent_profiles() -> List[Dict]:

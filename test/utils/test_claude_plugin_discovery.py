@@ -1,6 +1,7 @@
 """Tests for Claude Code plugin marketplace auto-discovery."""
 
 import json
+import os
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -9,8 +10,17 @@ import pytest
 
 from cli_agent_orchestrator.utils.agent_profiles import (
     _discover_claude_plugin_agent_dirs,
+    _reset_plugin_discovery_cache,
     list_agent_profiles,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_cache():
+    """Reset the plugin discovery cache before each test."""
+    _reset_plugin_discovery_cache()
+    yield
+    _reset_plugin_discovery_cache()
 
 
 def _setup_marketplace(
@@ -565,7 +575,9 @@ class TestReadAgentProfileSourcePluginIntegration:
             _read_agent_profile_source("nonexistent-agent")
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="symlinks require elevated privileges on Windows")
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="symlinks require elevated privileges on Windows"
+)
 class TestPluginPerFileContainment:
     """Tests for per-file path containment in plugin agent scanning."""
 
@@ -686,3 +698,109 @@ class TestPluginPerFileContainment:
         # Both real and alias are within the root, both accepted
         assert "real" in names
         assert "alias" in names
+
+
+class TestPluginDiscoveryCache:
+    """Tests for mtime-based caching of _discover_claude_plugin_agent_dirs."""
+
+    def test_cache_hit_avoids_recomputation(self, tmp_path, monkeypatch):
+        """Second call with unchanged filesystem returns cached result without recomputing."""
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        _setup_marketplace(tmp_path, [{"name": "p1", "has_agents": True}], {"p1@aim": True})
+
+        # First call — populates cache
+        result1 = _discover_claude_plugin_agent_dirs()
+        assert len(result1) == 1
+
+        # Spy on _compute_plugin_discovery
+        call_count = {"n": 0}
+        from cli_agent_orchestrator.utils.agent_profiles import _compute_plugin_discovery
+
+        original_compute = _compute_plugin_discovery
+
+        def counting_compute(*args, **kwargs):
+            call_count["n"] += 1
+            return original_compute(*args, **kwargs)
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles._compute_plugin_discovery",
+            counting_compute,
+        )
+
+        # Second call — should hit cache
+        result2 = _discover_claude_plugin_agent_dirs()
+        assert result2 == result1
+        assert call_count["n"] == 0
+
+    def test_cache_invalidated_on_settings_mtime_change(self, tmp_path, monkeypatch):
+        """Touching settings.json invalidates the cache."""
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        _setup_marketplace(tmp_path, [{"name": "p1", "has_agents": True}], {"p1@aim": True})
+
+        # First call
+        result1 = _discover_claude_plugin_agent_dirs()
+        assert len(result1) == 1
+
+        # Touch settings.json to bump mtime
+        settings_path = tmp_path / ".claude" / "settings.json"
+        import time
+
+        time.sleep(0.01)
+        os.utime(settings_path, None)
+
+        # Spy on _compute_plugin_discovery
+        call_count = {"n": 0}
+        from cli_agent_orchestrator.utils.agent_profiles import _compute_plugin_discovery
+
+        original_compute = _compute_plugin_discovery
+
+        def counting_compute(*args, **kwargs):
+            call_count["n"] += 1
+            return original_compute(*args, **kwargs)
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles._compute_plugin_discovery",
+            counting_compute,
+        )
+
+        # Second call — should recompute
+        result2 = _discover_claude_plugin_agent_dirs()
+        assert call_count["n"] == 1
+        assert result2 == result1
+
+    def test_cache_invalidated_on_marketplace_json_mtime_change(self, tmp_path, monkeypatch):
+        """Touching marketplace.json invalidates the cache."""
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        mkt_path = _setup_marketplace(
+            tmp_path, [{"name": "p1", "has_agents": True}], {"p1@aim": True}
+        )
+
+        # First call
+        result1 = _discover_claude_plugin_agent_dirs()
+        assert len(result1) == 1
+
+        # Touch marketplace.json
+        marketplace_json = mkt_path / ".claude-plugin" / "marketplace.json"
+        import time
+
+        time.sleep(0.01)
+        os.utime(marketplace_json, None)
+
+        # Spy on _compute_plugin_discovery
+        call_count = {"n": 0}
+        from cli_agent_orchestrator.utils.agent_profiles import _compute_plugin_discovery
+
+        original_compute = _compute_plugin_discovery
+
+        def counting_compute(*args, **kwargs):
+            call_count["n"] += 1
+            return original_compute(*args, **kwargs)
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles._compute_plugin_discovery",
+            counting_compute,
+        )
+
+        # Second call — should recompute
+        result2 = _discover_claude_plugin_agent_dirs()
+        assert call_count["n"] == 1
