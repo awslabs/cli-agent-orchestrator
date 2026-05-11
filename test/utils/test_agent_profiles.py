@@ -669,3 +669,22 @@ class TestParseAgentProfileTextHtmlCommentStrip:
         profile = parse_agent_profile_text(text, "keep")
 
         assert "<!-- keep this -->" in profile.system_prompt
+
+    def test_multiple_leading_html_comments_stripped(self):
+        """Multiple consecutive leading <!-- ... --> blocks are all stripped."""
+        from cli_agent_orchestrator.utils.agent_profiles import parse_agent_profile_text
+
+        text = (
+            "<!-- AIM boilerplate -->\n"
+            "<!-- per-agent header -->\n"
+            "---\n"
+            "name: test-agent\n"
+            "description: Multi-comment\n"
+            "---\n"
+            "body"
+        )
+        profile = parse_agent_profile_text(text, "test-agent")
+
+        assert profile.name == "test-agent"
+        assert profile.description == "Multi-comment"
+        assert profile.system_prompt == "body"

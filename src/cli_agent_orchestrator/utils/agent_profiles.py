@@ -210,7 +210,7 @@ def parse_agent_profile_text(resolved_text: str, profile_name: str) -> AgentProf
     # Strip leading HTML comments before the YAML frontmatter fence.
     # Some profile generators (e.g. AIM) prepend <!-- ... --> blocks that
     # prevent python-frontmatter from detecting the opening '---' delimiter.
-    resolved_text = re.sub(r"^<!--.*?-->\s*", "", resolved_text, flags=re.DOTALL)
+    resolved_text = re.sub(r"^(?:<!--.*?-->\s*)+", "", resolved_text, flags=re.DOTALL)
     profile_data = frontmatter.loads(resolved_text)
     meta = profile_data.metadata
     meta["system_prompt"] = profile_data.content.strip()
