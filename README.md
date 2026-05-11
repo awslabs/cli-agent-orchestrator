@@ -201,7 +201,7 @@ Each agent terminal is assigned a unique `CAO_TERMINAL_ID` environment variable.
 - Creates a new terminal with the specified agent profile
 - Sends the task message and waits for the agent to finish
 - Returns the agent's output to the caller and exits the agent
-- **Automatically deletes the worker terminal on success** — the scrollback and metadata are saved to `~/.cao/logs/terminal/` before deletion, so you can restore the terminal for debugging with `cao terminal restore <terminal_id>` as long as the session still exists
+- **Automatically deletes the worker terminal on success** — the scrollback and metadata are saved to `~/.cao/logs/terminal/` before deletion, so you can restore the terminal for debugging with `cao terminal restore <terminal_id>` as long as the session still exists. See [docs/terminal-lifecycle.md](docs/terminal-lifecycle.md) for the full lifecycle, snapshot schema, and restore semantics.
 - Use when you need **synchronous** execution with results
 
 Example: sequential code review workflow.
