@@ -804,3 +804,282 @@ class TestPluginDiscoveryCache:
         # Second call — should recompute
         result2 = _discover_claude_plugin_agent_dirs()
         assert call_count["n"] == 1
+        assert result2 == result1
+
+    def test_reset_plugin_discovery_cache_clears_state(self, tmp_path, monkeypatch):
+        """Explicit test that _reset_plugin_discovery_cache() forces recomputation."""
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        _setup_marketplace(tmp_path, [{"name": "p1", "has_agents": True}], {"p1@aim": True})
+
+        # First call populates cache
+        result1 = _discover_claude_plugin_agent_dirs()
+        assert len(result1) == 1
+
+        # Explicitly clear the cache
+        _reset_plugin_discovery_cache()
+
+        # Spy on _compute_plugin_discovery
+        call_count = {"n": 0}
+        from cli_agent_orchestrator.utils.agent_profiles import _compute_plugin_discovery
+
+        original_compute = _compute_plugin_discovery
+
+        def counting_compute(*args, **kwargs):
+            call_count["n"] += 1
+            return original_compute(*args, **kwargs)
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles._compute_plugin_discovery",
+            counting_compute,
+        )
+
+        # Second call should recompute because cache was reset
+        result2 = _discover_claude_plugin_agent_dirs()
+        assert call_count["n"] == 1
+        assert result2 == result1
+
+    def test_cache_invalidates_when_new_marketplace_added(self, tmp_path, monkeypatch):
+        """Adding a new marketplace (new settings.json entry) triggers re-discovery."""
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        mkt_path = _setup_marketplace(
+            tmp_path, [{"name": "p1", "has_agents": True}], {"p1@aim": True}
+        )
+
+        # First call — one marketplace visible
+        result1 = _discover_claude_plugin_agent_dirs()
+        assert len(result1) == 1
+
+        # Add a second marketplace to settings.json (bumps settings.json mtime)
+        mkt2_path = tmp_path / ".aim" / "cc-plugins-b"
+        mkt2_path.mkdir(parents=True)
+        (mkt2_path / ".claude-plugin").mkdir()
+        (mkt2_path / ".claude-plugin" / "marketplace.json").write_text(
+            json.dumps(
+                {"name": "bim", "plugins": [{"name": "p2", "source": "./p2", "version": "1.0"}]}
+            )
+        )
+        (mkt2_path / "p2" / "agents").mkdir(parents=True)
+        (mkt2_path / "p2" / "agents" / "p2-agent.md").write_text(
+            "---\nname: p2-agent\ndescription: From bim\n---\nPrompt"
+        )
+        # Rewrite settings.json with both marketplaces
+        import time
+
+        time.sleep(0.01)
+        settings_path = tmp_path / ".claude" / "settings.json"
+        settings_path.write_text(
+            json.dumps(
+                {
+                    "extraKnownMarketplaces": {
+                        "aim": {"source": {"path": str(mkt_path), "source": "directory"}},
+                        "bim": {"source": {"path": str(mkt2_path), "source": "directory"}},
+                    },
+                    "enabledPlugins": {"p1@aim": True, "p2@bim": True},
+                }
+            )
+        )
+
+        # Second call — cache invalidated by settings.json mtime change
+        result2 = _discover_claude_plugin_agent_dirs()
+        assert len(result2) == 2
+        # Both agent dirs present, by plugin_root
+        roots = {str(pr) for _, pr in result2}
+        assert str(mkt_path.resolve()) in roots
+        assert str(mkt2_path.resolve()) in roots
+
+    def test_cache_invalidates_when_marketplace_json_disappears(self, tmp_path, monkeypatch):
+        """A marketplace.json that disappears between calls triggers re-discovery."""
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        mkt_path = _setup_marketplace(
+            tmp_path, [{"name": "p1", "has_agents": True}], {"p1@aim": True}
+        )
+
+        # First call — populates cache with one marketplace.json mtime
+        result1 = _discover_claude_plugin_agent_dirs()
+        assert len(result1) == 1
+
+        # Delete the marketplace.json (settings.json unchanged)
+        marketplace_json = mkt_path / ".claude-plugin" / "marketplace.json"
+        marketplace_json.unlink()
+
+        # Second call — the cached mtime was a float; _get_mtime now returns None.
+        # Cache key no longer matches → re-discover. Result shrinks to [].
+        result2 = _discover_claude_plugin_agent_dirs()
+        assert result2 == []
+
+
+class TestReadAgentProfileSourcePerFileContainment:
+    """Fix A: _read_agent_profile_source per-file containment check for plugin agents."""
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="symlinks require elevated privileges on Windows"
+    )
+    def test_read_agent_profile_source_rejects_symlink_escape(self, tmp_path, monkeypatch, caplog):
+        """load_agent_profile('escape') where escape.md is a symlink outside plugin root.
+
+        NOTE: The per-file check added in Fix A to _read_agent_profile_source
+        (the logger.warning + continue branch) is effectively defense-in-depth
+        behind _safe_join, which already filters symlink escapes during the
+        _lookup_in_directory call. So the user-visible effect is the same
+        (FileNotFoundError) regardless of which layer rejects — test asserts
+        the correct end behavior.
+        """
+        from cli_agent_orchestrator.utils.agent_profiles import _read_agent_profile_source
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir(parents=True)
+        mkt_path = tmp_path / "mkt"
+        mkt_path.mkdir()
+        (mkt_path / ".claude-plugin").mkdir()
+        (mkt_path / ".claude-plugin" / "marketplace.json").write_text(
+            json.dumps(
+                {"name": "aim", "plugins": [{"name": "p1", "source": "./p1", "version": "1"}]}
+            )
+        )
+        agents_dir = mkt_path / "p1" / "agents"
+        agents_dir.mkdir(parents=True)
+        # Target outside the marketplace root
+        external = tmp_path / "outside"
+        external.mkdir()
+        (external / "escape.md").write_text("---\nname: escape\n---\nEvil")
+        (agents_dir / "escape.md").symlink_to(external / "escape.md")
+
+        (claude_dir / "settings.json").write_text(
+            json.dumps(
+                {
+                    "extraKnownMarketplaces": {
+                        "aim": {"source": {"path": str(mkt_path), "source": "directory"}}
+                    },
+                    "enabledPlugins": {"p1@aim": True},
+                }
+            )
+        )
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR",
+            tmp_path / "empty-local",
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs", lambda: {}
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", lambda: []
+        )
+        from unittest.mock import MagicMock
+
+        mock_store = MagicMock()
+        mock_store.__truediv__ = lambda self, name: MagicMock(is_file=lambda: False)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.resources.files",
+            lambda _pkg: mock_store,
+        )
+
+        with pytest.raises(FileNotFoundError):
+            _read_agent_profile_source("escape")
+
+    def test_read_agent_profile_source_accepts_regular_plugin_file(self, tmp_path, monkeypatch):
+        """Sanity check: a regular (non-symlinked) plugin agent file is returned."""
+        from cli_agent_orchestrator.utils.agent_profiles import _read_agent_profile_source
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        _setup_marketplace(tmp_path, [{"name": "p1", "has_agents": True}], {"p1@aim": True})
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR",
+            tmp_path / "empty-local",
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs", lambda: {}
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", lambda: []
+        )
+        from unittest.mock import MagicMock
+
+        mock_store = MagicMock()
+        mock_store.__truediv__ = lambda self, name: MagicMock(is_file=lambda: False)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.resources.files",
+            lambda _pkg: mock_store,
+        )
+
+        result = _read_agent_profile_source("p1-agent")
+        assert "Agent from p1" in result
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="symlinks require elevated privileges on Windows"
+)
+class TestFixAScopeIsNarrow:
+    """Fix A stays narrow: only claude_plugin path gets per-file containment.
+
+    A symlink escape inside a non-plugin agent dir (e.g. ~/.kiro/agents/) must
+    NOT be rejected, because _scan_directory (the non-plugin path) has no
+    containment check. If a future refactor accidentally broadens Fix A to all
+    callers, this test catches the regression.
+    """
+
+    def test_symlink_escape_in_non_plugin_dir_not_blocked(self, tmp_path, monkeypatch):
+        """Symlink in a provider dir (not a plugin) is still picked up by _scan_directory."""
+        from cli_agent_orchestrator.utils.agent_profiles import list_agent_profiles
+
+        # Provider agents dir containing a symlink that escapes
+        kiro_agents = tmp_path / "kiro-agents"
+        kiro_agents.mkdir()
+        external = tmp_path / "outside-kiro"
+        external.mkdir()
+        (external / "evil.md").write_text("---\nname: evil\ndescription: Escaped\n---\nOK")
+        (kiro_agents / "evil.md").symlink_to(external / "evil.md")
+
+        # No plugin discovery (we want to isolate the _scan_directory path)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles._discover_claude_plugin_agent_dirs",
+            lambda: [],
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR",
+            tmp_path / "empty-local",
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+            lambda: {"kiro_cli": str(kiro_agents)},
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", lambda: []
+        )
+        from unittest.mock import MagicMock
+
+        mock_store = MagicMock()
+        mock_store.iterdir.return_value = []
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.resources.files",
+            lambda _pkg: mock_store,
+        )
+
+        profiles = list_agent_profiles()
+        names = {p["name"] for p in profiles}
+        # 'evil' IS present — the fix deliberately did not broaden the check to
+        # non-plugin paths. This asserts the scope stays narrow.
+        assert "evil" in names
+
+
+class TestParseAgentProfileTextMultipleComments:
+    """Fix C extra coverage: three+ consecutive HTML comments stripped."""
+
+    def test_three_leading_html_comments_stripped(self):
+        from cli_agent_orchestrator.utils.agent_profiles import parse_agent_profile_text
+
+        text = (
+            "<!-- one -->\n"
+            "<!-- two -->\n"
+            "<!-- three -->\n"
+            "---\n"
+            "name: triple\n"
+            "description: Triple\n"
+            "---\n"
+            "body"
+        )
+        profile = parse_agent_profile_text(text, "triple")
+        assert profile.name == "triple"
+        assert profile.description == "Triple"
+        assert profile.system_prompt == "body"

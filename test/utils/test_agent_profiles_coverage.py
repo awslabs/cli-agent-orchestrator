@@ -300,11 +300,21 @@ class TestListAgentProfilesEdgeCases:
 
     @patch("cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", return_value=[])
     @patch("cli_agent_orchestrator.services.settings_service.get_agent_dirs", return_value={})
+    @patch(
+        "cli_agent_orchestrator.utils.agent_profiles._discover_claude_plugin_agent_dirs",
+        return_value=[],
+    )
     @patch("cli_agent_orchestrator.utils.agent_profiles._scan_directory")
     @patch("cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR")
     @patch("cli_agent_orchestrator.utils.agent_profiles.resources")
     def test_builtin_store_exception_handled(
-        self, mock_resources, mock_local_dir, mock_scan, mock_get_dirs, mock_get_extra
+        self,
+        mock_resources,
+        mock_local_dir,
+        mock_scan,
+        mock_discover,
+        mock_get_dirs,
+        mock_get_extra,
     ):
         """Exception scanning built-in store should be caught, not crash."""
         from cli_agent_orchestrator.utils.agent_profiles import list_agent_profiles
@@ -368,11 +378,21 @@ class TestListAgentProfilesEdgeCases:
 
     @patch("cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", return_value=[])
     @patch("cli_agent_orchestrator.services.settings_service.get_agent_dirs", return_value={})
+    @patch(
+        "cli_agent_orchestrator.utils.agent_profiles._discover_claude_plugin_agent_dirs",
+        return_value=[],
+    )
     @patch("cli_agent_orchestrator.utils.agent_profiles._scan_directory")
     @patch("cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR")
     @patch("cli_agent_orchestrator.utils.agent_profiles.resources")
     def test_non_md_builtin_files_skipped(
-        self, mock_resources, mock_local_dir, mock_scan, mock_get_dirs, mock_get_extra
+        self,
+        mock_resources,
+        mock_local_dir,
+        mock_scan,
+        mock_discover,
+        mock_get_dirs,
+        mock_get_extra,
     ):
         """Non-md files in built-in store should be ignored."""
         from cli_agent_orchestrator.utils.agent_profiles import list_agent_profiles
