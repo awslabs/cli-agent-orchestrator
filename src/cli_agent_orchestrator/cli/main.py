@@ -12,6 +12,7 @@ from cli_agent_orchestrator.cli.commands.mcp_server import mcp_server
 from cli_agent_orchestrator.cli.commands.session import session
 from cli_agent_orchestrator.cli.commands.shutdown import shutdown
 from cli_agent_orchestrator.cli.commands.skills import skills
+from cli_agent_orchestrator.cli.commands.terminal import terminal
 
 
 @click.group()
@@ -30,6 +31,7 @@ cli.add_command(mcp_server)
 cli.add_command(info)
 cli.add_command(skills)
 cli.add_command(session)
+cli.add_command(terminal)
 
 
 if __name__ == "__main__":
