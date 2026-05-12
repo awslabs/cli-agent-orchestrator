@@ -143,7 +143,12 @@ def create_terminal(
 
         # Step 3: Persist terminal metadata to database
         db_create_terminal(
-            terminal_id, session_name, window_name, provider, agent_profile, allowed_tools
+            terminal_id,
+            session_name,
+            window_name,
+            provider,
+            agent_profile,
+            allowed_tools,
         )
 
         # Step 3b: Load the profile once for allowed tool resolution before
@@ -455,6 +460,36 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
         metadata = get_terminal_metadata(terminal_id)
 
         if metadata:
+            # Snapshot scrollback + metadata before killing (for debugging/restore)
+            try:
+                # Capture plain text full scrollback (no -e, no line cap)
+                scrollback = tmux_client.get_history(
+                    metadata["tmux_session"],
+                    metadata["tmux_window"],
+                    strip_escapes=True,
+                    full_history=True,
+                )
+                scrollback_path = TERMINAL_LOG_DIR / f"{terminal_id}.scrollback"
+                scrollback_path.write_text(scrollback, encoding="utf-8")
+
+                import json as _json
+
+                snapshot = {
+                    "terminal_id": terminal_id,
+                    "session_name": metadata["tmux_session"],
+                    "window_name": metadata["tmux_window"],
+                    "agent_profile": metadata.get("agent_profile"),
+                    "provider": metadata["provider"],
+                    "working_directory": tmux_client.get_pane_working_directory(
+                        metadata["tmux_session"], metadata["tmux_window"]
+                    ),
+                    "allowed_tools": metadata.get("allowed_tools"),
+                }
+                snapshot_path = TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json"
+                snapshot_path.write_text(_json.dumps(snapshot, indent=2), encoding="utf-8")
+            except Exception as e:
+                logger.warning(f"Failed to snapshot terminal {terminal_id}: {e}")
+
             # Stop pipe-pane logging
             try:
                 tmux_client.stop_pipe_pane(metadata["tmux_session"], metadata["tmux_window"])

@@ -145,7 +145,9 @@ class TestTerminalPluginEvents:
         mock_generate_terminal_id.return_value = "abcd1234"
         mock_generate_window_name.return_value = "developer-abcd"
         mock_tmux.session_exists.return_value = False
-        mock_db_create_terminal.side_effect = lambda *_: call_order.append("db_create")
+        mock_db_create_terminal.side_effect = lambda *_args, **_kwargs: call_order.append(
+            "db_create"
+        )
         mock_load_agent_profile.return_value = AgentProfile(name="developer", description="Dev")
 
         provider = MagicMock()
