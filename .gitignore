@@ -51,3 +51,6 @@ context/
 
 # Local test runbooks (not shipped)
 MEMORY_TESTING.md
+
+# AIDLC working docs (not shipped)
+aidlc-docs/
