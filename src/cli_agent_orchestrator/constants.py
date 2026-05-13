@@ -39,8 +39,11 @@ TMUX_HISTORY_LINES = 200
 # =============================================================================
 # Application Directory Structure
 # =============================================================================
-# Base directory for all CAO data (~/.aws/cli-agent-orchestrator)
-CAO_HOME_DIR = Path.home() / ".aws" / "cli-agent-orchestrator"
+# Base directory for all CAO data (~/.aws/cli-agent-orchestrator).
+# The CAO_HOME_DIR override is useful for isolated/local pilot runs.
+CAO_HOME_DIR = Path(
+    os.environ.get("CAO_HOME_DIR", str(Path.home() / ".aws" / "cli-agent-orchestrator"))
+).expanduser()
 
 # Managed environment variable file
 CAO_ENV_FILE = CAO_HOME_DIR / ".env"

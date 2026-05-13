@@ -2,6 +2,25 @@
 
 CAO stores user configuration in `~/.aws/cli-agent-orchestrator/settings.json`. This file is managed by the settings service and can be edited via the Web UI Settings page or the REST API.
 
+## CAO State Directory
+
+By default, CAO stores its state under `~/.aws/cli-agent-orchestrator`. This
+directory contains the database, logs, installed agent profiles, skills, and
+settings file.
+
+For isolated development, CI, or local smoke tests, set `CAO_HOME_DIR` before
+starting `cao-server` or running `cao` commands:
+
+```bash
+export CAO_HOME_DIR=/tmp/cao-sandbox
+cao-server
+```
+
+When `CAO_HOME_DIR` is set, CAO derives its internal state paths from that
+directory, including `db/`, `logs/`, `agent-store/`, `agent-context/`, and
+`skills/`. The value is expanded with `~` support but is otherwise used as
+provided, so prefer an absolute path for reproducible runs.
+
 ## Agent Profile Directories
 
 CAO discovers agent profiles by scanning multiple directories. When loading or listing profiles, directories are scanned in this order (first match wins):

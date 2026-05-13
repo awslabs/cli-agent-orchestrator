@@ -97,6 +97,23 @@ class TestCaoHomeDir:
 
         assert isinstance(CAO_HOME_DIR, Path)
 
+    def test_cao_home_dir_honors_env_override(self, tmp_path):
+        """Test that CAO_HOME_DIR can be isolated with an environment override."""
+        import importlib
+
+        import cli_agent_orchestrator.constants as constants_module
+
+        custom_home = tmp_path / "cao-home"
+        with patch.dict("os.environ", {"CAO_HOME_DIR": str(custom_home)}, clear=False):
+            importlib.reload(constants_module)
+
+            assert constants_module.CAO_HOME_DIR == custom_home
+            assert constants_module.DB_DIR == custom_home / "db"
+            assert constants_module.LOCAL_AGENT_STORE_DIR == custom_home / "agent-store"
+            assert constants_module.SKILLS_DIR == custom_home / "skills"
+
+        importlib.reload(constants_module)
+
     def test_db_dir_is_under_cao_home(self):
         """Test that DB_DIR is under CAO_HOME_DIR."""
         from cli_agent_orchestrator.constants import CAO_HOME_DIR, DB_DIR
