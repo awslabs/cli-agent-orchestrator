@@ -301,6 +301,7 @@ class TestMessagePluginEvents:
         mock_get_metadata.return_value = {
             "tmux_session": "cao-demo",
             "tmux_window": "developer-abcd",
+            "provider": "claude_code",
         }
         provider = MagicMock()
         provider.paste_enter_count = 2

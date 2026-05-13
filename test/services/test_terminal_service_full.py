@@ -482,6 +482,7 @@ class TestSendInput:
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
             "tmux_window": "developer-abcd",
+            "provider": "claude_code",
         }
         mock_provider = mock_pm.get_provider.return_value
         mock_provider.paste_enter_count = 2
