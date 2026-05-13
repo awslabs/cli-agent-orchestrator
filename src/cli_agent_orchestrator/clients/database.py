@@ -104,6 +104,23 @@ class SessionEventModel(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class ProjectMarkerModel(Base):
+    """SQLAlchemy model for project-identity marker fork-detection (Phase 3 U8).
+
+    Tracks the realpath where a given ``project_id`` was last observed so
+    ``resolve_project_id`` can distinguish a rename (recorded path no longer
+    exists → update) from a copy (both paths exist → mint fresh id).
+    """
+
+    __tablename__ = "project_markers"
+
+    project_id = Column(String, primary_key=True)
+    nonce = Column(String, nullable=False)
+    realpath = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class ProjectAliasModel(Base):
     """SQLAlchemy model for project identity aliases (Phase 2.5 U6).
 
@@ -782,6 +799,50 @@ def get_project_id_by_alias(alias: str) -> Optional[str]:
     with SessionLocal() as db:
         row = db.query(ProjectAliasModel).filter(ProjectAliasModel.alias == alias).first()
         return str(row.project_id) if row else None
+
+
+# =============================================================================
+# Project marker database functions (Phase 3 U8)
+# =============================================================================
+
+
+def record_project_marker(project_id: str, nonce: str, realpath: str) -> None:
+    """Upsert a ``(project_id, nonce, realpath)`` row for fork-detection.
+
+    Updates ``nonce`` + ``realpath`` in place when ``project_id`` already
+    exists so a rename can move the recorded path forward without minting a
+    new id. Non-fatal on DB errors — callers should log and continue.
+    """
+    with SessionLocal() as db:
+        existing = (
+            db.query(ProjectMarkerModel).filter(ProjectMarkerModel.project_id == project_id).first()
+        )
+        if existing:
+            existing.nonce = nonce
+            existing.realpath = realpath
+            existing.updated_at = datetime.utcnow()
+            db.commit()
+            return
+        row = ProjectMarkerModel(project_id=project_id, nonce=nonce, realpath=realpath)
+        db.add(row)
+        db.commit()
+
+
+def lookup_project_marker(project_id: str) -> Optional[Dict[str, Any]]:
+    """Return the recorded marker row for ``project_id``, or None if absent."""
+    with SessionLocal() as db:
+        row = (
+            db.query(ProjectMarkerModel).filter(ProjectMarkerModel.project_id == project_id).first()
+        )
+        if not row:
+            return None
+        return {
+            "project_id": str(row.project_id),
+            "nonce": str(row.nonce),
+            "realpath": str(row.realpath),
+            "created_at": row.created_at,
+            "updated_at": row.updated_at,
+        }
 
 
 def list_aliases_for_project(project_id: str) -> List[Dict[str, Any]]:

@@ -45,7 +45,6 @@ from cli_agent_orchestrator.services.memory_service import (
     resolve_project_id,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -56,9 +55,7 @@ def _run(coro: Any) -> Any:
 
 
 def _make_engine(db_path: Path) -> Any:
-    engine = create_engine(
-        f"sqlite:///{db_path}", connect_args={"check_same_thread": False}
-    )
+    engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
     Base.metadata.create_all(bind=engine)
     return engine
 
@@ -106,9 +103,7 @@ def clear_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
 def _init_repo(path: Path, remote_url: str) -> None:
     """Initialize a git repo at ``path`` with a single ``origin`` remote."""
     path.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        ["git", "init", "-q"], cwd=path, check=True, capture_output=True
-    )
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True, capture_output=True)
     subprocess.run(
         ["git", "remote", "add", "origin", remote_url],
         cwd=path,
@@ -119,17 +114,13 @@ def _init_repo(path: Path, remote_url: str) -> None:
 
 def _git_available() -> bool:
     try:
-        subprocess.run(
-            ["git", "--version"], capture_output=True, check=True, timeout=2
-        )
+        subprocess.run(["git", "--version"], capture_output=True, check=True, timeout=2)
         return True
     except (FileNotFoundError, subprocess.SubprocessError):
         return False
 
 
-pytestmark = pytest.mark.skipif(
-    not _git_available(), reason="git executable required for U6 tests"
-)
+pytestmark = pytest.mark.skipif(not _git_available(), reason="git executable required for U6 tests")
 
 
 # ---------------------------------------------------------------------------
@@ -161,9 +152,7 @@ def test_ac1_same_git_remote_at_two_paths_resolves_same_project_id(
     assert id_main == id_wt
 
     main_hash = hashlib.sha256(os.path.realpath(main).encode()).hexdigest()[:12]
-    wt_hash = hashlib.sha256(
-        os.path.realpath(worktree).encode()
-    ).hexdigest()[:12]
+    wt_hash = hashlib.sha256(os.path.realpath(worktree).encode()).hexdigest()[:12]
     assert get_project_id_by_alias(main_hash) == id_main
     assert get_project_id_by_alias(wt_hash) == id_main
 
@@ -218,18 +207,30 @@ def test_ac2_rename_keeps_memories_recallable_via_alias(
 
 
 def test_ac3_non_git_falls_back_to_cwd_hash(
-    tmp_path: Path, isolated_db: Path, clear_overrides: None
+    tmp_path: Path,
+    isolated_db: Path,
+    clear_overrides: None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A plain directory must resolve exactly as Phase 2 did — SHA256[:12]."""
+    """A plain directory must resolve exactly as Phase 2 did — SHA256[:12].
+
+    Phase 3 U8 adds a marker-file branch that intercepts this fallback when
+    ``memory.project_marker`` is True (default). This AC locks pre-U6
+    behavior, so the marker is disabled explicitly — marker coverage lives
+    in ``test_project_identity_marker.py``.
+    """
     plain = tmp_path / "plain"
     plain.mkdir()
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.settings_service.is_project_marker_enabled",
+        lambda: False,
+        raising=True,
+    )
 
     svc = _make_svc(tmp_path / "mem", isolated_db)
     scope_id = svc.resolve_scope_id("project", {"cwd": str(plain)})
 
-    expected = hashlib.sha256(
-        os.path.realpath(plain).encode()
-    ).hexdigest()[:12]
+    expected = hashlib.sha256(os.path.realpath(plain).encode()).hexdigest()[:12]
     assert scope_id == expected
 
 
@@ -320,9 +321,7 @@ def test_explicit_project_id_from_settings_when_env_absent(
     )
 
     svc = _make_svc(tmp_path / "mem", isolated_db)
-    scope_id = svc.resolve_scope_id(
-        "project", {"cwd": str(tmp_path / "plain")}
-    )
+    scope_id = svc.resolve_scope_id("project", {"cwd": str(tmp_path / "plain")})
 
     assert scope_id == "from-settings"
 
@@ -346,9 +345,7 @@ def test_explicit_project_id_from_settings_when_env_absent(
         ("", "unknown"),
     ],
 )
-def test_normalize_git_remote_produces_safe_stable_id(
-    url: str, expected: str
-) -> None:
+def test_normalize_git_remote_produces_safe_stable_id(url: str, expected: str) -> None:
     assert _normalize_git_remote(url) == expected
 
 
@@ -364,21 +361,30 @@ def test_git_remote_identity_returns_none_for_non_repo(tmp_path: Path) -> None:
 
 
 def test_resolver_survives_filenotfound_on_git(
-    tmp_path: Path, isolated_db: Path, clear_overrides: None
+    tmp_path: Path,
+    isolated_db: Path,
+    clear_overrides: None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """If ``git`` is absent from PATH the resolver must fall back gracefully."""
+    """If ``git`` is absent from PATH the resolver must fall back gracefully.
+
+    Marker disabled so this covers the Phase 2 cwd-hash fallback path only;
+    the marker-enabled equivalent is covered in
+    ``test_project_identity_marker.py``.
+    """
     (tmp_path / "plain").mkdir()
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.settings_service.is_project_marker_enabled",
+        lambda: False,
+        raising=True,
+    )
     svc = _make_svc(tmp_path / "mem", isolated_db)
     with patch(
         "cli_agent_orchestrator.services.memory_service.subprocess.run",
         side_effect=FileNotFoundError("git not installed"),
     ):
-        scope_id = svc.resolve_scope_id(
-            "project", {"cwd": str(tmp_path / "plain")}
-        )
-    expected = hashlib.sha256(
-        os.path.realpath(tmp_path / "plain").encode()
-    ).hexdigest()[:12]
+        scope_id = svc.resolve_scope_id("project", {"cwd": str(tmp_path / "plain")})
+    expected = hashlib.sha256(os.path.realpath(tmp_path / "plain").encode()).hexdigest()[:12]
     assert scope_id == expected
 
 
@@ -482,9 +488,7 @@ def test_legacy_cwd_hash_dir_remains_searchable_after_alias_recorded(
     canonical = svc.resolve_scope_id("project", {"cwd": str(repo)})
     assert canonical is not None
 
-    legacy_hash = hashlib.sha256(
-        os.path.realpath(repo).encode()
-    ).hexdigest()[:12]
+    legacy_hash = hashlib.sha256(os.path.realpath(repo).encode()).hexdigest()[:12]
     assert legacy_hash != canonical
 
     # Create a legacy wiki file under the cwd-hash dir (as if pre-U6).

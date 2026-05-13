@@ -160,6 +160,15 @@ MEMORY_BASE_DIR = CAO_HOME_DIR / "memory"
 MEMORY_MAX_PER_SCOPE = 10
 MEMORY_SCOPE_BUDGET_CHARS = 1000
 
+# Phase 3 U8 — Project-identity marker file (rename/mv survival).
+# Written into ``<cwd>/.cao/project_id`` on first resolve when the cwd-hash
+# fallback branch is taken (non-git projects). Settings flag
+# ``memory.project_marker`` (env ``CAO_PROJECT_MARKER``) gates creation.
+PROJECT_MARKER_DIRNAME = ".cao"
+PROJECT_MARKER_FILENAME = "project_id"
+PROJECT_MARKER_DIR_MODE = 0o700
+PROJECT_MARKER_FILE_MODE = 0o600
+
 # =============================================================================
 # Tool Restriction Configuration
 # =============================================================================

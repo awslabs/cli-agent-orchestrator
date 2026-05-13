@@ -2,11 +2,16 @@
 
 import fcntl
 import hashlib
+import json
 import logging
 import os
 import re
+import secrets
 import subprocess
+import sys
+import tempfile
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -15,6 +20,10 @@ from cli_agent_orchestrator.constants import (
     MEMORY_BASE_DIR,
     MEMORY_MAX_PER_SCOPE,
     MEMORY_SCOPE_BUDGET_CHARS,
+    PROJECT_MARKER_DIR_MODE,
+    PROJECT_MARKER_DIRNAME,
+    PROJECT_MARKER_FILE_MODE,
+    PROJECT_MARKER_FILENAME,
 )
 from cli_agent_orchestrator.models.memory import Memory, MemoryScope, MemoryType
 
@@ -56,8 +65,7 @@ def _validate_project_id_override(raw: str) -> str:
         raise ValueError("project_id override contains null byte")
     if not _PROJECT_ID_OVERRIDE_PATTERN.match(raw):
         raise ValueError(
-            "project_id override must match ^[a-zA-Z0-9._\\-]{1,128}$; "
-            f"got {raw!r}"
+            "project_id override must match ^[a-zA-Z0-9._\\-]{1,128}$; " f"got {raw!r}"
         )
     return raw
 
@@ -133,7 +141,7 @@ def _normalize_git_remote(url: str) -> str:
     u = url.strip().lower()
     for proto in ("git+ssh://", "ssh://", "git://", "https://", "http://"):
         if u.startswith(proto):
-            u = u[len(proto):]
+            u = u[len(proto) :]
             break
     if "@" in u:
         u = u.split("@", 1)[1]
@@ -188,6 +196,377 @@ def _record_alias_safe(project_id: str, alias: str, kind: str) -> None:
         logger.debug(f"record_project_alias failed (non-fatal): {e}")
 
 
+# -----------------------------------------------------------------------------
+# Phase 3 U8 — Project-identity marker file (rename/mv survival)
+#
+# A ``<cwd>/.cao/project_id`` JSON blob lets the cwd-hash fallback branch
+# travel with the directory across rename/``mv``. The marker is opt-in via
+# ``memory.project_marker`` (default True); a SQLite fork-detection table
+# distinguishes rename (recorded path missing → update) from copy (both
+# paths exist → mint fresh id). Git-remote and explicit override resolution
+# are untouched.
+# -----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MarkerPayload:
+    """Parsed contents of a ``<cwd>/.cao/project_id`` marker file."""
+
+    project_id: str
+    nonce: str
+    created_at: str
+
+
+# Sentinel returned by ``_read_project_marker`` to distinguish the three
+# possible outcomes: ``None`` = missing (caller may mint); ``MARKER_CORRUPT``
+# = present but unusable (caller MUST fall through to cwd_hash without
+# touching disk — AC-U8.6 / AC-U8.7); ``MarkerPayload`` = valid.
+MARKER_CORRUPT: Any = object()
+
+# Nonce format: 16 lowercase hex chars (64 bits). Enforced at read time so a
+# hand-edited file with a non-hex nonce is treated as corrupt rather than
+# silently trusted.
+_NONCE_PATTERN = re.compile(r"^[0-9a-f]{16}$")
+
+
+def _is_project_marker_enabled() -> bool:
+    """Read the ``memory.project_marker`` flag; default True on any error."""
+    try:
+        from cli_agent_orchestrator.services.settings_service import (
+            is_project_marker_enabled,
+        )
+
+        return is_project_marker_enabled()
+    except Exception as e:
+        logger.debug(f"Failed to read memory.project_marker, defaulting to True: {e}")
+        return True
+
+
+def _marker_dir(cwd: Path) -> Path:
+    """Return the ``.cao/`` directory under a resolved ``cwd``.
+
+    Resolves ``cwd`` first (defense against symlink-based path composition
+    tricks) before joining the fixed dirname.
+    """
+    return cwd.resolve() / PROJECT_MARKER_DIRNAME
+
+
+def _marker_path(cwd: Path) -> Path:
+    """Return the full marker file path under ``<cwd>/.cao/project_id``."""
+    return _marker_dir(cwd) / PROJECT_MARKER_FILENAME
+
+
+def _read_project_marker(cwd: Path) -> Any:
+    """Read and validate the marker file.
+
+    Returns:
+        ``None``           — file does not exist (caller may mint + write).
+        ``MARKER_CORRUPT`` — file exists but is unreadable, malformed JSON,
+                             missing required fields, or carries an invalid
+                             ``project_id``/``nonce``. Caller MUST fall
+                             through to cwd_hash without touching disk
+                             (AC-U8.6 / AC-U8.7).
+        ``MarkerPayload``  — valid parsed marker.
+
+    Never raises.
+    """
+    path = _marker_path(cwd)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        # File exists (by path) but we cannot read it. Treat as corrupt so
+        # we do not silently overwrite a legitimate but transiently-blocked
+        # marker.
+        logger.warning(f"Cannot read project marker {path}: {e}")
+        return MARKER_CORRUPT
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        logger.warning(f"Corrupt project marker at {path}: {e}")
+        return MARKER_CORRUPT
+
+    if not isinstance(data, dict):
+        logger.warning(f"Project marker at {path} is not a JSON object")
+        return MARKER_CORRUPT
+
+    project_id = data.get("project_id")
+    nonce = data.get("nonce")
+    created_at = data.get("created_at")
+    if (
+        not isinstance(project_id, str)
+        or not isinstance(nonce, str)
+        or not isinstance(created_at, str)
+    ):
+        logger.warning(f"Project marker at {path} missing required fields")
+        return MARKER_CORRUPT
+
+    try:
+        _validate_project_id_override(project_id)
+    except ValueError as e:
+        logger.warning(f"Project marker at {path} has invalid project_id: {e}")
+        return MARKER_CORRUPT
+
+    # A hand-edited non-hex nonce is treated as corrupt rather than silently
+    # trusted downstream (downstream rename-branch nonce equality check).
+    if not _NONCE_PATTERN.match(nonce):
+        logger.warning(f"Project marker at {path} has malformed nonce")
+        return MARKER_CORRUPT
+
+    return MarkerPayload(project_id=project_id, nonce=nonce, created_at=created_at)
+
+
+def _mint_marker(cwd: Path) -> tuple[str, str, str]:
+    """Generate ``(project_id, nonce, created_at)`` for a fresh marker.
+
+    ``project_id`` is ``sha256(realpath + nonce + created_at)[:12]`` so two
+    fresh markers minted for the same ``realpath`` at different times (e.g.
+    a copy) produce distinct ids.
+    """
+    nonce = secrets.token_hex(8)  # 16 hex chars = 64 bits
+    created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    realpath = str(cwd.resolve())
+    seed = f"{realpath}|{nonce}|{created_at}"
+    project_id = hashlib.sha256(seed.encode()).hexdigest()[:12]
+    return project_id, nonce, created_at
+
+
+def _write_project_marker(cwd: Path, project_id: str, nonce: str, created_at: str) -> bool:
+    """Atomically write the marker file. Returns True on success, False otherwise.
+
+    Creates ``.cao/`` with ``0o700`` if missing; writes the payload via
+    ``tempfile.NamedTemporaryFile(dir=.cao)`` + ``os.replace`` so readers
+    never see a partial file. All IO errors are swallowed with a WARNING —
+    marker failure must never break resolution.
+    """
+    marker_dir = _marker_dir(cwd)
+    marker_file = marker_dir / PROJECT_MARKER_FILENAME
+    try:
+        marker_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.warning(f"Cannot create marker dir {marker_dir}: {e}")
+        return False
+
+    # Best-effort permission tightening on POSIX. On Windows chmod semantics
+    # differ — we skip the assertion path there but still try the call.
+    try:
+        os.chmod(marker_dir, PROJECT_MARKER_DIR_MODE)
+    except OSError as e:
+        logger.debug(f"chmod on marker dir failed (non-fatal): {e}")
+
+    payload = {
+        "project_id": project_id,
+        "nonce": nonce,
+        "created_at": created_at,
+    }
+    data = json.dumps(payload, indent=2) + "\n"
+
+    tmp_path: Optional[str] = None
+    try:
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=str(marker_dir),
+            prefix=".project_id.",
+            suffix=".tmp",
+            delete=False,
+        )
+        tmp_path = tmp.name
+        try:
+            tmp.write(data)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        finally:
+            tmp.close()
+        try:
+            os.chmod(tmp_path, PROJECT_MARKER_FILE_MODE)
+        except OSError as e:
+            logger.debug(f"chmod on marker tempfile failed (non-fatal): {e}")
+        os.replace(tmp_path, str(marker_file))
+        tmp_path = None  # replaced — no cleanup needed
+        return True
+    except OSError as e:
+        logger.warning(f"Cannot write project marker {marker_file}: {e}")
+        return False
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+_GITIGNORE_HINT_EMITTED: set[str] = set()
+# Bound the hint cache to avoid unbounded growth in a long-running
+# ``cao-server`` that sees many distinct cwds.
+_GITIGNORE_HINT_CACHE_MAX = 256
+
+
+def _emit_gitignore_hint_once(cwd: Path) -> None:
+    """Print a one-time stderr hint on first marker creation per process+cwd.
+
+    The hint reminds users to add ``.cao/`` to ``.gitignore`` if they don't
+    want project-identity metadata checked in. Subsequent resolves in the
+    same cwd (same process) suppress the hint.
+    """
+    try:
+        key = str(cwd.resolve())
+    except OSError:
+        key = str(cwd)
+    if key in _GITIGNORE_HINT_EMITTED:
+        return
+    # Drop an arbitrary older entry if the cap is reached — bounded FIFO-ish
+    # behavior. The hint is idempotent per-process anyway; an evicted cwd
+    # that resolves again just re-emits once.
+    if len(_GITIGNORE_HINT_EMITTED) >= _GITIGNORE_HINT_CACHE_MAX:
+        try:
+            _GITIGNORE_HINT_EMITTED.pop()
+        except KeyError:
+            pass
+    _GITIGNORE_HINT_EMITTED.add(key)
+    try:
+        print(
+            f"wrote {PROJECT_MARKER_DIRNAME}/{PROJECT_MARKER_FILENAME} — "
+            f"add {PROJECT_MARKER_DIRNAME}/ to .gitignore if you don't want "
+            "to check in project memory identity",
+            file=sys.stderr,
+        )
+    except Exception as e:
+        logger.debug(f"hint emission failed (non-fatal): {e}")
+
+
+def _record_marker_safe(project_id: str, nonce: str, realpath: str) -> None:
+    """Opportunistic SQLite marker upsert; swallow DB errors to debug."""
+    try:
+        from cli_agent_orchestrator.clients.database import record_project_marker
+
+        record_project_marker(project_id, nonce, realpath)
+    except Exception as e:
+        logger.debug(f"record_project_marker failed (non-fatal): {e}")
+
+
+def _lookup_marker_safe(project_id: str) -> Optional[dict]:
+    """Opportunistic SQLite marker read; swallow DB errors and return None."""
+    try:
+        from cli_agent_orchestrator.clients.database import lookup_project_marker
+
+        return lookup_project_marker(project_id)
+    except Exception as e:
+        logger.debug(f"lookup_project_marker failed (non-fatal): {e}")
+        return None
+
+
+def _resolve_via_marker(cwd: Path, cwd_hash: Optional[str]) -> Optional[str]:
+    """Marker-file branch of ``resolve_project_id``.
+
+    Returns a resolved ``project_id`` when the marker exists (or was just
+    minted); returns ``None`` when the marker branch should defer to the
+    cwd-hash fallback. Deferral happens on:
+
+      * marker present but corrupt/invalid (``MARKER_CORRUPT`` — AC-U8.6 /
+        AC-U8.7 — no disk writes, no SQLite writes);
+      * first-mint write failure;
+      * rename branch with nonce mismatch (adversarial hijack guard);
+      * concurrent-writer race where the disk lost our mint.
+
+    Writing the alias linking the marker id to the cwd-hash is opportunistic
+    so post-U8 memories stored against the marker id can still be found if a
+    user later disables the marker flag.
+    """
+    cwd_resolved = str(cwd.resolve())
+    payload = _read_project_marker(cwd)
+
+    # Corrupt/invalid marker (AC-U8.6 / AC-U8.7): do NOT overwrite, do NOT
+    # mint — fall through to cwd_hash so a transiently bad file is not
+    # silently replaced. The WARNING was already emitted in
+    # ``_read_project_marker``.
+    if payload is MARKER_CORRUPT:
+        return None
+
+    if isinstance(payload, MarkerPayload):
+        recorded = _lookup_marker_safe(payload.project_id)
+        if recorded and recorded.get("realpath") != cwd_resolved:
+            recorded_path = recorded.get("realpath", "")
+            if recorded_path and Path(recorded_path).exists():
+                # Copy — both locations exist. Mint a fresh identity for the
+                # new location so writes don't collide; leave the original
+                # marker untouched.
+                new_id, new_nonce, new_created = _mint_marker(cwd)
+                if _write_project_marker(cwd, new_id, new_nonce, new_created):
+                    _record_marker_safe(new_id, new_nonce, cwd_resolved)
+                    if cwd_hash and new_id != cwd_hash:
+                        _record_alias_safe(new_id, cwd_hash, "cwd_hash")
+                    logger.info(
+                        f"Project marker copy detected at {cwd_resolved}; "
+                        f"minted new project_id={new_id}"
+                    )
+                    return new_id
+                return None
+
+            # Rename branch requires nonce-match. A hostile repo that plants
+            # a marker carrying a known victim's project_id but a forged
+            # nonce would otherwise hijack that identity on first resolve.
+            # Mismatch → fall through to cwd_hash; do NOT touch SQLite, do
+            # NOT overwrite the marker file.
+            recorded_nonce = recorded.get("nonce", "")
+            if recorded_nonce and payload.nonce != recorded_nonce:
+                logger.warning(
+                    f"Project marker nonce mismatch at {cwd_resolved} "
+                    f"(project_id={payload.project_id}); falling through to cwd_hash"
+                )
+                return None
+
+            # Rename — recorded path gone, nonce matches; update SQLite to
+            # new realpath and keep the existing id + nonce.
+            _record_marker_safe(payload.project_id, payload.nonce, cwd_resolved)
+
+        # First-time-seen marker (no SQLite row yet) or rename path — record
+        # and return. Also record cwd_hash alias so pre-marker memories
+        # stored under the cwd-hash path are still reachable.
+        if not recorded:
+            _record_marker_safe(payload.project_id, payload.nonce, cwd_resolved)
+        if cwd_hash and payload.project_id != cwd_hash:
+            _record_alias_safe(payload.project_id, cwd_hash, "cwd_hash")
+        return payload.project_id
+
+    # No marker present — mint, write, record. Any write failure falls
+    # through to the cwd-hash branch so the caller still gets a stable id.
+    new_id, new_nonce, new_created = _mint_marker(cwd)
+    if not _write_project_marker(cwd, new_id, new_nonce, new_created):
+        return None
+
+    # Concurrent first-mint race: ``os.replace`` is atomic but last-writer-
+    # wins — two processes may both have called ``_write_project_marker`` on
+    # an empty dir. Re-read the file; if the winning id is not ours, adopt
+    # it (treat the other writer's id as authoritative). All
+    # ``_record_marker_safe`` calls are upserts by project_id so orphan rows
+    # do not accumulate beyond one per race.
+    disk = _read_project_marker(cwd)
+    if isinstance(disk, MarkerPayload) and disk.project_id != new_id:
+        logger.info(
+            f"Concurrent marker write at {cwd_resolved}; adopting on-disk "
+            f"project_id={disk.project_id}"
+        )
+        _record_marker_safe(disk.project_id, disk.nonce, cwd_resolved)
+        if cwd_hash and disk.project_id != cwd_hash:
+            _record_alias_safe(disk.project_id, cwd_hash, "cwd_hash")
+        _emit_gitignore_hint_once(cwd)
+        return disk.project_id
+    if disk is MARKER_CORRUPT:
+        # Our write was replaced by garbage between replace() and read().
+        # Fall through to cwd_hash rather than returning an id whose file is
+        # now unusable.
+        return None
+
+    _record_marker_safe(new_id, new_nonce, cwd_resolved)
+    if cwd_hash and new_id != cwd_hash:
+        _record_alias_safe(new_id, cwd_hash, "cwd_hash")
+    _emit_gitignore_hint_once(cwd)
+    return new_id
+
+
 def resolve_project_id(cwd: Optional[Path]) -> str:
     """Resolve canonical project identity via the U6 precedence chain.
 
@@ -207,9 +586,7 @@ def resolve_project_id(cwd: Optional[Path]) -> str:
     cwd_hash: Optional[str] = None
     if cwd is not None:
         try:
-            cwd_hash = hashlib.sha256(
-                os.path.realpath(str(cwd)).encode()
-            ).hexdigest()[:12]
+            cwd_hash = hashlib.sha256(os.path.realpath(str(cwd)).encode()).hexdigest()[:12]
         except Exception as e:
             logger.debug(f"cwd-hash derivation failed for {cwd}: {e}")
 
@@ -227,6 +604,20 @@ def resolve_project_id(cwd: Optional[Path]) -> str:
                 _record_alias_safe(canonical, cwd_hash, "cwd_hash")
             _record_alias_safe(canonical, remote_url, "git_remote")
             return canonical
+
+    # Phase 3 U8 — marker-file branch. Runs *only* when no explicit override
+    # and no git remote. Git-remote projects and explicit overrides skip this
+    # entirely (decision #1), so no ``.cao/`` directory is created for them.
+    if cwd is not None and _is_project_marker_enabled():
+        try:
+            marker_id = _resolve_via_marker(cwd, cwd_hash)
+        except Exception as e:
+            # Never let marker failures block resolution; fall through to the
+            # cwd-hash path.
+            logger.warning(f"Project marker resolution failed, falling through: {e}")
+            marker_id = None
+        if marker_id:
+            return marker_id
 
     if cwd_hash:
         return cwd_hash
@@ -1226,9 +1617,7 @@ class MemoryService:
 
         return dirs
 
-    def _append_legacy_alias_dirs(
-        self, canonical_id: str, dirs: list[Path]
-    ) -> None:
+    def _append_legacy_alias_dirs(self, canonical_id: str, dirs: list[Path]) -> None:
         """Append legacy ``<cwd_hash>/`` dirs that alias to ``canonical_id``.
 
         Safe no-op when the alias table or base_dir are unavailable. Only
@@ -1456,9 +1845,7 @@ class MemoryService:
 
             # Sort entries for this scope by updated_at desc so the newest
             # memories are considered first within the per-scope cap.
-            scope_entries = [
-                e for e in self._parse_index(index_path) if e["scope"] == scope_val
-            ]
+            scope_entries = [e for e in self._parse_index(index_path) if e["scope"] == scope_val]
             scope_entries.sort(key=lambda e: e.get("updated_at", ""), reverse=True)
 
             scope_memories: list[Memory] = []
@@ -1559,9 +1946,9 @@ class MemoryService:
             from cli_agent_orchestrator.services.terminal_service import send_input
 
             prompt = (
-                f"Curate memory context for terminal {terminal_id}. "
-                f"Task: {task_description}" if task_description else
-                f"Curate memory context for terminal {terminal_id}."
+                f"Curate memory context for terminal {terminal_id}. " f"Task: {task_description}"
+                if task_description
+                else f"Curate memory context for terminal {terminal_id}."
             )
             send_input(cm_terminal["id"], prompt)
 

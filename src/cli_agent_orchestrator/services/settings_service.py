@@ -81,7 +81,11 @@ def get_memory_settings() -> Dict[str, Any]:
     operations — see ``is_memory_enabled()``.
     """
     settings = _load()
-    defaults: Dict[str, Any] = {"enabled": True, "flush_threshold": 0.85}
+    defaults: Dict[str, Any] = {
+        "enabled": True,
+        "flush_threshold": 0.85,
+        "project_marker": True,
+    }
     saved = settings.get("memory", {})
     result = dict(defaults)
     result.update(saved)
@@ -98,6 +102,37 @@ def is_memory_enabled() -> bool:
         value = get_memory_settings().get("enabled", True)
     except Exception as e:
         logger.warning(f"Failed to read memory.enabled, defaulting to True: {e}")
+        return True
+    return bool(value)
+
+
+def is_project_marker_enabled() -> bool:
+    """Return True when the project-identity marker file (Phase 3 U8) is enabled.
+
+    Precedence:
+        1. ``CAO_PROJECT_MARKER`` env var (``0``/``false``/``no``/``off`` → False;
+           ``1``/``true``/``yes``/``on`` → True; anything else ignored).
+        2. ``memory.project_marker`` nested key in settings.json.
+        3. Default ``True`` — opt-out, same precedent as ``memory.enabled``.
+
+    Any read error falls through to True so the read path cannot brick the
+    resolver.
+    """
+    import os as _os
+
+    env_raw = _os.environ.get("CAO_PROJECT_MARKER")
+    if env_raw is not None:
+        v = env_raw.strip().lower()
+        if v in ("0", "false", "no", "off"):
+            return False
+        if v in ("1", "true", "yes", "on"):
+            return True
+        # Unrecognized value — fall through to settings.json rather than
+        # silently disabling.
+    try:
+        value = get_memory_settings().get("project_marker", True)
+    except Exception as e:
+        logger.warning(f"Failed to read memory.project_marker, defaulting to True: {e}")
         return True
     return bool(value)
 
@@ -146,6 +181,10 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         if not (0.0 < fval <= 1.0):
             raise ValueError(f"flush_threshold must be between 0.0 and 1.0, got {fval}")
         memory[key] = fval
+    elif key == "project_marker":
+        if not isinstance(value, bool):
+            raise ValueError(f"project_marker must be a bool, got {type(value).__name__}")
+        memory[key] = value
     else:
         raise ValueError(f"Unknown memory setting: {key}")
 
