@@ -775,6 +775,152 @@ class TestCodexV0111FooterFormat:
 
         assert status == TerminalStatus.PROCESSING
 
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_get_status_completed_v0111_with_stale_spinner(self, mock_tmux):
+        """COMPLETED when stale spinner remains before the final answer."""
+        mock_tmux.get_history.return_value = (
+            "› [CAO Handoff] Inspect the workspace.\n"
+            "\n"
+            "• Working (21s • esc to interrupt)\n"
+            "\n"
+            "─────\n"
+            "• Objective: inspect only /tmp/pilot-workspace.\n"
+            "\n"
+            "  Visible top-level files/directories:\n"
+            "\n"
+            "  - SESSION_STATE.md\n"
+            "\n"
+            "  SESSION_STATE.md: exists.\n"
+            "─────\n"
+            "\n"
+            "› Find and fix a bug in @filename\n"
+            "\n"
+            "  gpt-5.5 xhigh · /tmp/pilot-workspace\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_get_status_completed_when_answer_mentions_footer_like_text(self, mock_tmux):
+        """Footer-like text in an answer bullet is not TUI chrome."""
+        mock_tmux.get_history.return_value = (
+            "› explain the Codex footer\n"
+            "• The footer may show gpt-5.5 xhigh · /tmp/pilot-workspace.\n"
+            "\n"
+            "› \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_get_status_not_completed_for_tool_activity_only(self, mock_tmux):
+        """Tool activity bullets are not final assistant responses."""
+        mock_tmux.get_history.return_value = (
+            "› [CAO Handoff] Inspect the workspace.\n"
+            "\n"
+            "• Explored\n"
+            "  └ Search SESSION_STATE.md in .\n"
+            "\n"
+            "• Ran pwd\n"
+            "  └ /tmp/pilot-workspace\n"
+            "\n"
+            "› Summarize recent commits\n"
+            "\n"
+            "  gpt-5.5 xhigh · /tmp/pilot-workspace\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_get_status_not_completed_for_preamble_plus_tool_activity_only(self, mock_tmux):
+        """A pre-tool assistant note is not final completion after tool activity."""
+        mock_tmux.get_history.return_value = (
+            "› Use handoff to inspect the workspace.\n"
+            "\n"
+            "• I’ll route this through the CAO handoff path.\n"
+            "\n"
+            "• Called\n"
+            '  └ cao-mcp-server.handoff({"success": true})\n'
+            "\n"
+            "› Summarize recent commits\n"
+            "\n"
+            "  gpt-5.5 xhigh · /tmp/pilot-workspace\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_get_status_completed_for_response_after_tool_activity(self, mock_tmux):
+        """COMPLETED when a final response appears after tool activity."""
+        mock_tmux.get_history.return_value = (
+            "› Use handoff to inspect the workspace.\n"
+            "\n"
+            "• I’ll route this through the CAO handoff path.\n"
+            "\n"
+            "• Called\n"
+            '  └ cao-mcp-server.handoff({"success": true})\n'
+            "\n"
+            "• The handoff succeeded.\n"
+            "\n"
+            "› Summarize recent commits\n"
+            "\n"
+            "  gpt-5.5 xhigh · /tmp/pilot-workspace\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_get_status_completed_for_answer_bullets_that_look_like_activity(self, mock_tmux):
+        """Answer bullets starting with activity verbs are still responses."""
+        mock_tmux.get_history.return_value = (
+            "› summarize the work\n"
+            "• Done.\n"
+            "  • Ran tests successfully.\n"
+            "  • Updated docs.\n"
+            "  • Created a patch bundle.\n"
+            "\n"
+            "› Summarize recent commits\n"
+            "\n"
+            "  gpt-5.5 xhigh · /tmp/pilot-workspace\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_get_status_completed_for_top_level_ran_answer_without_tree(self, mock_tmux):
+        """A top-level answer bullet starting with Ran is not TUI activity."""
+        mock_tmux.get_history.return_value = (
+            "› summarize the work\n"
+            "• Ran tests successfully and prepared the patch bundle.\n"
+            "\n"
+            "› Summarize recent commits\n"
+            "\n"
+            "  gpt-5.5 xhigh · /tmp/pilot-workspace\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.COMPLETED
+
 
 class TestCodexProviderMessageExtraction:
     def test_extract_last_message_success(self):
@@ -955,6 +1101,154 @@ class TestCodexV0111Extraction:
 
         assert "I've fixed the issue" in message
         assert "Find and fix a bug" not in message
+
+    def test_extract_bullet_with_v0111_footer_and_stale_spinner(self):
+        """Extract final answer after stale TUI spinner, excluding footer chrome."""
+        output = (
+            "› [CAO Handoff] Inspect the workspace.\n"
+            "\n"
+            "• Working (21s • esc to interrupt)\n"
+            "\n"
+            "─────\n"
+            "• Objective: inspect only /tmp/pilot-workspace.\n"
+            "\n"
+            "  Visible top-level files/directories:\n"
+            "\n"
+            "  - SESSION_STATE.md\n"
+            "\n"
+            "  SESSION_STATE.md: exists.\n"
+            "─────\n"
+            "\n"
+            "› Find and fix a bug in @filename\n"
+            "\n"
+            "  gpt-5.5 xhigh · /tmp/pilot-workspace\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert "Objective: inspect only" in message
+        assert "SESSION_STATE.md: exists." in message
+        assert "Working (21s" not in message
+        assert "Find and fix a bug" not in message
+        assert "gpt-5.5" not in message
+
+    def test_extract_skips_tool_activity_before_final_answer(self):
+        """Tool activity rows before the answer should not be returned."""
+        output = (
+            "› [CAO Handoff] Inspect the workspace.\n"
+            "\n"
+            "• Explored\n"
+            "  └ Search SESSION_STATE.md in .\n"
+            "\n"
+            "• Ran pwd\n"
+            "  └ /tmp/pilot-workspace\n"
+            "\n"
+            "• Objective: inspect only /tmp/pilot-workspace.\n"
+            "  Visible top-level files/directories:\n"
+            "  - SESSION_STATE.md\n"
+            "  SESSION_STATE.md: exists.\n"
+            "\n"
+            "› Summarize recent commits\n"
+            "\n"
+            "  gpt-5.5 xhigh · /tmp/pilot-workspace\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert "Objective: inspect only" in message
+        assert "SESSION_STATE.md: exists." in message
+        assert "Explored" not in message
+        assert "Ran pwd" not in message
+
+    def test_extract_raises_for_tool_activity_only(self):
+        """Tool activity alone is not a completed Codex response."""
+        output = (
+            "› [CAO Handoff] Inspect the workspace.\n"
+            "\n"
+            "• Explored\n"
+            "  └ Search SESSION_STATE.md in .\n"
+            "\n"
+            "• Ran pwd\n"
+            "  └ /tmp/pilot-workspace\n"
+            "\n"
+            "› Summarize recent commits\n"
+            "\n"
+            "  gpt-5.5 xhigh · /tmp/pilot-workspace\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        with pytest.raises(ValueError, match="No Codex response found"):
+            provider.extract_last_message_from_script(output)
+
+    def test_extract_final_answer_after_tool_activity(self):
+        """Extraction should return the final answer after MCP/tool activity."""
+        output = (
+            "› Use handoff to inspect the workspace.\n"
+            "\n"
+            "• I’ll route this through the CAO handoff path.\n"
+            "\n"
+            "• Called\n"
+            '  └ cao-mcp-server.handoff({"success": true})\n'
+            '    {"output": "• RESULT:\\n  SESSION_STATE.md exists: yes."}\n'
+            "\n"
+            "• The handoff succeeded.\n"
+            "  Worker output summary: SESSION_STATE.md exists.\n"
+            "\n"
+            "› Summarize recent commits\n"
+            "\n"
+            "  gpt-5.5 xhigh · /tmp/pilot-workspace\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert "The handoff succeeded" in message
+        assert "SESSION_STATE.md exists" in message
+        assert "I’ll route" not in message
+        assert "cao-mcp-server.handoff" not in message
+
+    def test_extract_answer_bullets_that_look_like_activity(self):
+        """Normal answer bullets that start with activity verbs should remain."""
+        output = (
+            "› summarize the work\n"
+            "• Done.\n"
+            "  • Ran tests successfully.\n"
+            "  • Updated docs.\n"
+            "  • Created a patch bundle.\n"
+            "\n"
+            "› Summarize recent commits\n"
+            "\n"
+            "  gpt-5.5 xhigh · /tmp/pilot-workspace\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert "Done." in message
+        assert "Ran tests successfully" in message
+        assert "Updated docs" in message
+        assert "Created a patch bundle" in message
+        assert "gpt-5.5" not in message
+
+    def test_extract_top_level_ran_answer_without_tree(self):
+        """A top-level Ran answer without a Codex tree line should extract."""
+        output = (
+            "› summarize the work\n"
+            "• Ran tests successfully and prepared the patch bundle.\n"
+            "\n"
+            "› Summarize recent commits\n"
+            "\n"
+            "  gpt-5.5 xhigh · /tmp/pilot-workspace\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert "Ran tests successfully" in message
+        assert "gpt-5.5" not in message
 
 
 class TestCodexProviderMisc:
