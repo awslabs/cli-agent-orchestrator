@@ -157,8 +157,16 @@ class KiroCliProvider(BaseProvider):
 
     @property
     def extraction_tail_lines(self) -> int:
-        """Use full scrollback for extraction — long responses exceed 200 lines."""
-        return 5000
+        """Capture enough scrollback for no-credits extraction.
+
+        The no-credits fallback (_extract_tui_message) needs both the
+        start_separator (before the response) and end_separator (TUI frame
+        before the idle prompt) in the same capture window. For long agent
+        responses the start_separator can be hundreds of lines above the
+        idle prompt. 2000 lines covers responses up to ~1800 lines of
+        content, which exceeds any realistic single-turn agent response.
+        """
+        return 2000
 
     def _get_profile_model(self) -> Optional[str]:
         """Return profile.model if the agent profile can be loaded, else None.
@@ -423,7 +431,9 @@ class KiroCliProvider(BaseProvider):
                     if re.search(TUI_SEPARATOR_PATTERN, lines[i].strip()):
                         content_between = [l for l in lines[i + 1 : idle_line_idx] if l.strip()]
                         if len(content_between) >= 3:
-                            logger.debug("get_status: returning COMPLETED (TUI no-credits fallback)")
+                            logger.debug(
+                                "get_status: returning COMPLETED (TUI no-credits fallback)"
+                            )
                             return TerminalStatus.COMPLETED
                         break
 
@@ -564,7 +574,7 @@ class KiroCliProvider(BaseProvider):
                     if start_separator_idx is not None and end_separator_idx is not None:
                         content_lines = lines[start_separator_idx + 1 : end_separator_idx]
                         # Skip header line (agent · model · N%)
-                        content_lines = [l for l in content_lines if not re.search(r'·.*·.*%', l)]
+                        content_lines = [l for l in content_lines if not re.search(r"·.*·.*%", l)]
                         # Skip first paragraph (user message echo)
                         agent_start = 0
                         found_blank = False
@@ -582,15 +592,6 @@ class KiroCliProvider(BaseProvider):
                             final_answer = re.sub(ESCAPE_SEQUENCE_PATTERN, "", final_answer)
                             final_answer = re.sub(CONTROL_CHAR_PATTERN, "", final_answer)
                             return final_answer.strip()
-
-                # Last resort: separator not found but input was sent —
-                # handles truncated captures where separator scrolled out.
-                raw = re.sub(ANSI_CODE_PATTERN, "", "\n".join(lines))
-                raw = re.sub(ESCAPE_SEQUENCE_PATTERN, "", raw)
-                raw = re.sub(CONTROL_CHAR_PATTERN, "", raw)
-                raw = raw.strip()
-                if raw:
-                    return raw
 
             raise ValueError(
                 "No Kiro CLI response found - no Credits marker or green arrow detected"

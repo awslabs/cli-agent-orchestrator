@@ -1580,3 +1580,159 @@ class TestKiroCliCheck3ShellBaseline:
 
         assert status == TerminalStatus.PROCESSING
         mock_tmux.get_pane_current_command.assert_not_called()
+
+
+class TestKiroCliCheck6NoCredits:
+    """Tests for Check 6: no-Credits completion detection and extraction.
+
+    Covers the case where Kiro CLI is used with a Q Developer Pro subscription,
+    which does not emit the '▸ Credits:' marker after responses. Check 6 detects
+    completion via the idle prompt after input is received, and extraction falls
+    back to finding content between two TUI separator lines.
+    """
+
+    SEP = "─" * 52
+
+    def _tui_output(self, user_msg: str, agent_response: str) -> str:
+        """Build a synthetic no-credits TUI capture."""
+        return (
+            f"{self.SEP}\n"
+            f"  {user_msg}\n"
+            "\n"
+            f"  {agent_response}\n"
+            "\n"
+            f"{self.SEP}\n"
+            "developer · claude-sonnet-4.6 · ◔ 3%\n"
+            " Ask a question or describe a task ↵\n"
+        )
+
+    # -------------------------------------------------------------------------
+    # Check 6 — get_status()
+    # -------------------------------------------------------------------------
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_check6_completed_after_input_received(self, mock_tmux):
+        """Check 6 returns COMPLETED when idle prompt present and input was sent."""
+        mock_tmux.get_history.return_value = self._tui_output("validate this", "All checks pass.")
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        provider._input_received = True
+        status = provider.get_status()
+
+        assert status == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_check6_idle_before_input_received(self, mock_tmux):
+        """Check 6 must NOT fire during startup before any input is sent.
+
+        The TUI renders the idle prompt during initialization. Without the
+        _input_received guard, get_status() would return COMPLETED immediately
+        after launch before the agent has done any work.
+        """
+        mock_tmux.get_history.return_value = (
+            f"{self.SEP}\n"
+            "developer · claude-sonnet-4.6 · ◔ 0%\n"
+            " Ask a question or describe a task ↵\n"
+        )
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        # _input_received is False by default
+        status = provider.get_status()
+
+        assert status == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_check6_not_triggered_while_processing(self, mock_tmux):
+        """Check 6 must not fire when 'Kiro is working' appears after idle prompt."""
+        mock_tmux.get_history.return_value = (
+            "developer · auto · ◔ 3%\n"
+            " Ask a question or describe a task ↵\n"
+            " Kiro is working\n"
+        )
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        provider._input_received = True
+        status = provider.get_status()
+
+        assert status == TerminalStatus.PROCESSING
+
+    # -------------------------------------------------------------------------
+    # No-credits extraction — _extract_tui_message()
+    # -------------------------------------------------------------------------
+
+    def test_no_credits_extraction_returns_agent_response(self):
+        """Two-separator extraction returns agent response, not user echo or chrome."""
+        output = self._tui_output("What is 2+2?", "The answer is 4.")
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        provider._input_received = True
+        message = provider.extract_last_message_from_script(output)
+
+        assert "The answer is 4." in message
+        assert "What is 2+2?" not in message
+        assert "Ask a question" not in message
+
+    def test_no_credits_extraction_multiline_response(self):
+        """Two-separator extraction handles multi-line agent responses."""
+        output = (
+            f"{self.SEP}\n"
+            "  user question\n"
+            "\n"
+            "  Line one of response.\n"
+            "  Line two of response.\n"
+            "  Line three of response.\n"
+            "\n"
+            f"{self.SEP}\n"
+            "developer · claude-sonnet-4.6 · ◔ 3%\n"
+            " Ask a question or describe a task ↵\n"
+        )
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        provider._input_received = True
+        message = provider.extract_last_message_from_script(output)
+
+        assert "Line one of response." in message
+        assert "Line two of response." in message
+        assert "Line three of response." in message
+        assert "user question" not in message
+
+    def test_no_credits_extraction_only_one_separator_raises(self):
+        """When only one separator is found (truncated capture), raise ValueError.
+
+        The last-resort raw-scrollback fallback was removed to prevent corrupted
+        data masquerading as a valid agent response. A clear ValueError is
+        preferable so the orchestrator can surface a recoverable error.
+        """
+        output = (
+            f"{self.SEP}\n"
+            "developer · claude-sonnet-4.6 · ◔ 3%\n"
+            " Ask a question or describe a task ↵\n"
+        )
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        provider._input_received = True
+
+        with pytest.raises(ValueError, match="No Kiro CLI response found"):
+            provider.extract_last_message_from_script(output)
+
+    def test_no_credits_extraction_without_input_received_raises(self):
+        """Without _input_received, no-credits path is skipped and ValueError raised.
+
+        Preserves the original error contract for callers that have not sent input.
+        """
+        output = self._tui_output("question", "response")
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        # _input_received is False by default
+
+        with pytest.raises(ValueError, match="No Kiro CLI response found"):
+            provider.extract_last_message_from_script(output)
+
+    # -------------------------------------------------------------------------
+    # extraction_tail_lines regression guard
+    # -------------------------------------------------------------------------
+
+    def test_extraction_tail_lines_value(self):
+        """extraction_tail_lines must be 2000 to cover long no-credits responses."""
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        assert provider.extraction_tail_lines == 2000
