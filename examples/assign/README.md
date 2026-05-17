@@ -326,6 +326,86 @@ T=33s:  Supervisor receives all results, combines with template
 T=33s:  Present final report
 ```
 
+## Managing CAO Sessions via OpenClaw
+
+[OpenClaw](https://github.com/openclaw-ai/openclaw) ships a `cao-session-management` skill that lets an OpenClaw agent drive CAO sessions on your behalf from any connected chat channel (Telegram, Discord, etc.) or the local TUI. The skill wraps the `cao` CLI; the agent translates plain-language requests into the right command. Use this when you want to start, monitor, instruct, or shut down sessions without sitting at a terminal.
+
+### Prerequisites
+
+- OpenClaw installed and configured (`openclaw setup`).
+- CAO installed on the same host (`uvx --from git+https://github.com/awslabs/cli-agent-orchestrator.git@main cao` or `pip install cli-agent-orchestrator`).
+- Verify the skill is available:
+
+```bash
+openclaw skills | grep cao-session-management
+```
+
+The skill must show `✓ ready`.
+
+### Start a Session
+
+Ask OpenClaw to launch a session. The agent runs:
+
+```bash
+cao launch --agents <profile> --headless --yolo \
+  --session-name <name> --working-directory '<absolute-path>' "<task>"
+```
+
+Required flags when launched from an agent:
+- `--headless` so cao does not try to attach tmux interactively.
+- `--yolo` to skip confirmation prompts that would stall a non-interactive launch.
+- `--working-directory` must be an absolute path, single-quoted to block shell expansion of `~` or `$VARS` before the value reaches cao. A wrong path silently breaks the session.
+
+The launched session name is automatically prefixed with `cao-` (e.g. `--session-name triage` becomes `cao-triage`). All later commands use the prefixed form.
+
+Example chat instruction:
+> "Launch a CAO session called `triage` using the `analysis_supervisor` profile in `/home/me/data` to analyze datasets A, B, and C."
+
+### Check Session Status
+
+```bash
+cao session list                                  # active sessions
+cao session status cao-<name>                     # conductor status + last response
+cao session status cao-<name> --workers           # include worker terminals
+cao session status cao-<name> --terminal <id>     # drill into one terminal
+cao session status cao-<name> --json              # machine-readable; use to extract terminal IDs
+```
+
+Worker states reported include `IDLE`, `BUSY`, and `COMPLETED`. The JSON form is the reliable way to retrieve terminal IDs needed for direct sends.
+
+### Send Follow-Up Instructions
+
+```bash
+cao session send cao-<name> "<message>"                          # sync, waits for conductor to finish
+cao session send cao-<name> "<message>" --timeout N              # wait up to N seconds
+cao session send cao-<name> "<message>" --async                  # fire-and-forget
+cao session send cao-<name> "<message>" --terminal <worker-id>   # bypass conductor
+```
+
+Prefer routing through the conductor so it keeps full state of what was asked and answered. Bypass it only to unblock a stuck worker or to ask follow-ups of an `assign`-spawned worker that stays alive after completing its first task.
+
+### Stop a Session
+
+```bash
+cao shutdown --session cao-<name>
+```
+
+Gracefully shuts down the conductor and all worker terminals for one session and cleans up tmux records.
+
+### Kill All Sessions
+
+```bash
+cao shutdown --all
+```
+
+Tears down every active CAO session on the host. Use when sessions are orphaned, before a host reboot, or to reset state after a misconfigured launch.
+
+### Common Pitfalls
+
+- **Wrong `--working-directory`**: agents run but cannot find files; the only recovery is `cao shutdown --session ...` and relaunch with the correct path.
+- **Stuck conductor**: usually means a worker stopped responding. Run `cao session status cao-<name> --workers`, inspect the worker, and either prompt it to continue or ask it to resend results. Do not re-delegate work that may still be running.
+- **Prefix mismatch**: `launch` takes the un-prefixed name; `status`, `send`, and `shutdown --session` take the `cao-`-prefixed name.
+
 ## E2E Testing
 
 The `data_analyst` and `report_generator` profiles from this directory are used in the E2E test suite to validate assign and handoff flows across all providers (codex, claude_code, kiro_cli, kimi_cli, gemini_cli).
