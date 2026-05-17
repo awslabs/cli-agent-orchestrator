@@ -328,7 +328,7 @@ T=33s:  Present final report
 
 ## Managing CAO Sessions via OpenClaw
 
-[OpenClaw](https://github.com/openclaw-ai/openclaw) ships a `cao-session-management` skill that lets an OpenClaw agent drive CAO sessions on your behalf from any connected chat channel (Telegram, Discord, etc.) or the local TUI. The skill wraps the `cao` CLI; the agent translates plain-language requests into the right command. Use this when you want to start, monitor, instruct, or shut down sessions without sitting at a terminal.
+[OpenClaw](https://github.com/openclaw/openclaw) ships a `cao-session-management` skill that lets an OpenClaw agent drive CAO sessions on your behalf from any connected chat channel (Telegram, Discord, etc.) or the local TUI. The skill wraps the `cao` CLI; the agent translates plain-language requests into the right command. Use this when you want to start, monitor, instruct, or shut down sessions without sitting at a terminal.
 
 ### Prerequisites
 

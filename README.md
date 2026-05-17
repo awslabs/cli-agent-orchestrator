@@ -285,6 +285,18 @@ For the command reference and the agent-facing skill, see the [Session Managemen
 
 Because `cao session` is just shell commands, any AI assistant that supports shell-callable skills should be able to drive CAO this way — e.g. Claude Code, Kiro CLI, [OpenClaw](https://github.com/openclaw/openclaw), or [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 
+### OpenClaw Integration
+
+[OpenClaw](https://github.com/openclaw/openclaw) is an open-source AI agent harness with a built-in `cao-session-management` skill that wraps the `cao` CLI. An OpenClaw agent translates plain-language requests into the right `cao launch`, `cao session status`, `cao session send`, or `cao shutdown` command, so you can drive CAO from any channel OpenClaw is connected to (Telegram, Discord, local TUI, etc.) without sitting at a terminal.
+
+Typical uses:
+
+- Launch and monitor headless CAO sessions from chat.
+- Stream conductor status and worker output back to chat instead of attaching to tmux.
+- Stop, restart, or kill stuck sessions remotely.
+
+For prerequisites, the full command reference, and common pitfalls, see [examples/assign/README.md — Managing CAO Sessions via OpenClaw](examples/assign/README.md#managing-cao-sessions-via-openclaw).
+
 ### CAO Ops MCP Server
 
 `cao-ops-mcp` exposes the same management operations as structured MCP tools for a primary agent (Claude Code, Claude Desktop, etc.). It is the MCP-flavoured equivalent of `cao session` — pick `cao-ops-mcp` when your caller speaks MCP, `cao session` otherwise.
