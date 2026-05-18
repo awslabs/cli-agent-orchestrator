@@ -573,8 +573,12 @@ class KiroCliProvider(BaseProvider):
 
                     if start_separator_idx is not None and end_separator_idx is not None:
                         content_lines = lines[start_separator_idx + 1 : end_separator_idx]
-                        # Skip header line (agent · model · N%)
-                        content_lines = [l for l in content_lines if not re.search(r"·.*·.*%", l)]
+                        # Skip only the actual TUI header line (agent · model · N%)
+                        content_lines = [
+                            l
+                            for l in content_lines
+                            if not re.search(self._new_tui_header_pattern, l)
+                        ]
                         # Skip first paragraph (user message echo)
                         agent_start = 0
                         found_blank = False
