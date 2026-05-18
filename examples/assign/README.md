@@ -330,6 +330,8 @@ T=33s:  Present final report
 
 The `cao-session-management` skill ships in this repo at [`skills/cao-session-management/SKILL.md`](../../skills/cao-session-management/SKILL.md). Point an [OpenClaw](https://github.com/openclaw/openclaw) agent at it and the agent can drive CAO sessions on your behalf from any connected chat channel (Telegram, Discord, etc.) or the local TUI — translating plain-language requests into the right `cao` CLI invocations. Use this when you want to start, monitor, instruct, or shut down sessions without sitting at a terminal.
 
+> The basic commands shown below are an OpenClaw-flavored walkthrough. For the full command reference (all flags, status semantics, common mistakes), see [`skills/cao-session-management/SKILL.md`](../../skills/cao-session-management/SKILL.md). Related background: [docs/working-directory.md](../../docs/working-directory.md), [docs/terminal-lifecycle.md](../../docs/terminal-lifecycle.md), [docs/flows.md](../../docs/flows.md).
+
 ### Prerequisites
 
 - CAO installed on the same host with the `cao` binary on `PATH` — see [Installation](../../README.md#installation) in the root README.
