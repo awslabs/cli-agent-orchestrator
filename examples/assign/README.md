@@ -343,13 +343,13 @@ Ask OpenClaw to launch a session. The agent runs:
 
 ```bash
 cao launch --agents <profile> --headless --yolo \
-  --session-name <name> --working-directory '<absolute-path>' "<task>"
+  --session-name <name> --working-directory <absolute-path> "<task>"
 ```
 
 Required flags when launched from an agent:
 - `--headless` so cao does not try to attach tmux interactively.
 - `--yolo` to skip confirmation prompts that would stall a non-interactive launch.
-- `--working-directory` must be absolute (cao rejects relative paths after canonicalization). `~` is fine — cao expands it server-side, so values like `~/projects/foo` work. Cao does **not** expand `$VARS`, so let the shell expand them (e.g. `"$HOME/projects/foo"`) or pass a fully resolved path. A wrong path silently breaks the session.
+- `--working-directory` should be an absolute path. Cao canonicalizes it (`abspath` + `realpath`), so a relative value silently resolves against the server's CWD — almost never what you want. Cao **does** expand `~` server-side (`~/projects/foo` works); it does **not** expand `$VARS`. If you need shell-style expansion, let the shell do it before the value reaches cao (use double quotes: `--working-directory "$HOME/projects/foo"`) or pre-resolve to a fully expanded absolute path. A wrong path silently breaks the session.
 
 The launched session name is automatically prefixed with `cao-` (e.g. `--session-name triage` becomes `cao-triage`). All later commands use the prefixed form.
 
