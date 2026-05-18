@@ -283,7 +283,7 @@ Add `--async` to return immediately without waiting for completion.
 
 For the command reference and the agent-facing skill, see the [Session Management skill](skills/cao-session-management/SKILL.md).
 
-Because `cao session` is just shell commands, any AI assistant that supports shell-callable skills should be able to drive CAO this way — e.g. Claude Code, Kiro CLI, [OpenClaw](https://github.com/openclaw/openclaw), or [Hermes Agent](https://github.com/NousResearch/hermes-agent).
+Because `cao session` is just shell commands, any AI assistant that supports shell-callable skills should be able to drive CAO this way — e.g. Claude Code, Kiro CLI, [OpenClaw](https://github.com/openclaw/openclaw), or [Hermes Agent](https://github.com/NousResearch/hermes-agent). See [docs/external-tool-integration.md](docs/external-tool-integration.md) for integrating CAO session management into external tools.
 
 ### CAO Ops MCP Server
 
@@ -348,7 +348,7 @@ cao skills remove my-coding-standards
 
 Skills are delivered to providers automatically (native `skill://` resources for Kiro CLI; runtime prompt injection for Claude Code / Codex / Gemini / Kimi; baked-in `.agent.md` for Copilot).
 
-For the full reference — authoring, loading, delivery mechanics — see [docs/skills.md](docs/skills.md).
+For the full reference — authoring, loading, delivery mechanics — see [docs/skills.md](docs/skills.md). For integrating with OpenClaw or other external tools, see [docs/external-tool-integration.md](docs/external-tool-integration.md).
 
 ### Plugins
 
