@@ -356,6 +356,8 @@ The launched session name is automatically prefixed with `cao-` (e.g. `--session
 Example chat instruction:
 > "Launch a CAO session called `triage` using the `analysis_supervisor` profile in `/home/me/data` to analyze datasets A, B, and C."
 
+> Full `cao launch` reference: [Session Management CLI](../../README.md#session-management-cli) and [`SKILL.md`](../../skills/cao-session-management/SKILL.md). Working-directory semantics: [docs/working-directory.md](../../docs/working-directory.md).
+
 ### Check Session Status
 
 ```bash
@@ -367,6 +369,8 @@ cao session status cao-<name> --json              # machine-readable; use to ext
 ```
 
 Worker states are lowercase: `idle`, `processing`, `completed`, `waiting_user_answer`, `error`. The JSON form is the reliable way to retrieve terminal IDs needed for direct sends.
+
+> Full status reference and state semantics: [`SKILL.md`](../../skills/cao-session-management/SKILL.md). Terminal state machine: [docs/terminal-lifecycle.md](../../docs/terminal-lifecycle.md).
 
 ### Send Follow-Up Instructions
 
@@ -380,6 +384,8 @@ cao session send cao-<name> "<message>" --terminal <worker-id>   # bypass conduc
 If the timeout expires the agent is still running — re-check with `cao session status` later.
 
 Prefer routing through the conductor so it keeps full state of what was asked and answered. Bypass it only to unblock a stuck worker or to ask follow-ups of an `assign`-spawned worker that stays alive after completing its first task.
+
+> Full `cao session send` reference and conductor/worker routing rules: [`SKILL.md`](../../skills/cao-session-management/SKILL.md).
 
 ### Stop a Session
 
@@ -396,6 +402,8 @@ cao shutdown --all
 ```
 
 Tears down every active CAO session on the host. Use when sessions are orphaned, before a host reboot, or to reset state after a misconfigured launch.
+
+> Full shutdown semantics and cleanup behavior (snapshots, restore): [docs/terminal-lifecycle.md](../../docs/terminal-lifecycle.md).
 
 ### Common Pitfalls
 
