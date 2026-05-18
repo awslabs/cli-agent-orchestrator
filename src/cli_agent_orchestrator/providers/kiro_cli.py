@@ -128,6 +128,7 @@ class KiroCliProvider(BaseProvider):
         """
         super().__init__(terminal_id, session_name, window_name, allowed_tools)
         self._initialized = False
+        self._input_received = False
         self._agent_profile = agent_profile
 
         # Build dynamic prompt pattern based on agent profile
@@ -149,6 +150,23 @@ class KiroCliProvider(BaseProvider):
     def paste_enter_count(self) -> int:
         """Kiro CLI submits on single Enter after bracketed paste."""
         return 1
+
+    def mark_input_received(self) -> None:
+        """Track that input was sent, enabling separator-free completion detection."""
+        self._input_received = True
+
+    @property
+    def extraction_tail_lines(self) -> int:
+        """Capture enough scrollback for no-credits extraction.
+
+        The no-credits fallback (_extract_tui_message) needs both the
+        start_separator (before the response) and end_separator (TUI frame
+        before the idle prompt) in the same capture window. For long agent
+        responses the start_separator can be hundreds of lines above the
+        idle prompt. 2000 lines covers responses up to ~1800 lines of
+        content, which exceeds any realistic single-turn agent response.
+        """
+        return 2000
 
     def _get_profile_model(self) -> Optional[str]:
         """Return profile.model if the agent profile can be loaded, else None.
@@ -387,6 +405,38 @@ class KiroCliProvider(BaseProvider):
             # Credits marker found but no idle prompt after it — still processing
             return TerminalStatus.PROCESSING
 
+        # Check 6: Kiro CLI 2.3.0+ — no Credits marker emitted. Detect completion
+        # by presence of idle prompt after input was sent. For long responses the
+        # separator may have scrolled out of the capture buffer, so we search the
+        # entire buffer. If no separator is found but input was previously received,
+        # the idle prompt alone signals completion.
+        if has_new_tui_idle:
+            lines = clean_output.split("\n")
+            idle_line_idx = None
+            for i in range(len(lines) - 1, -1, -1):
+                if re.search(NEW_TUI_IDLE_PATTERN, lines[i]):
+                    idle_line_idx = i
+                    break
+            if idle_line_idx is not None:
+                # If input was sent, idle prompt alone means completion.
+                # The >=3 content check was blocking detection because the
+                # TUI's final frame only has the header between separator
+                # and idle prompt.
+                if self._input_received:
+                    logger.debug("get_status: returning COMPLETED (TUI idle after input)")
+                    return TerminalStatus.COMPLETED
+                # Before any input is sent, require separator + content to
+                # distinguish startup chrome from a real response.
+                for i in range(idle_line_idx - 1, -1, -1):
+                    if re.search(TUI_SEPARATOR_PATTERN, lines[i].strip()):
+                        content_between = [l for l in lines[i + 1 : idle_line_idx] if l.strip()]
+                        if len(content_between) >= 3:
+                            logger.debug(
+                                "get_status: returning COMPLETED (TUI no-credits fallback)"
+                            )
+                            return TerminalStatus.COMPLETED
+                        break
+
         # Default: Agent is IDLE, waiting for user input
         return TerminalStatus.IDLE
 
@@ -494,6 +544,59 @@ class KiroCliProvider(BaseProvider):
                 break
 
         if credits_idx is None:
+            # Kiro CLI 2.3.0+ may not emit a Credits line. Fall back to
+            # extracting content between separators around the response.
+            # Only attempt this when we know input was sent — without
+            # _input_received the original error contract is preserved.
+            if self._input_received:
+                idle_idx = None
+                for i in range(len(lines) - 1, -1, -1):
+                    if re.search(NEW_TUI_IDLE_PATTERN, lines[i]):
+                        idle_idx = i
+                        break
+
+                if idle_idx is not None:
+                    # Find the last separator before idle (TUI frame boundary)
+                    end_separator_idx = None
+                    for i in range(idle_idx - 1, -1, -1):
+                        if re.search(TUI_SEPARATOR_PATTERN, lines[i].strip()):
+                            end_separator_idx = i
+                            break
+
+                    # Find the separator before that (start of response area)
+                    start_separator_idx = None
+                    if end_separator_idx is not None:
+                        for i in range(end_separator_idx - 1, -1, -1):
+                            if re.search(TUI_SEPARATOR_PATTERN, lines[i].strip()):
+                                start_separator_idx = i
+                                break
+
+                    if start_separator_idx is not None and end_separator_idx is not None:
+                        content_lines = lines[start_separator_idx + 1 : end_separator_idx]
+                        # Skip only the actual TUI header line (agent · model · N%)
+                        content_lines = [
+                            l
+                            for l in content_lines
+                            if not re.search(self._new_tui_header_pattern, l)
+                        ]
+                        # Skip first paragraph (user message echo)
+                        agent_start = 0
+                        found_blank = False
+                        for i, line in enumerate(content_lines):
+                            stripped = line.strip()
+                            if not found_blank and not stripped:
+                                found_blank = True
+                                continue
+                            if found_blank and stripped:
+                                agent_start = i
+                                break
+                        response_lines = content_lines[agent_start:]
+                        final_answer = "\n".join(response_lines).strip()
+                        if final_answer:
+                            final_answer = re.sub(ESCAPE_SEQUENCE_PATTERN, "", final_answer)
+                            final_answer = re.sub(CONTROL_CHAR_PATTERN, "", final_answer)
+                            return final_answer.strip()
+
             raise ValueError(
                 "No Kiro CLI response found - no Credits marker or green arrow detected"
             )
