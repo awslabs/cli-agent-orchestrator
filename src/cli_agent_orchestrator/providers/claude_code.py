@@ -79,11 +79,17 @@ class ClaudeCodeProvider(BaseProvider):
         # tool permission prompts. CAO already confirms workspace access during
         # `cao launch` (or `--yolo`), so re-prompting each spawned agent
         # (supervisor and worker) is redundant and blocks handoff/assign flows.
+        # Profiles may opt into a safer mode via `permission_mode`
+        # (https://code.claude.com/docs/en/permission-modes); --yolo always wins.
         command_parts = ["claude", "--dangerously-skip-permissions"]
+        yolo = bool(self._allowed_tools and "*" in self._allowed_tools)
 
         if self._agent_profile is not None:
             try:
                 profile = load_agent_profile(self._agent_profile)
+
+                if not yolo and profile.permission_mode:
+                    command_parts = ["claude", "--permission-mode", profile.permission_mode]
 
                 if profile.model:
                     command_parts.extend(["--model", profile.model])

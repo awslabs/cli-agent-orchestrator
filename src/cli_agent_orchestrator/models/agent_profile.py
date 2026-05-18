@@ -1,8 +1,10 @@
 """Agent profile models."""
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
+
+PermissionMode = Literal["default", "acceptEdits", "plan", "auto", "bypassPermissions"]
 
 
 class McpServer(BaseModel):
@@ -35,3 +37,8 @@ class AgentProfile(BaseModel):
     hooks: Optional[Dict[str, Any]] = None
     useLegacyMcpJson: Optional[bool] = None
     model: Optional[str] = None
+
+    # Claude Code only: when set, the claude_code provider passes
+    # --permission-mode <value> instead of --dangerously-skip-permissions.
+    # `cao launch --yolo` overrides this and forces bypass.
+    permission_mode: Optional[PermissionMode] = None
