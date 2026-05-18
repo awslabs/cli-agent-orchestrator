@@ -332,11 +332,7 @@ The `cao-session-management` skill ships in this repo at [`skills/cao-session-ma
 
 ### Prerequisites
 
-- CAO installed on the same host. Recommended:
-  ```bash
-  uv tool install cli-agent-orchestrator
-  ```
-  Alternatives: `uvx --from git+https://github.com/awslabs/cli-agent-orchestrator.git@main cao`, or `pip install cli-agent-orchestrator`.
+- CAO installed on the same host with the `cao` binary on `PATH` — see [Installation](../../README.md#installation) in the root README.
 - OpenClaw installed and configured per its [setup docs](https://docs.openclaw.ai/start/wizard), with the OpenClaw agent's skills configuration pointing at this repo's `skills/cao-session-management/` directory. Refer to OpenClaw's documentation for the exact loader syntax.
 
 ### Start a Session
