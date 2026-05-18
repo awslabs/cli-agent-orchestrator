@@ -287,7 +287,7 @@ Because `cao session` is just shell commands, any AI assistant that supports she
 
 ### OpenClaw Integration
 
-[OpenClaw](https://github.com/openclaw/openclaw) is an open-source AI agent harness with a built-in `cao-session-management` skill that wraps the `cao` CLI. An OpenClaw agent translates plain-language requests into the right `cao launch`, `cao session status`, `cao session send`, or `cao shutdown` command, so you can drive CAO from any channel OpenClaw is connected to (Telegram, Discord, local TUI, etc.) without sitting at a terminal.
+[OpenClaw](https://github.com/openclaw/openclaw) is an open-source AI agent harness that can drive CAO using the [`cao-session-management` skill](skills/cao-session-management/SKILL.md) shipped in this repo. Point an OpenClaw agent at the skill and it translates plain-language requests into the right `cao launch`, `cao session status`, `cao session send`, or `cao shutdown` command — so you can drive CAO from any channel OpenClaw is connected to (Telegram, Discord, local TUI, etc.) without sitting at a terminal.
 
 Typical uses:
 

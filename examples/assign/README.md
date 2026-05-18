@@ -328,19 +328,16 @@ T=33s:  Present final report
 
 ## Managing CAO Sessions via OpenClaw
 
-[OpenClaw](https://github.com/openclaw/openclaw) ships a `cao-session-management` skill that lets an OpenClaw agent drive CAO sessions on your behalf from any connected chat channel (Telegram, Discord, etc.) or the local TUI. The skill wraps the `cao` CLI; the agent translates plain-language requests into the right command. Use this when you want to start, monitor, instruct, or shut down sessions without sitting at a terminal.
+The `cao-session-management` skill ships in this repo at [`skills/cao-session-management/SKILL.md`](../../skills/cao-session-management/SKILL.md). Point an [OpenClaw](https://github.com/openclaw/openclaw) agent at it and the agent can drive CAO sessions on your behalf from any connected chat channel (Telegram, Discord, etc.) or the local TUI — translating plain-language requests into the right `cao` CLI invocations. Use this when you want to start, monitor, instruct, or shut down sessions without sitting at a terminal.
 
 ### Prerequisites
 
-- OpenClaw installed and configured (`openclaw setup`).
-- CAO installed on the same host (`uvx --from git+https://github.com/awslabs/cli-agent-orchestrator.git@main cao` or `pip install cli-agent-orchestrator`).
-- Verify the skill is available:
-
-```bash
-openclaw skills | grep cao-session-management
-```
-
-The skill must show `✓ ready`.
+- CAO installed on the same host. Recommended:
+  ```bash
+  uv tool install cli-agent-orchestrator
+  ```
+  Alternatives: `uvx --from git+https://github.com/awslabs/cli-agent-orchestrator.git@main cao`, or `pip install cli-agent-orchestrator`.
+- OpenClaw installed and configured per its [setup docs](https://docs.openclaw.ai/start/wizard), with the OpenClaw agent's skills configuration pointing at this repo's `skills/cao-session-management/` directory. Refer to OpenClaw's documentation for the exact loader syntax.
 
 ### Start a Session
 
@@ -354,7 +351,7 @@ cao launch --agents <profile> --headless --yolo \
 Required flags when launched from an agent:
 - `--headless` so cao does not try to attach tmux interactively.
 - `--yolo` to skip confirmation prompts that would stall a non-interactive launch.
-- `--working-directory` must be an absolute path, single-quoted to block shell expansion of `~` or `$VARS` before the value reaches cao. A wrong path silently breaks the session.
+- `--working-directory` must be absolute (cao rejects relative paths after canonicalization). `~` is fine — cao expands it server-side, so values like `~/projects/foo` work. Cao does **not** expand `$VARS`, so let the shell expand them (e.g. `"$HOME/projects/foo"`) or pass a fully resolved path. A wrong path silently breaks the session.
 
 The launched session name is automatically prefixed with `cao-` (e.g. `--session-name triage` becomes `cao-triage`). All later commands use the prefixed form.
 
@@ -371,16 +368,18 @@ cao session status cao-<name> --terminal <id>     # drill into one terminal
 cao session status cao-<name> --json              # machine-readable; use to extract terminal IDs
 ```
 
-Worker states reported include `IDLE`, `BUSY`, and `COMPLETED`. The JSON form is the reliable way to retrieve terminal IDs needed for direct sends.
+Worker states are lowercase: `idle`, `processing`, `completed`, `waiting_user_answer`, `error`. The JSON form is the reliable way to retrieve terminal IDs needed for direct sends.
 
 ### Send Follow-Up Instructions
 
 ```bash
-cao session send cao-<name> "<message>"                          # sync, waits for conductor to finish
-cao session send cao-<name> "<message>" --timeout N              # wait up to N seconds
+cao session send cao-<name> "<message>"                          # sync, waits up to 300s (default)
+cao session send cao-<name> "<message>" --timeout N              # override timeout to N seconds
 cao session send cao-<name> "<message>" --async                  # fire-and-forget
 cao session send cao-<name> "<message>" --terminal <worker-id>   # bypass conductor
 ```
+
+If the timeout expires the agent is still running — re-check with `cao session status` later.
 
 Prefer routing through the conductor so it keeps full state of what was asked and answered. Bypass it only to unblock a stuck worker or to ask follow-ups of an `assign`-spawned worker that stays alive after completing its first task.
 
