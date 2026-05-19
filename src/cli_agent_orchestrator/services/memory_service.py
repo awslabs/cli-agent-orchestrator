@@ -124,10 +124,18 @@ class MemoryService:
     def get_wiki_path(self, scope: str, scope_id: Optional[str], key: str) -> Path:
         """Get the path to a wiki topic file.
 
-        Validates the resolved path stays within MEMORY_BASE_DIR to prevent path traversal.
+        For session and agent scopes, ``scope_id`` is nested into the
+        path so that two sessions (or two agent profiles) with the same
+        key do not collide on disk.
+
+        Validates the resolved path stays within MEMORY_BASE_DIR to
+        prevent path traversal.
         """
         project_dir = self._get_project_dir(scope, scope_id)
-        wiki_path = (project_dir / "wiki" / scope / f"{key}.md").resolve()
+        if scope in (MemoryScope.SESSION.value, MemoryScope.AGENT.value) and scope_id:
+            wiki_path = (project_dir / "wiki" / scope / scope_id / f"{key}.md").resolve()
+        else:
+            wiki_path = (project_dir / "wiki" / scope / f"{key}.md").resolve()
         base_resolved = self.base_dir.resolve()
         if (
             not str(wiki_path).startswith(str(base_resolved) + os.sep)
@@ -166,6 +174,14 @@ class MemoryService:
         MemoryType(memory_type)
 
         scope_id = self.resolve_scope_id(scope, terminal_context)
+        # ``project`` requires a resolvable cwd. Without it we'd silently
+        # fall back to the global container and mix project memories
+        # across projects.
+        if scope == MemoryScope.PROJECT.value and scope_id is None:
+            raise ValueError(
+                "Cannot store project-scoped memory without a working "
+                "directory. Pass terminal_context with 'cwd' set."
+            )
         if key is None:
             key = self.auto_generate_key(content)
         else:
@@ -234,6 +250,7 @@ class MemoryService:
             created_at=created_at,
             updated_at=now,
             content=content,
+            action=action,
         )
 
     # -------------------------------------------------------------------------
@@ -268,8 +285,13 @@ class MemoryService:
 
             est_tokens = int(len(content.split()) * 1.3)
 
-            # Build the new entry line
-            relative_path = f"{scope}/{key}.md"
+            # Build the new entry line. Session and agent scopes nest
+            # scope_id into the path so different sessions/agents do
+            # not collide on the same key.
+            if scope in (MemoryScope.SESSION.value, MemoryScope.AGENT.value) and scope_id:
+                relative_path = f"{scope}/{scope_id}/{key}.md"
+            else:
+                relative_path = f"{scope}/{key}.md"
             entry_line = (
                 f"- [{key}]({relative_path}) — "
                 f"type:{memory_type} tags:{tags} ~{est_tokens}tok updated:{timestamp}"
@@ -306,14 +328,10 @@ class MemoryService:
 
             if action == "remove":
                 # Remove existing entry for this key
-                lines = [
-                    ln for ln in lines if not (f"[{key}](" in ln and f"{scope}/{key}.md" in ln)
-                ]
+                lines = [ln for ln in lines if not (f"[{key}](" in ln and f"{relative_path}" in ln)]
             else:
                 # Remove existing entry for this key if present (for update)
-                lines = [
-                    ln for ln in lines if not (f"[{key}](" in ln and f"{scope}/{key}.md" in ln)
-                ]
+                lines = [ln for ln in lines if not (f"[{key}](" in ln and f"{relative_path}" in ln)]
                 # Re-find section after removal
                 section_idx = None
                 for i, line in enumerate(lines):
@@ -483,7 +501,7 @@ class MemoryService:
         memory_id = id_match.group(1) if id_match else str(uuid.uuid4())
 
         # Extract tags from comment
-        tags_match = re.search(r"tags: ([^-\n|]+?)(?:\s*-->|\s*\|)", file_content)
+        tags_match = re.search(r"tags: ([^\n|]*?)(?:\s*-->|\s*\|)", file_content)
         tags = tags_match.group(1).strip() if tags_match else entry.get("tags", "")
 
         # Extract scope from comment
@@ -557,8 +575,11 @@ class MemoryService:
         wiki_path.unlink()
         logger.info(f"Deleted memory file: {wiki_path}")
 
-        # Update index.md
-        self._update_index(scope, scope_id, key, "", "", "", "", "remove")
+        # Update index.md. Pass the current timestamp so the index header
+        # reflects the time of the most recent change (a delete is a
+        # change too).
+        now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self._update_index(scope, scope_id, key, "", "", "", now_ts, "remove")
 
         return True
 
@@ -633,8 +654,10 @@ class MemoryService:
     def _get_terminal_context(self, terminal_id: str) -> Optional[dict]:
         """Get terminal context for scope resolution.
 
-        Reads from the database via terminal service.
-        Returns None if terminal not found.
+        Reads from the database via terminal service. Resolves the
+        terminal's current working directory through tmux so that
+        project-scope resolution works in production. Returns None if
+        terminal not found.
         """
         try:
             from cli_agent_orchestrator.clients.database import SessionLocal, TerminalModel
@@ -643,13 +666,25 @@ class MemoryService:
                 terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
                 if not terminal:
                     return None
-                return {
+                ctx = {
                     "terminal_id": terminal.id,
                     "session_name": terminal.tmux_session,
                     "provider": terminal.provider,
                     "agent_profile": terminal.agent_profile,
-                    "cwd": None,  # working_directory not in TerminalModel; resolved dynamically via tmux
+                    "cwd": None,
                 }
+
+            # Resolve cwd via tmux pane lookup. Lazy-import to avoid
+            # importing terminal_service at module load (circular import).
+            try:
+                from cli_agent_orchestrator.services.terminal_service import (
+                    get_working_directory,
+                )
+
+                ctx["cwd"] = get_working_directory(terminal_id)
+            except Exception as e:
+                logger.warning(f"Could not resolve working directory for {terminal_id}: {e}")
+            return ctx
         except Exception as e:
             logger.warning(f"Could not get terminal context for {terminal_id}: {e}")
             return None

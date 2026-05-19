@@ -42,6 +42,11 @@ class Memory(BaseModel):
     created_at: datetime = Field(..., description="Creation timestamp")
     updated_at: datetime = Field(..., description="Last update timestamp")
     content: str = Field(default="", description="Memory content loaded from wiki file")
+    action: Optional[str] = Field(
+        default=None,
+        exclude=True,
+        description="Set by store() to 'created' or 'updated'; not persisted on disk.",
+    )
 
     @field_validator("scope")
     @classmethod

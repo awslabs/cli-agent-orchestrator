@@ -153,12 +153,16 @@ Always use pytest for testing in this project. Do not use unittest.
 
 ## Retention
 
+Retention is keyed on **scope**, with one override for memory type:
+
 | Scope | Retention |
 |---|---|
 | `global` | Never expires |
 | `project` | 90 days since last update |
 | `session` | 14 days |
 | `agent` | Never expires |
+
+Memories with `memory_type` of `user` or `feedback` are operator-curated knowledge and never expire regardless of scope.
 
 Cleanup runs automatically in the background when `cao-server` starts.
 

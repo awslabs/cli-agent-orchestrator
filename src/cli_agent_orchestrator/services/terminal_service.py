@@ -348,9 +348,11 @@ def send_input(
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
         # Inject memory context into the very first user message after init.
-        # Kiro uses the AgentSpawn hook for injection instead to avoid double injection — skip here.
-        if metadata.get("provider") != ProviderType.KIRO_CLI.value:
-            message = inject_memory_context(message, terminal_id)
+        # Phase 1 wires injection inline for every provider. The Kiro
+        # AgentSpawn hook will replace this path once the plugin
+        # migration PR lands; until then, inline injection is the only
+        # delivery path.
+        message = inject_memory_context(message, terminal_id)
 
         # Check how many Enter keys the provider needs after paste
         provider = provider_manager.get_provider(terminal_id)

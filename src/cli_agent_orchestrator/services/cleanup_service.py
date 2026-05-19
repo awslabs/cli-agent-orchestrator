@@ -69,25 +69,31 @@ def cleanup_old_data():
 # Memory Cleanup — tiered retention
 # =============================================================================
 
-# Retention policy: days until expiry (None = indefinite)
-RETENTION_POLICY: dict[str, int | None] = {
-    "user": None,
-    "feedback": None,
+# Scope-keyed retention policy. ``user`` and ``feedback`` memory_types
+# are operator-curated and stay forever regardless of scope. Anything
+# else expires per the scope of the entry.
+SCOPE_RETENTION_DAYS: dict[str, int | None] = {
+    "global": None,
+    "agent": None,
     "project": 90,
-    "reference": 90,
+    "session": 14,
 }
-SESSION_SCOPE_RETENTION_DAYS = 14
+PERMANENT_MEMORY_TYPES: frozenset[str] = frozenset({"user", "feedback"})
 
 
 async def cleanup_expired_memories() -> None:
-    """Delete expired memories based on tiered retention policy.
+    """Delete expired memories based on scope-keyed retention policy.
 
-    - session-scoped memories (any type): 14 days
-    - project/reference type memories: 90 days
-    - user/feedback type memories: indefinite (never expire)
+    - session scope: 14 days
+    - project scope: 90 days
+    - global scope:  never expires
+    - agent scope:   never expires
+    - memory_type ``user`` or ``feedback``: never expires (regardless of scope)
 
     Idempotent — safe to run multiple times.
     """
+    import asyncio
+
     try:
         now = datetime.now(timezone.utc)
         expired_count = 0
@@ -101,8 +107,11 @@ async def cleanup_expired_memories() -> None:
         memory_service = MemoryService(base_dir=MEMORY_BASE_DIR)
 
         # Walk project dirs: {MEMORY_BASE_DIR}/{project_dir}/wiki/index.md
-        for index_path in MEMORY_BASE_DIR.glob("*/wiki/index.md"):
-            expired_entries = _find_expired_entries(index_path, now)
+        # Glob and parse are sync I/O; offload to a thread so the event
+        # loop stays responsive when there are many projects.
+        index_paths = await asyncio.to_thread(lambda: list(MEMORY_BASE_DIR.glob("*/wiki/index.md")))
+        for index_path in index_paths:
+            expired_entries = await asyncio.to_thread(_find_expired_entries, index_path, now)
             if not expired_entries:
                 continue
 
@@ -113,10 +122,15 @@ async def cleanup_expired_memories() -> None:
 
             for entry in expired_entries:
                 try:
+                    # Prefer the entry's own scope_id (parsed from the
+                    # nested wiki path) so per-session and per-agent
+                    # files resolve correctly. Fall back to the
+                    # container's scope_id otherwise.
+                    effective_scope_id = entry.get("scope_id") or scope_id
                     await memory_service.forget(
                         key=entry["key"],
                         scope=entry["scope"],
-                        scope_id=scope_id,
+                        scope_id=effective_scope_id,
                     )
                     expired_count += 1
                     logger.info(
@@ -166,8 +180,17 @@ def _find_expired_entries(index_path: Path, now: datetime) -> list[dict]:
             continue
 
         key = match.group(1)
+        relative_path = match.group(2)
         memory_type = match.group(3)
         updated_str = match.group(4)
+
+        # Extract scope_id from nested path for session/agent scopes:
+        #   session/<scope_id>/<key>.md  →  scope_id
+        # Flat paths (project, global) leave entry_scope_id = None.
+        entry_scope_id: str | None = None
+        path_parts = relative_path.split("/")
+        if len(path_parts) >= 3 and path_parts[0] in ("session", "agent"):
+            entry_scope_id = path_parts[1]
 
         # Parse updated_at timestamp
         try:
@@ -179,25 +202,18 @@ def _find_expired_entries(index_path: Path, now: datetime) -> list[dict]:
 
         age_days = (now - updated_at).days
 
-        # Session-scoped: 14-day retention regardless of type
-        if current_scope == "session":
-            if age_days > SESSION_SCOPE_RETENTION_DAYS:
-                expired.append(
-                    {
-                        "key": key,
-                        "scope": current_scope,
-                        "memory_type": memory_type,
-                    }
-                )
+        # ``user`` and ``feedback`` memory_types are curated knowledge;
+        # they never expire regardless of scope.
+        if memory_type in PERMANENT_MEMORY_TYPES:
             continue
 
-        # Type-based retention
-        retention_days = RETENTION_POLICY.get(memory_type)
+        retention_days = SCOPE_RETENTION_DAYS.get(current_scope)
         if retention_days is not None and age_days > retention_days:
             expired.append(
                 {
                     "key": key,
                     "scope": current_scope,
+                    "scope_id": entry_scope_id,
                     "memory_type": memory_type,
                 }
             )

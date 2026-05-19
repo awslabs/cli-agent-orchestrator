@@ -809,7 +809,8 @@ async def memory_store(
             "scope": memory.scope,
             "scope_id": memory.scope_id,
             "file_path": memory.file_path,
-            "action": "updated" if memory.created_at != memory.updated_at else "created",
+            "action": memory.action
+            or ("updated" if memory.created_at != memory.updated_at else "created"),
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -864,7 +865,7 @@ async def memory_recall(
                     "scope": m.scope,
                     "tags": m.tags,
                     "file_path": m.file_path,
-                    "updated_at": m.updated_at.isoformat() + "Z",
+                    "updated_at": m.updated_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 }
                 for m in memories
             ]

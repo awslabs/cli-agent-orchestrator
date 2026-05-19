@@ -946,3 +946,117 @@ class TestCleanupSessionIntegration:
         # Both should still exist
         assert Path(user_mem.file_path).exists()
         assert Path(feedback_mem.file_path).exists()
+
+
+# ---------------------------------------------------------------------------
+# P3-B — production path: _get_terminal_context() must resolve cwd
+# from tmux without test-side monkeypatching.
+# ---------------------------------------------------------------------------
+
+
+class TestTerminalContextResolution:
+    """Verify _get_terminal_context() wires cwd via the working-directory helper.
+
+    These tests do NOT monkeypatch ``_get_terminal_context`` itself. Instead
+    they monkeypatch the database lookup and the tmux working-directory
+    helper, exercising the real wiring inside the method. This catches
+    regressions where the production code path silently returns ``cwd=None``.
+    """
+
+    def test_cwd_resolved_via_working_directory_helper(self, tmp_path, monkeypatch):
+        """A live terminal_id should produce a context with cwd populated."""
+        svc = MemoryService(base_dir=tmp_path)
+
+        # Stub the database query inside _get_terminal_context.
+        class _FakeTerminal:
+            id = "term-prod"
+            tmux_session = "cao-demo"
+            provider = "claude_code"
+            agent_profile = "developer"
+
+        class _FakeQuery:
+            def filter(self, *_args, **_kwargs):
+                return self
+
+            def first(self):
+                return _FakeTerminal()
+
+        class _FakeSession:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_a):
+                return False
+
+            def query(self, _model):
+                return _FakeQuery()
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        monkeypatch.setattr(db_mod, "SessionLocal", lambda: _FakeSession())
+
+        # Stub get_working_directory so we don't need a real tmux pane.
+        from cli_agent_orchestrator.services import terminal_service as ts_mod
+
+        monkeypatch.setattr(
+            ts_mod,
+            "get_working_directory",
+            lambda terminal_id: "/home/user/project-x",
+        )
+
+        ctx = svc._get_terminal_context("term-prod")
+
+        assert ctx is not None
+        assert ctx["terminal_id"] == "term-prod"
+        assert ctx["session_name"] == "cao-demo"
+        assert ctx["provider"] == "claude_code"
+        assert ctx["agent_profile"] == "developer"
+        # The fix that this test guards: cwd MUST be the value the
+        # working-directory helper returned, not None.
+        assert ctx["cwd"] == "/home/user/project-x"
+
+    def test_cwd_falls_back_to_none_when_helper_raises(self, tmp_path, monkeypatch):
+        """Helper failures must not crash _get_terminal_context."""
+        svc = MemoryService(base_dir=tmp_path)
+
+        class _FakeTerminal:
+            id = "term-broken"
+            tmux_session = "cao-demo"
+            provider = "claude_code"
+            agent_profile = "developer"
+
+        class _FakeQuery:
+            def filter(self, *_args, **_kwargs):
+                return self
+
+            def first(self):
+                return _FakeTerminal()
+
+        class _FakeSession:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_a):
+                return False
+
+            def query(self, _model):
+                return _FakeQuery()
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        monkeypatch.setattr(db_mod, "SessionLocal", lambda: _FakeSession())
+
+        def _broken(_terminal_id):
+            raise RuntimeError("tmux unavailable")
+
+        from cli_agent_orchestrator.services import terminal_service as ts_mod
+
+        monkeypatch.setattr(ts_mod, "get_working_directory", _broken)
+
+        ctx = svc._get_terminal_context("term-broken")
+        assert ctx is not None
+        # Other fields still populated from the DB.
+        assert ctx["terminal_id"] == "term-broken"
+        # cwd is None when the helper fails — but importantly the call
+        # didn't raise.
+        assert ctx["cwd"] is None

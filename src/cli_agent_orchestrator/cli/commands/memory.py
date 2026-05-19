@@ -25,13 +25,19 @@ def _run_async(coro):
 
 
 _VALID_KEY_RE = re.compile(r"^[a-z0-9\-]+$")
+_MAX_KEY_LENGTH = 60  # mirrors MemoryService._sanitize_key
 
 
 def _validate_key(key: str) -> str:
-    """Validate memory key to prevent path traversal. Only [a-z0-9-] allowed."""
+    """Validate memory key. Only [a-z0-9-] up to 60 chars (matches service)."""
     if not _VALID_KEY_RE.match(key):
         raise click.BadParameter(
             f"Invalid key '{key}'. Keys may only contain lowercase letters, digits, and hyphens.",
+            param_hint="'KEY'",
+        )
+    if len(key) > _MAX_KEY_LENGTH:
+        raise click.BadParameter(
+            f"Key '{key}' exceeds {_MAX_KEY_LENGTH}-character limit.",
             param_hint="'KEY'",
         )
     return key
