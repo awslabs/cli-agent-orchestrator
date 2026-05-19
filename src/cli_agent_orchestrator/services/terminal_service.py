@@ -198,23 +198,6 @@ def create_terminal(
                 profile.allowedTools, profile.role, mcp_server_names
             )
 
-        # Step 3d: Register provider-specific hooks for memory self-save
-        try:
-            from cli_agent_orchestrator.hooks.registration import (
-                register_hooks_claude_code,
-                register_hooks_codex,
-                register_hooks_kiro,
-            )
-
-            if provider == ProviderType.CLAUDE_CODE.value and working_directory:
-                register_hooks_claude_code(working_directory)
-            elif provider == ProviderType.CODEX.value and working_directory:
-                register_hooks_codex(working_directory)
-            elif provider == ProviderType.KIRO_CLI.value:
-                register_hooks_kiro(agent_profile)
-        except Exception as e:
-            logger.warning(f"Failed to register hooks for terminal {terminal_id}: {e}")
-
         # Step 4: Create and initialize the CLI provider
         # This starts the agent (e.g., runs "kiro-cli chat --agent developer").
         # Only runtime-prompt providers (Claude Code, Codex, Gemini, Kimi) receive

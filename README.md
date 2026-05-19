@@ -34,7 +34,7 @@ CAO implements a hierarchical multi-agent system — one supervisor agent delega
 - **Scheduled flows** — cron-like scheduling for unattended agent runs. See [docs/flows.md](docs/flows.md).
 - **Web UI, CLI, and MCP control planes** — manage sessions from the browser, `cao session` commands, or the `cao-ops-mcp` server. See [docs/control-planes.md](docs/control-planes.md).
 - **Tool restrictions per agent** — `role` + `allowedTools` in the profile, translated to each provider's native enforcement (5 of 7 providers support hard enforcement). See [docs/tool-restrictions.md](docs/tool-restrictions.md).
-- **Persistent agent memory** — agents store and recall knowledge across sessions using `memory_store` and `memory_recall` MCP tools. CAO automatically injects relevant memories as context at session start, with auto-save hooks for Claude Code and Kiro CLI. See [docs/memory.md](docs/memory.md).
+- **Persistent agent memory** — agents store and recall knowledge across sessions using `memory_store` and `memory_recall` MCP tools. CAO automatically injects relevant memories as context at session start. See [docs/memory.md](docs/memory.md).
 - **Direct worker steering** — unlike traditional "sub-agent" features, you can attach to a running worker and intervene mid-task.
 - **Full CLI feature access** — agents keep native CLI features: Claude Code [sub-agents](https://docs.claude.com/en/docs/claude-code/sub-agents), Amazon Q Developer [Custom Agent](https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/command-line-custom-agents.html), provider-native auth, etc.
 - **Plugin system for outbound events** — forward inter-agent messages to Discord, Slack, Telegram, or any webhook target. See [Plugins](#plugins).

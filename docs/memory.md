@@ -117,27 +117,9 @@ When an agent receives its first message in a session, CAO prepends a `<cao-memo
 
 Memories are selected in scope precedence order: `session` > `project` > `global`.
 
-**Kiro CLI:** Memory injection happens via the `agentSpawn` hook registered at `~/.kiro/agents/{profile}.json`, which fires before the first user message. CAO does not double-inject for Kiro.
+## Auto-Save
 
-## Auto-Save Hooks
-
-CAO registers hooks to prompt agents to save memories automatically.
-
-### Claude Code
-
-Registered in `.claude/settings.local.json` (in the working directory) at terminal creation:
-
-- **Stop hook**: fires every 15 human messages, prompts agent to save key findings
-- **PreCompact hook**: fires before context compression, prompts emergency save
-
-### Kiro CLI
-
-Registered in `~/.kiro/agents/{profile}.json` at terminal creation:
-
-- **`agentSpawn`**: injects memory context at agent startup (via CAO API)
-- **`userPromptSubmit`**: fires a save reminder every 15 user prompts
-
-Hook scripts are installed to `~/.aws/cli-agent-orchestrator/hooks/` on server startup.
+In Phase 1 there is no automatic save hook. Agents must call `memory_store` explicitly via MCP when they want to persist a fact. Agent profiles include guidance on when to store. Hook-driven auto-save is shipped via per-provider plugins in a subsequent PR.
 
 ## Storage Layout
 
