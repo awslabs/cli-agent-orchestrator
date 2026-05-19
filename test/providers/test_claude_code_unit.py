@@ -93,6 +93,7 @@ class TestClaudeCodeProviderInitialization:
         mock_profile.model = None
         mock_profile.system_prompt = "Test system prompt"
         mock_profile.mcpServers = None
+        mock_profile.permissionMode = None
         mock_load.return_value = mock_profile
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0", "test-agent")
@@ -136,6 +137,7 @@ class TestClaudeCodeProviderInitialization:
         mock_profile.model = None
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {"server1": {"command": "test", "args": ["--flag"]}}
+        mock_profile.permissionMode = None
         mock_load.return_value = mock_profile
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0", "test-agent")
@@ -561,6 +563,7 @@ class TestClaudeCodeProviderMisc:
         command = provider._build_claude_command()
 
         assert "claude --dangerously-skip-permissions" in command
+        assert "--permission-mode" not in command
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     def test_build_claude_command_with_system_prompt(self, mock_load):
@@ -569,6 +572,7 @@ class TestClaudeCodeProviderMisc:
         mock_profile.model = None
         mock_profile.system_prompt = "Test prompt\nwith newlines"
         mock_profile.mcpServers = None
+        mock_profile.permissionMode = None
         mock_load.return_value = mock_profile
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0", "test-agent")
@@ -586,6 +590,7 @@ class TestClaudeCodeProviderMisc:
         mock_profile.mcpServers = {
             "cao-mcp-server": {"command": "cao-mcp-server", "args": ["--port", "8080"]}
         }
+        mock_profile.permissionMode = None
         mock_load.return_value = mock_profile
 
         provider = ClaudeCodeProvider("term-42", "test-session", "window-0", "test-agent")
@@ -614,6 +619,7 @@ class TestClaudeCodeProviderMisc:
                 "env": {"MY_VAR": "my_value", "OTHER": "other_value"},
             }
         }
+        mock_profile.permissionMode = None
         mock_load.return_value = mock_profile
 
         provider = ClaudeCodeProvider("term-99", "test-session", "window-0", "test-agent")
@@ -643,6 +649,7 @@ class TestClaudeCodeProviderMisc:
                 "env": {"CAO_TERMINAL_ID": "user-provided-id"},
             }
         }
+        mock_profile.permissionMode = None
         mock_load.return_value = mock_profile
 
         provider = ClaudeCodeProvider("term-99", "test-session", "window-0", "test-agent")
@@ -667,6 +674,7 @@ class TestClaudeCodeProviderModelFlag:
         mock_profile.model = "sonnet"
         mock_profile.system_prompt = None
         mock_profile.mcpServers = None
+        mock_profile.permissionMode = None
         mock_load.return_value = mock_profile
 
         provider = ClaudeCodeProvider("tid", "sess", "win", "agent")
@@ -680,12 +688,61 @@ class TestClaudeCodeProviderModelFlag:
         mock_profile.model = None
         mock_profile.system_prompt = None
         mock_profile.mcpServers = None
+        mock_profile.permissionMode = None
         mock_load.return_value = mock_profile
 
         provider = ClaudeCodeProvider("tid", "sess", "win", "agent")
         command = provider._build_claude_command()
 
         assert "--model" not in command
+
+
+class TestClaudeCodeProviderPermissionMode:
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_uses_permission_mode_when_set_and_not_yolo(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = "auto"
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent")
+        command = provider._build_claude_command()
+
+        assert "--permission-mode auto" in command
+        assert "--dangerously-skip-permissions" not in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_yolo_overrides_permission_mode(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = "auto"
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", allowed_tools=["*"])
+        command = provider._build_claude_command()
+
+        assert "--dangerously-skip-permissions" in command
+        assert "--permission-mode" not in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_legacy_profile_without_permission_mode(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent")
+        command = provider._build_claude_command()
+
+        assert "--dangerously-skip-permissions" in command
+        assert "--permission-mode" not in command
 
 
 class TestClaudeCodeProviderStartupPrompts:

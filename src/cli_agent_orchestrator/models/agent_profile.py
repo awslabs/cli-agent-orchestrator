@@ -37,8 +37,4 @@ class AgentProfile(BaseModel):
     hooks: Optional[Dict[str, Any]] = None
     useLegacyMcpJson: Optional[bool] = None
     model: Optional[str] = None
-
-    # Claude Code only: when set, the claude_code provider passes
-    # --permission-mode <value> instead of --dangerously-skip-permissions.
-    # `cao launch --yolo` overrides this and forces bypass.
-    permission_mode: Optional[PermissionMode] = None
+    permissionMode: Optional[PermissionMode] = None
