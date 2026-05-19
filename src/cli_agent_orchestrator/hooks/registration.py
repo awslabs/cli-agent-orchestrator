@@ -122,7 +122,9 @@ def register_hooks_kiro(agent_profile: str) -> None:
 
     agent_config_path = KIRO_AGENTS_DIR / f"{agent_profile}.json"
     if not agent_config_path.exists():
-        logger.warning(f"Kiro agent config not found: {agent_config_path}, skipping hook registration")
+        logger.warning(
+            f"Kiro agent config not found: {agent_config_path}, skipping hook registration"
+        )
         return
 
     existing: dict = {}
@@ -137,7 +139,8 @@ def register_hooks_kiro(agent_profile: str) -> None:
     # Remove all existing CAO entries from every event key (handles stale/old-format entries)
     for event_key in list(hooks.keys()):
         hooks[event_key] = [
-            e for e in hooks[event_key]
+            e
+            for e in hooks[event_key]
             if isinstance(e, dict) and e.get("command") not in _CAO_HOOK_COMMANDS
         ]
         if not hooks[event_key]:
