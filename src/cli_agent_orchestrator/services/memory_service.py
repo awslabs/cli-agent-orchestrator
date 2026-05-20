@@ -113,12 +113,13 @@ class MemoryService:
         """Get the project-level directory that holds the wiki/ dir."""
         if scope == MemoryScope.GLOBAL.value:
             return self.base_dir / "global"
-        # For project/session/agent scopes, we need a project hash.
-        # scope_id for project IS the project hash. For session/agent, we
-        # use "global" as the project container (they can exist without a project).
+        # ``project`` scope uses the resolved cwd-hash as its container.
+        # ``session`` and ``agent`` always live under the ``global``
+        # container in Phase 1 — their scope_id is nested into the
+        # wiki path (see get_wiki_path) for isolation, not into the
+        # container directory.
         if scope == MemoryScope.PROJECT.value and scope_id:
             return self.base_dir / scope_id
-        # session and agent scopes also live under a project dir when project context exists
         return self.base_dir / "global"
 
     def get_wiki_path(self, scope: str, scope_id: Optional[str], key: str) -> Path:
@@ -187,6 +188,12 @@ class MemoryService:
         else:
             key = self._sanitize_key(key)
 
+        # Normalize tags: strip whitespace and rejoin with commas. The
+        # index entry format expects tags to contain no spaces (the
+        # parser uses ``tags:(\S*)``), so ``"ci, deploy"`` would
+        # otherwise become unrecallable through the index.
+        tags = ",".join(t.strip() for t in tags.split(",") if t.strip())
+
         now = datetime.now(timezone.utc)
         timestamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -201,8 +208,6 @@ class MemoryService:
         if is_update:
             # Read existing file to get original created_at and id from comment
             existing_content = wiki_path.read_text(encoding="utf-8")
-            # Append new timestamped entry
-            new_content = existing_content.rstrip("\n") + f"\n\n## {timestamp}\n{content}\n"
             # Try to extract original id
             id_match = re.search(r"<!-- id: ([a-f0-9\-]+)", existing_content)
             if id_match:
@@ -213,6 +218,20 @@ class MemoryService:
                 created_at = datetime.strptime(ts_match.group(1), "%Y-%m-%dT%H:%M:%SZ").replace(
                     tzinfo=timezone.utc
                 )
+            # Rewrite the header line so updated memory_type/tags stay
+            # in sync with index.md (recall() reads the file header).
+            new_header = (
+                f"<!-- id: {memory_id} | scope: {scope} | "
+                f"type: {memory_type} | tags: {tags} -->"
+            )
+            existing_content = re.sub(
+                r"<!-- id: [a-f0-9\-]+ \| scope: [^|]+ \| type: [^|]+ \| tags: [^>]*-->",
+                new_header,
+                existing_content,
+                count=1,
+            )
+            # Append new timestamped entry
+            new_content = existing_content.rstrip("\n") + f"\n\n## {timestamp}\n{content}\n"
         else:
             new_content = (
                 f"# {key}\n"

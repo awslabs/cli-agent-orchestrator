@@ -131,9 +131,11 @@ In Phase 1 there is no automatic save hook. Agents must call `memory_store` expl
 │       ├── global/
 │       │   └── {key}.md
 │       ├── session/
-│       │   └── {key}.md
+│       │   └── {session_name}/
+│       │       └── {key}.md
 │       └── agent/
-│           └── {key}.md
+│           └── {agent_profile}/
+│               └── {key}.md
 └── {cwd_hash}/                   # e.g. 14ae6bda7bac
     └── wiki/
         ├── index.md              # index of this project's memories

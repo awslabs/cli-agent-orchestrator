@@ -857,6 +857,7 @@ async def memory_recall(
             terminal_context=terminal_context,
         )
         return {
+            "success": True,
             "memories": [
                 {
                     "key": m.key,
@@ -868,7 +869,7 @@ async def memory_recall(
                     "updated_at": m.updated_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 }
                 for m in memories
-            ]
+            ],
         }
     except Exception as e:
         return {"success": False, "error": str(e)}

@@ -127,10 +127,16 @@ async def cleanup_expired_memories() -> None:
                     # files resolve correctly. Fall back to the
                     # container's scope_id otherwise.
                     effective_scope_id = entry.get("scope_id") or scope_id
-                    await memory_service.forget(
-                        key=entry["key"],
-                        scope=entry["scope"],
-                        scope_id=effective_scope_id,
+                    # ``forget()`` is declared async but its body is
+                    # sync FS work (unlink + flock + index rewrite).
+                    # Offload to a thread so the event loop stays
+                    # responsive when many entries expire.
+                    await asyncio.to_thread(
+                        _forget_sync,
+                        memory_service,
+                        entry["key"],
+                        entry["scope"],
+                        effective_scope_id,
                     )
                     expired_count += 1
                     logger.info(
@@ -147,6 +153,18 @@ async def cleanup_expired_memories() -> None:
 
     except Exception as e:
         logger.error(f"Error during memory cleanup: {e}")
+
+
+def _forget_sync(memory_service, key: str, scope: str, scope_id: str | None) -> None:
+    """Run MemoryService.forget() synchronously in a worker thread.
+
+    forget() is declared async but its body is sync; we invoke it
+    via asyncio.run inside the worker thread so the outer event
+    loop is not blocked by the unlink + flock + index rewrite.
+    """
+    import asyncio as _asyncio
+
+    _asyncio.run(memory_service.forget(key=key, scope=scope, scope_id=scope_id))
 
 
 def _find_expired_entries(index_path: Path, now: datetime) -> list[dict]:
