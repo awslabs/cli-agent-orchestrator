@@ -132,6 +132,19 @@ class BaseProvider(ABC):
         pass
 
     @property
+    def accepts_input_while_processing(self) -> bool:
+        """Whether this provider buffers pasted input during PROCESSING for next-turn pickup.
+
+        When True AND CAO_EAGER_INBOX_DELIVERY is enabled, the inbox service will
+        deliver messages to this terminal even when its status is PROCESSING or
+        WAITING_USER_ANSWER, rather than waiting for IDLE/COMPLETED.
+
+        Override in subclasses for providers whose TUI buffers input at all times
+        (e.g., Claude Code's Ink renderer).
+        """
+        return False
+
+    @property
     def extraction_retries(self) -> int:
         """Number of extraction retries for transient TUI rendering issues.
 

@@ -175,6 +175,194 @@ class TestCheckAndSendPendingMessages:
         mock_update_status.assert_called_once_with(1, MessageStatus.FAILED)
 
 
+class TestEagerInboxDelivery:
+    """Tests for eager inbox delivery (CAO_EAGER_INBOX_DELIVERY).
+
+    Covers the relaxed status gate in check_and_send_pending_messages() that
+    allows PROCESSING and WAITING_USER_ANSWER delivery when the env var is
+    enabled and the provider declares accepts_input_while_processing=True.
+    """
+
+    def _make_message(self):
+        msg = MagicMock()
+        msg.id = 42
+        msg.message = "eager test"
+        msg.sender_id = "sender-1"
+        return msg
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_delivery_idle_status_always_works(
+        self, mock_get_messages, mock_pm, mock_ts, mock_update
+    ):
+        """IDLE delivers regardless of env var or provider capability."""
+        mock_get_messages.return_value = [self._make_message()]
+        provider = MagicMock()
+        provider.get_status.return_value = TerminalStatus.IDLE
+        provider.accepts_input_while_processing = False
+        mock_pm.get_provider.return_value = provider
+
+        with patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", False):
+            result = check_and_send_pending_messages("t1")
+
+        assert result is True
+        mock_ts.send_input.assert_called_once()
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_delivery_completed_status_always_works(
+        self, mock_get_messages, mock_pm, mock_ts, mock_update
+    ):
+        """COMPLETED delivers regardless of env var or provider capability."""
+        mock_get_messages.return_value = [self._make_message()]
+        provider = MagicMock()
+        provider.get_status.return_value = TerminalStatus.COMPLETED
+        provider.accepts_input_while_processing = False
+        mock_pm.get_provider.return_value = provider
+
+        with patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", False):
+            result = check_and_send_pending_messages("t1")
+
+        assert result is True
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_delivery_processing_with_eager_enabled_and_capable_provider(
+        self, mock_get_messages, mock_pm, mock_ts, mock_update
+    ):
+        """PROCESSING + eager ON + capable provider -> delivers."""
+        mock_get_messages.return_value = [self._make_message()]
+        provider = MagicMock()
+        provider.get_status.return_value = TerminalStatus.PROCESSING
+        provider.accepts_input_while_processing = True
+        mock_pm.get_provider.return_value = provider
+
+        with patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", True):
+            result = check_and_send_pending_messages("t1")
+
+        assert result is True
+        mock_ts.send_input.assert_called_once()
+
+    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_delivery_processing_with_eager_enabled_and_non_capable_provider(
+        self, mock_get_messages, mock_pm
+    ):
+        """PROCESSING + eager ON + non-capable provider -> skips."""
+        mock_get_messages.return_value = [self._make_message()]
+        provider = MagicMock()
+        provider.get_status.return_value = TerminalStatus.PROCESSING
+        provider.accepts_input_while_processing = False
+        mock_pm.get_provider.return_value = provider
+
+        with patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", True):
+            result = check_and_send_pending_messages("t1")
+
+        assert result is False
+
+    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_delivery_processing_with_eager_disabled(self, mock_get_messages, mock_pm):
+        """PROCESSING + eager OFF -> skips even for capable provider."""
+        mock_get_messages.return_value = [self._make_message()]
+        provider = MagicMock()
+        provider.get_status.return_value = TerminalStatus.PROCESSING
+        provider.accepts_input_while_processing = True
+        mock_pm.get_provider.return_value = provider
+
+        with patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", False):
+            result = check_and_send_pending_messages("t1")
+
+        assert result is False
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_delivery_waiting_user_answer_with_eager_enabled_and_capable_provider(
+        self, mock_get_messages, mock_pm, mock_ts, mock_update
+    ):
+        """WAITING_USER_ANSWER + eager ON + capable provider -> delivers."""
+        mock_get_messages.return_value = [self._make_message()]
+        provider = MagicMock()
+        provider.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
+        provider.accepts_input_while_processing = True
+        mock_pm.get_provider.return_value = provider
+
+        with patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", True):
+            result = check_and_send_pending_messages("t1")
+
+        assert result is True
+        mock_ts.send_input.assert_called_once()
+
+    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_delivery_error_status_never_delivers(self, mock_get_messages, mock_pm):
+        """ERROR -> never delivers regardless of flags."""
+        mock_get_messages.return_value = [self._make_message()]
+        provider = MagicMock()
+        provider.get_status.return_value = TerminalStatus.ERROR
+        provider.accepts_input_while_processing = True
+        mock_pm.get_provider.return_value = provider
+
+        with patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", True):
+            result = check_and_send_pending_messages("t1")
+
+        assert result is False
+
+
+class TestEagerInboxDeliveryWatchdog:
+    """Tests for eager delivery in the watchdog path (LogFileHandler)."""
+
+    @patch("cli_agent_orchestrator.services.inbox_service.check_and_send_pending_messages")
+    @patch("cli_agent_orchestrator.services.inbox_service._has_idle_pattern")
+    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_watchdog_skips_idle_check_for_eager_capable_provider(
+        self, mock_get_messages, mock_pm, mock_has_idle, mock_check_send
+    ):
+        """Watchdog proceeds past idle check when eager + capable provider."""
+        mock_get_messages.return_value = [MagicMock()]
+        provider = MagicMock()
+        provider.accepts_input_while_processing = True
+        mock_pm.get_provider.return_value = provider
+
+        handler = LogFileHandler()
+        with patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", True):
+            handler._handle_log_change("t1")
+
+        # _has_idle_pattern should NOT be called (skipped)
+        mock_has_idle.assert_not_called()
+        mock_check_send.assert_called_once_with("t1", registry=None)
+
+    @patch("cli_agent_orchestrator.services.inbox_service.check_and_send_pending_messages")
+    @patch("cli_agent_orchestrator.services.inbox_service._has_idle_pattern")
+    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_watchdog_requires_idle_check_for_non_capable_provider(
+        self, mock_get_messages, mock_pm, mock_has_idle, mock_check_send
+    ):
+        """Watchdog still requires idle check for non-capable provider even with eager ON."""
+        mock_get_messages.return_value = [MagicMock()]
+        provider = MagicMock()
+        provider.accepts_input_while_processing = False
+        mock_pm.get_provider.return_value = provider
+        mock_has_idle.return_value = False  # Not idle
+
+        handler = LogFileHandler()
+        with patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", True):
+            handler._handle_log_change("t1")
+
+        mock_has_idle.assert_called_once_with("t1")
+        mock_check_send.assert_not_called()
+
+
 class TestPollOpenCodePendingMessages:
     """Tests for the temporary OpenCode inbox poller."""
 

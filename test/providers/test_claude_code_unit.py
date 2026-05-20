@@ -107,15 +107,62 @@ class TestClaudeCodeProviderInitialization:
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
-    def test_initialize_with_invalid_agent_profile(self, mock_tmux, mock_load, mock_wait_shell, _):
-        """Test initialization with invalid agent profile."""
+    def test_initialize_with_missing_profile_falls_back_to_native_agent(
+        self, mock_tmux, mock_load, mock_wait_shell, _
+    ):
+        """Test missing CAO profile falls back to --agent <name> for native agent store."""
         mock_wait_shell.return_value = True
         mock_load.side_effect = FileNotFoundError("Profile not found")
+        mock_tmux.get_history.side_effect = [
+            "",
+            "Welcome to Claude Code v2.0",
+            "Welcome to Claude Code v2.0",
+        ]
 
-        provider = ClaudeCodeProvider("test123", "test-session", "window-0", "invalid-agent")
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0", "my-native-agent")
+        with patch.object(provider, "get_status", return_value=TerminalStatus.IDLE):
+            result = provider.initialize()
+
+        assert result is True
+        # Verify --agent flag was passed with the profile name
+        send_keys_call = mock_tmux.send_keys.call_args
+        command = (
+            send_keys_call[0][2]
+            if len(send_keys_call[0]) > 2
+            else send_keys_call[1].get("keys", "")
+        )
+        assert "--agent my-native-agent" in command
+
+    @_PATCH_SETTINGS
+    @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.tmux_client")
+    def test_initialize_with_broken_profile_raises_provider_error(
+        self, mock_tmux, mock_load, mock_wait_shell, _
+    ):
+        """Test that a broken profile (parse error) raises ProviderError, not silent fallback."""
+        mock_wait_shell.return_value = True
+        mock_load.side_effect = RuntimeError("YAML parse error in profile")
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0", "broken-agent")
 
         with pytest.raises(ProviderError, match="Failed to load agent profile"):
             provider.initialize()
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_build_command_uses_native_agent_from_profile(self, mock_load):
+        """Test profile with native_agent field uses --agent passthrough."""
+        mock_profile = MagicMock()
+        mock_profile.native_agent = "my-claude-agent"
+        mock_profile.permissionMode = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0", "test-agent")
+        command = provider._build_claude_command()
+
+        assert "--agent my-claude-agent" in command
+        assert "--append-system-prompt" not in command
+        assert "--mcp-config" not in command
 
     @_PATCH_SETTINGS
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
@@ -517,6 +564,18 @@ that spans multiple lines
         result = provider.extract_last_message_from_script(output)
 
         assert "Second response" in result
+
+    def test_extract_message_preserves_mid_line_angle_bracket(self):
+        """Test that > in mid-line content (Java generics, git diffs, HTML) is not a stop."""
+        output = """⏺ Here is the code:
+List<String> items = new ArrayList<>();
+Map<String, List<Integer>> nested = getMap();
+> """
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        result = provider.extract_last_message_from_script(output)
+
+        assert "List<String>" in result
+        assert "Map<String, List<Integer>>" in result
 
     def test_extract_message_with_separator(self):
         """Test extraction stops at separator."""

@@ -33,7 +33,7 @@ from cli_agent_orchestrator.clients.database import (
     list_pending_receiver_ids_by_provider,
     update_message_status,
 )
-from cli_agent_orchestrator.constants import TERMINAL_LOG_DIR
+from cli_agent_orchestrator.constants import EAGER_INBOX_DELIVERY, TERMINAL_LOG_DIR
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -109,7 +109,13 @@ def check_and_send_pending_messages(
     # the idle prompt was never found, so messages stayed PENDING forever.
     status = provider.get_status()
 
-    if status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
+    eager_eligible = (
+        EAGER_INBOX_DELIVERY
+        and provider.accepts_input_while_processing
+        and status in (TerminalStatus.PROCESSING, TerminalStatus.WAITING_USER_ANSWER)
+    )
+
+    if status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED) and not eager_eligible:
         logger.debug(f"Terminal {terminal_id} not ready (status={status})")
         return False
 
@@ -182,7 +188,18 @@ class LogFileHandler(FileSystemEventHandler):
                 return
 
             # Fast check: does log tail have idle pattern?
-            if not _has_idle_pattern(terminal_id):
+            # Skip for eager-delivery-capable providers — they have no idle pattern
+            # during PROCESSING but can still accept input.
+            skip_idle_check = False
+            if EAGER_INBOX_DELIVERY:
+                try:
+                    provider = provider_manager.get_provider(terminal_id)
+                    if provider and provider.accepts_input_while_processing:
+                        skip_idle_check = True
+                except Exception as e:
+                    logger.debug(f"Eager delivery check failed for {terminal_id}: {e}")
+
+            if not skip_idle_check and not _has_idle_pattern(terminal_id):
                 logger.debug(
                     f"Terminal {terminal_id} not idle (no idle pattern in log tail), skipping"
                 )

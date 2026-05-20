@@ -232,6 +232,7 @@ Example: a supervisor assigns parallel data-analysis tasks to multiple analysts 
 - Sends a message to a specific terminal's inbox; delivered when the terminal is idle
 - Enables ongoing collaboration and multi-turn conversations
 - Common in **swarm** operations
+- Supports [eager delivery](docs/inbox-delivery.md) for providers that buffer input during processing (eliminates inter-turn latency)
 
 Example: multi-role feature development.
 

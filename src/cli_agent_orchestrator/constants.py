@@ -60,6 +60,12 @@ TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
 # Lower values = faster response, higher CPU usage
 INBOX_POLLING_INTERVAL = 5
 
+# Eager inbox delivery: when enabled, deliver queued messages to terminals in
+# PROCESSING or WAITING_USER_ANSWER state for providers that declare
+# accepts_input_while_processing=True. Eliminates latency between agent turns
+# for capable providers (e.g., Claude Code).
+EAGER_INBOX_DELIVERY = os.environ.get("CAO_EAGER_INBOX_DELIVERY", "false").lower() == "true"
+
 # =============================================================================
 # Cleanup Service Configuration
 # =============================================================================
