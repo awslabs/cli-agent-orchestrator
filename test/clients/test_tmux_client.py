@@ -100,6 +100,127 @@ class TestCreateSession:
         assert kwargs.get("y") == 50
 
 
+class TestCreateSessionEnvironmentFiltering:
+    """Tests for environment variable filtering in create_session (#242)."""
+
+    def _get_passed_environment(self, tmux, tmp_path, env_override):
+        mock_window = MagicMock()
+        mock_window.name = "w"
+        mock_session = MagicMock()
+        mock_session.windows = [mock_window]
+        tmux.server.new_session.return_value = mock_session
+
+        with patch.dict(os.environ, env_override, clear=True):
+            tmux.create_session("ses", "w", "tid1", str(tmp_path))
+
+        return tmux.server.new_session.call_args.kwargs["environment"]
+
+    def test_essential_keys_always_passed(self, tmux, tmp_path):
+        env = self._get_passed_environment(
+            tmux,
+            tmp_path,
+            {
+                "HOME": "/home/user",
+                "PATH": "/usr/bin" * 500,
+                "SHELL": "/bin/bash",
+                "LANG": "en_US.UTF-8",
+                "LC_ALL": "en_US.UTF-8",
+                "LC_CTYPE": "UTF-8",
+            },
+        )
+        assert env["HOME"] == "/home/user"
+        assert env["PATH"] == "/usr/bin" * 500  # large PATH not dropped
+        assert env["LC_ALL"] == "en_US.UTF-8"
+        assert env["LC_CTYPE"] == "UTF-8"
+
+    def test_blocked_prefixes_filtered(self, tmux, tmp_path):
+        env = self._get_passed_environment(
+            tmux,
+            tmp_path,
+            {
+                "HOME": "/home/user",
+                "CLAUDE_SESSION_ID": "abc",
+                "CODEX_TOKEN": "secret",
+                "__MISE_WATCH": "long_data",
+            },
+        )
+        assert "CLAUDE_SESSION_ID" not in env
+        assert "CODEX_TOKEN" not in env
+        assert "__MISE_WATCH" not in env
+
+    def test_allowed_claude_auth_vars_pass_through(self, tmux, tmp_path):
+        env = self._get_passed_environment(
+            tmux,
+            tmp_path,
+            {
+                "HOME": "/home/user",
+                "CLAUDE_CODE_USE_BEDROCK": "1",
+                "CLAUDE_CODE_SKIP_FOUNDRY_AUTH": "1",
+            },
+        )
+        assert env["CLAUDE_CODE_USE_BEDROCK"] == "1"
+        assert env["CLAUDE_CODE_SKIP_FOUNDRY_AUTH"] == "1"
+
+    def test_cao_kiro_mise_aws_prefixes_pass(self, tmux, tmp_path):
+        env = self._get_passed_environment(
+            tmux,
+            tmp_path,
+            {
+                "HOME": "/home/user",
+                "CAO_TERMINAL_ID": "old",  # will be overwritten
+                "CAO_SERVER_PORT": "9889",
+                "KIRO_MODEL": "sonnet",
+                "MISE_ENV": "dev",
+                "AWS_PROFILE": "prod",
+                "AWS_REGION": "us-east-1",
+                "AWS_SESSION_TOKEN": "tok",
+            },
+        )
+        assert env["CAO_SERVER_PORT"] == "9889"
+        assert env["KIRO_MODEL"] == "sonnet"
+        assert env["MISE_ENV"] == "dev"
+        assert env["AWS_PROFILE"] == "prod"
+        assert env["AWS_SESSION_TOKEN"] == "tok"
+        # CAO_TERMINAL_ID is always overwritten
+        assert env["CAO_TERMINAL_ID"] == "tid1"
+
+    def test_large_prefix_vars_dropped(self, tmux, tmp_path):
+        large_value = "x" * 2048  # exactly 2048 bytes, should be dropped (< 2048 fails)
+        env = self._get_passed_environment(
+            tmux,
+            tmp_path,
+            {
+                "HOME": "/home/user",
+                "CAO_BIG_VAR": large_value,
+            },
+        )
+        assert "CAO_BIG_VAR" not in env
+
+    def test_prefix_var_under_limit_passes(self, tmux, tmp_path):
+        env = self._get_passed_environment(
+            tmux,
+            tmp_path,
+            {
+                "HOME": "/home/user",
+                "CAO_SMALL": "x" * 2047,
+            },
+        )
+        assert "CAO_SMALL" in env
+
+    def test_unrecognized_vars_excluded(self, tmux, tmp_path):
+        env = self._get_passed_environment(
+            tmux,
+            tmp_path,
+            {
+                "HOME": "/home/user",
+                "RANDOM_VAR": "value",
+                "MY_CUSTOM_THING": "data",
+            },
+        )
+        assert "RANDOM_VAR" not in env
+        assert "MY_CUSTOM_THING" not in env
+
+
 # ── create_window ────────────────────────────────────────────────────
 
 
