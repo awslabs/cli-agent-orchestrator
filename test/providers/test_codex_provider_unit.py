@@ -378,6 +378,7 @@ class TestCodexProviderCodexProfile:
         assert "--yolo" in command
         assert "--profile" not in command
 
+
 class TestCodexProviderStatusDetection:
     @patch("cli_agent_orchestrator.providers.codex.tmux_client")
     def test_get_status_idle(self, mock_tmux):
