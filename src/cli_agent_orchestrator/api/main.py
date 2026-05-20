@@ -30,6 +30,7 @@ from cli_agent_orchestrator.constants import (
     ALLOWED_HOSTS,
     CAO_HOME_DIR,
     CORS_ORIGINS,
+    DEFAULT_PROVIDER,
     INBOX_POLLING_INTERVAL,
     SERVER_HOST,
     SERVER_PORT,
@@ -49,8 +50,9 @@ from cli_agent_orchestrator.services import (
 )
 from cli_agent_orchestrator.services.cleanup_service import cleanup_old_data
 from cli_agent_orchestrator.services.inbox_service import LogFileHandler
+from cli_agent_orchestrator.services.install_service import InstallResult, install_agent
 from cli_agent_orchestrator.services.terminal_service import OutputMode
-from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
+from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.logging import setup_logging
 from cli_agent_orchestrator.utils.skills import (
     SkillNameError,
@@ -83,6 +85,17 @@ async def flow_daemon():
         await asyncio.sleep(60)
 
 
+async def opencode_inbox_delivery_daemon(registry: PluginRegistry) -> None:
+    """Background task to wake OpenCode inbox delivery for pending messages."""
+    logger.info("OpenCode inbox delivery poller started")
+    while True:
+        await asyncio.sleep(INBOX_POLLING_INTERVAL)
+        try:
+            await asyncio.to_thread(inbox_service.poll_opencode_pending_messages, registry)
+        except Exception:
+            logger.exception("OpenCode inbox delivery poller error")
+
+
 # Response Models
 class TerminalOutputResponse(BaseModel):
     output: str
@@ -102,6 +115,18 @@ class WorkingDirectoryResponse(BaseModel):
     working_directory: Optional[str] = Field(
         description="Current working directory of the terminal, or None if unavailable"
     )
+
+
+class InstallAgentProfileRequest(BaseModel):
+    """Request body for installing an agent profile.
+
+    ``env_vars`` travels in the JSON body rather than as a query parameter so
+    that any secrets callers inject are not written to HTTP access logs.
+    """
+
+    source: str
+    provider: str = DEFAULT_PROVIDER
+    env_vars: Optional[Dict[str, str]] = None
 
 
 class CreateFlowRequest(BaseModel):
@@ -138,6 +163,10 @@ async def lifespan(app: FastAPI):
     # Start flow daemon as background task
     daemon_task = asyncio.create_task(flow_daemon())
 
+    # Start temporary OpenCode inbox poller. GH #115 tracks replacing this
+    # provider-specific wakeup path with a unified delivery engine.
+    opencode_inbox_task = asyncio.create_task(opencode_inbox_delivery_daemon(registry))
+
     # Start inbox watcher
     inbox_observer = PollingObserver(timeout=INBOX_POLLING_INTERVAL)
     inbox_observer.schedule(LogFileHandler(registry), str(TERMINAL_LOG_DIR), recursive=False)
@@ -155,6 +184,13 @@ async def lifespan(app: FastAPI):
     daemon_task.cancel()
     try:
         await daemon_task
+    except asyncio.CancelledError:
+        pass
+
+    # Cancel OpenCode inbox poller on shutdown
+    opencode_inbox_task.cancel()
+    try:
+        await opencode_inbox_task
     except asyncio.CancelledError:
         pass
 
@@ -211,6 +247,41 @@ async def list_agent_profiles_endpoint() -> List[Dict]:
         )
 
 
+@app.get("/agents/profiles/{name}")
+async def get_agent_profile_endpoint(name: str) -> Dict:
+    """Return the full parsed content of a named agent profile."""
+    try:
+        profile = load_agent_profile(name)
+        return profile.model_dump(exclude_none=True)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@app.post("/agents/profiles/install")
+async def install_agent_profile_endpoint(request: InstallAgentProfileRequest) -> InstallResult:
+    """Install an agent profile for a target provider.
+
+    HTTP (and transitively ``cao-ops-mcp``, which calls this endpoint) is an
+    untrusted surface. ``install_agent()`` only accepts bare profile names or
+    https:// URLs; local filesystem paths are handled by the CLI entry point
+    alone. A remote caller therefore cannot coerce the server into reading
+    arbitrary ``.md`` files from disk.
+    """
+    result = install_agent(
+        source=request.source,
+        provider=request.provider,
+        env_vars=request.env_vars,
+    )
+    if not result.success:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=result.message)
+
+    return result
+
+
 @app.get("/agents/providers")
 async def list_providers_endpoint() -> List[Dict]:
     """List available providers with installation status."""
@@ -224,6 +295,7 @@ async def list_providers_endpoint() -> List[Dict]:
         "gemini_cli": "gemini",
         "kimi_cli": "kimi",
         "copilot_cli": "copilot",
+        "opencode_cli": "opencode",
     }
     result = []
     for provider, binary in provider_binaries.items():
@@ -301,8 +373,8 @@ async def get_skill_content(name: str) -> SkillContentResponse:
 @app.post("/sessions", response_model=Terminal, status_code=status.HTTP_201_CREATED)
 async def create_session(
     request: Request,
-    provider: str,
     agent_profile: str,
+    provider: Optional[str] = None,
     session_name: Optional[str] = None,
     working_directory: Optional[str] = None,
     allowed_tools: Optional[str] = None,
@@ -377,14 +449,17 @@ async def delete_session(request: Request, session_name: str) -> Dict:
 async def create_terminal_in_session(
     request: Request,
     session_name: str,
-    provider: str,
     agent_profile: str,
+    provider: Optional[str] = None,
     working_directory: Optional[str] = None,
     allowed_tools: Optional[str] = None,
 ) -> Terminal:
     """Create additional terminal in existing session."""
     try:
-        resolved_provider = resolve_provider(agent_profile, fallback_provider=provider)
+        if provider is None:
+            resolved_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
+        else:
+            resolved_provider = provider
 
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None

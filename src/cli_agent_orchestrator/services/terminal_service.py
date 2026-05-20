@@ -28,6 +28,7 @@ from cli_agent_orchestrator.clients.database import delete_terminal as db_delete
 from cli_agent_orchestrator.clients.database import (
     get_terminal_metadata,
     update_last_active,
+    update_terminal_shell_command,
 )
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.constants import SESSION_PREFIX, TERMINAL_LOG_DIR
@@ -142,7 +143,12 @@ def create_terminal(
 
         # Step 3: Persist terminal metadata to database
         db_create_terminal(
-            terminal_id, session_name, window_name, provider, agent_profile, allowed_tools
+            terminal_id,
+            session_name,
+            window_name,
+            provider,
+            agent_profile,
+            allowed_tools,
         )
 
         # Step 3b: Load the profile once for allowed tool resolution before
@@ -181,6 +187,13 @@ def create_terminal(
         )
         provider_instance.initialize()
 
+        # Persist shell_command baseline if the provider captured one
+        shell_command = provider_instance.shell_baseline
+        if not isinstance(shell_command, str):
+            shell_command = None
+        if shell_command:
+            update_terminal_shell_command(terminal_id, shell_command)
+
         # Step 5: Set up terminal logging via tmux pipe-pane
         # This captures all terminal output to a log file for inbox monitoring
         log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
@@ -194,6 +207,7 @@ def create_terminal(
             provider=ProviderType(provider),
             session_name=session_name,
             agent_profile=agent_profile,
+            shell_command=shell_command,
             status=TerminalStatus.IDLE,
             last_active=datetime.now(),
         )
@@ -309,7 +323,11 @@ def send_input(
         enter_count = provider.paste_enter_count if provider else 1
 
         tmux_client.send_keys(
-            metadata["tmux_session"], metadata["tmux_window"], message, enter_count=enter_count
+            metadata["tmux_session"],
+            metadata["tmux_window"],
+            message,
+            enter_count=enter_count,
+            force_bracketed_paste=True,
         )
 
         # Notify the provider that external input was received.
@@ -442,6 +460,36 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
         metadata = get_terminal_metadata(terminal_id)
 
         if metadata:
+            # Snapshot scrollback + metadata before killing (for debugging/restore)
+            try:
+                # Capture plain text full scrollback (no -e, no line cap)
+                scrollback = tmux_client.get_history(
+                    metadata["tmux_session"],
+                    metadata["tmux_window"],
+                    strip_escapes=True,
+                    full_history=True,
+                )
+                scrollback_path = TERMINAL_LOG_DIR / f"{terminal_id}.scrollback"
+                scrollback_path.write_text(scrollback, encoding="utf-8")
+
+                import json as _json
+
+                snapshot = {
+                    "terminal_id": terminal_id,
+                    "session_name": metadata["tmux_session"],
+                    "window_name": metadata["tmux_window"],
+                    "agent_profile": metadata.get("agent_profile"),
+                    "provider": metadata["provider"],
+                    "working_directory": tmux_client.get_pane_working_directory(
+                        metadata["tmux_session"], metadata["tmux_window"]
+                    ),
+                    "allowed_tools": metadata.get("allowed_tools"),
+                }
+                snapshot_path = TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json"
+                snapshot_path.write_text(_json.dumps(snapshot, indent=2), encoding="utf-8")
+            except Exception as e:
+                logger.warning(f"Failed to snapshot terminal {terminal_id}: {e}")
+
             # Stop pipe-pane logging
             try:
                 tmux_client.stop_pipe_pane(metadata["tmux_session"], metadata["tmux_window"])

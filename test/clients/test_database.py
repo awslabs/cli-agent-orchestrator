@@ -26,11 +26,13 @@ from cli_agent_orchestrator.clients.database import (
     get_terminal_metadata,
     init_db,
     list_flows,
+    list_pending_receiver_ids_by_provider,
     list_terminals_by_session,
     update_flow_enabled,
     update_flow_run_times,
     update_last_active,
     update_message_status,
+    update_terminal_shell_command,
 )
 from cli_agent_orchestrator.models.inbox import MessageStatus
 
@@ -121,6 +123,41 @@ class TestTerminalOperations:
         mock_session.commit.assert_called_once()
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_update_terminal_shell_command(self, mock_session_class):
+        """Test updating shell_command baseline for a terminal."""
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_terminal = MagicMock()
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = mock_terminal
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        result = update_terminal_shell_command("test123", "bash")
+
+        assert result is True
+        assert mock_terminal.shell_command == "bash"
+        mock_session.commit.assert_called_once()
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_update_terminal_shell_command_not_found(self, mock_session_class):
+        """Test updating shell_command for a terminal that doesn't exist."""
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = None
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        result = update_terminal_shell_command("nonexistent", "bash")
+
+        assert result is False
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_delete_terminal(self, mock_session_class):
         """Test deleting a terminal."""
         mock_session = MagicMock()
@@ -177,6 +214,25 @@ class TestTerminalOperations:
 
         assert len(result) == 1
         assert result[0]["id"] == "test123"
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_list_pending_receiver_ids_by_provider(self, mock_session_class):
+        """Test listing pending receivers for a specific provider."""
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_query = MagicMock()
+        mock_query.join.return_value.filter.return_value.distinct.return_value.all.return_value = [
+            ("receiver-1",),
+            ("receiver-2",),
+        ]
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        result = list_pending_receiver_ids_by_provider("opencode_cli")
+
+        assert result == ["receiver-1", "receiver-2"]
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_delete_terminals_by_session(self, mock_session_class):

@@ -162,3 +162,10 @@ jobs:
         with:
           fail-on-severity: high
           deny-licenses: GPL-3.0, AGPL-3.0
+
+# NOTE: CodeQL runs via GitHub's "default setup" (visible as the `Analyze (...)`
+# checks on every PR). Adding a workflow-based CodeQL job here would conflict
+# with default setup ("CodeQL analyses from advanced configurations cannot be
+# processed when the default setup is enabled") and fail uploads. To widen the
+# query suite beyond the default, toggle default setup off in
+# Settings → Code security → CodeQL default setup and re-add a workflow job.

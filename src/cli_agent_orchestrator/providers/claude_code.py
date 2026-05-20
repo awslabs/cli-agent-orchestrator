@@ -79,47 +79,53 @@ class ClaudeCodeProvider(BaseProvider):
         # tool permission prompts. CAO already confirms workspace access during
         # `cao launch` (or `--yolo`), so re-prompting each spawned agent
         # (supervisor and worker) is redundant and blocks handoff/assign flows.
-        command_parts = ["claude", "--dangerously-skip-permissions"]
+        yolo = bool(self._allowed_tools and "*" in self._allowed_tools)
 
+        profile = None
         if self._agent_profile is not None:
             try:
                 profile = load_agent_profile(self._agent_profile)
-
-                if profile.model:
-                    command_parts.extend(["--model", profile.model])
-
-                # Add system prompt - escape newlines to prevent tmux chunking issues
-                system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
-                system_prompt = self._apply_skill_prompt(system_prompt)
-                if system_prompt:
-                    # Replace actual newlines with \n escape sequences
-                    # This prevents tmux send_keys chunking from breaking the command
-                    escaped_prompt = system_prompt.replace("\\", "\\\\").replace("\n", "\\n")
-                    command_parts.extend(["--append-system-prompt", escaped_prompt])
-
-                # Add MCP config if present.
-                # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
-                # can identify the current terminal for handoff/assign operations.
-                # Claude Code does not automatically forward parent shell env vars
-                # to MCP subprocesses, so we inject it explicitly via the env field.
-                if profile.mcpServers:
-                    mcp_config = {}
-                    for server_name, server_config in profile.mcpServers.items():
-                        if isinstance(server_config, dict):
-                            mcp_config[server_name] = dict(server_config)
-                        else:
-                            mcp_config[server_name] = server_config.model_dump(exclude_none=True)
-
-                        env = mcp_config[server_name].get("env", {})
-                        if "CAO_TERMINAL_ID" not in env:
-                            env["CAO_TERMINAL_ID"] = self.terminal_id
-                            mcp_config[server_name]["env"] = env
-
-                    mcp_json = json.dumps({"mcpServers": mcp_config})
-                    command_parts.extend(["--mcp-config", mcp_json])
-
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
+
+        if profile and profile.permissionMode and not yolo:
+            command_parts = ["claude", "--permission-mode", profile.permissionMode]
+        else:
+            command_parts = ["claude", "--dangerously-skip-permissions"]
+
+        if profile is not None:
+            if profile.model:
+                command_parts.extend(["--model", profile.model])
+
+            # Add system prompt - escape newlines to prevent tmux chunking issues
+            system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
+            system_prompt = self._apply_skill_prompt(system_prompt)
+            if system_prompt:
+                # Replace actual newlines with \n escape sequences
+                # This prevents tmux send_keys chunking from breaking the command
+                escaped_prompt = system_prompt.replace("\\", "\\\\").replace("\n", "\\n")
+                command_parts.extend(["--append-system-prompt", escaped_prompt])
+
+            # Add MCP config if present.
+            # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
+            # can identify the current terminal for handoff/assign operations.
+            # Claude Code does not automatically forward parent shell env vars
+            # to MCP subprocesses, so we inject it explicitly via the env field.
+            if profile.mcpServers:
+                mcp_config = {}
+                for server_name, server_config in profile.mcpServers.items():
+                    if isinstance(server_config, dict):
+                        mcp_config[server_name] = dict(server_config)
+                    else:
+                        mcp_config[server_name] = server_config.model_dump(exclude_none=True)
+
+                    env = mcp_config[server_name].get("env", {})
+                    if "CAO_TERMINAL_ID" not in env:
+                        env["CAO_TERMINAL_ID"] = self.terminal_id
+                        mcp_config[server_name]["env"] = env
+
+                mcp_json = json.dumps({"mcpServers": mcp_config})
+                command_parts.extend(["--mcp-config", mcp_json])
 
         # Apply tool restrictions via --disallowedTools flags.
         # --dangerously-skip-permissions bypasses prompts but --disallowedTools

@@ -78,6 +78,148 @@ class TestCreateSession:
         with pytest.raises(Exception, match="tmux error"):
             tmux.create_session("ses", "w", "tid1", str(tmp_path))
 
+    def test_create_session_uses_explicit_dimensions(self, tmux, tmp_path):
+        """Guard against regressing the kiro-cli 2.1.x SIGWINCH-repaint bug (#216).
+
+        Default detached pane is 80x24. When the user attaches, tmux resizes
+        the pane to their real terminal size and kiro-cli 2.1.x fails to
+        repaint (blank screen, input silently dropped). Creating the pane at
+        220x50 makes the attach-time resize a no-op or shrink, which kiro
+        handles correctly.
+        """
+        mock_window = MagicMock()
+        mock_window.name = "my-window"
+        mock_session = MagicMock()
+        mock_session.windows = [mock_window]
+        tmux.server.new_session.return_value = mock_session
+
+        tmux.create_session("ses", "my-window", "tid1", str(tmp_path))
+
+        kwargs = tmux.server.new_session.call_args.kwargs
+        assert kwargs.get("x") == 220
+        assert kwargs.get("y") == 50
+
+
+class TestCreateSessionEnvironmentFiltering:
+    """Tests for environment variable filtering in create_session (#242)."""
+
+    def _get_passed_environment(self, tmux, tmp_path, env_override):
+        mock_window = MagicMock()
+        mock_window.name = "w"
+        mock_session = MagicMock()
+        mock_session.windows = [mock_window]
+        tmux.server.new_session.return_value = mock_session
+
+        with patch.dict(os.environ, env_override, clear=True):
+            tmux.create_session("ses", "w", "tid1", str(tmp_path))
+
+        return tmux.server.new_session.call_args.kwargs["environment"]
+
+    def test_essential_keys_always_passed(self, tmux, tmp_path):
+        env = self._get_passed_environment(
+            tmux,
+            tmp_path,
+            {
+                "HOME": "/home/user",
+                "PATH": "/usr/bin" * 500,
+                "SHELL": "/bin/bash",
+                "LANG": "en_US.UTF-8",
+                "LC_ALL": "en_US.UTF-8",
+                "LC_CTYPE": "UTF-8",
+            },
+        )
+        assert env["HOME"] == "/home/user"
+        assert env["PATH"] == "/usr/bin" * 500  # large PATH not dropped
+        assert env["LC_ALL"] == "en_US.UTF-8"
+        assert env["LC_CTYPE"] == "UTF-8"
+
+    def test_blocked_prefixes_filtered(self, tmux, tmp_path):
+        env = self._get_passed_environment(
+            tmux,
+            tmp_path,
+            {
+                "HOME": "/home/user",
+                "CLAUDE_SESSION_ID": "abc",
+                "CODEX_TOKEN": "secret",
+                "__MISE_WATCH": "long_data",
+            },
+        )
+        assert "CLAUDE_SESSION_ID" not in env
+        assert "CODEX_TOKEN" not in env
+        assert "__MISE_WATCH" not in env
+
+    def test_allowed_claude_auth_vars_pass_through(self, tmux, tmp_path):
+        env = self._get_passed_environment(
+            tmux,
+            tmp_path,
+            {
+                "HOME": "/home/user",
+                "CLAUDE_CODE_USE_BEDROCK": "1",
+                "CLAUDE_CODE_SKIP_FOUNDRY_AUTH": "1",
+            },
+        )
+        assert env["CLAUDE_CODE_USE_BEDROCK"] == "1"
+        assert env["CLAUDE_CODE_SKIP_FOUNDRY_AUTH"] == "1"
+
+    def test_cao_kiro_mise_aws_prefixes_pass(self, tmux, tmp_path):
+        env = self._get_passed_environment(
+            tmux,
+            tmp_path,
+            {
+                "HOME": "/home/user",
+                "CAO_TERMINAL_ID": "old",  # will be overwritten
+                "CAO_SERVER_PORT": "9889",
+                "KIRO_MODEL": "sonnet",
+                "MISE_ENV": "dev",
+                "AWS_PROFILE": "prod",
+                "AWS_REGION": "us-east-1",
+                "AWS_SESSION_TOKEN": "tok",
+            },
+        )
+        assert env["CAO_SERVER_PORT"] == "9889"
+        assert env["KIRO_MODEL"] == "sonnet"
+        assert env["MISE_ENV"] == "dev"
+        assert env["AWS_PROFILE"] == "prod"
+        assert env["AWS_SESSION_TOKEN"] == "tok"
+        # CAO_TERMINAL_ID is always overwritten
+        assert env["CAO_TERMINAL_ID"] == "tid1"
+
+    def test_large_prefix_vars_dropped(self, tmux, tmp_path):
+        large_value = "x" * 2048  # exactly 2048 bytes, should be dropped (< 2048 fails)
+        env = self._get_passed_environment(
+            tmux,
+            tmp_path,
+            {
+                "HOME": "/home/user",
+                "CAO_BIG_VAR": large_value,
+            },
+        )
+        assert "CAO_BIG_VAR" not in env
+
+    def test_prefix_var_under_limit_passes(self, tmux, tmp_path):
+        env = self._get_passed_environment(
+            tmux,
+            tmp_path,
+            {
+                "HOME": "/home/user",
+                "CAO_SMALL": "x" * 2047,
+            },
+        )
+        assert "CAO_SMALL" in env
+
+    def test_unrecognized_vars_excluded(self, tmux, tmp_path):
+        env = self._get_passed_environment(
+            tmux,
+            tmp_path,
+            {
+                "HOME": "/home/user",
+                "RANDOM_VAR": "value",
+                "MY_CUSTOM_THING": "data",
+            },
+        )
+        assert "RANDOM_VAR" not in env
+        assert "MY_CUSTOM_THING" not in env
+
 
 # ── create_window ────────────────────────────────────────────────────
 
@@ -109,6 +251,21 @@ class TestCreateWindow:
 
         with pytest.raises(ValueError, match="Window name is None"):
             tmux.create_window("ses", "w", "tid2", str(tmp_path))
+
+    def test_create_window_with_window_shell(self, tmux, tmp_path):
+        mock_window = MagicMock()
+        mock_window.name = "restored-window"
+        mock_session = MagicMock()
+        mock_session.new_window.return_value = mock_window
+        tmux.server.sessions.get.return_value = mock_session
+
+        result = tmux.create_window(
+            "ses", "restored-window", "tid2", str(tmp_path), window_shell="cat /tmp/x; exec bash -l"
+        )
+
+        assert result == "restored-window"
+        call_kwargs = mock_session.new_window.call_args[1]
+        assert call_kwargs["window_shell"] == "cat /tmp/x; exec bash -l"
 
 
 # ── send_keys ────────────────────────────────────────────────────────
@@ -271,6 +428,23 @@ class TestGetHistory:
         tmux.get_history("ses", "win", tail_lines=50)
 
         mock_pane.cmd.assert_called_once_with("capture-pane", "-e", "-p", "-S", "-50")
+
+    def test_get_history_full_history(self, tmux):
+        mock_pane = MagicMock()
+        mock_result = MagicMock()
+        mock_result.stdout = ["line1", "line2"]
+        mock_pane.cmd.return_value = mock_result
+        mock_window = MagicMock()
+        mock_window.panes = [mock_pane]
+        mock_session = MagicMock()
+        mock_session.windows.get.return_value = mock_window
+        tmux.server.sessions.get.return_value = mock_session
+
+        result = tmux.get_history("ses", "win", strip_escapes=True, full_history=True)
+
+        assert result == "line1\nline2"
+        # full_history uses "-S" "-" (no line count), strip_escapes omits "-e"
+        mock_pane.cmd.assert_called_once_with("capture-pane", "-p", "-S", "-")
 
 
 # ── list_sessions ────────────────────────────────────────────────────
@@ -527,3 +701,42 @@ class TestStopPipePane:
 
         with pytest.raises(ValueError, match="not found"):
             tmux.stop_pipe_pane("ses", "nonexistent")
+
+
+class TestGetPaneCurrentCommand:
+    def test_get_pane_current_command_success(self, tmux):
+        mock_session = MagicMock()
+        mock_window = MagicMock()
+        mock_pane = MagicMock()
+        mock_pane.cmd.return_value.stdout = ["bash"]
+        mock_window.active_pane = mock_pane
+        mock_session.windows.get.return_value = mock_window
+        tmux.server.sessions.get.return_value = mock_session
+
+        result = tmux.get_pane_current_command("ses", "win")
+
+        assert result == "bash"
+        mock_pane.cmd.assert_called_once_with("display-message", "-p", "#{pane_current_command}")
+
+    def test_get_pane_current_command_session_not_found(self, tmux):
+        tmux.server.sessions.get.return_value = None
+
+        result = tmux.get_pane_current_command("nonexistent", "win")
+
+        assert result is None
+
+    def test_get_pane_current_command_window_not_found(self, tmux):
+        mock_session = MagicMock()
+        mock_session.windows.get.return_value = None
+        tmux.server.sessions.get.return_value = mock_session
+
+        result = tmux.get_pane_current_command("ses", "nonexistent")
+
+        assert result is None
+
+    def test_get_pane_current_command_exception_returns_none(self, tmux):
+        tmux.server.sessions.get.side_effect = Exception("tmux error")
+
+        result = tmux.get_pane_current_command("ses", "win")
+
+        assert result is None

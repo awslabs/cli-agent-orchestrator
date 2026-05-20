@@ -25,7 +25,7 @@ describe('Store', () => {
   it('sets terminal status', () => {
     const { setTerminalStatus } = useStore.getState()
     setTerminalStatus('term-1', 'idle')
-    expect(useStore.getState().terminalStatuses['term-1']).toBe('idle')
+    expect(useStore.getState().terminalStatuses['term-1']).toBe('IDLE')
   })
 
   it('sets multiple terminal statuses independently', () => {
@@ -33,8 +33,8 @@ describe('Store', () => {
     setTerminalStatus('term-1', 'idle')
     setTerminalStatus('term-2', 'processing')
     const statuses = useStore.getState().terminalStatuses
-    expect(statuses['term-1']).toBe('idle')
-    expect(statuses['term-2']).toBe('processing')
+    expect(statuses['term-1']).toBe('IDLE')
+    expect(statuses['term-2']).toBe('PROCESSING')
   })
 
   it('shows and clears snackbar', () => {

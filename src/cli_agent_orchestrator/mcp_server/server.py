@@ -14,6 +14,7 @@ from cli_agent_orchestrator.constants import API_BASE_URL, DEFAULT_PROVIDER
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 from cli_agent_orchestrator.utils.terminal import generate_session_name, wait_until_terminal_status
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,36 @@ ENABLE_WORKING_DIRECTORY = os.getenv("CAO_ENABLE_WORKING_DIRECTORY", "false").lo
 
 # Environment variable to enable/disable automatic sender terminal ID injection
 ENABLE_SENDER_ID_INJECTION = os.getenv("CAO_ENABLE_SENDER_ID_INJECTION", "false").lower() == "true"
+
+# Terminal count threshold for cleanup nudge
+TERMINAL_CLEANUP_NUDGE_THRESHOLD = 10
+
+
+def _get_cleanup_nudge() -> str:
+    """Return a cleanup nudge string if the session has too many terminals, else empty string."""
+    current_terminal_id = os.environ.get("CAO_TERMINAL_ID")
+    if not current_terminal_id:
+        return ""
+    try:
+        resp = requests.get(f"{API_BASE_URL}/terminals/{current_terminal_id}")
+        if resp.status_code != 200:
+            return ""
+        session_name = resp.json().get("session_name")
+        if not session_name:
+            return ""
+        resp = requests.get(f"{API_BASE_URL}/sessions/{session_name}/terminals")
+        if resp.status_code != 200:
+            return ""
+        count = len(resp.json())
+        if count >= TERMINAL_CLEANUP_NUDGE_THRESHOLD:
+            return (
+                f" NOTE: This session has {count} terminals. "
+                f"Consider calling delete_terminal on terminals you no longer need."
+            )
+    except Exception:
+        pass
+    return ""
+
 
 # Create MCP server
 mcp = FastMCP(
@@ -124,7 +155,8 @@ def _create_terminal(
         response.raise_for_status()
         terminal_metadata = response.json()
 
-        provider = terminal_metadata["provider"]
+        # Treat the supervisor provider as a fallback, not an explicit override.
+        provider = resolve_provider(agent_profile, fallback_provider=terminal_metadata["provider"])
         session_name = terminal_metadata["session_name"]
         parent_allowed_tools = terminal_metadata.get("allowed_tools")
 
@@ -163,6 +195,7 @@ def _create_terminal(
     else:
         # Create new session with terminal
         session_name = generate_session_name()
+        provider = resolve_provider(agent_profile, fallback_provider=provider)
         params = {
             "provider": provider,
             "agent_profile": agent_profile,
@@ -362,11 +395,19 @@ async def _handoff_impl(
         response = requests.post(f"{API_BASE_URL}/terminals/{terminal_id}/exit")
         response.raise_for_status()
 
+        # Auto-delete the worker terminal after successful handoff
+        try:
+            requests.delete(f"{API_BASE_URL}/terminals/{terminal_id}")
+            logger.info(f"Auto-deleted handoff terminal {terminal_id}")
+        except Exception as e:
+            logger.warning(f"Failed to auto-delete handoff terminal {terminal_id}: {e}")
+
         execution_time = time.time() - start_time
 
         return HandoffResult(
             success=True,
-            message=f"Successfully handed off to {agent_profile} ({provider}) in {execution_time:.2f}s",
+            message=f"Successfully handed off to {agent_profile} ({provider}) in {execution_time:.2f}s"
+            + _get_cleanup_nudge(),
             output=output,
             terminal_id=terminal_id,
         )
@@ -513,7 +554,11 @@ def _assign_impl(
         return {
             "success": True,
             "terminal_id": terminal_id,
-            "message": f"Task assigned to {agent_profile} (terminal: {terminal_id})",
+            "message": (
+                f"Task assigned to {agent_profile} (terminal: {terminal_id}). "
+                f"Call delete_terminal('{terminal_id}') when you no longer need this terminal."
+                + _get_cleanup_nudge()
+            ),
         }
 
     except Exception as e:
@@ -547,6 +592,11 @@ Example message: "Analyze the logs. When done, send results back to terminal ee3
 - Directory must exist and be accessible"""
 
     desc += """
+
+## Cleanup
+
+When you are done with an assigned terminal (received results or no longer need it),
+call delete_terminal(terminal_id) to free system resources.
 
 Args:
     agent_profile: Agent profile for the worker terminal
@@ -642,6 +692,39 @@ async def load_skill(
 ) -> Any:
     """Retrieve skill content from cao-server."""
     return _load_skill_impl(name)
+
+
+@mcp.tool()
+def delete_terminal(
+    terminal_id: str = Field(
+        description="The terminal ID to delete (obtained from assign or handoff results)"
+    ),
+) -> Dict[str, Any]:
+    """Delete a terminal that is no longer needed, freeing system resources.
+
+    Use this to clean up terminals created via assign once you have received
+    their results or no longer need them. This kills the tmux window and
+    removes the terminal record.
+
+    Handoff terminals are automatically cleaned up on success — you only need
+    to call this for assign terminals.
+
+    Args:
+        terminal_id: The terminal ID to delete
+
+    Returns:
+        Dict with success status and message
+    """
+    try:
+        response = requests.delete(f"{API_BASE_URL}/terminals/{terminal_id}")
+        response.raise_for_status()
+        return {"success": True, "message": f"Terminal {terminal_id} deleted successfully"}
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            return {"success": False, "message": f"Terminal {terminal_id} not found"}
+        return {"success": False, "message": f"Failed to delete terminal: {str(e)}"}
+    except Exception as e:
+        return {"success": False, "message": f"Failed to delete terminal: {str(e)}"}
 
 
 def main():

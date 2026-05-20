@@ -13,98 +13,99 @@ from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, reso
 class TestLoadAgentProfile:
     """Tests for load_agent_profile function."""
 
-    @patch("cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR")
-    @patch("cli_agent_orchestrator.utils.agent_profiles.frontmatter")
-    def test_load_agent_profile_from_local_store(self, mock_frontmatter, mock_local_dir):
-        """Test loading agent profile from local store."""
-        # Setup mock local directory
-        mock_local_path = MagicMock(spec=Path)
-        mock_local_path.exists.return_value = True
-        mock_local_path.read_text.return_value = (
+    def test_load_agent_profile_from_local_store(self, tmp_path, monkeypatch):
+        """Test loading agent profile from the local store."""
+        local_store = tmp_path / "agent-store"
+        local_store.mkdir()
+        (local_store / "test-agent.md").write_text(
             "---\nname: test-agent\ndescription: Test agent\n---\nSystem prompt content"
         )
-        mock_local_dir.__truediv__.return_value = mock_local_path
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR", local_store
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs", lambda: {}
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", lambda: []
+        )
 
-        # Setup frontmatter mock
-        mock_parsed = MagicMock()
-        mock_parsed.metadata = {"name": "test-agent", "description": "Test agent"}
-        mock_parsed.content = "System prompt content"
-        mock_frontmatter.loads.return_value = mock_parsed
-
-        # Execute
         result = load_agent_profile("test-agent")
 
-        # Verify
         assert result.name == "test-agent"
         assert result.description == "Test agent"
         assert result.system_prompt == "System prompt content"
-        mock_local_path.exists.assert_called_once()
 
-    @patch("cli_agent_orchestrator.utils.agent_profiles.resources")
-    @patch("cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR")
-    @patch("cli_agent_orchestrator.utils.agent_profiles.frontmatter")
-    def test_load_agent_profile_from_builtin_store(
-        self, mock_frontmatter, mock_local_dir, mock_resources
-    ):
-        """Test loading agent profile from built-in store when local not found."""
-        # Setup mock local directory (not found)
-        mock_local_path = MagicMock(spec=Path)
-        mock_local_path.exists.return_value = False
-        mock_local_dir.__truediv__.return_value = mock_local_path
+    def test_load_agent_profile_from_builtin_store(self, tmp_path, monkeypatch):
+        """Test loading agent profile from the built-in store when local store is empty."""
+        # Point the local store at an empty directory so we fall through to built-in.
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR",
+            tmp_path / "empty-local",
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs", lambda: {}
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", lambda: []
+        )
 
-        # Setup built-in store mock
-        mock_agent_store = MagicMock()
-        mock_profile_file = MagicMock()
-        mock_profile_file.is_file.return_value = True
-        mock_profile_file.read_text.return_value = (
+        # Fake built-in store backed by a real on-disk directory so `is_file()`
+        # and `read_text()` behave like Traversable would.
+        builtin_store = tmp_path / "builtin-store"
+        builtin_store.mkdir()
+        (builtin_store / "builtin-agent.md").write_text(
             "---\nname: builtin-agent\ndescription: Builtin agent\n---\nBuiltin prompt"
         )
-        mock_agent_store.__truediv__.return_value = mock_profile_file
-        mock_resources.files.return_value = mock_agent_store
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.resources.files",
+            lambda _pkg: builtin_store,
+        )
 
-        # Setup frontmatter mock
-        mock_parsed = MagicMock()
-        mock_parsed.metadata = {"name": "builtin-agent", "description": "Builtin agent"}
-        mock_parsed.content = "Builtin prompt"
-        mock_frontmatter.loads.return_value = mock_parsed
-
-        # Execute
         result = load_agent_profile("builtin-agent")
 
-        # Verify
         assert result.name == "builtin-agent"
         assert result.description == "Builtin agent"
         assert result.system_prompt == "Builtin prompt"
 
-    @patch("cli_agent_orchestrator.utils.agent_profiles.resources")
-    @patch("cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR")
-    def test_load_agent_profile_not_found(self, mock_local_dir, mock_resources):
-        """Test loading agent profile that doesn't exist."""
-        # Setup mock local directory (not found)
-        mock_local_path = MagicMock(spec=Path)
-        mock_local_path.exists.return_value = False
-        mock_local_dir.__truediv__.return_value = mock_local_path
+    def test_load_agent_profile_not_found(self, tmp_path, monkeypatch):
+        """Missing profile in every store should raise FileNotFoundError."""
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR",
+            tmp_path / "empty-local",
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs", lambda: {}
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", lambda: []
+        )
+        empty_builtin = tmp_path / "empty-builtin"
+        empty_builtin.mkdir()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.resources.files",
+            lambda _pkg: empty_builtin,
+        )
 
-        # Setup built-in store mock (not found)
-        mock_agent_store = MagicMock()
-        mock_profile_file = MagicMock()
-        mock_profile_file.is_file.return_value = False
-        mock_agent_store.__truediv__.return_value = mock_profile_file
-        mock_resources.files.return_value = mock_agent_store
-
-        # Execute and verify — FileNotFoundError passes through directly
         with pytest.raises(FileNotFoundError, match="Agent profile not found"):
             load_agent_profile("nonexistent")
 
-    @patch("cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR")
-    def test_load_agent_profile_exception_handling(self, mock_local_dir):
-        """Test exception handling in load_agent_profile."""
-        # Setup mock to raise exception
-        mock_local_path = MagicMock(spec=Path)
-        mock_local_path.exists.side_effect = Exception("File system error")
-        mock_local_dir.__truediv__.return_value = mock_local_path
+    def test_load_agent_profile_exception_handling(self, tmp_path, monkeypatch):
+        """Test exception handling in load_agent_profile wraps unexpected errors."""
+        local_store = tmp_path / "agent-store"
+        local_store.mkdir()
+        profile = local_store / "test-agent.md"
+        profile.write_text("---\nname: test-agent\ndescription: Test\n---\nprompt")
 
-        # Execute and verify
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR", local_store
+        )
+        # Inject a failure during parsing to exercise the wrapping RuntimeError branch.
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.parse_agent_profile_text",
+            lambda *a, **kw: (_ for _ in ()).throw(Exception("parse error")),
+        )
+
         with pytest.raises(RuntimeError, match="Failed to load agent profile"):
             load_agent_profile("test-agent")
 

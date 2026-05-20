@@ -36,13 +36,16 @@ def install_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Dict[s
     # opencode_agents intentionally NOT pre-created — install must mkdir it.
 
     monkeypatch.setattr(
-        "cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR", local_store
+        "cli_agent_orchestrator.services.install_service.LOCAL_AGENT_STORE_DIR", local_store
     )
     monkeypatch.setattr(
-        "cli_agent_orchestrator.cli.commands.install.AGENT_CONTEXT_DIR", context_dir
+        "cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR", local_store
     )
     monkeypatch.setattr(
-        "cli_agent_orchestrator.cli.commands.install.OPENCODE_AGENTS_DIR", opencode_agents
+        "cli_agent_orchestrator.services.install_service.AGENT_CONTEXT_DIR", context_dir
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.install_service.OPENCODE_AGENTS_DIR", opencode_agents
     )
     # Redirect the config file used by opencode_config helpers
     monkeypatch.setattr(
@@ -57,7 +60,7 @@ def install_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Dict[s
     # Suppress ensure_skills_symlink filesystem side-effects in install unit tests.
     # The symlink helper's own behaviour is covered by test_opencode_config.py.
     monkeypatch.setattr(
-        "cli_agent_orchestrator.cli.commands.install.ensure_skills_symlink", lambda: None
+        "cli_agent_orchestrator.services.install_service.ensure_skills_symlink", lambda: None
     )
 
     return {
@@ -142,7 +145,7 @@ class TestFreshInstall:
         """ensure_skills_symlink() must be called once per opencode_cli install."""
         calls: list[int] = []
         monkeypatch.setattr(
-            "cli_agent_orchestrator.cli.commands.install.ensure_skills_symlink",
+            "cli_agent_orchestrator.services.install_service.ensure_skills_symlink",
             lambda: calls.append(1),
         )
         _write_profile(install_workspace["local_store"] / "test-agent.md")
@@ -528,13 +531,16 @@ class TestOpencodeAgentListIntegration:
         context_dir.mkdir(parents=True)
 
         monkeypatch.setattr(
-            "cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR", local_store
+            "cli_agent_orchestrator.services.install_service.LOCAL_AGENT_STORE_DIR", local_store
         )
         monkeypatch.setattr(
-            "cli_agent_orchestrator.cli.commands.install.AGENT_CONTEXT_DIR", context_dir
+            "cli_agent_orchestrator.utils.agent_profiles.LOCAL_AGENT_STORE_DIR", local_store
         )
         monkeypatch.setattr(
-            "cli_agent_orchestrator.cli.commands.install.OPENCODE_AGENTS_DIR", agents_dir
+            "cli_agent_orchestrator.services.install_service.AGENT_CONTEXT_DIR", context_dir
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.install_service.OPENCODE_AGENTS_DIR", agents_dir
         )
         monkeypatch.setattr(
             "cli_agent_orchestrator.utils.opencode_config.OPENCODE_CONFIG_FILE", config_file

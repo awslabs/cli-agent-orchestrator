@@ -78,6 +78,12 @@ LOCAL_AGENT_STORE_DIR = CAO_HOME_DIR / "agent-store"
 # Local skill store for installed CAO skills
 SKILLS_DIR = CAO_HOME_DIR / "skills"
 
+# Per-terminal workspace directories for providers that read context files
+# from the current working directory (currently: Gemini CLI's GEMINI.md).
+# Each terminal gets its own subdirectory so parallel sessions cannot clobber
+# each other's system prompt.
+GEMINI_WORKSPACES_DIR = CAO_HOME_DIR / "gemini-workspaces"
+
 # Provider-specific agent directories
 Q_AGENTS_DIR = Path.home() / ".aws" / "amazonq" / "cli-agents"  # Q CLI agents
 KIRO_AGENTS_DIR = Path(os.environ.get("CAO_AGENTS_DIR", str(Path.home() / ".kiro" / "agents")))

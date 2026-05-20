@@ -162,3 +162,55 @@ class TestHandoffMessageContext:
         sent_message = mock_send.call_args[0][1]
         assert mock_send.call_args[0][2] == "handoff"
         assert sent_message.endswith(original)
+
+
+class TestHandoffAutoDelete:
+    """Tests for auto-deletion of handoff terminals on success."""
+
+    @patch("cli_agent_orchestrator.mcp_server.server._send_direct_input")
+    @patch("cli_agent_orchestrator.mcp_server.server.wait_until_terminal_status")
+    @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
+    def test_auto_deletes_terminal_on_success(self, mock_create, mock_wait, mock_send):
+        """Handoff terminal is deleted via DELETE /terminals/{id} on success."""
+        mock_create.return_value = ("dev-t1", "kiro_cli")
+        mock_wait.side_effect = [True, True]
+        mock_send.return_value = None
+
+        with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+            mock_response = MagicMock()
+            mock_response.json.return_value = {"output": "done"}
+            mock_response.raise_for_status.return_value = None
+            mock_requests.get.return_value = mock_response
+            mock_requests.post.return_value = mock_response
+            mock_requests.delete.return_value = MagicMock()
+
+            import asyncio
+
+            asyncio.run(_handoff_impl("developer", "Do task"))
+
+            mock_requests.delete.assert_called_once()
+            call_url = mock_requests.delete.call_args[0][0]
+            assert "dev-t1" in call_url
+
+    @patch("cli_agent_orchestrator.mcp_server.server._send_direct_input")
+    @patch("cli_agent_orchestrator.mcp_server.server.wait_until_terminal_status")
+    @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
+    def test_auto_delete_failure_does_not_raise(self, mock_create, mock_wait, mock_send):
+        """Auto-delete failure is logged but does not fail the handoff result."""
+        mock_create.return_value = ("dev-t1", "kiro_cli")
+        mock_wait.side_effect = [True, True]
+        mock_send.return_value = None
+
+        with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+            mock_response = MagicMock()
+            mock_response.json.return_value = {"output": "done"}
+            mock_response.raise_for_status.return_value = None
+            mock_requests.get.return_value = mock_response
+            mock_requests.post.return_value = mock_response
+            mock_requests.delete.side_effect = Exception("network error")
+
+            import asyncio
+
+            result = asyncio.run(_handoff_impl("developer", "Do task"))
+
+        assert result.success is True

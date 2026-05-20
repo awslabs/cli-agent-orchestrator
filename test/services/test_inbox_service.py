@@ -1,7 +1,7 @@
 """Tests for the inbox service."""
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -12,6 +12,7 @@ from cli_agent_orchestrator.services.inbox_service import (
     _get_log_tail,
     _has_idle_pattern,
     check_and_send_pending_messages,
+    poll_opencode_pending_messages,
 )
 
 
@@ -172,6 +173,35 @@ class TestCheckAndSendPendingMessages:
             check_and_send_pending_messages("test-terminal")
 
         mock_update_status.assert_called_once_with(1, MessageStatus.FAILED)
+
+
+class TestPollOpenCodePendingMessages:
+    """Tests for the temporary OpenCode inbox poller."""
+
+    @patch("cli_agent_orchestrator.services.inbox_service.check_and_send_pending_messages")
+    @patch("cli_agent_orchestrator.services.inbox_service.list_pending_receiver_ids_by_provider")
+    def test_polls_pending_opencode_receivers(self, mock_list_receivers, mock_check_send):
+        """Test poller attempts delivery for each pending OpenCode receiver."""
+        mock_list_receivers.return_value = ["receiver-1", "receiver-2"]
+
+        poll_opencode_pending_messages()
+
+        mock_list_receivers.assert_called_once_with("opencode_cli")
+        assert mock_check_send.call_args_list == [
+            call("receiver-1", registry=None),
+            call("receiver-2", registry=None),
+        ]
+
+    @patch("cli_agent_orchestrator.services.inbox_service.check_and_send_pending_messages")
+    @patch("cli_agent_orchestrator.services.inbox_service.list_pending_receiver_ids_by_provider")
+    def test_survives_per_receiver_failure(self, mock_list_receivers, mock_check_send):
+        """Test one failed receiver does not stop the poll loop."""
+        mock_list_receivers.return_value = ["receiver-1", "receiver-2"]
+        mock_check_send.side_effect = [Exception("tmux busy"), False]
+
+        poll_opencode_pending_messages()
+
+        assert mock_check_send.call_count == 2
 
 
 class TestLogFileHandler:

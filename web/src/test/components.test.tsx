@@ -3,6 +3,7 @@ import { render, screen } from '@testing-library/react'
 import { StatusBadge } from '../components/StatusBadge'
 import { ErrorBoundary } from '../components/ErrorBoundary'
 import { ConfirmModal } from '../components/ConfirmModal'
+import { FALLBACK_PROVIDERS } from '../components/AgentPanel'
 
 describe('StatusBadge', () => {
   it('renders idle status', () => {
@@ -138,5 +139,44 @@ describe('ConfirmModal', () => {
     )
     const button = screen.getByText('Closing...').closest('button')
     expect(button).toBeDisabled()
+  })
+})
+
+describe('FALLBACK_PROVIDERS', () => {
+  it('includes opencode_cli', () => {
+    expect(FALLBACK_PROVIDERS).toContain('opencode_cli')
+  })
+
+  it('includes all known providers', () => {
+    const expected = ['kiro_cli', 'claude_code', 'q_cli', 'codex', 'gemini_cli', 'kimi_cli', 'copilot_cli', 'opencode_cli']
+    for (const p of expected) {
+      expect(FALLBACK_PROVIDERS).toContain(p)
+    }
+  })
+
+  it('maps to enabled select options with default underscore label', () => {
+    // Simulates the fallback option construction used in AgentPanel
+    const options = FALLBACK_PROVIDERS.map(n => ({
+      value: n,
+      label: n.replace(/_/g, ' '),
+      disabled: false,
+    }))
+    const opencodeOption = options.find(o => o.value === 'opencode_cli')
+    expect(opencodeOption).toBeDefined()
+    // opencode_cli uses the default underscore-to-space replacement
+    expect(opencodeOption!.label).toBe('opencode cli')
+    expect(opencodeOption!.disabled).toBe(false)
+
+    const kiroOption = options.find(o => o.value === 'kiro_cli')
+    expect(kiroOption).toBeDefined()
+    expect(kiroOption!.label).toBe('kiro cli')
+  })
+
+  it('provides an opencode_cli option on empty providers', () => {
+    // Simulates: when providers.length === 0, fallback is used
+    const noProviders: any[] = []
+    const effective = noProviders.length > 0 ? noProviders : FALLBACK_PROVIDERS.map(n => ({ name: n, binary: '', installed: true }))
+    const names = effective.map(p => p.name)
+    expect(names).toContain('opencode_cli')
   })
 })

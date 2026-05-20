@@ -37,10 +37,11 @@ def cleanup_old_data():
         # Clean up old terminal log files
         terminal_logs_deleted = 0
         if TERMINAL_LOG_DIR.exists():
-            for log_file in TERMINAL_LOG_DIR.glob("*.log"):
-                if log_file.stat().st_mtime < cutoff_date.timestamp():
-                    log_file.unlink()
-                    terminal_logs_deleted += 1
+            for pattern in ("*.log", "*.scrollback", "*.snapshot.json"):
+                for log_file in TERMINAL_LOG_DIR.glob(pattern):
+                    if log_file.stat().st_mtime < cutoff_date.timestamp():
+                        log_file.unlink()
+                        terminal_logs_deleted += 1
         logger.info(f"Deleted {terminal_logs_deleted} old terminal log files")
 
         # Clean up old server log files

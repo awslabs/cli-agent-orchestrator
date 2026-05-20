@@ -39,13 +39,21 @@ export interface TerminalMeta {
   tmux_window: string
   provider: string
   agent_profile: string | null
+  created_at: string | null
   last_active: string | null
 }
+
+/**
+ * Known profile source values the backend can emit.
+ * Using `string` (not a closed union) so new provider-discovered directories
+ * and custom agent directories are accepted without repeated type widening.
+ */
+export type AgentProfileSource = string
 
 export interface AgentProfileInfo {
   name: string
   description: string
-  source: 'built-in' | 'local' | 'kiro' | 'q_cli'
+  source: AgentProfileSource
 }
 
 export interface AgentDirsSettings {

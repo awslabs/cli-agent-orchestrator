@@ -55,6 +55,12 @@ Security scans run:
 - On every push to the `main` branch
 - On every pull request targeting `main`
 
+### CodeQL Static Analysis
+
+CodeQL runs via GitHub's default setup on every push to `main` and every pull request, covering both Python and JavaScript/TypeScript. Findings appear as PR review comments and in the repo's [Security tab](https://github.com/awslabs/cli-agent-orchestrator/security/code-scanning). Default setup catches `py/full-ssrf`, `py/path-injection`, `py/request-without-timeout`, and the rest of the `security-extended` query suite.
+
+Default setup is configured in repo settings, not in a workflow file — adding a workflow-based CodeQL job alongside it causes upload conflicts. If the team later needs the wider `security-and-quality` suite or custom queries, toggle default setup off first and then add an advanced workflow.
+
 ### Dependency Review
 
 Pull requests are automatically checked for:
@@ -77,6 +83,14 @@ trivy fs --severity HIGH,CRITICAL .
 
 # Scan Python dependencies
 trivy fs --scanners vuln --severity HIGH,CRITICAL .
+```
+
+Or use the bundled wrapper that mirrors CI (`trivy` + optional local CodeQL):
+
+```bash
+scripts/security-scan.sh           # run all available scanners
+scripts/security-scan.sh trivy     # just Trivy
+scripts/security-scan.sh codeql    # just CodeQL (requires the CodeQL CLI)
 ```
 
 ## Tool Restrictions (allowedTools)
@@ -174,7 +188,7 @@ When using CLI Agent Orchestrator:
 
 2. **Secure API Access**: The CAO server runs on localhost by default. If exposing externally, use proper authentication and TLS.
 
-3. **Agent Profiles**: Review agent profiles before installation, especially those from external sources.
+3. **Agent Profiles**: Review agent profiles before installation, especially those from external sources. Remote profile downloads (`cao install https://...`) are restricted by an allowlist — the default trusts `github.com` and `raw.githubusercontent.com` only. Extend via `CAO_PROFILE_ALLOWED_HOSTS=host1,host2` on the `cao-server` environment when using self-hosted profile mirrors. The HTTP install endpoint additionally refuses local `.md` file paths; only the CLI can install from disk.
 
 4. **Environment Variables**: Never commit sensitive environment variables. Use `.env` files (excluded from git) or secure secret management.
 
