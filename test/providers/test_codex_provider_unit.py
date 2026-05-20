@@ -315,6 +315,58 @@ class TestCodexProviderModelFlag:
         assert "--model" not in command
 
 
+class TestCodexBuildCommandExtra:
+    """Coverage for branches inside ``_build_codex_command`` that the
+    pre-existing fixtures didn't exercise."""
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_security_prompt_prepended_when_tools_restricted(self, mock_load):
+        # When ``allowed_tools`` is a restricted set (no "*"), the provider
+        # prepends SECURITY_PROMPT plus a "You only have access to these
+        # tools:" hint to the developer_instructions payload.
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = "Original system prompt."
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = None
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider(
+            "tid", "sess", "win", "agent", allowed_tools=["fs_read", "fs_list"]
+        )
+        command = provider._build_codex_command()
+
+        assert "You only have access to these tools: fs_read, fs_list" in command
+        assert "Original system prompt." in command
+        # SECURITY_PROMPT lives in constants; assert on a stable substring
+        # rather than importing the constant into the test fixture.
+        assert "NEVER" in command  # "NEVER read/output: ~/.aws/credentials..."
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_mcp_server_accepts_model_instance(self, mock_load):
+        # mcpServers values may arrive as McpServer model instances (not
+        # dicts) when loaded via Pydantic; the provider falls back to
+        # ``model_dump(exclude_none=True)`` for that path.
+        from cli_agent_orchestrator.models.agent_profile import McpServer
+
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = ""
+        mock_profile.mcpServers = {
+            "model-server": McpServer(command="node", args=["server.js"]),
+        }
+        mock_profile.codexProfile = None
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+
+        assert "mcp_servers.model-server.command=" in command
+        assert "node" in command
+        assert "mcp_servers.model-server.args=" in command
+        assert "server.js" in command
+
+
 class TestCodexProviderCodexProfile:
     """Tests that profile.codexProfile swaps --yolo for codex's --profile <name>."""
 
