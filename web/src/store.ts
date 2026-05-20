@@ -42,6 +42,12 @@ export const useStore = create<Store>((set, get) => ({
     try {
       const sessions = await api.listSessions()
       const prev = get()
+      // Only skip empty responses when reconnecting (connected was false),
+      // not after intentional deletions.
+      if (sessions.length === 0 && prev.sessions.length > 0 && !prev.connected) {
+        set({ connected: true })
+        return
+      }
       if (!prev.connected || !jsonEqual(prev.sessions, sessions)) {
         set({ sessions, connected: true })
       }
@@ -94,8 +100,9 @@ export const useStore = create<Store>((set, get) => ({
   setConnected: (connected) => set({ connected }),
   setTerminalStatus: (id, status) =>
     set(state => {
-      if (state.terminalStatuses[id] === status) return state
-      return { terminalStatuses: { ...state.terminalStatuses, [id]: status } }
+      const normalized = status ? status.toUpperCase() : status
+      if (state.terminalStatuses[id] === normalized) return state
+      return { terminalStatuses: { ...state.terminalStatuses, [id]: normalized } }
     }),
   clearTerminalStatuses: (ids) =>
     set(state => {

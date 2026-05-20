@@ -39,6 +39,7 @@ export interface TerminalMeta {
   tmux_window: string
   provider: string
   agent_profile: string | null
+  created_at: string | null
   last_active: string | null
 }
 

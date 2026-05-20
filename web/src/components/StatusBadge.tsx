@@ -8,7 +8,7 @@ interface StatusStyle {
   pulse?: boolean
 }
 
-const STATUS_CONFIG: Record<string, StatusStyle> = {
+export const STATUS_CONFIG: Record<string, StatusStyle> = {
   IDLE: {
     label: 'Idle',
     dotClass: 'bg-emerald-400',
