@@ -32,6 +32,7 @@ Define the agent's role, responsibilities, and behavior here.
 - `toolAliases` (object): Map tool names to aliases
 - `toolsSettings` (object): Tool-specific configuration
 - `model` (string): AI model to use
+- `permissionMode` (string, `claude_code` only): One of `"default"`, `"acceptEdits"`, `"plan"`, `"auto"`, `"bypassPermissions"`. When set, the `claude_code` provider passes `--permission-mode <value>` instead of `--dangerously-skip-permissions`. `cao launch --yolo` overrides this and forces bypass. See [Claude Code permission modes](https://code.claude.com/docs/en/permission-modes).
 - `prompt` (string): Additional prompt text
 
 ## Tool Restrictions

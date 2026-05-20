@@ -255,6 +255,8 @@ As described in [How Tool Restrictions Are Enforced](#how-tool-restrictions-are-
 claude --dangerously-skip-permissions --disallowedTools Bash --disallowedTools Edit --disallowedTools Write
 ```
 
+`permissionMode` is a separate axis from `--disallowedTools`: `permissionMode` controls which permission tier the session runs under (unconditional bypass vs. classifier-gated tiers like `auto`), while `--disallowedTools` enforces the per-tool denylist. The two stack — a profile can set `permissionMode: auto` *and* a tool denylist, and both apply on the launch command. See [Permission Mode Override](claude-code.md#permission-mode-override) for full details.
+
 **Kiro CLI / Q CLI** — Writes `allowedTools` into the agent JSON at install time:
 ```json
 { "allowedTools": ["@cao-mcp-server", "fs_read", "fs_list"] }

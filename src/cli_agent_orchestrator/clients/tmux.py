@@ -129,7 +129,9 @@ class TmuxClient:
             # errors when CAO itself runs inside a provider (e.g. Claude Code).
             # Preserve CLAUDE_CODE_USE_* and CLAUDE_CODE_SKIP_* vars needed
             # for provider authentication (Bedrock, Vertex AI, Foundry).
-            blocked_prefixes = ("CLAUDE", "CODEX_")
+            # Also filter vars with very long values and __MISE_ internal vars
+            # to avoid tmux "command too long" errors in large environments.
+            blocked_prefixes = ("CLAUDE", "CODEX_", "__MISE_")
             allowed_vars = {
                 "CLAUDE_CODE_USE_BEDROCK",
                 "CLAUDE_CODE_USE_VERTEX",
@@ -138,10 +140,33 @@ class TmuxClient:
                 "CLAUDE_CODE_SKIP_VERTEX_AUTH",
                 "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
             }
+            # Only pass essential env vars to avoid tmux "command too long"
+            essential_keys = {
+                "HOME",
+                "PATH",
+                "SHELL",
+                "USER",
+                "LANG",
+                "LC_ALL",
+                "LC_CTYPE",
+                "TERM",
+                "SSH_AUTH_SOCK",
+                "DISPLAY",
+                "XDG_RUNTIME_DIR",
+                "DO_NOT_TRACK",
+            }
             environment = {
                 k: v
                 for k, v in os.environ.items()
-                if k in allowed_vars or not any(k.startswith(p) for p in blocked_prefixes)
+                if (
+                    k in essential_keys
+                    or k in allowed_vars
+                    or (
+                        not any(k.startswith(p) for p in blocked_prefixes)
+                        and k.startswith(("CAO_", "KIRO_", "MISE_", "AWS_"))
+                        and len(v.encode("utf-8")) < 2048
+                    )
+                )
             }
             environment["CAO_TERMINAL_ID"] = terminal_id
 
