@@ -201,7 +201,17 @@ def clear(scope, yes):
     deleted_count = 0
     for mem in memories:
         try:
-            result = _run_async(svc.forget(key=mem.key, scope=scope, terminal_context=ctx))
+            # Pass scope_id from the recalled memory so session/agent
+            # deletes target the nested on-disk path (the CLI cwd
+            # context lacks session_name/agent_profile).
+            result = _run_async(
+                svc.forget(
+                    key=mem.key,
+                    scope=scope,
+                    terminal_context=ctx,
+                    scope_id=mem.scope_id,
+                )
+            )
             if result:
                 deleted_count += 1
         except Exception:

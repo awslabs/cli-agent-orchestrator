@@ -200,55 +200,70 @@ class MemoryService:
         wiki_path = self.get_wiki_path(scope, scope_id, key)
         wiki_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Check if topic file already exists (upsert)
-        is_update = wiki_path.exists()
-        memory_id = str(uuid.uuid4())
-        created_at = now
+        # Per-topic lock around the read-modify-write cycle. Without
+        # this, two concurrent store() calls for the same
+        # (scope, scope_id, key) can both read the old content and
+        # then overwrite each other, losing one update. Mirrors the
+        # .index.lock pattern in _update_index.
+        topic_lock_path = wiki_path.parent / f".{key}.lock"
+        topic_lock_fd = open(topic_lock_path, "w")
+        try:
+            fcntl.flock(topic_lock_fd, fcntl.LOCK_EX)
 
-        if is_update:
-            # Read existing file to get original created_at and id from comment
-            existing_content = wiki_path.read_text(encoding="utf-8")
-            # Try to extract original id
-            id_match = re.search(r"<!-- id: ([a-f0-9\-]+)", existing_content)
-            if id_match:
-                memory_id = id_match.group(1)
-            # Extract original created_at
-            ts_match = re.search(r"## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)", existing_content)
-            if ts_match:
-                created_at = datetime.strptime(ts_match.group(1), "%Y-%m-%dT%H:%M:%SZ").replace(
-                    tzinfo=timezone.utc
+            # Check if topic file already exists (upsert)
+            is_update = wiki_path.exists()
+            memory_id = str(uuid.uuid4())
+            created_at = now
+
+            if is_update:
+                # Read existing file to get original created_at and id from comment
+                existing_content = wiki_path.read_text(encoding="utf-8")
+                # Try to extract original id
+                id_match = re.search(r"<!-- id: ([a-f0-9\-]+)", existing_content)
+                if id_match:
+                    memory_id = id_match.group(1)
+                # Extract original created_at
+                ts_match = re.search(r"## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)", existing_content)
+                if ts_match:
+                    created_at = datetime.strptime(ts_match.group(1), "%Y-%m-%dT%H:%M:%SZ").replace(
+                        tzinfo=timezone.utc
+                    )
+                # Rewrite the header line so updated memory_type/tags stay
+                # in sync with index.md (recall() reads the file header).
+                new_header = (
+                    f"<!-- id: {memory_id} | scope: {scope} | "
+                    f"type: {memory_type} | tags: {tags} -->"
                 )
-            # Rewrite the header line so updated memory_type/tags stay
-            # in sync with index.md (recall() reads the file header).
-            new_header = (
-                f"<!-- id: {memory_id} | scope: {scope} | "
-                f"type: {memory_type} | tags: {tags} -->"
-            )
-            existing_content = re.sub(
-                r"<!-- id: [a-f0-9\-]+ \| scope: [^|]+ \| type: [^|]+ \| tags: [^>]*-->",
-                new_header,
-                existing_content,
-                count=1,
-            )
-            # Append new timestamped entry
-            new_content = existing_content.rstrip("\n") + f"\n\n## {timestamp}\n{content}\n"
-        else:
-            new_content = (
-                f"# {key}\n"
-                f"<!-- id: {memory_id} | scope: {scope} | type: {memory_type} | tags: {tags} -->\n"
-                f"\n## {timestamp}\n{content}\n"
-            )
+                existing_content = re.sub(
+                    r"<!-- id: [a-f0-9\-]+ \| scope: [^|]+ \| type: [^|]+ \| tags: [^>]*-->",
+                    new_header,
+                    existing_content,
+                    count=1,
+                )
+                # Append new timestamped entry
+                new_content = existing_content.rstrip("\n") + f"\n\n## {timestamp}\n{content}\n"
+            else:
+                new_content = (
+                    f"# {key}\n"
+                    f"<!-- id: {memory_id} | scope: {scope} | type: {memory_type} | tags: {tags} -->\n"
+                    f"\n## {timestamp}\n{content}\n"
+                )
 
-        # Atomic write: write to tmp then os.replace
-        tmp_path = wiki_path.parent / f".{key}.tmp"
-        tmp_path.write_text(new_content, encoding="utf-8")
-        os.replace(str(tmp_path), str(wiki_path))
+            # Atomic write: write to tmp then os.replace
+            tmp_path = wiki_path.parent / f".{key}.tmp"
+            tmp_path.write_text(new_content, encoding="utf-8")
+            os.replace(str(tmp_path), str(wiki_path))
 
-        # Update index.md
-        action = "updated" if is_update else "created"
-        self._update_index(scope, scope_id, key, memory_type, tags, content, timestamp, action)
+            # Update index.md
+            action = "updated" if is_update else "created"
+            self._update_index(scope, scope_id, key, memory_type, tags, content, timestamp, action)
 
-        logger.info(f"Memory {action}: key={key} scope={scope} scope_id={scope_id}")
+            logger.info(f"Memory {action}: key={key} scope={scope} scope_id={scope_id}")
+        finally:
+            try:
+                fcntl.flock(topic_lock_fd, fcntl.LOCK_UN)
+            finally:
+                topic_lock_fd.close()
 
         source_provider = None
         source_terminal_id = None
@@ -500,14 +515,29 @@ class MemoryService:
                 line,
             )
             if match and current_scope:
+                relative_path = match.group(2)
+                # Session/agent entries embed scope_id in the path
+                # (e.g. ``session/<scope_id>/<key>.md``). Extract it
+                # here so callers (CLI clear, recall→forget) can
+                # target the right file without reconstructing the
+                # original terminal_context.
+                entry_scope_id: Optional[str] = None
+                path_parts = relative_path.split("/")
+                if len(path_parts) >= 3 and path_parts[0] in (
+                    MemoryScope.SESSION.value,
+                    MemoryScope.AGENT.value,
+                ):
+                    entry_scope_id = path_parts[1]
+
                 entries.append(
                     {
                         "key": match.group(1),
-                        "relative_path": match.group(2),
+                        "relative_path": relative_path,
                         "memory_type": match.group(3),
                         "tags": match.group(4),
                         "updated_at": match.group(5),
                         "scope": current_scope,
+                        "scope_id": entry_scope_id,
                     }
                 )
 

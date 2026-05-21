@@ -1060,3 +1060,72 @@ class TestTerminalContextResolution:
         # cwd is None when the helper fails — but importantly the call
         # didn't raise.
         assert ctx["cwd"] is None
+
+
+class TestSessionScopeIdRoundTrip:
+    """Session/agent memories store scope_id in the path; recall must
+    return it so callers (CLI clear, cleanup) can target the right file
+    without reconstructing the original terminal_context.
+    """
+
+    @pytest.mark.asyncio
+    async def test_recall_returns_scope_id_for_session_memory(self, tmp_path):
+        svc = MemoryService(base_dir=tmp_path)
+        ctx = {"session_name": "demo-session", "terminal_id": "term-1"}
+
+        await svc.store(
+            content="session-only fact",
+            scope="session",
+            memory_type="reference",
+            key="fact-a",
+            terminal_context=ctx,
+        )
+
+        results = await svc.recall(scope="session", terminal_context=ctx)
+        assert len(results) == 1
+        assert results[0].scope_id == "demo-session"
+
+    @pytest.mark.asyncio
+    async def test_forget_via_recalled_scope_id_succeeds(self, tmp_path):
+        """Round-trip: store → recall → forget(scope_id=mem.scope_id).
+        This is the exact path the CLI ``clear`` command takes.
+        """
+        svc = MemoryService(base_dir=tmp_path)
+        ctx_a = {"session_name": "session-a", "terminal_id": "term-a"}
+        ctx_b = {"session_name": "session-b", "terminal_id": "term-b"}
+
+        # Same key under two different sessions — must NOT collide.
+        await svc.store(
+            content="from-a",
+            scope="session",
+            memory_type="reference",
+            key="shared-key",
+            terminal_context=ctx_a,
+        )
+        await svc.store(
+            content="from-b",
+            scope="session",
+            memory_type="reference",
+            key="shared-key",
+            terminal_context=ctx_b,
+        )
+
+        # Recall WITHOUT a session in context (CLI case) — should
+        # surface entries from both sessions, each with its own scope_id.
+        results = await svc.recall(scope="session", terminal_context=None)
+        scope_ids = {m.scope_id for m in results}
+        assert scope_ids == {"session-a", "session-b"}
+
+        # Forget using the recalled scope_id, not the original context.
+        for mem in results:
+            ok = await svc.forget(
+                key=mem.key,
+                scope="session",
+                terminal_context=None,
+                scope_id=mem.scope_id,
+            )
+            assert ok is True
+
+        # Both files gone.
+        remaining = await svc.recall(scope="session", terminal_context=None)
+        assert remaining == []

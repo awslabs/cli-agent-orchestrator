@@ -352,6 +352,10 @@ def send_input(
         # AgentSpawn hook will replace this path once the plugin
         # migration PR lands; until then, inline injection is the only
         # delivery path.
+        # Keep the original message for the PostSendMessageEvent so
+        # plugins/webhooks see what the caller sent — not the
+        # internal <cao-memory> block that we paste into the TUI.
+        original_message = message
         message = inject_memory_context(message, terminal_id)
 
         # Check how many Enter keys the provider needs after paste
@@ -383,7 +387,7 @@ def send_input(
                     session_id=metadata["tmux_session"],
                     sender=sender_id,
                     receiver=terminal_id,
-                    message=message,
+                    message=original_message,
                     orchestration_type=orchestration_type,
                 ),
             )
