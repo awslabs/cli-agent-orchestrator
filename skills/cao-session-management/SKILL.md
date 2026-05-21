@@ -31,20 +31,22 @@ Before launching a session, verify:
 
 ## Discovering Available Profiles
 
+Profiles are CAO-level entities, installed with `cao install` regardless of which CLI provider runs them. To find available profiles:
+
 | Source | Command |
 |--------|---------|
-| `kiro_cli` provider profiles | `kiro-cli agent list` |
-| Custom profiles installed locally | `ls ~/.aws/cli-agent-orchestrator/agent-store/` |
-| Built-in profiles available to install | see [README — Quick Start](../../README.md#quick-start) (`code_supervisor`, `developer`, `reviewer`, …) |
+| Profiles already installed locally (works for all providers) | `ls ~/.aws/cli-agent-orchestrator/agent-store/` |
+| Built-in profiles you can install | see [README — Quick Start](../../README.md#quick-start) (`code_supervisor`, `developer`, `reviewer`, …) |
+| Provider-native list (`kiro_cli` only) | `kiro-cli agent list` — useful because CAO mirrors profiles into `~/.kiro/agents/` |
 
-If unsure, ask the user which profile to use rather than guessing.
+If unsure which profile to use, ask the user rather than guessing.
 
 ## Quick Example
 
-A complete, copy-pasteable supervisor launch with default provider (`kiro_cli`):
+A complete, copy-pasteable supervisor launch. The default provider is `kiro_cli`; pass `--provider <name>` to use another (`claude_code`, `codex`, `gemini_cli`, `kimi_cli`, `copilot_cli`, `opencode_cli`, `q_cli`).
 
 ```bash
-# One-time setup
+# One-time setup (provider-agnostic — `cao install` works for any provider)
 cao install code_supervisor
 cao install developer
 cao install reviewer
@@ -53,6 +55,10 @@ cao install reviewer
 cao launch --agents code_supervisor --headless --yolo \
   --session-name my-task --working-directory '/path/to/project' \
   "Build a hello-world Python script. Delegate to developer, then reviewer."
+
+# Same launch on a different provider
+# cao launch --agents code_supervisor --provider claude_code --headless --yolo \
+#   --session-name my-task --working-directory '/path/to/project' "..."
 
 # Check progress / final output
 cao session status cao-my-task
@@ -66,8 +72,7 @@ cao shutdown --session cao-my-task
 
 Every `cao launch` MUST include:
 
-- `--agents PROFILE` — for `kiro_cli` provider, run `kiro-cli agent list` to discover
-  profiles; otherwise ask the user
+- `--agents PROFILE` — see [Discovering Available Profiles](#discovering-available-profiles) above; if unclear, ask the user
 - `--headless` — required from an LLM agent; without it cao tries to attach tmux
 - `--session-name NAME` — cao adds `cao-` prefix automatically
 - `--working-directory DIR` — a wrong path silently breaks the session with no
