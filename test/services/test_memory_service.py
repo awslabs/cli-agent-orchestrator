@@ -1129,3 +1129,40 @@ class TestSessionScopeIdRoundTrip:
         # Both files gone.
         remaining = await svc.recall(scope="session", terminal_context=None)
         assert remaining == []
+
+    @pytest.mark.asyncio
+    async def test_recall_isolates_by_session_scope_id(self, tmp_path):
+        """A scoped recall with a session context must not return
+        memories that belong to OTHER sessions, even though all
+        session memories share the global index.
+        """
+        svc = MemoryService(base_dir=tmp_path)
+        ctx_a = {"session_name": "session-a", "terminal_id": "term-a"}
+        ctx_b = {"session_name": "session-b", "terminal_id": "term-b"}
+
+        await svc.store(
+            content="visible-from-a",
+            scope="session",
+            memory_type="reference",
+            key="a-key",
+            terminal_context=ctx_a,
+        )
+        await svc.store(
+            content="visible-from-b",
+            scope="session",
+            memory_type="reference",
+            key="b-key",
+            terminal_context=ctx_b,
+        )
+
+        # Recall as session-a → only a-key.
+        results_a = await svc.recall(scope="session", terminal_context=ctx_a)
+        assert {m.key for m in results_a} == {"a-key"}
+
+        # Recall as session-b → only b-key.
+        results_b = await svc.recall(scope="session", terminal_context=ctx_b)
+        assert {m.key for m in results_b} == {"b-key"}
+
+        # CLI scan_all path still sees both.
+        results_all = await svc.recall(scope="session", terminal_context=None, scan_all=True)
+        assert {m.key for m in results_all} == {"a-key", "b-key"}

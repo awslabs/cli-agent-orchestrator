@@ -423,6 +423,21 @@ class MemoryService:
         # Determine which project dirs to search
         search_dirs = self._get_search_dirs(scope, terminal_context, scan_all=scan_all)
 
+        # For session/agent scopes, all entries share the global
+        # index. If the caller passes a terminal_context that resolves
+        # to a scope_id, narrow the result set to memories for THAT
+        # session/agent — otherwise a recall would leak memories
+        # across sessions or agents that happen to share keys.
+        # ``scan_all`` (CLI inspection) and missing context still see
+        # every entry.
+        scope_id_filter: Optional[str] = None
+        if (
+            scope in (MemoryScope.SESSION.value, MemoryScope.AGENT.value)
+            and not scan_all
+            and terminal_context
+        ):
+            scope_id_filter = self.resolve_scope_id(scope, terminal_context)
+
         for project_dir in search_dirs:
             index_path = project_dir / "wiki" / "index.md"
             if not index_path.exists():
@@ -436,6 +451,10 @@ class MemoryService:
                     continue
                 # Filter by memory_type
                 if memory_type and entry["memory_type"] != memory_type:
+                    continue
+                # Filter session/agent entries by scope_id when caller
+                # has a relevant context (see scope_id_filter above).
+                if scope_id_filter and entry.get("scope_id") != scope_id_filter:
                     continue
 
                 # Read the wiki file
@@ -683,10 +702,7 @@ class MemoryService:
             for entry in entries:
                 if entry["scope"] != scope_val:
                     continue
-                if (
-                    scope_val != MemoryScope.GLOBAL.value
-                    and entry.get("scope_id") != scope_id
-                ):
+                if scope_val != MemoryScope.GLOBAL.value and entry.get("scope_id") != scope_id:
                     continue
                 wiki_file = project_dir / "wiki" / entry["relative_path"]
                 if not wiki_file.exists():
