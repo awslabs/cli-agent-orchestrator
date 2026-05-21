@@ -18,6 +18,50 @@ session orchestrates the work.
 - **Conductor**: The supervisor terminal — receives instructions, delegates to workers
 - **Provider**: LLM backend. Default `kiro_cli`, override with `--provider`
 
+## Prerequisites
+
+Before launching a session, verify:
+
+- **`cao-server` is running** at `localhost:9889`. Quick check:
+  ```bash
+  curl -sf http://localhost:9889/sessions >/dev/null && echo OK || echo "start cao-server"
+  ```
+  If not running, start it in a separate terminal: `cao-server`.
+- **The agent profile is installed.** `cao launch --agents <profile>` fails if the profile is unknown. Install built-ins or custom files with `cao install <profile|path|url>`.
+
+## Discovering Available Profiles
+
+| Source | Command |
+|--------|---------|
+| `kiro_cli` provider profiles | `kiro-cli agent list` |
+| Custom profiles installed locally | `ls ~/.aws/cli-agent-orchestrator/agent-store/` |
+| Built-in profiles available to install | see [README — Quick Start](../../README.md#quick-start) (`code_supervisor`, `developer`, `reviewer`, …) |
+
+If unsure, ask the user which profile to use rather than guessing.
+
+## Quick Example
+
+A complete, copy-pasteable supervisor launch with default provider (`kiro_cli`):
+
+```bash
+# One-time setup
+cao install code_supervisor
+cao install developer
+cao install reviewer
+
+# Launch headlessly (assumes cao-server is already running)
+cao launch --agents code_supervisor --headless --yolo \
+  --session-name my-task --working-directory '/path/to/project' \
+  "Build a hello-world Python script. Delegate to developer, then reviewer."
+
+# Check progress / final output
+cao session status cao-my-task
+cao session status cao-my-task --workers
+
+# Clean up
+cao shutdown --session cao-my-task
+```
+
 ## Launching a Session
 
 Every `cao launch` MUST include:
