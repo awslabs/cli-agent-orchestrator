@@ -556,7 +556,7 @@ class MemoryService:
             key=entry["key"],
             memory_type=memory_type,
             scope=scope,
-            scope_id=None,  # Not stored in file; resolved at query time
+            scope_id=entry.get("scope_id"),
             file_path=str(wiki_file),
             tags=tags,
             source_provider=None,
