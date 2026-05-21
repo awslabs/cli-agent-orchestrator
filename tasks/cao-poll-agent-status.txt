@@ -1,0 +1,14 @@
+CAO session status polling task.
+
+Objective:
+- Determine the current CAO status of worker terminals `3c6b5b14` and `4d9e1124`.
+
+Instructions:
+- Use CAO session-management commands to identify the active session that contains these terminals.
+- Poll the current live status for each terminal.
+- Report:
+  - session name
+  - whether each terminal is still present
+  - each terminal's current status
+  - any last response or exit/completion signal visible from CAO
+- Do not modify repository files.

@@ -1,0 +1,9 @@
+Dummy CAO verification task.
+
+Objective:
+- Confirm a worker agent can launch, read this task file, and exit normally.
+
+Instructions for the worker:
+- Read this file at the absolute path provided by the supervisor.
+- Reply with a short confirmation that you started successfully, read the file, and are now exiting.
+- Do not modify repository files.
