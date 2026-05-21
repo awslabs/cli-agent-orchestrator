@@ -175,13 +175,25 @@ class MemoryService:
         MemoryType(memory_type)
 
         scope_id = self.resolve_scope_id(scope, terminal_context)
-        # ``project`` requires a resolvable cwd. Without it we'd silently
-        # fall back to the global container and mix project memories
-        # across projects.
+        # Non-global scoped memories require a resolvable scope_id for
+        # on-disk isolation. Without it, writes could collapse into a
+        # shared scope directory and leak memories across projects,
+        # sessions, or agents.
         if scope == MemoryScope.PROJECT.value and scope_id is None:
             raise ValueError(
                 "Cannot store project-scoped memory without a working "
                 "directory. Pass terminal_context with 'cwd' set."
+            )
+        if scope == MemoryScope.SESSION.value and scope_id is None:
+            raise ValueError(
+                "Cannot store session-scoped memory without a session "
+                "identifier. Pass terminal_context with 'session_name' "
+                "or 'session' set."
+            )
+        if scope == MemoryScope.AGENT.value and scope_id is None:
+            raise ValueError(
+                "Cannot store agent-scoped memory without an agent "
+                "profile. Pass terminal_context with 'agent_profile' set."
             )
         if key is None:
             key = self.auto_generate_key(content)
