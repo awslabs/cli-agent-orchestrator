@@ -35,13 +35,13 @@ Profiles are CAO-level entities, installed with `cao install` regardless of whic
 
 | Source | Command |
 |--------|---------|
-| All installed profiles (built-in + local), with source labels | `curl -sf http://localhost:9889/agents/profiles` — canonical, provider-agnostic |
+| All available profiles across built-in store + local store + provider directories | `curl -sf http://localhost:9889/agents/profiles` — canonical, provider-agnostic |
 | Custom/local profile files only | `ls ~/.aws/cli-agent-orchestrator/agent-store/` |
 | Built-in profiles installed via `cao install <name>` | `ls ~/.aws/cli-agent-orchestrator/agent-context/` |
 | Built-in profiles you can install | see [README — Quick Start](../../README.md#quick-start) (`code_supervisor`, `developer`, `reviewer`, …) |
 | Provider-native list (`kiro_cli` only) | `kiro-cli agent list` — useful because CAO mirrors profiles into `~/.kiro/agents/` |
 
-The HTTP endpoint is the recommended check: it merges built-ins (installed via `cao install`, which writes to `agent-context/`) with custom profile files (in `agent-store/`) and returns both with a `source` field.
+The HTTP endpoint is the recommended check: it scans the built-in packaged store, the local store (`agent-store/`), and provider-specific directories (including `agent-context/`), then returns a deduplicated list (by profile name, built-in wins) with a `source` label on each entry.
 
 If unsure which profile to use, ask the user rather than guessing.
 
