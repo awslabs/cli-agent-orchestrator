@@ -66,7 +66,7 @@ If the external tool's agent has filesystem access, tell it to install the skill
 
 The agent will read the SKILL.md, copy the folder into its own workspace, and make it available for future sessions.
 
-For Hermes Agent specifically, the agent can run `skill_manage(action='create', name='cao-session-management', category='cli-agent-orchestrator', content=<SKILL.md contents>)` to register the skill into `~/.hermes/skills/cli-agent-orchestrator/cao-session-management/`. Note that Option C creates a copy that will go stale on CAO upgrades — prefer Option A (symlink) when a shared filesystem is available.
+For Hermes Agent specifically, the agent can run `from pathlib import Path; skill_manage(action='create', name='cao-session-management', category='cli-agent-orchestrator', content=Path('~/.aws/cli-agent-orchestrator/skills/cao-session-management/SKILL.md').expanduser().read_text())` to register the skill into `~/.hermes/skills/cli-agent-orchestrator/cao-session-management/`. Note that Option C creates a copy that will go stale on CAO upgrades — prefer Option A (symlink) when a shared filesystem is available.
 
 ## Scope
 
