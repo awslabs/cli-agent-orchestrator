@@ -683,6 +683,11 @@ class MemoryService:
             for entry in entries:
                 if entry["scope"] != scope_val:
                     continue
+                if (
+                    scope_val != MemoryScope.GLOBAL.value
+                    and entry.get("scope_id") != scope_id
+                ):
+                    continue
                 wiki_file = project_dir / "wiki" / entry["relative_path"]
                 if not wiki_file.exists():
                     continue
