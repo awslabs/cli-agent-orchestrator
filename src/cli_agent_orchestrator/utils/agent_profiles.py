@@ -1,9 +1,12 @@
 """Agent profile utilities."""
 
+import json
 import logging
+import os
+import re
 from importlib import resources
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 import frontmatter
 
@@ -81,6 +84,172 @@ def _scan_directory(directory: Path, source_label: str, profiles: Dict[str, Dict
                 }
 
 
+def _is_path_contained(path: Path, root: Path) -> bool:
+    """Return True if *path* resolves to a location inside *root*."""
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _scan_plugin_directory(
+    directory: Path, source_label: str, profiles: Dict[str, Dict], plugin_root: Path
+) -> None:
+    """Scan a plugin directory with per-file path containment validation.
+
+    Like ``_scan_directory`` but skips any entry whose resolved path escapes
+    *plugin_root*. This prevents symlinks inside a plugin's agents/ directory
+    from exposing files outside the plugin tree.
+    """
+    if not directory.exists():
+        return
+    resolved_root = plugin_root.resolve()
+    for item in directory.iterdir():
+        if not _is_path_contained(item, resolved_root):
+            logger.warning(
+                "Plugin agent file %s resolves outside plugin root %s — skipping",
+                item,
+                resolved_root,
+            )
+            continue
+        if item.is_dir():
+            profile_name = item.name
+            desc = ""
+            agent_md = item / "agent.md"
+            if agent_md.exists() and _is_path_contained(agent_md, resolved_root):
+                try:
+                    data = frontmatter.loads(agent_md.read_text())
+                    desc = data.metadata.get("description", "")
+                except Exception:
+                    pass
+            if profile_name not in profiles:
+                profiles[profile_name] = {
+                    "name": profile_name,
+                    "description": desc,
+                    "source": source_label,
+                }
+        elif item.suffix == ".md" and item.is_file():
+            profile_name = item.stem
+            desc = ""
+            try:
+                data = frontmatter.loads(item.read_text())
+                desc = data.metadata.get("description", "")
+            except Exception:
+                pass
+            if profile_name not in profiles:
+                profiles[profile_name] = {
+                    "name": profile_name,
+                    "description": desc,
+                    "source": source_label,
+                }
+
+
+_PLUGIN_DIR_CACHE: Optional[Dict] = None
+
+
+def _reset_plugin_discovery_cache() -> None:
+    """Clear the plugin discovery cache. Intended for test use only."""
+    global _PLUGIN_DIR_CACHE
+    _PLUGIN_DIR_CACHE = None
+
+
+def _get_mtime(path: Path) -> Optional[float]:
+    """Return mtime of *path*, or None if it cannot be stat'd."""
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return None
+
+
+def _discover_claude_plugin_agent_dirs() -> List[Tuple[Path, Path]]:
+    """Walk Claude Code marketplaces and return agent dirs from enabled plugins.
+
+    Returns a list of ``(agents_dir, marketplace_root)`` tuples so callers can
+    perform per-file path containment against the marketplace root.
+
+    Results are cached at module level and invalidated when the mtime of
+    settings.json or any marketplace.json changes.
+    """
+    global _PLUGIN_DIR_CACHE
+
+    settings_path = Path.home() / ".claude" / "settings.json"
+    settings_mtime = _get_mtime(settings_path)
+
+    # Fast path: if settings.json mtime hasn't changed, check full cache key
+    if _PLUGIN_DIR_CACHE is not None and _PLUGIN_DIR_CACHE["settings_mtime"] == settings_mtime:
+        # Verify marketplace.json mtimes haven't changed either
+        if all(_get_mtime(p) == m for p, m in _PLUGIN_DIR_CACHE["marketplace_mtimes"]):
+            return _PLUGIN_DIR_CACHE["value"]
+
+    # Cache miss — perform full discovery
+    result, marketplace_mtimes = _compute_plugin_discovery(settings_path)
+    _PLUGIN_DIR_CACHE = {
+        "settings_mtime": settings_mtime,
+        "marketplace_mtimes": marketplace_mtimes,
+        "value": result,
+    }
+    return result
+
+
+def _compute_plugin_discovery(
+    settings_path: Path,
+) -> Tuple[List[Tuple[Path, Path]], List[Tuple[Path, Optional[float]]]]:
+    """Perform the actual plugin discovery and return (result, marketplace_mtimes)."""
+    try:
+        data = json.loads(settings_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        if settings_path.exists():
+            logger.warning("Failed to read %s", settings_path)
+        return [], []
+
+    marketplaces = data.get("extraKnownMarketplaces", {})
+    enabled_plugins = data.get("enabledPlugins", {})
+    if not marketplaces:
+        return [], []
+
+    agent_dirs: List[Tuple[Path, Path]] = []
+    marketplace_mtimes: List[Tuple[Path, Optional[float]]] = []
+    for mkt_name, mkt_config in marketplaces.items():
+        source = mkt_config.get("source", {})
+        if source.get("source") != "directory":
+            continue
+        mkt_path = Path(source.get("path", ""))
+        if not mkt_path.is_dir():
+            continue
+
+        marketplace_json = mkt_path / ".claude-plugin" / "marketplace.json"
+        marketplace_mtimes.append((marketplace_json, _get_mtime(marketplace_json)))
+        try:
+            mkt_data = json.loads(marketplace_json.read_text())
+        except (json.JSONDecodeError, OSError):
+            logger.warning("Failed to read %s", marketplace_json)
+            continue
+
+        resolved_mkt = mkt_path.resolve()
+        for plugin in mkt_data.get("plugins", []):
+            plugin_name = plugin.get("name", "")
+            if not enabled_plugins.get(f"{plugin_name}@{mkt_name}", False):
+                continue
+            plugin_source = plugin.get("source", "")
+            plugin_dir = (mkt_path / plugin_source).resolve()
+            # Path containment check
+            try:
+                plugin_dir.relative_to(resolved_mkt)
+            except ValueError:
+                logger.warning(
+                    "Plugin path %s escapes marketplace root %s — skipping",
+                    plugin_dir,
+                    resolved_mkt,
+                )
+                continue
+            agents_dir = plugin_dir / "agents"
+            if agents_dir.is_dir():
+                agent_dirs.append((agents_dir, resolved_mkt))
+
+    return agent_dirs, marketplace_mtimes
+
+
 def list_agent_profiles() -> List[Dict]:
     """Discover all available agent profiles from all configured directories.
 
@@ -137,7 +306,11 @@ def list_agent_profiles() -> List[Dict]:
             continue
         _scan_directory(path, label, profiles)
 
-    # 4. Extra user-added directories
+    # 4. Claude Code plugin marketplace directories
+    for plugin_agents_dir, plugin_root in _discover_claude_plugin_agent_dirs():
+        _scan_plugin_directory(plugin_agents_dir, "claude_plugin", profiles, plugin_root)
+
+    # 5. Extra user-added directories
     for extra_dir in get_extra_agent_dirs():
         _scan_directory(Path(extra_dir), "custom", profiles)
 
@@ -146,6 +319,10 @@ def list_agent_profiles() -> List[Dict]:
 
 def parse_agent_profile_text(resolved_text: str, profile_name: str) -> AgentProfile:
     """Parse an AgentProfile from already-resolved markdown text."""
+    # Strip leading HTML comments before the YAML frontmatter fence.
+    # Some profile generators (e.g. AIM) prepend <!-- ... --> blocks that
+    # prevent python-frontmatter from detecting the opening '---' delimiter.
+    resolved_text = re.sub(r"^(?:<!--.*?-->\s*)+", "", resolved_text, flags=re.DOTALL)
     profile_data = frontmatter.loads(resolved_text)
     meta = profile_data.metadata
     meta["system_prompt"] = profile_data.content.strip()
@@ -201,6 +378,22 @@ def _read_agent_profile_source(agent_name: str) -> str:
         found = _lookup_in_directory(Path(dir_path))
         if found is not None:
             return found
+
+    for plugin_agents_dir, plugin_root in _discover_claude_plugin_agent_dirs():
+        found = _lookup_in_directory(plugin_agents_dir)
+        if found is not None:
+            # Verify the resolved file stays inside the plugin root
+            flat = _safe_join(plugin_agents_dir, f"{agent_name}.md")
+            nested = _safe_join(plugin_agents_dir, agent_name, "agent.md")
+            candidate = flat if (flat is not None and flat.exists()) else nested
+            if candidate is not None and _is_path_contained(candidate, plugin_root):
+                return found
+            logger.warning(
+                "Plugin agent file for '%s' resolves outside plugin root %s — skipping",
+                agent_name,
+                plugin_root,
+            )
+            continue
 
     for extra_dir in get_extra_agent_dirs():
         found = _lookup_in_directory(Path(extra_dir))

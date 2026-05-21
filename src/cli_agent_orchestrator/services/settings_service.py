@@ -15,7 +15,7 @@ SETTINGS_FILE = CAO_HOME_DIR / "settings.json"
 _DEFAULTS = {
     "kiro_cli": str(Path.home() / ".kiro" / "agents"),
     "q_cli": str(Path.home() / ".aws" / "amazonq" / "cli-agents"),
-    "claude_code": str(Path.home() / ".aws" / "cli-agent-orchestrator" / "agent-store"),
+    "claude_code": str(Path.home() / ".claude" / "agents"),
     "codex": str(Path.home() / ".aws" / "cli-agent-orchestrator" / "agent-store"),
     "cao_installed": str(Path.home() / ".aws" / "cli-agent-orchestrator" / "agent-context"),
 }

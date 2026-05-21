@@ -74,6 +74,43 @@ Add additional directories that are scanned for agent profiles across all provid
 }
 ```
 
+## Claude Code Plugin Marketplace Auto-Discovery
+
+CAO automatically discovers agent profiles from Claude Code plugin marketplaces. When plugins are installed via AIM (or any tool that registers marketplaces in Claude Code's settings), their agents appear in CAO without manual configuration.
+
+### How It Works
+
+On each profile scan, CAO reads `~/.claude/settings.json` and:
+
+1. Iterates `extraKnownMarketplaces` entries with `source.source == "directory"`.
+2. Reads each marketplace's `.claude-plugin/marketplace.json` for the plugin list.
+3. For each plugin, checks `enabledPlugins["<plugin>@<marketplace>"]` — only enabled plugins are scanned.
+4. If the plugin has an `agents/` subdirectory, its `.md` profiles are included.
+
+Discovered profiles appear with `source: "claude_plugin"` in `GET /agents/profiles`.
+
+### Precedence
+
+Plugin agents are scanned **after** the local store and provider directories but **before** extra custom directories. If a local agent has the same name as a plugin agent, the local one wins (first-match dedup).
+
+### Disabling a Plugin's CAO Visibility
+
+Toggle the plugin off in `~/.claude/settings.json`:
+
+```json
+{
+  "enabledPlugins": {
+    "MyPlugin@aim": false
+  }
+}
+```
+
+CAO will stop listing that plugin's agents on the next request.
+
+### Security
+
+Plugin paths are validated to stay within their marketplace root directory. Any plugin whose resolved path escapes the marketplace root is skipped with a warning.
+
 ## API Endpoints
 
 | Method | Endpoint | Description |
