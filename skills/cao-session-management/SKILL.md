@@ -49,8 +49,11 @@ If unsure which profile to use, ask the user rather than guessing.
 
 A complete, copy-pasteable supervisor launch. The default provider is `kiro_cli`; pass `--provider <name>` to use another (`claude_code`, `codex`, `gemini_cli`, `kimi_cli`, `copilot_cli`, `opencode_cli`, `q_cli`).
 
+This example assumes a configured CAO setup (server running, profiles installed). On an already-configured host you can skip straight to `cao launch`. The `cao install` lines below are only for first-time setup; remove them if your CAO is already configured.
+
 ```bash
-# One-time setup (provider-agnostic — `cao install` works for any provider)
+# Optional — skip if your CAO is already configured with these profiles.
+# Provider-agnostic: `cao install` works for any provider.
 cao install code_supervisor
 cao install developer
 cao install reviewer
