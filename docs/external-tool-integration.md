@@ -2,7 +2,7 @@
 
 CAO skills follow the universal [SKILL.md](https://github.com/anthropics/skills) format. Any LLM harness that reads this format can consume CAO skills directly — no conversion needed.
 
-Any tool that loads SKILL.md files can consume these skills — [OpenClaw](https://github.com/openclaw/openclaw) is used as the example below, but the same approach works for any compatible harness.
+Any tool that loads SKILL.md files can consume these skills. [OpenClaw](https://github.com/openclaw/openclaw) and [Hermes Agent](https://github.com/NousResearch/hermes-agent) are both used as worked examples below; the same approach works for any compatible harness.
 
 ## What This Enables
 
@@ -31,7 +31,8 @@ This turns any SKILL.md-compatible tool into an orchestration client for CAO's m
 
 ```bash
 # Replace TARGET_SKILLS with your tool's skill directory
-TARGET_SKILLS=~/.openclaw/workspace/skills   # OpenClaw example
+TARGET_SKILLS=~/.openclaw/workspace/skills          # OpenClaw example
+# TARGET_SKILLS=~/.hermes/skills/cli-agent-orchestrator   # Hermes Agent example
 mkdir -p "$TARGET_SKILLS"
 
 # Symlink the session management skill
@@ -64,6 +65,8 @@ If the external tool's agent has filesystem access, tell it to install the skill
 > Install the skill from ~/.aws/cli-agent-orchestrator/skills/cao-session-management into your skills directory
 
 The agent will read the SKILL.md, copy the folder into its own workspace, and make it available for future sessions.
+
+For Hermes Agent specifically, the agent can run `from pathlib import Path; skill_manage(action='create', name='cao-session-management', category='cli-agent-orchestrator', content=Path('~/.aws/cli-agent-orchestrator/skills/cao-session-management/SKILL.md').expanduser().read_text())` to register the skill into `~/.hermes/skills/cli-agent-orchestrator/cao-session-management/`. Note that Option C creates a copy that will go stale on CAO upgrades — prefer Option A (symlink) when a shared filesystem is available.
 
 ## Scope
 

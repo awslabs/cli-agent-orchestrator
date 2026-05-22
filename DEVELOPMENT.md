@@ -53,9 +53,18 @@ npm install
 # Start dev server (hot-reloads on file changes)
 npm run dev        # http://localhost:5173
 
-# Build for production
-npm run build      # Outputs to web/dist/
+# Build for production (outputs to src/cli_agent_orchestrator/web_ui/)
+npm run build
 ```
+
+> **Important:** The build step is required before installing the package with
+> `uv tool install .`. Skipping it leaves `web_ui/` empty and causes `cao-server`
+> to return `404 Not Found` on every request to the web UI.
+> Run `npm run build` from `web/` first, then reinstall:
+> ```bash
+> cd web && npm run build
+> uv tool install --reinstall .
+> ```
 
 The Vite dev server proxies API calls to the backend at `localhost:9889`. Make sure `cao-server` is running before starting the frontend.
 
@@ -275,6 +284,21 @@ The same pattern applies to every provider that ships an `<provider>_integration
 > **Note:** Q CLI is slated for deprecation. Do not build new development workflows around Q CLI; prefer Kiro CLI, Claude Code, or Codex CLI as your default provider while contributing.
 
 ## Troubleshooting
+
+### Web UI Shows "404 Not Found"
+
+The web UI assets are not committed to the repository — they are a build artifact.
+If `cao-server` starts successfully but the browser shows `{"detail":"Not Found"}`,
+the `web_ui/` bundle is missing from the installed package.
+
+```bash
+# 1. Build the frontend
+cd web && npm install && npm run build
+
+# 2. Reinstall the package so the built assets are picked up
+cd ..
+uv tool install --reinstall .
+```
 
 ### Import Errors
 
