@@ -137,7 +137,9 @@ class CodexProvider(BaseProvider):
         # is the default because CAO runs codex non-interactively in tmux
         # where approval prompts would block handoff/assign. Profiles can
         # opt out via `codexProfile` (names a [profiles.<name>] block in
-        # ~/.codex/config.toml); `cao launch --yolo` always wins.
+        # ~/.codex/config.toml), unless unrestricted allowed tools are enabled.
+        # In practice, allowed_tools containing "*" is treated as yolo mode
+        # and overrides codexProfile in the same way as an explicit yolo launch.
         yolo = bool(self._allowed_tools and "*" in self._allowed_tools)
 
         profile = None
