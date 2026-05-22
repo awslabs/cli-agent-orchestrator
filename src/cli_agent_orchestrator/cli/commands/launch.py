@@ -10,6 +10,7 @@ import requests
 from cli_agent_orchestrator.constants import (
     API_BASE_URL,
     DEFAULT_PROVIDER,
+    MCP_REQUEST_TIMEOUT,
     PROVIDERS,
     SERVER_HOST,
     SERVER_PORT,
@@ -66,6 +67,12 @@ PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
     default=None,
     help="Working directory for the session (default: current directory)",
 )
+@click.option(
+    "--memory",
+    "memory",
+    is_flag=True,
+    help="Also launch a context-manager (memory_manager) terminal for curated memory injection.",
+)
 def launch(
     message,
     agents,
@@ -77,6 +84,7 @@ def launch(
     auto_approve,
     yolo,
     working_directory,
+    memory,
 ):
     """Launch cao session with specified agent profile."""
     try:
@@ -201,8 +209,10 @@ def launch(
         if resolved_allowed_tools:
             # Pass as comma-separated string for query param
             params["allowed_tools"] = ",".join(resolved_allowed_tools)
+        if memory:
+            params["memory_manager"] = "true"
 
-        response = requests.post(url, params=params)
+        response = requests.post(url, params=params, timeout=MCP_REQUEST_TIMEOUT)
         response.raise_for_status()
 
         terminal = response.json()
@@ -244,6 +254,7 @@ def launch(
             response = requests.post(
                 f"{API_BASE_URL}/terminals/{terminal['id']}/input",
                 params={"message": message},
+                timeout=MCP_REQUEST_TIMEOUT,
             )
             response.raise_for_status()
             time.sleep(3)
@@ -254,6 +265,7 @@ def launch(
             output_resp = requests.get(
                 f"{API_BASE_URL}/terminals/{terminal['id']}/output",
                 params={"mode": "last"},
+                timeout=MCP_REQUEST_TIMEOUT,
             )
             output_resp.raise_for_status()
             output = output_resp.json().get("output", "")

@@ -110,6 +110,9 @@ SERVER_VERSION = "0.1.0"
 
 API_BASE_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
 
+# Default timeout (seconds) for HTTP calls to the CAO API server.
+MCP_REQUEST_TIMEOUT = 30
+
 
 # Operators can extend network allowlists via the env vars handled below.
 # Same comma-separated pattern as ``CAO_PROFILE_ALLOWED_HOSTS`` in install_service.

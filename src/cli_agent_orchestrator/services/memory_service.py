@@ -1,26 +1,136 @@
-"""Memory service for CAO memory system (Phase 1 — file-based, no SQLite)."""
+"""Memory service for CAO memory system (Phase 2 — wiki + SQLite metadata)."""
 
 import fcntl
 import hashlib
 import logging
 import os
 import re
+import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from cli_agent_orchestrator.constants import MEMORY_BASE_DIR
 from cli_agent_orchestrator.models.memory import Memory, MemoryScope, MemoryType
 
 logger = logging.getLogger(__name__)
 
+VALID_SEARCH_MODES = ("metadata", "bm25", "hybrid")
+
+# Per-curator dispatch locks. A worker that fails to acquire its session's
+# curator lock falls back to Phase 1 rather than queueing — context injection
+# is best-effort and must never block the worker.
+_curator_locks: dict[str, threading.Lock] = {}
+
 
 class MemoryService:
-    """File-based memory service. All storage uses wiki markdown files and index.md."""
+    """Memory service backed by wiki markdown files and SQLite metadata.
 
-    def __init__(self, base_dir: Optional[Path] = None):
+    Wiki files remain the content store. SQLite mirrors metadata
+    (key, scope, type, tags, file_path, timestamps) for fast filtered
+    lookup. ``index.md`` is regenerated as a human-readable view.
+    """
+
+    def __init__(self, base_dir: Optional[Path] = None, db_engine: Any = None):
         self.base_dir = base_dir or MEMORY_BASE_DIR
+        self._db_engine = db_engine
+        self._db_session_factory: Any = None
+        if db_engine is not None:
+            from sqlalchemy.orm import sessionmaker
+
+            self._db_session_factory = sessionmaker(
+                autocommit=False, autoflush=False, bind=db_engine
+            )
+
+    # -------------------------------------------------------------------------
+    # SQLite metadata operations
+    # -------------------------------------------------------------------------
+
+    def _get_db_session(self) -> Any:
+        """Get a SQLAlchemy session — uses test engine if provided, else global."""
+        if self._db_session_factory:
+            return self._db_session_factory()
+        from cli_agent_orchestrator.clients.database import SessionLocal
+
+        return SessionLocal()
+
+    def _upsert_metadata(
+        self,
+        key: str,
+        memory_type: str,
+        scope: str,
+        scope_id: Optional[str],
+        file_path: str,
+        tags: str,
+        source_provider: Optional[str],
+        source_terminal_id: Optional[str],
+        token_estimate: Optional[int],
+    ) -> None:
+        """Insert or update the metadata row for (key, scope, scope_id).
+
+        Symmetric upsert: every field set on insert is also set on update —
+        ``memory_type``, ``tags``, ``file_path``, ``source_provider``,
+        ``source_terminal_id``, ``token_estimate``, ``updated_at``.
+        """
+        from cli_agent_orchestrator.clients.database import MemoryMetadataModel
+
+        with self._get_db_session() as db:
+            existing = (
+                db.query(MemoryMetadataModel)
+                .filter(
+                    MemoryMetadataModel.key == key,
+                    MemoryMetadataModel.scope == scope,
+                    (
+                        MemoryMetadataModel.scope_id == scope_id
+                        if scope_id is not None
+                        else MemoryMetadataModel.scope_id.is_(None)
+                    ),
+                )
+                .first()
+            )
+            if existing:
+                existing.memory_type = memory_type
+                existing.tags = tags
+                existing.file_path = file_path
+                existing.source_provider = source_provider
+                existing.source_terminal_id = source_terminal_id
+                existing.token_estimate = token_estimate
+                existing.updated_at = datetime.now(timezone.utc)
+                db.commit()
+            else:
+                row = MemoryMetadataModel(
+                    id=str(uuid.uuid4()),
+                    key=key,
+                    memory_type=memory_type,
+                    scope=scope,
+                    scope_id=scope_id,
+                    file_path=file_path,
+                    tags=tags,
+                    source_provider=source_provider,
+                    source_terminal_id=source_terminal_id,
+                    token_estimate=token_estimate,
+                )
+                db.add(row)
+                db.commit()
+
+    def _delete_metadata(self, key: str, scope: str, scope_id: Optional[str]) -> bool:
+        """Delete the metadata row for (key, scope, scope_id). Returns True if removed."""
+        from cli_agent_orchestrator.clients.database import MemoryMetadataModel
+
+        with self._get_db_session() as db:
+            q = db.query(MemoryMetadataModel).filter(
+                MemoryMetadataModel.key == key,
+                MemoryMetadataModel.scope == scope,
+            )
+            if scope_id is not None:
+                q = q.filter(MemoryMetadataModel.scope_id == scope_id)
+            else:
+                q = q.filter(MemoryMetadataModel.scope_id.is_(None))
+            deleted: int = q.delete()
+            db.commit()
+            return deleted > 0
 
     # -------------------------------------------------------------------------
     # Scope resolution
@@ -270,6 +380,30 @@ class MemoryService:
             action = "updated" if is_update else "created"
             self._update_index(scope, scope_id, key, memory_type, tags, content, timestamp, action)
 
+            # Mirror metadata into SQLite. Token estimate is char-based
+            # (len(content) / 4) — a coarse proxy used by the context-budget
+            # planner; it differs from the word-based estimate written into
+            # index.md, which is purely a human-readable hint.
+            source_provider_in_ctx: Optional[str] = None
+            source_terminal_id_in_ctx: Optional[str] = None
+            if terminal_context:
+                source_provider_in_ctx = terminal_context.get("provider")
+                source_terminal_id_in_ctx = terminal_context.get("terminal_id")
+            try:
+                self._upsert_metadata(
+                    key=key,
+                    memory_type=memory_type,
+                    scope=scope,
+                    scope_id=scope_id,
+                    file_path=str(wiki_path),
+                    tags=tags,
+                    source_provider=source_provider_in_ctx,
+                    source_terminal_id=source_terminal_id_in_ctx,
+                    token_estimate=len(content) // 4,
+                )
+            except Exception as e:
+                logger.warning(f"Memory metadata SQLite upsert failed (key={key}): {e}")
+
             logger.info(f"Memory {action}: key={key} scope={scope} scope_id={scope_id}")
         finally:
             try:
@@ -416,8 +550,84 @@ class MemoryService:
         limit: int = 10,
         terminal_context: Optional[dict] = None,
         scan_all: bool = False,
+        search_mode: str = "hybrid",
     ) -> list[Memory]:
-        """Recall memories matching query and filters. File-based search."""
+        """Recall memories matching query and filters.
+
+        ``search_mode``:
+          - ``metadata``: substring match against key/tags/content via index.md walk.
+          - ``bm25``: BM25 ranking over wiki bodies (content-aware).
+          - ``hybrid``: metadata results first, then BM25 fills with what metadata missed.
+        """
+        if search_mode not in VALID_SEARCH_MODES:
+            raise ValueError(
+                f"Invalid search_mode {search_mode!r}; expected one of {VALID_SEARCH_MODES}"
+            )
+
+        if search_mode == "bm25":
+            if not query:
+                return []
+            scope_id = (
+                self.resolve_scope_id(scope, terminal_context)
+                if scope and scope != MemoryScope.GLOBAL.value and terminal_context
+                else None
+            )
+            return self._bm25_search(
+                query=query,
+                scope=scope,
+                scope_id=scope_id,
+                memory_type=memory_type,
+                limit=limit,
+                exclude_keys=set(),
+                terminal_context=terminal_context,
+                scan_all=scan_all,
+            )
+
+        metadata_results = await self._metadata_recall(
+            query=query,
+            scope=scope,
+            memory_type=memory_type,
+            limit=limit,
+            terminal_context=terminal_context,
+            scan_all=scan_all,
+        )
+
+        if search_mode == "metadata" or not query:
+            return metadata_results
+
+        # hybrid: top up with BM25 hits not already in metadata results
+        exclude_keys = {m.key for m in metadata_results}
+        remaining = max(0, limit - len(metadata_results))
+        if remaining == 0:
+            return metadata_results
+
+        scope_id = (
+            self.resolve_scope_id(scope, terminal_context)
+            if scope and scope != MemoryScope.GLOBAL.value and terminal_context
+            else None
+        )
+        bm25_results = self._bm25_search(
+            query=query,
+            scope=scope,
+            scope_id=scope_id,
+            memory_type=memory_type,
+            limit=remaining,
+            exclude_keys=exclude_keys,
+            terminal_context=terminal_context,
+            scan_all=scan_all,
+        )
+        return metadata_results + bm25_results
+
+    async def _metadata_recall(
+        self,
+        query: Optional[str] = None,
+        scope: Optional[str] = None,
+        memory_type: Optional[str] = None,
+        limit: int = 10,
+        terminal_context: Optional[dict] = None,
+        scan_all: bool = False,
+    ) -> list[Memory]:
+        """Substring-match recall via index.md walk (Phase 1 path)."""
         results: list[Memory] = []
 
         # Determine which project dirs to search
@@ -491,6 +701,130 @@ class MemoryService:
             results.sort(key=lambda m: (precedence.get(m.scope, 99), -m.updated_at.timestamp()))
 
         return results[:limit]
+
+    # -------------------------------------------------------------------------
+    # BM25 fallback search
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _bm25_tokenize(text: str) -> list[str]:
+        """Lowercase, split on non-alphanumeric, drop empties."""
+        return [t for t in re.split(r"[^a-zA-Z0-9]+", text.lower()) if t]
+
+    def _bm25_search(
+        self,
+        query: str,
+        scope: Optional[str],
+        scope_id: Optional[str],
+        memory_type: Optional[str],
+        limit: int,
+        exclude_keys: set,
+        terminal_context: Optional[dict],
+        scan_all: bool,
+    ) -> list[Memory]:
+        """Rank wiki bodies by BM25 against ``query``.
+
+        Returns ``[]`` (and logs at debug) if ``rank_bm25`` is unavailable —
+        callers must continue gracefully without it.
+        """
+        try:
+            from rank_bm25 import BM25Okapi  # type: ignore[import-untyped]
+        except ImportError:
+            logger.debug("rank_bm25 not installed; BM25 search disabled")
+            return []
+
+        query_tokens = self._bm25_tokenize(query)
+        if not query_tokens:
+            return []
+
+        search_dirs = self._get_search_dirs(scope, terminal_context, scan_all=scan_all)
+
+        candidates: list[tuple[Path, dict]] = []
+        seen: set[Path] = set()
+        for project_dir in search_dirs:
+            wiki_root = project_dir / "wiki"
+            if not wiki_root.exists():
+                continue
+            for wiki_file in wiki_root.rglob("*.md"):
+                if wiki_file.name == "index.md" or wiki_file in seen:
+                    continue
+                seen.add(wiki_file)
+                rel_parts = wiki_file.relative_to(wiki_root).parts
+                if not rel_parts:
+                    continue
+                file_scope = rel_parts[0]
+                entry_scope_id: Optional[str] = None
+                if (
+                    file_scope
+                    in (
+                        MemoryScope.SESSION.value,
+                        MemoryScope.AGENT.value,
+                    )
+                    and len(rel_parts) >= 3
+                ):
+                    entry_scope_id = rel_parts[1]
+
+                if scope and file_scope != scope:
+                    continue
+                if scope_id and entry_scope_id != scope_id:
+                    continue
+                key = wiki_file.stem
+                if key in exclude_keys:
+                    continue
+
+                # Peek at memory_type from header comment for filtering
+                if memory_type:
+                    head = wiki_file.read_text(encoding="utf-8")[:512]
+                    type_match = re.search(r"type: (\S+)", head)
+                    file_type = type_match.group(1).rstrip(" |") if type_match else ""
+                    if file_type != memory_type:
+                        continue
+
+                entry = {
+                    "key": key,
+                    "scope": file_scope,
+                    "scope_id": entry_scope_id,
+                    "memory_type": "",
+                    "tags": "",
+                    "relative_path": "/".join(rel_parts),
+                }
+                candidates.append((wiki_file, entry))
+
+        if not candidates:
+            return []
+
+        corpus_tokens: list[list[str]] = []
+        contents: list[str] = []
+        for wiki_file, _entry in candidates:
+            text = wiki_file.read_text(encoding="utf-8")
+            contents.append(text)
+            corpus_tokens.append(self._bm25_tokenize(text))
+
+        bm25 = BM25Okapi(corpus_tokens)
+        scores = bm25.get_scores(query_tokens)
+
+        # BM25 IDF can go negative on tiny corpora when df > N/2, so we cannot
+        # gate on score > 0 alone. A document only counts as a match when at
+        # least one query token actually appears in it; ranking among matches
+        # then uses the BM25 score directly.
+        query_token_set = set(query_tokens)
+        ranked = sorted(
+            (
+                (scores[i], i)
+                for i in range(len(candidates))
+                if query_token_set & set(corpus_tokens[i])
+            ),
+            key=lambda x: x[0],
+            reverse=True,
+        )[:limit]
+
+        results: list[Memory] = []
+        for _score, idx in ranked:
+            wiki_file, entry = candidates[idx]
+            memory = self._parse_wiki_file(wiki_file, contents[idx], entry)
+            if memory:
+                results.append(memory)
+        return results
 
     def _get_search_dirs(
         self,
@@ -649,6 +983,12 @@ class MemoryService:
         wiki_path = self.get_wiki_path(scope, scope_id, key)
 
         if not wiki_path.exists():
+            # Drop any stale SQLite row so metadata stays consistent
+            # with the wiki even when the file vanished out-of-band.
+            try:
+                self._delete_metadata(key, scope, scope_id)
+            except Exception as e:
+                logger.warning(f"Memory metadata SQLite delete failed (key={key}): {e}")
             return False
 
         # Delete the wiki file
@@ -660,6 +1000,12 @@ class MemoryService:
         # change too).
         now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         self._update_index(scope, scope_id, key, "", "", "", now_ts, "remove")
+
+        # Drop the SQLite metadata row alongside the file.
+        try:
+            self._delete_metadata(key, scope, scope_id)
+        except Exception as e:
+            logger.warning(f"Memory metadata SQLite delete failed (key={key}): {e}")
 
         return True
 
@@ -732,6 +1078,100 @@ class MemoryService:
 
         context = "## Context from CAO Memory\n" + "\n".join(lines)
         return f"<cao-memory>\n{context}\n</cao-memory>"
+
+    # -------------------------------------------------------------------------
+    # U9 — Curated injection via context-manager agent
+    # -------------------------------------------------------------------------
+
+    def _find_context_manager_terminal(self, session_name: Optional[str]) -> Optional[dict]:
+        """Find an IDLE memory_manager terminal in ``session_name``.
+
+        Sessions are isolated: a worker in session A must never dispatch to a
+        curator in session B (same bug class as the scope_id leak).
+        """
+        if not session_name:
+            return None
+        try:
+            from cli_agent_orchestrator.clients.database import list_all_terminals
+
+            for t in list_all_terminals():
+                if (
+                    t.get("agent_profile") == "memory_manager"
+                    and t.get("session_name") == session_name
+                ):
+                    return t
+        except Exception as e:
+            logger.debug(f"_find_context_manager_terminal failed: {e}")
+        return None
+
+    def get_curated_memory_context(
+        self, terminal_id: str, task_description: Optional[str] = None
+    ) -> str:
+        """Curated injection path with Phase 1 fallback.
+
+        If a memory_manager terminal in the same session is IDLE, dispatch the
+        task description and read back its ``<cao-memory>`` block. On any
+        failure (no manager, busy, timeout, missing provider, parse failure),
+        fall back to the deterministic Phase 1 path so injection never blocks
+        the worker agent.
+        """
+        try:
+            ctx = self._get_terminal_context(terminal_id)
+            session_name = ctx.get("session_name") if ctx else None
+            cm = self._find_context_manager_terminal(session_name)
+            if not cm:
+                return self.get_memory_context_for_terminal(terminal_id)
+
+            from cli_agent_orchestrator.models.terminal import TerminalStatus
+            from cli_agent_orchestrator.providers.manager import provider_manager
+
+            provider = provider_manager.get_provider(cm["id"])
+            if provider is None:
+                return self.get_memory_context_for_terminal(terminal_id)
+
+            # Serialize concurrent dispatches to the same curator: two workers
+            # racing would otherwise both see IDLE, both send_input, and the
+            # second would clobber the first's request mid-flight.
+            lock = _curator_locks.setdefault(cm["id"], threading.Lock())
+            if not lock.acquire(blocking=False):
+                return self.get_memory_context_for_terminal(terminal_id)
+            try:
+                if provider.get_status() != TerminalStatus.IDLE:
+                    return self.get_memory_context_for_terminal(terminal_id)
+
+                from cli_agent_orchestrator.services.terminal_service import (
+                    get_output,
+                    send_input,
+                )
+
+                send_input(cm["id"], task_description or "")
+
+                # Poll up to ~15s for the curator to finish responding. Without
+                # the sleep this loop spins in microseconds and we always read
+                # stale output.
+                for _ in range(30):
+                    if provider.get_status() in (
+                        TerminalStatus.COMPLETED,
+                        TerminalStatus.IDLE,
+                    ):
+                        break
+                    time.sleep(0.5)
+
+                output = get_output(cm["id"])
+            finally:
+                lock.release()
+
+            if isinstance(output, dict):
+                output = output.get("output", "")
+            if output and "<cao-memory>" in output:
+                start = output.rfind("<cao-memory>")
+                end = output.rfind("</cao-memory>")
+                if 0 <= start < end:
+                    return output[start : end + len("</cao-memory>")]
+        except Exception as e:
+            logger.debug(f"get_curated_memory_context failed, falling back: {e}")
+
+        return self.get_memory_context_for_terminal(terminal_id)
 
     def _get_terminal_context(self, terminal_id: str) -> Optional[dict]:
         """Get terminal context for scope resolution.

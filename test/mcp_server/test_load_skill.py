@@ -33,7 +33,7 @@ class TestLoadSkillImpl:
         result = _load_skill_impl("python-testing")
 
         assert result == "# Use pytest"
-        mock_get.assert_called_once_with("http://127.0.0.1:9889/skills/python-testing")
+        mock_get.assert_called_once_with("http://127.0.0.1:9889/skills/python-testing", timeout=30)
 
     @patch("cli_agent_orchestrator.mcp_server.server.requests.get")
     def test_returns_error_dict_for_404(self, mock_get):

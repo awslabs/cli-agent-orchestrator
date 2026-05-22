@@ -14,7 +14,16 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Dict, List, Optional, cast
 
-from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
+from fastapi import (
+    BackgroundTasks,
+    FastAPI,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field, field_validator
@@ -401,13 +410,23 @@ async def get_skill_content(name: str) -> SkillContentResponse:
 @app.post("/sessions", response_model=Terminal, status_code=status.HTTP_201_CREATED)
 async def create_session(
     request: Request,
+    background_tasks: BackgroundTasks,
     agent_profile: str,
     provider: Optional[str] = None,
     session_name: Optional[str] = None,
     working_directory: Optional[str] = None,
     allowed_tools: Optional[str] = None,
+    memory_manager: Optional[str] = None,
 ) -> Terminal:
-    """Create a new session with exactly one terminal."""
+    """Create a new session with exactly one terminal.
+
+    When ``memory_manager`` is truthy, a sidecar ``memory_manager`` terminal is
+    spawned asynchronously in the same tmux session — provider initialization
+    can take 15-30s and would otherwise block the HTTP response past the
+    client's request timeout. The worker's first message may arrive before
+    the curator reaches IDLE; ``get_curated_memory_context`` falls back to
+    Phase 1 in that window.
+    """
     try:
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
@@ -420,6 +439,28 @@ async def create_session(
             allowed_tools=allowed_tools_list,
             registry=get_plugin_registry(request),
         )
+
+        if memory_manager and str(memory_manager).lower() in ("true", "1", "yes"):
+            registry = get_plugin_registry(request)
+            sidecar_provider = provider or DEFAULT_PROVIDER
+            sidecar_session = result.session_name
+
+            def _spawn_sidecar() -> None:
+                try:
+                    from cli_agent_orchestrator.services import terminal_service
+
+                    terminal_service.create_terminal(
+                        provider=sidecar_provider,
+                        agent_profile="memory_manager",
+                        session_name=sidecar_session,
+                        working_directory=working_directory,
+                        registry=registry,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to spawn memory_manager sidecar: {e}")
+
+            background_tasks.add_task(_spawn_sidecar)
+
         return result
 
     except ValueError as e:
