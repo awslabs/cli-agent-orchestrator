@@ -63,7 +63,7 @@ from cli_agent_orchestrator.utils.skills import (
     load_skill_content,
     validate_skill_name,
 )
-from cli_agent_orchestrator.utils.terminal import generate_session_name
+from cli_agent_orchestrator.utils.terminal import generate_session_name, validate_tmux_name
 
 logger = logging.getLogger(__name__)
 
@@ -409,6 +409,8 @@ async def create_session(
 ) -> Terminal:
     """Create a new session with exactly one terminal."""
     try:
+        if session_name is not None:
+            validate_tmux_name(session_name, "session_name")
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
@@ -445,6 +447,7 @@ async def list_sessions() -> List[Dict]:
 @app.get("/sessions/{session_name}")
 async def get_session(session_name: str) -> Dict:
     try:
+        validate_tmux_name(session_name, "session_name")
         return session_service.get_session(session_name)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -458,6 +461,7 @@ async def get_session(session_name: str) -> Dict:
 @app.delete("/sessions/{session_name}")
 async def delete_session(request: Request, session_name: str) -> Dict:
     try:
+        validate_tmux_name(session_name, "session_name")
         result = session_service.delete_session(session_name, registry=get_plugin_registry(request))
         return {"success": True, **result}
     except ValueError as e:
@@ -484,6 +488,7 @@ async def create_terminal_in_session(
 ) -> Terminal:
     """Create additional terminal in existing session."""
     try:
+        validate_tmux_name(session_name, "session_name")
         if provider is None:
             resolved_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
         else:
@@ -515,9 +520,12 @@ async def create_terminal_in_session(
 async def list_terminals_in_session(session_name: str) -> List[Dict]:
     """List all terminals in a session."""
     try:
+        validate_tmux_name(session_name, "session_name")
         from cli_agent_orchestrator.clients.database import list_terminals_by_session
 
         return list_terminals_by_session(session_name)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

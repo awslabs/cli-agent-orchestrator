@@ -322,6 +322,67 @@ class TestCreateSession:
         assert response.status_code == 500
         assert "Failed to create session" in response.json()["detail"]
 
+    @pytest.mark.parametrize(
+        "bad_name",
+        ["evil:name", "evil.name", "-leading", "with space", "../escape", "name;rm"],
+    )
+    def test_create_session_rejects_unsafe_name(self, client, bad_name):
+        """POST /sessions rejects session names that could break tmux target parsing."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "session_name": bad_name,
+                },
+            )
+
+        assert response.status_code == 400
+        assert "session_name" in response.json()["detail"]
+        mock_svc.create_session.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "bad_name",
+        ["evil:name", "evil.name", "-leading", "with space"],
+    )
+    def test_get_session_rejects_unsafe_name(self, client, bad_name):
+        """GET /sessions/{name} rejects unsafe names before service call."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            response = client.get(f"/sessions/{bad_name}")
+
+        # Routing may turn '/' into 404 paths, but every other case should
+        # reach the handler and be rejected as 404 (ValueError -> 404).
+        assert response.status_code in (400, 404)
+        mock_svc.get_session.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "bad_name",
+        ["evil:name", "evil.name", "-leading", "with space"],
+    )
+    def test_delete_session_rejects_unsafe_name(self, client, bad_name):
+        """DELETE /sessions/{name} rejects unsafe names before service call."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            response = client.delete(f"/sessions/{bad_name}")
+
+        assert response.status_code in (400, 404)
+        mock_svc.delete_session.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "bad_name",
+        ["evil:name", "evil.name", "-leading", "with space"],
+    )
+    def test_create_terminal_rejects_unsafe_session_name(self, client, bad_name):
+        """POST /sessions/{name}/terminals rejects unsafe session names."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            response = client.post(
+                f"/sessions/{bad_name}/terminals",
+                params={"provider": "kiro_cli", "agent_profile": "developer"},
+            )
+
+        assert response.status_code in (400, 404)
+        mock_svc.create_terminal.assert_not_called()
+
 
 class TestListSessions:
     """Tests for GET /sessions endpoint."""
