@@ -208,6 +208,29 @@ def get_plugin_registry(request: Request) -> PluginRegistry:
     return cast(PluginRegistry, request.app.state.plugin_registry)
 
 
+# Values that indicate ``TERM`` is effectively unusable and must be overridden
+# rather than inherited by the tmux attach subprocess. ``dumb`` is the common
+# fallback that containers and devcontainers ship with when no real terminal
+# is attached. Empty string and missing key behave the same way.
+_UNUSABLE_TERM_VALUES = frozenset({"", "dumb"})
+_DEFAULT_PTY_TERM = "xterm-256color"
+
+
+def _build_pty_env() -> Dict[str, str]:
+    """Build the env handed to the tmux PTY attach subprocess.
+
+    Copies the parent process environment so cao-server's normal config
+    (PATH, HOME, AWS_*, etc.) reaches tmux, and forces ``TERM`` to a usable
+    value when the inherited one would break terminal rendering. Explicit
+    non-dumb ``TERM`` values from the operator are preserved verbatim. See
+    issue #150.
+    """
+    env = os.environ.copy()
+    if env.get("TERM", "") in _UNUSABLE_TERM_VALUES:
+        env["TERM"] = _DEFAULT_PTY_TERM
+    return env
+
+
 app = FastAPI(
     title="CLI Agent Orchestrator",
     description="Simplified CLI Agent Orchestrator API",
@@ -772,7 +795,13 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     winsize = struct.pack("HHHH", 24, 80, 0, 0)
     fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
 
-    # Start tmux attach inside the PTY
+    # Start tmux attach inside the PTY.
+    # Container/devcontainer environments often leave TERM unset or set to
+    # ``dumb``, which strips colours, breaks cursor positioning and corrupts
+    # the Ink-based TUIs that agent CLIs render. Force a sane default so the
+    # browser-side xterm.js renderer sees the escape sequences it expects.
+    # Any explicit non-dumb TERM the operator set is preserved.
+    pty_env = _build_pty_env()
     proc = subprocess.Popen(
         ["tmux", "-u", "attach-session", "-t", f"{session_name}:{window_name}"],
         stdin=slave_fd,
@@ -780,6 +809,7 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
         stderr=slave_fd,
         close_fds=True,
         preexec_fn=os.setsid,
+        env=pty_env,
     )
     os.close(slave_fd)
 

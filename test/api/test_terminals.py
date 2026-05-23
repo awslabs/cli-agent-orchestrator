@@ -1,6 +1,7 @@
 """Tests for terminal-related API endpoints including working directory and exit."""
 
-from unittest.mock import ANY, MagicMock, patch
+from typing import Dict
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -408,6 +409,119 @@ class TestWebSocketLocalhostRestriction:
         with pytest.raises(Exception):
             with client.websocket_connect("/terminals/abcd1234/ws"):
                 pass
+
+
+class TestBuildPtyEnv:
+    """Tests for the tmux PTY attach environment builder (issue #150).
+
+    The helper is responsible for ensuring the tmux ``attach-session``
+    subprocess sees a usable ``TERM`` value. Container environments
+    routinely ship with ``TERM`` unset or set to ``dumb``, which breaks
+    xterm.js rendering on the browser side.
+    """
+
+    def _build(self, env_overrides):
+        """Run ``_build_pty_env`` under a controlled os.environ."""
+        from cli_agent_orchestrator.api.main import _build_pty_env
+
+        with patch.dict("os.environ", env_overrides, clear=True):
+            return _build_pty_env()
+
+    def test_unset_term_is_defaulted(self):
+        env = self._build({"HOME": "/root", "PATH": "/usr/bin"})
+        assert env["TERM"] == "xterm-256color"
+
+    def test_empty_string_term_is_defaulted(self):
+        env = self._build({"TERM": "", "HOME": "/root"})
+        assert env["TERM"] == "xterm-256color"
+
+    def test_dumb_term_is_overridden(self):
+        # The whole point of issue #150 — Docker's TERM=dumb is unusable.
+        env = self._build({"TERM": "dumb", "HOME": "/root"})
+        assert env["TERM"] == "xterm-256color"
+
+    def test_explicit_xterm_term_is_preserved(self):
+        env = self._build({"TERM": "xterm-256color", "HOME": "/root"})
+        assert env["TERM"] == "xterm-256color"
+
+    def test_custom_term_is_preserved(self):
+        # Operators that explicitly pick a different terminfo entry should
+        # see their choice respected — only unset/empty/dumb gets overridden.
+        env = self._build({"TERM": "screen-256color", "HOME": "/root"})
+        assert env["TERM"] == "screen-256color"
+
+    def test_other_env_vars_are_inherited(self):
+        env = self._build(
+            {
+                "HOME": "/home/cao",
+                "PATH": "/opt/cao/bin",
+                "AWS_REGION": "us-west-2",
+                "CAO_TERMINAL_ID": "abcd1234",
+            }
+        )
+        # The whole parent env must reach the subprocess so tmux can find its
+        # config and the agent CLIs can locate their credentials.
+        assert env["HOME"] == "/home/cao"
+        assert env["PATH"] == "/opt/cao/bin"
+        assert env["AWS_REGION"] == "us-west-2"
+        assert env["CAO_TERMINAL_ID"] == "abcd1234"
+
+
+class TestWebSocketSubprocessTerm:
+    """Wiring guard: ensure ``terminal_ws`` actually hands the PTY env
+    (with the corrected ``TERM``) to the tmux attach subprocess. Catches
+    a regression where the helper exists but never gets called from the
+    endpoint."""
+
+    @pytest.mark.asyncio
+    async def test_subprocess_popen_receives_corrected_term(self):
+        """When the parent process has TERM=dumb, the tmux attach Popen call
+        must receive ``env`` with ``TERM=xterm-256color`` instead of inheriting
+        the broken value.
+
+        We let Popen raise immediately after capture so the endpoint stops
+        before touching the real PTY/asyncio loop.
+        """
+        from cli_agent_orchestrator.api import main as main_module
+
+        ws = MagicMock()
+        ws.client = MagicMock(host="127.0.0.1")
+        ws.accept = AsyncMock()
+        ws.close = AsyncMock()
+
+        captured: Dict[str, object] = {}
+
+        def capture_and_stop(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            raise _StopHere("captured Popen args")
+
+        with (
+            patch.dict("os.environ", {"TERM": "dumb", "HOME": "/root"}, clear=True),
+            patch.object(
+                main_module,
+                "get_terminal_metadata",
+                return_value={"tmux_session": "cao-s", "tmux_window": "w"},
+            ),
+            patch.object(main_module.subprocess, "Popen", side_effect=capture_and_stop),
+            patch.object(main_module.pty, "openpty", return_value=(100, 101)),
+            patch.object(main_module.fcntl, "ioctl"),
+            patch.object(main_module.fcntl, "fcntl"),
+            patch.object(main_module.os, "close"),
+        ):
+            with pytest.raises(_StopHere):
+                await main_module.terminal_ws(ws, "abcd1234")
+
+        passed_env = captured["kwargs"].get("env")  # type: ignore[union-attr]
+        assert passed_env is not None, (
+            "tmux Popen must receive env=; without it the subprocess inherits "
+            "the parent's broken TERM (issue #150)"
+        )
+        assert passed_env["TERM"] == "xterm-256color"
+
+
+class _StopHere(Exception):
+    """Sentinel raised by the wiring test once Popen args are captured."""
 
 
 class TestCrossProviderResolution:
