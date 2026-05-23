@@ -596,3 +596,141 @@ def test_launch_honors_profile_provider_when_flag_not_given():
         params = mock_post.call_args.kwargs["params"]
         # provider is NOT sent — server-side resolution handles it
         assert "provider" not in params
+
+
+def test_launch_yolo_still_resolves_profile_provider():
+    """--yolo must not swallow ``provider:`` in the agent profile frontmatter.
+
+    Regression guard for #239: ``resolve_provider`` previously lived inside
+    the ``else`` branch of the permission-resolution conditional and never
+    fired when ``--yolo`` took the first branch, breaking heterogeneous-
+    panelist workflows where each agent profile pins a specific CLI.
+    """
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run"),
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+        patch(
+            "cli_agent_orchestrator.utils.agent_profiles.resolve_provider",
+            return_value="claude_code",
+        ) as mock_resolve,
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
+
+        result = runner.invoke(launch, ["--agents", "codex_panelist", "--yolo"])
+
+        assert result.exit_code == 0
+        # Provider resolution must run even on the --yolo branch.
+        mock_resolve.assert_called_once_with("codex_panelist", "kiro_cli")
+        # The kiro_cli-specific yolo warning text must NOT appear, because
+        # the profile's provider ("claude_code") was honoured.
+        assert "kiro_cli will launch in --legacy-ui mode" not in result.output
+
+
+def test_launch_allowed_tools_still_resolves_profile_provider():
+    """--allowed-tools must also not swallow ``provider:`` in the profile."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run"),
+        patch(
+            "cli_agent_orchestrator.utils.agent_profiles.resolve_provider",
+            return_value="gemini_cli",
+        ) as mock_resolve,
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+
+        result = runner.invoke(
+            launch,
+            [
+                "--agents",
+                "gemini_panelist",
+                "--allowed-tools",
+                "fs_read",
+                "--headless",
+            ],
+            input="y\n",
+        )
+
+        assert result.exit_code == 0
+        mock_resolve.assert_called_once_with("gemini_panelist", "kiro_cli")
+        # Local prompts must reflect the resolved provider, not the default.
+        assert "launching on gemini_cli" in result.output
+
+
+def test_launch_explicit_provider_skips_profile_resolution():
+    """An explicit --provider flag wins over the profile's provider field.
+
+    ``resolve_provider`` should not be invoked at all when the operator names
+    a provider on the command line.
+    """
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run"),
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+        patch("cli_agent_orchestrator.utils.agent_profiles.resolve_provider") as mock_resolve,
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
+
+        result = runner.invoke(
+            launch,
+            ["--agents", "codex_panelist", "--yolo", "--provider", "claude_code"],
+        )
+
+        assert result.exit_code == 0
+        mock_resolve.assert_not_called()
+        # Explicit provider IS sent to the API in this path.
+        params = mock_post.call_args.kwargs["params"]
+        assert params["provider"] == "claude_code"
+
+
+def test_launch_yolo_falls_back_to_default_when_profile_lacks_provider():
+    """When the profile has no ``provider`` key, ``--yolo`` falls back to
+    DEFAULT_PROVIDER. ``resolve_provider`` handles this by returning the
+    fallback it was given, so the trailing local fallback is unnecessary."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run"),
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+        patch(
+            "cli_agent_orchestrator.utils.agent_profiles.resolve_provider",
+            return_value="kiro_cli",  # fallback returned because profile has no provider
+        ),
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
+
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
+
+        assert result.exit_code == 0
+        # The kiro_cli-specific yolo warning IS expected here because the
+        # profile didn't override and the fallback is kiro_cli.
+        assert "kiro_cli will launch in --legacy-ui mode" in result.output

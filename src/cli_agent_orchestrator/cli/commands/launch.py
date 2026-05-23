@@ -106,20 +106,25 @@ def launch(
                 resolved_allowed_tools = resolve_allowed_tools(
                     profile.allowedTools, profile.role, mcp_server_names
                 )
-                # Honour profile.provider when --provider not explicitly passed
-                if provider is None:
-                    from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
-
-                    provider = resolve_provider(agents, DEFAULT_PROVIDER)
             except (FileNotFoundError, RuntimeError):
                 # Profile not found — use developer defaults (backward compatible)
                 no_role_set = True
                 resolved_allowed_tools = resolve_allowed_tools(None, None, None)
 
-        # Fall back to DEFAULT_PROVIDER when --provider was not given and
-        # profile resolution didn't set it (yolo, --allowed-tools, or missing profile)
+        # Honour profile.provider whenever the user did not pass --provider
+        # explicitly. This runs regardless of which permission-resolution
+        # branch above fired — provider selection ("which CLI runs this
+        # agent?") is orthogonal to tool restrictions ("what is the agent
+        # allowed to do?"). Previously this lookup lived inside the ``else``
+        # branch and ``--yolo`` / ``--allowed-tools`` silently bypassed the
+        # profile's ``provider:`` field, breaking heterogeneous-panel
+        # workflows. See issue #239. ``resolve_provider`` falls back to
+        # ``DEFAULT_PROVIDER`` when the profile is missing or has no
+        # ``provider`` key, so the trailing fallback is no longer needed.
         if provider is None:
-            provider = DEFAULT_PROVIDER
+            from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
+
+            provider = resolve_provider(agents, DEFAULT_PROVIDER)
 
         # Validate provider
         if provider not in PROVIDERS:
