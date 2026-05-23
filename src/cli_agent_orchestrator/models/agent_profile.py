@@ -39,8 +39,9 @@ class AgentProfile(BaseModel):
     model: Optional[str] = None
     permissionMode: Optional[PermissionMode] = None
 
-    # Codex-only. Names a [profiles.<name>] block in ~/.codex/config.toml;
-    # passed as --profile <name> instead of --yolo. min_length=1 prevents
-    # an explicit empty string from silently degrading to --yolo, since
-    # this is a permission-floor knob.
+    # Codex-only. Names a [profiles.<name>] block in ~/.codex/config.toml.
+    # Used as --profile <name> when yolo mode is not active; unrestricted
+    # allowed tools still force --yolo. min_length=1 prevents an explicit
+    # empty string from silently degrading to --yolo, since this is a
+    # permission-floor knob.
     codexProfile: Optional[str] = Field(default=None, min_length=1)
