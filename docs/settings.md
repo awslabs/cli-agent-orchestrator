@@ -84,3 +84,35 @@ Add additional directories that are scanned for agent profiles across all provid
 | `POST` | `/settings/extra-agent-dirs` | Set extra custom directories |
 
 See [api.md](api.md) for the full API reference.
+
+## Server Network Settings
+
+`cao-server` is a local-only service by default. The host header, CORS, and
+WebSocket client allowlists ship locked down to loopback. Three env vars let
+operators extend each list when running CAO behind a reverse proxy or inside a
+container — see issues [#149](https://github.com/awslabs/cli-agent-orchestrator/issues/149)
+and [#151](https://github.com/awslabs/cli-agent-orchestrator/issues/151).
+
+All three accept a comma-separated list and **extend** (not replace) the built-in
+defaults, so loopback access is preserved even when the env var is set:
+
+| Env var | Extends | Use case |
+|---|---|---|
+| `CAO_ALLOWED_HOSTS` | `ALLOWED_HOSTS` (Host header allowlist used by `TrustedHostMiddleware`) | Fronting cao-server with a reverse proxy at a hostname other than `localhost` / `127.0.0.1`. |
+| `CAO_CORS_ORIGINS` | `CORS_ORIGINS` (browser origins permitted by CORS) | Serving the web UI from a non-default port, or from another origin (e.g. a custom dashboard). |
+| `CAO_WS_ALLOWED_CLIENTS` | `WS_ALLOWED_CLIENTS` (client IPs permitted to attach to the PTY WebSocket) | Running `cao-server` inside Docker where the host browser arrives via a bridge IP (e.g. `172.17.0.1`). |
+
+Example — running `cao-server` in a container that accepts WebSocket attaches
+from the Docker bridge:
+
+```bash
+CAO_ALLOWED_HOSTS=cao.local \
+CAO_CORS_ORIGINS=http://cao.local:8080 \
+CAO_WS_ALLOWED_CLIENTS=172.17.0.1 \
+  uv tool run cao-server --host 0.0.0.0
+```
+
+> **Security note:** the WebSocket PTY endpoint is unauthenticated. Only add
+> client IPs you actually trust to `CAO_WS_ALLOWED_CLIENTS` — anyone who can
+> reach the listener at one of those IPs gets full PTY access to running
+> agent terminals.

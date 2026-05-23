@@ -81,6 +81,71 @@ class TestCorsOrigins:
         assert "http://127.0.0.1:3000" in CORS_ORIGINS
 
 
+class TestNetworkAllowlistEnvOverrides:
+    """Tests for env-var-driven extensions of the network allowlists (issues #149, #151).
+
+    Each override extends the built-in defaults rather than replacing them, so an
+    operator can add a Docker bridge IP or a custom origin without locking
+    themselves out of loopback access.
+    """
+
+    def _reload_constants(self, env_overrides):
+        import importlib
+        import os
+
+        env_copy = os.environ.copy()
+        # Strip any pre-set network override vars so the test starts from the
+        # documented defaults, then layer the overrides under test on top.
+        for key in ("CAO_CORS_ORIGINS", "CAO_ALLOWED_HOSTS", "CAO_WS_ALLOWED_CLIENTS"):
+            env_copy.pop(key, None)
+        env_copy.update(env_overrides)
+        with patch.dict("os.environ", env_copy, clear=True):
+            import cli_agent_orchestrator.constants as constants_module
+
+            importlib.reload(constants_module)
+            return constants_module
+
+    def test_cao_cors_origins_extends_defaults(self):
+        mod = self._reload_constants(
+            {"CAO_CORS_ORIGINS": "http://app.local,http://example.test:9000"}
+        )
+        assert "http://localhost:5173" in mod.CORS_ORIGINS
+        assert "http://app.local" in mod.CORS_ORIGINS
+        assert "http://example.test:9000" in mod.CORS_ORIGINS
+
+    def test_cao_allowed_hosts_extends_defaults(self):
+        mod = self._reload_constants({"CAO_ALLOWED_HOSTS": "cao.internal,proxy.example.com"})
+        assert "localhost" in mod.ALLOWED_HOSTS
+        assert "127.0.0.1" in mod.ALLOWED_HOSTS
+        assert "cao.internal" in mod.ALLOWED_HOSTS
+        assert "proxy.example.com" in mod.ALLOWED_HOSTS
+
+    def test_cao_ws_allowed_clients_extends_defaults(self):
+        mod = self._reload_constants({"CAO_WS_ALLOWED_CLIENTS": "172.17.0.1, 192.168.1.5"})
+        assert "127.0.0.1" in mod.WS_ALLOWED_CLIENTS
+        assert "::1" in mod.WS_ALLOWED_CLIENTS
+        assert "172.17.0.1" in mod.WS_ALLOWED_CLIENTS
+        # Leading whitespace stripped
+        assert "192.168.1.5" in mod.WS_ALLOWED_CLIENTS
+
+    def test_overrides_skip_empty_segments(self):
+        mod = self._reload_constants({"CAO_WS_ALLOWED_CLIENTS": ",,172.17.0.1,, ,"})
+        assert "" not in mod.WS_ALLOWED_CLIENTS
+        assert "172.17.0.1" in mod.WS_ALLOWED_CLIENTS
+
+    def test_defaults_when_env_not_set(self):
+        mod = self._reload_constants({})
+        # Defaults intact, no extras.
+        assert mod.WS_ALLOWED_CLIENTS == ["127.0.0.1", "::1", "localhost"]
+        assert mod.ALLOWED_HOSTS == ["localhost", "127.0.0.1"]
+        assert mod.CORS_ORIGINS == [
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+        ]
+
+
 class TestCaoHomeDir:
     """Tests for CAO home directory constants."""
 

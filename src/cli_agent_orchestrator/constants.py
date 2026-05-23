@@ -110,24 +110,47 @@ SERVER_VERSION = "0.1.0"
 
 API_BASE_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
 
-# CORS allowed origins for web-based clients
+
+# Operators can extend network allowlists via the env vars handled below.
+# Same comma-separated pattern as ``CAO_PROFILE_ALLOWED_HOSTS`` in install_service.
+def _split_env_list(name: str) -> list[str]:
+    """Parse a comma-separated env var into a stripped, non-empty entry list."""
+    value = os.environ.get(name, "")
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+# CORS allowed origins for web-based clients.
+# Defaults cover the Vite dev server and a common production port.
+# Operators serving the UI on a custom port (or from a different origin) can
+# extend the list with the ``CAO_CORS_ORIGINS`` env var (comma-separated).
 CORS_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
-]
+] + _split_env_list("CAO_CORS_ORIGINS")
 
-# Allowed Host headers for DNS rebinding protection (CVE mitigation)
-# Only localhost connections permitted - CAO is a local-only service
-# These hosts are validated by TrustedHostMiddleware to prevent DNS rebinding attacks
-# Note: IPv6 (::1) is not included as CAO is accessed via IPv4 localhost in practice
-# Future extension point: To allow additional hosts, add --allowed-hosts CLI flag
-# or CAO_ALLOWED_HOSTS env var (comma-separated) that modifies this list
+# Allowed Host headers for DNS rebinding protection (CVE mitigation).
+# Defaults: localhost-only, matching CAO's local-only service design.
+# Validated by TrustedHostMiddleware to prevent DNS rebinding attacks.
+# Operators fronting cao-server with a reverse proxy or running it inside a
+# container can extend the list via ``CAO_ALLOWED_HOSTS`` (comma-separated).
 ALLOWED_HOSTS = [
     "localhost",
     "127.0.0.1",
-]
+] + _split_env_list("CAO_ALLOWED_HOSTS")
+
+# Allowed client IPs/hostnames for the WebSocket PTY attach endpoint.
+# Defaults: loopback-only. The WebSocket endpoint provides unauthenticated PTY
+# access, so this list is deliberately tight.
+# Operators running cao-server inside a container (e.g. Docker, where the host
+# browser connects via a bridge IP like 172.17.0.1) can extend the list with
+# ``CAO_WS_ALLOWED_CLIENTS`` (comma-separated). See issue #149.
+WS_ALLOWED_CLIENTS = [
+    "127.0.0.1",
+    "::1",
+    "localhost",
+] + _split_env_list("CAO_WS_ALLOWED_CLIENTS")
 
 # =============================================================================
 # Memory System Configuration

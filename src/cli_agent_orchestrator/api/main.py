@@ -36,6 +36,7 @@ from cli_agent_orchestrator.constants import (
     SERVER_PORT,
     SERVER_VERSION,
     TERMINAL_LOG_DIR,
+    WS_ALLOWED_CLIENTS,
 )
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
@@ -772,10 +773,13 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     It is intended for localhost-only use. Do NOT expose the server to
     untrusted networks (e.g. --host 0.0.0.0) without adding authentication.
     """
-    # Reject connections from non-loopback clients
+    # Reject connections from clients outside the configured allowlist.
+    # Defaults to loopback; operators running cao-server inside a container can
+    # extend the allowlist with the ``CAO_WS_ALLOWED_CLIENTS`` env var so the
+    # host browser (reaching the container via a bridge IP) can attach.
     client_host = websocket.client.host if websocket.client else None
-    if client_host not in (None, "127.0.0.1", "::1", "localhost"):
-        await websocket.close(code=4003, reason="WebSocket access is restricted to localhost")
+    if client_host is not None and client_host not in WS_ALLOWED_CLIENTS:
+        await websocket.close(code=4003, reason="WebSocket access is restricted to allowed clients")
         return
 
     await websocket.accept()

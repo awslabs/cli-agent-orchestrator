@@ -410,6 +410,64 @@ class TestWebSocketLocalhostRestriction:
             with client.websocket_connect("/terminals/abcd1234/ws"):
                 pass
 
+    @pytest.mark.asyncio
+    async def test_websocket_endpoint_admits_client_in_allowlist(self):
+        """Direct-call unit test: a client whose host is in WS_ALLOWED_CLIENTS
+        passes the allowlist gate and reaches the next step (terminal lookup).
+
+        Driving the coroutine directly with a mock ``WebSocket`` lets us
+        observe the exact ``close`` calls without fighting the TestClient's
+        opaque mapping of post-accept closes to HTTP 400 denials.
+        """
+        from cli_agent_orchestrator.api.main import terminal_ws
+
+        ws = MagicMock()
+        ws.client = MagicMock(host="172.17.0.1")  # Docker bridge IP, simulating issue #149
+        ws.accept = AsyncMock()
+        ws.close = AsyncMock()
+
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.WS_ALLOWED_CLIENTS",
+                ["127.0.0.1", "::1", "localhost", "172.17.0.1"],
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.get_terminal_metadata",
+                return_value=None,
+            ),
+        ):
+            await terminal_ws(ws, "abcd1234")
+
+        # Allowlist let it through → accept happened.
+        ws.accept.assert_awaited_once()
+        # Terminal lookup returned None → close with 4004 (not 4003).
+        ws.close.assert_awaited_once()
+        kwargs = ws.close.call_args.kwargs
+        assert kwargs.get("code") == 4004
+
+    @pytest.mark.asyncio
+    async def test_websocket_endpoint_rejects_client_outside_allowlist(self):
+        """Direct-call unit test: a client whose host is not in the allowlist
+        is closed with policy code 4003 before any accept happens."""
+        from cli_agent_orchestrator.api.main import terminal_ws
+
+        ws = MagicMock()
+        ws.client = MagicMock(host="10.0.0.5")
+        ws.accept = AsyncMock()
+        ws.close = AsyncMock()
+
+        with patch(
+            "cli_agent_orchestrator.api.main.WS_ALLOWED_CLIENTS",
+            ["127.0.0.1", "::1", "localhost"],
+        ):
+            await terminal_ws(ws, "abcd1234")
+
+        # Rejected before accept.
+        ws.accept.assert_not_called()
+        ws.close.assert_awaited_once()
+        kwargs = ws.close.call_args.kwargs
+        assert kwargs.get("code") == 4003
+
 
 class TestBuildPtyEnv:
     """Tests for the tmux PTY attach environment builder (issue #150).
