@@ -800,6 +800,18 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     session_name = metadata["tmux_session"]
     window_name = metadata["tmux_window"]
 
+    # Defence-in-depth: re-validate the names from the DB before they
+    # flow into a tmux subprocess argument. The POST /sessions handler
+    # now validates user-supplied session_name, but pre-existing rows
+    # or future code paths could still bypass that, and tmux parses
+    # ':' / '.' as target delimiters.
+    try:
+        validate_tmux_name(session_name, "session_name")
+        validate_tmux_name(window_name, "window_name")
+    except ValueError:
+        await websocket.close(code=4003, reason="Invalid tmux target name")
+        return
+
     # Create PTY pair for tmux attach
     master_fd, slave_fd = pty.openpty()
 

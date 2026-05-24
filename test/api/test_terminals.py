@@ -468,6 +468,38 @@ class TestWebSocketLocalhostRestriction:
         kwargs = ws.close.call_args.kwargs
         assert kwargs.get("code") == 4003
 
+    @pytest.mark.asyncio
+    async def test_websocket_endpoint_rejects_invalid_tmux_metadata(self):
+        """Defence-in-depth: if a stored terminal row contains a tmux session
+        or window name with delimiter characters, the WS handler must close
+        the connection rather than splice the bad name into ``tmux -t``.
+        """
+        from cli_agent_orchestrator.api.main import terminal_ws
+
+        ws = MagicMock()
+        ws.client = MagicMock(host="127.0.0.1")
+        ws.accept = AsyncMock()
+        ws.close = AsyncMock()
+
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.WS_ALLOWED_CLIENTS",
+                ["127.0.0.1"],
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.get_terminal_metadata",
+                return_value={"tmux_session": "evil:name", "tmux_window": "win"},
+            ),
+        ):
+            await terminal_ws(ws, "abcd1234")
+
+        # Allowlist passed → accept happened, but validation failed → 4003.
+        ws.accept.assert_awaited_once()
+        ws.close.assert_awaited_once()
+        kwargs = ws.close.call_args.kwargs
+        assert kwargs.get("code") == 4003
+        assert "Invalid tmux target name" in kwargs.get("reason", "")
+
 
 class TestBuildPtyEnv:
     """Tests for the tmux PTY attach environment builder (issue #150).
