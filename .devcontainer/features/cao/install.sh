@@ -14,8 +14,9 @@ INSTALL_DIR="/usr/local/share/cao"
 echo "Installing CLI Agent Orchestrator (version: ${VERSION})..."
 
 # Install system dependencies
-apt-get update -y
-apt-get install -y --no-install-recommends tmux git curl
+apt-get update -y \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tmux git curl \
+    && rm -rf /var/lib/apt/lists/*
 
 # Clone repository to a fixed location so editable install keeps
 # web UI asset paths correct relative to the Python package source.
@@ -43,7 +44,11 @@ if [ "$WEBUI" = "true" ]; then
     fi
     echo "Building web UI..."
     cd "$INSTALL_DIR/repo/web"
-    npm install
+    if [ -f package-lock.json ]; then
+        npm ci
+    else
+        npm install
+    fi
     npm run build
     echo "Web UI built successfully."
 fi
@@ -56,6 +61,7 @@ if [ "\${AUTOSTART:-${AUTOSTART}}" = "true" ]; then
     echo "Starting cao-server on port \${PORT:-${PORT}}..."
     exec cao-server --host 0.0.0.0 --port "\${PORT:-${PORT}}"
 fi
+exec "$@"
 EOF
 chmod +x "$INSTALL_DIR/entrypoint.sh"
 
