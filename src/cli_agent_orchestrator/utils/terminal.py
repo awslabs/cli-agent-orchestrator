@@ -43,7 +43,10 @@ def validate_tmux_name(name: str, kind: str = "name") -> str:
         ValueError: If ``name`` is not a string or fails the allowlist.
     """
     if not isinstance(name, str) or not _VALID_TMUX_NAME.match(name):
-        raise ValueError(f"Invalid {kind} '{name}': must match {_VALID_TMUX_NAME.pattern}")
+        # Use repr() so control characters (newlines, escapes) in a hostile
+        # name cannot smuggle log/response-injection payloads through the
+        # error string.
+        raise ValueError(f"Invalid {kind}: {name!r}")
     return name
 
 
