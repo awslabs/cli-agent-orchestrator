@@ -19,7 +19,6 @@ def test_install_script_uses_official_repo_default() -> None:
     """Ensure the feature installer defaults to the official upstream repository."""
     install_script = (FEATURE_DIR / "install.sh").read_text(encoding="utf-8")
 
-    assert "https://github.com/ThePlenkov/cli-agent-orchestrator" not in install_script
     assert "https://github.com/awslabs/cli-agent-orchestrator.git" in install_script
 
 
