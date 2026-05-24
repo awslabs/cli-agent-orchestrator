@@ -64,6 +64,63 @@ def set_agent_dirs(dirs: Dict[str, str]) -> Dict[str, str]:
     return get_agent_dirs()
 
 
+def get_memory_settings() -> Dict[str, Any]:
+    """Get memory-related settings.
+
+    ``enabled`` defaults to ``True`` (opt-out) to preserve current shipping
+    behavior. Setting it to ``False`` disables all memory subsystem
+    operations — see ``is_memory_enabled()``.
+    """
+    settings = _load()
+    defaults: Dict[str, Any] = {"enabled": True, "flush_threshold": 0.85}
+    saved = settings.get("memory", {})
+    result = dict(defaults)
+    result.update(saved)
+    return result
+
+
+def is_memory_enabled() -> bool:
+    """Return True when the memory subsystem is enabled.
+
+    Reads the ``memory.enabled`` flag; defaults to True (opt-out) so
+    existing installations preserve current behavior.
+    """
+    try:
+        value = get_memory_settings().get("enabled", True)
+    except Exception as e:
+        logger.warning(f"Failed to read memory.enabled, defaulting to True: {e}")
+        return True
+    return bool(value)
+
+
+def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
+    """Update a single memory setting.
+
+    Supported keys:
+        ``enabled`` (bool) — master switch for the memory subsystem.
+        ``flush_threshold`` (float, 0.0 < x ≤ 1.0) — context-usage trigger.
+    """
+    settings = _load()
+    memory = settings.get("memory", {})
+
+    if key == "enabled":
+        if not isinstance(value, bool):
+            raise ValueError(f"enabled must be a bool, got {type(value).__name__}")
+        memory[key] = value
+    elif key == "flush_threshold":
+        fval = float(value)
+        if not (0.0 < fval <= 1.0):
+            raise ValueError(f"flush_threshold must be between 0.0 and 1.0, got {fval}")
+        memory[key] = fval
+    else:
+        raise ValueError(f"Unknown memory setting: {key}")
+
+    settings["memory"] = memory
+    _save(settings)
+    logger.info(f"Updated memory setting: {key}={memory[key]}")
+    return get_memory_settings()
+
+
 def get_extra_agent_dirs() -> List[str]:
     """Get extra agent scan directories (user-added custom paths)."""
     settings = _load()

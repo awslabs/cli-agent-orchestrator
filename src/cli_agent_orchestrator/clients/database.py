@@ -83,6 +83,22 @@ class MemoryMetadataModel(Base):
     __table_args__ = (UniqueConstraint("key", "scope", "scope_id", name="uq_memory_key_scope"),)
 
 
+class ProjectAliasModel(Base):
+    """SQLAlchemy model for project identity aliases (Phase 2.5 U6).
+
+    Maps historical/alternate project identifiers (cwd hashes, manual labels)
+    to a canonical ``project_id`` so memory recall survives directory rename
+    and worktree layouts.
+    """
+
+    __tablename__ = "project_aliases"
+
+    project_id = Column(String, primary_key=True)
+    alias = Column(String, primary_key=True)
+    kind = Column(String, nullable=False)  # "git_remote" | "cwd_hash" | "manual"
+    created_at = Column(DateTime(timezone=True), default=_utcnow)
+
+
 class FlowModel(Base):
     """SQLAlchemy model for flow metadata."""
 
@@ -365,6 +381,60 @@ def get_inbox_messages(
             )
             for msg in messages
         ]
+
+
+def record_project_alias(project_id: str, alias: str, kind: str) -> None:
+    """Idempotently record a project_id ↔ alias mapping (Phase 2.5 U6).
+
+    Used opportunistically by ``resolve_project_id`` to track historical
+    cwd-hash and git-remote-url aliases for a canonical project_id. Best-effort
+    only — DB errors are swallowed so identity resolution is never blocked.
+    """
+    if not project_id or not alias or project_id == alias:
+        return
+    try:
+        with SessionLocal() as db:
+            existing = (
+                db.query(ProjectAliasModel)
+                .filter(
+                    ProjectAliasModel.project_id == project_id,
+                    ProjectAliasModel.alias == alias,
+                )
+                .first()
+            )
+            if existing is None:
+                db.add(ProjectAliasModel(project_id=project_id, alias=alias, kind=kind))
+                db.commit()
+    except Exception as e:
+        logger.debug(f"record_project_alias failed (non-fatal): {e}")
+
+
+def get_project_id_by_alias(alias: str) -> Optional[str]:
+    """Return the canonical ``project_id`` for an alias, or None if unknown."""
+    if not alias:
+        return None
+    try:
+        with SessionLocal() as db:
+            row = db.query(ProjectAliasModel).filter(ProjectAliasModel.alias == alias).first()
+            return row.project_id if row else None
+    except Exception as e:
+        logger.debug(f"get_project_id_by_alias failed (non-fatal): {e}")
+        return None
+
+
+def list_aliases_for_project(project_id: str) -> List[Dict[str, Any]]:
+    """List all aliases recorded for a canonical ``project_id``."""
+    if not project_id:
+        return []
+    try:
+        with SessionLocal() as db:
+            rows = (
+                db.query(ProjectAliasModel).filter(ProjectAliasModel.project_id == project_id).all()
+            )
+            return [{"project_id": r.project_id, "alias": r.alias, "kind": r.kind} for r in rows]
+    except Exception as e:
+        logger.debug(f"list_aliases_for_project failed (non-fatal): {e}")
+        return []
 
 
 def update_message_status(message_id: int, status: MessageStatus) -> bool:
