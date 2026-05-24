@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Devcontainer feature install script for CLI Agent Orchestrator (CAO)
-# https://github.com/ThePlenkov/cli-agent-orchestrator
+# https://github.com/awslabs/cli-agent-orchestrator
 set -e
 
 VERSION="${VERSION:-latest}"
@@ -8,7 +8,7 @@ WEBUI="${WEBUI:-true}"
 PORT="${PORT:-9889}"
 AUTOSTART="${AUTOSTART:-false}"
 
-REPO_URL="https://github.com/ThePlenkov/cli-agent-orchestrator.git"
+REPO_URL="${REPO_URL:-https://github.com/awslabs/cli-agent-orchestrator.git}"
 INSTALL_DIR="/usr/local/share/cao"
 
 echo "Installing CLI Agent Orchestrator (version: ${VERSION})..."
@@ -17,9 +17,10 @@ echo "Installing CLI Agent Orchestrator (version: ${VERSION})..."
 apt-get update -y
 apt-get install -y --no-install-recommends tmux git curl
 
-# Clone repository to a fixed location so the editable install keeps
-# the web/dist path correct relative to the Python package source.
+# Clone repository to a fixed location so editable install keeps
+# web UI asset paths correct relative to the Python package source.
 mkdir -p "$INSTALL_DIR"
+rm -rf "$INSTALL_DIR/repo"
 if [ "$VERSION" = "latest" ]; then
     git clone --depth 1 "$REPO_URL" "$INSTALL_DIR/repo"
 else
@@ -30,8 +31,8 @@ else
     fi
 fi
 
-# Editable install so that Path(__file__).parent.parent.parent.parent
-# resolves to the repo root where web/dist lives.
+# Editable install keeps server static asset resolution aligned with
+# the checked out source layout for the selected version.
 python3 -m pip install -e "$INSTALL_DIR/repo"
 
 # Build web UI if requested
@@ -59,7 +60,7 @@ EOF
 chmod +x "$INSTALL_DIR/entrypoint.sh"
 
 echo "CLI Agent Orchestrator installed successfully."
-echo "  - Run 'cao --version' to verify the CLI."
+echo "  - Run 'cao --help' to verify the CLI."
 echo "  - Run 'cao-server --help' to see server options."
 if [ "$WEBUI" = "true" ]; then
     echo "  - Web UI will be served at http://localhost:${PORT} when cao-server is running."
