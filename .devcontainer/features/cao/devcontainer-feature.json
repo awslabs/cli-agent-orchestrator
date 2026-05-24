@@ -29,8 +29,8 @@
         "ghcr.io/devcontainers/features/python:1": {}
     },
     "installsAfter": [
-        "ghcr.io/devcontainers/features/node",
-        "ghcr.io/devcontainers/features/python"
+        "ghcr.io/devcontainers/features/node:1",
+        "ghcr.io/devcontainers/features/python:1"
     ],
     "entrypoint": "/usr/local/share/cao/entrypoint.sh"
 }

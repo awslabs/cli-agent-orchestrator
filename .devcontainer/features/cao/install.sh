@@ -13,10 +13,17 @@ INSTALL_DIR="/usr/local/share/cao"
 
 echo "Installing CLI Agent Orchestrator (version: ${VERSION})..."
 
-# Install system dependencies
-apt-get update -y \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tmux git curl \
-    && rm -rf /var/lib/apt/lists/*
+# Install system dependencies with distro-aware package manager detection.
+if command -v apt-get &>/dev/null; then
+    apt-get update -y \
+        && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tmux git curl \
+        && rm -rf /var/lib/apt/lists/*
+elif command -v apk &>/dev/null; then
+    apk add --no-cache tmux git curl
+else
+    echo "ERROR: Unsupported base image. Expected apt-get or apk to install dependencies." >&2
+    exit 1
+fi
 
 TMUX_VERSION="$(tmux -V | awk '{print $2}')"
 if ! printf '3.3\n%s\n' "$TMUX_VERSION" | sort -V -C; then
@@ -31,16 +38,21 @@ rm -rf "$INSTALL_DIR/repo"
 if [[ "$VERSION" = "latest" ]]; then
     git clone --depth 1 "$REPO_URL" "$INSTALL_DIR/repo"
 else
-    # Try a filtered clone first to reduce image build cost.
-    if ! git clone --filter=blob:none "$REPO_URL" "$INSTALL_DIR/repo"; then
-        git clone "$REPO_URL" "$INSTALL_DIR/repo"
-    fi
-    if ! git -C "$INSTALL_DIR/repo" checkout "$VERSION"; then
-        rm -rf "$INSTALL_DIR/repo"
-        git clone "$REPO_URL" "$INSTALL_DIR/repo"
+    # For branch/tag refs, prefer a shallow clone for faster image builds.
+    if [[ ! "$VERSION" =~ ^[0-9a-fA-F]{7,40}$ ]] && git clone --depth 1 --branch "$VERSION" "$REPO_URL" "$INSTALL_DIR/repo"; then
+        :
+    else
+        # For commit SHAs or unknown refs, try filtered clone first to reduce transfer cost.
+        if ! git clone --filter=blob:none "$REPO_URL" "$INSTALL_DIR/repo"; then
+            git clone "$REPO_URL" "$INSTALL_DIR/repo"
+        fi
         if ! git -C "$INSTALL_DIR/repo" checkout "$VERSION"; then
-            echo "ERROR: Version '${VERSION}' not found in repository ${REPO_URL}." >&2
-            exit 1
+            rm -rf "$INSTALL_DIR/repo"
+            git clone "$REPO_URL" "$INSTALL_DIR/repo"
+            if ! git -C "$INSTALL_DIR/repo" checkout "$VERSION"; then
+                echo "ERROR: Version '${VERSION}' not found in repository ${REPO_URL}." >&2
+                exit 1
+            fi
         fi
     fi
 fi
@@ -70,11 +82,15 @@ fi
 AUTOSTART_DEFAULT_LITERAL="$(printf '%q' "$AUTOSTART")"
 PORT_DEFAULT_LITERAL="$(printf '%q' "$PORT")"
 
-cat > "$INSTALL_DIR/entrypoint.sh" << EOF
+{
+cat << EOF
 #!/usr/bin/env bash
 # CAO devcontainer entrypoint
 AUTOSTART_DEFAULT=${AUTOSTART_DEFAULT_LITERAL}
 PORT_DEFAULT=${PORT_DEFAULT_LITERAL}
+EOF
+
+cat << 'EOF'
 
 AUTOSTART_VALUE="${AUTOSTART:-$AUTOSTART_DEFAULT}"
 PORT_VALUE="${PORT:-$PORT_DEFAULT}"
@@ -90,6 +106,7 @@ fi
 
 exec tail -f /dev/null
 EOF
+} > "$INSTALL_DIR/entrypoint.sh"
 chmod +x "$INSTALL_DIR/entrypoint.sh"
 
 echo "CLI Agent Orchestrator installed successfully."
