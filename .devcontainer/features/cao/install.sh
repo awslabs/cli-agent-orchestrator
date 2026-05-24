@@ -28,7 +28,7 @@ fi
 # web UI asset paths correct relative to the Python package source.
 mkdir -p "$INSTALL_DIR"
 rm -rf "$INSTALL_DIR/repo"
-if [ "$VERSION" = "latest" ]; then
+if [[ "$VERSION" = "latest" ]]; then
     git clone --depth 1 "$REPO_URL" "$INSTALL_DIR/repo"
 else
     # Try a filtered clone first to reduce image build cost.
@@ -50,14 +50,14 @@ fi
 python3 -m pip install -e "$INSTALL_DIR/repo"
 
 # Build web UI if requested
-if [ "$WEBUI" = "true" ]; then
+if [[ "$WEBUI" = "true" ]]; then
     if ! command -v npm &>/dev/null; then
         echo "ERROR: npm is not available. Install the Node.js devcontainer feature before this one, or set webui=false." >&2
         exit 1
     fi
     echo "Building web UI..."
     cd "$INSTALL_DIR/repo/web"
-    if [ -f package-lock.json ]; then
+    if [[ -f package-lock.json ]]; then
         npm ci
     else
         npm install
@@ -79,12 +79,12 @@ PORT_DEFAULT=${PORT_DEFAULT_LITERAL}
 AUTOSTART_VALUE="${AUTOSTART:-$AUTOSTART_DEFAULT}"
 PORT_VALUE="${PORT:-$PORT_DEFAULT}"
 
-if [ "$AUTOSTART_VALUE" = "true" ]; then
+if [[ "$AUTOSTART_VALUE" = "true" ]]; then
     echo "Starting cao-server on port $PORT_VALUE..."
     exec cao-server --host 0.0.0.0 --port "$PORT_VALUE"
 fi
 
-if [ "$#" -gt 0 ]; then
+if [[ "$#" -gt 0 ]]; then
     exec "$@"
 fi
 
@@ -95,6 +95,6 @@ chmod +x "$INSTALL_DIR/entrypoint.sh"
 echo "CLI Agent Orchestrator installed successfully."
 echo "  - Run 'cao --help' to verify the CLI."
 echo "  - Run 'cao-server --help' to see server options."
-if [ "$WEBUI" = "true" ]; then
+if [[ "$WEBUI" = "true" ]]; then
     echo "  - Web UI will be served at http://localhost:${PORT} when cao-server is running."
 fi
