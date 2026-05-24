@@ -53,7 +53,7 @@ Use directly from the repository checkout:
 
 ## Validation
 
-## Mandatory smoke checks
+### Mandatory smoke checks
 
 Run in the target container environment:
 
@@ -63,7 +63,7 @@ cao --help
 cao-server --help
 ```
 
-## Optional full checks
+### Optional full checks
 
 ```bash
 sudo VERSION=latest WEBUI=true AUTOSTART=false bash .devcontainer/features/cao/install.sh

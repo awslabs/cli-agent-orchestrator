@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Devcontainer feature install script for CLI Agent Orchestrator (CAO)
 # https://github.com/awslabs/cli-agent-orchestrator
-set -e
+set -euo pipefail
 
 VERSION="${VERSION:-latest}"
 WEBUI="${WEBUI:-true}"
@@ -25,10 +25,17 @@ rm -rf "$INSTALL_DIR/repo"
 if [ "$VERSION" = "latest" ]; then
     git clone --depth 1 "$REPO_URL" "$INSTALL_DIR/repo"
 else
-    git clone "$REPO_URL" "$INSTALL_DIR/repo"
+    # Try a filtered clone first to reduce image build cost.
+    if ! git clone --filter=blob:none "$REPO_URL" "$INSTALL_DIR/repo"; then
+        git clone "$REPO_URL" "$INSTALL_DIR/repo"
+    fi
     if ! git -C "$INSTALL_DIR/repo" checkout "$VERSION"; then
-        echo "ERROR: Version '${VERSION}' not found in repository ${REPO_URL}." >&2
-        exit 1
+        rm -rf "$INSTALL_DIR/repo"
+        git clone "$REPO_URL" "$INSTALL_DIR/repo"
+        if ! git -C "$INSTALL_DIR/repo" checkout "$VERSION"; then
+            echo "ERROR: Version '${VERSION}' not found in repository ${REPO_URL}." >&2
+            exit 1
+        fi
     fi
 fi
 
@@ -54,15 +61,27 @@ if [ "$WEBUI" = "true" ]; then
 fi
 
 # Create entrypoint script that optionally starts cao-server on container start
-cat > "$INSTALL_DIR/entrypoint.sh" << EOF
+cat > "$INSTALL_DIR/entrypoint.sh" << 'EOF'
 #!/usr/bin/env bash
 # CAO devcontainer entrypoint
-if [ "\${AUTOSTART:-${AUTOSTART}}" = "true" ]; then
-    echo "Starting cao-server on port \${PORT:-${PORT}}..."
-    exec cao-server --host 0.0.0.0 --port "\${PORT:-${PORT}}"
+AUTOSTART_DEFAULT="__AUTOSTART_DEFAULT__"
+PORT_DEFAULT="__PORT_DEFAULT__"
+
+AUTOSTART_VALUE="${AUTOSTART:-$AUTOSTART_DEFAULT}"
+PORT_VALUE="${PORT:-$PORT_DEFAULT}"
+
+if [ "$AUTOSTART_VALUE" = "true" ]; then
+    echo "Starting cao-server on port $PORT_VALUE..."
+    exec cao-server --host 0.0.0.0 --port "$PORT_VALUE"
 fi
-exec "$@"
+
+if [ "$#" -gt 0 ]; then
+    exec "$@"
+fi
+
+exec tail -f /dev/null
 EOF
+sed -i "s|__AUTOSTART_DEFAULT__|$AUTOSTART|g; s|__PORT_DEFAULT__|$PORT|g" "$INSTALL_DIR/entrypoint.sh"
 chmod +x "$INSTALL_DIR/entrypoint.sh"
 
 echo "CLI Agent Orchestrator installed successfully."
