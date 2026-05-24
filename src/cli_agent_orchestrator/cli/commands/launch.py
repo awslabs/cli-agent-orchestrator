@@ -28,6 +28,60 @@ PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
     "opencode_cli",
 }
 
+# Validation constraints for ``--env`` forwarded vars (mirrored server-side
+# in ``TmuxClient._merge_extra_env``). See issue #248.
+_FORWARDED_ENV_BLOCKED_PREFIXES = ("CLAUDE", "CODEX_", "__MISE_")
+_FORWARDED_ENV_PREFIX_ALLOWLIST = frozenset(
+    {
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+        "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+        "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+        "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+    }
+)
+_FORWARDED_ENV_MAX_VALUE_BYTES = 2048
+
+
+def _parse_env_pairs(pairs):
+    """Parse repeated ``KEY=VALUE`` entries into a dict, validating each.
+
+    Mirrors the constraints applied to inherited env in TmuxClient so a
+    forwarded var that would be silently dropped server-side is rejected at
+    the CLI boundary with a clear error message instead.
+    """
+    result: dict[str, str] = {}
+    for raw in pairs:
+        if "=" not in raw:
+            raise click.ClickException(
+                f"--env expects KEY=VALUE (got {raw!r}); did you forget the '='?"
+            )
+        key, value = raw.split("=", 1)
+        # POSIX env names: leading letter/underscore, then alnum/underscore.
+        # Stricter than ``str.isidentifier`` only in that it forbids non-ASCII.
+        if (
+            not key
+            or not (key[0].isalpha() or key[0] == "_")
+            or not all(c.isalnum() or c == "_" for c in key)
+            or not key.isascii()
+        ):
+            raise click.ClickException(f"--env key must match [A-Za-z_][A-Za-z0-9_]* (got {key!r})")
+        if key not in _FORWARDED_ENV_PREFIX_ALLOWLIST and any(
+            key.startswith(p) for p in _FORWARDED_ENV_BLOCKED_PREFIXES
+        ):
+            raise click.ClickException(
+                f"--env key {key!r} uses a blocked prefix "
+                f"({', '.join(_FORWARDED_ENV_BLOCKED_PREFIXES)}) reserved for provider env"
+            )
+        if len(value.encode("utf-8")) >= _FORWARDED_ENV_MAX_VALUE_BYTES:
+            raise click.ClickException(
+                f"--env value for {key!r} exceeds {_FORWARDED_ENV_MAX_VALUE_BYTES} bytes "
+                "(tmux argv limit, PR #246)"
+            )
+        result[key] = value
+    return result
+
 
 @click.command()
 @click.argument("message", required=False, default=None)
@@ -66,6 +120,16 @@ PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
     default=None,
     help="Working directory for the session (default: current directory)",
 )
+@click.option(
+    "--env",
+    "env_pairs",
+    multiple=True,
+    metavar="KEY=VALUE",
+    help="Forward an env var to the supervisor AND every worker spawned later "
+    "in the same session. Repeatable. Values travel in the request body, not "
+    "the URL. Blocked prefixes (CLAUDE/CODEX_/__MISE_) and >=2048-byte values "
+    "are rejected. See issue #248.",
+)
 def launch(
     message,
     agents,
@@ -77,11 +141,13 @@ def launch(
     auto_approve,
     yolo,
     working_directory,
+    env_pairs,
 ):
     """Launch cao session with specified agent profile."""
     try:
         display_dir = working_directory or os.path.realpath(os.getcwd())
         explicit_provider = provider is not None  # True only when --provider was passed
+        forwarded_env = _parse_env_pairs(env_pairs) if env_pairs else {}
 
         # Resolve allowedTools: --yolo > --allowed-tools CLI > profile/role defaults
         from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -202,7 +268,14 @@ def launch(
             # Pass as comma-separated string for query param
             params["allowed_tools"] = ",".join(resolved_allowed_tools)
 
-        response = requests.post(url, params=params)
+        # Forwarded env vars travel in the JSON body so values (which may
+        # contain secrets) don't end up in cao-server's HTTP access log.
+        # See issue #248.
+        post_kwargs: dict = {"params": params}
+        if forwarded_env:
+            post_kwargs["json"] = {"env_vars": forwarded_env}
+
+        response = requests.post(url, **post_kwargs)
         response.raise_for_status()
 
         terminal = response.json()

@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
-from cli_agent_orchestrator.cli.commands.launch import launch
+from cli_agent_orchestrator.cli.commands.launch import _parse_env_pairs, launch
 
 
 def test_launch_passes_cwd_by_default():
@@ -734,3 +734,146 @@ def test_launch_yolo_falls_back_to_default_when_profile_lacks_provider():
         # The kiro_cli-specific yolo warning IS expected here because the
         # profile didn't override and the fallback is kiro_cli.
         assert "kiro_cli will launch in --legacy-ui mode" in result.output
+
+
+# ── --env forwarded env vars (issue #248) ────────────────────────────
+
+
+class TestParseEnvPairs:
+    """``_parse_env_pairs`` validates --env at the CLI boundary so a value
+    that would be silently dropped server-side is rejected up front."""
+
+    def test_valid_pairs_parsed(self):
+        assert _parse_env_pairs(["FOO=bar", "AWS_REGION=us-west-2"]) == {
+            "FOO": "bar",
+            "AWS_REGION": "us-west-2",
+        }
+
+    def test_value_with_equals_preserved(self):
+        # Split on first '=' only — values may legitimately contain '='.
+        assert _parse_env_pairs(["URL=https://x?a=1&b=2"]) == {"URL": "https://x?a=1&b=2"}
+
+    def test_empty_value_allowed(self):
+        assert _parse_env_pairs(["EMPTY="]) == {"EMPTY": ""}
+
+    @pytest.mark.parametrize("bad", ["NO_EQUALS", "", "=value_with_no_key"])
+    def test_invalid_format_rejected(self, bad):
+        import click as _click
+
+        with pytest.raises(_click.ClickException):
+            _parse_env_pairs([bad])
+
+    @pytest.mark.parametrize("key", ["1FOO", "FÖÖ", "BAD-KEY", "WITH SPACE"])
+    def test_bad_key_rejected(self, key):
+        import click as _click
+
+        with pytest.raises(_click.ClickException, match="--env key must match"):
+            _parse_env_pairs([f"{key}=x"])
+
+    @pytest.mark.parametrize("blocked", ["CLAUDE_SECRET=x", "CODEX_TOKEN=x", "__MISE_X=y"])
+    def test_blocked_prefix_rejected(self, blocked):
+        import click as _click
+
+        with pytest.raises(_click.ClickException, match="blocked prefix"):
+            _parse_env_pairs([blocked])
+
+    def test_allowlisted_claude_auth_var_passes(self):
+        # The 6 CLAUDE_CODE_USE_* / SKIP_* auth vars are explicitly allowed
+        # through despite matching the CLAUDE prefix — same allowlist as
+        # TmuxClient inherits at the server boundary.
+        assert _parse_env_pairs(["CLAUDE_CODE_USE_BEDROCK=1"]) == {"CLAUDE_CODE_USE_BEDROCK": "1"}
+
+    def test_value_at_cap_rejected(self):
+        import click as _click
+
+        with pytest.raises(_click.ClickException, match="exceeds 2048 bytes"):
+            _parse_env_pairs(["BIG=" + ("x" * 2048)])
+
+    def test_value_under_cap_accepted(self):
+        assert _parse_env_pairs(["SMALL=" + ("x" * 2047)]) == {"SMALL": "x" * 2047}
+
+
+def test_launch_forwards_env_in_json_body_not_url():
+    """``--env`` values travel in the request body so secrets do not leak
+    into cao-server's HTTP access log. Issue #248."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run"),
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
+
+        result = runner.invoke(
+            launch,
+            [
+                "--agents",
+                "test-agent",
+                "--yolo",
+                "--env",
+                "MNEMOSYNE_DIR=/root/mnemosyne",
+                "--env",
+                "ISAAC_CHANNEL=room:engineering",
+            ],
+        )
+
+        assert result.exit_code == 0
+        kwargs = mock_post.call_args.kwargs
+        # env vars must NOT appear in query params
+        assert "env_vars" not in kwargs["params"]
+        assert "MNEMOSYNE_DIR" not in kwargs["params"]
+        # env vars travel under the embedded ``env_vars`` body key
+        assert kwargs["json"] == {
+            "env_vars": {
+                "MNEMOSYNE_DIR": "/root/mnemosyne",
+                "ISAAC_CHANNEL": "room:engineering",
+            }
+        }
+
+
+def test_launch_without_env_omits_request_body():
+    """A launch with no --env must not send a JSON body — preserves
+    backward compatibility with callers that ignore an unexpected body."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run"),
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
+
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
+
+        assert result.exit_code == 0
+        assert "json" not in mock_post.call_args.kwargs
+
+
+def test_launch_rejects_blocked_env_prefix_before_calling_api():
+    """A blocked --env prefix must fail at the CLI boundary, before any
+    POST is issued — operator gets an actionable error instead of a
+    silent server-side drop."""
+    runner = CliRunner()
+
+    with patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post:
+        result = runner.invoke(
+            launch,
+            ["--agents", "test-agent", "--yolo", "--env", "CLAUDE_SESSION_ID=abc"],
+        )
+
+        assert result.exit_code != 0
+        assert "blocked prefix" in result.output
+        mock_post.assert_not_called()

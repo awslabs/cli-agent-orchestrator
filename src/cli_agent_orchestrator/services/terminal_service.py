@@ -44,6 +44,7 @@ from cli_agent_orchestrator.plugins import (
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
+from cli_agent_orchestrator.services.session_env import get_session_env, set_session_env
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
 from cli_agent_orchestrator.utils.terminal import (
@@ -115,6 +116,7 @@ def create_terminal(
     working_directory: Optional[str] = None,
     allowed_tools: Optional[list[str]] = None,
     registry: PluginRegistry | None = None,
+    env_vars: Optional[dict[str, str]] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -131,6 +133,12 @@ def create_terminal(
         session_name: Optional custom session name. If not provided, auto-generated.
         new_session: If True, creates a new tmux session. If False, adds to existing.
         working_directory: Optional working directory for the terminal shell
+        env_vars: Operator-forwarded env vars (``cao launch --env``). On
+            ``new_session=True``, these are stored on the session record and
+            inherited by every worker spawned later in the same session. On
+            ``new_session=False``, the persisted session vars are merged in
+            automatically; the explicit ``env_vars`` argument is ignored to
+            keep the per-session view consistent. See issue #248.
 
     Returns:
         Terminal object with all metadata populated
@@ -159,15 +167,31 @@ def create_terminal(
             if tmux_client.session_exists(session_name):
                 raise ValueError(f"Session '{session_name}' already exists")
 
+            # Persist forwarded env BEFORE the tmux call so even an early
+            # failure leaves the session record consistent with what gets
+            # cleared on delete_session.
+            if env_vars:
+                set_session_env(session_name, env_vars)
+
             # Create new tmux session with initial window
-            tmux_client.create_session(session_name, window_name, terminal_id, working_directory)
+            tmux_client.create_session(
+                session_name,
+                window_name,
+                terminal_id,
+                working_directory,
+                extra_env=env_vars,
+            )
             session_created = True  # only set after successful creation
         else:
             # Add window to existing session
             if not tmux_client.session_exists(session_name):
                 raise ValueError(f"Session '{session_name}' not found")
             window_name = tmux_client.create_window(
-                session_name, window_name, terminal_id, working_directory
+                session_name,
+                window_name,
+                terminal_id,
+                working_directory,
+                extra_env=get_session_env(session_name),
             )
 
         # Step 3: Persist terminal metadata to database

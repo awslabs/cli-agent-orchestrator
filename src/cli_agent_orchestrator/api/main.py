@@ -14,7 +14,16 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Dict, List, Optional, cast
 
-from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
+from fastapi import (
+    Body,
+    FastAPI,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field, field_validator
@@ -406,8 +415,15 @@ async def create_session(
     session_name: Optional[str] = None,
     working_directory: Optional[str] = None,
     allowed_tools: Optional[str] = None,
+    env_vars: Optional[Dict[str, str]] = Body(default=None, embed=True),
 ) -> Terminal:
-    """Create a new session with exactly one terminal."""
+    """Create a new session with exactly one terminal.
+
+    ``env_vars`` (request body, optional) is the operator-forwarded env map
+    from ``cao launch --env``. It travels in the JSON body — not the query
+    string — so values potentially containing secrets do not land in
+    cao-server's HTTP access log. See issue #248.
+    """
     try:
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
@@ -419,6 +435,7 @@ async def create_session(
             working_directory=working_directory,
             allowed_tools=allowed_tools_list,
             registry=get_plugin_registry(request),
+            env_vars=env_vars,
         )
         return result
 

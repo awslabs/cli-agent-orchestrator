@@ -30,6 +30,28 @@ cao shutdown --session <session-name>
 
 ![Tmux Window Selector](./assets/tmux_all_windows.png)
 
+## Forwarding env vars to spawned agents
+
+By default, only a tight allowlist of env vars (`HOME`, `PATH`, `SHELL`, plus `CAO_*` / `KIRO_*` / `MISE_*` / `AWS_*` prefixes) reaches agents spawned inside tmux. The filter keeps the `tmux new-session -e` argv under the kernel limit and prevents nested-session loops when CAO itself runs inside a provider.
+
+To forward additional vars to **the supervisor and every worker spawned later in the same session** (via `assign` / `handoff` / the web UI), pass `--env KEY=VALUE` to `cao launch`:
+
+```bash
+cao launch --agents code_supervisor \
+  --env MNEMOSYNE_DIR=/root/mnemosyne \
+  --env ISAAC_CHANNEL=room:engineering
+```
+
+The flag is repeatable. Values travel in the request body, not the URL, so secrets do not land in cao-server's HTTP access log.
+
+Rejected at the CLI boundary:
+
+- Keys matching `CLAUDE` / `CODEX_` / `__MISE_` (reserved for provider auth — the 6 `CLAUDE_CODE_USE_*` / `CLAUDE_CODE_SKIP_*` auth flags are explicitly allowlisted).
+- Keys outside `[A-Za-z_][A-Za-z0-9_]*` (non-POSIX names break the shell).
+- Values ≥ 2048 bytes (per-var cap that keeps the tmux argv under the kernel limit — see PR #246).
+
+Forwarded vars are held in process memory on cao-server and dropped when the session is deleted; restarting cao-server wipes them.
+
 ## Notes
 
 - CAO session names are automatically prefixed with `cao-`. Use the prefixed name (e.g. `cao-my-task`) when referencing a session in `tmux attach`, `cao session send`, or `cao shutdown`.
