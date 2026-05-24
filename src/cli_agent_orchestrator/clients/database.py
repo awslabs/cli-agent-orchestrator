@@ -119,16 +119,16 @@ def _migrate_memory_indexes() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        conn = sqlite3.connect(str(DATABASE_FILE))
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory_metadata (scope, scope_id)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_memory_updated ON memory_metadata (updated_at)"
-        )
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_type ON memory_metadata (memory_type)")
-        conn.commit()
-        conn.close()
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory_metadata (scope, scope_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memory_updated ON memory_metadata (updated_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memory_type ON memory_metadata (memory_type)"
+            )
     except Exception as e:
         logger.debug(f"Memory index migration skipped: {e}")
 
