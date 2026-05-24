@@ -4,7 +4,7 @@
 set -euo pipefail
 
 VERSION="${VERSION:-latest}"
-WEBUI="${WEBUI:-true}"
+WEBUI="${WEBUI:-false}"
 PORT="${PORT:-9889}"
 AUTOSTART="${AUTOSTART:-false}"
 
@@ -17,6 +17,12 @@ echo "Installing CLI Agent Orchestrator (version: ${VERSION})..."
 apt-get update -y \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tmux git curl \
     && rm -rf /var/lib/apt/lists/*
+
+TMUX_VERSION="$(tmux -V | awk '{print $2}')"
+if ! printf '3.3\n%s\n' "$TMUX_VERSION" | sort -V -C; then
+    echo "ERROR: tmux >= 3.3 is required, but found $TMUX_VERSION." >&2
+    exit 1
+fi
 
 # Clone repository to a fixed location so editable install keeps
 # web UI asset paths correct relative to the Python package source.
@@ -61,11 +67,14 @@ if [ "$WEBUI" = "true" ]; then
 fi
 
 # Create entrypoint script that optionally starts cao-server on container start
-cat > "$INSTALL_DIR/entrypoint.sh" << 'EOF'
+AUTOSTART_DEFAULT_LITERAL="$(printf '%q' "$AUTOSTART")"
+PORT_DEFAULT_LITERAL="$(printf '%q' "$PORT")"
+
+cat > "$INSTALL_DIR/entrypoint.sh" << EOF
 #!/usr/bin/env bash
 # CAO devcontainer entrypoint
-AUTOSTART_DEFAULT="__AUTOSTART_DEFAULT__"
-PORT_DEFAULT="__PORT_DEFAULT__"
+AUTOSTART_DEFAULT=${AUTOSTART_DEFAULT_LITERAL}
+PORT_DEFAULT=${PORT_DEFAULT_LITERAL}
 
 AUTOSTART_VALUE="${AUTOSTART:-$AUTOSTART_DEFAULT}"
 PORT_VALUE="${PORT:-$PORT_DEFAULT}"
@@ -81,7 +90,6 @@ fi
 
 exec tail -f /dev/null
 EOF
-sed -i "s|__AUTOSTART_DEFAULT__|$AUTOSTART|g; s|__PORT_DEFAULT__|$PORT|g" "$INSTALL_DIR/entrypoint.sh"
 chmod +x "$INSTALL_DIR/entrypoint.sh"
 
 echo "CLI Agent Orchestrator installed successfully."

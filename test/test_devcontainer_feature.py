@@ -40,3 +40,12 @@ def test_feature_declares_python_dependency() -> None:
     )
 
     assert feature_manifest["dependsOn"]["ghcr.io/devcontainers/features/python:1"] == {}
+
+
+def test_feature_webui_defaults_to_false() -> None:
+    """Default config should not require npm/node to complete installation."""
+    feature_manifest = json.loads(
+        (FEATURE_DIR / "devcontainer-feature.json").read_text(encoding="utf-8")
+    )
+
+    assert feature_manifest["options"]["webui"]["default"] is False

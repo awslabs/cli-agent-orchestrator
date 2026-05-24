@@ -11,7 +11,7 @@ Install CLI Agent Orchestrator inside a devcontainer with one feature block, opt
 The feature supports these options:
 
 - `version` (string, default: `latest`) - git ref to checkout (`latest`, tag, or commit SHA)
-- `webui` (boolean, default: `true`) - build web assets during install
+- `webui` (boolean, default: `false`) - build web assets during install
 - `port` (string, default: `9889`) - server port used by entrypoint autostart
 - `autostart` (boolean, default: `false`) - run `cao-server` when container starts
 
@@ -26,7 +26,7 @@ Use after publishing to GHCR:
   "features": {
     "ghcr.io/awslabs/cli-agent-orchestrator/cao:2": {
       "version": "latest",
-      "webui": true,
+      "webui": false,
       "port": "9889",
       "autostart": false
     }
@@ -43,13 +43,15 @@ Use directly from the repository checkout:
   "features": {
     "./.devcontainer/features/cao": {
       "version": "latest",
-      "webui": true,
+      "webui": false,
       "port": "9889",
       "autostart": false
     }
   }
 }
 ```
+
+If you enable `webui: true`, ensure `npm` is available in the container (for example by adding `ghcr.io/devcontainers/features/node:1`).
 
 ## Validation
 

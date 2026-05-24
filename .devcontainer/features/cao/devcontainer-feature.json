@@ -11,7 +11,7 @@
         },
         "webui": {
             "type": "boolean",
-            "default": true,
+            "default": false,
             "description": "Build and include the web UI"
         },
         "port": {
