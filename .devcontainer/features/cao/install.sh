@@ -26,7 +26,16 @@ else
 fi
 
 TMUX_VERSION="$(tmux -V | awk '{print $2}')"
-if ! printf '3.3\n%s\n' "$TMUX_VERSION" | sort -V -C; then
+TMUX_MAJOR="$(printf '%s' "$TMUX_VERSION" | awk -F. '{print $1}')"
+TMUX_MINOR_RAW="$(printf '%s' "$TMUX_VERSION" | awk -F. '{print $2}')"
+TMUX_MINOR="${TMUX_MINOR_RAW%%[^0-9]*}"
+
+if [[ -z "$TMUX_MAJOR" || ! "$TMUX_MAJOR" =~ ^[0-9]+$ || -z "$TMUX_MINOR" || ! "$TMUX_MINOR" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: Unable to parse tmux version '$TMUX_VERSION'." >&2
+    exit 1
+fi
+
+if (( TMUX_MAJOR < 3 || (TMUX_MAJOR == 3 && TMUX_MINOR < 3) )); then
     echo "ERROR: tmux >= 3.3 is required, but found $TMUX_VERSION." >&2
     exit 1
 fi
