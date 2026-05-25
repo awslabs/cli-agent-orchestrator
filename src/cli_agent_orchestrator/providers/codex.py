@@ -133,82 +133,91 @@ class CodexProvider(BaseProvider):
         Returns properly escaped shell command string that can be safely sent via tmux.
         Uses codex's -c developer_instructions flag to inject agent system prompts.
         """
-        # --yolo (alias for --dangerously-bypass-approvals-and-sandbox):
-        # bypass approval prompts and sandboxing. CAO agents run in
-        # non-interactive tmux sessions where interactive approval prompts
-        # block handoff/assign flows. This mirrors Claude Code's
-        # --dangerously-skip-permissions and Gemini CLI's --yolo flags.
-        command_parts = ["codex", "--yolo", "--no-alt-screen", "--disable", "shell_snapshot"]
+        # --yolo (alias for --dangerously-bypass-approvals-and-sandbox)
+        # is the default because CAO runs codex non-interactively in tmux
+        # where approval prompts would block handoff/assign. Profiles can
+        # opt out via `codexProfile` (names a [profiles.<name>] block in
+        # ~/.codex/config.toml), unless unrestricted allowed tools are enabled.
+        # In practice, allowed_tools containing "*" is treated as yolo mode
+        # and overrides codexProfile in the same way as an explicit yolo launch.
+        yolo = bool(self._allowed_tools and "*" in self._allowed_tools)
 
+        profile = None
         if self._agent_profile is not None:
             try:
                 profile = load_agent_profile(self._agent_profile)
-
-                if profile.model:
-                    command_parts.extend(["--model", profile.model])
-
-                system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
-                system_prompt = self._apply_skill_prompt(system_prompt)
-
-                # Prepend security constraints for soft enforcement (Codex has no
-                # native tool restriction mechanism). Only applied when tool
-                # restrictions are active (not unrestricted "*").
-                if self._allowed_tools and "*" not in self._allowed_tools:
-                    from cli_agent_orchestrator.constants import SECURITY_PROMPT
-
-                    tools_list = ", ".join(self._allowed_tools)
-                    tool_constraint = f"\nYou only have access to these tools: {tools_list}\n"
-                    system_prompt = SECURITY_PROMPT + tool_constraint + system_prompt
-
-                if system_prompt:
-                    # Codex accepts developer_instructions via -c config override.
-                    # This is injected as a developer role message before AGENTS.md content.
-                    # Escape backslashes, double quotes, and newlines for TOML basic string.
-                    # Newlines must become literal \n to prevent tmux send_keys from
-                    # splitting the command across multiple lines.
-                    escaped_prompt = (
-                        system_prompt.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-                    )
-                    command_parts.extend(["-c", f'developer_instructions="{escaped_prompt}"'])
-
-                # Add MCP servers via -c config overrides (per-session, no global config changes).
-                # Each server field is set via dotted path: mcp_servers.<name>.<field>=<value>
-                if profile.mcpServers:
-                    for server_name, server_config in profile.mcpServers.items():
-                        prefix = f"mcp_servers.{server_name}"
-                        if isinstance(server_config, dict):
-                            cfg = server_config
-                        else:
-                            cfg = server_config.model_dump(exclude_none=True)
-                        if "command" in cfg:
-                            command_parts.extend(["-c", f'{prefix}.command="{cfg["command"]}"'])
-                        if "args" in cfg:
-                            args_toml = "[" + ", ".join(f'"{a}"' for a in cfg["args"]) + "]"
-                            command_parts.extend(["-c", f"{prefix}.args={args_toml}"])
-                        if "env" in cfg and cfg["env"]:
-                            for env_key, env_val in cfg["env"].items():
-                                command_parts.extend(["-c", f'{prefix}.env.{env_key}="{env_val}"'])
-                        # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
-                        # can identify the current session for handoff/assign operations.
-                        # Codex does not forward env vars to MCP subprocesses by default;
-                        # env_vars lists names to inherit from the parent shell environment.
-                        env_vars = cfg.get("env_vars", [])
-                        if "CAO_TERMINAL_ID" not in env_vars:
-                            env_vars = list(env_vars) + ["CAO_TERMINAL_ID"]
-                        env_vars_toml = "[" + ", ".join(f'"{v}"' for v in env_vars) + "]"
-                        command_parts.extend(["-c", f"{prefix}.env_vars={env_vars_toml}"])
-                        # Set a generous tool timeout for MCP calls like handoff, which
-                        # create a new terminal, initialize the provider, send a message,
-                        # wait for the agent to complete, and extract the output.
-                        # Codex defaults to 60s which is too short for multi-step operations.
-                        # Value MUST be a TOML float (600.0, not 600) because Codex
-                        # deserializes tool_timeout_sec via Option<f64>; a TOML integer
-                        # is silently rejected and falls back to the 60s default.
-                        if "tool_timeout_sec" not in cfg:
-                            command_parts.extend(["-c", f"{prefix}.tool_timeout_sec=600.0"])
-
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
+
+        if profile and profile.codexProfile and not yolo:
+            command_parts = ["codex", "--profile", profile.codexProfile]
+        else:
+            command_parts = ["codex", "--yolo"]
+        command_parts.extend(["--no-alt-screen", "--disable", "shell_snapshot"])
+
+        if profile is not None:
+            if profile.model:
+                command_parts.extend(["--model", profile.model])
+
+            system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
+            system_prompt = self._apply_skill_prompt(system_prompt)
+
+            # Prepend security constraints for soft enforcement (Codex has no
+            # native tool restriction mechanism). Only applied when tool
+            # restrictions are active (not unrestricted "*").
+            if self._allowed_tools and "*" not in self._allowed_tools:
+                from cli_agent_orchestrator.constants import SECURITY_PROMPT
+
+                tools_list = ", ".join(self._allowed_tools)
+                tool_constraint = f"\nYou only have access to these tools: {tools_list}\n"
+                system_prompt = SECURITY_PROMPT + tool_constraint + system_prompt
+
+            if system_prompt:
+                # Codex accepts developer_instructions via -c config override.
+                # This is injected as a developer role message before AGENTS.md content.
+                # Escape backslashes, double quotes, and newlines for TOML basic string.
+                # Newlines must become literal \n to prevent tmux send_keys from
+                # splitting the command across multiple lines.
+                escaped_prompt = (
+                    system_prompt.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+                )
+                command_parts.extend(["-c", f'developer_instructions="{escaped_prompt}"'])
+
+            # Add MCP servers via -c config overrides (per-session, no global config changes).
+            # Each server field is set via dotted path: mcp_servers.<name>.<field>=<value>
+            if profile.mcpServers:
+                for server_name, server_config in profile.mcpServers.items():
+                    prefix = f"mcp_servers.{server_name}"
+                    if isinstance(server_config, dict):
+                        cfg = server_config
+                    else:
+                        cfg = server_config.model_dump(exclude_none=True)
+                    if "command" in cfg:
+                        command_parts.extend(["-c", f'{prefix}.command="{cfg["command"]}"'])
+                    if "args" in cfg:
+                        args_toml = "[" + ", ".join(f'"{a}"' for a in cfg["args"]) + "]"
+                        command_parts.extend(["-c", f"{prefix}.args={args_toml}"])
+                    if "env" in cfg and cfg["env"]:
+                        for env_key, env_val in cfg["env"].items():
+                            command_parts.extend(["-c", f'{prefix}.env.{env_key}="{env_val}"'])
+                    # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
+                    # can identify the current session for handoff/assign operations.
+                    # Codex does not forward env vars to MCP subprocesses by default;
+                    # env_vars lists names to inherit from the parent shell environment.
+                    env_vars = cfg.get("env_vars", [])
+                    if "CAO_TERMINAL_ID" not in env_vars:
+                        env_vars = list(env_vars) + ["CAO_TERMINAL_ID"]
+                    env_vars_toml = "[" + ", ".join(f'"{v}"' for v in env_vars) + "]"
+                    command_parts.extend(["-c", f"{prefix}.env_vars={env_vars_toml}"])
+                    # Set a generous tool timeout for MCP calls like handoff, which
+                    # create a new terminal, initialize the provider, send a message,
+                    # wait for the agent to complete, and extract the output.
+                    # Codex defaults to 60s which is too short for multi-step operations.
+                    # Value MUST be a TOML float (600.0, not 600) because Codex
+                    # deserializes tool_timeout_sec via Option<f64>; a TOML integer
+                    # is silently rejected and falls back to the 60s default.
+                    if "tool_timeout_sec" not in cfg:
+                        command_parts.extend(["-c", f"{prefix}.tool_timeout_sec=600.0"])
 
         return shlex.join(command_parts)
 
