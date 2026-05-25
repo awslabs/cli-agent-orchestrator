@@ -9,6 +9,7 @@ from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
     generate_terminal_id,
     generate_window_name,
+    validate_tmux_name,
     wait_for_shell,
     wait_until_status,
     wait_until_terminal_status,
@@ -55,6 +56,73 @@ class TestGenerateFunctions:
         names = [generate_window_name("test") for _ in range(10)]
 
         assert len(set(names)) == 10
+
+    def test_generate_window_name_rejects_unsafe_profile(self):
+        """A profile name with tmux delimiters must not produce a window name."""
+        with pytest.raises(ValueError):
+            generate_window_name("evil:profile")
+        with pytest.raises(ValueError):
+            generate_window_name("evil profile")
+        with pytest.raises(ValueError):
+            generate_window_name("../escape")
+
+
+class TestValidateTmuxName:
+    """Tests for the tmux name allowlist validator."""
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "cao-abcd1234",
+            "developer-1a2b",
+            "session_1",
+            "A",
+            "abc123",
+            "_underscore_start",
+            "a" * 64,
+        ],
+    )
+    def test_accepts_safe_names(self, name):
+        assert validate_tmux_name(name) == name
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "",
+            "-leading-dash",
+            "with:colon",
+            "with.dot",
+            "with space",
+            "with/slash",
+            "with;semi",
+            "with$dollar",
+            "with`backtick",
+            "with$(cmd)",
+            "with\nnewline",
+            "trailing\n",
+            "trailing\r",
+            "..",
+            "../escape",
+            "a" * 65,
+        ],
+    )
+    def test_rejects_unsafe_names(self, name):
+        with pytest.raises(ValueError):
+            validate_tmux_name(name)
+
+    def test_rejects_non_string(self):
+        with pytest.raises(ValueError):
+            validate_tmux_name(None)  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            validate_tmux_name(123)  # type: ignore[arg-type]
+
+    def test_error_message_includes_kind(self):
+        try:
+            validate_tmux_name("bad:name", kind="session_name")
+        except ValueError as e:
+            assert "session_name" in str(e)
+        else:
+            pytest.fail("expected ValueError")
 
 
 class TestWaitForShell:

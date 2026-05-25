@@ -1,6 +1,7 @@
 """Session utilities for CLI Agent Orchestrator."""
 
 import logging
+import re
 import time
 import uuid
 from typing import TYPE_CHECKING, Union
@@ -17,11 +18,45 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Allowlist for tmux session/window names. tmux uses ':' and '.' as target
+# delimiters and treats leading '-' as an option, so we constrain names to
+# safe characters only. The 64-char cap matches typical tmux name lengths.
+_VALID_TMUX_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_\-]{0,63}$")
+
+
+def validate_tmux_name(name: str, kind: str = "name") -> str:
+    """Validate a tmux session or window name against an allowlist.
+
+    Rejects names containing tmux target delimiters (':', '.'), shell
+    metacharacters, leading dashes (parsed as flags), or any character
+    outside ``[A-Za-z0-9_-]``. The first character must be alphanumeric
+    or underscore.
+
+    Args:
+        name: Candidate session or window name.
+        kind: Label used in the error message (e.g. ``"session_name"``).
+
+    Returns:
+        The validated name unchanged.
+
+    Raises:
+        ValueError: If ``name`` is not a string or fails the allowlist.
+    """
+    # fullmatch() (not match()): Python's `$` anchor can match before a
+    # trailing newline, so `match()` would accept `"name\n"`. fullmatch
+    # forces the entire string to satisfy the pattern.
+    if not isinstance(name, str) or not _VALID_TMUX_NAME.fullmatch(name):
+        # Use repr() so control characters (newlines, escapes) in a hostile
+        # name cannot smuggle log/response-injection payloads through the
+        # error string.
+        raise ValueError(f"Invalid {kind}: {name!r}")
+    return name
+
 
 def generate_session_name() -> str:
     """Generate a unique session name with SESSION_PREFIX."""
     session_uuid = uuid.uuid4().hex[:8]
-    return f"{SESSION_PREFIX}{session_uuid}"
+    return validate_tmux_name(f"{SESSION_PREFIX}{session_uuid}", "session_name")
 
 
 def generate_terminal_id() -> str:
@@ -31,7 +66,7 @@ def generate_terminal_id() -> str:
 
 def generate_window_name(agent_profile: str) -> str:
     """Generate window name from agent profile with unique suffix."""
-    return f"{agent_profile}-{uuid.uuid4().hex[:4]}"
+    return validate_tmux_name(f"{agent_profile}-{uuid.uuid4().hex[:4]}", "window_name")
 
 
 def wait_for_shell(
