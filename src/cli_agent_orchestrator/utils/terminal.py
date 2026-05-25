@@ -42,7 +42,10 @@ def validate_tmux_name(name: str, kind: str = "name") -> str:
     Raises:
         ValueError: If ``name`` is not a string or fails the allowlist.
     """
-    if not isinstance(name, str) or not _VALID_TMUX_NAME.match(name):
+    # fullmatch() (not match()): Python's `$` anchor can match before a
+    # trailing newline, so `match()` would accept `"name\n"`. fullmatch
+    # forces the entire string to satisfy the pattern.
+    if not isinstance(name, str) or not _VALID_TMUX_NAME.fullmatch(name):
         # Use repr() so control characters (newlines, escapes) in a hostile
         # name cannot smuggle log/response-injection payloads through the
         # error string.

@@ -99,6 +99,8 @@ class TestValidateTmuxName:
             "with`backtick",
             "with$(cmd)",
             "with\nnewline",
+            "trailing\n",
+            "trailing\r",
             "..",
             "../escape",
             "a" * 65,
