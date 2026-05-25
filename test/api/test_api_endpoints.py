@@ -322,6 +322,124 @@ class TestCreateSession:
         assert response.status_code == 500
         assert "Failed to create session" in response.json()["detail"]
 
+    @pytest.mark.parametrize(
+        "bad_name",
+        # NB: '-leading' is not in this set — terminal_service prepends the
+        # SESSION_PREFIX 'cao-' so the effective name becomes 'cao--leading',
+        # which is a valid tmux target (no leading dash). The boundary check
+        # validates the prefixed value, so leading-dash inputs are accepted
+        # here but rejected on path-param routes that have no prefixing.
+        ["evil:name", "evil.name", "with space", "../escape", "name;rm"],
+    )
+    def test_create_session_rejects_unsafe_name(self, client, bad_name):
+        """POST /sessions rejects session names that could break tmux target parsing."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "session_name": bad_name,
+                },
+            )
+
+        assert response.status_code == 400
+        assert "session_name" in response.json()["detail"]
+        mock_svc.create_session.assert_not_called()
+
+    def test_create_session_rejects_name_that_overflows_after_prefix(self, client):
+        """A 64-char name (max valid) becomes 68 chars after the cao- prefix
+        is prepended by terminal_service. The boundary check must catch this
+        with a 400 instead of letting it slip through to a sink failure.
+        """
+        # 64 ascii chars — passes the validator on its own, but cao-prefixed
+        # is 68 chars, exceeds the 64-char cap, must be rejected.
+        long_name = "a" * 64
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "session_name": long_name,
+                },
+            )
+
+        assert response.status_code == 400
+        assert "session_name" in response.json()["detail"]
+        mock_svc.create_session.assert_not_called()
+
+    def test_create_session_accepts_already_prefixed_name(self, client):
+        """An already-prefixed valid name should not be double-prefixed in
+        the validation check.
+        """
+        # 60 chars after the cao- prefix → 64 total, exactly at the limit.
+        prefixed = "cao-" + "b" * 60
+        from cli_agent_orchestrator.models.terminal import Terminal as TerminalModel
+
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session.return_value = TerminalModel(
+                id="abcd1234",
+                name="w",
+                session_name=prefixed,
+                provider="kiro_cli",
+                agent_profile="developer",
+            )
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "session_name": prefixed,
+                },
+            )
+
+        assert response.status_code == 201
+        mock_svc.create_session.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "bad_name",
+        ["evil:name", "evil.name", "-leading", "with space"],
+    )
+    def test_get_session_rejects_unsafe_name(self, client, bad_name):
+        """GET /sessions/{name} returns 400 for unsafe names (validation,
+        not "not found")."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            response = client.get(f"/sessions/{bad_name}")
+
+        assert response.status_code == 400
+        assert "session_name" in response.json()["detail"]
+        mock_svc.get_session.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "bad_name",
+        ["evil:name", "evil.name", "-leading", "with space"],
+    )
+    def test_delete_session_rejects_unsafe_name(self, client, bad_name):
+        """DELETE /sessions/{name} returns 400 for unsafe names."""
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            response = client.delete(f"/sessions/{bad_name}")
+
+        assert response.status_code == 400
+        assert "session_name" in response.json()["detail"]
+        mock_svc.delete_session.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "bad_name",
+        ["evil:name", "evil.name", "-leading", "with space"],
+    )
+    def test_create_terminal_rejects_unsafe_session_name(self, client, bad_name):
+        """POST /sessions/{name}/terminals returns 400 for unsafe session names."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            response = client.post(
+                f"/sessions/{bad_name}/terminals",
+                params={"provider": "kiro_cli", "agent_profile": "developer"},
+            )
+
+        assert response.status_code == 400
+        assert "session_name" in response.json()["detail"]
+        mock_svc.create_terminal.assert_not_called()
+
 
 class TestListSessions:
     """Tests for GET /sessions endpoint."""

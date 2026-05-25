@@ -10,6 +10,7 @@ from typing import Dict, List, Optional
 import libtmux
 
 from cli_agent_orchestrator.constants import TMUX_HISTORY_LINES
+from cli_agent_orchestrator.utils.terminal import validate_tmux_name
 
 logger = logging.getLogger(__name__)
 
@@ -263,7 +264,15 @@ class TmuxClient:
                 (bash 4.x does not support bracketed paste and will inject the
                 escape sequences literally into the command line).
         """
-        target = f"{session_name}:{window_name}"
+        # Defence-in-depth: re-validate at the sink even though callers
+        # validate at the API/MCP boundary. Both halves flow into a
+        # tmux subprocess argument (-t target), and tmux itself parses
+        # ':' / '.' as target delimiters, so any leak past upstream
+        # validation could pivot to a different pane. Validating here
+        # also clears the CodeQL py/command-line-injection data flow.
+        validated_session = validate_tmux_name(session_name, "session_name")
+        validated_window = validate_tmux_name(window_name, "window_name")
+        target = f"{validated_session}:{validated_window}"
         buf_name = f"cao_{uuid.uuid4().hex[:8]}"
         try:
             logger.info(f"send_keys: {target} - keys: {keys}")

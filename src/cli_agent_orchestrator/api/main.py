@@ -63,7 +63,7 @@ from cli_agent_orchestrator.utils.skills import (
     load_skill_content,
     validate_skill_name,
 )
-from cli_agent_orchestrator.utils.terminal import generate_session_name
+from cli_agent_orchestrator.utils.terminal import generate_session_name, validate_tmux_name
 
 logger = logging.getLogger(__name__)
 
@@ -409,6 +409,20 @@ async def create_session(
 ) -> Terminal:
     """Create a new session with exactly one terminal."""
     try:
+        if session_name is not None:
+            # terminal_service.create_terminal prepends SESSION_PREFIX
+            # ("cao-") if missing, so an API caller's 64-char valid name
+            # would become 68 chars and fail downstream validation. Check
+            # the *effective* prefixed value here so the rejection happens
+            # at the boundary with a clear message.
+            from cli_agent_orchestrator.constants import SESSION_PREFIX
+
+            effective = (
+                session_name
+                if session_name.startswith(SESSION_PREFIX)
+                else f"{SESSION_PREFIX}{session_name}"
+            )
+            validate_tmux_name(effective, "session_name")
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
@@ -444,6 +458,12 @@ async def list_sessions() -> List[Dict]:
 
 @app.get("/sessions/{session_name}")
 async def get_session(session_name: str) -> Dict:
+    # Validate before entering the try block so a malformed name surfaces
+    # as 400 instead of being mapped to 404 by the not-found handler below.
+    try:
+        validate_tmux_name(session_name, "session_name")
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
         return session_service.get_session(session_name)
     except ValueError as e:
@@ -457,6 +477,10 @@ async def get_session(session_name: str) -> Dict:
 
 @app.delete("/sessions/{session_name}")
 async def delete_session(request: Request, session_name: str) -> Dict:
+    try:
+        validate_tmux_name(session_name, "session_name")
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
         result = session_service.delete_session(session_name, registry=get_plugin_registry(request))
         return {"success": True, **result}
@@ -483,6 +507,10 @@ async def create_terminal_in_session(
     allowed_tools: Optional[str] = None,
 ) -> Terminal:
     """Create additional terminal in existing session."""
+    try:
+        validate_tmux_name(session_name, "session_name")
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
         if provider is None:
             resolved_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
@@ -514,6 +542,10 @@ async def create_terminal_in_session(
 @app.get("/sessions/{session_name}/terminals")
 async def list_terminals_in_session(session_name: str) -> List[Dict]:
     """List all terminals in a session."""
+    try:
+        validate_tmux_name(session_name, "session_name")
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
         from cli_agent_orchestrator.clients.database import list_terminals_by_session
 
@@ -789,8 +821,18 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
         await websocket.close(code=4004, reason="Terminal not found")
         return
 
-    session_name = metadata["tmux_session"]
-    window_name = metadata["tmux_window"]
+    # Defence-in-depth: re-validate the names from the DB before they
+    # flow into a tmux subprocess argument. The POST /sessions handler
+    # now validates user-supplied session_name, but pre-existing rows
+    # or future code paths could still bypass that, and tmux parses
+    # ':' / '.' as target delimiters. Bind the validator return values
+    # so the sanitization is explicit at the actual sink below.
+    try:
+        session_name = validate_tmux_name(metadata["tmux_session"], "session_name")
+        window_name = validate_tmux_name(metadata["tmux_window"], "window_name")
+    except ValueError:
+        await websocket.close(code=4003, reason="Invalid tmux target name")
+        return
 
     # Create PTY pair for tmux attach
     master_fd, slave_fd = pty.openpty()
