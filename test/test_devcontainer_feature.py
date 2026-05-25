@@ -79,5 +79,6 @@ def test_install_script_supports_apt_and_apk() -> None:
 
     assert "command -v apt-get" in install_script
     assert "command -v apk" in install_script
+    assert "pip_install_editable" in install_script
     assert "--no-cache-dir" in install_script
-    assert 'TMUX_SOURCE_REF:-3.4' in install_script
+    assert "break-system-packages" in install_script

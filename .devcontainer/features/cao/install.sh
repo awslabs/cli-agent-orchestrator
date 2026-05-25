@@ -135,9 +135,18 @@ ensure_tmux_at_least_33 || {
     exit 1
 }
 
+pip_install_editable() {
+    local target="$1"
+    local -a pip_args=(--no-cache-dir)
+    if python3 -m pip install --help 2>/dev/null | grep -q break-system-packages; then
+        pip_args+=(--break-system-packages)
+    fi
+    python3 -m pip install "${pip_args[@]}" -e "$target"
+}
+
 # Editable install keeps server static asset resolution aligned with
 # the checked out source layout for the selected version.
-python3 -m pip install --no-cache-dir -e "$INSTALL_DIR/repo"
+pip_install_editable "$INSTALL_DIR/repo"
 
 # Build web UI if requested
 if [[ "$WEBUI" = "true" ]]; then
