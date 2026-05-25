@@ -44,7 +44,11 @@ from cli_agent_orchestrator.plugins import (
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
-from cli_agent_orchestrator.services.session_env import get_session_env, set_session_env
+from cli_agent_orchestrator.services.session_env import (
+    clear_session_env,
+    get_session_env,
+    set_session_env,
+)
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
 from cli_agent_orchestrator.utils.terminal import (
@@ -167,11 +171,9 @@ def create_terminal(
             if tmux_client.session_exists(session_name):
                 raise ValueError(f"Session '{session_name}' already exists")
 
-            # Persist forwarded env BEFORE the tmux call so even an early
-            # failure leaves the session record consistent with what gets
-            # cleared on delete_session.
-            if env_vars:
-                set_session_env(session_name, env_vars)
+            # Wipe any stale mapping a prior aborted lifecycle for this name
+            # may have left behind, so a no-env relaunch can't inherit them.
+            clear_session_env(session_name)
 
             # Create new tmux session with initial window
             tmux_client.create_session(
@@ -182,6 +184,12 @@ def create_terminal(
                 extra_env=env_vars,
             )
             session_created = True  # only set after successful creation
+
+            # Persist forwarded env only after the tmux session actually
+            # exists; the failure path below clears it if a later step
+            # tears the session back down.
+            if env_vars:
+                set_session_env(session_name, env_vars)
         else:
             # Add window to existing session
             if not tmux_client.session_exists(session_name):
@@ -292,6 +300,10 @@ def create_terminal(
                 tmux_client.kill_session(session_name)
             except:
                 pass  # Ignore cleanup errors
+            # Session is gone, drop any forwarded env we stashed for it so
+            # secrets don't linger in memory or bleed into a future reuse
+            # of the same name.
+            clear_session_env(session_name)
         raise
 
 

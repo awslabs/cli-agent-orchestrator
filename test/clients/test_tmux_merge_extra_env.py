@@ -58,7 +58,8 @@ def test_is_blocked_env_key_classification():
     assert TmuxClient._is_blocked_env_key("CLAUDE_SESSION_ID") is True
     assert TmuxClient._is_blocked_env_key("CODEX_TOKEN") is True
     assert TmuxClient._is_blocked_env_key("__MISE_WATCH") is True
-    # Allowlisted overrides match-by-prefix.
+    # Allowlist matches the full key, not a prefix — only the exact entries
+    # in _BLOCKED_PREFIX_ALLOWLIST are exempted from the blocked prefixes.
     assert TmuxClient._is_blocked_env_key("CLAUDE_CODE_USE_BEDROCK") is False
     assert TmuxClient._is_blocked_env_key("CLAUDE_CODE_SKIP_FOUNDRY_AUTH") is False
     # Unrelated keys aren't blocked.
