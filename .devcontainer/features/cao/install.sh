@@ -55,20 +55,21 @@ install_tmux_build_deps() {
 }
 
 install_tmux_from_source() {
-  local tmp_dir
-  tmp_dir="$(mktemp -d)"
-  echo "Building tmux from source in $tmp_dir..."
-  if ! git clone --depth 1 https://github.com/tmux/tmux.git "$tmp_dir/tmux"; then
-      rm -rf "$tmp_dir"
-      echo "ERROR: Failed to clone tmux source repository." >&2
-      return 1
-  fi
-  if ! (cd "$tmp_dir/tmux" && sh autogen.sh && ./configure && make && make install); then
-      rm -rf "$tmp_dir"
-      echo "ERROR: tmux source build failed." >&2
-      return 1
-  fi
-  rm -rf "$tmp_dir"
+    local tmp_dir
+    local tmux_ref="${TMUX_SOURCE_REF:-3.4}"
+    tmp_dir="$(mktemp -d)"
+    echo "Building tmux ${tmux_ref} from source in $tmp_dir..."
+    if ! git clone --depth 1 --branch "$tmux_ref" https://github.com/tmux/tmux.git "$tmp_dir/tmux"; then
+        rm -rf "$tmp_dir"
+        echo "ERROR: Failed to clone tmux source repository at ref ${tmux_ref}." >&2
+        return 1
+    fi
+    if ! (cd "$tmp_dir/tmux" && sh autogen.sh && ./configure && make && make install); then
+        rm -rf "$tmp_dir"
+        echo "ERROR: tmux source build failed." >&2
+        return 1
+    fi
+    rm -rf "$tmp_dir"
 }
 
 ensure_tmux_at_least_33() {
@@ -136,7 +137,7 @@ ensure_tmux_at_least_33 || {
 
 # Editable install keeps server static asset resolution aligned with
 # the checked out source layout for the selected version.
-python3 -m pip install -e "$INSTALL_DIR/repo"
+python3 -m pip install --no-cache-dir -e "$INSTALL_DIR/repo"
 
 # Build web UI if requested
 if [[ "$WEBUI" = "true" ]]; then
@@ -153,11 +154,6 @@ if [[ "$WEBUI" = "true" ]]; then
                 return 0
             fi
         done
-        candidate="$(find "$repo" -maxdepth 3 -name package.json -type f 2>/dev/null | head -1)"
-        if [[ -n "$candidate" ]]; then
-            dirname "$candidate"
-            return 0
-        fi
         echo "ERROR: Could not locate web UI npm project under $repo." >&2
         echo "Supported layouts include repo/web (package.json) and built artifacts under:" >&2
         echo "  - repo/web/dist/index.html" >&2
