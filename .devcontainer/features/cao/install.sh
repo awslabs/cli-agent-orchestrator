@@ -25,20 +25,83 @@ else
     exit 1
 fi
 
-TMUX_VERSION="$(tmux -V | awk '{print $2}')"
-TMUX_MAJOR="$(printf '%s' "$TMUX_VERSION" | awk -F. '{print $1}')"
-TMUX_MINOR_RAW="$(printf '%s' "$TMUX_VERSION" | awk -F. '{print $2}')"
-TMUX_MINOR="${TMUX_MINOR_RAW%%[^0-9]*}"
+read_tmux_version() {
+    TMUX_VERSION="$(tmux -V | awk '{print $2}')"
+    TMUX_MAJOR="$(printf '%s' "$TMUX_VERSION" | awk -F. '{print $1}')"
+    TMUX_MINOR_RAW="$(printf '%s' "$TMUX_VERSION" | awk -F. '{print $2}')"
+    TMUX_MINOR="${TMUX_MINOR_RAW%%[^0-9]*}"
+}
 
-if [[ -z "$TMUX_MAJOR" || ! "$TMUX_MAJOR" =~ ^[0-9]+$ || -z "$TMUX_MINOR" || ! "$TMUX_MINOR" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: Unable to parse tmux version '$TMUX_VERSION'." >&2
-    exit 1
-fi
+tmux_version_ok() {
+    read_tmux_version
+    if [[ -z "$TMUX_MAJOR" || ! "$TMUX_MAJOR" =~ ^[0-9]+$ || -z "$TMUX_MINOR" || ! "$TMUX_MINOR" =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+    (( TMUX_MAJOR > 3 || (TMUX_MAJOR == 3 && TMUX_MINOR >= 3) ))
+}
 
-if (( TMUX_MAJOR < 3 || (TMUX_MAJOR == 3 && TMUX_MINOR < 3) )); then
-    echo "ERROR: tmux >= 3.3 is required, but found $TMUX_VERSION." >&2
-    exit 1
-fi
+install_tmux_build_deps() {
+    if command -v apt-get &>/dev/null; then
+        apt-get update -y \
+            && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                libevent-dev libncurses-dev build-essential autoconf automake pkg-config bison \
+            && rm -rf /var/lib/apt/lists/*
+    elif command -v apk &>/dev/null; then
+        apk add --no-cache libevent-dev ncurses-dev build-base autoconf automake pkgconf bison
+    else
+        echo "ERROR: Unsupported base image for tmux source install." >&2
+        return 1
+    fi
+}
+
+install_tmux_from_source() {
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  echo "Building tmux from source in $tmp_dir..."
+  if ! git clone --depth 1 https://github.com/tmux/tmux.git "$tmp_dir/tmux"; then
+      rm -rf "$tmp_dir"
+      echo "ERROR: Failed to clone tmux source repository." >&2
+      return 1
+  fi
+  if ! (cd "$tmp_dir/tmux" && sh autogen.sh && ./configure && make && make install); then
+      rm -rf "$tmp_dir"
+      echo "ERROR: tmux source build failed." >&2
+      return 1
+  fi
+  rm -rf "$tmp_dir"
+}
+
+ensure_tmux_at_least_33() {
+    if tmux_version_ok; then
+        return 0
+    fi
+
+    echo "tmux >= 3.3 is required; attempting package-manager upgrade..."
+    if command -v apt-get &>/dev/null; then
+        apt-get update -y \
+            && DEBIAN_FRONTEND=noninteractive apt-get install --only-upgrade -y tmux \
+            && rm -rf /var/lib/apt/lists/* || true
+    elif command -v apk &>/dev/null; then
+        apk upgrade tmux || true
+    fi
+
+    if tmux_version_ok; then
+        echo "tmux upgraded via package manager: $(tmux -V)"
+        return 0
+    fi
+
+    echo "Package-manager tmux is still too old; falling back to source install (see tmux-install.sh)..."
+    install_tmux_build_deps || return 1
+    install_tmux_from_source || return 1
+
+    if tmux_version_ok; then
+        echo "tmux installed from source: $(tmux -V)"
+        return 0
+    fi
+
+    echo "ERROR: tmux >= 3.3 is required, but found $(tmux -V 2>/dev/null || echo 'none')." >&2
+    return 1
+}
 
 # Clone repository to a fixed location so editable install keeps
 # web UI asset paths correct relative to the Python package source.
@@ -66,6 +129,11 @@ else
     fi
 fi
 
+ensure_tmux_at_least_33 || {
+    echo "ERROR: Could not install tmux >= 3.3 (see repo/tmux-install.sh for manual setup)." >&2
+    exit 1
+}
+
 # Editable install keeps server static asset resolution aligned with
 # the checked out source layout for the selected version.
 python3 -m pip install -e "$INSTALL_DIR/repo"
@@ -76,8 +144,30 @@ if [[ "$WEBUI" = "true" ]]; then
         echo "ERROR: npm is not available. Install the Node.js devcontainer feature before this one, or set webui=false." >&2
         exit 1
     fi
-    echo "Building web UI..."
-    cd "$INSTALL_DIR/repo/web"
+    resolve_web_project_dir() {
+        local repo="$1"
+        local candidate
+        for candidate in "$repo/web" "$repo/frontend" "$repo/ui"; do
+            if [[ -f "$candidate/package.json" ]]; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+        done
+        candidate="$(find "$repo" -maxdepth 3 -name package.json -type f 2>/dev/null | head -1)"
+        if [[ -n "$candidate" ]]; then
+            dirname "$candidate"
+            return 0
+        fi
+        echo "ERROR: Could not locate web UI npm project under $repo." >&2
+        echo "Supported layouts include repo/web (package.json) and built artifacts under:" >&2
+        echo "  - repo/web/dist/index.html" >&2
+        echo "  - repo/src/cli_agent_orchestrator/web_ui/index.html" >&2
+        return 1
+    }
+
+    web_project_dir="$(resolve_web_project_dir "$INSTALL_DIR/repo")"
+    echo "Building web UI in ${web_project_dir}..."
+    cd "$web_project_dir"
     if [[ -f package-lock.json ]]; then
         npm ci
     else
@@ -100,6 +190,7 @@ PORT_DEFAULT=${PORT_DEFAULT_LITERAL}
 EOF
 
 cat << 'EOF'
+set -euo pipefail
 
 AUTOSTART_VALUE="${AUTOSTART:-$AUTOSTART_DEFAULT}"
 PORT_VALUE="${PORT:-$PORT_DEFAULT}"

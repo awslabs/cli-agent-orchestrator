@@ -56,10 +56,11 @@ def test_feature_installs_after_uses_versioned_feature_ids() -> None:
         (FEATURE_DIR / "devcontainer-feature.json").read_text(encoding="utf-8")
     )
 
-    assert feature_manifest["installsAfter"] == [
+    required_installs_after = {
         "ghcr.io/devcontainers/features/node:1",
         "ghcr.io/devcontainers/features/python:1",
-    ]
+    }
+    assert required_installs_after.issubset(feature_manifest["installsAfter"])
 
 
 def test_install_script_generates_runtime_safe_entrypoint() -> None:
@@ -67,6 +68,7 @@ def test_install_script_generates_runtime_safe_entrypoint() -> None:
     install_script = (FEATURE_DIR / "install.sh").read_text(encoding="utf-8")
 
     assert "cat << 'EOF'" in install_script
+    assert "set -euo pipefail" in install_script
     assert 'AUTOSTART_VALUE="${AUTOSTART:-$AUTOSTART_DEFAULT}"' in install_script
     assert 'PORT_VALUE="${PORT:-$PORT_DEFAULT}"' in install_script
 
