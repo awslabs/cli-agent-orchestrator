@@ -130,6 +130,30 @@ CORS_ORIGINS = [
     "http://127.0.0.1:5173",
 ] + _split_env_list("CAO_CORS_ORIGINS")
 
+
+# Hostnames that bind on all interfaces and so cannot be turned into a usable
+# Origin header on their own — derive loopback origins for these instead.
+_WILDCARD_BIND_HOSTS = frozenset({"0.0.0.0", "::", "::0"})
+
+
+def add_local_cors_origins(host: str, port: int) -> None:
+    """Extend ``CORS_ORIGINS`` in place with origins derived from the listen
+    address. Called from ``cao-server`` after argparse so a non-default
+    ``--port`` does not force operators to also set ``CAO_CORS_ORIGINS`` for
+    same-host browser access (issue #151).
+
+    The list is mutated in place because Starlette's ``CORSMiddleware`` keeps
+    a reference to the original sequence and re-reads it per request; any new
+    entry is therefore picked up by the already-installed middleware.
+    """
+    if host in _WILDCARD_BIND_HOSTS or host in {"127.0.0.1", "localhost"}:
+        candidates = [f"http://localhost:{port}", f"http://127.0.0.1:{port}"]
+    else:
+        candidates = [f"http://{host}:{port}"]
+    for origin in candidates:
+        if origin not in CORS_ORIGINS:
+            CORS_ORIGINS.append(origin)
+
 # Allowed Host headers for DNS rebinding protection (CVE mitigation).
 # Defaults: localhost-only, matching CAO's local-only service design.
 # Validated by TrustedHostMiddleware to prevent DNS rebinding attacks.
