@@ -262,6 +262,7 @@ class TestCreateSession:
             working_directory=None,
             allowed_tools=None,
             registry=ANY,
+            env_vars=None,
         )
 
     def test_create_session_with_session_name(self, client):
