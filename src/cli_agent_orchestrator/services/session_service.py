@@ -36,6 +36,7 @@ from cli_agent_orchestrator.plugins import (
 )
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
+from cli_agent_orchestrator.services.session_env import clear_session_env
 from cli_agent_orchestrator.services.terminal_service import create_terminal
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 
@@ -49,8 +50,14 @@ def create_session(
     working_directory: str | None = None,
     allowed_tools: list[str] | None = None,
     registry: PluginRegistry | None = None,
+    env_vars: dict[str, str] | None = None,
 ) -> Terminal:
-    """Create a new session by creating its initial terminal."""
+    """Create a new session by creating its initial terminal.
+
+    ``env_vars`` are operator-forwarded env vars from ``cao launch --env``.
+    They are persisted on the session record so every worker spawned later
+    in the same session inherits them. See issue #248.
+    """
     if provider is None:
         resolved_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
     else:
@@ -64,6 +71,7 @@ def create_session(
         working_directory=working_directory,
         allowed_tools=allowed_tools,
         registry=registry,
+        env_vars=env_vars,
     )
     dispatch_plugin_event(
         registry,
@@ -131,6 +139,10 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
 
         # Delete terminal metadata
         delete_terminals_by_session(session_name)
+
+        # Drop the per-session forwarded-env mapping (issue #248). Safe
+        # even when no vars were forwarded — the helper is a no-op then.
+        clear_session_env(session_name)
 
         result["deleted"].append(session_name)
         logger.info(f"Deleted session: {session_name}")
