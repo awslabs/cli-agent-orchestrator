@@ -1081,3 +1081,27 @@ class TestMainEntryPoint:
 
             main()
             # No assertion needed beyond no exception — the code path is covered
+
+    def test_main_extends_cors_for_custom_host_port(self):
+        """``main()`` must call ``add_local_cors_origins`` with the resolved
+        host/port *before* uvicorn starts, otherwise the same-host browser
+        access promised by issue #151 silently regresses (the helper is
+        unit-tested in isolation but the CLI wiring has no other guard)."""
+        with (
+            patch("argparse.ArgumentParser.parse_args") as mock_args,
+            patch("uvicorn.run") as mock_uvicorn,
+            patch("cli_agent_orchestrator.api.main.add_local_cors_origins") as mock_add,
+        ):
+            mock_args.return_value = MagicMock(agents_dir=None, host="0.0.0.0", port=9999)
+
+            from cli_agent_orchestrator.api.main import main
+
+            main()
+
+            mock_add.assert_called_once_with("0.0.0.0", 9999)
+            # Wiring order matters: the middleware reads CORS_ORIGINS per
+            # request, but mutating the list after uvicorn.run blocks would
+            # be unreachable on first request. Assert helper ran first.
+            assert mock_add.call_count == 1
+            assert mock_uvicorn.call_count == 1
+            assert mock_add.call_args_list[0].args == ("0.0.0.0", 9999)

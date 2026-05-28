@@ -214,6 +214,33 @@ class TestAddLocalCorsOrigins:
         assert "http://localhost:7777" in captured
         assert "http://127.0.0.1:7777" in captured
 
+    def test_ipv6_loopback_adds_all_loopback_aliases(self):
+        """``::1`` is loopback like ``127.0.0.1`` / ``localhost``: any of the
+        three should grant same-host access from a browser that picks any of
+        the others, so all three origins are added."""
+        mod = self._reload_constants()
+        mod.add_local_cors_origins("::1", 9999)
+        assert "http://localhost:9999" in mod.CORS_ORIGINS
+        assert "http://127.0.0.1:9999" in mod.CORS_ORIGINS
+        assert "http://[::1]:9999" in mod.CORS_ORIGINS
+
+    def test_ipv6_wildcard_bind_includes_bracketed_loopback(self):
+        """Binding on ``::`` must also allow IPv6 loopback in brackets — that
+        is the form a browser actually emits in ``Origin``."""
+        mod = self._reload_constants()
+        mod.add_local_cors_origins("::", 8080)
+        assert "http://[::1]:8080" in mod.CORS_ORIGINS
+
+    def test_ipv6_literal_host_is_bracketed(self):
+        """A non-loopback IPv6 literal must be formatted with brackets so the
+        derived origin matches the ``Origin`` header the browser sends."""
+        mod = self._reload_constants()
+        mod.add_local_cors_origins("2001:db8::1", 9889)
+        assert "http://[2001:db8::1]:9889" in mod.CORS_ORIGINS
+        # The unbracketed form would never match a real Origin header and so
+        # would only bloat the allowlist — guard against accidental reintro.
+        assert "http://2001:db8::1:9889" not in mod.CORS_ORIGINS
+
 
 class TestCaoHomeDir:
     """Tests for CAO home directory constants."""
