@@ -175,6 +175,7 @@ def add_local_cors_origins(host: str, port: int) -> None:
         if origin not in CORS_ORIGINS:
             CORS_ORIGINS.append(origin)
 
+
 # Allowed Host headers for DNS rebinding protection (CVE mitigation).
 # Defaults: localhost-only, matching CAO's local-only service design.
 # Validated by TrustedHostMiddleware to prevent DNS rebinding attacks.
