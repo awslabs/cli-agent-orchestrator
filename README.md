@@ -105,6 +105,14 @@ uv tool install cli-agent-orchestrator==2.1.0
 
 For local development (`git clone` + `uv sync`) and the testing/quality workflow, see [DEVELOPMENT.md](DEVELOPMENT.md).
 
+## Devcontainer Feature
+
+CAO includes an official devcontainer feature for container-native installation.
+
+- Usage and options: [docs/devcontainer-feature.md](docs/devcontainer-feature.md)
+- Local validation commands: [docs/devcontainer-feature.md#validation](docs/devcontainer-feature.md#validation)
+- Release plan: [docs/devcontainer-feature.md#release-plan](docs/devcontainer-feature.md#release-plan)
+
 ## Prerequisite: a CLI agent tool
 
 CAO drives existing CLI agent tools — it does not replace them. Before using CAO, install at least one of the following. You can install more than one and mix them in the same orchestration.
