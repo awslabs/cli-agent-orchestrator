@@ -44,9 +44,7 @@ class TestInjectMemoryContextFunction:
     @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
     def test_first_message_gets_memory_injected(self, mock_svc_cls):
         """First message should have <cao-memory> block prepended."""
-        mock_svc_cls.return_value.get_memory_context_for_terminal.return_value = (
-            SAMPLE_MEMORY_CONTEXT
-        )
+        mock_svc_cls.return_value.get_curated_memory_context.return_value = SAMPLE_MEMORY_CONTEXT
 
         result = inject_memory_context(ORIGINAL_MESSAGE, "term-001")
 
@@ -58,9 +56,7 @@ class TestInjectMemoryContextFunction:
     @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
     def test_second_message_not_injected(self, mock_svc_cls):
         """Second message to same terminal should NOT get memory injection."""
-        mock_svc_cls.return_value.get_memory_context_for_terminal.return_value = (
-            SAMPLE_MEMORY_CONTEXT
-        )
+        mock_svc_cls.return_value.get_curated_memory_context.return_value = SAMPLE_MEMORY_CONTEXT
 
         # First call — injects
         inject_memory_context(ORIGINAL_MESSAGE, "term-002")
@@ -73,7 +69,7 @@ class TestInjectMemoryContextFunction:
     @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
     def test_no_injection_when_no_memories(self, mock_svc_cls):
         """When no memories exist, message should be returned unchanged."""
-        mock_svc_cls.return_value.get_memory_context_for_terminal.return_value = ""
+        mock_svc_cls.return_value.get_curated_memory_context.return_value = ""
 
         result = inject_memory_context(ORIGINAL_MESSAGE, "term-003")
 
@@ -92,9 +88,7 @@ class TestInjectMemoryContextFunction:
     @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
     def test_injection_failure_returns_original(self, mock_svc_cls):
         """If MemoryService raises, original message should be returned."""
-        mock_svc_cls.return_value.get_memory_context_for_terminal.side_effect = RuntimeError(
-            "DB error"
-        )
+        mock_svc_cls.return_value.get_curated_memory_context.side_effect = RuntimeError("DB error")
 
         result = inject_memory_context(ORIGINAL_MESSAGE, "term-004")
 
@@ -105,9 +99,7 @@ class TestInjectMemoryContextFunction:
     @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
     def test_different_terminals_both_get_injection(self, mock_svc_cls):
         """Different terminals should each get their own injection."""
-        mock_svc_cls.return_value.get_memory_context_for_terminal.return_value = (
-            SAMPLE_MEMORY_CONTEXT
-        )
+        mock_svc_cls.return_value.get_curated_memory_context.return_value = SAMPLE_MEMORY_CONTEXT
 
         r1 = inject_memory_context("Message A", "term-A")
         r2 = inject_memory_context("Message B", "term-B")
@@ -133,9 +125,7 @@ class TestClaudeCodeInjection:
     @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
     def test_claude_code_injection(self, mock_svc_cls):
         """First message to Claude Code terminal should include <cao-memory> block."""
-        mock_svc_cls.return_value.get_memory_context_for_terminal.return_value = (
-            SAMPLE_MEMORY_CONTEXT
-        )
+        mock_svc_cls.return_value.get_curated_memory_context.return_value = SAMPLE_MEMORY_CONTEXT
 
         injected = inject_memory_context(ORIGINAL_MESSAGE, "term-claude-001")
 
@@ -154,9 +144,7 @@ class TestKiroInjection:
     @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
     def test_kiro_injection(self, mock_svc_cls):
         """First message to Kiro CLI terminal should include <cao-memory> block."""
-        mock_svc_cls.return_value.get_memory_context_for_terminal.return_value = (
-            SAMPLE_MEMORY_CONTEXT
-        )
+        mock_svc_cls.return_value.get_curated_memory_context.return_value = SAMPLE_MEMORY_CONTEXT
 
         injected = inject_memory_context(ORIGINAL_MESSAGE, "term-kiro-001")
 
@@ -175,9 +163,7 @@ class TestGeminiInjection:
     @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
     def test_gemini_injection(self, mock_svc_cls):
         """First message to Gemini terminal should include <cao-memory> block."""
-        mock_svc_cls.return_value.get_memory_context_for_terminal.return_value = (
-            SAMPLE_MEMORY_CONTEXT
-        )
+        mock_svc_cls.return_value.get_curated_memory_context.return_value = SAMPLE_MEMORY_CONTEXT
 
         injected = inject_memory_context(ORIGINAL_MESSAGE, "term-gemini-001")
 
@@ -228,7 +214,7 @@ class TestNoInjectionWhenEmpty:
     @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
     def test_no_injection_when_empty(self, mock_svc_cls):
         """When no memories exist, no <cao-memory> block should be injected."""
-        mock_svc_cls.return_value.get_memory_context_for_terminal.return_value = ""
+        mock_svc_cls.return_value.get_curated_memory_context.return_value = ""
 
         injected = inject_memory_context(ORIGINAL_MESSAGE, "term-001")
 

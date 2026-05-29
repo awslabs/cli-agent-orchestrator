@@ -49,5 +49,8 @@ context/
 # Worktrees
 .worktrees
 
+# aidlc
+aidlc-docs
+
 # Separate git repos (not part of this project)
 cao-flows/

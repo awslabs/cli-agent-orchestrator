@@ -10,6 +10,7 @@ import requests
 from cli_agent_orchestrator.constants import (
     API_BASE_URL,
     DEFAULT_PROVIDER,
+    MCP_REQUEST_TIMEOUT,
     PROVIDERS,
     SERVER_HOST,
     SERVER_PORT,
@@ -121,6 +122,12 @@ def _parse_env_pairs(pairs):
     help="Working directory for the session (default: current directory)",
 )
 @click.option(
+    "--memory",
+    "memory",
+    is_flag=True,
+    help="Also launch a context-manager (memory_manager) terminal for curated memory injection.",
+)
+@click.option(
     "--env",
     "env_pairs",
     multiple=True,
@@ -141,6 +148,7 @@ def launch(
     auto_approve,
     yolo,
     working_directory,
+    memory,
     env_pairs,
 ):
     """Launch cao session with specified agent profile."""
@@ -267,11 +275,13 @@ def launch(
         if resolved_allowed_tools:
             # Pass as comma-separated string for query param
             params["allowed_tools"] = ",".join(resolved_allowed_tools)
+        if memory:
+            params["memory_manager"] = "true"
 
         # Forwarded env vars travel in the JSON body so values (which may
         # contain secrets) don't end up in cao-server's HTTP access log.
         # See issue #248.
-        post_kwargs: dict = {"params": params}
+        post_kwargs: dict = {"params": params, "timeout": MCP_REQUEST_TIMEOUT}
         if forwarded_env:
             post_kwargs["json"] = {"env_vars": forwarded_env}
 
@@ -317,6 +327,7 @@ def launch(
             response = requests.post(
                 f"{API_BASE_URL}/terminals/{terminal['id']}/input",
                 params={"message": message},
+                timeout=MCP_REQUEST_TIMEOUT,
             )
             response.raise_for_status()
             time.sleep(3)
@@ -327,6 +338,7 @@ def launch(
             output_resp = requests.get(
                 f"{API_BASE_URL}/terminals/{terminal['id']}/output",
                 params={"mode": "last"},
+                timeout=MCP_REQUEST_TIMEOUT,
             )
             output_resp.raise_for_status()
             output = output_resp.json().get("output", "")

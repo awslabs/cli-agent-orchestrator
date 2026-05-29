@@ -18,6 +18,7 @@ Terminal Workflow:
 """
 
 import logging
+import threading
 import time
 from datetime import datetime
 from enum import Enum
@@ -61,6 +62,7 @@ logger = logging.getLogger(__name__)
 
 # Track terminals that have already received memory injection (first message only).
 _memory_injected_terminals: set = set()
+_memory_injected_lock = threading.Lock()
 
 
 def inject_memory_context(first_message: str, terminal_id: str) -> str:
@@ -73,14 +75,14 @@ def inject_memory_context(first_message: str, terminal_id: str) -> str:
     a formatted <cao-memory>...</cao-memory> block (or empty string if
     no memories exist). Stateless — no file mutation, no backup/restore.
     """
-    if terminal_id in _memory_injected_terminals:
-        return first_message
-
-    _memory_injected_terminals.add(terminal_id)
+    with _memory_injected_lock:
+        if terminal_id in _memory_injected_terminals:
+            return first_message
+        _memory_injected_terminals.add(terminal_id)
 
     try:
         svc = MemoryService()
-        context = svc.get_memory_context_for_terminal(terminal_id)
+        context = svc.get_curated_memory_context(terminal_id, task_description=first_message[:200])
         if context:
             return context + "\n\n" + first_message
     except Exception as e:
@@ -580,7 +582,13 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
 
         # Cleanup provider state and database record
         provider_manager.cleanup_provider(terminal_id)
-        _memory_injected_terminals.discard(terminal_id)
+        with _memory_injected_lock:
+            _memory_injected_terminals.discard(terminal_id)
+        # Drop any per-curator dispatch lock so the registry doesn't grow
+        # forever as memory_manager terminals come and go.
+        from cli_agent_orchestrator.services.memory_service import _curator_locks
+
+        _curator_locks.pop(terminal_id, None)
         deleted = db_delete_terminal(terminal_id)
         logger.info(f"Deleted terminal: {terminal_id}")
         if deleted and metadata:

@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from cli_agent_orchestrator.constants import API_BASE_URL
+from cli_agent_orchestrator.constants import API_BASE_URL, MCP_REQUEST_TIMEOUT
 from cli_agent_orchestrator.mcp_server.server import _build_assign_description
 
 
@@ -51,6 +51,7 @@ class TestCreateTerminalProviderResolution:
                 "agent_profile": "reviewer",
                 "working_directory": "/repo",
             },
+            timeout=MCP_REQUEST_TIMEOUT,
         )
 
     @patch(
@@ -92,6 +93,7 @@ class TestCreateTerminalProviderResolution:
                 "agent_profile": "reviewer",
                 "working_directory": "/repo",
             },
+            timeout=MCP_REQUEST_TIMEOUT,
         )
 
 
