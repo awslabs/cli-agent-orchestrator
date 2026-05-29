@@ -67,10 +67,12 @@ def test_feature_installs_after_uses_versioned_feature_ids() -> None:
         "ghcr.io/devcontainers/features/node:1",
         "ghcr.io/devcontainers/features/python:1",
     }
-    missing_features = required_installs_after.difference(feature_manifest["installsAfter"])
-    if missing_features:
+    missing_from_installs_after = required_installs_after.difference(
+        feature_manifest["installsAfter"]
+    )
+    if missing_from_installs_after:
         raise AssertionError(
-            f"installsAfter is missing required features: {sorted(missing_features)}"
+            f"installsAfter is missing required features: {sorted(missing_from_installs_after)}"
         )
 
 
