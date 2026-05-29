@@ -14,7 +14,17 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Dict, List, Optional, cast
 
-from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
+from fastapi import (
+    BackgroundTasks,
+    Body,
+    FastAPI,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field, field_validator
@@ -37,6 +47,7 @@ from cli_agent_orchestrator.constants import (
     SERVER_VERSION,
     TERMINAL_LOG_DIR,
     WS_ALLOWED_CLIENTS,
+    add_local_cors_origins,
 )
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
@@ -401,13 +412,29 @@ async def get_skill_content(name: str) -> SkillContentResponse:
 @app.post("/sessions", response_model=Terminal, status_code=status.HTTP_201_CREATED)
 async def create_session(
     request: Request,
+    background_tasks: BackgroundTasks,
     agent_profile: str,
     provider: Optional[str] = None,
     session_name: Optional[str] = None,
     working_directory: Optional[str] = None,
     allowed_tools: Optional[str] = None,
+    memory_manager: Optional[str] = None,
+    env_vars: Optional[Dict[str, str]] = Body(default=None, embed=True),
 ) -> Terminal:
-    """Create a new session with exactly one terminal."""
+    """Create a new session with exactly one terminal.
+
+    When ``memory_manager`` is truthy, a sidecar ``memory_manager`` terminal is
+    spawned asynchronously in the same tmux session — provider initialization
+    can take 15-30s and would otherwise block the HTTP response past the
+    client's request timeout. The worker's first message may arrive before
+    the curator reaches IDLE; ``get_curated_memory_context`` falls back to
+    Phase 1 in that window.
+
+    ``env_vars`` (request body, optional) is the operator-forwarded env map
+    from ``cao launch --env``. It travels in the JSON body — not the query
+    string — so values potentially containing secrets do not land in
+    cao-server's HTTP access log. See issue #248.
+    """
     try:
         if session_name is not None:
             # terminal_service.create_terminal prepends SESSION_PREFIX
@@ -433,7 +460,30 @@ async def create_session(
             working_directory=working_directory,
             allowed_tools=allowed_tools_list,
             registry=get_plugin_registry(request),
+            env_vars=env_vars,
         )
+
+        if memory_manager and str(memory_manager).lower() in ("true", "1", "yes"):
+            registry = get_plugin_registry(request)
+            sidecar_provider = provider or DEFAULT_PROVIDER
+            sidecar_session = result.session_name
+
+            def _spawn_sidecar() -> None:
+                try:
+                    from cli_agent_orchestrator.services import terminal_service
+
+                    terminal_service.create_terminal(
+                        provider=sidecar_provider,
+                        agent_profile="memory_manager",
+                        session_name=sidecar_session,
+                        working_directory=working_directory,
+                        registry=registry,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to spawn memory_manager sidecar: {e}")
+
+            background_tasks.add_task(_spawn_sidecar)
+
         return result
 
     except ValueError as e:
@@ -1119,6 +1169,11 @@ def main():
 
     host = args.host or SERVER_HOST
     port = args.port or SERVER_PORT
+    # Extend the CORS allowlist so a custom --host/--port still permits
+    # same-host browser access without requiring CAO_CORS_ORIGINS. The
+    # already-installed CORSMiddleware reads the list by reference, so
+    # mutating it before uvicorn starts is sufficient. See issue #151.
+    add_local_cors_origins(host, port)
     uvicorn.run(app, host=host, port=port)
 
 

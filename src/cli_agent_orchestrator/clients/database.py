@@ -1,10 +1,19 @@
 """Minimal database client with only terminal metadata."""
 
 import logging
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import Boolean, Column, DateTime, Integer, String, create_engine
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    Integer,
+    String,
+    UniqueConstraint,
+    create_engine,
+)
 from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
 
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
@@ -44,6 +53,36 @@ class InboxModel(Base):
     created_at = Column(DateTime, default=datetime.now)
 
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class MemoryMetadataModel(Base):
+    """SQLAlchemy model for memory metadata (Phase 2 U1).
+
+    SQLite is the source of truth for metadata queries; wiki markdown
+    files remain the content store. Each row corresponds to exactly one
+    wiki file on disk.
+    """
+
+    __tablename__ = "memory_metadata"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    key = Column(String, nullable=False)
+    memory_type = Column(String, nullable=False)
+    scope = Column(String, nullable=False)
+    scope_id = Column(String, nullable=True)
+    file_path = Column(String, nullable=False)
+    tags = Column(String, nullable=False, default="")
+    source_provider = Column(String, nullable=True)
+    source_terminal_id = Column(String, nullable=True)
+    token_estimate = Column(Integer, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=_utcnow)
+    updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
+
+    __table_args__ = (UniqueConstraint("key", "scope", "scope_id", name="uq_memory_key_scope"),)
+
+
 class FlowModel(Base):
     """SQLAlchemy model for flow metadata."""
 
@@ -70,6 +109,28 @@ def init_db() -> None:
     """Initialize database tables and apply schema migrations."""
     Base.metadata.create_all(bind=engine)
     _migrate_terminals_schema()
+    _migrate_memory_indexes()
+
+
+def _migrate_memory_indexes() -> None:
+    """Add explicit indexes on memory_metadata for query performance."""
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory_metadata (scope, scope_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memory_updated ON memory_metadata (updated_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memory_type ON memory_metadata (memory_type)"
+            )
+    except Exception as e:
+        logger.debug(f"Memory index migration skipped: {e}")
 
 
 def _migrate_terminals_schema() -> None:

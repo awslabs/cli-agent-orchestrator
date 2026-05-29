@@ -18,6 +18,7 @@ Terminal Workflow:
 """
 
 import logging
+import threading
 import time
 from datetime import datetime
 from enum import Enum
@@ -44,6 +45,11 @@ from cli_agent_orchestrator.plugins import (
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
+from cli_agent_orchestrator.services.session_env import (
+    clear_session_env,
+    get_session_env,
+    set_session_env,
+)
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
 from cli_agent_orchestrator.utils.terminal import (
@@ -56,6 +62,7 @@ logger = logging.getLogger(__name__)
 
 # Track terminals that have already received memory injection (first message only).
 _memory_injected_terminals: set = set()
+_memory_injected_lock = threading.Lock()
 
 
 def inject_memory_context(first_message: str, terminal_id: str) -> str:
@@ -68,14 +75,14 @@ def inject_memory_context(first_message: str, terminal_id: str) -> str:
     a formatted <cao-memory>...</cao-memory> block (or empty string if
     no memories exist). Stateless — no file mutation, no backup/restore.
     """
-    if terminal_id in _memory_injected_terminals:
-        return first_message
-
-    _memory_injected_terminals.add(terminal_id)
+    with _memory_injected_lock:
+        if terminal_id in _memory_injected_terminals:
+            return first_message
+        _memory_injected_terminals.add(terminal_id)
 
     try:
         svc = MemoryService()
-        context = svc.get_memory_context_for_terminal(terminal_id)
+        context = svc.get_curated_memory_context(terminal_id, task_description=first_message[:200])
         if context:
             return context + "\n\n" + first_message
     except Exception as e:
@@ -115,6 +122,7 @@ def create_terminal(
     working_directory: Optional[str] = None,
     allowed_tools: Optional[list[str]] = None,
     registry: PluginRegistry | None = None,
+    env_vars: Optional[dict[str, str]] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -131,6 +139,12 @@ def create_terminal(
         session_name: Optional custom session name. If not provided, auto-generated.
         new_session: If True, creates a new tmux session. If False, adds to existing.
         working_directory: Optional working directory for the terminal shell
+        env_vars: Operator-forwarded env vars (``cao launch --env``). On
+            ``new_session=True``, these are stored on the session record and
+            inherited by every worker spawned later in the same session. On
+            ``new_session=False``, the persisted session vars are merged in
+            automatically; the explicit ``env_vars`` argument is ignored to
+            keep the per-session view consistent. See issue #248.
 
     Returns:
         Terminal object with all metadata populated
@@ -159,15 +173,35 @@ def create_terminal(
             if tmux_client.session_exists(session_name):
                 raise ValueError(f"Session '{session_name}' already exists")
 
+            # Wipe any stale mapping a prior aborted lifecycle for this name
+            # may have left behind, so a no-env relaunch can't inherit them.
+            clear_session_env(session_name)
+
             # Create new tmux session with initial window
-            tmux_client.create_session(session_name, window_name, terminal_id, working_directory)
+            tmux_client.create_session(
+                session_name,
+                window_name,
+                terminal_id,
+                working_directory,
+                extra_env=env_vars,
+            )
             session_created = True  # only set after successful creation
+
+            # Persist forwarded env only after the tmux session actually
+            # exists; the failure path below clears it if a later step
+            # tears the session back down.
+            if env_vars:
+                set_session_env(session_name, env_vars)
         else:
             # Add window to existing session
             if not tmux_client.session_exists(session_name):
                 raise ValueError(f"Session '{session_name}' not found")
             window_name = tmux_client.create_window(
-                session_name, window_name, terminal_id, working_directory
+                session_name,
+                window_name,
+                terminal_id,
+                working_directory,
+                extra_env=get_session_env(session_name),
             )
 
         # Step 3: Persist terminal metadata to database
@@ -268,6 +302,10 @@ def create_terminal(
                 tmux_client.kill_session(session_name)
             except:
                 pass  # Ignore cleanup errors
+            # Session is gone, drop any forwarded env we stashed for it so
+            # secrets don't linger in memory or bleed into a future reuse
+            # of the same name.
+            clear_session_env(session_name)
         raise
 
 
@@ -544,7 +582,13 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
 
         # Cleanup provider state and database record
         provider_manager.cleanup_provider(terminal_id)
-        _memory_injected_terminals.discard(terminal_id)
+        with _memory_injected_lock:
+            _memory_injected_terminals.discard(terminal_id)
+        # Drop any per-curator dispatch lock so the registry doesn't grow
+        # forever as memory_manager terminals come and go.
+        from cli_agent_orchestrator.services.memory_service import _curator_locks
+
+        _curator_locks.pop(terminal_id, None)
         deleted = db_delete_terminal(terminal_id)
         logger.info(f"Deleted terminal: {terminal_id}")
         if deleted and metadata:
