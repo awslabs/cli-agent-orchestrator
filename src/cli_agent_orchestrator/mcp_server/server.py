@@ -672,6 +672,23 @@ else:
 def _send_message_impl(receiver_id: str, message: str) -> Dict[str, Any]:
     """Implementation of send_message logic."""
     try:
+        # Guard against the worker sending a message to itself (issue #24).
+        # Worker agents sometimes confuse their own CAO_TERMINAL_ID with the
+        # supervisor's and end up queueing a message into their own inbox,
+        # which never reaches the supervisor. Reject that here so the worker
+        # gets a clear error and can pick the correct receiver_id instead.
+        own_terminal_id = os.environ.get("CAO_TERMINAL_ID")
+        if own_terminal_id and receiver_id == own_terminal_id:
+            return {
+                "success": False,
+                "error": (
+                    f"receiver_id ({receiver_id}) is this terminal's own CAO_TERMINAL_ID. "
+                    "send_message cannot deliver to the sender. The callback terminal ID of "
+                    "the supervisor that assigned this task is in the task message — use "
+                    "that as receiver_id instead."
+                ),
+            }
+
         # Auto-inject sender terminal ID suffix when enabled
         if ENABLE_SENDER_ID_INJECTION:
             sender_id = os.environ.get("CAO_TERMINAL_ID", "unknown")
