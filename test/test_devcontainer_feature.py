@@ -29,7 +29,12 @@ def test_feature_manifest_version_matches_project_version() -> None:
     )
     pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
-    assert feature_manifest["version"] == pyproject["project"]["version"]
+    feature_version = feature_manifest["version"]
+    project_version = pyproject["project"]["version"]
+    if feature_version != project_version:
+        raise AssertionError(
+            f"Feature version {feature_version} does not match project version {project_version}"
+        )
 
 
 def test_feature_declares_python_dependency() -> None:
@@ -38,7 +43,9 @@ def test_feature_declares_python_dependency() -> None:
         (FEATURE_DIR / "devcontainer-feature.json").read_text(encoding="utf-8")
     )
 
-    assert feature_manifest["dependsOn"]["ghcr.io/devcontainers/features/python:1"] == {}
+    python_dependency = feature_manifest["dependsOn"]["ghcr.io/devcontainers/features/python:1"]
+    if python_dependency != {}:
+        raise AssertionError("Python feature dependency must be declared as an empty object")
 
 
 def test_feature_webui_defaults_to_false() -> None:
@@ -60,7 +67,11 @@ def test_feature_installs_after_uses_versioned_feature_ids() -> None:
         "ghcr.io/devcontainers/features/node:1",
         "ghcr.io/devcontainers/features/python:1",
     }
-    assert required_installs_after.issubset(feature_manifest["installsAfter"])
+    missing_features = required_installs_after.difference(feature_manifest["installsAfter"])
+    if missing_features:
+        raise AssertionError(
+            f"installsAfter is missing required features: {sorted(missing_features)}"
+        )
 
 
 def test_install_script_generates_runtime_safe_entrypoint() -> None:
