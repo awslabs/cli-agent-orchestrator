@@ -1,5 +1,6 @@
 """Tests for settings_service module."""
 
+import importlib
 import json
 from pathlib import Path
 from unittest.mock import patch
@@ -117,6 +118,25 @@ class TestGetAgentDirs:
         result = get_agent_dirs()
         for key in _DEFAULTS:
             assert key in result
+
+    def test_cao_managed_defaults_follow_cao_home_dir_env_override(self, tmp_path):
+        """CAO-managed agent directories stay inside an overridden CAO home."""
+        import cli_agent_orchestrator.constants as constants_module
+        import cli_agent_orchestrator.services.settings_service as settings_module
+
+        custom_home = tmp_path / "cao-home"
+        with patch.dict("os.environ", {"CAO_HOME_DIR": str(custom_home)}, clear=False):
+            importlib.reload(constants_module)
+            importlib.reload(settings_module)
+
+            result = settings_module.get_agent_dirs()
+
+            assert result["claude_code"] == str(custom_home / "agent-store")
+            assert result["codex"] == str(custom_home / "agent-store")
+            assert result["cao_installed"] == str(custom_home / "agent-context")
+
+        importlib.reload(constants_module)
+        importlib.reload(settings_module)
 
 
 class TestSetAgentDirs:
