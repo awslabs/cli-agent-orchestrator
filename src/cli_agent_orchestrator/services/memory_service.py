@@ -1316,12 +1316,13 @@ class MemoryService:
         )
 
         lines: list[str] = []
-        base_resolved = self.base_dir.resolve()
 
         for scope_val in scopes_in_order:
             scope_id = self.resolve_scope_id(scope_val, terminal_context)
             project_dir = self._get_project_dir(scope_val, scope_id)
-            index_path = project_dir / "wiki" / "index.md"
+            wiki_dir = project_dir / "wiki"
+            wiki_resolved = wiki_dir.resolve()
+            index_path = wiki_dir / "index.md"
             if not index_path.exists():
                 continue
 
@@ -1343,9 +1344,13 @@ class MemoryService:
             for entry in scope_entries:
                 if len(scope_memories) >= MEMORY_MAX_PER_SCOPE:
                     break
-                wiki_file = project_dir / "wiki" / entry["relative_path"]
+                wiki_file = wiki_dir / entry["relative_path"]
                 resolved_wiki = wiki_file.resolve()
-                if not str(resolved_wiki).startswith(str(base_resolved) + os.sep):
+                # Guard against a crafted/corrupted index entry (e.g.
+                # ``../<other-project>/wiki/...``) escaping this scope's wiki
+                # directory and leaking another project's memory. Validate
+                # against the per-scope wiki dir, not the global memory base.
+                if not str(resolved_wiki).startswith(str(wiki_resolved) + os.sep):
                     logger.warning(
                         f"Path traversal in index entry rejected: {entry.get('relative_path')}"
                     )

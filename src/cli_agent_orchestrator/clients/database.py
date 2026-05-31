@@ -93,8 +93,12 @@ class ProjectAliasModel(Base):
 
     __tablename__ = "project_aliases"
 
-    project_id = Column(String, primary_key=True)
+    # ``alias`` is the sole primary key: an alias maps to exactly one canonical
+    # project_id, so reverse lookups (get_project_id_by_alias) are stable. A
+    # cwd-hash first resolved via an override and later via its git remote
+    # upserts the same row rather than creating a second, ambiguous mapping.
     alias = Column(String, primary_key=True)
+    project_id = Column(String, nullable=False, index=True)
     kind = Column(String, nullable=False)  # "git_remote" | "cwd_hash" | "manual"
     created_at = Column(DateTime(timezone=True), default=_utcnow)
 
@@ -123,9 +127,45 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 def init_db() -> None:
     """Initialize database tables and apply schema migrations."""
+    _migrate_project_aliases_schema()
     Base.metadata.create_all(bind=engine)
     _migrate_terminals_schema()
     _migrate_memory_indexes()
+
+
+def _migrate_project_aliases_schema() -> None:
+    """Rebuild project_aliases if it predates the alias-only primary key.
+
+    The table originally used a composite PK ``(project_id, alias)``, which
+    allowed one alias to map to several project_ids and made reverse lookups
+    nondeterministic. The new schema keys on ``alias`` alone. SQLite cannot
+    alter a primary key in place, so drop and recreate. The table is an
+    opportunistic identity cache rebuilt by ``resolve_project_id`` on demand,
+    so dropping rows is safe. Runs before ``create_all`` so the fresh schema
+    is created with the new PK.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            row = conn.execute(
+                "SELECT name FROM sqlite_master " "WHERE type='table' AND name='project_aliases'"
+            ).fetchone()
+            if row is None:
+                return  # table doesn't exist yet — create_all builds it fresh
+            cols = conn.execute("PRAGMA table_info(project_aliases)").fetchall()
+            # PRAGMA returns rows: (cid, name, type, notnull, dflt_value, pk).
+            # In the legacy schema both project_id and alias have pk>0; in the
+            # new schema only alias does.
+            pk_cols = {c[1] for c in cols if c[5]}
+            if pk_cols != {"alias"}:
+                conn.execute("DROP TABLE project_aliases")
+                conn.commit()
+                logger.info("Migration: rebuilt project_aliases with alias-only primary key")
+    except Exception as e:
+        logger.debug(f"project_aliases migration skipped: {e}")
 
 
 def _migrate_memory_indexes() -> None:
@@ -394,16 +434,17 @@ def record_project_alias(project_id: str, alias: str, kind: str) -> None:
         return
     try:
         with SessionLocal() as db:
-            existing = (
-                db.query(ProjectAliasModel)
-                .filter(
-                    ProjectAliasModel.project_id == project_id,
-                    ProjectAliasModel.alias == alias,
-                )
-                .first()
-            )
+            # Upsert by alias (the primary key). If the same alias was already
+            # mapped — e.g. recorded against an override id, then re-resolved
+            # via git remote — repoint it to the current canonical project_id
+            # so reverse lookups stay deterministic instead of duplicating.
+            existing = db.query(ProjectAliasModel).filter(ProjectAliasModel.alias == alias).first()
             if existing is None:
                 db.add(ProjectAliasModel(project_id=project_id, alias=alias, kind=kind))
+                db.commit()
+            elif existing.project_id != project_id or existing.kind != kind:
+                existing.project_id = project_id
+                existing.kind = kind
                 db.commit()
     except Exception as e:
         logger.debug(f"record_project_alias failed (non-fatal): {e}")

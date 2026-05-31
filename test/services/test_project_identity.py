@@ -267,6 +267,37 @@ def test_explicit_project_id_from_settings_when_env_absent(
 
 
 # ---------------------------------------------------------------------------
+# Alias uniqueness — an alias maps to exactly one canonical project_id
+# ---------------------------------------------------------------------------
+
+
+def test_alias_upserts_to_single_project_id(isolated_db: Path) -> None:
+    """Re-recording an alias for a new project_id repoints it, never duplicates.
+
+    A cwd-hash first resolved via an explicit override and later via its git
+    remote must end up mapping to exactly one canonical id, so reverse lookups
+    are deterministic.
+    """
+    from cli_agent_orchestrator.clients.database import record_project_alias
+
+    alias = "deadbeefcafe"
+
+    # First resolution maps the cwd-hash to an override-supplied id.
+    record_project_alias("override-id", alias, "cwd_hash")
+    assert get_project_id_by_alias(alias) == "override-id"
+
+    # Later, the same cwd resolves via its git remote: the alias repoints.
+    record_project_alias("github-com-acme-widgets", alias, "cwd_hash")
+    assert get_project_id_by_alias(alias) == "github-com-acme-widgets"
+
+    # Exactly one mapping exists for the alias — no duplicate rows.
+    old = [a for a in list_aliases_for_project("override-id") if a["alias"] == alias]
+    new = [a for a in list_aliases_for_project("github-com-acme-widgets") if a["alias"] == alias]
+    assert old == []
+    assert len(new) == 1
+
+
+# ---------------------------------------------------------------------------
 # _normalize_git_remote shape
 # ---------------------------------------------------------------------------
 
