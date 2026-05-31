@@ -74,7 +74,7 @@ class TestSessionPluginEvents:
 
     @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
-    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_dispatches_post_kill_session_event_after_cleanup(
         self, mock_tmux, mock_list_terminals, mock_delete_terminals
     ):
@@ -85,8 +85,8 @@ class TestSessionPluginEvents:
         async def record_dispatch(*_args):
             call_order.append("dispatch")
 
-        mock_tmux.session_exists.return_value = True
-        mock_tmux.kill_session.side_effect = lambda *_: call_order.append("kill_session")
+        mock_tmux.return_value.session_exists.return_value = True
+        mock_tmux.return_value.kill_session.side_effect = lambda *_: call_order.append("kill_session")
         mock_list_terminals.return_value = []
         mock_delete_terminals.side_effect = lambda *_: call_order.append("delete_terminals")
         registry.dispatch.side_effect = record_dispatch
@@ -101,13 +101,15 @@ class TestSessionPluginEvents:
         assert event.session_id == "cao-demo"
         assert event.session_name == "cao-demo"
 
-    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
-    def test_delete_session_does_not_dispatch_on_failure(self, mock_tmux):
-        """Missing sessions should raise without emitting events."""
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_delete_session_does_not_dispatch_on_failure(self, mock_tmux, mock_list_terminals):
+        """Session deletion failures must not emit events."""
         registry = _registry_mock()
-        mock_tmux.session_exists.return_value = False
+        mock_tmux.return_value.session_exists.return_value = True
+        mock_list_terminals.side_effect = RuntimeError("db error")
 
-        with pytest.raises(ValueError, match="Session 'cao-missing' not found"):
+        with pytest.raises(RuntimeError, match="db error"):
             delete_session("cao-missing", registry=registry)
 
         registry.dispatch.assert_not_awaited()
@@ -121,7 +123,7 @@ class TestTerminalPluginEvents:
     @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     def test_create_terminal_dispatches_post_create_terminal_event_after_setup(
@@ -183,7 +185,7 @@ class TestTerminalPluginEvents:
     @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
     @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     def test_create_terminal_does_not_dispatch_on_failure(
@@ -223,7 +225,7 @@ class TestTerminalPluginEvents:
 
     @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal", return_value=True)
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_delete_terminal_dispatches_post_kill_terminal_event_after_delete(
         self, mock_get_metadata, mock_tmux, mock_provider_manager, mock_db_delete_terminal
@@ -257,7 +259,7 @@ class TestTerminalPluginEvents:
 
     @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_delete_terminal_does_not_dispatch_on_failure(
         self, mock_get_metadata, mock_tmux, mock_provider_manager, mock_db_delete_terminal
@@ -282,7 +284,7 @@ class TestMessagePluginEvents:
 
     @pytest.mark.parametrize("orchestration_type", ["send_message", "assign", "handoff"])
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_send_input_dispatches_post_send_message_event_for_each_orchestration_mode(
@@ -331,7 +333,7 @@ class TestMessagePluginEvents:
         assert event.message == "Hello from supervisor"
         assert event.orchestration_type == orchestration_type
 
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_send_input_does_not_dispatch_on_failure(

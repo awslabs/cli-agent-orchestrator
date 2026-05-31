@@ -35,7 +35,7 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -334,14 +334,14 @@ class KimiCliProvider(BaseProvider):
             TimeoutError: If shell or Kimi CLI doesn't start within timeout
         """
         # Wait for shell prompt to appear in the tmux window
-        if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
+        if not wait_for_shell(get_backend(), self.session_name, self.window_name, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
         # Build properly escaped command string
         command = self._build_kimi_command()
 
         # Send Kimi command to the tmux window
-        tmux_client.send_keys(self.session_name, self.window_name, command)
+        get_backend().send_keys(self.session_name, self.window_name, command)
 
         # Wait for Kimi CLI to reach IDLE or COMPLETED state (prompt visible).
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
@@ -386,7 +386,7 @@ class KimiCliProvider(BaseProvider):
         Returns:
             TerminalStatus indicating current state
         """
-        output = tmux_client.get_history(self.session_name, self.window_name, tail_lines=tail_lines)
+        output = get_backend().get_history(self.session_name, self.window_name, tail_lines=tail_lines)
 
         if not output:
             return TerminalStatus.ERROR

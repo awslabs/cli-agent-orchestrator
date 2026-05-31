@@ -31,7 +31,7 @@ from cli_agent_orchestrator.clients.database import (
     update_last_active,
     update_terminal_shell_command,
 )
-from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import SESSION_PREFIX, TERMINAL_LOG_DIR
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
@@ -174,7 +174,7 @@ def create_terminal(
                 session_name = f"{SESSION_PREFIX}{session_name}"
 
             # Prevent duplicate sessions
-            if tmux_client.session_exists(session_name):
+            if get_backend().session_exists(session_name):
                 raise ValueError(f"Session '{session_name}' already exists")
 
             # Wipe any stale mapping a prior aborted lifecycle for this name
@@ -182,7 +182,7 @@ def create_terminal(
             clear_session_env(session_name)
 
             # Create new tmux session with initial window
-            tmux_client.create_session(
+            get_backend().create_session(
                 session_name,
                 window_name,
                 terminal_id,
@@ -198,9 +198,9 @@ def create_terminal(
                 set_session_env(session_name, env_vars)
         else:
             # Add window to existing session
-            if not tmux_client.session_exists(session_name):
+            if not get_backend().session_exists(session_name):
                 raise ValueError(f"Session '{session_name}' not found")
-            window_name = tmux_client.create_window(
+            window_name = get_backend().create_window(
                 session_name,
                 window_name,
                 terminal_id,
@@ -266,7 +266,7 @@ def create_terminal(
         # This captures all terminal output to a log file for inbox monitoring
         log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
         log_path.touch()  # Ensure file exists before watching
-        tmux_client.pipe_pane(session_name, window_name, str(log_path))
+        get_backend().pipe_pane(session_name, window_name, str(log_path))
 
         # Build and return the Terminal object
         terminal = Terminal(
@@ -305,7 +305,7 @@ def create_terminal(
             pass  # Ignore cleanup errors
         if session_created and session_name:
             try:
-                tmux_client.kill_session(session_name)
+                get_backend().kill_session(session_name)
             except:
                 pass  # Ignore cleanup errors
             # Session is gone, drop any forwarded env we stashed for it so
@@ -362,7 +362,7 @@ def get_working_directory(terminal_id: str) -> Optional[str]:
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        working_dir = tmux_client.get_pane_working_directory(
+        working_dir = get_backend().get_pane_working_directory(
             metadata["tmux_session"], metadata["tmux_window"]
         )
         return working_dir
@@ -424,7 +424,7 @@ def send_input(
         # Check how many Enter keys the provider needs after paste
         enter_count = provider.paste_enter_count if provider else 1
 
-        tmux_client.send_keys(
+        get_backend().send_keys(
             metadata["tmux_session"],
             metadata["tmux_window"],
             message,
@@ -481,7 +481,7 @@ def send_special_key(terminal_id: str, key: str) -> bool:
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        tmux_client.send_special_key(metadata["tmux_session"], metadata["tmux_window"], key)
+        get_backend().send_special_key(metadata["tmux_session"], metadata["tmux_window"], key)
 
         update_last_active(terminal_id)
         logger.info(f"Sent special key '{key}' to terminal: {terminal_id}")
@@ -500,55 +500,113 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
     TUI-based providers (e.g. Gemini CLI's Ink renderer) whose notification
     spinners can temporarily obscure response text in the tmux capture buffer.
 
-    If the provider exposes an ``extraction_tail_lines`` attribute, the
-    history capture for LAST mode uses that value instead of the default
-    ``TMUX_HISTORY_LINES``. Status-check captures are unaffected (they go
-    through get_status directly). A single capture-pane call is made per
-    get_output invocation.
+    If the provider exposes an ``extraction_tail_lines`` attribute, that
+    fixed value is used for the history capture and the escalating-fetch
+    logic below is skipped.
+
+    Otherwise, extraction uses an escalating fetch strategy: start with a
+    small capture window and widen until the response marker is found.
+    Steps: 200 -> 500 -> 1000 -> 5000.  If no marker is found at 5000 lines,
+    the raw tail is returned with a [PARTIAL RESPONSE] prefix so the caller
+    knows the output may be incomplete.
     """
+    # Escalation steps used when the provider does not declare extraction_tail_lines.
+    _ESCALATION_STEPS = [200, 500, 1000, 5000]
+
     try:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
         if mode == OutputMode.FULL:
-            return tmux_client.get_history(metadata["tmux_session"], metadata["tmux_window"])
+            return get_backend().get_history(metadata["tmux_session"], metadata["tmux_window"])
         elif mode == OutputMode.LAST:
             provider = provider_manager.get_provider(terminal_id)
             if provider is None:
                 raise ValueError(f"Provider not found for terminal {terminal_id}")
 
-            # Capability check: providers that need deeper scrollback for extraction
-            # opt in by defining ``extraction_tail_lines``. Base providers don't.
-            extract_lines = getattr(provider, "extraction_tail_lines", None)
-            full_output = tmux_client.get_history(
-                metadata["tmux_session"],
-                metadata["tmux_window"],
-                tail_lines=extract_lines,
-            )
-
-            retries = provider.extraction_retries
-            last_err: Exception | None = None
-            for attempt in range(1 + retries):
-                try:
-                    if attempt > 0:
-                        time.sleep(10.0)
-                        full_output = tmux_client.get_history(
-                            metadata["tmux_session"],
-                            metadata["tmux_window"],
-                            tail_lines=extract_lines,
+            # If the provider pins a fixed scrollback depth, honour it and skip
+            # escalation — the provider knows what it needs.
+            fixed_extract_lines = getattr(provider, "extraction_tail_lines", None)
+            if fixed_extract_lines is not None:
+                full_output = get_backend().get_history(
+                    metadata["tmux_session"],
+                    metadata["tmux_window"],
+                    tail_lines=fixed_extract_lines,
+                )
+                retries = provider.extraction_retries
+                last_err: Exception | None = None
+                for attempt in range(1 + retries):
+                    try:
+                        if attempt > 0:
+                            time.sleep(10.0)
+                            full_output = get_backend().get_history(
+                                metadata["tmux_session"],
+                                metadata["tmux_window"],
+                                tail_lines=fixed_extract_lines,
+                            )
+                        return provider.extract_last_message_from_script(full_output)
+                    except ValueError as exc:
+                        last_err = exc
+                        logger.debug(
+                            "Output extraction attempt %d/%d for %s failed: %s",
+                            attempt + 1,
+                            1 + retries,
+                            terminal_id,
+                            exc,
                         )
-                    return provider.extract_last_message_from_script(full_output)
+                raise last_err  # type: ignore[misc]
+
+            # Escalating fetch: try progressively larger capture windows until
+            # the response marker is found or we hit the cap.
+            last_err = None
+            full_output = ""
+            for step_lines in _ESCALATION_STEPS:
+                full_output = get_backend().get_history(
+                    metadata["tmux_session"],
+                    metadata["tmux_window"],
+                    tail_lines=step_lines,
+                )
+                try:
+                    result = provider.extract_last_message_from_script(full_output)
+                    if step_lines > _ESCALATION_STEPS[0]:
+                        logger.debug(
+                            "get_output: %s marker found at %d lines",
+                            terminal_id,
+                            step_lines,
+                        )
+                    return result
                 except ValueError as exc:
                     last_err = exc
                     logger.debug(
-                        "Output extraction attempt %d/%d for %s failed: %s",
-                        attempt + 1,
-                        1 + retries,
+                        "get_output: %s no marker at %d lines, escalating",
                         terminal_id,
-                        exc,
+                        step_lines,
                     )
-            raise last_err  # type: ignore[misc]
+
+            # All tail-based steps failed — try full scrollback before giving up.
+            logger.debug(
+                "get_output: %s escalation exhausted, trying full_history",
+                terminal_id,
+            )
+            full_output = get_backend().get_history(
+                metadata["tmux_session"],
+                metadata["tmux_window"],
+                full_history=True,
+            )
+            try:
+                result = provider.extract_last_message_from_script(full_output)
+                logger.debug("get_output: %s marker found in full_history", terminal_id)
+                return result
+            except ValueError:
+                pass
+
+            # Full scrollback also failed — return partial.
+            logger.warning(
+                "get_output: %s response marker not found in full_history, returning partial",
+                terminal_id,
+            )
+            return f"[PARTIAL RESPONSE - response marker not found in {_ESCALATION_STEPS[-1]} lines]\n{full_output}"
 
     except Exception as e:
         logger.error(f"Failed to get output from terminal {terminal_id}: {e}")
@@ -565,7 +623,7 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
             # Snapshot scrollback + metadata before killing (for debugging/restore)
             try:
                 # Capture plain text full scrollback (no -e, no line cap)
-                scrollback = tmux_client.get_history(
+                scrollback = get_backend().get_history(
                     metadata["tmux_session"],
                     metadata["tmux_window"],
                     strip_escapes=True,
@@ -582,7 +640,7 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
                     "window_name": metadata["tmux_window"],
                     "agent_profile": metadata.get("agent_profile"),
                     "provider": metadata["provider"],
-                    "working_directory": tmux_client.get_pane_working_directory(
+                    "working_directory": get_backend().get_pane_working_directory(
                         metadata["tmux_session"], metadata["tmux_window"]
                     ),
                     "allowed_tools": metadata.get("allowed_tools"),
@@ -594,13 +652,13 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
 
             # Stop pipe-pane logging
             try:
-                tmux_client.stop_pipe_pane(metadata["tmux_session"], metadata["tmux_window"])
+                get_backend().stop_pipe_pane(metadata["tmux_session"], metadata["tmux_window"])
             except Exception as e:
                 logger.warning(f"Failed to stop pipe-pane for {terminal_id}: {e}")
 
             # Kill the tmux window (this terminates the agent process)
             try:
-                tmux_client.kill_window(metadata["tmux_session"], metadata["tmux_window"])
+                get_backend().kill_window(metadata["tmux_session"], metadata["tmux_window"])
             except Exception as e:
                 logger.warning(f"Failed to kill tmux window for {terminal_id}: {e}")
 

@@ -22,7 +22,7 @@ import re
 import shlex
 from typing import Optional
 
-from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import OPENCODE_CONFIG_DIR, OPENCODE_CONFIG_FILE
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
@@ -137,11 +137,11 @@ class OpenCodeCliProvider(BaseProvider):
         Raises:
             TimeoutError: If shell or OpenCode doesn't reach IDLE/COMPLETED in time.
         """
-        if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
+        if not wait_for_shell(get_backend(), self.session_name, self.window_name, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
         command = self._build_launch_command()
-        tmux_client.send_keys(self.session_name, self.window_name, command)
+        get_backend().send_keys(self.session_name, self.window_name, command)
 
         # 120s covers first-run npm install (5–30s) and concurrent multi-agent launches.
         if not wait_until_status(
@@ -186,12 +186,12 @@ class OpenCodeCliProvider(BaseProvider):
         5. ERROR — fallback
 
         Args:
-            tail_lines: Lines to capture; None uses the tmux_client default.
+            tail_lines: Lines to capture; None uses the backend default.
 
         Returns:
             Current TerminalStatus.
         """
-        output = tmux_client.get_history(self.session_name, self.window_name, tail_lines=tail_lines)
+        output = get_backend().get_history(self.session_name, self.window_name, tail_lines=tail_lines)
         if not output:
             return TerminalStatus.ERROR
 

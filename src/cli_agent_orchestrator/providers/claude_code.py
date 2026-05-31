@@ -4,13 +4,12 @@ import json
 import logging
 import re
 import shlex
-import subprocess
 import time
 from pathlib import Path
 from typing import Optional
 
-from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
@@ -27,7 +26,7 @@ class ProviderError(Exception):
 
 # Regex patterns for Claude Code output analysis
 ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
-RESPONSE_PATTERN = r"⏺(?:\x1b\[[0-9;]*m)*\s+"  # Handle any ANSI codes between marker and text
+RESPONSE_PATTERN = r"[⏺●](?:\x1b\[[0-9;]*m)*\s+"  # ⏺ (U+23FA) old claude, ● (U+25CF) new claude
 # Match Claude Code processing spinners:
 # - Old format: "✽ Cooking… (esc to interrupt)" / "✶ Thinking… (esc to interrupt)"
 # - New format: "✽ Cooking… (6s · ↓ 174 tokens · thinking)"
@@ -68,6 +67,10 @@ class ClaudeCodeProvider(BaseProvider):
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
+        self._task_dispatched = False
+        self._last_dispatch_time: float = 0.0   # set by mark_input_received()
+        self._done_first_detected: float = 0.0  # first time herdr reported "done" this cycle
+        self._idle_first_detected: float = 0.0  # first time herdr reported "idle" post-dispatch
 
     def _build_claude_command(self) -> str:
         """Build Claude Code command with agent profile if provided.
@@ -220,7 +223,7 @@ class ClaudeCodeProvider(BaseProvider):
         start_time = time.time()
         bypass_accepted = False
         while time.time() - start_time < timeout:
-            output = tmux_client.get_history(self.session_name, self.window_name)
+            output = get_backend().get_history(self.session_name, self.window_name)
             if not output:
                 time.sleep(1.0)
                 continue
@@ -231,13 +234,12 @@ class ClaudeCodeProvider(BaseProvider):
             #    Only act once — the text stays in the buffer after dismissal.
             if not bypass_accepted and re.search(BYPASS_PROMPT_PATTERN, clean_output):
                 logger.info("Bypass permissions prompt detected, auto-accepting")
-                target = f"{self.session_name}:{self.window_name}"
-                # Send raw Down arrow escape sequence (-l for literal) to move
-                # cursor to "Yes, I accept", then Enter to confirm.
-                # tmux send-keys "Down" doesn't work with Claude's Ink TUI.
-                subprocess.run(["tmux", "send-keys", "-t", target, "-l", "\x1b[B"], check=False)
+                # Send Down arrow to move cursor to "Yes, I accept", then Enter.
+                get_backend().send_keys(
+                    self.session_name, self.window_name, "\x1b[B", enter_count=0
+                )
                 time.sleep(0.5)
-                subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], check=False)
+                get_backend().send_special_key(self.session_name, self.window_name, "Enter")
                 bypass_accepted = True
                 time.sleep(1.0)
                 continue  # Trust prompt may follow
@@ -245,17 +247,9 @@ class ClaudeCodeProvider(BaseProvider):
             # 2) Handle workspace trust prompt
             if re.search(TRUST_PROMPT_PATTERN, clean_output):
                 logger.info("Workspace trust prompt detected, auto-accepting")
-                session = tmux_client.server.sessions.get(session_name=self.session_name)
-                if session is None:
-                    time.sleep(1.0)
-                    continue
-                window = session.windows.get(window_name=self.window_name)
-                if window is None:
-                    time.sleep(1.0)
-                    continue
-                pane = window.active_pane
-                if pane:
-                    pane.send_keys("", enter=True)
+                get_backend().send_special_key(
+                    self.session_name, self.window_name, "Enter"
+                )
                 return
 
             # 3) Claude Code fully started — no prompts needed
@@ -272,7 +266,7 @@ class ClaudeCodeProvider(BaseProvider):
     def initialize(self) -> bool:
         """Initialize Claude Code provider by starting claude command."""
         # Wait for shell prompt to appear in the tmux window
-        if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
+        if not wait_for_shell(get_backend(), self.session_name, self.window_name, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
         # Prevent bypass permissions dialog from appearing (settings-based fix).
@@ -286,10 +280,10 @@ class ClaudeCodeProvider(BaseProvider):
         # from Claude Code's own ❯ REPL prompt — they are visually identical
         # after ANSI stripping, so without a snapshot, status detection can
         # falsely return IDLE on the old shell prompt before claude even starts.
-        pre_launch_snapshot = tmux_client.get_history(self.session_name, self.window_name) or ""
+        pre_launch_snapshot = get_backend().get_history(self.session_name, self.window_name) or ""
 
         # Send Claude Code command using tmux client
-        tmux_client.send_keys(self.session_name, self.window_name, command)
+        get_backend().send_keys(self.session_name, self.window_name, command)
 
         # Handle startup prompts (bypass permissions + workspace trust)
         self._handle_startup_prompts(timeout=20.0)
@@ -303,7 +297,7 @@ class ClaudeCodeProvider(BaseProvider):
         # ❯ prompt triggers an immediate IDLE return before claude starts.
         deadline = time.time() + 30.0
         while time.time() < deadline:
-            current_output = tmux_client.get_history(self.session_name, self.window_name) or ""
+            current_output = get_backend().get_history(self.session_name, self.window_name) or ""
             new_content = current_output[len(pre_launch_snapshot) :]
             # Claude-specific startup markers that cannot come from the shell:
             # the ──────── separator, bypass/trust prompt text, or "Claude Code"
@@ -315,7 +309,7 @@ class ClaudeCodeProvider(BaseProvider):
             )
             if claude_started:
                 status = self.get_status()
-                if status in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}:
+                if status in {TerminalStatus.IDLE, TerminalStatus.COMPLETED, TerminalStatus.WAITING_USER_ANSWER}:
                     break
             time.sleep(1.0)
         else:
@@ -325,50 +319,104 @@ class ClaudeCodeProvider(BaseProvider):
         return True
 
     def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
-        """Get Claude Code status by analyzing terminal output.
+        """Get Claude Code status.
 
-        Uses a structural "thinking-before-separator" check as the primary
-        PROCESSING indicator, plus position-based fallbacks for edge cases.
+        Two detection paths:
 
-        Bug history:
-        1. Stale-spinner bug (#104): Old spinner lines persist in the tmux
-           scrollback after the agent returns to idle (Claude Code renders
-           inline, not alt-screen, inside a tmux pane). Position comparison
-           of last spinner vs last idle prompt catches this.
+        1. Native path (herdr backend): get_native_status() returns the full
+           herdr agent state as a TerminalStatus. When non-None, buffer reads are
+           skipped entirely. The only ambiguous case is IDLE -- herdr reports "idle"
+           both before any task has been dispatched and after a task completed when
+           the user focuses the tab (resetting "done" to "idle"). _task_dispatched
+           (set by mark_input_received() on first send_input()) disambiguates:
+           IDLE + _task_dispatched=True -> COMPLETED, otherwise -> IDLE.
 
-        2. Mid-tool-execution race (this issue): The ❯ input prompt is ALWAYS
-           rendered at the bottom of the tmux pane (last position in the
-           scrollback buffer). Position-based comparisons against ❯ are
-           therefore unreliable — last_idle.start() is always greater than
-           any other marker when anything has been typed/executed.
-
-        V3 fix (structural): Check whether any line containing … (U+2026,
-        the ellipsis used in all Claude Code thinking/spinner text) appears
-        immediately before the ──────── separator line. Claude Code draws
-        this separator between the active-execution area and the input prompt.
-        When the agent is thinking/processing:
-        "· Swirling… (thinking)\n\n──────────────────────\n❯ "
-        When idle or completed:
-        "some response text\n──────────────────────\n❯ "
-        A stale old spinner line far back in scrollback will NOT be
-        immediately before the separator, so the structural check is immune
-        to the stale-spinner false-positive.
+        2. Buffer path (tmux backend, or herdr backend error): Reads 500 lines
+           from the pane and runs structural regex analysis. Uses a
+           "thinking-before-separator" check as the primary PROCESSING indicator,
+           plus position-based fallbacks for edge cases.
 
         See: https://github.com/awslabs/cli-agent-orchestrator/issues/104
         """
+        # Native status: herdr knows agent state without pane content parsing.
+        # When the backend returns non-None, trust it and skip buffer reads.
+        # The only ambiguous case is IDLE: herdr "idle" fires both when no task
+        # has been dispatched yet AND when a task completed but the user focused
+        # the tab (resetting "done" -> "idle"). _task_dispatched disambiguates.
+        # Tmux backend always returns None -- falls through to buffer analysis.
+        native = get_backend().get_native_status(self.session_name, self.window_name)
+        logger.debug(
+            "[get_status] terminal=%s native=%s",
+            self.terminal_id,
+            native.value if native is not None else None,
+        )
+        if native is not None:
+            if native == TerminalStatus.PROCESSING:
+                # Reset flush-wait timers — herdr is actively working, so any
+                # previously stamped idle/done timestamp is from a pre-work gap
+                # and must not be counted toward the post-completion flush wait.
+                self._done_first_detected = 0.0
+                self._idle_first_detected = 0.0
+                logger.debug("[get_status] terminal=%s -> PROCESSING (native)", self.terminal_id)
+                return TerminalStatus.PROCESSING
+            if native == TerminalStatus.COMPLETED and self._task_dispatched:
+                # herdr "done": wait 10s from first detection for buffer to flush.
+                if self._done_first_detected == 0.0:
+                    self._done_first_detected = time.time()
+                waited = time.time() - self._done_first_detected
+                if waited >= 10.0:
+                    logger.debug(
+                        "[get_status] terminal=%s -> COMPLETED (native done, %.1fs flush wait elapsed)",
+                        self.terminal_id, waited,
+                    )
+                    return TerminalStatus.COMPLETED
+                logger.debug(
+                    "[get_status] terminal=%s -> PROCESSING (native done, flush wait %.1fs/10s)",
+                    self.terminal_id, waited,
+                )
+                return TerminalStatus.PROCESSING
+            if native == TerminalStatus.IDLE and self._task_dispatched:
+                # herdr "idle" post-dispatch: wait 10s from first detection, then
+                # keep returning PROCESSING until 5 min from dispatch (give up).
+                if self._idle_first_detected == 0.0:
+                    self._idle_first_detected = time.time()
+                waited = time.time() - self._idle_first_detected
+                elapsed = time.time() - self._last_dispatch_time
+                if waited >= 10.0:
+                    if elapsed >= 300.0:
+                        logger.warning(
+                            "[get_status] terminal=%s -> COMPLETED (native idle, %.0fs since dispatch, giving up)",
+                            self.terminal_id, elapsed,
+                        )
+                        return TerminalStatus.COMPLETED
+                    logger.debug(
+                        "[get_status] terminal=%s -> COMPLETED (native idle, %.1fs flush wait elapsed)",
+                        self.terminal_id, waited,
+                    )
+                    return TerminalStatus.COMPLETED
+                logger.debug(
+                    "[get_status] terminal=%s -> PROCESSING (native idle, flush wait %.1fs/10s)",
+                    self.terminal_id, waited,
+                )
+                return TerminalStatus.PROCESSING
+            if native == TerminalStatus.IDLE:
+                logger.debug(
+                    "[get_status] terminal=%s -> IDLE (native idle, no task dispatched)",
+                    self.terminal_id,
+                )
+                return TerminalStatus.IDLE
+            # COMPLETED (no task dispatched), WAITING_USER_ANSWER, ERROR -- return directly
+            logger.debug(
+                "[get_status] terminal=%s -> %s (native)", self.terminal_id, native.value
+            )
+            return native
 
-        output = tmux_client.get_history(self.session_name, self.window_name, tail_lines=tail_lines)
+        output = get_backend().get_history(self.session_name, self.window_name, tail_lines=tail_lines)
 
         if not output:
             return TerminalStatus.ERROR
 
         # PRIMARY PROCESSING check: walk backwards from the *last* separator.
-        # If we encounter a spinner line (spinner char + …) before we encounter
-        # another separator, the agent is actively processing.
-        # If we hit another separator first, the spinner belongs to a previously
-        # completed task — covers two distinct false-positive patterns:
-        # 1. Mid-conversation compaction: "✢ Compacting…" → sep → more output → last sep
-        # 2. Post-exit: live spinner → sep (task done) → ❯ /exit → last sep (exit menu)
         _sep_re = re.compile(r"(?:\x1b\[[0-9;]*m)*\u2500{20,}")
         _sep_positions = [m.start() for m in _sep_re.finditer(output)]
         if _sep_positions:
@@ -377,7 +425,7 @@ class ClaudeCodeProvider(BaseProvider):
                 if re.search(r"[✶✢✽✻✳·][^\n]*\u2026", line):
                     return TerminalStatus.PROCESSING  # spinner before another separator
                 if _sep_re.search(line):
-                    break  # hit another separator first — spinner is from a completed task
+                    break  # hit another separator first -- spinner is from a completed task
 
         # Find the LAST occurrence of each marker for fallback position checks.
         last_processing = None
@@ -393,14 +441,11 @@ class ClaudeCodeProvider(BaseProvider):
             last_response = m
 
         # FALLBACK PROCESSING: spinner visible AND no separator follows it yet
-        # (early in execution before the separator appears). Position comparison
-        # is used here only when no separator is present (safe case).
         if last_processing and not re.search(r"\u2500{20,}", output):
             if last_idle is None or last_processing.start() > last_idle.start():
                 return TerminalStatus.PROCESSING
 
         # Check for waiting user answer via the active Ink selection footer.
-        # Exclude startup prompts (trust + bypass), which also render the footer.
         if (
             re.search(WAITING_USER_ANSWER_PATTERN, output)
             and not re.search(TRUST_PROMPT_PATTERN, output)
@@ -408,7 +453,7 @@ class ClaudeCodeProvider(BaseProvider):
         ):
             return TerminalStatus.WAITING_USER_ANSWER
 
-        # COMPLETED: ⏺ response exists AND ❯ prompt is visible (agent finished).
+        # COMPLETED: response exists AND prompt is visible (agent finished).
         if last_response and last_idle:
             return TerminalStatus.COMPLETED
 
@@ -427,6 +472,18 @@ class ClaudeCodeProvider(BaseProvider):
         """
         return self._initialized
 
+    def mark_input_received(self) -> None:
+        """Record that a task was dispatched to this terminal.
+
+        Called by the terminal service after send_input() delivers a message.
+        Sets _task_dispatched=True so get_status() can distinguish herdr 'idle'
+        after task completion from 'idle' before any task was dispatched.
+        """
+        self._task_dispatched = True
+        self._last_dispatch_time = time.time()
+        self._done_first_detected = 0.0
+        self._idle_first_detected = 0.0
+
     def get_idle_pattern_for_log(self) -> str:
         """Return Claude Code IDLE prompt pattern for log files."""
         return IDLE_PROMPT_PATTERN_LOG
@@ -437,18 +494,18 @@ class ClaudeCodeProvider(BaseProvider):
     _SOL_IDLE_RE = re.compile(r"^\s*(?:\x1b\[[0-9;]*m)*[>❯](?:\x1b\[[0-9;]*m)*[\s\xa0]")
 
     def extract_last_message_from_script(self, script_output: str) -> str:
-        """Extract Claude's final response message using ⏺ indicator."""
+        """Extract Claude's final response message using ⏺/● response marker."""
         # Find all matches of response pattern
         matches = list(re.finditer(RESPONSE_PATTERN, script_output))
 
         if not matches:
-            raise ValueError("No Claude Code response found - no ⏺ pattern detected")
+            raise ValueError("No Claude Code response found - no ⏺/● pattern detected")
 
         # Get the last match (final answer)
         last_match = matches[-1]
         start_pos = last_match.end()
 
-        # Extract everything after the last ⏺ until:
+        # Extract everything after the last ⏺/● until:
         # 1. A start-of-line idle prompt (❯ or >) — the definitive boundary
         # 2. A completion stat line ("✻ Sautéed for 14s") — trims the stat
         # Using start-of-line anchor avoids false stops on ">" inside
@@ -463,13 +520,17 @@ class ClaudeCodeProvider(BaseProvider):
             clean_line = re.sub(ANSI_CODE_PATTERN, "", line).strip()
             if self._SOL_IDLE_RE.match(line):
                 break
-            if "────────" in line:
+            # Match full-width Claude UI separator (20+ U+2500 dashes spanning the line).
+            # Table borders also contain ──── runs but always pair with other box-drawing
+            # chars (corners, intersections U+2501-U+257F). Claude's separator uses only
+            # U+2500 dashes plus optional text — no other box-drawing chars present.
+            if re.search(r"─{20,}", clean_line) and not re.search("[━-╿]", clean_line):
                 break
 
             response_lines.append(clean_line)
 
         if not response_lines or not any(line.strip() for line in response_lines):
-            raise ValueError("Empty Claude Code response - no content found after ⏺")
+            raise ValueError("Empty Claude Code response - no content found after ⏺/●")
 
         # Join lines and clean up
         final_answer = "\n".join(response_lines).strip()

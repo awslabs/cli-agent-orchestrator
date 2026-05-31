@@ -26,7 +26,7 @@ from cli_agent_orchestrator.clients.database import update_flow_enabled as db_up
 from cli_agent_orchestrator.clients.database import (
     update_flow_run_times as db_update_flow_run_times,
 )
-from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import DEFAULT_PROVIDER, PROVIDERS
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -233,7 +233,7 @@ def execute_flow(name: str) -> bool:
 
         # Launch session
         session_name = f"cao-flow-{flow.name}"
-        if tmux_client.session_exists(session_name):
+        if get_backend().session_exists(session_name):
             terminals = list_terminals_by_session(session_name)
             # Only check the first (conductor) terminal for busy status.
             # Worker terminals spawned by the conductor may have stale status
@@ -244,7 +244,7 @@ def execute_flow(name: str) -> bool:
                 return False
             for t in terminals:
                 provider_manager.cleanup_provider(t["id"])
-            tmux_client.kill_session(session_name)
+            get_backend().kill_session(session_name)
             delete_terminals_by_session(session_name)
         terminal = create_terminal(
             session_name=session_name,

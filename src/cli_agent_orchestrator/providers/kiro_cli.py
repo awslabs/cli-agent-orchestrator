@@ -22,7 +22,7 @@ import re
 import shlex
 from typing import Optional
 
-from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -208,11 +208,11 @@ class KiroCliProvider(BaseProvider):
         """
         # Step 1: Wait for shell prompt to appear in the tmux window
         # This ensures the terminal is ready before we send commands
-        if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
+        if not wait_for_shell(get_backend(), self.session_name, self.window_name, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
         # Capture the shell process name before launching kiro — used later to detect kiro exit
-        self.shell_baseline = tmux_client.get_pane_current_command(
+        self.shell_baseline = get_backend().get_pane_current_command(
             self.session_name, self.window_name
         )
 
@@ -245,7 +245,7 @@ class KiroCliProvider(BaseProvider):
             base_args.extend(["--model", model])
         base_args.extend(["--agent", self._agent_profile])
         command = shlex.join(base_args)
-        tmux_client.send_keys(self.session_name, self.window_name, command)
+        get_backend().send_keys(self.session_name, self.window_name, command)
 
         # Step 3: Wait for Kiro CLI to fully initialize and show the agent prompt.
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
@@ -259,15 +259,15 @@ class KiroCliProvider(BaseProvider):
             # Non-yolo TUI mode failed — fall back to --legacy-ui
             logger.warning("Kiro CLI TUI initialization timed out, retrying with --legacy-ui")
             # Exit the current session and start fresh with --legacy-ui
-            tmux_client.send_keys(self.session_name, self.window_name, "/exit")
-            if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
+            get_backend().send_keys(self.session_name, self.window_name, "/exit")
+            if not wait_for_shell(get_backend(), self.session_name, self.window_name, timeout=10.0):
                 raise TimeoutError("Shell recovery timed out after --legacy-ui fallback")
             legacy_args = ["kiro-cli", "chat", "--legacy-ui"]
             if model:
                 legacy_args.extend(["--model", model])
             legacy_args.extend(["--agent", self._agent_profile])
             legacy_command = shlex.join(legacy_args)
-            tmux_client.send_keys(self.session_name, self.window_name, legacy_command)
+            get_backend().send_keys(self.session_name, self.window_name, legacy_command)
             if not wait_until_status(
                 self, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=30.0
             ):
@@ -289,13 +289,13 @@ class KiroCliProvider(BaseProvider):
 
         Args:
             tail_lines: Number of lines to capture from terminal history.
-                        If None, uses default from tmux_client.
+                        If None, uses default from get_backend().
 
         Returns:
             Current TerminalStatus enum value
         """
         logger.debug(f"get_status: tail_lines={tail_lines}")
-        output = tmux_client.get_history(self.session_name, self.window_name, tail_lines=tail_lines)
+        output = get_backend().get_history(self.session_name, self.window_name, tail_lines=tail_lines)
 
         # No output indicates a terminal error
         if not output:
@@ -347,7 +347,7 @@ class KiroCliProvider(BaseProvider):
         # by Kiro's boot screen and silently dropped.
         if not has_idle_prompt and not has_new_tui_idle:
             if self._initialized and self.shell_baseline:
-                current_cmd = tmux_client.get_pane_current_command(
+                current_cmd = get_backend().get_pane_current_command(
                     self.session_name, self.window_name
                 )
                 if current_cmd == self.shell_baseline:

@@ -1,0 +1,775 @@
+"""Unit tests for HerdrBackend — pane_id resolution and command construction."""
+
+import json
+import time
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from cli_agent_orchestrator.backends.base import (
+    TerminalBackend,
+    TerminalBackendError,
+    TerminalNotFoundError,
+)
+from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+
+# --- Fixtures ---
+
+
+@pytest.fixture
+def backend():
+    # Patch os.path.exists so _ensure_session_running finds the socket immediately,
+    # avoiding the 5-second poll timeout in unit tests.
+    with patch("cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True):
+        yield HerdrBackend(send_delay_ms=0)
+
+
+def _make_pane_list_response(panes):
+    """Build a herdr pane list JSON envelope."""
+    return json.dumps({"id": "cli:pane:list", "result": {"panes": panes, "type": "pane_list"}})
+
+
+def _make_workspace_list_response(workspaces):
+    """Build a herdr workspace list JSON envelope."""
+    return json.dumps(
+        {"id": "cli:workspace:list", "result": {"workspaces": workspaces, "type": "workspace_list"}}
+    )
+
+
+def _make_tab_list_response(tabs):
+    """Build a herdr tab list JSON envelope."""
+    return json.dumps({"id": "cli:tab:list", "result": {"tabs": tabs, "type": "tab_list"}})
+
+
+def _completed(stdout="", returncode=0):
+    """Create a mock CompletedProcess."""
+    mock = MagicMock()
+    mock.stdout = stdout
+    mock.returncode = returncode
+    mock.stderr = ""
+    return mock
+
+
+# --- ABC Compliance ---
+
+
+class TestHerdrBackendABC:
+    """Verify HerdrBackend satisfies the ABC."""
+
+    def test_is_instance_of_terminal_backend(self, backend):
+        assert isinstance(backend, TerminalBackend)
+
+    def test_all_methods_implemented(self, backend):
+        for method in [
+            "create_session", "session_exists", "list_sessions", "kill_session",
+            "create_window", "kill_window", "send_keys", "send_special_key",
+            "get_history", "get_pane_working_directory", "get_pane_current_command",
+            "attach_session", "pipe_pane", "stop_pipe_pane",
+        ]:
+            assert callable(getattr(backend, method))
+
+
+# --- Pane ID Resolution ---
+
+
+class TestPaneIdResolution:
+    """Test terminal_id → pane_id resolution with cache."""
+
+    @patch("subprocess.run")
+    def test_resolves_pane_id_from_list(self, mock_run, backend):
+        """Should resolve terminal_id to pane_id via herdr pane list."""
+        panes = [
+            {"terminal_id": "term_abc", "pane_id": "w1-1", "workspace_id": "w1"},
+            {"terminal_id": "term_def", "pane_id": "w1-2", "workspace_id": "w1"},
+        ]
+        mock_run.return_value = _completed(_make_pane_list_response(panes))
+
+        result = backend._resolve_pane_id("term_abc")
+        assert result == "w1-1"
+
+    @patch("subprocess.run")
+    def test_cache_hit_avoids_subprocess(self, mock_run, backend):
+        """Cached pane_id should be returned without calling herdr."""
+        backend._pane_cache["term_cached"] = ("w2-3", time.time())
+
+        result = backend._resolve_pane_id("term_cached")
+        assert result == "w2-3"
+        mock_run.assert_not_called()
+
+    @patch("subprocess.run")
+    def test_cache_expired_calls_subprocess(self, mock_run, backend):
+        """Expired cache entry should trigger a fresh resolve."""
+        backend._pane_cache["term_old"] = ("w2-3", time.time() - 10.0)  # expired
+
+        panes = [{"terminal_id": "term_old", "pane_id": "w2-4", "workspace_id": "w2"}]
+        mock_run.return_value = _completed(_make_pane_list_response(panes))
+
+        result = backend._resolve_pane_id("term_old")
+        assert result == "w2-4"
+        mock_run.assert_called_once()
+
+    @patch("subprocess.run")
+    def test_raises_terminal_not_found(self, mock_run, backend):
+        """Should raise TerminalNotFoundError when terminal_id is not in list."""
+        panes = [{"terminal_id": "term_other", "pane_id": "w1-1", "workspace_id": "w1"}]
+        mock_run.return_value = _completed(_make_pane_list_response(panes))
+
+        with pytest.raises(TerminalNotFoundError, match="term_missing"):
+            backend._resolve_pane_id("term_missing")
+
+
+# --- Command Construction ---
+
+
+class TestHerdrBackendCommands:
+    """Verify correct herdr CLI command construction for each method."""
+
+    @patch("subprocess.run")
+    def test_session_exists_true(self, mock_run, backend):
+        """session_exists returns True when workspace label matches."""
+        ws = [{"label": "cao-test", "workspace_id": "w1"}]
+        mock_run.return_value = _completed(_make_workspace_list_response(ws))
+
+        assert backend.session_exists("cao-test") is True
+
+    @patch("subprocess.run")
+    def test_session_exists_false(self, mock_run, backend):
+        """session_exists returns False when no workspace matches."""
+        ws = [{"label": "other", "workspace_id": "w1"}]
+        mock_run.return_value = _completed(_make_workspace_list_response(ws))
+
+        assert backend.session_exists("cao-test") is False
+
+    @patch("subprocess.run")
+    def test_list_sessions(self, mock_run, backend):
+        """list_sessions returns workspace labels."""
+        ws = [
+            {"label": "cao-proj1", "workspace_id": "w1"},
+            {"label": "cao-proj2", "workspace_id": "w2"},
+        ]
+        mock_run.return_value = _completed(_make_workspace_list_response(ws))
+
+        result = backend.list_sessions()
+        assert len(result) == 2
+        assert result[0]["name"] == "cao-proj1"
+        assert result[1]["name"] == "cao-proj2"
+
+    @patch("subprocess.run")
+    def test_create_session_calls_workspace_create(self, mock_run, backend):
+        """create_session should call herdr workspace create with --label and inject env."""
+        # Include root_pane.pane_id so _parse_new_pane_id succeeds and _inject_env_vars
+        # uses the known pane_id directly (no fallback pane list scan needed).
+        ws_create_resp = _completed(json.dumps({
+            "id": "cli:workspace:create",
+            "result": {
+                "workspace_id": "w_new",
+                "root_pane": {"pane_id": "w_new-1", "workspace_id": "w_new", "tab_id": "tab-0"},
+                "type": "workspace_created",
+            },
+        }))
+        mock_run.side_effect = [
+            ws_create_resp,  # workspace create
+            _completed(),    # tab rename (root tab labeled with window_name)
+            _completed(),    # pane send-text (env export)
+            _completed(),    # pane send-keys Enter
+        ]
+
+        backend.create_session("cao-myproj", "window-0", "tid1", "/home/user/project")
+
+        # First call should be workspace create
+        cmd = mock_run.call_args_list[0][0][0]
+        assert cmd[:3] == ["herdr", "--session", "cao"]
+        assert "workspace" in cmd
+        assert "create" in cmd
+        assert "--label" in cmd
+        assert "cao-myproj" in cmd
+        assert "--cwd" in cmd
+        assert "/home/user/project" in cmd
+        # Env injection should have sent the export command (call index 2)
+        env_cmd = mock_run.call_args_list[2][0][0]
+        assert "send-text" in env_cmd
+        assert "CAO_TERMINAL_ID=tid1" in env_cmd[-1]
+        assert "CAO_SESSION_NAME=cao-myproj" in env_cmd[-1]
+
+    @patch("subprocess.run")
+    def test_kill_session_calls_workspace_close(self, mock_run, backend):
+        """kill_session should resolve workspace_id then call herdr workspace close <id>."""
+        ws = [{"label": "cao-test", "workspace_id": "w_abc123"}]
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),  # _resolve_workspace_id
+            _completed(),                                    # workspace close
+        ]
+
+        result = backend.kill_session("cao-test")
+
+        assert result is True
+        close_call = mock_run.call_args_list[1][0][0]
+        assert "workspace" in close_call
+        assert "close" in close_call
+        assert "w_abc123" in close_call
+        assert "--label" not in close_call
+
+    @patch("subprocess.run")
+    def test_send_keys_calls_send_text_then_enter(self, mock_run, backend):
+        """send_keys should call pane send-text then pane send-keys Enter."""
+        # Mock workspace list (for _resolve_pane_id_from_window)
+        ws = [{"label": "cao-test", "workspace_id": "w1"}]
+        panes = [{"terminal_id": "tid1", "pane_id": "w1-1", "workspace_id": "w1"}]
+
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),  # workspace list
+            _completed(_make_pane_list_response(panes)),    # pane list
+            _completed(),  # send-text
+            _completed(),  # send-keys Enter
+        ]
+
+        backend.send_keys("cao-test", "window-0", "hello world", enter_count=1)
+
+        calls = [c[0][0] for c in mock_run.call_args_list]
+        # Third call should be send-text
+        assert "send-text" in calls[2]
+        assert "hello world" in calls[2]
+        # Fourth call should be send-keys Enter
+        assert "send-keys" in calls[3]
+        assert "Enter" in calls[3]
+
+    @patch("subprocess.run")
+    def test_send_special_key_enter(self, mock_run, backend):
+        """send_special_key with empty string sends Enter."""
+        ws = [{"label": "cao-test", "workspace_id": "w1"}]
+        panes = [{"terminal_id": "tid1", "pane_id": "w1-1", "workspace_id": "w1"}]
+
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),
+            _completed(_make_pane_list_response(panes)),
+            _completed(),  # send-keys Enter
+        ]
+
+        backend.send_special_key("cao-test", "window-0", "")
+
+        cmd = mock_run.call_args_list[-1][0][0]
+        assert "send-keys" in cmd
+        assert "Enter" in cmd
+
+    @patch("subprocess.run")
+    def test_get_history_calls_pane_read(self, mock_run, backend):
+        """get_history should call herdr pane read with correct flags."""
+        ws = [{"label": "cao-test", "workspace_id": "w1"}]
+        panes = [{"terminal_id": "tid1", "pane_id": "w1-1", "workspace_id": "w1"}]
+
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),
+            _completed(_make_pane_list_response(panes)),
+            _completed(stdout="pane output here"),  # pane read
+        ]
+
+        result = backend.get_history("cao-test", "window-0", tail_lines=50)
+
+        assert result == "pane output here"
+        cmd = mock_run.call_args_list[-1][0][0]
+        assert "pane" in cmd
+        assert "read" in cmd
+        assert "--lines" in cmd
+        assert "50" in cmd
+
+    @patch("subprocess.run")
+    def test_get_pane_working_directory(self, mock_run, backend):
+        """get_pane_working_directory should parse cwd from pane get."""
+        ws = [{"label": "cao-test", "workspace_id": "w1"}]
+        panes = [{"terminal_id": "tid1", "pane_id": "w1-1", "workspace_id": "w1"}]
+        pane_info = json.dumps({
+            "id": "cli:pane:get",
+            "result": {"pane": {"cwd": "/home/user/project"}, "type": "pane_info"},
+        })
+
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),
+            _completed(_make_pane_list_response(panes)),
+            _completed(stdout=pane_info),  # pane get
+        ]
+
+        result = backend.get_pane_working_directory("cao-test", "window-0")
+        assert result == "/home/user/project"
+
+    @patch("subprocess.run")
+    def test_pipe_pane_is_noop(self, mock_run, backend):
+        """pipe_pane should be a no-op (no subprocess calls)."""
+        backend.pipe_pane("cao-test", "window-0", "/tmp/log.txt")
+        mock_run.assert_not_called()
+
+    @patch("subprocess.run")
+    def test_stop_pipe_pane_is_noop(self, mock_run, backend):
+        """stop_pipe_pane should be a no-op (no subprocess calls)."""
+        backend.stop_pipe_pane("cao-test", "window-0")
+        mock_run.assert_not_called()
+
+
+# --- Error Handling ---
+
+
+class TestHerdrBackendErrors:
+    """Verify error wrapping behavior."""
+
+    @patch("subprocess.run")
+    def test_nonzero_exit_raises_backend_error(self, mock_run, backend):
+        """Non-zero herdr exit should raise TerminalBackendError."""
+        mock_run.return_value = _completed(returncode=1)
+        mock_run.return_value.stderr = "workspace not found"
+
+        with pytest.raises(TerminalBackendError, match="herdr command failed"):
+            backend._run_herdr(["workspace", "close", "--label", "missing"])
+
+    @patch("subprocess.run")
+    def test_herdr_not_found_raises_backend_error(self, mock_run, backend):
+        """FileNotFoundError from herdr should raise TerminalBackendError."""
+        mock_run.side_effect = FileNotFoundError("herdr")
+
+        with pytest.raises(TerminalBackendError, match="herdr CLI not found"):
+            backend._run_herdr(["workspace", "list"])
+
+    def test_invalidate_cache_clears_all(self, backend):
+        """invalidate_cache should empty both caches."""
+        backend._pane_cache["tid1"] = ("w1-1", time.time())
+        backend._workspace_cache["cao-test"] = ("w1", time.time())
+
+        backend.invalidate_cache()
+
+        assert backend._pane_cache == {}
+        assert backend._workspace_cache == {}
+
+
+# --- Multi-pane resolution (S-008) ---
+
+
+class TestMultiPaneResolution:
+    """Test _resolve_pane_id_from_window with multiple panes in one workspace."""
+
+    @pytest.fixture
+    def backend(self):
+        with patch("cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True):
+            yield HerdrBackend(send_delay_ms=0)
+
+    @patch("subprocess.run")
+    def test_resolves_correct_pane_via_window_mapping(self, mock_run, backend):
+        """With window→terminal mapping, resolves correct pane via fresh tab+pane lookup.
+
+        First call: workspace list (cache miss) + tab list + pane list = 3 subprocess calls.
+        Second call: workspace cache hit + tab list + pane list = 2 subprocess calls.
+        """
+        backend._window_to_terminal["cao-test:developer-abc1"] = "tid_1"
+        backend._window_to_terminal["cao-test:developer-abc2"] = "tid_2"
+
+        ws = [{"label": "cao-test", "workspace_id": "w1"}]
+        tabs = [
+            {"tab_id": "tab-1", "workspace_id": "w1", "label": "developer-abc1"},
+            {"tab_id": "tab-2", "workspace_id": "w1", "label": "developer-abc2"},
+        ]
+        panes = [
+            {"tab_id": "tab-1", "pane_id": "w1-1", "workspace_id": "w1"},
+            {"tab_id": "tab-2", "pane_id": "w1-2", "workspace_id": "w1"},
+        ]
+
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),  # workspace list (cache miss)
+            _completed(_make_tab_list_response(tabs)),       # tab list
+            _completed(_make_pane_list_response(panes)),     # pane list
+            # second call: workspace cache hit, so only tab + pane needed
+            _completed(_make_tab_list_response(tabs)),
+            _completed(_make_pane_list_response(panes)),
+        ]
+
+        assert backend._resolve_pane_id_from_window("cao-test", "developer-abc1") == "w1-1"
+        assert backend._resolve_pane_id_from_window("cao-test", "developer-abc2") == "w1-2"
+
+    @patch("subprocess.run")
+    def test_wrong_window_raises_not_found(self, mock_run, backend):
+        """Mapped terminal_id with no matching pane for the tab raises TerminalNotFoundError."""
+        backend._window_to_terminal["cao-test:unknown-win"] = "tid_gone"
+
+        ws = [{"label": "cao-test", "workspace_id": "w1"}]
+        # Tab exists but no panes match its tab_id
+        tabs = [{"tab_id": "tab-x", "workspace_id": "w1", "label": "unknown-win"}]
+        panes = [{"tab_id": "tab-other", "pane_id": "w1-1", "workspace_id": "w1"}]
+
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),
+            _completed(_make_tab_list_response(tabs)),
+            _completed(_make_pane_list_response(panes)),
+        ]
+
+        with pytest.raises(TerminalNotFoundError, match="tid_gone"):
+            backend._resolve_pane_id_from_window("cao-test", "unknown-win")
+
+    @patch("subprocess.run")
+    def test_fallback_without_mapping_returns_first_pane(self, mock_run, backend):
+        """Without a window→terminal mapping, falls back to first pane in workspace."""
+        # No mapping registered — simulates pre-existing pane
+        ws = [{"label": "cao-test", "workspace_id": "w1"}]
+        panes = [
+            {"terminal_id": "tid_1", "pane_id": "w1-1", "workspace_id": "w1"},
+            {"terminal_id": "tid_2", "pane_id": "w1-2", "workspace_id": "w1"},
+        ]
+
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),  # workspace list (resolve_workspace_id)
+            _completed(_make_pane_list_response(panes)),    # pane list
+        ]
+
+        result = backend._resolve_pane_id_from_window("cao-test", "unmapped-window")
+        assert result == "w1-1"
+
+    @patch("subprocess.run")
+    def test_three_terminals_each_resolves_correctly(self, mock_run, backend):
+        """Three terminals each resolve to their distinct pane via fresh tab+pane lookup.
+
+        First call: workspace list (cache miss) + tab + pane = 3 calls.
+        Second/third calls: workspace cache hit + tab + pane = 2 calls each.
+        Total: 7 subprocess calls.
+        """
+        backend._window_to_terminal["cao-proj:conductor-a1"] = "tid_cond"
+        backend._window_to_terminal["cao-proj:worker-b2"] = "tid_work"
+        backend._window_to_terminal["cao-proj:reviewer-c3"] = "tid_rev"
+
+        ws = [{"label": "cao-proj", "workspace_id": "w5"}]
+        tabs = [
+            {"tab_id": "tab-c", "workspace_id": "w5", "label": "conductor-a1"},
+            {"tab_id": "tab-w", "workspace_id": "w5", "label": "worker-b2"},
+            {"tab_id": "tab-r", "workspace_id": "w5", "label": "reviewer-c3"},
+        ]
+        panes = [
+            {"tab_id": "tab-c", "pane_id": "w5-1", "workspace_id": "w5"},
+            {"tab_id": "tab-w", "pane_id": "w5-2", "workspace_id": "w5"},
+            {"tab_id": "tab-r", "pane_id": "w5-3", "workspace_id": "w5"},
+        ]
+
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),  # workspace list (cache miss)
+            _completed(_make_tab_list_response(tabs)),
+            _completed(_make_pane_list_response(panes)),
+            # second + third calls: workspace cache hit
+            _completed(_make_tab_list_response(tabs)),
+            _completed(_make_pane_list_response(panes)),
+            _completed(_make_tab_list_response(tabs)),
+            _completed(_make_pane_list_response(panes)),
+        ]
+
+        assert backend._resolve_pane_id_from_window("cao-proj", "conductor-a1") == "w5-1"
+        assert backend._resolve_pane_id_from_window("cao-proj", "worker-b2") == "w5-2"
+        assert backend._resolve_pane_id_from_window("cao-proj", "reviewer-c3") == "w5-3"
+
+    @patch("subprocess.run")
+    def test_resolve_pane_id_from_window_always_does_fresh_lookup(self, mock_run, backend):
+        """Calling _resolve_pane_id_from_window twice returns fresh results each call,
+        even when pane_id shifts between calls (simulates post-deletion renumbering).
+
+        First call: workspace list (cache miss) + tab list + pane list = 3 subprocess calls.
+        Second call: workspace cache hit + tab list + pane list = 2 subprocess calls.
+        Total: 5 subprocess calls.
+        """
+        backend._window_to_terminal["cao-test:window-0"] = "tid1"
+
+        ws = [{"label": "cao-test", "workspace_id": "w1"}]
+        tabs = [{"tab_id": "tab-1", "workspace_id": "w1", "label": "window-0"}]
+        # First call: pane_id is w1-3; second call: pane_id shifted to w1-2
+        first_panes = [{"tab_id": "tab-1", "pane_id": "w1-3", "workspace_id": "w1"}]
+        second_panes = [{"tab_id": "tab-1", "pane_id": "w1-2", "workspace_id": "w1"}]
+
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),   # workspace list (cache miss)
+            _completed(_make_tab_list_response(tabs)),
+            _completed(_make_pane_list_response(first_panes)),
+            # second call: workspace cache hit, so only tab + pane
+            _completed(_make_tab_list_response(tabs)),
+            _completed(_make_pane_list_response(second_panes)),
+        ]
+
+        first_result = backend._resolve_pane_id_from_window("cao-test", "window-0")
+        second_result = backend._resolve_pane_id_from_window("cao-test", "window-0")
+
+        assert first_result == "w1-3"
+        assert second_result == "w1-2"
+        # 3 calls (first) + 2 calls (second, workspace cached) = 5 total
+        assert mock_run.call_count == 5
+
+    @patch("subprocess.run")
+    def test_resolve_pane_id_from_window_uses_tab_id(self, mock_run, backend):
+        """When multiple panes exist in the workspace, the correct one is returned by
+        matching tab_id (not just the first pane in workspace order)."""
+        backend._window_to_terminal["cao-test:target-window"] = "tid_target"
+
+        ws = [{"label": "cao-test", "workspace_id": "w1"}]
+        tabs = [
+            {"tab_id": "tab-other", "workspace_id": "w1", "label": "other-window"},
+            {"tab_id": "tab-target", "workspace_id": "w1", "label": "target-window"},
+        ]
+        # target pane appears second — a first-pane-wins strategy would return wrong result
+        panes = [
+            {"tab_id": "tab-other", "pane_id": "w1-1", "workspace_id": "w1"},
+            {"tab_id": "tab-target", "pane_id": "w1-2", "workspace_id": "w1"},
+        ]
+
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),
+            _completed(_make_tab_list_response(tabs)),
+            _completed(_make_pane_list_response(panes)),
+        ]
+
+        result = backend._resolve_pane_id_from_window("cao-test", "target-window")
+        assert result == "w1-2"
+
+
+# --- Session socket path ---
+
+
+class TestSessionSocketPath:
+    """Test _session_socket_path for named and default sessions."""
+
+    @patch.dict("os.environ", {"XDG_CONFIG_HOME": "/custom/config"})
+    def test_named_session_uses_subdir(self):
+        """Named session should produce <config_home>/herdr/<name>/herdr.sock."""
+        with patch("cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True):
+            b = HerdrBackend(herdr_session="cao")
+        assert b._session_socket_path() == "/custom/config/herdr/sessions/cao/herdr.sock"
+
+    @patch.dict("os.environ", {"XDG_CONFIG_HOME": "/custom/config"})
+    def test_default_session_uses_flat_path(self):
+        """'default' session should produce <config_home>/herdr/herdr.sock (no subdir)."""
+        with patch("cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True):
+            b = HerdrBackend(herdr_session="default")
+        assert b._session_socket_path() == "/custom/config/herdr/herdr.sock"
+
+    @patch.dict("os.environ", {"XDG_CONFIG_HOME": "/custom/config"})
+    def test_arbitrary_session_name(self):
+        """An arbitrary session name should appear as a subdirectory."""
+        with patch("cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True):
+            b = HerdrBackend(herdr_session="my-workspace")
+        assert b._session_socket_path() == "/custom/config/herdr/sessions/my-workspace/herdr.sock"
+
+
+# --- Ensure session running ---
+
+
+class TestEnsureSessionRunning:
+    """Test _ensure_session_running startup logic."""
+
+    def test_does_nothing_when_socket_exists(self):
+        """If socket already exists, no Popen should be called."""
+        with patch("cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True):
+            with patch("subprocess.Popen") as mock_popen:
+                HerdrBackend(herdr_session="cao")
+        mock_popen.assert_not_called()
+
+    def test_starts_server_when_socket_absent(self):
+        """If socket is absent, Popen should be called with herdr server args."""
+        # Socket absent initially, then appears after first poll.
+        exists_sequence = [False, True]
+
+        def exists_side_effect(path):
+            return exists_sequence.pop(0) if exists_sequence else True
+
+        with patch(
+            "cli_agent_orchestrator.backends.herdr_backend.os.path.exists",
+            side_effect=exists_side_effect,
+        ):
+            with patch("subprocess.Popen") as mock_popen:
+                with patch("time.sleep"):
+                    HerdrBackend(herdr_session="cao")
+
+        mock_popen.assert_called_once()
+        cmd = mock_popen.call_args[0][0]
+        assert cmd == ["herdr", "--session", "cao", "server"]
+
+    def test_logs_warning_when_socket_never_appears(self):
+        """If socket never appears within 5s, a warning is logged and no error raised."""
+        # Simulate clock: first call returns 0.0 (sets deadline=5.0),
+        # all subsequent calls return 6.0 (past deadline, exits loop).
+        # Using a counter so exhaustion from logging internals is not an issue.
+        call_count = {"n": 0}
+
+        def fake_time():
+            call_count["n"] += 1
+            return 0.0 if call_count["n"] == 1 else 6.0
+
+        with patch(
+            "cli_agent_orchestrator.backends.herdr_backend.os.path.exists",
+            return_value=False,
+        ):
+            with patch("subprocess.Popen"):
+                with patch("cli_agent_orchestrator.backends.herdr_backend.time.sleep"):
+                    with patch(
+                        "cli_agent_orchestrator.backends.herdr_backend.time.time",
+                        side_effect=fake_time,
+                    ):
+                        # Should not raise
+                        HerdrBackend(herdr_session="cao")
+
+
+# --- create_window window_shell ---
+
+
+class TestCreateWindowWindowShell:
+    """Verify create_window handles window_shell correctly."""
+
+    @patch("time.sleep")
+    @patch("subprocess.run")
+    def test_create_window_with_window_shell(self, mock_run, mock_sleep, backend):
+        """When window_shell is provided, pane run is called after a 0.5s sleep."""
+        ws = [{"label": "cao-test", "workspace_id": "w1"}]
+        tab_create_resp = _completed(json.dumps({
+            "id": "cli:tab:create",
+            "result": {
+                "root_pane": {"pane_id": "w1-5", "workspace_id": "w1"},
+                "type": "tab_created",
+            },
+        }))
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),  # _resolve_workspace_id
+            tab_create_resp,                                 # tab create
+            _completed(),                                    # pane send-text (env export)
+            _completed(),                                    # pane send-keys Enter
+            _completed(),                                    # pane run
+        ]
+
+        backend.create_window(
+            "cao-test", "restored-win", "tid99", "/home/user",
+            window_shell="cat '/path/file'; exec /bin/bash -l",
+        )
+
+        mock_sleep.assert_called_once_with(0.5)
+        pane_run_call = mock_run.call_args_list[-1][0][0]
+        assert "pane" in pane_run_call
+        assert "run" in pane_run_call
+        assert "w1-5" in pane_run_call
+        assert "cat '/path/file'; exec /bin/bash -l" in pane_run_call
+
+    @patch("time.sleep")
+    @patch("subprocess.run")
+    def test_create_window_window_shell_failure_is_nonfatal(self, mock_run, mock_sleep, backend):
+        """If pane run raises, create_window still returns window_name without raising."""
+        ws = [{"label": "cao-test", "workspace_id": "w1"}]
+        tab_create_resp = _completed(json.dumps({
+            "id": "cli:tab:create",
+            "result": {
+                "root_pane": {"pane_id": "w1-6", "workspace_id": "w1"},
+                "type": "tab_created",
+            },
+        }))
+        pane_run_fail = _completed(returncode=1)
+        pane_run_fail.stderr = "pane not found"
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),  # _resolve_workspace_id
+            tab_create_resp,                                 # tab create
+            _completed(),                                    # pane send-text (env export)
+            _completed(),                                    # pane send-keys Enter
+            pane_run_fail,                                   # pane run (fails)
+        ]
+
+        result = backend.create_window(
+            "cao-test", "restored-win", "tid99", "/home/user",
+            window_shell="exec /bin/bash -l",
+        )
+
+        assert result == "restored-win"
+
+
+# --- get_native_status() mapping ---
+
+
+class TestGetNativeStatus:
+    """Verify get_native_status() returns correct TerminalStatus for all herdr states."""
+
+    from cli_agent_orchestrator.models.terminal import TerminalStatus as _TS
+
+    def _make_pane_get_response(self, agent_status: str) -> str:
+        return json.dumps({
+            "id": "cli:pane:get",
+            "result": {
+                "pane": {"pane_id": "w1-1", "agent_status": agent_status},
+                "type": "pane_info",
+            },
+        })
+
+    def _setup_fresh_resolution(self, backend):
+        """Pre-populate workspace cache and register window mapping for tests.
+
+        _resolve_pane_id_from_window now performs fresh tab+pane lookups. Pre-populating
+        the workspace cache (which has a TTL and is stable) means tests only need to
+        mock tab list, pane list, and pane get — not workspace list as well.
+        """
+        backend._window_to_terminal["s:w"] = "tid1"
+        backend._workspace_cache["s"] = ("w1", time.time())
+
+    def _make_resolution_side_effects(self, pane_get_response):
+        """Build the mock side_effect sequence for a fresh resolution + pane get call."""
+        tabs = [{"tab_id": "tab-1", "workspace_id": "w1", "label": "w"}]
+        panes = [{"tab_id": "tab-1", "pane_id": "w1-1", "workspace_id": "w1"}]
+        return [
+            _completed(_make_tab_list_response(tabs)),   # tab list
+            _completed(_make_pane_list_response(panes)), # pane list
+            pane_get_response,                            # pane get
+        ]
+
+    @patch("subprocess.run")
+    def test_working_returns_processing(self, mock_run, backend):
+        self._setup_fresh_resolution(backend)
+        mock_run.side_effect = self._make_resolution_side_effects(
+            _completed(self._make_pane_get_response("working"))
+        )
+
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
+        result = backend.get_native_status("s", "w")
+        assert result == TerminalStatus.PROCESSING
+
+    @patch("subprocess.run")
+    def test_blocked_returns_waiting_user_answer(self, mock_run, backend):
+        self._setup_fresh_resolution(backend)
+        mock_run.side_effect = self._make_resolution_side_effects(
+            _completed(self._make_pane_get_response("blocked"))
+        )
+
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
+        result = backend.get_native_status("s", "w")
+        assert result == TerminalStatus.WAITING_USER_ANSWER
+
+    @patch("subprocess.run")
+    def test_done_returns_completed(self, mock_run, backend):
+        self._setup_fresh_resolution(backend)
+        mock_run.side_effect = self._make_resolution_side_effects(
+            _completed(self._make_pane_get_response("done"))
+        )
+
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
+        result = backend.get_native_status("s", "w")
+        assert result == TerminalStatus.COMPLETED
+
+    @patch("subprocess.run")
+    def test_idle_returns_idle(self, mock_run, backend):
+        self._setup_fresh_resolution(backend)
+        mock_run.side_effect = self._make_resolution_side_effects(
+            _completed(self._make_pane_get_response("idle"))
+        )
+
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
+        result = backend.get_native_status("s", "w")
+        assert result == TerminalStatus.IDLE
+
+    @patch("subprocess.run")
+    def test_unknown_returns_error(self, mock_run, backend):
+        self._setup_fresh_resolution(backend)
+        mock_run.side_effect = self._make_resolution_side_effects(
+            _completed(self._make_pane_get_response("unknown"))
+        )
+
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
+        result = backend.get_native_status("s", "w")
+        assert result == TerminalStatus.ERROR
+
+    @patch("subprocess.run")
+    def test_command_failure_returns_none(self, mock_run, backend):
+        self._setup_fresh_resolution(backend)
+        pane_get_fail = _completed(returncode=1)
+        mock_run.side_effect = self._make_resolution_side_effects(pane_get_fail)
+
+        result = backend.get_native_status("s", "w")
+        assert result is None

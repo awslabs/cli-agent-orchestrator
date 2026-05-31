@@ -368,14 +368,14 @@ class TestExecuteFlow:
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
     @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
-    @patch("cli_agent_orchestrator.services.flow_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.flow_service.get_backend")
     @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
     @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
     def test_execute_flow_without_script(
         self,
         mock_db_get,
         mock_update_times,
-        mock_tmux_client,
+        mock_get_backend,
         mock_list_terminals,
         mock_create_terminal,
         mock_send_input,
@@ -405,7 +405,7 @@ Simple prompt without variables.
             next_run=datetime.now(),
         )
         mock_db_get.return_value = mock_flow
-        mock_tmux_client.session_exists.return_value = False
+        mock_get_backend.return_value.session_exists.return_value = False
 
         mock_terminal = MagicMock()
         mock_terminal.id = "terminal-123"
@@ -421,14 +421,14 @@ Simple prompt without variables.
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
     @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
-    @patch("cli_agent_orchestrator.services.flow_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.flow_service.get_backend")
     @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
     @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
     def test_execute_flow_with_script_execute_true(
         self,
         mock_db_get,
         mock_update_times,
-        mock_tmux_client,
+        mock_get_backend,
         mock_list_terminals,
         mock_create_terminal,
         mock_send_input,
@@ -463,7 +463,7 @@ Value is [[value]].
                 next_run=datetime.now(),
             )
             mock_db_get.return_value = mock_flow
-            mock_tmux_client.session_exists.return_value = False
+            mock_get_backend.return_value.session_exists.return_value = False
 
             # Mock script output
             mock_subprocess.return_value = MagicMock(
@@ -619,14 +619,14 @@ Prompt.
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
     @patch("cli_agent_orchestrator.services.flow_service.provider_manager")
     @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
-    @patch("cli_agent_orchestrator.services.flow_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.flow_service.get_backend")
     @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
     @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
     def test_execute_flow_skips_when_session_busy(
         self,
         mock_db_get,
         mock_update_times,
-        mock_tmux_client,
+        mock_get_backend,
         mock_list_terminals,
         mock_provider_manager,
         mock_create_terminal,
@@ -649,7 +649,7 @@ Prompt.
                 next_run=datetime.now(),
             )
         mock_db_get.return_value = mock_flow
-        mock_tmux_client.session_exists.return_value = True
+        mock_get_backend.return_value.session_exists.return_value = True
         mock_list_terminals.return_value = [{"id": "t1", "agent_profile": "developer"}]
         mock_provider = MagicMock()
         mock_provider.get_status.return_value = TerminalStatus.PROCESSING
@@ -659,21 +659,21 @@ Prompt.
 
         assert result is False
         mock_create_terminal.assert_not_called()
-        mock_tmux_client.kill_session.assert_not_called()
+        mock_get_backend.return_value.kill_session.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.flow_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
     @patch("cli_agent_orchestrator.services.flow_service.provider_manager")
     @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
-    @patch("cli_agent_orchestrator.services.flow_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.flow_service.get_backend")
     @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
     @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
     def test_execute_flow_kills_idle_session_and_proceeds(
         self,
         mock_db_get,
         mock_update_times,
-        mock_tmux_client,
+        mock_get_backend,
         mock_list_terminals,
         mock_provider_manager,
         mock_create_terminal,
@@ -697,7 +697,7 @@ Prompt.
                 next_run=datetime.now(),
             )
         mock_db_get.return_value = mock_flow
-        mock_tmux_client.session_exists.return_value = True
+        mock_get_backend.return_value.session_exists.return_value = True
         mock_list_terminals.return_value = [{"id": "t1"}]
         mock_provider = MagicMock()
         mock_provider.get_status.return_value = TerminalStatus.IDLE
@@ -709,7 +709,7 @@ Prompt.
         result = execute_flow("idle-flow")
 
         assert result is True
-        mock_tmux_client.kill_session.assert_called_once()
+        mock_get_backend.return_value.kill_session.assert_called_once()
         mock_provider_manager.cleanup_provider.assert_called_once_with("t1")
         mock_create_terminal.assert_called_once()
 
@@ -718,14 +718,14 @@ Prompt.
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
     @patch("cli_agent_orchestrator.services.flow_service.provider_manager")
     @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
-    @patch("cli_agent_orchestrator.services.flow_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.flow_service.get_backend")
     @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
     @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
     def test_execute_flow_handles_unknown_provider_as_non_busy(
         self,
         mock_db_get,
         mock_update_times,
-        mock_tmux_client,
+        mock_get_backend,
         mock_list_terminals,
         mock_provider_manager,
         mock_create_terminal,
@@ -749,7 +749,7 @@ Prompt.
                 next_run=datetime.now(),
             )
         mock_db_get.return_value = mock_flow
-        mock_tmux_client.session_exists.return_value = True
+        mock_get_backend.return_value.session_exists.return_value = True
         mock_list_terminals.return_value = [{"id": "t1"}]
         mock_provider_manager.get_provider.side_effect = ValueError("unknown terminal")
         mock_terminal = MagicMock()
@@ -759,7 +759,7 @@ Prompt.
         result = execute_flow("orphan-provider-flow")
 
         assert result is True
-        mock_tmux_client.kill_session.assert_called_once()
+        mock_get_backend.return_value.kill_session.assert_called_once()
         mock_create_terminal.assert_called_once()
 
     @patch("cli_agent_orchestrator.services.flow_service.delete_terminals_by_session")
@@ -767,14 +767,14 @@ Prompt.
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
     @patch("cli_agent_orchestrator.services.flow_service.provider_manager")
     @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
-    @patch("cli_agent_orchestrator.services.flow_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.flow_service.get_backend")
     @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
     @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
     def test_execute_flow_kills_orphaned_session(
         self,
         mock_db_get,
         mock_update_times,
-        mock_tmux_client,
+        mock_get_backend,
         mock_list_terminals,
         mock_provider_manager,
         mock_create_terminal,
@@ -798,7 +798,7 @@ Prompt.
                 next_run=datetime.now(),
             )
         mock_db_get.return_value = mock_flow
-        mock_tmux_client.session_exists.return_value = True
+        mock_get_backend.return_value.session_exists.return_value = True
         mock_list_terminals.return_value = []
         mock_terminal = MagicMock()
         mock_terminal.id = "terminal-123"
@@ -807,7 +807,7 @@ Prompt.
         result = execute_flow("empty-session-flow")
 
         assert result is True
-        mock_tmux_client.kill_session.assert_called_once()
+        mock_get_backend.return_value.kill_session.assert_called_once()
         mock_create_terminal.assert_called_once()
         mock_provider_manager.get_provider.assert_not_called()
 

@@ -100,80 +100,80 @@ class TestGetStatusFromFixtures:
     def _mock_provider(self, fixture_content: str) -> OpenCodeCliProvider:
         provider = make_provider()
         mock_tmux = MagicMock()
-        mock_tmux.get_history.return_value = fixture_content
+        mock_tmux.return_value.get_history.return_value = fixture_content
         provider._tmux_client = mock_tmux  # not used directly — patch below
         return provider
 
-    @patch("cli_agent_orchestrator.providers.opencode_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     def test_idle_splash_returns_idle(self, mock_tmux):
-        mock_tmux.get_history.return_value = load_fixture("opencode_cli_idle_splash.txt")
+        mock_tmux.return_value.get_history.return_value = load_fixture("opencode_cli_idle_splash.txt")
         provider = make_provider()
         assert provider.get_status() == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.opencode_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     def test_idle_splash_ansi_returns_idle(self, mock_tmux):
-        mock_tmux.get_history.return_value = load_ansi_fixture("opencode_cli_idle_splash.ansi.txt")
+        mock_tmux.return_value.get_history.return_value = load_ansi_fixture("opencode_cli_idle_splash.ansi.txt")
         provider = make_provider()
         assert provider.get_status() == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.opencode_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     def test_processing_returns_processing(self, mock_tmux):
-        mock_tmux.get_history.return_value = load_fixture("opencode_cli_processing.txt")
+        mock_tmux.return_value.get_history.return_value = load_fixture("opencode_cli_processing.txt")
         provider = make_provider()
         assert provider.get_status() == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.opencode_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     def test_processing_ansi_returns_processing(self, mock_tmux):
-        mock_tmux.get_history.return_value = load_ansi_fixture("opencode_cli_processing.ansi.txt")
+        mock_tmux.return_value.get_history.return_value = load_ansi_fixture("opencode_cli_processing.ansi.txt")
         provider = make_provider()
         assert provider.get_status() == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.opencode_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     def test_completed_returns_completed(self, mock_tmux):
-        mock_tmux.get_history.return_value = load_fixture("opencode_cli_completed.txt")
+        mock_tmux.return_value.get_history.return_value = load_fixture("opencode_cli_completed.txt")
         provider = make_provider()
         assert provider.get_status() == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.opencode_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     def test_completed_ansi_returns_completed(self, mock_tmux):
-        mock_tmux.get_history.return_value = load_ansi_fixture("opencode_cli_completed.ansi.txt")
+        mock_tmux.return_value.get_history.return_value = load_ansi_fixture("opencode_cli_completed.ansi.txt")
         provider = make_provider()
         assert provider.get_status() == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.opencode_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     def test_permission_ansi_returns_waiting_user_answer(self, mock_tmux):
         # ANSI fixture required: plain text loses the △ Permission required overlay.
-        mock_tmux.get_history.return_value = load_ansi_fixture("opencode_cli_permission.ansi.txt")
+        mock_tmux.return_value.get_history.return_value = load_ansi_fixture("opencode_cli_permission.ansi.txt")
         provider = make_provider()
         assert provider.get_status() == TerminalStatus.WAITING_USER_ANSWER
 
-    @patch("cli_agent_orchestrator.providers.opencode_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     def test_idle_post_completion_returns_idle(self, mock_tmux):
         # Use plain fixture — ANSI variant reuses the completed frame (see OPENCODE_FIXTURES.md).
-        mock_tmux.get_history.return_value = load_fixture("opencode_cli_idle_post_completion.txt")
+        mock_tmux.return_value.get_history.return_value = load_fixture("opencode_cli_idle_post_completion.txt")
         provider = make_provider()
         assert provider.get_status() == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.opencode_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     def test_empty_output_returns_error(self, mock_tmux):
-        mock_tmux.get_history.return_value = ""
+        mock_tmux.return_value.get_history.return_value = ""
         provider = make_provider()
         assert provider.get_status() == TerminalStatus.ERROR
 
-    @patch("cli_agent_orchestrator.providers.opencode_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     def test_none_output_returns_error(self, mock_tmux):
-        mock_tmux.get_history.return_value = None
+        mock_tmux.return_value.get_history.return_value = None
         provider = make_provider()
         assert provider.get_status() == TerminalStatus.ERROR
 
-    @patch("cli_agent_orchestrator.providers.opencode_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     def test_unknown_output_returns_error_fallback(self, mock_tmux):
         """Non-empty output with no recognizable pattern → ERROR fallback.
 
         Exercises the final ``return TerminalStatus.ERROR`` at the end of
         get_status(), distinct from the early return on empty/None output.
         """
-        mock_tmux.get_history.return_value = "random text without any tui markers"
+        mock_tmux.return_value.get_history.return_value = "random text without any tui markers"
         provider = make_provider()
         assert provider.get_status() == TerminalStatus.ERROR
 
@@ -186,7 +186,7 @@ class TestGetStatusFromFixtures:
 class TestStaleEscInterruptGuard:
     """Verify position-aware guard: esc interrupt on earlier line + idle footer on later line → IDLE."""
 
-    @patch("cli_agent_orchestrator.providers.opencode_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     def test_stale_esc_interrupt_returns_idle(self, mock_tmux):
         # Synthetic: esc interrupt on line 0 (old frame), ctrl+p commands on line 2 (new frame).
         stale_output = (
@@ -194,22 +194,22 @@ class TestStaleEscInterruptGuard:
             "\n"
             "                  ctrl+p commands    • OpenCode 1.14.19"
         )
-        mock_tmux.get_history.return_value = stale_output
+        mock_tmux.return_value.get_history.return_value = stale_output
         provider = make_provider()
         assert provider.get_status() == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.opencode_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     def test_same_line_esc_and_idle_returns_processing(self, mock_tmux):
         # esc interrupt and ctrl+p commands on the same footer line → PROCESSING (normal case).
         same_line_output = (
             "   some content here\n"
             "   ⬝⬝⬝⬝  esc interrupt                     tab agents  ctrl+p commands    • OpenCode"
         )
-        mock_tmux.get_history.return_value = same_line_output
+        mock_tmux.return_value.get_history.return_value = same_line_output
         provider = make_provider()
         assert provider.get_status() == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.opencode_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     def test_stale_esc_followed_by_full_completion_returns_completed(self, mock_tmux):
         # Stale esc interrupt line, then full completion marker + idle footer → COMPLETED.
         stale_to_completed = (
@@ -221,7 +221,7 @@ class TestStaleEscInterruptGuard:
             "\n"
             "                  ctrl+p commands    • OpenCode 1.14.19"
         )
-        mock_tmux.get_history.return_value = stale_to_completed
+        mock_tmux.return_value.get_history.return_value = stale_to_completed
         provider = make_provider()
         assert provider.get_status() == TerminalStatus.COMPLETED
 
@@ -342,7 +342,7 @@ class TestExtractLastMessage:
 class TestInitialize:
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.opencode_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     def test_initialize_success_returns_true(self, mock_tmux, mock_shell, mock_wait):
         mock_shell.return_value = True
         mock_wait.return_value = True
@@ -351,7 +351,7 @@ class TestInitialize:
 
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.opencode_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     def test_initialize_uses_120s_timeout(self, mock_tmux, mock_shell, mock_wait):
         mock_shell.return_value = True
         mock_wait.return_value = True
@@ -362,39 +362,39 @@ class TestInitialize:
 
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.opencode_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     def test_initialize_sends_agent_flag(self, mock_tmux, mock_shell, mock_wait):
         mock_shell.return_value = True
         mock_wait.return_value = True
         provider = make_provider(agent_profile="developer")
         provider.initialize()
-        sent_cmd = mock_tmux.send_keys.call_args[0][2]
+        sent_cmd = mock_tmux.return_value.send_keys.call_args[0][2]
         assert "--agent developer" in sent_cmd
 
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.opencode_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     def test_initialize_includes_model_when_set(self, mock_tmux, mock_shell, mock_wait):
         mock_shell.return_value = True
         mock_wait.return_value = True
         provider = make_provider(model="anthropic/claude-sonnet-4-6")
         provider.initialize()
-        sent_cmd = mock_tmux.send_keys.call_args[0][2]
+        sent_cmd = mock_tmux.return_value.send_keys.call_args[0][2]
         assert "--model anthropic/claude-sonnet-4-6" in sent_cmd
 
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.opencode_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     def test_initialize_no_model_flag_when_unset(self, mock_tmux, mock_shell, mock_wait):
         mock_shell.return_value = True
         mock_wait.return_value = True
         provider = make_provider(model=None)
         provider.initialize()
-        sent_cmd = mock_tmux.send_keys.call_args[0][2]
+        sent_cmd = mock_tmux.return_value.send_keys.call_args[0][2]
         assert "--model" not in sent_cmd
 
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.opencode_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     def test_initialize_raises_on_shell_timeout(self, mock_tmux, mock_shell):
         mock_shell.return_value = False
         provider = make_provider()
@@ -403,7 +403,7 @@ class TestInitialize:
 
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.opencode_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     def test_initialize_raises_on_opencode_timeout(self, mock_tmux, mock_shell, mock_wait):
         mock_shell.return_value = True
         mock_wait.return_value = False
@@ -413,13 +413,13 @@ class TestInitialize:
 
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.opencode_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     def test_initialize_sets_env_vars_in_command(self, mock_tmux, mock_shell, mock_wait):
         mock_shell.return_value = True
         mock_wait.return_value = True
         provider = make_provider()
         provider.initialize()
-        sent_cmd = mock_tmux.send_keys.call_args[0][2]
+        sent_cmd = mock_tmux.return_value.send_keys.call_args[0][2]
         assert "OPENCODE_DISABLE_AUTOUPDATE=1" in sent_cmd
         assert "OPENCODE_DISABLE_MOUSE=1" in sent_cmd
         assert "OPENCODE_CLIENT=cao" in sent_cmd

@@ -28,12 +28,16 @@ class TestHealthCheck:
     """Tests for GET /health endpoint."""
 
     def test_health_check_returns_ok(self, client):
-        """GET /health returns status ok."""
+        """GET /health returns status ok with component health."""
         response = client.get("/health")
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "ok"
         assert data["service"] == "cli-agent-orchestrator"
+        components = data["components"]
+        assert components["cao"] == "ok"
+        assert components["herdr"] in ("ok", "unavailable")
+        assert components["claude"] in ("ok", "unavailable")
 
 
 # ── Agent profiles endpoint ──────────────────────────────────────────

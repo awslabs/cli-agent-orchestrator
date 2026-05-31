@@ -13,7 +13,7 @@ from cli_agent_orchestrator.services.terminal_service import (
 class TestTerminalServiceWorkingDirectory:
     """Test terminal service working directory functionality."""
 
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_get_working_directory_success(self, mock_get_metadata, mock_tmux_client):
         """Test successful working directory retrieval."""
@@ -36,7 +36,7 @@ class TestTerminalServiceWorkingDirectory:
             "test-session", "test-window"
         )
 
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_get_working_directory_terminal_not_found(self, mock_get_metadata, mock_tmux_client):
         """Test ValueError when terminal not found."""
@@ -51,7 +51,7 @@ class TestTerminalServiceWorkingDirectory:
         mock_get_metadata.assert_called_once_with(terminal_id)
         mock_tmux_client.get_pane_working_directory.assert_not_called()
 
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_get_working_directory_returns_none(self, mock_get_metadata, mock_tmux_client):
         """Test when pane has no working directory."""
@@ -73,7 +73,7 @@ class TestTerminalServiceWorkingDirectory:
             "test-session", "test-window"
         )
 
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_get_working_directory_returns_directory_from_tmux_pane(
         self, mock_get_metadata, mock_tmux_client
@@ -97,7 +97,7 @@ class TestTerminalServiceWorkingDirectory:
             "cao-workspace", "developer-xyz"
         )
 
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_get_working_directory_raises_for_nonexistent_terminal(
         self, mock_get_metadata, mock_tmux_client
@@ -117,7 +117,7 @@ class TestSendSpecialKey:
     """Tests for send_special_key function."""
 
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_send_special_key_sends_key_via_tmux_client(
         self, mock_get_metadata, mock_tmux_client, mock_update_last_active
@@ -141,7 +141,7 @@ class TestSendSpecialKey:
         mock_update_last_active.assert_called_once_with(terminal_id)
 
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_send_special_key_ctrl_c(
         self, mock_get_metadata, mock_tmux_client, mock_update_last_active
@@ -163,7 +163,7 @@ class TestSendSpecialKey:
             "cao-session", "reviewer-efgh", "C-c"
         )
 
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_send_special_key_terminal_not_found(self, mock_get_metadata, mock_tmux_client):
         """Test that send_special_key raises ValueError when terminal not found."""
@@ -176,7 +176,7 @@ class TestSendSpecialKey:
 
         mock_tmux_client.send_special_key.assert_not_called()
 
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_send_special_key_propagates_tmux_errors(self, mock_get_metadata, mock_tmux_client):
         """Test that send_special_key propagates exceptions from tmux client."""
@@ -193,7 +193,7 @@ class TestSendSpecialKey:
             send_special_key(terminal_id, "Escape")
 
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_send_special_key_escape(
         self, mock_get_metadata, mock_tmux_client, mock_update_last_active

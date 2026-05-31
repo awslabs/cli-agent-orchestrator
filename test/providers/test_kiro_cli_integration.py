@@ -20,6 +20,8 @@ from pathlib import Path
 
 import pytest
 
+from cli_agent_orchestrator.backends.registry import set_backend
+from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
@@ -76,6 +78,19 @@ def cleanup_session(test_session_name):
         tmux_client.kill_session(test_session_name)
     except Exception:
         pass
+
+
+@pytest.fixture(autouse=True)
+def use_tmux_backend():
+    """Pin the backend registry to TmuxBackend for these integration tests.
+
+    KiroCliProvider calls get_backend() internally. The global backend is set
+    by BackendFactory which reads config.json, so on a host configured for
+    herdr this would fail. Pin to tmux explicitly since the session fixture
+    creates tmux sessions.
+    """
+    set_backend(TmuxBackend())
+    yield
 
 
 @pytest.fixture

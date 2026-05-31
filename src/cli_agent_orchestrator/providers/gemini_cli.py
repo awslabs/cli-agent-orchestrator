@@ -37,7 +37,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import GEMINI_WORKSPACES_DIR
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
@@ -475,7 +475,7 @@ class GeminiCliProvider(BaseProvider):
             TimeoutError: If shell or Gemini CLI doesn't start within timeout
         """
         # Wait for shell prompt to appear in the tmux window
-        if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
+        if not wait_for_shell(get_backend(), self.session_name, self.window_name, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
         # Send a warm-up command before launching Gemini.
@@ -486,11 +486,11 @@ class GeminiCliProvider(BaseProvider):
         # An echo round-trip with output verification ensures the shell has
         # fully processed its init before we launch gemini.
         warmup_marker = "CAO_SHELL_READY"
-        tmux_client.send_keys(self.session_name, self.window_name, f"echo {warmup_marker}")
+        get_backend().send_keys(self.session_name, self.window_name, f"echo {warmup_marker}")
         warmup_start = time.time()
         warmup_timeout = 15.0
         while time.time() - warmup_start < warmup_timeout:
-            output = tmux_client.get_history(self.session_name, self.window_name)
+            output = get_backend().get_history(self.session_name, self.window_name)
             if output and warmup_marker in output:
                 break
             time.sleep(0.5)
@@ -508,7 +508,7 @@ class GeminiCliProvider(BaseProvider):
         command = self._build_gemini_command()
 
         # Send Gemini command to the tmux window
-        tmux_client.send_keys(self.session_name, self.window_name, command)
+        get_backend().send_keys(self.session_name, self.window_name, command)
 
         # Wait for Gemini CLI to finish initialization.
         # Gemini takes 10-15+ seconds to load due to Node.js/Ink startup.
@@ -539,7 +539,7 @@ class GeminiCliProvider(BaseProvider):
             time.sleep(1.0)
         else:
             # Capture diagnostic info for debugging initialization failures.
-            diag_output = tmux_client.get_history(self.session_name, self.window_name)
+            diag_output = get_backend().get_history(self.session_name, self.window_name)
             diag_last_50 = "\n".join((diag_output or "").splitlines()[-50:])
             logger.error(
                 f"Gemini CLI init timeout diagnostic — terminal {self.terminal_id}, "
@@ -581,7 +581,7 @@ class GeminiCliProvider(BaseProvider):
         Returns:
             TerminalStatus indicating current state
         """
-        output = tmux_client.get_history(self.session_name, self.window_name, tail_lines=tail_lines)
+        output = get_backend().get_history(self.session_name, self.window_name, tail_lines=tail_lines)
 
         if not output:
             return TerminalStatus.ERROR

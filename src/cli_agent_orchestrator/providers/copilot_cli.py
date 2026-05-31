@@ -16,7 +16,7 @@ from typing import Optional
 
 from libtmux.exc import LibTmuxException
 
-from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.terminal import wait_for_shell
@@ -81,7 +81,7 @@ class CopilotCliProvider(BaseProvider):
 
     def _history(self, tail_lines: Optional[int] = None) -> str:
         try:
-            raw = tmux_client.get_history(
+            raw = get_backend().get_history(
                 self.session_name, self.window_name, tail_lines=tail_lines
             )
         except (
@@ -145,7 +145,7 @@ class CopilotCliProvider(BaseProvider):
 
         command_parts.extend(["--config-dir", str(config_dir)])
         try:
-            pane_working_dir = tmux_client.get_pane_working_directory(
+            pane_working_dir = get_backend().get_pane_working_directory(
                 self.session_name,
                 self.window_name,
             )
@@ -199,10 +199,10 @@ class CopilotCliProvider(BaseProvider):
         return json.dumps({"mcpServers": merged_servers}, ensure_ascii=False)
 
     def _send_enter(self) -> None:
-        tmux_client.send_special_key(self.session_name, self.window_name, "Enter")
+        get_backend().send_special_key(self.session_name, self.window_name, "Enter")
 
     def _send_key(self, key: str) -> None:
-        tmux_client.send_special_key(self.session_name, self.window_name, key)
+        get_backend().send_special_key(self.session_name, self.window_name, key)
 
     def _accept_trust_prompts(self, timeout: float = 30.0) -> None:
         start = time.time()
@@ -267,7 +267,7 @@ class CopilotCliProvider(BaseProvider):
     def initialize(self) -> bool:
         try:
             shell_ready = wait_for_shell(
-                tmux_client, self.session_name, self.window_name, timeout=30.0
+                get_backend(), self.session_name, self.window_name, timeout=30.0
             )
         except Exception as exc:
             logger.warning(
@@ -281,7 +281,7 @@ class CopilotCliProvider(BaseProvider):
         if not shell_ready:
             raise TimeoutError("Shell initialization timed out after 30 seconds")
 
-        tmux_client.send_keys(self.session_name, self.window_name, self._command())
+        get_backend().send_keys(self.session_name, self.window_name, self._command())
 
         deadline = time.time() + 60.0
         self._accept_trust_prompts(timeout=10.0)

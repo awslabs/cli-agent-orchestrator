@@ -393,8 +393,14 @@ def delete_terminals_by_session(tmux_session: str) -> int:
 
 
 def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> InboxMessage:
-    """Create inbox message with status=MessageStatus.PENDING."""
+    """Create inbox message with status=MessageStatus.PENDING.
+
+    Raises:
+        ValueError: If the receiver terminal does not exist.
+    """
     with SessionLocal() as db:
+        if not db.query(TerminalModel).filter(TerminalModel.id == receiver_id).first():
+            raise ValueError(f"Terminal '{receiver_id}' not found")
         inbox_msg = InboxModel(
             sender_id=sender_id,
             receiver_id=receiver_id,
