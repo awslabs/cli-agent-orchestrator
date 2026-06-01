@@ -7,7 +7,7 @@ flow_daemon, lifespan, and the main() entry point.
 
 import asyncio
 from datetime import datetime
-from unittest.mock import ANY, AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, Mock, call, patch
 
 import pytest
 
@@ -1081,3 +1081,29 @@ class TestMainEntryPoint:
 
             main()
             # No assertion needed beyond no exception — the code path is covered
+
+    def test_main_extends_cors_for_custom_host_port(self):
+        """``main()`` must call ``add_local_cors_origins`` with the resolved
+        host/port *before* uvicorn starts, otherwise the same-host browser
+        access promised by issue #151 silently regresses. ``uvicorn.run`` is
+        blocking in real execution, so any mutation of ``CORS_ORIGINS`` after
+        it would be unreachable on first request — the order assertion below
+        guards against an accidental reorder of those two lines."""
+        parent = Mock()
+        with (
+            patch("argparse.ArgumentParser.parse_args") as mock_args,
+            patch("uvicorn.run") as mock_uvicorn,
+            patch("cli_agent_orchestrator.api.main.add_local_cors_origins") as mock_add,
+        ):
+            parent.attach_mock(mock_add, "add_cors")
+            parent.attach_mock(mock_uvicorn, "uvicorn_run")
+            mock_args.return_value = MagicMock(agents_dir=None, host="0.0.0.0", port=9999)
+
+            from cli_agent_orchestrator.api.main import main
+
+            main()
+
+            assert parent.mock_calls == [
+                call.add_cors("0.0.0.0", 9999),
+                call.uvicorn_run(app, host="0.0.0.0", port=9999),
+            ]

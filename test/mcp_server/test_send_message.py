@@ -4,6 +4,55 @@ import os
 from unittest.mock import patch
 
 
+class TestSendMessageSelfSendGuard:
+    """Tests for the self-send guard added for issue #24.
+
+    A worker agent occasionally calls send_message with its own
+    CAO_TERMINAL_ID as the receiver, which silently delivers the result
+    into its own inbox instead of the supervisor's. The guard turns that
+    into an explicit error so the worker can pick the correct receiver.
+    """
+
+    @patch("cli_agent_orchestrator.mcp_server.server._send_to_inbox")
+    def test_send_message_rejects_self_send(self, mock_inbox):
+        """Sending to the caller's own CAO_TERMINAL_ID should be rejected."""
+        from cli_agent_orchestrator.mcp_server.server import _send_message_impl
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "worker-abc"}):
+            result = _send_message_impl("worker-abc", "Done!")
+
+        assert result["success"] is False
+        assert "worker-abc" in result["error"]
+        assert "own CAO_TERMINAL_ID" in result["error"]
+        mock_inbox.assert_not_called()
+
+    @patch("cli_agent_orchestrator.mcp_server.server._send_to_inbox")
+    def test_send_message_allows_distinct_receiver(self, mock_inbox):
+        """Sending to a different terminal should still go through."""
+        from cli_agent_orchestrator.mcp_server.server import _send_message_impl
+
+        mock_inbox.return_value = {"success": True}
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "worker-abc"}):
+            _send_message_impl("supervisor-xyz", "Done!")
+
+        mock_inbox.assert_called_once()
+        assert mock_inbox.call_args[0][0] == "supervisor-xyz"
+
+    @patch("cli_agent_orchestrator.mcp_server.server._send_to_inbox")
+    def test_send_message_no_guard_when_cao_terminal_id_unset(self, mock_inbox):
+        """Without CAO_TERMINAL_ID the guard is inert — _send_to_inbox runs
+        and surfaces its own error path."""
+        from cli_agent_orchestrator.mcp_server.server import _send_message_impl
+
+        mock_inbox.return_value = {"success": True}
+
+        with patch.dict(os.environ, {}, clear=True):
+            _send_message_impl("any-receiver", "Hello")
+
+        mock_inbox.assert_called_once()
+
+
 class TestSendMessageSenderIdInjection:
     """Tests for sender ID injection in _send_message_impl."""
 

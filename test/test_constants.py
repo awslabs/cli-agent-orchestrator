@@ -152,6 +152,96 @@ class TestNetworkAllowlistEnvOverrides:
         ]
 
 
+class TestAddLocalCorsOrigins:
+    """Tests for runtime CORS extension from the cao-server listen address (issue #151)."""
+
+    def _reload_constants(self):
+        """Reload constants with the network override env vars stripped so the
+        list under test always starts from the documented defaults."""
+        import importlib
+        import os
+
+        env_copy = os.environ.copy()
+        for key in ("CAO_CORS_ORIGINS", "CAO_ALLOWED_HOSTS", "CAO_WS_ALLOWED_CLIENTS"):
+            env_copy.pop(key, None)
+        with patch.dict("os.environ", env_copy, clear=True):
+            import cli_agent_orchestrator.constants as constants_module
+
+            importlib.reload(constants_module)
+            return constants_module
+
+    def test_custom_port_on_loopback_host_adds_localhost_and_ip_origins(self):
+        mod = self._reload_constants()
+        mod.add_local_cors_origins("127.0.0.1", 9999)
+        assert "http://localhost:9999" in mod.CORS_ORIGINS
+        assert "http://127.0.0.1:9999" in mod.CORS_ORIGINS
+
+    def test_wildcard_bind_derives_loopback_origins(self):
+        mod = self._reload_constants()
+        mod.add_local_cors_origins("0.0.0.0", 8080)
+        assert "http://localhost:8080" in mod.CORS_ORIGINS
+        assert "http://127.0.0.1:8080" in mod.CORS_ORIGINS
+
+    def test_custom_host_adds_that_host_only(self):
+        mod = self._reload_constants()
+        mod.add_local_cors_origins("cao.internal", 9889)
+        assert "http://cao.internal:9889" in mod.CORS_ORIGINS
+        assert "http://localhost:9889" not in mod.CORS_ORIGINS
+        assert "http://127.0.0.1:9889" not in mod.CORS_ORIGINS
+
+    def test_idempotent_when_called_twice(self):
+        mod = self._reload_constants()
+        mod.add_local_cors_origins("127.0.0.1", 9999)
+        mod.add_local_cors_origins("127.0.0.1", 9999)
+        assert mod.CORS_ORIGINS.count("http://localhost:9999") == 1
+        assert mod.CORS_ORIGINS.count("http://127.0.0.1:9999") == 1
+
+    def test_default_port_does_not_duplicate_existing_origins(self):
+        mod = self._reload_constants()
+        # 5173 is already in the built-in defaults; calling with that port
+        # must not add a duplicate entry.
+        mod.add_local_cors_origins("127.0.0.1", 5173)
+        assert mod.CORS_ORIGINS.count("http://localhost:5173") == 1
+        assert mod.CORS_ORIGINS.count("http://127.0.0.1:5173") == 1
+
+    def test_mutation_is_observable_through_existing_reference(self):
+        """CORSMiddleware stores the list by reference. Mutating the module
+        attribute after middleware install must be visible to anyone holding
+        a prior reference, otherwise the runtime extension does nothing."""
+        mod = self._reload_constants()
+        captured = mod.CORS_ORIGINS  # the reference the middleware would hold
+        mod.add_local_cors_origins("127.0.0.1", 7777)
+        assert "http://localhost:7777" in captured
+        assert "http://127.0.0.1:7777" in captured
+
+    def test_ipv6_loopback_adds_all_loopback_aliases(self):
+        """``::1`` is loopback like ``127.0.0.1`` / ``localhost``: any of the
+        three should grant same-host access from a browser that picks any of
+        the others, so all three origins are added."""
+        mod = self._reload_constants()
+        mod.add_local_cors_origins("::1", 9999)
+        assert "http://localhost:9999" in mod.CORS_ORIGINS
+        assert "http://127.0.0.1:9999" in mod.CORS_ORIGINS
+        assert "http://[::1]:9999" in mod.CORS_ORIGINS
+
+    def test_ipv6_wildcard_bind_includes_bracketed_loopback(self):
+        """Binding on ``::`` must also allow IPv6 loopback in brackets — that
+        is the form a browser actually emits in ``Origin``."""
+        mod = self._reload_constants()
+        mod.add_local_cors_origins("::", 8080)
+        assert "http://[::1]:8080" in mod.CORS_ORIGINS
+
+    def test_ipv6_literal_host_is_bracketed(self):
+        """A non-loopback IPv6 literal must be formatted with brackets so the
+        derived origin matches the ``Origin`` header the browser sends."""
+        mod = self._reload_constants()
+        mod.add_local_cors_origins("2001:db8::1", 9889)
+        assert "http://[2001:db8::1]:9889" in mod.CORS_ORIGINS
+        # The unbracketed form would never match a real Origin header and so
+        # would only bloat the allowlist — guard against accidental reintro.
+        assert "http://2001:db8::1:9889" not in mod.CORS_ORIGINS
+
+
 class TestCaoHomeDir:
     """Tests for CAO home directory constants."""
 

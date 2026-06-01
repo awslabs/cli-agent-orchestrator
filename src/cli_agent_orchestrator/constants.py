@@ -60,6 +60,12 @@ TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
 # Lower values = faster response, higher CPU usage
 INBOX_POLLING_INTERVAL = 5
 
+# Eager inbox delivery: when enabled, deliver queued messages to terminals in
+# PROCESSING or WAITING_USER_ANSWER state for providers that declare
+# accepts_input_while_processing=True. Eliminates latency between agent turns
+# for capable providers (e.g., Claude Code).
+EAGER_INBOX_DELIVERY = os.environ.get("CAO_EAGER_INBOX_DELIVERY", "false").lower() == "true"
+
 # =============================================================================
 # Cleanup Service Configuration
 # =============================================================================
@@ -132,6 +138,52 @@ CORS_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
 ] + _split_env_list("CAO_CORS_ORIGINS")
+
+
+# Hostnames that bind on all interfaces and so cannot be turned into a usable
+# Origin header on their own — derive loopback origins for these instead.
+_WILDCARD_BIND_HOSTS = frozenset({"0.0.0.0", "::", "::0"})
+# Hosts that all resolve to the local machine; treated interchangeably so a
+# request from any of them is accepted regardless of which one was passed to
+# ``--host``.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _format_origin(host: str, port: int) -> str:
+    """Build an HTTP Origin string, bracketing IPv6 literals as browsers do."""
+    if ":" in host:
+        return f"http://[{host}]:{port}"
+    return f"http://{host}:{port}"
+
+
+def add_local_cors_origins(host: str, port: int) -> None:
+    """Extend ``CORS_ORIGINS`` in place with origins derived from the listen
+    address. Called from ``cao-server`` after argparse so a non-default
+    ``--port`` does not force operators to also set ``CAO_CORS_ORIGINS`` for
+    same-host browser access (issue #151).
+
+    The list is mutated in place because Starlette's ``CORSMiddleware`` keeps
+    a reference to the original sequence and re-reads it per request; any new
+    entry is therefore picked up by the already-installed middleware.
+
+    IPv6 literals are bracketed in the generated origin to match what the
+    browser actually sends in the ``Origin`` header (CORS does exact-string
+    matching), and any of ``localhost`` / ``127.0.0.1`` / ``::1`` triggers
+    all three loopback aliases so same-host access works regardless of which
+    one the operator passed to ``--host``.
+    """
+    if host in _WILDCARD_BIND_HOSTS or host in _LOOPBACK_HOSTS:
+        candidates = [
+            f"http://localhost:{port}",
+            f"http://127.0.0.1:{port}",
+            f"http://[::1]:{port}",
+        ]
+    else:
+        candidates = [_format_origin(host, port)]
+    for origin in candidates:
+        if origin not in CORS_ORIGINS:
+            CORS_ORIGINS.append(origin)
+
 
 # Allowed Host headers for DNS rebinding protection (CVE mitigation).
 # Defaults: localhost-only, matching CAO's local-only service design.

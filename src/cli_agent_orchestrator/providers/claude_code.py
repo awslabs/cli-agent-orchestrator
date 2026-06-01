@@ -74,6 +74,13 @@ class ClaudeCodeProvider(BaseProvider):
 
         Returns properly escaped shell command string that can be safely sent via tmux.
         Uses shlex.join() to handle multiline strings and special characters correctly.
+
+        Three routing paths based on agent profile state:
+        1. Profile with native_agent field -> pass --agent <native_agent> directly
+           (thin wrapper: Claude Code handles all config)
+        2. No CAO profile found -> pass --agent <name> directly to Claude Code's
+           native agent store (~/.claude/agents/)
+        3. Full CAO profile -> decompose into CLI flags (model, prompt, MCP, etc.)
         """
         # --dangerously-skip-permissions: bypass the workspace trust dialog and
         # tool permission prompts. CAO already confirms workspace access during
@@ -85,15 +92,31 @@ class ClaudeCodeProvider(BaseProvider):
         if self._agent_profile is not None:
             try:
                 profile = load_agent_profile(self._agent_profile)
+            except FileNotFoundError:
+                profile = None
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
+        # Determine permission mode for the base command
         if profile and profile.permissionMode and not yolo:
             command_parts = ["claude", "--permission-mode", profile.permissionMode]
         else:
             command_parts = ["claude", "--dangerously-skip-permissions"]
 
-        if profile is not None:
+        # Route based on profile state
+        native = getattr(profile, "native_agent", None) if profile else None
+        if profile is not None and isinstance(native, str) and native:
+            # Thin wrapper: CAO profile maps to a native Claude Code agent.
+            # Let Claude Code handle all config (MCP servers, hooks, tools, model).
+            # CAO_TERMINAL_ID propagates via tmux pane env inheritance.
+            command_parts.extend(["--agent", native])
+        elif self._agent_profile is not None and profile is None:
+            # No CAO profile exists — pass agent name directly to Claude Code's
+            # native agent store (~/.claude/agents/). Same thin-orchestrator
+            # pattern as the Kiro CLI provider.
+            command_parts.extend(["--agent", self._agent_profile])
+        elif profile is not None:
+            # Full CAO profile with config decomposition
             if profile.model:
                 command_parts.extend(["--model", profile.model])
 
@@ -101,8 +124,6 @@ class ClaudeCodeProvider(BaseProvider):
             system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
             system_prompt = self._apply_skill_prompt(system_prompt)
             if system_prompt:
-                # Replace actual newlines with \n escape sequences
-                # This prevents tmux send_keys chunking from breaking the command
                 escaped_prompt = system_prompt.replace("\\", "\\\\").replace("\n", "\\n")
                 command_parts.extend(["--append-system-prompt", escaped_prompt])
 
@@ -144,13 +165,14 @@ class ClaudeCodeProvider(BaseProvider):
         # When cao-server runs inside a Claude Code session, CLAUDE* env vars
         # leak into spawned tmux panes (via the tmux server's global env).
         # Claude Code detects these and refuses to start ("nested session").
-        # Unset all matching vars except CLAUDE_CODE_USE_* and
+        # Unset all matching vars except CLAUDE_CODE_USE_*,
         # CLAUDE_CODE_SKIP_*_AUTH (needed for provider authentication:
-        # Bedrock, Vertex AI, Foundry).
+        # Bedrock, Vertex AI, Foundry), and CLAUDE_CODE_EFFORT_LEVEL (user pref).
         unset_cmd = (
             "unset $(env | sed -n 's/^\\(CLAUDE[A-Z_]*\\)=.*/\\1/p'"
             " | grep -v -E 'CLAUDE_CODE_USE_(BEDROCK|VERTEX|FOUNDRY)"
-            "|CLAUDE_CODE_SKIP_(BEDROCK|VERTEX|FOUNDRY)_AUTH'"
+            "|CLAUDE_CODE_SKIP_(BEDROCK|VERTEX|FOUNDRY)_AUTH"
+            "|CLAUDE_CODE_EFFORT_LEVEL'"
             ") 2>/dev/null"
         )
         return f"{unset_cmd}; {claude_cmd}"
@@ -390,9 +412,23 @@ class ClaudeCodeProvider(BaseProvider):
 
         return TerminalStatus.ERROR
 
+    @property
+    def accepts_input_while_processing(self) -> bool:
+        """Claude Code's Ink TUI buffers pasted input during processing.
+
+        Only true after initialization completes — during startup the REPL
+        isn't ready to accept input even though get_status() sees PROCESSING.
+        """
+        return self._initialized
+
     def get_idle_pattern_for_log(self) -> str:
         """Return Claude Code IDLE prompt pattern for log files."""
         return IDLE_PROMPT_PATTERN_LOG
+
+    # Start-of-line idle prompt for extraction: ❯ or > at the beginning of a line
+    # (after optional ANSI codes).  Mid-line ">" in Java generics, git diffs, HTML
+    # etc. must NOT trigger the stop condition.
+    _SOL_IDLE_RE = re.compile(r"^\s*(?:\x1b\[[0-9;]*m)*[>❯](?:\x1b\[[0-9;]*m)*[\s\xa0]")
 
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract Claude's final response message using ⏺ indicator."""
@@ -406,7 +442,11 @@ class ClaudeCodeProvider(BaseProvider):
         last_match = matches[-1]
         start_pos = last_match.end()
 
-        # Extract everything after the last ⏺ until next prompt or separator
+        # Extract everything after the last ⏺ until:
+        # 1. A start-of-line idle prompt (❯ or >) — the definitive boundary
+        # 2. A completion stat line ("✻ Sautéed for 14s") — trims the stat
+        # Using start-of-line anchor avoids false stops on ">" inside
+        # response content (Java generics, git diffs, HTML tags, etc.).
         remaining_text = script_output[start_pos:]
 
         # Split by lines and extract response
@@ -414,12 +454,12 @@ class ClaudeCodeProvider(BaseProvider):
         response_lines = []
 
         for line in lines:
-            # Stop at next > prompt or separator line
-            if re.match(r">\s", line) or "────────" in line:
+            clean_line = re.sub(ANSI_CODE_PATTERN, "", line).strip()
+            if self._SOL_IDLE_RE.match(line):
+                break
+            if "────────" in line:
                 break
 
-            # Clean the line
-            clean_line = line.strip()
             response_lines.append(clean_line)
 
         if not response_lines or not any(line.strip() for line in response_lines):

@@ -47,6 +47,7 @@ from cli_agent_orchestrator.constants import (
     SERVER_VERSION,
     TERMINAL_LOG_DIR,
     WS_ALLOWED_CLIENTS,
+    add_local_cors_origins,
 )
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
@@ -1168,6 +1169,11 @@ def main():
 
     host = args.host or SERVER_HOST
     port = args.port or SERVER_PORT
+    # Extend the CORS allowlist so a custom --host/--port still permits
+    # same-host browser access without requiring CAO_CORS_ORIGINS. The
+    # already-installed CORSMiddleware reads the list by reference, so
+    # mutating it before uvicorn starts is sufficient. See issue #151.
+    add_local_cors_origins(host, port)
     uvicorn.run(app, host=host, port=port)
 
 

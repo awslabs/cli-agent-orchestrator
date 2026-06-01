@@ -113,6 +113,27 @@ permissionMode: auto
 You review code for quality and correctness.
 ```
 
+## Eager Inbox Delivery
+
+Claude Code's Ink TUI buffers pasted input even while the agent is processing. CAO exploits this to deliver queued inbox messages during PROCESSING and WAITING_USER_ANSWER states, eliminating inter-turn latency. Enable with `CAO_EAGER_INBOX_DELIVERY=true`.
+
+See [Inbox Delivery](inbox-delivery.md) for the full architecture, two-flag gate, and how to enable this for other providers.
+
+## Native Agent Routing
+
+When a CAO profile specifies a `native_agent` field, the provider passes `--agent <name>` directly to Claude Code's native agent store (`~/.claude/agents/`). This is a thin-wrapper mode where Claude Code handles all configuration (MCP servers, hooks, tools, model).
+
+If no CAO profile is found for the given agent name, the provider also falls back to `--agent <name>`, assuming it exists in the native store.
+
+```markdown
+---
+name: my-wrapper
+description: Thin wrapper for a native Claude Code agent
+provider: claude_code
+native_agent: my-native-agent
+---
+```
+
 ## Implementation Notes
 
 - **Prompt patterns**: `IDLE_PROMPT_PATTERN` matches both old `>` and new `❯` prompt styles, including non-breaking space (`\xa0`)

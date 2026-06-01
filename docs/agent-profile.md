@@ -33,6 +33,7 @@ Define the agent's role, responsibilities, and behavior here.
 - `toolsSettings` (object): Tool-specific configuration
 - `model` (string): AI model to use
 - `permissionMode` (string, `claude_code` only): One of `"default"`, `"acceptEdits"`, `"plan"`, `"auto"`, `"bypassPermissions"`. When set, the `claude_code` provider passes `--permission-mode <value>` instead of `--dangerously-skip-permissions`. `cao launch --yolo` overrides this and forces bypass. See [Claude Code permission modes](https://code.claude.com/docs/en/permission-modes).
+- `native_agent` (string, `claude_code` only): Name of a native Claude Code agent (`~/.claude/agents/`). When set, the provider passes `--agent <name>` directly and skips system prompt / MCP config decomposition (thin-wrapper mode). See [Claude Code native agent routing](claude-code.md#native-agent-routing).
 - `prompt` (string): Additional prompt text
 
 ## Tool Restrictions
