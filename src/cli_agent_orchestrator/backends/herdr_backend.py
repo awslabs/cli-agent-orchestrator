@@ -28,8 +28,9 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 logger = logging.getLogger(__name__)
 
 # Cache TTL for pane_id resolution (seconds).
-# Used by _resolve_pane_id() (inbox service path, herdr-native terminal_ids).
-# Not used by _resolve_pane_id_from_window() which skips TTL for active terminals.
+# Used by _resolve_pane_id() (inbox service path, herdr-native terminal_ids) and
+# _resolve_workspace_id(). _resolve_pane_id_from_window() never caches pane_ids —
+# herdr renumbers panes on deletion, so it resolves the pane fresh every call.
 _PANE_CACHE_TTL = 5.0
 
 
@@ -59,8 +60,6 @@ class HerdrBackend(TerminalBackend):
         self._pane_cache: Dict[str, tuple[str, float]] = {}
         # Workspace cache: session_name → (workspace_id, timestamp)
         self._workspace_cache: Dict[str, tuple[str, float]] = {}
-        # Window name → terminal_id mapping (populated at create_session/create_window)
-        self._window_to_terminal: Dict[str, str] = {}
         self._ensure_session_running()
 
     @property
@@ -271,11 +270,6 @@ class HerdrBackend(TerminalBackend):
         result = self._run_herdr(["workspace", "close", workspace_id], check=False)
         if result.returncode == 0:
             self._workspace_cache.pop(session_name, None)
-            # Clean up window→terminal mappings for this session
-            prefix = f"{session_name}:"
-            to_remove = [k for k in self._window_to_terminal if k.startswith(prefix)]
-            for k in to_remove:
-                self._window_to_terminal.pop(k, None)
             logger.info(f"Killed herdr workspace: {session_name}")
             return True
         return False
@@ -335,13 +329,6 @@ class HerdrBackend(TerminalBackend):
             return False
 
         result = self._run_herdr(["pane", "close", pane_id], check=False)
-
-        # Clean up window→terminal mapping and inbox-service pane cache entry
-        key = f"{session_name}:{window_name}"
-        terminal_id = self._window_to_terminal.pop(key, None)
-        if terminal_id:
-            # Remove from _pane_cache so the inbox service path doesn't use a stale entry
-            self._pane_cache.pop(terminal_id, None)
 
         if result.returncode == 0:
             logger.info(f"Killed herdr pane {pane_id} for {session_name}:{window_name}")
@@ -544,7 +531,8 @@ class HerdrBackend(TerminalBackend):
         """Resolve CAO terminal_id to herdr pane_id.
 
         Prefers the _pane_cache (populated by _inject_env_vars at create time).
-        Falls back to _window_to_terminal + _resolve_pane_id if session/window given.
+        Falls back to live label-based resolution (_resolve_workspace_id ->
+        _resolve_tab_id -> pane list) if session/window given.
 
         Args:
             terminal_id: CAO UUID terminal identifier
@@ -652,24 +640,22 @@ class HerdrBackend(TerminalBackend):
 
         Called after create_session/create_window to export env vars into the
         pane's shell so agents and `cao info` can identify the terminal/session.
-        Also records the window_name→terminal_id mapping for pane resolution.
 
         Args:
             session_name: CAO session name
-            window_name: Window name for the mapping
+            window_name: Window name (kept for signature symmetry / logging)
             terminal_id: Terminal identifier to inject
             pane_id: Pane ID from the create response. If None, falls back to
                 pane list scan (less reliable under concurrency).
         """
-        # Record mapping for _resolve_pane_id_from_window
-        key = f"{session_name}:{window_name}"
-        self._window_to_terminal[key] = terminal_id
-
         try:
             # Use provided pane_id if available (from create response)
             target_pane_id = pane_id
             if not target_pane_id:
-                # Fallback: scan pane list for last pane in workspace
+                # Fallback: scan pane list for last pane in workspace.
+                # NOTE: under concurrent creates in the same workspace this can
+                # pick the wrong (most-recent) pane. It only fires when the create
+                # response lacked a pane_id; the pane_id param is the primary path.
                 workspace_id = self._resolve_workspace_id(session_name)
                 result = self._run_herdr(["pane", "list"])
                 data = self._parse_herdr_json(result.stdout)
@@ -723,23 +709,22 @@ class HerdrBackend(TerminalBackend):
     def _resolve_pane_id_from_window(self, session_name: str, window_name: str) -> str:
         """Resolve a pane_id given session_name and window_name.
 
-        Always performs a fresh herdr tab list + pane list lookup. Pane IDs are
-        not stable across deletions — herdr renumbers remaining panes when any
-        pane in the workspace is removed. A cache would return stale IDs and
-        cause pane_not_found errors for live terminals.
+        Performs a fresh herdr workspace + tab + pane lookup on every call. Pane
+        IDs are not stable across deletions — herdr renumbers remaining panes
+        when any pane in the workspace is removed, so a cached pane_id would go
+        stale and cause pane_not_found errors for live terminals. workspace_id
+        resolution is cached with a short TTL inside _resolve_workspace_id as a
+        latency optimization; the chain is otherwise resolved live.
 
-        When a window→terminal mapping exists (set at create time), uses tab_id
-        as the stable intermediary to find the exact pane. Falls back to the
-        first pane in the workspace when no mapping exists (e.g., legacy panes).
+        Resolution chain: workspace_id (by label) → tab_id (by label within the
+        workspace) → the pane whose tab_id matches. There is no fallback: a tab
+        must exist for the window and a pane must exist for the tab.
+
+        Raises:
+            TerminalNotFoundError: If the workspace, tab, or pane cannot be
+                resolved for session_name:window_name.
         """
-        # Look up terminal_id from the window mapping
-        key = f"{session_name}:{window_name}"
-        terminal_id = self._window_to_terminal.get(key)
-
-        if terminal_id:
-            # Fresh resolution via tab_id as stable intermediary.
-            # workspace_id is cached with TTL and is stable — workspaces are
-            # never renumbered by pane deletions.
+        try:
             workspace_id = self._resolve_workspace_id(session_name)
             tab_id = self._resolve_tab_id(session_name, workspace_id, window_name)
 
@@ -749,36 +734,14 @@ class HerdrBackend(TerminalBackend):
                 panes = data.get("panes", []) if isinstance(data, dict) else data
             except json.JSONDecodeError as e:
                 raise TerminalBackendError(f"Failed to parse herdr pane list: {e}") from e
-
-            for pane in panes:
-                if pane.get("tab_id") == tab_id:
-                    return str(pane["pane_id"])
-
-            raise TerminalNotFoundError(terminal_id)
-
-        # Fallback: no mapping (e.g., legacy or externally created panes)
-        # Resolve workspace and return the first pane found
-        try:
-            workspace_id = self._resolve_workspace_id(session_name)
-        except TerminalBackendError:
-            raise TerminalBackendError(
-                f"No pane found for workspace '{session_name}' window '{window_name}'"
-            )
-
-        result = self._run_herdr(["pane", "list"])
-        try:
-            data = self._parse_herdr_json(result.stdout)
-            panes = data.get("panes", []) if isinstance(data, dict) else data
-        except json.JSONDecodeError as e:
-            raise TerminalBackendError(f"Failed to parse herdr pane list: {e}") from e
+        except TerminalBackendError as e:
+            raise TerminalNotFoundError(f"{session_name}:{window_name}") from e
 
         for pane in panes:
-            if pane.get("workspace_id") == workspace_id:
+            if pane.get("tab_id") == tab_id:
                 return str(pane["pane_id"])
 
-        raise TerminalBackendError(
-            f"No pane found for workspace '{session_name}' window '{window_name}'"
-        )
+        raise TerminalNotFoundError(f"{session_name}:{window_name}")
 
     def invalidate_cache(self) -> None:
         """Invalidate all cached pane_id mappings.

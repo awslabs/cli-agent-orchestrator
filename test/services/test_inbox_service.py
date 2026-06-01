@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.constants import INBOX_RECONCILE_GRACE_SECONDS
 from cli_agent_orchestrator.models.inbox import MessageStatus
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -219,6 +220,34 @@ class TestCheckAndSendPendingMessages:
 
         assert order[0] == ("update", (1, MessageStatus.DELIVERED))
         assert order[1][0] == "send"
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_resolution_failure_leaves_message_pending(
+        self, mock_get_messages, mock_provider_manager, mock_terminal_service, mock_update_status
+    ):
+        """A TerminalNotFoundError during send leaves the message PENDING, not FAILED.
+
+        Pane resolution can transiently fail (e.g. herdr pane not yet resolvable).
+        The message must remain pending for a later retry rather than being marked
+        FAILED or silently misrouted.
+        """
+        mock_message = MagicMock()
+        mock_message.id = 1
+        mock_message.message = "test message"
+        mock_get_messages.return_value = [mock_message]
+        mock_provider = MagicMock()
+        mock_provider.get_status.return_value = TerminalStatus.IDLE
+        mock_provider_manager.get_provider.return_value = mock_provider
+        mock_terminal_service.send_input.side_effect = TerminalNotFoundError("s:w")
+
+        result = check_and_send_pending_messages("test-terminal")
+
+        assert result is False
+        # Message stays pending: status is never updated to DELIVERED or FAILED
+        mock_update_status.assert_not_called()
 
 
 class TestEagerInboxDelivery:

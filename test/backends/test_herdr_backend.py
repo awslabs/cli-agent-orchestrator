@@ -213,12 +213,14 @@ class TestHerdrBackendCommands:
     @patch("subprocess.run")
     def test_send_keys_calls_send_text_then_enter(self, mock_run, backend):
         """send_keys should call pane send-text then pane send-keys Enter."""
-        # Mock workspace list (for _resolve_pane_id_from_window)
+        # Resolution path: workspace list + tab list + pane list (3 calls)
         ws = [{"label": "cao-test", "workspace_id": "w1"}]
-        panes = [{"terminal_id": "tid1", "pane_id": "w1-1", "workspace_id": "w1"}]
+        tabs = [{"tab_id": "tab-0", "workspace_id": "w1", "label": "window-0"}]
+        panes = [{"tab_id": "tab-0", "pane_id": "w1-1", "workspace_id": "w1"}]
 
         mock_run.side_effect = [
             _completed(_make_workspace_list_response(ws)),  # workspace list
+            _completed(_make_tab_list_response(tabs)),      # tab list
             _completed(_make_pane_list_response(panes)),    # pane list
             _completed(),  # send-text
             _completed(),  # send-keys Enter
@@ -227,21 +229,22 @@ class TestHerdrBackendCommands:
         backend.send_keys("cao-test", "window-0", "hello world", enter_count=1)
 
         calls = [c[0][0] for c in mock_run.call_args_list]
-        # Third call should be send-text
-        assert "send-text" in calls[2]
-        assert "hello world" in calls[2]
-        # Fourth call should be send-keys Enter
-        assert "send-keys" in calls[3]
-        assert "Enter" in calls[3]
+        # After the 3 resolution calls: send-text then send-keys Enter
+        assert "send-text" in calls[-2]
+        assert "hello world" in calls[-2]
+        assert "send-keys" in calls[-1]
+        assert "Enter" in calls[-1]
 
     @patch("subprocess.run")
     def test_send_special_key_enter(self, mock_run, backend):
         """send_special_key with empty string sends Enter."""
         ws = [{"label": "cao-test", "workspace_id": "w1"}]
-        panes = [{"terminal_id": "tid1", "pane_id": "w1-1", "workspace_id": "w1"}]
+        tabs = [{"tab_id": "tab-0", "workspace_id": "w1", "label": "window-0"}]
+        panes = [{"tab_id": "tab-0", "pane_id": "w1-1", "workspace_id": "w1"}]
 
         mock_run.side_effect = [
             _completed(_make_workspace_list_response(ws)),
+            _completed(_make_tab_list_response(tabs)),
             _completed(_make_pane_list_response(panes)),
             _completed(),  # send-keys Enter
         ]
@@ -256,10 +259,12 @@ class TestHerdrBackendCommands:
     def test_get_history_calls_pane_read(self, mock_run, backend):
         """get_history should call herdr pane read with correct flags."""
         ws = [{"label": "cao-test", "workspace_id": "w1"}]
-        panes = [{"terminal_id": "tid1", "pane_id": "w1-1", "workspace_id": "w1"}]
+        tabs = [{"tab_id": "tab-0", "workspace_id": "w1", "label": "window-0"}]
+        panes = [{"tab_id": "tab-0", "pane_id": "w1-1", "workspace_id": "w1"}]
 
         mock_run.side_effect = [
             _completed(_make_workspace_list_response(ws)),
+            _completed(_make_tab_list_response(tabs)),
             _completed(_make_pane_list_response(panes)),
             _completed(stdout="pane output here"),  # pane read
         ]
@@ -277,7 +282,8 @@ class TestHerdrBackendCommands:
     def test_get_pane_working_directory(self, mock_run, backend):
         """get_pane_working_directory should parse cwd from pane get."""
         ws = [{"label": "cao-test", "workspace_id": "w1"}]
-        panes = [{"terminal_id": "tid1", "pane_id": "w1-1", "workspace_id": "w1"}]
+        tabs = [{"tab_id": "tab-0", "workspace_id": "w1", "label": "window-0"}]
+        panes = [{"tab_id": "tab-0", "pane_id": "w1-1", "workspace_id": "w1"}]
         pane_info = json.dumps({
             "id": "cli:pane:get",
             "result": {"pane": {"cwd": "/home/user/project"}, "type": "pane_info"},
@@ -285,6 +291,7 @@ class TestHerdrBackendCommands:
 
         mock_run.side_effect = [
             _completed(_make_workspace_list_response(ws)),
+            _completed(_make_tab_list_response(tabs)),
             _completed(_make_pane_list_response(panes)),
             _completed(stdout=pane_info),  # pane get
         ]
@@ -357,9 +364,6 @@ class TestMultiPaneResolution:
         First call: workspace list (cache miss) + tab list + pane list = 3 subprocess calls.
         Second call: workspace cache hit + tab list + pane list = 2 subprocess calls.
         """
-        backend._window_to_terminal["cao-test:developer-abc1"] = "tid_1"
-        backend._window_to_terminal["cao-test:developer-abc2"] = "tid_2"
-
         ws = [{"label": "cao-test", "workspace_id": "w1"}]
         tabs = [
             {"tab_id": "tab-1", "workspace_id": "w1", "label": "developer-abc1"},
@@ -384,9 +388,7 @@ class TestMultiPaneResolution:
 
     @patch("subprocess.run")
     def test_wrong_window_raises_not_found(self, mock_run, backend):
-        """Mapped terminal_id with no matching pane for the tab raises TerminalNotFoundError."""
-        backend._window_to_terminal["cao-test:unknown-win"] = "tid_gone"
-
+        """A tab with no matching pane raises TerminalNotFoundError keyed on session:window."""
         ws = [{"label": "cao-test", "workspace_id": "w1"}]
         # Tab exists but no panes match its tab_id
         tabs = [{"tab_id": "tab-x", "workspace_id": "w1", "label": "unknown-win"}]
@@ -398,26 +400,25 @@ class TestMultiPaneResolution:
             _completed(_make_pane_list_response(panes)),
         ]
 
-        with pytest.raises(TerminalNotFoundError, match="tid_gone"):
+        with pytest.raises(TerminalNotFoundError, match="cao-test:unknown-win"):
             backend._resolve_pane_id_from_window("cao-test", "unknown-win")
 
     @patch("subprocess.run")
-    def test_fallback_without_mapping_returns_first_pane(self, mock_run, backend):
-        """Without a window→terminal mapping, falls back to first pane in workspace."""
-        # No mapping registered — simulates pre-existing pane
+    def test_no_matching_tab_raises_not_found(self, mock_run, backend):
+        """No tab for the window: _resolve_tab_id raises TerminalBackendError, which is
+        re-raised as TerminalNotFoundError keyed on session:window. No silent fallback to
+        an arbitrary pane in the workspace."""
         ws = [{"label": "cao-test", "workspace_id": "w1"}]
-        panes = [
-            {"terminal_id": "tid_1", "pane_id": "w1-1", "workspace_id": "w1"},
-            {"terminal_id": "tid_2", "pane_id": "w1-2", "workspace_id": "w1"},
-        ]
+        # Tabs exist in the workspace but none match the requested window label
+        tabs = [{"tab_id": "tab-other", "workspace_id": "w1", "label": "some-other-window"}]
 
         mock_run.side_effect = [
-            _completed(_make_workspace_list_response(ws)),  # workspace list (resolve_workspace_id)
-            _completed(_make_pane_list_response(panes)),    # pane list
+            _completed(_make_workspace_list_response(ws)),
+            _completed(_make_tab_list_response(tabs)),
         ]
 
-        result = backend._resolve_pane_id_from_window("cao-test", "unmapped-window")
-        assert result == "w1-1"
+        with pytest.raises(TerminalNotFoundError, match="cao-test:unmapped-window"):
+            backend._resolve_pane_id_from_window("cao-test", "unmapped-window")
 
     @patch("subprocess.run")
     def test_three_terminals_each_resolves_correctly(self, mock_run, backend):
@@ -427,10 +428,6 @@ class TestMultiPaneResolution:
         Second/third calls: workspace cache hit + tab + pane = 2 calls each.
         Total: 7 subprocess calls.
         """
-        backend._window_to_terminal["cao-proj:conductor-a1"] = "tid_cond"
-        backend._window_to_terminal["cao-proj:worker-b2"] = "tid_work"
-        backend._window_to_terminal["cao-proj:reviewer-c3"] = "tid_rev"
-
         ws = [{"label": "cao-proj", "workspace_id": "w5"}]
         tabs = [
             {"tab_id": "tab-c", "workspace_id": "w5", "label": "conductor-a1"},
@@ -467,8 +464,6 @@ class TestMultiPaneResolution:
         Second call: workspace cache hit + tab list + pane list = 2 subprocess calls.
         Total: 5 subprocess calls.
         """
-        backend._window_to_terminal["cao-test:window-0"] = "tid1"
-
         ws = [{"label": "cao-test", "workspace_id": "w1"}]
         tabs = [{"tab_id": "tab-1", "workspace_id": "w1", "label": "window-0"}]
         # First call: pane_id is w1-3; second call: pane_id shifted to w1-2
@@ -496,8 +491,6 @@ class TestMultiPaneResolution:
     def test_resolve_pane_id_from_window_uses_tab_id(self, mock_run, backend):
         """When multiple panes exist in the workspace, the correct one is returned by
         matching tab_id (not just the first pane in workspace order)."""
-        backend._window_to_terminal["cao-test:target-window"] = "tid_target"
-
         ws = [{"label": "cao-test", "workspace_id": "w1"}]
         tabs = [
             {"tab_id": "tab-other", "workspace_id": "w1", "label": "other-window"},
@@ -691,13 +684,12 @@ class TestGetNativeStatus:
         })
 
     def _setup_fresh_resolution(self, backend):
-        """Pre-populate workspace cache and register window mapping for tests.
+        """Pre-populate the workspace cache for tests.
 
-        _resolve_pane_id_from_window now performs fresh tab+pane lookups. Pre-populating
+        _resolve_pane_id_from_window performs fresh tab+pane lookups. Pre-populating
         the workspace cache (which has a TTL and is stable) means tests only need to
         mock tab list, pane list, and pane get — not workspace list as well.
         """
-        backend._window_to_terminal["s:w"] = "tid1"
         backend._workspace_cache["s"] = ("w1", time.time())
 
     def _make_resolution_side_effects(self, pane_get_response):
