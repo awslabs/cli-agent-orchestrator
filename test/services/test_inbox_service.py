@@ -172,7 +172,47 @@ class TestCheckAndSendPendingMessages:
         with pytest.raises(Exception, match="Send failed"):
             check_and_send_pending_messages("test-terminal")
 
-        mock_update_status.assert_called_once_with(1, MessageStatus.FAILED)
+        # Status is optimistically set to DELIVERED before send_input, then
+        # reset to FAILED when the send raises.
+        mock_update_status.assert_has_calls(
+            [
+                call(1, MessageStatus.DELIVERED),
+                call(1, MessageStatus.FAILED),
+            ]
+        )
+        assert mock_update_status.call_count == 2
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_marks_delivered_before_send_input(
+        self, mock_get_messages, mock_provider_manager, mock_terminal_service, mock_update_status
+    ):
+        """Regression test for the double-delivery race (GH #164).
+
+        send_input() writes to the terminal log, which re-triggers the
+        watchdog. The message must already be marked DELIVERED by then, so the
+        status update has to happen before send_input is called.
+        """
+        mock_message = MagicMock()
+        mock_message.id = 1
+        mock_message.message = "test message"
+        mock_get_messages.return_value = [mock_message]
+        mock_provider = MagicMock()
+        mock_provider.get_status.return_value = TerminalStatus.IDLE
+        mock_provider_manager.get_provider.return_value = mock_provider
+
+        order = []
+        mock_update_status.side_effect = lambda *args, **kwargs: order.append(("update", args))
+        mock_terminal_service.send_input.side_effect = lambda *args, **kwargs: order.append(
+            ("send", args)
+        )
+
+        check_and_send_pending_messages("test-terminal")
+
+        assert order[0] == ("update", (1, MessageStatus.DELIVERED))
+        assert order[1][0] == "send"
 
 
 class TestEagerInboxDelivery:

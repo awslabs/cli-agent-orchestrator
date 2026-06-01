@@ -124,6 +124,13 @@ def check_and_send_pending_messages(
     # synchronous handoff/assign paths bypass the inbox and pass their own
     # orchestration_type directly to send_input().
     try:
+        # Mark DELIVERED before sending. send_input() types into the tmux pane,
+        # which writes to the terminal log file and re-triggers the watchdog's
+        # on_modified handler. If the status were still PENDING at that point,
+        # the re-entrant check would find the message and deliver it a second
+        # time. Updating the status first closes that race window. On failure
+        # the except block resets the status to FAILED.
+        update_message_status(message.id, MessageStatus.DELIVERED)
         if registry is None:
             terminal_service.send_input(terminal_id, message.message)
         else:
@@ -134,7 +141,6 @@ def check_and_send_pending_messages(
                 sender_id=message.sender_id,
                 orchestration_type=OrchestrationType.SEND_MESSAGE,
             )
-        update_message_status(message.id, MessageStatus.DELIVERED)
         logger.info(f"Delivered message {message.id} to terminal {terminal_id}")
         return True
     except Exception as e:
