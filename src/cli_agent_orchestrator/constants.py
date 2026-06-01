@@ -66,6 +66,25 @@ INBOX_POLLING_INTERVAL = 5
 # for capable providers (e.g., Claude Code).
 EAGER_INBOX_DELIVERY = os.environ.get("CAO_EAGER_INBOX_DELIVERY", "false").lower() == "true"
 
+# Reconciliation sweep for orphaned inbox messages.
+# The immediate (on POST) and watchdog (on log-file change) delivery paths can
+# both miss a message when the receiving terminal is already idle: the single
+# immediate attempt may observe a stale status, and the watchdog only fires on
+# log output that an idle agent never produces. Those messages would otherwise
+# stay PENDING forever. A slow background sweep re-attempts delivery for any
+# message left pending past the grace window below, acting as a catch-all
+# fallback under the two fast paths (issue #131).
+#
+# The interval is deliberately much larger than INBOX_POLLING_INTERVAL: this is
+# a safety net, not a primary delivery path, so it trades latency for low load.
+INBOX_RECONCILE_INTERVAL = 30  # seconds between reconciliation sweeps
+
+# Only reconcile messages older than this. Keeping the grace window >=
+# INBOX_POLLING_INTERVAL (the watchdog poll cadence) ensures the sweep never
+# competes with the immediate and watchdog paths for freshly queued messages —
+# it only adopts ones those paths have already had their chance at and missed.
+INBOX_RECONCILE_GRACE_SECONDS = 30
+
 # =============================================================================
 # Cleanup Service Configuration
 # =============================================================================

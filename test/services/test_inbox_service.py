@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+from cli_agent_orchestrator.constants import INBOX_RECONCILE_GRACE_SECONDS
 from cli_agent_orchestrator.models.inbox import MessageStatus
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.inbox_service import (
@@ -13,6 +14,7 @@ from cli_agent_orchestrator.services.inbox_service import (
     _has_idle_pattern,
     check_and_send_pending_messages,
     poll_opencode_pending_messages,
+    reconcile_orphaned_messages,
 )
 
 
@@ -388,6 +390,35 @@ class TestPollOpenCodePendingMessages:
         mock_check_send.side_effect = [Exception("tmux busy"), False]
 
         poll_opencode_pending_messages()
+
+        assert mock_check_send.call_count == 2
+
+
+class TestReconcileOrphanedMessages:
+    """Tests for the provider-agnostic inbox reconciliation sweep (issue #131)."""
+
+    @patch("cli_agent_orchestrator.services.inbox_service.check_and_send_pending_messages")
+    @patch("cli_agent_orchestrator.services.inbox_service.list_pending_receiver_ids_older_than")
+    def test_reconciles_stale_receivers(self, mock_list_receivers, mock_check_send):
+        """Sweep attempts delivery for each receiver with an orphaned message."""
+        mock_list_receivers.return_value = ["receiver-1", "receiver-2"]
+
+        reconcile_orphaned_messages()
+
+        mock_list_receivers.assert_called_once_with(INBOX_RECONCILE_GRACE_SECONDS)
+        assert mock_check_send.call_args_list == [
+            call("receiver-1", registry=None),
+            call("receiver-2", registry=None),
+        ]
+
+    @patch("cli_agent_orchestrator.services.inbox_service.check_and_send_pending_messages")
+    @patch("cli_agent_orchestrator.services.inbox_service.list_pending_receiver_ids_older_than")
+    def test_survives_per_receiver_failure(self, mock_list_receivers, mock_check_send):
+        """One failed receiver does not stop the sweep."""
+        mock_list_receivers.return_value = ["receiver-1", "receiver-2"]
+        mock_check_send.side_effect = [Exception("tmux busy"), False]
+
+        reconcile_orphaned_messages()
 
         assert mock_check_send.call_count == 2
 
