@@ -5,6 +5,7 @@ import hashlib
 import logging
 import os
 import re
+import subprocess
 import threading
 import time
 import uuid
@@ -12,17 +13,213 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from cli_agent_orchestrator.constants import MEMORY_BASE_DIR
+from cli_agent_orchestrator.constants import (
+    MEMORY_BASE_DIR,
+    MEMORY_MAX_PER_SCOPE,
+    MEMORY_SCOPE_BUDGET_CHARS,
+)
 from cli_agent_orchestrator.models.memory import Memory, MemoryScope, MemoryType
 
 logger = logging.getLogger(__name__)
 
 VALID_SEARCH_MODES = ("metadata", "bm25", "hybrid")
 
+
+MEMORY_DISABLED_MESSAGE = (
+    "memory subsystem is disabled. Set memory.enabled=true in settings.json " "to re-enable."
+)
+
+
+class MemoryDisabledError(RuntimeError):
+    """Raised when a write entry point is called while memory is disabled.
+
+    Read paths (recall, get_memory_context_for_terminal) instead return an
+    empty result, since silent empty reads are a safer no-op than raising.
+    """
+
+
+def _is_memory_enabled() -> bool:
+    """Module-level guard for memory entry points.
+
+    Imported lazily to avoid a settings → memory_service circular import at
+    module load time. Defaults to True if the import or read fails so a
+    broken settings file never silently disables memory.
+    """
+    try:
+        from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+        return is_memory_enabled()
+    except Exception:
+        return True
+
+
 # Per-curator dispatch locks. A worker that fails to acquire its session's
 # curator lock falls back to Phase 1 rather than queueing — context injection
 # is best-effort and must never block the worker.
 _curator_locks: dict[str, threading.Lock] = {}
+
+
+# -----------------------------------------------------------------------------
+# Phase 2.5 U6 — Module-level project identity resolver
+#
+# Exposed at module scope (not on MemoryService) so non-service callers can
+# reuse the same precedence chain without instantiating a MemoryService.
+# -----------------------------------------------------------------------------
+
+_PROJECT_ID_OVERRIDE_PATTERN = re.compile(r"^[a-zA-Z0-9._\-]{1,128}$")
+
+
+class ProjectIdentityResolutionError(RuntimeError):
+    """Raised when no project identity can be derived from any source."""
+
+
+def _validate_project_id_override(raw: str) -> str:
+    """Validate an explicit ``project_id`` override; raise on reject.
+
+    Rejects rather than sanitizes — silent sanitization of an explicit
+    user-supplied config value hides typos and buries the contract.
+    """
+    if "\x00" in raw:
+        raise ValueError("project_id override contains null byte")
+    if not _PROJECT_ID_OVERRIDE_PATTERN.match(raw):
+        raise ValueError(
+            "project_id override must match ^[a-zA-Z0-9._\\-]{1,128}$; " f"got {raw!r}"
+        )
+    return raw
+
+
+def _read_project_id_override() -> Optional[str]:
+    """Read and validate the explicit ``project_id`` override.
+
+    Precedence: ``CAO_PROJECT_ID`` env → ``memory.project_id`` settings key.
+    """
+    raw: Optional[str] = os.environ.get("CAO_PROJECT_ID")
+    if not raw:
+        try:
+            from cli_agent_orchestrator.services.settings_service import (
+                get_memory_settings,
+            )
+
+            raw = get_memory_settings().get("project_id")
+        except Exception as e:
+            logger.debug(f"Failed to read project_id override, skipping: {e}")
+            raw = None
+    if not raw:
+        return None
+    return _validate_project_id_override(raw)
+
+
+def _normalize_git_remote(url: str) -> str:
+    """Normalize a git remote URL into a stable slug id.
+
+    Rules: lowercase, strip protocol, strip auth, SCP→host/path, strip
+    trailing ``.git``, collapse non-alnum runs to ``-``. Empty input → ``"unknown"``.
+    """
+    if not url:
+        return "unknown"
+    u = url.strip().lower()
+    for proto in ("git+ssh://", "ssh://", "git://", "https://", "http://"):
+        if u.startswith(proto):
+            u = u[len(proto) :]
+            break
+    if "@" in u:
+        u = u.split("@", 1)[1]
+    if ":" in u:
+        head, _, tail = u.partition(":")
+        if "/" not in head:
+            u = f"{head}/{tail}"
+    if u.endswith(".git"):
+        u = u[:-4]
+    u = re.sub(r"[^a-z0-9]+", "-", u).strip("-")
+    return u or "unknown"
+
+
+def _git_remote_identity(cwd: Path) -> Optional[str]:
+    """Return ``remote.origin.url`` for ``cwd``, or ``None`` when absent.
+
+    ``timeout=2`` keeps laggy NFS from blocking the resolver.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(cwd), "config", "--get", "remote.origin.url"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        logger.debug(f"git remote lookup failed in {cwd}: {e}")
+        return None
+    if result.returncode != 0:
+        return None
+    url = result.stdout.strip()
+    return url or None
+
+
+def _record_alias_safe(project_id: str, alias: str, kind: str) -> None:
+    """Opportunistically record an alias row; swallow DB errors.
+
+    The alias table is a nice-to-have for future migration; a DB hiccup must
+    never block identity resolution.
+    """
+    if not project_id or not alias or project_id == alias:
+        return
+    try:
+        from cli_agent_orchestrator.clients.database import record_project_alias
+
+        record_project_alias(project_id, alias, kind)
+    except Exception as e:
+        logger.debug(f"record_project_alias failed (non-fatal): {e}")
+
+
+def resolve_project_id(cwd: Optional[Path]) -> str:
+    """Resolve canonical project identity via the U6 precedence chain.
+
+    Precedence:
+        1. explicit override (``CAO_PROJECT_ID`` env → ``memory.project_id`` settings)
+        2. ``git config --get remote.origin.url`` (normalized)
+        3. ``sha256(realpath(cwd))[:12]`` — Phase 2 parity fallback
+
+    Sources 1 and 2 opportunistically record the current ``cwd_hash`` into
+    ``ProjectAliasModel`` (kind=``cwd_hash``) so legacy directories stay
+    recallable. The raw git remote URL is never persisted — it can embed
+    credentials, and the auth-stripped ``canonical`` id covers identity.
+    Alias writes never block.
+
+    Raises ``ProjectIdentityResolutionError`` when all three sources fail.
+    """
+    cwd_hash: Optional[str] = None
+    if cwd is not None:
+        try:
+            cwd_hash = hashlib.sha256(os.path.realpath(str(cwd)).encode()).hexdigest()[:12]
+        except Exception as e:
+            logger.debug(f"cwd-hash derivation failed for {cwd}: {e}")
+
+    override = _read_project_id_override()
+    if override:
+        if cwd_hash and override != cwd_hash:
+            _record_alias_safe(override, cwd_hash, "cwd_hash")
+        return override
+
+    if cwd is not None:
+        remote_url = _git_remote_identity(cwd)
+        if remote_url:
+            canonical = _normalize_git_remote(remote_url)
+            if cwd_hash and canonical != cwd_hash:
+                _record_alias_safe(canonical, cwd_hash, "cwd_hash")
+            # Deliberately do NOT persist the raw remote URL as an alias: git
+            # remotes can embed credentials (https://user:token@host/...), and
+            # nothing reads a ``git_remote`` row back — the cwd-hash alias
+            # already covers legacy-dir lookup. ``canonical`` is auth-stripped
+            # by ``_normalize_git_remote``, so the returned id is safe.
+            return canonical
+
+    if cwd_hash:
+        return cwd_hash
+
+    raise ProjectIdentityResolutionError(
+        "Cannot resolve project identity: no override, no git remote, and no cwd provided"
+    )
 
 
 class MemoryService:
@@ -155,10 +352,11 @@ class MemoryService:
 
         if scope == MemoryScope.PROJECT.value:
             cwd = ctx.get("cwd") or ctx.get("working_directory")
-            if not cwd:
+            cwd_path = Path(cwd) if cwd else None
+            try:
+                return resolve_project_id(cwd_path)
+            except ProjectIdentityResolutionError:
                 return None
-            real = os.path.realpath(cwd)
-            return hashlib.sha256(real.encode()).hexdigest()[:12]
 
         if scope == MemoryScope.SESSION.value:
             raw = ctx.get("session_name") or ctx.get("session")
@@ -179,6 +377,49 @@ class MemoryService:
         sanitized = re.sub(r"[^a-zA-Z0-9\-_]", "", value)
         sanitized = re.sub(r"-+", "-", sanitized).strip("-_")
         return sanitized or "unknown"
+
+    # -------------------------------------------------------------------------
+    # Storage migration (Phase 2.5 U6)
+    # -------------------------------------------------------------------------
+
+    def plan_project_dir_migration(self, canonical_id: str, alias: str) -> dict:
+        """Describe (without mutating) a migration from ``alias/`` to ``canonical_id/``.
+
+        Returns a dict with ``dry_run`` (always True), ``canonical_id``, ``alias``,
+        ``source_exists``, ``destination_exists``, ``action`` (``"none"``,
+        ``"rename"``, ``"merge"``, ``"conflict"``), and ``files``.
+        """
+        source = self._get_project_dir(MemoryScope.PROJECT.value, alias)
+        dest = self._get_project_dir(MemoryScope.PROJECT.value, canonical_id)
+        source_exists = source.exists() and source.is_dir()
+        dest_exists = dest.exists() and dest.is_dir()
+        files: list[str] = []
+        if source_exists:
+            for p in sorted(source.rglob("*")):
+                if p.is_file():
+                    try:
+                        files.append(str(p.relative_to(source)))
+                    except ValueError:
+                        continue
+        if not source_exists:
+            action = "none"
+        elif canonical_id == alias:
+            action = "none"
+        elif not dest_exists:
+            action = "rename"
+        elif files:
+            action = "merge"
+        else:
+            action = "conflict"
+        return {
+            "dry_run": True,
+            "canonical_id": canonical_id,
+            "alias": alias,
+            "source_exists": source_exists,
+            "destination_exists": dest_exists,
+            "action": action,
+            "files": files,
+        }
 
     # -------------------------------------------------------------------------
     # Key generation
@@ -279,7 +520,13 @@ class MemoryService:
 
         Declared async for compatibility with async callers (MCP server, FastAPI).
         File I/O is synchronous; a future improvement would use aiofiles.
+
+        Raises ``MemoryDisabledError`` when ``memory.enabled`` is False
+        (U5 / SC-6) — no filesystem or SQLite writes happen.
         """
+        if not _is_memory_enabled():
+            raise MemoryDisabledError(MEMORY_DISABLED_MESSAGE)
+
         # Validate
         MemoryScope(scope)
         MemoryType(memory_type)
@@ -558,7 +805,12 @@ class MemoryService:
           - ``metadata``: substring match against key/tags/content via index.md walk.
           - ``bm25``: BM25 ranking over wiki bodies (content-aware).
           - ``hybrid``: metadata results first, then BM25 fills with what metadata missed.
+
+        Returns ``[]`` when ``memory.enabled`` is False (U5 / SC-6).
         """
+        if not _is_memory_enabled():
+            return []
+
         if search_mode not in VALID_SEARCH_MODES:
             raise ValueError(
                 f"Invalid search_mode {search_mode!r}; expected one of {VALID_SEARCH_MODES}"
@@ -853,6 +1105,21 @@ class MemoryService:
                 project_dir = self.base_dir / project_scope_id
                 if project_dir.exists() and project_dir not in dirs:
                     dirs.append(project_dir)
+                # Also include legacy cwd-hash dirs recorded as aliases so
+                # pre-U6 memories survive the canonical-id transition.
+                try:
+                    from cli_agent_orchestrator.clients.database import (
+                        list_aliases_for_project,
+                    )
+
+                    for alias in list_aliases_for_project(project_scope_id):
+                        if alias.get("kind") != "cwd_hash":
+                            continue
+                        alias_dir = self.base_dir / alias["alias"]
+                        if alias_dir.exists() and alias_dir not in dirs:
+                            dirs.append(alias_dir)
+                except Exception as e:
+                    logger.debug(f"alias dir enumeration failed: {e}")
         # Without context and scan_all=False, only global is safe (agent/MCP context).
 
         return dirs
@@ -976,7 +1243,13 @@ class MemoryService:
 
         If scope_id is provided directly it is used as-is (for cleanup).
         Otherwise it is resolved from terminal_context.
+
+        Raises ``MemoryDisabledError`` when ``memory.enabled`` is False
+        (U5 / SC-6) — no filesystem or SQLite writes happen.
         """
+        if not _is_memory_enabled():
+            raise MemoryDisabledError(MEMORY_DISABLED_MESSAGE)
+
         key = self._sanitize_key(key)
         if scope_id is None:
             scope_id = self.resolve_scope_id(scope, terminal_context)
@@ -1020,58 +1293,89 @@ class MemoryService:
     ) -> str:
         """Build the memory context block for terminal injection.
 
-        Scope precedence: session > project > global.
-        Fills up to budget_chars, dropping oldest entries first if over budget.
+        Scope precedence: session > project > global (preserved in output).
+
+        Each scope is independently capped at ``MEMORY_MAX_PER_SCOPE`` entries
+        and at ``min(MEMORY_SCOPE_BUDGET_CHARS, budget_chars // n_scopes)``
+        characters. Unused budget from an empty scope is NOT reallocated to
+        other scopes (keeps cache-friendly scope boundaries intact).
+
+        Returns ``""`` when ``memory.enabled`` is False (U5 / SC-6) — never
+        reads index.md or wiki files.
         """
-        # We need terminal context to resolve scopes. Import here to avoid circular imports.
+        if not _is_memory_enabled():
+            return ""
+
         terminal_context = self._get_terminal_context(terminal_id)
         if not terminal_context:
             return ""
 
-        # Collect memories in precedence order
-        all_memories: list[Memory] = []
         scopes_in_order = [
             MemoryScope.SESSION.value,
             MemoryScope.PROJECT.value,
             MemoryScope.GLOBAL.value,
         ]
 
+        scope_char_cap = min(
+            MEMORY_SCOPE_BUDGET_CHARS,
+            max(0, budget_chars // len(scopes_in_order)),
+        )
+
+        lines: list[str] = []
+
         for scope_val in scopes_in_order:
             scope_id = self.resolve_scope_id(scope_val, terminal_context)
             project_dir = self._get_project_dir(scope_val, scope_id)
-            index_path = project_dir / "wiki" / "index.md"
-
+            wiki_dir = project_dir / "wiki"
+            wiki_resolved = wiki_dir.resolve()
+            index_path = wiki_dir / "index.md"
             if not index_path.exists():
                 continue
 
-            entries = self._parse_index(index_path)
-            for entry in entries:
-                if entry["scope"] != scope_val:
+            scope_entries = []
+            for e in self._parse_index(index_path):
+                if e["scope"] != scope_val:
                     continue
-                if scope_val != MemoryScope.GLOBAL.value and entry.get("scope_id") != scope_id:
+                # Session/agent entries embed scope_id in the wiki path and
+                # share index.md with global, so the scope_id must match the
+                # caller's. Project entries already live in a per-project
+                # directory and global has no scope_id by design.
+                if scope_val in (MemoryScope.SESSION.value, MemoryScope.AGENT.value):
+                    if e.get("scope_id") != scope_id:
+                        continue
+                scope_entries.append(e)
+            scope_entries.sort(key=lambda e: e.get("updated_at", ""), reverse=True)
+
+            scope_memories: list[Memory] = []
+            for entry in scope_entries:
+                if len(scope_memories) >= MEMORY_MAX_PER_SCOPE:
+                    break
+                wiki_file = wiki_dir / entry["relative_path"]
+                resolved_wiki = wiki_file.resolve()
+                # Guard against a crafted/corrupted index entry (e.g.
+                # ``../<other-project>/wiki/...``) escaping this scope's wiki
+                # directory and leaking another project's memory. Validate
+                # against the per-scope wiki dir, not the global memory base.
+                if not str(resolved_wiki).startswith(str(wiki_resolved) + os.sep):
+                    logger.warning(
+                        f"Path traversal in index entry rejected: {entry.get('relative_path')}"
+                    )
                     continue
-                wiki_file = project_dir / "wiki" / entry["relative_path"]
-                if not wiki_file.exists():
+                if not resolved_wiki.exists():
                     continue
-                file_content = wiki_file.read_text(encoding="utf-8")
-                memory = self._parse_wiki_file(wiki_file, file_content, entry)
+                file_content = resolved_wiki.read_text(encoding="utf-8")
+                memory = self._parse_wiki_file(resolved_wiki, file_content, entry)
                 if memory:
-                    all_memories.append(memory)
+                    scope_memories.append(memory)
 
-        if not all_memories:
-            return ""
-
-        # Build context block within budget
-        lines: list[str] = []
-        used_chars = 0
-
-        for mem in all_memories:
-            line = f"- [{mem.scope}] {mem.key}: {mem.content}"
-            line_len = len(line)
-            if used_chars + line_len > budget_chars:
-                break
-            lines.append(line)
-            used_chars += line_len
+            scope_used_chars = 0
+            for mem in scope_memories:
+                line = f"- [{mem.scope}] {mem.key}: {mem.content}"
+                line_len = len(line) + 1
+                if scope_used_chars + line_len > scope_char_cap:
+                    break
+                lines.append(line)
+                scope_used_chars += line_len
 
         if not lines:
             return ""
@@ -1115,6 +1419,8 @@ class MemoryService:
         fall back to the deterministic Phase 1 path so injection never blocks
         the worker agent.
         """
+        if not _is_memory_enabled():
+            return ""
         try:
             ctx = self._get_terminal_context(terminal_id)
             session_name = ctx.get("session_name") if ctx else None

@@ -213,6 +213,13 @@ WS_ALLOWED_CLIENTS = [
 # Base directory for all memory wiki files
 MEMORY_BASE_DIR = CAO_HOME_DIR / "memory"
 
+# Per-scope injection caps (Phase 2.5 U2). Each scope (session, project,
+# global) is independently capped so one scope cannot monopolize the
+# injection budget. ``MEMORY_MAX_PER_SCOPE`` bounds entry count;
+# ``MEMORY_SCOPE_BUDGET_CHARS`` bounds character count per scope.
+MEMORY_MAX_PER_SCOPE = 10
+MEMORY_SCOPE_BUDGET_CHARS = 1000
+
 # =============================================================================
 # Tool Restriction Configuration
 # =============================================================================

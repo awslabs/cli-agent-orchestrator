@@ -599,8 +599,69 @@ class TestInitDb:
     """Tests for init_db function."""
 
     @patch("cli_agent_orchestrator.clients.database.Base")
-    def test_init_db(self, mock_base):
+    @patch("cli_agent_orchestrator.clients.database._migrate_project_aliases_schema")
+    def test_init_db(self, mock_alias_migrate, mock_base):
         """Test database initialization."""
         init_db()
 
         mock_base.metadata.create_all.assert_called_once()
+
+
+class TestProjectAliasMigration:
+    """Tests for the project_aliases alias-only primary-key migration."""
+
+    def test_legacy_composite_pk_table_is_rebuilt(self, tmp_path, monkeypatch):
+        """A legacy table with composite PK (project_id, alias) is dropped."""
+        import sqlite3
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        db_file = tmp_path / "legacy.db"
+        with sqlite3.connect(str(db_file)) as conn:
+            conn.execute(
+                "CREATE TABLE project_aliases ("
+                "project_id TEXT NOT NULL, alias TEXT NOT NULL, kind TEXT NOT NULL, "
+                "created_at TEXT, PRIMARY KEY (project_id, alias))"
+            )
+            conn.execute("INSERT INTO project_aliases VALUES ('p1', 'a1', 'cwd_hash', NULL)")
+            conn.commit()
+
+        monkeypatch.setattr(db_mod, "DATABASE_FILE", db_file, raising=False)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.constants.DATABASE_FILE", db_file, raising=False
+        )
+
+        db_mod._migrate_project_aliases_schema()
+
+        with sqlite3.connect(str(db_file)) as conn:
+            exists = conn.execute(
+                "SELECT name FROM sqlite_master " "WHERE type='table' AND name='project_aliases'"
+            ).fetchone()
+        assert exists is None, "legacy table should be dropped for create_all to rebuild"
+
+    def test_alias_only_pk_table_is_left_intact(self, tmp_path, monkeypatch):
+        """A table already keyed on alias alone is not touched."""
+        import sqlite3
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        db_file = tmp_path / "current.db"
+        with sqlite3.connect(str(db_file)) as conn:
+            conn.execute(
+                "CREATE TABLE project_aliases ("
+                "alias TEXT PRIMARY KEY, project_id TEXT NOT NULL, kind TEXT NOT NULL, "
+                "created_at TEXT)"
+            )
+            conn.execute("INSERT INTO project_aliases VALUES ('a1', 'p1', 'cwd_hash', NULL)")
+            conn.commit()
+
+        monkeypatch.setattr(db_mod, "DATABASE_FILE", db_file, raising=False)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.constants.DATABASE_FILE", db_file, raising=False
+        )
+
+        db_mod._migrate_project_aliases_schema()
+
+        with sqlite3.connect(str(db_file)) as conn:
+            rows = conn.execute("SELECT alias, project_id FROM project_aliases").fetchall()
+        assert rows == [("a1", "p1")], "current-schema table must be left intact"

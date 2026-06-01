@@ -14,6 +14,10 @@ from cli_agent_orchestrator.constants import API_BASE_URL, DEFAULT_PROVIDER, MCP
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.services.memory_service import (
+    MEMORY_DISABLED_MESSAGE,
+    MemoryDisabledError,
+)
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 from cli_agent_orchestrator.utils.terminal import generate_session_name, wait_until_terminal_status
 
@@ -855,6 +859,8 @@ async def memory_store(
             "action": memory.action
             or ("updated" if memory.created_at != memory.updated_at else "created"),
         }
+    except MemoryDisabledError as e:
+        return {"success": False, "disabled": True, "error": str(e)}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -889,6 +895,15 @@ async def memory_recall(
     Use this to check if relevant knowledge already exists before asking the user.
     """
     from cli_agent_orchestrator.services.memory_service import MemoryService
+    from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+    if not is_memory_enabled():
+        return {
+            "success": False,
+            "disabled": True,
+            "error": MEMORY_DISABLED_MESSAGE,
+            "memories": [],
+        }
 
     try:
         service = MemoryService()
@@ -916,6 +931,8 @@ async def memory_recall(
                 for m in memories
             ],
         }
+    except MemoryDisabledError as e:
+        return {"success": False, "disabled": True, "error": str(e)}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -948,6 +965,8 @@ async def memory_forget(
             "key": key,
             "scope": scope,
         }
+    except MemoryDisabledError as e:
+        return {"success": False, "disabled": True, "error": str(e)}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
