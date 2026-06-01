@@ -181,8 +181,10 @@ def resolve_project_id(cwd: Optional[Path]) -> str:
         3. ``sha256(realpath(cwd))[:12]`` — Phase 2 parity fallback
 
     Sources 1 and 2 opportunistically record the current ``cwd_hash`` into
-    ``ProjectAliasModel`` (kind=``cwd_hash``). Source 2 also records the raw
-    git URL (kind=``git_remote``). Alias writes never block.
+    ``ProjectAliasModel`` (kind=``cwd_hash``) so legacy directories stay
+    recallable. The raw git remote URL is never persisted — it can embed
+    credentials, and the auth-stripped ``canonical`` id covers identity.
+    Alias writes never block.
 
     Raises ``ProjectIdentityResolutionError`` when all three sources fail.
     """
@@ -205,7 +207,11 @@ def resolve_project_id(cwd: Optional[Path]) -> str:
             canonical = _normalize_git_remote(remote_url)
             if cwd_hash and canonical != cwd_hash:
                 _record_alias_safe(canonical, cwd_hash, "cwd_hash")
-            _record_alias_safe(canonical, remote_url, "git_remote")
+            # Deliberately do NOT persist the raw remote URL as an alias: git
+            # remotes can embed credentials (https://user:token@host/...), and
+            # nothing reads a ``git_remote`` row back — the cwd-hash alias
+            # already covers legacy-dir lookup. ``canonical`` is auth-stripped
+            # by ``_normalize_git_remote``, so the returned id is safe.
             return canonical
 
     if cwd_hash:

@@ -129,6 +129,40 @@ def test_ac1_same_git_remote_at_two_paths_resolves_same_project_id(
     assert get_project_id_by_alias(wt_hash) == id_main
 
 
+def test_credentialed_remote_url_is_not_persisted_as_alias(
+    tmp_path: Path, isolated_db: Path, clear_overrides: None
+) -> None:
+    """A remote URL with embedded credentials must never reach the alias table.
+
+    Git remotes commonly look like ``https://user:token@host/org/repo.git``.
+    Resolving project identity records aliases, but the raw URL (and therefore
+    the secret) must not be persisted — only the auth-stripped canonical id
+    and the cwd-hash. See Copilot PR #262 HIGH finding.
+    """
+    secret = "s3cr3t-token"
+    remote = f"https://alice:{secret}@github.com/acme/widgets.git"
+    repo = tmp_path / "repo"
+    _init_repo(repo, remote)
+
+    svc = _make_svc(tmp_path / "mem", isolated_db)
+    canonical = svc.resolve_scope_id("project", {"cwd": str(repo)})
+
+    # Canonical id is auth-stripped.
+    assert canonical == "github-com-acme-widgets"
+    assert secret not in canonical
+
+    # No alias row anywhere holds the raw URL, the secret, or kind=git_remote.
+    aliases = list_aliases_for_project(canonical)
+    assert all(a["kind"] != "git_remote" for a in aliases), "git_remote alias must not be recorded"
+    for a in aliases:
+        assert secret not in a["alias"], "credential leaked into alias value"
+        assert remote not in a["alias"], "raw remote URL leaked into alias value"
+
+    # Only the cwd-hash alias is recorded, and it still resolves correctly.
+    cwd_hash = hashlib.sha256(os.path.realpath(repo).encode()).hexdigest()[:12]
+    assert get_project_id_by_alias(cwd_hash) == canonical
+
+
 # ---------------------------------------------------------------------------
 # AC2 — rename keeps memories recallable
 # ---------------------------------------------------------------------------
