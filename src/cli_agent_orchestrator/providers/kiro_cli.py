@@ -86,10 +86,7 @@ TUI_PROCESSING_PATTERN = r"Kiro is working"
 # is interactive, so a paste sent during this window is absorbed by the
 # pre-prompt boot screen and silently dropped (observed during e2e
 # allowed-tools tests).
-TUI_INITIALIZING_PATTERN = (
-    r"Initializing\.\.\.|\d+ of \d+ mcp servers initialized\."
-    r"\s*ctrl-c to start chatting now"
-)
+TUI_INITIALIZING_PATTERN = r"Initializing\.\.\.|\d+ of \d+ mcp servers initialized\.\s*ctrl-c to start chatting now"  # noqa: E501
 
 # TUI permission prompt: shown instead of legacy [y/n/t] format.
 # Requires all three options together to avoid false positives on "Yes"/"No" in agent output.
