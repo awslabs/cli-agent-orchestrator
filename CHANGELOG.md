@@ -97,6 +97,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - bump python-multipart from 0.0.26 to 0.0.27 (#232)
 
+- bump vitest from 3.2.4 to 4.1.0 in /web (#267)
+
 
 ## [2.1.1] - 2026-04-28
 
