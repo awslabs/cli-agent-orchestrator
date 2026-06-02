@@ -156,9 +156,16 @@ class ProviderManager:
             metadata["tmux_window"],
             metadata["agent_profile"],
         )
-        # Restore shell_command baseline from DB so get_status() can detect kiro exit
+        # Restore shell_command baseline from DB so get_status() can detect kiro exit.
+        # The terminal already exists in the DB, so its CLI has long since
+        # launched — mark the provider as initialized so KiroCliProvider's
+        # post-launch checks (Check 3) trust the restored baseline. Without
+        # this, a restored terminal that has returned to the shell would be
+        # misreported as PROCESSING indefinitely.
         if metadata.get("shell_command"):
             provider.shell_baseline = metadata["shell_command"]
+            if hasattr(provider, "_initialized"):
+                provider._initialized = True
         logger.info(f"Created provider on-demand for terminal {terminal_id}")
         return provider
 
