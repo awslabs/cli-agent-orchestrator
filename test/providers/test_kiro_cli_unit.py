@@ -1477,6 +1477,30 @@ class TestKiroCliTuiMode:
         # Must require three dots to avoid matching the word alone
         assert not re.search(TUI_INITIALIZING_PATTERN, "Initializing")
         assert not re.search(TUI_INITIALIZING_PATTERN, "Initialized")
+        # MCP-server init line — Kiro shows this before the prompt is
+        # interactive, and pastes during this window get dropped.
+        assert re.search(
+            TUI_INITIALIZING_PATTERN,
+            "0 of 1 mcp servers initialized. ctrl-c to start chatting now",
+        )
+        assert re.search(
+            TUI_INITIALIZING_PATTERN,
+            "2 of 5 mcp servers initialized. ctrl-c to start chatting now",
+        )
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_mcp_server_init_yields_processing(self, mock_tmux):
+        """Kiro shows the idle-prompt placeholder before MCP servers finish
+        loading. A paste sent during this window is silently absorbed by
+        the boot screen, so we must report PROCESSING until init completes.
+        """
+        mock_tmux.get_history.return_value = (
+            "0 of 1 mcp servers initialized. ctrl-c to start chatting now\n"
+            "────────────────────────────────────────────────────\n"
+            "[developer] !> Need help with features or setup? Use /help\n"
+        )
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        assert provider.get_status() == TerminalStatus.PROCESSING
 
     def test_tui_permission_pattern(self):
         """Test TUI permission pattern matches expected formats."""
@@ -1546,16 +1570,42 @@ class TestKiroCliCheck3ShellBaseline:
 
     @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
     def test_check3_shell_match_returns_idle(self, mock_tmux):
-        """No idle prompt + current command matches shell_baseline → IDLE."""
+        """No idle prompt + current command matches shell_baseline → IDLE.
+
+        Requires `_initialized=True`: the shell-baseline IDLE rule is only
+        trustworthy after kiro-cli has launched. Pre-launch the pane's
+        current command is still the shell, so honoring it would let
+        pastes leak into Kiro's boot screen.
+        """
         mock_tmux.get_history.return_value = "Some processing output without idle prompt"
         mock_tmux.get_pane_current_command.return_value = "bash"
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         provider.shell_baseline = "bash"
+        provider._initialized = True
         status = provider.get_status()
 
         assert status == TerminalStatus.IDLE
         mock_tmux.get_pane_current_command.assert_called_once_with("test-session", "window-0")
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
+    def test_check3_pre_init_shell_match_returns_processing(self, mock_tmux):
+        """Pre-init (`_initialized=False`) + current command matches shell_baseline → PROCESSING.
+
+        Between send_keys('kiro-cli chat ...') and the moment kiro exec's,
+        the pane's current command still matches the shell_baseline. We
+        must report PROCESSING in this window so callers don't paste into
+        Kiro's pre-interactive boot screen.
+        """
+        mock_tmux.get_history.return_value = "Some processing output without idle prompt"
+
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        provider.shell_baseline = "bash"
+        # _initialized defaults to False
+        status = provider.get_status()
+
+        assert status == TerminalStatus.PROCESSING
+        mock_tmux.get_pane_current_command.assert_not_called()
 
     @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
     def test_check3_shell_mismatch_returns_processing(self, mock_tmux):
