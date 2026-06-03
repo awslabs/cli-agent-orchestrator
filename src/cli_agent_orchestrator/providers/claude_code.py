@@ -8,8 +8,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status

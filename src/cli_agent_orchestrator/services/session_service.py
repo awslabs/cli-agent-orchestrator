@@ -22,11 +22,11 @@ Session Lifecycle:
 import logging
 from typing import Dict, List
 
+from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     delete_terminals_by_session,
     list_terminals_by_session,
 )
-from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import SESSION_PREFIX
 from cli_agent_orchestrator.models.terminal import Terminal
 from cli_agent_orchestrator.plugins import (
