@@ -10,6 +10,7 @@ from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
 from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
 from cli_agent_orchestrator.providers.gemini_cli import GeminiCliProvider
+from cli_agent_orchestrator.providers.hermes import HermesProvider
 from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
 from cli_agent_orchestrator.providers.opencode_cli import OpenCodeCliProvider
@@ -111,6 +112,15 @@ class ProviderManager:
                     agent_profile,
                     allowed_tools,
                     model=model,
+                )
+            elif provider_type == ProviderType.HERMES.value:
+                provider = HermesProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    skill_prompt=skill_prompt,
                 )
             else:
                 raise ValueError(f"Unknown provider type: {provider_type}")

@@ -66,7 +66,7 @@ from cli_agent_orchestrator.services.cleanup_service import (
 )
 from cli_agent_orchestrator.services.inbox_service import LogFileHandler
 from cli_agent_orchestrator.services.install_service import InstallResult, install_agent
-from cli_agent_orchestrator.services.terminal_service import OutputMode
+from cli_agent_orchestrator.services.terminal_service import OutputMode, TerminalInputBlockedError
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.logging import setup_logging
 from cli_agent_orchestrator.utils.skills import (
@@ -332,6 +332,7 @@ async def list_providers_endpoint() -> List[Dict]:
         "q_cli": "q",
         "codex": "codex",
         "gemini_cli": "gemini",
+        "hermes": "hermes",
         "kimi_cli": "kimi",
         "copilot_cli": "copilot",
         "opencode_cli": "opencode",
@@ -677,12 +678,29 @@ async def send_terminal_input(
             orchestration_type=orchestration_type,
         )
         return {"success": success}
+    except TerminalInputBlockedError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to send input: {str(e)}",
+        )
+
+
+@app.post("/terminals/{terminal_id}/key")
+async def send_terminal_key(terminal_id: TerminalId, key: str) -> Dict:
+    """Send a tmux special key to a terminal."""
+    try:
+        success = terminal_service.send_special_key(terminal_id, key)
+        return {"success": success}
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to send key: {str(e)}",
         )
 
 

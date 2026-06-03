@@ -782,6 +782,24 @@ class TestSendTerminalInput:
         assert response.status_code == 404
         assert "Terminal not found" in response.json()["detail"]
 
+    def test_send_input_blocked_returns_conflict(self, client):
+        """POST /terminals/{id}/input returns 409 for protected interactive prompts."""
+        from cli_agent_orchestrator.services.terminal_service import TerminalInputBlockedError
+
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.TerminalInputBlockedError = TerminalInputBlockedError
+            mock_svc.send_input.side_effect = TerminalInputBlockedError(
+                "Terminal abcd1234 is waiting for a user answer"
+            )
+
+            response = client.post(
+                "/terminals/abcd1234/input",
+                params={"message": "new task", "orchestration_type": "assign"},
+            )
+
+        assert response.status_code == 409
+        assert "waiting for a user answer" in response.json()["detail"]
+
     def test_send_input_server_error(self, client):
         """POST /terminals/{id}/input returns 500 on error."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:

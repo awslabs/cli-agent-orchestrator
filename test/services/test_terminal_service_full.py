@@ -9,6 +9,7 @@ from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.terminal_service import (
     OutputMode,
+    TerminalInputBlockedError,
     create_terminal,
     delete_terminal,
     get_output,
@@ -494,6 +495,57 @@ class TestSendInput:
             "developer-abcd",
             "test message",
             enter_count=2,
+            force_bracketed_paste=True,
+        )
+        mock_update.assert_called_once_with("test1234")
+
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_input_blocks_assign_when_provider_waits_for_user_answer(
+        self, mock_get_metadata, mock_tmux, mock_pm, mock_update
+    ):
+        """Orchestrated task text must not answer an active provider prompt."""
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_provider = mock_pm.get_provider.return_value
+        mock_provider.blocks_orchestrated_input_while_waiting_user_answer = True
+        mock_provider.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
+
+        with pytest.raises(TerminalInputBlockedError, match="waiting for a user answer"):
+            send_input("test1234", "new task", orchestration_type="assign")
+
+        mock_tmux.send_keys.assert_not_called()
+        mock_update.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_input_allows_manual_answer_when_provider_waits_for_user_answer(
+        self, mock_get_metadata, mock_tmux, mock_pm, mock_update
+    ):
+        """Manual input can still answer clarify/approval prompts."""
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_provider = mock_pm.get_provider.return_value
+        mock_provider.blocks_orchestrated_input_while_waiting_user_answer = True
+        mock_provider.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
+        mock_provider.paste_enter_count = 1
+
+        result = send_input("test1234", "1")
+
+        assert result is True
+        mock_tmux.send_keys.assert_called_once_with(
+            "cao-session",
+            "developer-abcd",
+            "1",
+            enter_count=1,
             force_bracketed_paste=True,
         )
         mock_update.assert_called_once_with("test1234")

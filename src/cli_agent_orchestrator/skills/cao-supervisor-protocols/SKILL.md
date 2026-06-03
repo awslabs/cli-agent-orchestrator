@@ -16,6 +16,7 @@ From `cao-mcp-server`, supervisors orchestrate work with:
 - `assign(agent_profile, message)` for asynchronous work that returns immediately
 - `handoff(agent_profile, message)` for synchronous work that blocks until the worker finishes
 - `send_message(receiver_id, message)` for direct messages to an existing terminal
+- `answer_user_prompt(terminal_id, answer)` for answering an active approval or clarify prompt in an existing terminal
 
 Your own terminal ID is available in the `CAO_TERMINAL_ID` environment variable. Use it when you need workers to send results back to you.
 
@@ -67,6 +68,10 @@ Examples:
 - Send a concise status update to a collaborating supervisor.
 
 When sending direct messages, include enough context that the receiver can act without re-reading the full original task.
+
+## Interactive Worker Prompts
+
+Some providers can stop on approval prompts or clarify pickers. If a worker terminal is waiting for a user answer, do not use `assign`, `handoff`, or `send_message` to answer it. Use `answer_user_prompt(terminal_id, answer)` with the exact selection or text to submit, such as `1`, `o`, or a custom answer.
 
 ## Practical Workflow
 
