@@ -31,7 +31,7 @@ IDLE_PROMPT_TAIL_LINES = 5
 IDLE_PROMPT_PATTERN_LOG = r"\? for shortcuts"
 # Match assistant response start: "assistant:/codex:/agent:" (label style from synthetic
 # test fixtures) or "•" bullet point (real Codex interactive output format).
-ASSISTANT_PREFIX_PATTERN = r"^(?:(?:assistant|codex|agent)\s*:|\s*•)"
+ASSISTANT_PREFIX_PATTERN = r"^(?:(?:assistant|codex|agent)\s*:|[^\S\n]*•)"
 # Match user input: "You ..." (label style) or "› text" (Codex interactive prompt).
 # The "›[^\S\n]*\S" alternative requires a non-whitespace character on the same line
 # to distinguish user input ("› what is your role?") from the empty idle prompt ("› ").
@@ -50,7 +50,15 @@ ERROR_PATTERN = r"^(?:Error:|ERROR:|Traceback \(most recent call last\):|panic:)
 # Used to detect when the bottom lines contain TUI chrome rather than user input.
 # v0.110 and earlier: "? for shortcuts" and "N% context left"
 # v0.111+: "model · N% left · path" (PR #13202 restored draft footer hints)
-TUI_FOOTER_PATTERN = r"(?:\?\s+for shortcuts|context left|\d+%\s+left)"
+# Current Codex builds may also render "gpt-5.5 xhigh · /path" without a
+# context percentage.
+TUI_FOOTER_PATTERN = (
+    r"^\s*(?:"
+    r"\?\s+for shortcuts(?:.*(?:\d+%\s+)?context left)?"
+    r"|\d+%\s+context left"
+    r"|(?:gpt|o)\S*(?:\s+[\w.-]+)*\s+·\s+(?:(?:\d+%\s+left)\s+·\s+)?(?:~|/).*"
+    r")\s*$"
+)
 # Codex TUI progress spinner: "• Working (0s • esc to interrupt)",
 # "• Thinking (2s ...)", "• Starting script creation (10s • esc to interrupt)".
 # The prefix text varies but the "(Ns • esc to interrupt)" format is consistent.
@@ -58,6 +66,16 @@ TUI_FOOTER_PATTERN = r"(?:\?\s+for shortcuts|context left|\d+%\s+left)"
 # Must be checked before COMPLETED to avoid false positives (the • matches
 # ASSISTANT_PREFIX_PATTERN and the TUI footer › matches idle prompt).
 TUI_PROGRESS_PATTERN = r"•.*\(\d+s\s*•\s*esc to interrupt\)"
+
+# Codex's TUI also renders tool activity as bullet rows. These are not final
+# assistant responses and must not complete handoff or become extracted output.
+TUI_ACTIVITY_PATTERN = (
+    r"^•\s+(?:"
+    r"Explored|Ran|Read|Edited|Viewed|Searched|Listed|Opened|Calling|Called|"
+    r"Working|Thinking|Updated(?:\s+Plan)?|Applied|Patched|Wrote|Created|"
+    r"Deleted|Moved|Copied"
+    r")\b.*$"
+)
 
 # Workspace trust/approval prompt shown when Codex opens a new directory
 TRUST_PROMPT_PATTERN = r"allow Codex to work in this folder"
@@ -102,6 +120,65 @@ def _compute_tui_footer_cutoff(all_lines: list) -> int:
             break
 
     return len("\n".join(all_lines[:footer_start_idx]))
+
+
+def _assistant_response_matches(text: str) -> list[re.Match]:
+    """Return assistant markers that are response starts, not TUI activity rows."""
+    matches = []
+    for match in re.finditer(ASSISTANT_PREFIX_PATTERN, text, re.IGNORECASE | re.MULTILINE):
+        line_end = text.find("\n", match.start())
+        if line_end == -1:
+            line_end = len(text)
+        line = text[match.start() : line_end]
+        if re.match(TUI_PROGRESS_PATTERN, line):
+            continue
+        if _is_tui_activity_match(text, match.start()):
+            continue
+        matches.append(match)
+    return matches
+
+
+def _is_tui_activity_match(text: str, start_pos: int) -> bool:
+    """Return whether a bullet at start_pos is a Codex TUI activity row.
+
+    Activity rows are top-level bullets such as "• Ran pwd" followed by a
+    Codex-rendered tree/details line ("  └ ..."). Requiring the details line
+    prevents normal answer bullets like "  • Ran tests" or "• Ran tests
+    successfully" from being filtered out.
+    """
+    line_end = text.find("\n", start_pos)
+    if line_end == -1:
+        line_end = len(text)
+    line = text[start_pos:line_end]
+    if not re.match(TUI_ACTIVITY_PATTERN, line):
+        return False
+
+    rest = text[line_end + 1 :]
+    for next_line in rest.splitlines():
+        if not next_line.strip():
+            continue
+        return bool(re.match(r"[^\S\n]+└\s+", next_line))
+
+    return False
+
+
+def _tui_activity_matches(text: str) -> list[re.Match]:
+    """Return TUI activity row matches, excluding normal answer bullets."""
+    return [
+        match
+        for match in re.finditer(TUI_ACTIVITY_PATTERN, text, re.MULTILINE)
+        if _is_tui_activity_match(text, match.start())
+    ]
+
+
+def _last_tui_activity_or_progress_end(text: str) -> int:
+    """Return the end offset of the last Codex TUI activity/progress row."""
+    last_end = 0
+    for match in re.finditer(TUI_PROGRESS_PATTERN, text, re.MULTILINE):
+        last_end = max(last_end, match.end())
+    for match in _tui_activity_matches(text):
+        last_end = max(last_end, match.end())
+    return last_end
 
 
 class ProviderError(Exception):
@@ -242,7 +319,13 @@ class CodexProvider(BaseProvider):
             if re.search(TRUST_PROMPT_PATTERN, clean_output):
                 logger.info("Codex workspace trust prompt detected, auto-accepting")
                 session = tmux_client.server.sessions.get(session_name=self.session_name)
+                if session is None:
+                    logger.warning("Codex trust prompt detected but tmux session was not found")
+                    return
                 window = session.windows.get(window_name=self.window_name)
+                if window is None:
+                    logger.warning("Codex trust prompt detected but tmux window was not found")
+                    return
                 pane = window.active_pane
                 if pane:
                     pane.send_keys("", enter=True)
@@ -320,13 +403,18 @@ class CodexProvider(BaseProvider):
             if match.start() < cutoff_pos:
                 last_user = match
 
-        output_after_last_user = clean_output[last_user.start() :] if last_user else clean_output
+        analysis_output = clean_output[:cutoff_pos]
+        output_after_last_user = (
+            analysis_output[last_user.start() :] if last_user else analysis_output
+        )
+        assistant_matches_after_last_user = (
+            _assistant_response_matches(output_after_last_user) if last_user else []
+        )
+        last_activity_end = _last_tui_activity_or_progress_end(output_after_last_user)
         assistant_after_last_user = bool(
             last_user
-            and re.search(
-                ASSISTANT_PREFIX_PATTERN,
-                output_after_last_user,
-                re.IGNORECASE | re.MULTILINE,
+            and any(
+                match.start() >= last_activity_end for match in assistant_matches_after_last_user
             )
         )
 
@@ -369,17 +457,23 @@ class CodexProvider(BaseProvider):
             # With --no-alt-screen, the TUI footer (› hint + status bar) is always
             # rendered at the bottom, even during processing. The • in the progress
             # spinner matches ASSISTANT_PREFIX_PATTERN, causing a false COMPLETED.
-            # Detect the spinner and return PROCESSING before checking for COMPLETED.
-            if re.search(TUI_PROGRESS_PATTERN, tail_output, re.MULTILINE):
-                return TerminalStatus.PROCESSING
+            # Treat the spinner as active only when it is the newest assistant-like
+            # marker after the last user input. Codex can leave stale spinner lines
+            # in scrollback after the final answer is rendered.
+            progress_region = output_after_last_user if last_user is not None else tail_output
+            progress_matches = list(
+                re.finditer(TUI_PROGRESS_PATTERN, progress_region, re.MULTILINE)
+            )
+            if progress_matches:
+                assistant_matches = _assistant_response_matches(progress_region)
+                last_progress_start = progress_matches[-1].start()
+                last_assistant_start = assistant_matches[-1].start() if assistant_matches else -1
+                if last_assistant_start <= last_progress_start:
+                    return TerminalStatus.PROCESSING
 
             # Consider COMPLETED only if we see an assistant marker after the last user message.
             if last_user is not None:
-                if re.search(
-                    ASSISTANT_PREFIX_PATTERN,
-                    clean_output[last_user.start() :],
-                    re.IGNORECASE | re.MULTILINE,
-                ):
+                if assistant_after_last_user:
                     return TerminalStatus.COMPLETED
 
                 return TerminalStatus.IDLE
@@ -426,56 +520,71 @@ class CodexProvider(BaseProvider):
 
         if user_matches:
             last_user = user_matches[-1]
+            response_search_start = last_user.start()
+
+            # If Codex left stale TUI progress spinners in scrollback, begin
+            # searching for the final response after the latest spinner.
+            progress_matches = list(
+                re.finditer(
+                    TUI_PROGRESS_PATTERN,
+                    clean_output[response_search_start:cutoff_pos],
+                    re.MULTILINE,
+                )
+            )
+            activity_matches = list(
+                _tui_activity_matches(clean_output[response_search_start:cutoff_pos])
+            )
+            chrome_matches = progress_matches + activity_matches
+            if chrome_matches:
+                response_search_start += max(match.end() for match in chrome_matches)
 
             # Find the first assistant response marker (• or assistant:) after
             # the user message. This correctly skips multi-line user messages
             # that wrap across several lines in the Codex TUI.
-            asst_after_user = re.search(
-                ASSISTANT_PREFIX_PATTERN,
-                clean_output[last_user.start() :],
-                re.IGNORECASE | re.MULTILINE,
-            )
-            if asst_after_user:
-                response_start = last_user.start() + asst_after_user.start()
-            else:
+            response_region = clean_output[response_search_start:cutoff_pos]
+            asst_matches = _assistant_response_matches(response_region)
+            if asst_matches:
+                response_start = response_search_start + asst_matches[0].start()
+            elif not tui_footer_detected and not _tui_activity_matches(response_region):
                 # No assistant marker found; fall back to skipping one line
                 user_line_end = clean_output.find("\n", last_user.start())
                 if user_line_end == -1:
                     user_line_end = len(clean_output)
                 response_start = user_line_end + 1
-
-            # Find extraction boundary: empty idle prompt or TUI footer area.
-            # With --no-alt-screen, the TUI footer (› hint + status bar) has no
-            # empty idle prompt. Use cutoff_pos as the boundary when TUI is present.
-            idle_after = re.search(
-                IDLE_PROMPT_STRICT_PATTERN,
-                clean_output[response_start:],
-                re.MULTILINE,
-            )
-            if idle_after:
-                end_pos = response_start + idle_after.start()
-            elif tui_footer_detected:
-                end_pos = cutoff_pos
             else:
-                end_pos = len(clean_output)
+                response_start = None
 
-            response_text = clean_output[response_start:end_pos].strip()
-
-            if response_text:
-                # Strip "assistant:" prefix if present (label format)
-                response_text = re.sub(
-                    r"^(?:assistant|codex|agent)\s*:\s*",
-                    "",
-                    response_text,
-                    count=1,
-                    flags=re.IGNORECASE,
+            if response_start is not None:
+                # Find extraction boundary: empty idle prompt or TUI footer area.
+                # With --no-alt-screen, the TUI footer (› hint + status bar) has no
+                # empty idle prompt. Use cutoff_pos as the boundary when TUI is present.
+                idle_after = re.search(
+                    IDLE_PROMPT_STRICT_PATTERN,
+                    clean_output[response_start:],
+                    re.MULTILINE,
                 )
-                return response_text.strip()
+                if idle_after:
+                    end_pos = response_start + idle_after.start()
+                elif tui_footer_detected:
+                    end_pos = cutoff_pos
+                else:
+                    end_pos = len(clean_output)
+
+                response_text = clean_output[response_start:end_pos].strip()
+
+                if response_text:
+                    # Strip "assistant:" prefix if present (label format)
+                    response_text = re.sub(
+                        r"^(?:assistant|codex|agent)\s*:\s*",
+                        "",
+                        response_text,
+                        count=1,
+                        flags=re.IGNORECASE,
+                    )
+                    return response_text.strip()
 
         # Fallback: assistant marker based extraction (no user message found).
-        matches = list(
-            re.finditer(ASSISTANT_PREFIX_PATTERN, clean_output, re.IGNORECASE | re.MULTILINE)
-        )
+        matches = _assistant_response_matches(clean_output)
 
         if not matches:
             raise ValueError("No Codex response found - no assistant marker detected")

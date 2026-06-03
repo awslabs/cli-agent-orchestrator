@@ -3,9 +3,9 @@
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, cast
 
-from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.constants import AGENT_CONTEXT_DIR, CAO_HOME_DIR, LOCAL_AGENT_STORE_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -15,9 +15,9 @@ SETTINGS_FILE = CAO_HOME_DIR / "settings.json"
 _DEFAULTS = {
     "kiro_cli": str(Path.home() / ".kiro" / "agents"),
     "q_cli": str(Path.home() / ".aws" / "amazonq" / "cli-agents"),
-    "claude_code": str(Path.home() / ".aws" / "cli-agent-orchestrator" / "agent-store"),
-    "codex": str(Path.home() / ".aws" / "cli-agent-orchestrator" / "agent-store"),
-    "cao_installed": str(Path.home() / ".aws" / "cli-agent-orchestrator" / "agent-context"),
+    "claude_code": str(LOCAL_AGENT_STORE_DIR),
+    "codex": str(LOCAL_AGENT_STORE_DIR),
+    "cao_installed": str(AGENT_CONTEXT_DIR),
 }
 
 
@@ -25,7 +25,10 @@ def _load() -> Dict[str, Any]:
     """Load settings from disk."""
     if SETTINGS_FILE.exists():
         try:
-            return json.loads(SETTINGS_FILE.read_text())
+            data = json.loads(SETTINGS_FILE.read_text())
+            if isinstance(data, dict):
+                return cast(Dict[str, Any], data)
+            logger.warning("Settings file did not contain a JSON object")
         except Exception as e:
             logger.warning(f"Failed to read settings: {e}")
     return {}
@@ -124,12 +127,16 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
 def get_extra_agent_dirs() -> List[str]:
     """Get extra agent scan directories (user-added custom paths)."""
     settings = _load()
-    return settings.get("extra_agent_dirs", [])
+    extra_dirs = settings.get("extra_agent_dirs", [])
+    if not isinstance(extra_dirs, list):
+        return []
+    return [str(path) for path in extra_dirs]
 
 
 def set_extra_agent_dirs(dirs: List[str]) -> List[str]:
     """Set extra agent scan directories."""
     settings = _load()
-    settings["extra_agent_dirs"] = [d for d in dirs if d.strip()]
+    extra_dirs = [d for d in dirs if d.strip()]
+    settings["extra_agent_dirs"] = extra_dirs
     _save(settings)
-    return settings["extra_agent_dirs"]
+    return extra_dirs
