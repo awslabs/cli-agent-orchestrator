@@ -12,7 +12,6 @@ rather than crashing ``cao-server``.
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 
 from cli_agent_orchestrator.clients.database import get_terminal_metadata
@@ -128,12 +127,21 @@ class ClaudeCodeMemoryPlugin(CaoPlugin):
         if "\x00" in working_directory:
             raise ValueError("working directory contains null bytes")
 
-        base = Path(working_directory).resolve(strict=True)
+        # resolve(strict=True) raises OSError (e.g. FileNotFoundError) for an
+        # ephemeral/missing cwd. Surface it as ValueError so the caller's
+        # single ``except ValueError`` reliably catches every validation
+        # failure and honours the plugin's log-and-skip contract.
+        try:
+            base = Path(working_directory).resolve(strict=True)
+        except OSError as exc:
+            raise ValueError(f"working directory {working_directory!r} is not resolvable: {exc}")
         target = (base / CLAUDE_DIR / CLAUDE_FILENAME).resolve()
-        base_str = str(base)
-        target_str = str(target)
-        if target_str != base_str and not target_str.startswith(base_str + os.sep):
-            raise ValueError(f"target {target_str} escapes working directory {base_str}")
+        # relative_to() correctly handles the root-path case (base == "/"),
+        # which a string startswith(base + separator) check mishandles ("//").
+        try:
+            target.relative_to(base)
+        except ValueError:
+            raise ValueError(f"target {target} escapes working directory {base}")
         return target
 
     def _write_block(self, target: Path, context_block: str) -> None:

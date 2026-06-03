@@ -318,3 +318,53 @@ def test_validated_target_path_rejects_null_byte() -> None:
     plugin = ClaudeCodeMemoryPlugin()
     with pytest.raises(ValueError, match="null byte"):
         plugin._validated_target_path("/tmp/proj\x00/evil")
+
+
+def test_validated_target_path_missing_dir_raises_valueerror() -> None:
+    """A non-existent working dir must raise ValueError, not OSError.
+
+    resolve(strict=True) raises FileNotFoundError (an OSError) for a missing
+    cwd; the handler only catches ValueError, so the validator must convert
+    it. Otherwise the error escapes the plugin's log-and-skip contract.
+    """
+
+    plugin = ClaudeCodeMemoryPlugin()
+    with pytest.raises(ValueError, match="not resolvable"):
+        plugin._validated_target_path("/nonexistent-cao-dir-xyz123/sub")
+
+
+@pytest.mark.asyncio
+async def test_missing_working_dir_does_not_escape_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ephemeral/missing cwd must be logged-and-skipped, never raised.
+
+    Exercises the full handler: resolve(strict=True) on the missing dir would
+    raise FileNotFoundError; the plugin must swallow it via its ValueError
+    path rather than letting it reach PluginRegistry.dispatch.
+    """
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.get_terminal_metadata",
+        lambda terminal_id: {
+            "tmux_session": "cao-test-session",
+            "tmux_window": "developer-abcd",
+            "id": terminal_id,
+        },
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.tmux_client.get_pane_working_directory",
+        lambda session, window: "/nonexistent-cao-dir-xyz123/sub",
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.claude_code_memory.MemoryService",
+        lambda: type(
+            "F",
+            (),
+            {"get_memory_context_for_terminal": lambda self, t: "<cao-memory>X</cao-memory>"},
+        )(),
+    )
+
+    plugin = ClaudeCodeMemoryPlugin()
+    # Must not raise.
+    await plugin.on_post_create_terminal(_event())
