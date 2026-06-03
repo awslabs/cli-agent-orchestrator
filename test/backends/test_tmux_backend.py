@@ -98,8 +98,11 @@ class TestTmuxBackendDelegation:
     def test_send_keys_delegates(self, backend, mock_client):
         backend.send_keys("cao-test", "window-0", "hello", enter_count=2)
         mock_client.send_keys.assert_called_once_with(
-            "cao-test", "window-0", "hello",
-            enter_count=2, force_bracketed_paste=False,
+            "cao-test",
+            "window-0",
+            "hello",
+            enter_count=2,
+            force_bracketed_paste=False,
         )
 
     def test_send_special_key_delegates(self, backend, mock_client):
@@ -110,7 +113,11 @@ class TestTmuxBackendDelegation:
         mock_client.get_history.return_value = "output text"
         result = backend.get_history("cao-test", "window-0", tail_lines=50)
         mock_client.get_history.assert_called_once_with(
-            "cao-test", "window-0", tail_lines=50, strip_escapes=False, full_history=False,
+            "cao-test",
+            "window-0",
+            tail_lines=50,
+            strip_escapes=False,
+            full_history=False,
         )
         assert result == "output text"
 

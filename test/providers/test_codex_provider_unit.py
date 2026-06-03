@@ -452,7 +452,9 @@ class TestCodexProviderStatusDetection:
 
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     def test_get_status_processing(self, mock_tmux):
-        mock_tmux.return_value.get_history.return_value = load_fixture("codex_processing_output.txt")
+        mock_tmux.return_value.get_history.return_value = load_fixture(
+            "codex_processing_output.txt"
+        )
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         status = provider.get_status()
@@ -461,7 +463,9 @@ class TestCodexProviderStatusDetection:
 
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     def test_get_status_waiting_user_answer(self, mock_tmux):
-        mock_tmux.return_value.get_history.return_value = load_fixture("codex_permission_output.txt")
+        mock_tmux.return_value.get_history.return_value = load_fixture(
+            "codex_permission_output.txt"
+        )
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         status = provider.get_status()
@@ -494,7 +498,9 @@ class TestCodexProviderStatusDetection:
         status = provider.get_status(tail_lines=50)
 
         assert status == TerminalStatus.IDLE
-        mock_tmux.return_value.get_history.assert_called_once_with("test-session", "window-0", tail_lines=50)
+        mock_tmux.return_value.get_history.assert_called_once_with(
+            "test-session", "window-0", tail_lines=50
+        )
 
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     def test_get_status_processing_when_old_prompt_present(self, mock_tmux):
@@ -537,7 +543,9 @@ class TestCodexProviderStatusDetection:
     def test_get_status_idle_if_no_assistant_after_last_user(self, mock_tmux):
         # If there is a user message but no assistant response after it, we should not
         # treat the session as COMPLETED.
-        mock_tmux.return_value.get_history.return_value = "assistant: Welcome\n" "You Do the thing\n" "\n" "❯ \n"
+        mock_tmux.return_value.get_history.return_value = (
+            "assistant: Welcome\n" "You Do the thing\n" "\n" "❯ \n"
+        )
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         status = provider.get_status()
@@ -759,7 +767,9 @@ class TestCodexBulletFormatStatusDetection:
     @patch("cli_agent_orchestrator.providers.codex.get_backend")
     def test_get_status_error_not_masked_by_bullet_pattern(self, mock_tmux):
         """ERROR still detected when no • response and error after › user message."""
-        mock_tmux.return_value.get_history.return_value = "› do something\nError: connection refused\n"
+        mock_tmux.return_value.get_history.return_value = (
+            "› do something\nError: connection refused\n"
+        )
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         status = provider.get_status()

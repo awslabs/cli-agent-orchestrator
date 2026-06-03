@@ -226,7 +226,10 @@ class TestRestoreCommand:
             with patch(
                 "cli_agent_orchestrator.cli.commands.terminal.requests.get", return_value=mock_resp
             ):
-                with patch("cli_agent_orchestrator.cli.commands.terminal.get_backend", return_value=mock_tmux):
+                with patch(
+                    "cli_agent_orchestrator.cli.commands.terminal.get_backend",
+                    return_value=mock_tmux,
+                ):
                     result = runner.invoke(terminal, ["restore", "abc12345"])
 
         assert result.exit_code != 0
@@ -254,7 +257,10 @@ class TestRestoreCommand:
             with patch(
                 "cli_agent_orchestrator.cli.commands.terminal.requests.get", return_value=mock_resp
             ):
-                with patch("cli_agent_orchestrator.cli.commands.terminal.get_backend", return_value=mock_tmux):
+                with patch(
+                    "cli_agent_orchestrator.cli.commands.terminal.get_backend",
+                    return_value=mock_tmux,
+                ):
                     result = runner.invoke(terminal, ["restore", "abc12345"])
 
         assert result.exit_code == 0
@@ -285,7 +291,10 @@ class TestRestoreCommand:
             with patch(
                 "cli_agent_orchestrator.cli.commands.terminal.requests.get", return_value=mock_resp
             ):
-                with patch("cli_agent_orchestrator.cli.commands.terminal.get_backend", return_value=mock_tmux):
+                with patch(
+                    "cli_agent_orchestrator.cli.commands.terminal.get_backend",
+                    return_value=mock_tmux,
+                ):
                     with patch.dict("os.environ", {"SHELL": "/bin/zsh"}):
                         result = runner.invoke(terminal, ["restore", "abc12345"])
 
@@ -323,7 +332,10 @@ class TestRestoreCommand:
             with patch(
                 "cli_agent_orchestrator.cli.commands.terminal.requests.get", return_value=mock_resp
             ):
-                with patch("cli_agent_orchestrator.cli.commands.terminal.get_backend", return_value=mock_tmux):
+                with patch(
+                    "cli_agent_orchestrator.cli.commands.terminal.get_backend",
+                    return_value=mock_tmux,
+                ):
                     result = runner.invoke(terminal, ["restore", "abc12345"])
 
         assert result.exit_code == 0

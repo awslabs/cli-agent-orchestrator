@@ -816,7 +816,6 @@ Map<String, List<Integer>> nested = getMap();
         assert "value 1" in result
         assert "End of response" in result
 
-
     def test_extract_message_bullet_marker(self):
         """● (U+25CF) is accepted as a response marker — newer Claude versions use this."""
         output = "● Here is the bullet response\nthat spans lines\n> "
@@ -1114,9 +1113,7 @@ class TestClaudeCodeProviderStartupPrompts:
 
         # Verify Down arrow sent via send_keys and Enter via send_special_key
         mock_tmux.send_keys.assert_called_once()
-        mock_tmux.send_special_key.assert_called_once_with(
-            "test-session", "window-0", "Enter"
-        )
+        mock_tmux.send_special_key.assert_called_once_with("test-session", "window-0", "Enter")
 
     @patch("cli_agent_orchestrator.backends.registry._backend")
     def test_handle_bypass_then_trust_prompt(self, mock_tmux):

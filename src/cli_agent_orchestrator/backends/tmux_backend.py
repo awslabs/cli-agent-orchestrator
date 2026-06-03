@@ -64,7 +64,11 @@ class TmuxBackend(TerminalBackend):
     ) -> str:
         try:
             return self._client.create_window(
-                session_name, window_name, terminal_id, working_directory, window_shell,
+                session_name,
+                window_name,
+                terminal_id,
+                working_directory,
+                window_shell,
                 extra_env=extra_env,
             )
         except Exception as e:
@@ -86,7 +90,10 @@ class TmuxBackend(TerminalBackend):
         force_bracketed_paste: bool = False,
     ) -> None:
         self._client.send_keys(
-            session_name, window_name, keys, enter_count=enter_count,
+            session_name,
+            window_name,
+            keys,
+            enter_count=enter_count,
             force_bracketed_paste=force_bracketed_paste,
         )
 
@@ -104,7 +111,8 @@ class TmuxBackend(TerminalBackend):
         full_history: bool = False,
     ) -> str:
         return self._client.get_history(
-            session_name, window_name,
+            session_name,
+            window_name,
             tail_lines=tail_lines,
             strip_escapes=strip_escapes,
             full_history=full_history,

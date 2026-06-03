@@ -191,7 +191,9 @@ class OpenCodeCliProvider(BaseProvider):
         Returns:
             Current TerminalStatus.
         """
-        output = get_backend().get_history(self.session_name, self.window_name, tail_lines=tail_lines)
+        output = get_backend().get_history(
+            self.session_name, self.window_name, tail_lines=tail_lines
+        )
         if not output:
             return TerminalStatus.ERROR
 

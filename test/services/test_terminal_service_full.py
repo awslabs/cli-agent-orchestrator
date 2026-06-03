@@ -704,10 +704,12 @@ class TestGetOutput:
             "tmux_window": "developer-abcd",
         }
         mock_tmux.get_history.return_value = "output"
-        mock_provider = MagicMock(spec=[
-            "extract_last_message_from_script",
-            "extraction_retries",
-        ])  # no extraction_tail_lines attribute → escalation path
+        mock_provider = MagicMock(
+            spec=[
+                "extract_last_message_from_script",
+                "extraction_retries",
+            ]
+        )  # no extraction_tail_lines attribute → escalation path
         mock_provider.extract_last_message_from_script.side_effect = [
             ValueError("no marker"),  # 200-line attempt fails
             "found at 500",  # 500-line attempt succeeds
@@ -731,10 +733,12 @@ class TestGetOutput:
             "tmux_window": "developer-abcd",
         }
         mock_tmux.get_history.return_value = "raw tail content"
-        mock_provider = MagicMock(spec=[
-            "extract_last_message_from_script",
-            "extraction_retries",
-        ])  # no extraction_tail_lines attribute → escalation path
+        mock_provider = MagicMock(
+            spec=[
+                "extract_last_message_from_script",
+                "extraction_retries",
+            ]
+        )  # no extraction_tail_lines attribute → escalation path
         mock_provider.extract_last_message_from_script.side_effect = ValueError("no marker")
         mock_provider_manager.get_provider.return_value = mock_provider
 
@@ -759,10 +763,12 @@ class TestGetOutput:
             "tmux_session": "cao-session",
             "tmux_window": "developer-abcd",
         }
-        mock_provider = MagicMock(spec=[
-            "extract_last_message_from_script",
-            "extraction_retries",
-        ])  # no extraction_tail_lines attribute → escalation path
+        mock_provider = MagicMock(
+            spec=[
+                "extract_last_message_from_script",
+                "extraction_retries",
+            ]
+        )  # no extraction_tail_lines attribute → escalation path
 
         # Tail-based reads fail (marker too far back), full_history read succeeds
         def history_side_effect(*args, **kwargs):

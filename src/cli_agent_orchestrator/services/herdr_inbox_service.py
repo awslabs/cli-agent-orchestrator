@@ -157,7 +157,9 @@ class HerdrInboxService:
 
         ws_result = subprocess.run(
             ["herdr", "--session", self._herdr_session, "workspace", "list"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         if ws_result.returncode != 0:
             logger.debug("Startup DB cleanup: herdr workspace list failed, skipping")
@@ -166,16 +168,16 @@ class HerdrInboxService:
         try:
             ws_data = json.loads(ws_result.stdout)
             workspaces = ws_data.get("result", {}).get("workspaces", [])
-            workspace_to_session = {
-                ws["workspace_id"]: ws["label"] for ws in workspaces
-            }
+            workspace_to_session = {ws["workspace_id"]: ws["label"] for ws in workspaces}
         except (json.JSONDecodeError, KeyError) as e:
             logger.warning(f"Startup DB cleanup: failed to parse workspace list: {e}")
             return
 
         tab_result = subprocess.run(
             ["herdr", "--session", self._herdr_session, "tab", "list"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         if tab_result.returncode != 0:
             logger.debug("Startup DB cleanup: herdr tab list failed, skipping")
@@ -282,7 +284,9 @@ class HerdrInboxService:
         # Get live panes from herdr
         result = subprocess.run(
             ["herdr", "--session", self._herdr_session, "pane", "list"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         if result.returncode != 0:
             logger.warning(f"Reconcile: herdr pane list failed: {result.stderr}")
@@ -299,15 +303,15 @@ class HerdrInboxService:
         # Build workspace_id -> session_name mapping
         ws_result = subprocess.run(
             ["herdr", "--session", self._herdr_session, "workspace", "list"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         if ws_result.returncode == 0:
             try:
                 ws_data = json.loads(ws_result.stdout)
                 workspaces = ws_data.get("result", {}).get("workspaces", [])
-                self._workspace_to_session = {
-                    ws["workspace_id"]: ws["label"] for ws in workspaces
-                }
+                self._workspace_to_session = {ws["workspace_id"]: ws["label"] for ws in workspaces}
             except (json.JSONDecodeError, KeyError):
                 pass
 
@@ -316,7 +320,9 @@ class HerdrInboxService:
         # starts empty (so the stale-pane diff below produces nothing).
         tab_result = subprocess.run(
             ["herdr", "--session", self._herdr_session, "tab", "list"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         if tab_result.returncode == 0:
             try:
@@ -535,7 +541,8 @@ class HerdrInboxService:
 
             # If session has no more terminals in our map, kill workspace
             remaining_in_session = [
-                t for t in self._pane_to_terminal.values()
+                t
+                for t in self._pane_to_terminal.values()
                 if (m := get_terminal_metadata(t)) and m.get("tmux_session") == session_name
             ]
             if session_name and not remaining_in_session:
@@ -555,11 +562,14 @@ class HerdrInboxService:
             try:
                 delete_terminals_by_session(session_name)
             except Exception as e:
-                logger.warning(f"workspace.closed: failed to delete terminals for {session_name}: {e}")
+                logger.warning(
+                    f"workspace.closed: failed to delete terminals for {session_name}: {e}"
+                )
 
             # Prune maps — pane_ids from this workspace start with workspace_id prefix
             to_remove = [
-                (pid, tid) for pid, tid in self._pane_to_terminal.items()
+                (pid, tid)
+                for pid, tid in self._pane_to_terminal.items()
                 if pid.startswith(workspace_id)
             ]
             for pid, tid in to_remove:
@@ -607,7 +617,9 @@ class HerdrInboxService:
 
             result = subprocess.run(
                 ["herdr", "--session", self._herdr_session, "pane", "read", pane_id],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True,
+                text=True,
+                timeout=5,
             )
             if result.returncode != 0:
                 continue

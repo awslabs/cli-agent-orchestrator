@@ -263,7 +263,9 @@ class TestKiroCliProviderStatusDetection:
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
     def test_get_status_completed(self, mock_tmux):
         """Test COMPLETED status detection."""
-        mock_tmux.return_value.get_history.return_value = load_fixture("kiro_cli_completed_output.txt")
+        mock_tmux.return_value.get_history.return_value = load_fixture(
+            "kiro_cli_completed_output.txt"
+        )
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         status = provider.get_status()
@@ -273,7 +275,9 @@ class TestKiroCliProviderStatusDetection:
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
     def test_get_status_processing(self, mock_tmux):
         """Test PROCESSING status detection."""
-        mock_tmux.return_value.get_history.return_value = load_fixture("kiro_cli_processing_output.txt")
+        mock_tmux.return_value.get_history.return_value = load_fixture(
+            "kiro_cli_processing_output.txt"
+        )
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         status = provider.get_status()
@@ -283,7 +287,9 @@ class TestKiroCliProviderStatusDetection:
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
     def test_get_status_waiting_user_answer(self, mock_tmux):
         """Test WAITING_USER_ANSWER status detection."""
-        mock_tmux.return_value.get_history.return_value = load_fixture("kiro_cli_permission_output.txt")
+        mock_tmux.return_value.get_history.return_value = load_fixture(
+            "kiro_cli_permission_output.txt"
+        )
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         status = provider.get_status()
@@ -319,7 +325,9 @@ class TestKiroCliProviderStatusDetection:
         status = provider.get_status(tail_lines=50)
 
         assert status == TerminalStatus.IDLE
-        mock_tmux.return_value.get_history.assert_called_once_with("test-session", "window-0", tail_lines=50)
+        mock_tmux.return_value.get_history.assert_called_once_with(
+            "test-session", "window-0", tail_lines=50
+        )
 
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
     def test_status_processing_response_started_no_final_prompt(self, mock_tmux):
@@ -388,7 +396,9 @@ class TestKiroCliProviderStatusDetection:
         assert status == TerminalStatus.COMPLETED
 
         # Verify extraction gets the last response
-        message = provider.extract_last_message_from_script(mock_tmux.return_value.get_history.return_value)
+        message = provider.extract_last_message_from_script(
+            mock_tmux.return_value.get_history.return_value
+        )
         assert "Second response" in message
         assert "First response" not in message
 
@@ -798,7 +808,9 @@ class TestKiroCliProviderPromptPatterns:
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
     def test_prompt_with_percentage(self, mock_tmux):
         """Test prompt with usage percentage."""
-        mock_tmux.return_value.get_history.return_value = "\x1b[36m[developer] \x1b[32m75%\x1b[35m>\x1b[39m "
+        mock_tmux.return_value.get_history.return_value = (
+            "\x1b[36m[developer] \x1b[32m75%\x1b[35m>\x1b[39m "
+        )
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         status = provider.get_status()
@@ -808,7 +820,9 @@ class TestKiroCliProviderPromptPatterns:
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
     def test_prompt_with_special_profile_characters(self, mock_tmux):
         """Test prompt with special characters in profile name."""
-        mock_tmux.return_value.get_history.return_value = "\x1b[36m[code-reviewer_v2]\x1b[35m>\x1b[39m "
+        mock_tmux.return_value.get_history.return_value = (
+            "\x1b[36m[code-reviewer_v2]\x1b[35m>\x1b[39m "
+        )
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "code-reviewer_v2")
         status = provider.get_status()
@@ -822,7 +836,9 @@ class TestKiroCliProviderHandoffScenarios:
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
     def test_handoff_successful_status(self, mock_tmux):
         """Test COMPLETED status detection with successful handoff."""
-        mock_tmux.return_value.get_history.return_value = load_fixture("kiro_cli_handoff_successful.txt")
+        mock_tmux.return_value.get_history.return_value = load_fixture(
+            "kiro_cli_handoff_successful.txt"
+        )
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "supervisor")
         status = provider.get_status()
@@ -873,7 +889,9 @@ class TestKiroCliProviderHandoffScenarios:
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
     def test_handoff_with_permission_prompt(self, mock_tmux):
         """Test WAITING_USER_ANSWER status during handoff requiring permission."""
-        mock_tmux.return_value.get_history.return_value = load_fixture("kiro_cli_handoff_with_permission.txt")
+        mock_tmux.return_value.get_history.return_value = load_fixture(
+            "kiro_cli_handoff_with_permission.txt"
+        )
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "supervisor")
         status = provider.get_status()
@@ -950,7 +968,9 @@ class TestKiroCliProviderEdgeCases:
     def test_long_agent_profile_name(self, mock_tmux):
         """Test with very long agent profile name."""
         long_profile = "very_long_agent_profile_name_that_exceeds_normal_length"
-        mock_tmux.return_value.get_history.return_value = f"\x1b[36m[{long_profile}]\x1b[35m>\x1b[39m "
+        mock_tmux.return_value.get_history.return_value = (
+            f"\x1b[36m[{long_profile}]\x1b[35m>\x1b[39m "
+        )
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", long_profile)
         status = provider.get_status()
@@ -971,7 +991,9 @@ class TestKiroCliProviderEdgeCases:
         assert status == TerminalStatus.COMPLETED
 
         # Test message extraction
-        message = provider.extract_last_message_from_script(mock_tmux.return_value.get_history.return_value)
+        message = provider.extract_last_message_from_script(
+            mock_tmux.return_value.get_history.return_value
+        )
         assert "日本語" in message
         assert "café" in message
         assert "🚀" in message
@@ -985,7 +1007,9 @@ class TestKiroCliProviderEdgeCases:
         )
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
-        message = provider.extract_last_message_from_script(mock_tmux.return_value.get_history.return_value)
+        message = provider.extract_last_message_from_script(
+            mock_tmux.return_value.get_history.return_value
+        )
 
         # Control characters should be cleaned
         assert "\x07" not in message  # Bell
@@ -1133,7 +1157,9 @@ class TestKiroCliTuiMode:
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
     def test_tui_idle_detection(self, mock_tmux):
         """Test IDLE detection with pure TUI output."""
-        mock_tmux.return_value.get_history.return_value = load_fixture("kiro_cli_tui_idle_output.txt")
+        mock_tmux.return_value.get_history.return_value = load_fixture(
+            "kiro_cli_tui_idle_output.txt"
+        )
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         status = provider.get_status()
@@ -1143,7 +1169,9 @@ class TestKiroCliTuiMode:
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
     def test_tui_completed_detection(self, mock_tmux):
         """Test COMPLETED detection with Credits marker + idle prompt."""
-        mock_tmux.return_value.get_history.return_value = load_fixture("kiro_cli_tui_completed_output.txt")
+        mock_tmux.return_value.get_history.return_value = load_fixture(
+            "kiro_cli_tui_completed_output.txt"
+        )
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         status = provider.get_status()
@@ -1153,7 +1181,9 @@ class TestKiroCliTuiMode:
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
     def test_tui_processing_detection(self, mock_tmux):
         """Test PROCESSING when TUI idle prompt is absent."""
-        mock_tmux.return_value.get_history.return_value = load_fixture("kiro_cli_tui_processing_output.txt")
+        mock_tmux.return_value.get_history.return_value = load_fixture(
+            "kiro_cli_tui_processing_output.txt"
+        )
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         status = provider.get_status()
@@ -1577,7 +1607,9 @@ class TestKiroCliCheck3ShellBaseline:
         current command is still the shell, so honoring it would let
         pastes leak into Kiro's boot screen.
         """
-        mock_tmux.return_value.get_history.return_value = "Some processing output without idle prompt"
+        mock_tmux.return_value.get_history.return_value = (
+            "Some processing output without idle prompt"
+        )
         mock_tmux.return_value.get_pane_current_command.return_value = "bash"
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
@@ -1586,7 +1618,9 @@ class TestKiroCliCheck3ShellBaseline:
         status = provider.get_status()
 
         assert status == TerminalStatus.IDLE
-        mock_tmux.return_value.get_pane_current_command.assert_called_once_with("test-session", "window-0")
+        mock_tmux.return_value.get_pane_current_command.assert_called_once_with(
+            "test-session", "window-0"
+        )
 
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
     def test_check3_pre_init_shell_match_returns_processing(self, mock_backend):
@@ -1597,7 +1631,9 @@ class TestKiroCliCheck3ShellBaseline:
         must report PROCESSING in this window so callers don't paste into
         Kiro's pre-interactive boot screen.
         """
-        mock_backend.return_value.get_history.return_value = "Some processing output without idle prompt"
+        mock_backend.return_value.get_history.return_value = (
+            "Some processing output without idle prompt"
+        )
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         provider.shell_baseline = "bash"
@@ -1610,7 +1646,9 @@ class TestKiroCliCheck3ShellBaseline:
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
     def test_check3_shell_mismatch_returns_processing(self, mock_tmux):
         """No idle prompt + current command differs from shell_baseline → PROCESSING."""
-        mock_tmux.return_value.get_history.return_value = "Some processing output without idle prompt"
+        mock_tmux.return_value.get_history.return_value = (
+            "Some processing output without idle prompt"
+        )
         mock_tmux.return_value.get_pane_current_command.return_value = "kiro"
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
@@ -1622,7 +1660,9 @@ class TestKiroCliCheck3ShellBaseline:
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
     def test_check3_no_baseline_returns_processing_without_pane_query(self, mock_tmux):
         """No idle prompt + shell_baseline is None → PROCESSING, no pane command query."""
-        mock_tmux.return_value.get_history.return_value = "Some processing output without idle prompt"
+        mock_tmux.return_value.get_history.return_value = (
+            "Some processing output without idle prompt"
+        )
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         # shell_baseline defaults to None
@@ -1663,7 +1703,9 @@ class TestKiroCliCheck6NoCredits:
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
     def test_check6_completed_after_input_received(self, mock_tmux):
         """Check 6 returns COMPLETED when idle prompt present and input was sent."""
-        mock_tmux.return_value.get_history.return_value = self._tui_output("validate this", "All checks pass.")
+        mock_tmux.return_value.get_history.return_value = self._tui_output(
+            "validate this", "All checks pass."
+        )
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         provider._input_received = True

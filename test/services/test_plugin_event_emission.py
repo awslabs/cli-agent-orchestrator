@@ -86,7 +86,9 @@ class TestSessionPluginEvents:
             call_order.append("dispatch")
 
         mock_tmux.return_value.session_exists.return_value = True
-        mock_tmux.return_value.kill_session.side_effect = lambda *_: call_order.append("kill_session")
+        mock_tmux.return_value.kill_session.side_effect = lambda *_: call_order.append(
+            "kill_session"
+        )
         mock_list_terminals.return_value = []
         mock_delete_terminals.side_effect = lambda *_: call_order.append("delete_terminals")
         registry.dispatch.side_effect = record_dispatch

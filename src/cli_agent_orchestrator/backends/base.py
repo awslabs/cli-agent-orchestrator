@@ -291,13 +291,9 @@ class TerminalBackend(ABC):
         Raises:
             NotImplementedError: If backend does not support pane ID resolution
         """
-        raise NotImplementedError(
-            f"{type(self).__name__} does not support get_pane_id()"
-        )
+        raise NotImplementedError(f"{type(self).__name__} does not support get_pane_id()")
 
-    def get_native_status(
-        self, session_name: str, window_name: str
-    ) -> Optional[TerminalStatus]:
+    def get_native_status(self, session_name: str, window_name: str) -> Optional[TerminalStatus]:
         """Query native agent status if the backend has agent awareness.
 
         Returns None if unsupported — caller falls back to pane content parsing.

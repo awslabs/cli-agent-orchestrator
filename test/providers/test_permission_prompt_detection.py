@@ -51,7 +51,9 @@ class TestPermissionPromptActive:
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
     def test_p1_active_empty_prompt(self, mock_tmux):
         """P1: Permission prompt shown, empty idle prompt on next line, unanswered."""
-        mock_tmux.return_value.get_history.return_value = load_fixture("kiro_cli_permission_active_empty.txt")
+        mock_tmux.return_value.get_history.return_value = load_fixture(
+            "kiro_cli_permission_active_empty.txt"
+        )
         provider = make_provider("cao-internal-docs-expert")
         assert provider.get_status() == TerminalStatus.WAITING_USER_ANSWER
 
@@ -111,7 +113,9 @@ class TestPermissionPromptStale:
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
     def test_p5_answered_y_agent_idle(self, mock_tmux):
         """P5: User answered y, agent ran tool, now idle again."""
-        mock_tmux.return_value.get_history.return_value = load_fixture("kiro_cli_permission_stale_answered.txt")
+        mock_tmux.return_value.get_history.return_value = load_fixture(
+            "kiro_cli_permission_stale_answered.txt"
+        )
         provider = make_provider("cao-workspace-expert")
         status = provider.get_status()
         assert status != TerminalStatus.WAITING_USER_ANSWER
@@ -172,14 +176,18 @@ class TestNonPermissionCases:
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
     def test_n2_idle_trailing_text(self, mock_tmux):
         """N2: Idle with trailing text after prompt."""
-        mock_tmux.return_value.get_history.return_value = "[developer] 24% λ > send message back to supervisor?"
+        mock_tmux.return_value.get_history.return_value = (
+            "[developer] 24% λ > send message back to supervisor?"
+        )
         provider = make_provider("developer")
         assert provider.get_status() == TerminalStatus.IDLE
 
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
     def test_n3_idle_what_would_you_like(self, mock_tmux):
         """N3: Idle with 'What would you like to do next?' trailing text."""
-        mock_tmux.return_value.get_history.return_value = "[developer] 11% > What would you like to do next?"
+        mock_tmux.return_value.get_history.return_value = (
+            "[developer] 11% > What would you like to do next?"
+        )
         provider = make_provider("developer")
         assert provider.get_status() == TerminalStatus.IDLE
 
@@ -226,7 +234,9 @@ class TestPermissionPromptEdgeCases:
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
     def test_permission_same_line_as_idle(self, mock_tmux):
         """Original fixture format: [y/n/t]: and idle prompt on same line."""
-        mock_tmux.return_value.get_history.return_value = "Allow this action? [y/n/t]: [developer] 10% λ > "
+        mock_tmux.return_value.get_history.return_value = (
+            "Allow this action? [y/n/t]: [developer] 10% λ > "
+        )
         provider = make_provider("developer")
         assert provider.get_status() == TerminalStatus.WAITING_USER_ANSWER
 
@@ -260,7 +270,9 @@ class TestPermissionPromptEdgeCases:
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
     def test_no_permission_prompt_in_output(self, mock_tmux):
         """No permission prompt at all — should not affect idle detection."""
-        mock_tmux.return_value.get_history.return_value = "> Here is my response\n\n" "[developer] 22% λ > "
+        mock_tmux.return_value.get_history.return_value = (
+            "> Here is my response\n\n" "[developer] 22% λ > "
+        )
         provider = make_provider("developer")
         assert provider.get_status() == TerminalStatus.COMPLETED
 

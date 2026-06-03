@@ -31,7 +31,6 @@ from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.constants import INBOX_POLLING_INTERVAL, TERMINAL_LOG_DIR
 from cli_agent_orchestrator.plugins import PluginRegistry
 
-
 # --- Test doubles -------------------------------------------------------
 
 
@@ -96,9 +95,7 @@ def _patched_lifespan(backend: object, tasks: list):
     with ExitStack() as stack:
 
         def patch_main(name: str, **kwargs):
-            return stack.enter_context(
-                patch(f"cli_agent_orchestrator.api.main.{name}", **kwargs)
-            )
+            return stack.enter_context(patch(f"cli_agent_orchestrator.api.main.{name}", **kwargs))
 
         # Intercept task creation so no real background tasks run.
         stack.enter_context(patch("asyncio.create_task", _make_fake_create_task(tasks)))
@@ -116,9 +113,7 @@ def _patched_lifespan(backend: object, tasks: list):
             set_svc=patch_main("set_herdr_inbox_service"),
             observer_cls=patch_main("PollingObserver"),
             log_handler_cls=patch_main("LogFileHandler"),
-            load=stack.enter_context(
-                patch.object(PluginRegistry, "load", new_callable=AsyncMock)
-            ),
+            load=stack.enter_context(patch.object(PluginRegistry, "load", new_callable=AsyncMock)),
             teardown=stack.enter_context(
                 patch.object(PluginRegistry, "teardown", new_callable=AsyncMock)
             ),

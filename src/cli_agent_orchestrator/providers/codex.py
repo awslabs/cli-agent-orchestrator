@@ -322,7 +322,9 @@ class CodexProvider(BaseProvider):
 
     def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
         """Get Codex status by analyzing terminal output."""
-        output = get_backend().get_history(self.session_name, self.window_name, tail_lines=tail_lines)
+        output = get_backend().get_history(
+            self.session_name, self.window_name, tail_lines=tail_lines
+        )
 
         if not output:
             return TerminalStatus.ERROR

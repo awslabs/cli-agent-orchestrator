@@ -13,7 +13,6 @@ from cli_agent_orchestrator.backends.base import (
 )
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 
-
 # --- Fixtures ---
 
 
@@ -62,10 +61,20 @@ class TestHerdrBackendABC:
 
     def test_all_methods_implemented(self, backend):
         for method in [
-            "create_session", "session_exists", "list_sessions", "kill_session",
-            "create_window", "kill_window", "send_keys", "send_special_key",
-            "get_history", "get_pane_working_directory", "get_pane_current_command",
-            "attach_session", "pipe_pane", "stop_pipe_pane",
+            "create_session",
+            "session_exists",
+            "list_sessions",
+            "kill_session",
+            "create_window",
+            "kill_window",
+            "send_keys",
+            "send_special_key",
+            "get_history",
+            "get_pane_working_directory",
+            "get_pane_current_command",
+            "attach_session",
+            "pipe_pane",
+            "stop_pipe_pane",
         ]:
             assert callable(getattr(backend, method))
 
@@ -160,19 +169,27 @@ class TestHerdrBackendCommands:
         """create_session should call herdr workspace create with --label and inject env."""
         # Include root_pane.pane_id so _parse_new_pane_id succeeds and _inject_env_vars
         # uses the known pane_id directly (no fallback pane list scan needed).
-        ws_create_resp = _completed(json.dumps({
-            "id": "cli:workspace:create",
-            "result": {
-                "workspace_id": "w_new",
-                "root_pane": {"pane_id": "w_new-1", "workspace_id": "w_new", "tab_id": "tab-0"},
-                "type": "workspace_created",
-            },
-        }))
+        ws_create_resp = _completed(
+            json.dumps(
+                {
+                    "id": "cli:workspace:create",
+                    "result": {
+                        "workspace_id": "w_new",
+                        "root_pane": {
+                            "pane_id": "w_new-1",
+                            "workspace_id": "w_new",
+                            "tab_id": "tab-0",
+                        },
+                        "type": "workspace_created",
+                    },
+                }
+            )
+        )
         mock_run.side_effect = [
             ws_create_resp,  # workspace create
-            _completed(),    # tab rename (root tab labeled with window_name)
-            _completed(),    # pane send-text (env export)
-            _completed(),    # pane send-keys Enter
+            _completed(),  # tab rename (root tab labeled with window_name)
+            _completed(),  # pane send-text (env export)
+            _completed(),  # pane send-keys Enter
         ]
 
         backend.create_session("cao-myproj", "window-0", "tid1", "/home/user/project")
@@ -198,7 +215,7 @@ class TestHerdrBackendCommands:
         ws = [{"label": "cao-test", "workspace_id": "w_abc123"}]
         mock_run.side_effect = [
             _completed(_make_workspace_list_response(ws)),  # _resolve_workspace_id
-            _completed(),                                    # workspace close
+            _completed(),  # workspace close
         ]
 
         result = backend.kill_session("cao-test")
@@ -220,8 +237,8 @@ class TestHerdrBackendCommands:
 
         mock_run.side_effect = [
             _completed(_make_workspace_list_response(ws)),  # workspace list
-            _completed(_make_tab_list_response(tabs)),      # tab list
-            _completed(_make_pane_list_response(panes)),    # pane list
+            _completed(_make_tab_list_response(tabs)),  # tab list
+            _completed(_make_pane_list_response(panes)),  # pane list
             _completed(),  # send-text
             _completed(),  # send-keys Enter
         ]
@@ -284,10 +301,12 @@ class TestHerdrBackendCommands:
         ws = [{"label": "cao-test", "workspace_id": "w1"}]
         tabs = [{"tab_id": "tab-0", "workspace_id": "w1", "label": "window-0"}]
         panes = [{"tab_id": "tab-0", "pane_id": "w1-1", "workspace_id": "w1"}]
-        pane_info = json.dumps({
-            "id": "cli:pane:get",
-            "result": {"pane": {"cwd": "/home/user/project"}, "type": "pane_info"},
-        })
+        pane_info = json.dumps(
+            {
+                "id": "cli:pane:get",
+                "result": {"pane": {"cwd": "/home/user/project"}, "type": "pane_info"},
+            }
+        )
 
         mock_run.side_effect = [
             _completed(_make_workspace_list_response(ws)),
@@ -354,7 +373,9 @@ class TestMultiPaneResolution:
 
     @pytest.fixture
     def backend(self):
-        with patch("cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True):
+        with patch(
+            "cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True
+        ):
             yield HerdrBackend(send_delay_ms=0)
 
     @patch("subprocess.run")
@@ -376,8 +397,8 @@ class TestMultiPaneResolution:
 
         mock_run.side_effect = [
             _completed(_make_workspace_list_response(ws)),  # workspace list (cache miss)
-            _completed(_make_tab_list_response(tabs)),       # tab list
-            _completed(_make_pane_list_response(panes)),     # pane list
+            _completed(_make_tab_list_response(tabs)),  # tab list
+            _completed(_make_pane_list_response(panes)),  # pane list
             # second call: workspace cache hit, so only tab + pane needed
             _completed(_make_tab_list_response(tabs)),
             _completed(_make_pane_list_response(panes)),
@@ -471,7 +492,7 @@ class TestMultiPaneResolution:
         second_panes = [{"tab_id": "tab-1", "pane_id": "w1-2", "workspace_id": "w1"}]
 
         mock_run.side_effect = [
-            _completed(_make_workspace_list_response(ws)),   # workspace list (cache miss)
+            _completed(_make_workspace_list_response(ws)),  # workspace list (cache miss)
             _completed(_make_tab_list_response(tabs)),
             _completed(_make_pane_list_response(first_panes)),
             # second call: workspace cache hit, so only tab + pane
@@ -521,21 +542,27 @@ class TestSessionSocketPath:
     @patch.dict("os.environ", {"XDG_CONFIG_HOME": "/custom/config"})
     def test_named_session_uses_subdir(self):
         """Named session should produce <config_home>/herdr/<name>/herdr.sock."""
-        with patch("cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True):
+        with patch(
+            "cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True
+        ):
             b = HerdrBackend(herdr_session="cao")
         assert b._session_socket_path() == "/custom/config/herdr/sessions/cao/herdr.sock"
 
     @patch.dict("os.environ", {"XDG_CONFIG_HOME": "/custom/config"})
     def test_default_session_uses_flat_path(self):
         """'default' session should produce <config_home>/herdr/herdr.sock (no subdir)."""
-        with patch("cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True):
+        with patch(
+            "cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True
+        ):
             b = HerdrBackend(herdr_session="default")
         assert b._session_socket_path() == "/custom/config/herdr/herdr.sock"
 
     @patch.dict("os.environ", {"XDG_CONFIG_HOME": "/custom/config"})
     def test_arbitrary_session_name(self):
         """An arbitrary session name should appear as a subdirectory."""
-        with patch("cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True):
+        with patch(
+            "cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True
+        ):
             b = HerdrBackend(herdr_session="my-workspace")
         assert b._session_socket_path() == "/custom/config/herdr/sessions/my-workspace/herdr.sock"
 
@@ -548,7 +575,9 @@ class TestEnsureSessionRunning:
 
     def test_does_nothing_when_socket_exists(self):
         """If socket already exists, no Popen should be called."""
-        with patch("cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True):
+        with patch(
+            "cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True
+        ):
             with patch("subprocess.Popen") as mock_popen:
                 HerdrBackend(herdr_session="cao")
         mock_popen.assert_not_called()
@@ -609,23 +638,30 @@ class TestCreateWindowWindowShell:
     def test_create_window_with_window_shell(self, mock_run, mock_sleep, backend):
         """When window_shell is provided, pane run is called after a 0.5s sleep."""
         ws = [{"label": "cao-test", "workspace_id": "w1"}]
-        tab_create_resp = _completed(json.dumps({
-            "id": "cli:tab:create",
-            "result": {
-                "root_pane": {"pane_id": "w1-5", "workspace_id": "w1"},
-                "type": "tab_created",
-            },
-        }))
+        tab_create_resp = _completed(
+            json.dumps(
+                {
+                    "id": "cli:tab:create",
+                    "result": {
+                        "root_pane": {"pane_id": "w1-5", "workspace_id": "w1"},
+                        "type": "tab_created",
+                    },
+                }
+            )
+        )
         mock_run.side_effect = [
             _completed(_make_workspace_list_response(ws)),  # _resolve_workspace_id
-            tab_create_resp,                                 # tab create
-            _completed(),                                    # pane send-text (env export)
-            _completed(),                                    # pane send-keys Enter
-            _completed(),                                    # pane run
+            tab_create_resp,  # tab create
+            _completed(),  # pane send-text (env export)
+            _completed(),  # pane send-keys Enter
+            _completed(),  # pane run
         ]
 
         backend.create_window(
-            "cao-test", "restored-win", "tid99", "/home/user",
+            "cao-test",
+            "restored-win",
+            "tid99",
+            "/home/user",
             window_shell="cat '/path/file'; exec /bin/bash -l",
         )
 
@@ -641,25 +677,32 @@ class TestCreateWindowWindowShell:
     def test_create_window_window_shell_failure_is_nonfatal(self, mock_run, mock_sleep, backend):
         """If pane run raises, create_window still returns window_name without raising."""
         ws = [{"label": "cao-test", "workspace_id": "w1"}]
-        tab_create_resp = _completed(json.dumps({
-            "id": "cli:tab:create",
-            "result": {
-                "root_pane": {"pane_id": "w1-6", "workspace_id": "w1"},
-                "type": "tab_created",
-            },
-        }))
+        tab_create_resp = _completed(
+            json.dumps(
+                {
+                    "id": "cli:tab:create",
+                    "result": {
+                        "root_pane": {"pane_id": "w1-6", "workspace_id": "w1"},
+                        "type": "tab_created",
+                    },
+                }
+            )
+        )
         pane_run_fail = _completed(returncode=1)
         pane_run_fail.stderr = "pane not found"
         mock_run.side_effect = [
             _completed(_make_workspace_list_response(ws)),  # _resolve_workspace_id
-            tab_create_resp,                                 # tab create
-            _completed(),                                    # pane send-text (env export)
-            _completed(),                                    # pane send-keys Enter
-            pane_run_fail,                                   # pane run (fails)
+            tab_create_resp,  # tab create
+            _completed(),  # pane send-text (env export)
+            _completed(),  # pane send-keys Enter
+            pane_run_fail,  # pane run (fails)
         ]
 
         result = backend.create_window(
-            "cao-test", "restored-win", "tid99", "/home/user",
+            "cao-test",
+            "restored-win",
+            "tid99",
+            "/home/user",
             window_shell="exec /bin/bash -l",
         )
 
@@ -675,13 +718,15 @@ class TestGetNativeStatus:
     from cli_agent_orchestrator.models.terminal import TerminalStatus as _TS
 
     def _make_pane_get_response(self, agent_status: str) -> str:
-        return json.dumps({
-            "id": "cli:pane:get",
-            "result": {
-                "pane": {"pane_id": "w1-1", "agent_status": agent_status},
-                "type": "pane_info",
-            },
-        })
+        return json.dumps(
+            {
+                "id": "cli:pane:get",
+                "result": {
+                    "pane": {"pane_id": "w1-1", "agent_status": agent_status},
+                    "type": "pane_info",
+                },
+            }
+        )
 
     def _setup_fresh_resolution(self, backend):
         """Pre-populate the workspace cache for tests.
@@ -697,9 +742,9 @@ class TestGetNativeStatus:
         tabs = [{"tab_id": "tab-1", "workspace_id": "w1", "label": "w"}]
         panes = [{"tab_id": "tab-1", "pane_id": "w1-1", "workspace_id": "w1"}]
         return [
-            _completed(_make_tab_list_response(tabs)),   # tab list
-            _completed(_make_pane_list_response(panes)), # pane list
-            pane_get_response,                            # pane get
+            _completed(_make_tab_list_response(tabs)),  # tab list
+            _completed(_make_pane_list_response(panes)),  # pane list
+            pane_get_response,  # pane get
         ]
 
     @patch("subprocess.run")
@@ -710,6 +755,7 @@ class TestGetNativeStatus:
         )
 
         from cli_agent_orchestrator.models.terminal import TerminalStatus
+
         result = backend.get_native_status("s", "w")
         assert result == TerminalStatus.PROCESSING
 
@@ -721,6 +767,7 @@ class TestGetNativeStatus:
         )
 
         from cli_agent_orchestrator.models.terminal import TerminalStatus
+
         result = backend.get_native_status("s", "w")
         assert result == TerminalStatus.WAITING_USER_ANSWER
 
@@ -732,6 +779,7 @@ class TestGetNativeStatus:
         )
 
         from cli_agent_orchestrator.models.terminal import TerminalStatus
+
         result = backend.get_native_status("s", "w")
         assert result == TerminalStatus.COMPLETED
 
@@ -743,6 +791,7 @@ class TestGetNativeStatus:
         )
 
         from cli_agent_orchestrator.models.terminal import TerminalStatus
+
         result = backend.get_native_status("s", "w")
         assert result == TerminalStatus.IDLE
 
@@ -754,6 +803,7 @@ class TestGetNativeStatus:
         )
 
         from cli_agent_orchestrator.models.terminal import TerminalStatus
+
         result = backend.get_native_status("s", "w")
         assert result == TerminalStatus.ERROR
 

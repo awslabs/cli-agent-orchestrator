@@ -348,7 +348,9 @@ class TestCopilotCliProviderStatusDetection:
 
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
     def test_get_status_idle_with_no_user_message(self, mock_tmux):
-        mock_tmux.return_value.get_history.return_value = "GitHub Copilot v0.0.415\n❯ Type @ to mention files"
+        mock_tmux.return_value.get_history.return_value = (
+            "GitHub Copilot v0.0.415\n❯ Type @ to mention files"
+        )
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
         assert provider.get_status() == TerminalStatus.IDLE
 
@@ -379,7 +381,9 @@ class TestCopilotCliProviderStatusDetection:
 
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
     def test_get_status_completed_when_response_present_and_idle(self, mock_tmux):
-        mock_tmux.return_value.get_history.return_value = "❯ refactor this\n● Edit file.py (+1 -1)\n❯ "
+        mock_tmux.return_value.get_history.return_value = (
+            "❯ refactor this\n● Edit file.py (+1 -1)\n❯ "
+        )
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
         assert provider.get_status() == TerminalStatus.COMPLETED
 
@@ -399,13 +403,17 @@ class TestCopilotCliProviderStatusDetection:
 
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
     def test_get_status_error_when_idle_and_error_without_assistant_marker(self, mock_tmux):
-        mock_tmux.return_value.get_history.return_value = "❯ refactor this\nError: failed to parse\n❯ "
+        mock_tmux.return_value.get_history.return_value = (
+            "❯ refactor this\nError: failed to parse\n❯ "
+        )
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
         assert provider.get_status() == TerminalStatus.ERROR
 
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
     def test_get_status_completed_when_idle_and_error_with_assistant_marker(self, mock_tmux):
-        mock_tmux.return_value.get_history.return_value = "❯ refactor this\nassistant: note\nError: sample\n❯ "
+        mock_tmux.return_value.get_history.return_value = (
+            "❯ refactor this\nassistant: note\nError: sample\n❯ "
+        )
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
         assert provider.get_status() == TerminalStatus.COMPLETED
 
@@ -538,7 +546,9 @@ class TestCopilotCliProviderMisc:
     def test_send_enter_uses_tmux_client(self, mock_tmux):
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
         provider._send_enter()
-        mock_tmux.return_value.send_special_key.assert_called_once_with("test-session", "window-0", "Enter")
+        mock_tmux.return_value.send_special_key.assert_called_once_with(
+            "test-session", "window-0", "Enter"
+        )
 
     def test_get_idle_pattern_for_log(self):
         provider = CopilotCliProvider("test1234", "test-session", "window-0")

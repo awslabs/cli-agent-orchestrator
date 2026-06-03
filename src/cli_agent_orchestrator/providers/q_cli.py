@@ -68,7 +68,9 @@ class QCliProvider(BaseProvider):
     def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
         """Get Q CLI status by analyzing terminal output."""
         logger.debug(f"get_status: tail_lines={tail_lines}")
-        output = get_backend().get_history(self.session_name, self.window_name, tail_lines=tail_lines)
+        output = get_backend().get_history(
+            self.session_name, self.window_name, tail_lines=tail_lines
+        )
 
         if not output:
             return TerminalStatus.ERROR

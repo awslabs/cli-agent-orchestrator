@@ -68,7 +68,7 @@ class ClaudeCodeProvider(BaseProvider):
         self._initialized = False
         self._agent_profile = agent_profile
         self._task_dispatched = False
-        self._last_dispatch_time: float = 0.0   # set by mark_input_received()
+        self._last_dispatch_time: float = 0.0  # set by mark_input_received()
         self._done_first_detected: float = 0.0  # first time herdr reported "done" this cycle
         self._idle_first_detected: float = 0.0  # first time herdr reported "idle" post-dispatch
 
@@ -247,9 +247,7 @@ class ClaudeCodeProvider(BaseProvider):
             # 2) Handle workspace trust prompt
             if re.search(TRUST_PROMPT_PATTERN, clean_output):
                 logger.info("Workspace trust prompt detected, auto-accepting")
-                get_backend().send_special_key(
-                    self.session_name, self.window_name, "Enter"
-                )
+                get_backend().send_special_key(self.session_name, self.window_name, "Enter")
                 return
 
             # 3) Claude Code fully started — no prompts needed
@@ -309,7 +307,11 @@ class ClaudeCodeProvider(BaseProvider):
             )
             if claude_started:
                 status = self.get_status()
-                if status in {TerminalStatus.IDLE, TerminalStatus.COMPLETED, TerminalStatus.WAITING_USER_ANSWER}:
+                if status in {
+                    TerminalStatus.IDLE,
+                    TerminalStatus.COMPLETED,
+                    TerminalStatus.WAITING_USER_ANSWER,
+                }:
                     break
             time.sleep(1.0)
         else:
@@ -367,12 +369,14 @@ class ClaudeCodeProvider(BaseProvider):
                 if waited >= 10.0:
                     logger.debug(
                         "[get_status] terminal=%s -> COMPLETED (native done, %.1fs flush wait elapsed)",
-                        self.terminal_id, waited,
+                        self.terminal_id,
+                        waited,
                     )
                     return TerminalStatus.COMPLETED
                 logger.debug(
                     "[get_status] terminal=%s -> PROCESSING (native done, flush wait %.1fs/10s)",
-                    self.terminal_id, waited,
+                    self.terminal_id,
+                    waited,
                 )
                 return TerminalStatus.PROCESSING
             if native == TerminalStatus.IDLE and self._task_dispatched:
@@ -386,17 +390,20 @@ class ClaudeCodeProvider(BaseProvider):
                     if elapsed >= 300.0:
                         logger.warning(
                             "[get_status] terminal=%s -> COMPLETED (native idle, %.0fs since dispatch, giving up)",
-                            self.terminal_id, elapsed,
+                            self.terminal_id,
+                            elapsed,
                         )
                         return TerminalStatus.COMPLETED
                     logger.debug(
                         "[get_status] terminal=%s -> COMPLETED (native idle, %.1fs flush wait elapsed)",
-                        self.terminal_id, waited,
+                        self.terminal_id,
+                        waited,
                     )
                     return TerminalStatus.COMPLETED
                 logger.debug(
                     "[get_status] terminal=%s -> PROCESSING (native idle, flush wait %.1fs/10s)",
-                    self.terminal_id, waited,
+                    self.terminal_id,
+                    waited,
                 )
                 return TerminalStatus.PROCESSING
             if native == TerminalStatus.IDLE:
@@ -406,12 +413,12 @@ class ClaudeCodeProvider(BaseProvider):
                 )
                 return TerminalStatus.IDLE
             # COMPLETED (no task dispatched), WAITING_USER_ANSWER, ERROR -- return directly
-            logger.debug(
-                "[get_status] terminal=%s -> %s (native)", self.terminal_id, native.value
-            )
+            logger.debug("[get_status] terminal=%s -> %s (native)", self.terminal_id, native.value)
             return native
 
-        output = get_backend().get_history(self.session_name, self.window_name, tail_lines=tail_lines)
+        output = get_backend().get_history(
+            self.session_name, self.window_name, tail_lines=tail_lines
+        )
 
         if not output:
             return TerminalStatus.ERROR

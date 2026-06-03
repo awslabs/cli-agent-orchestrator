@@ -193,21 +193,27 @@ class TestKimiCliProviderStatusDetection:
     @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
     def test_get_status_completed(self, mock_tmux):
         """Test COMPLETED detection when response is present with prompt."""
-        mock_tmux.return_value.get_history.return_value = _read_fixture("kimi_cli_completed_output.txt")
+        mock_tmux.return_value.get_history.return_value = _read_fixture(
+            "kimi_cli_completed_output.txt"
+        )
         provider = KimiCliProvider("term-1", "session-1", "window-1")
         assert provider.get_status() == TerminalStatus.COMPLETED
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
     def test_get_status_completed_complex(self, mock_tmux):
         """Test COMPLETED detection with multi-line code response."""
-        mock_tmux.return_value.get_history.return_value = _read_fixture("kimi_cli_complex_response.txt")
+        mock_tmux.return_value.get_history.return_value = _read_fixture(
+            "kimi_cli_complex_response.txt"
+        )
         provider = KimiCliProvider("term-1", "session-1", "window-1")
         assert provider.get_status() == TerminalStatus.COMPLETED
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
     def test_get_status_processing(self, mock_tmux):
         """Test PROCESSING detection when no prompt at bottom."""
-        mock_tmux.return_value.get_history.return_value = _read_fixture("kimi_cli_processing_output.txt")
+        mock_tmux.return_value.get_history.return_value = _read_fixture(
+            "kimi_cli_processing_output.txt"
+        )
         provider = KimiCliProvider("term-1", "session-1", "window-1")
         assert provider.get_status() == TerminalStatus.PROCESSING
 
@@ -252,7 +258,9 @@ class TestKimiCliProviderStatusDetection:
         mock_tmux.return_value.get_history.return_value = _read_fixture("kimi_cli_idle_output.txt")
         provider = KimiCliProvider("term-1", "session-1", "window-1")
         provider.get_status(tail_lines=20)
-        mock_tmux.return_value.get_history.assert_called_once_with("session-1", "window-1", tail_lines=20)
+        mock_tmux.return_value.get_history.assert_called_once_with(
+            "session-1", "window-1", tail_lines=20
+        )
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
     def test_get_status_idle_tall_terminal(self, mock_tmux):

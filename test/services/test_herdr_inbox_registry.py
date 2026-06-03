@@ -118,8 +118,7 @@ class TestModuleImport:
         attribute, so it actually exercises the import.
         """
         service_name = "cli_agent_orchestrator.services.herdr_inbox_service"
-        probe = textwrap.dedent(
-            f"""
+        probe = textwrap.dedent(f"""
             import sys
             import cli_agent_orchestrator.services.herdr_inbox_registry as r
             assert r.get_herdr_inbox_service() is None, "default should be None"
@@ -128,8 +127,7 @@ class TestModuleImport:
                 "TYPE_CHECKING guard was defeated"
             )
             print("OK")
-            """
-        )
+            """)
         result = subprocess.run(
             [sys.executable, "-c", probe],
             capture_output=True,

@@ -101,7 +101,9 @@ class TestQCliProviderStatusDetection:
     @patch("cli_agent_orchestrator.providers.q_cli.get_backend")
     def test_get_status_processing(self, mock_tmux):
         """Test PROCESSING status detection."""
-        mock_tmux.return_value.get_history.return_value = load_fixture("q_cli_processing_output.txt")
+        mock_tmux.return_value.get_history.return_value = load_fixture(
+            "q_cli_processing_output.txt"
+        )
 
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
         status = provider.get_status()
@@ -111,7 +113,9 @@ class TestQCliProviderStatusDetection:
     @patch("cli_agent_orchestrator.providers.q_cli.get_backend")
     def test_get_status_waiting_user_answer(self, mock_tmux):
         """Test WAITING_USER_ANSWER status detection."""
-        mock_tmux.return_value.get_history.return_value = load_fixture("q_cli_permission_output.txt")
+        mock_tmux.return_value.get_history.return_value = load_fixture(
+            "q_cli_permission_output.txt"
+        )
 
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
         status = provider.get_status()
@@ -147,7 +151,9 @@ class TestQCliProviderStatusDetection:
         status = provider.get_status(tail_lines=50)
 
         assert status == TerminalStatus.IDLE
-        mock_tmux.return_value.get_history.assert_called_once_with("test-session", "window-0", tail_lines=50)
+        mock_tmux.return_value.get_history.assert_called_once_with(
+            "test-session", "window-0", tail_lines=50
+        )
 
     @patch("cli_agent_orchestrator.providers.q_cli.get_backend")
     def test_status_processing_response_started_no_final_prompt(self, mock_tmux):
@@ -216,7 +222,9 @@ class TestQCliProviderStatusDetection:
         assert status == TerminalStatus.COMPLETED
 
         # Verify extraction gets the last response
-        message = provider.extract_last_message_from_script(mock_tmux.return_value.get_history.return_value)
+        message = provider.extract_last_message_from_script(
+            mock_tmux.return_value.get_history.return_value
+        )
         assert "Second response" in message
         assert "First response" not in message
 
@@ -473,7 +481,9 @@ class TestQCliProviderPromptPatterns:
     @patch("cli_agent_orchestrator.providers.q_cli.get_backend")
     def test_prompt_with_percentage(self, mock_tmux):
         """Test prompt with usage percentage."""
-        mock_tmux.return_value.get_history.return_value = "\x1b[36m[developer] \x1b[32m75%\x1b[35m>\x1b[39m "
+        mock_tmux.return_value.get_history.return_value = (
+            "\x1b[36m[developer] \x1b[32m75%\x1b[35m>\x1b[39m "
+        )
 
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
         status = provider.get_status()
@@ -483,7 +493,9 @@ class TestQCliProviderPromptPatterns:
     @patch("cli_agent_orchestrator.providers.q_cli.get_backend")
     def test_prompt_with_special_profile_characters(self, mock_tmux):
         """Test prompt with special characters in profile name."""
-        mock_tmux.return_value.get_history.return_value = "\x1b[36m[code-reviewer_v2]\x1b[35m>\x1b[39m "
+        mock_tmux.return_value.get_history.return_value = (
+            "\x1b[36m[code-reviewer_v2]\x1b[35m>\x1b[39m "
+        )
 
         provider = QCliProvider("test1234", "test-session", "window-0", "code-reviewer_v2")
         status = provider.get_status()
@@ -497,7 +509,9 @@ class TestQCliProviderHandoffScenarios:
     @patch("cli_agent_orchestrator.providers.q_cli.get_backend")
     def test_handoff_successful_status(self, mock_tmux):
         """Test COMPLETED status detection with successful handoff."""
-        mock_tmux.return_value.get_history.return_value = load_fixture("q_cli_handoff_successful.txt")
+        mock_tmux.return_value.get_history.return_value = load_fixture(
+            "q_cli_handoff_successful.txt"
+        )
 
         provider = QCliProvider("test1234", "test-session", "window-0", "supervisor")
         status = provider.get_status()
@@ -548,7 +562,9 @@ class TestQCliProviderHandoffScenarios:
     @patch("cli_agent_orchestrator.providers.q_cli.get_backend")
     def test_handoff_with_permission_prompt(self, mock_tmux):
         """Test WAITING_USER_ANSWER status during handoff requiring permission."""
-        mock_tmux.return_value.get_history.return_value = load_fixture("q_cli_handoff_with_permission.txt")
+        mock_tmux.return_value.get_history.return_value = load_fixture(
+            "q_cli_handoff_with_permission.txt"
+        )
 
         provider = QCliProvider("test1234", "test-session", "window-0", "supervisor")
         status = provider.get_status()
@@ -620,7 +636,9 @@ class TestQCliProviderEdgeCases:
     def test_long_agent_profile_name(self, mock_tmux):
         """Test with very long agent profile name."""
         long_profile = "very_long_agent_profile_name_that_exceeds_normal_length"
-        mock_tmux.return_value.get_history.return_value = f"\x1b[36m[{long_profile}]\x1b[35m>\x1b[39m "
+        mock_tmux.return_value.get_history.return_value = (
+            f"\x1b[36m[{long_profile}]\x1b[35m>\x1b[39m "
+        )
 
         provider = QCliProvider("test1234", "test-session", "window-0", long_profile)
         status = provider.get_status()
@@ -641,7 +659,9 @@ class TestQCliProviderEdgeCases:
         assert status == TerminalStatus.COMPLETED
 
         # Test message extraction
-        message = provider.extract_last_message_from_script(mock_tmux.return_value.get_history.return_value)
+        message = provider.extract_last_message_from_script(
+            mock_tmux.return_value.get_history.return_value
+        )
         assert "日本語" in message
         assert "café" in message
         assert "🚀" in message
@@ -655,7 +675,9 @@ class TestQCliProviderEdgeCases:
         )
 
         provider = QCliProvider("test1234", "test-session", "window-0", "developer")
-        message = provider.extract_last_message_from_script(mock_tmux.return_value.get_history.return_value)
+        message = provider.extract_last_message_from_script(
+            mock_tmux.return_value.get_history.return_value
+        )
 
         # Control characters should be cleaned
         assert "\x07" not in message  # Bell

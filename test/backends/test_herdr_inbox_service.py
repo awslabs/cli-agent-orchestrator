@@ -72,9 +72,7 @@ class TestHerdrInboxServiceCrossThreadRegistration:
             service._writer = AsyncMock()
 
             # Call register from a separate thread that has no event loop of its own.
-            t = threading.Thread(
-                target=service.register_terminal, args=("tid_cross", "pane-cross")
-            )
+            t = threading.Thread(target=service.register_terminal, args=("tid_cross", "pane-cross"))
             t.start()
             t.join()
 
@@ -166,24 +164,44 @@ class TestHerdrInboxServiceEventParsing:
         service.register_terminal("tid1", "pane-x", is_kiro=False)
 
         # Simulate two events: one "idle" (delivery) and one "working" (no delivery)
-        idle_event = json.dumps({
-            "event": "pane.agent_status_changed",
-            "data": {"pane_id": "pane-x", "agent_status": "idle"},
-        }).encode() + b"\n"
-        done_event = json.dumps({
-            "event": "pane.agent_status_changed",
-            "data": {"pane_id": "pane-x", "agent_status": "done"},
-        }).encode() + b"\n"
+        idle_event = (
+            json.dumps(
+                {
+                    "event": "pane.agent_status_changed",
+                    "data": {"pane_id": "pane-x", "agent_status": "idle"},
+                }
+            ).encode()
+            + b"\n"
+        )
+        done_event = (
+            json.dumps(
+                {
+                    "event": "pane.agent_status_changed",
+                    "data": {"pane_id": "pane-x", "agent_status": "done"},
+                }
+            ).encode()
+            + b"\n"
+        )
         # "working" event — should NOT trigger delivery
-        working_event = json.dumps({
-            "event": "pane.agent_status_changed",
-            "data": {"pane_id": "pane-x", "agent_status": "working"},
-        }).encode() + b"\n"
+        working_event = (
+            json.dumps(
+                {
+                    "event": "pane.agent_status_changed",
+                    "data": {"pane_id": "pane-x", "agent_status": "working"},
+                }
+            ).encode()
+            + b"\n"
+        )
         # Unknown pane — should NOT trigger delivery
-        other_event = json.dumps({
-            "event": "pane.agent_status_changed",
-            "data": {"pane_id": "pane-other", "agent_status": "idle"},
-        }).encode() + b"\n"
+        other_event = (
+            json.dumps(
+                {
+                    "event": "pane.agent_status_changed",
+                    "data": {"pane_id": "pane-other", "agent_status": "idle"},
+                }
+            ).encode()
+            + b"\n"
+        )
 
         async def run():
             reader = asyncio.StreamReader()
@@ -209,10 +227,15 @@ class TestHerdrInboxServiceEventParsing:
         service.register_terminal("tid1", "pane-x", is_kiro=False)
 
         # Old flat format — pane_id and agent_status at top level (not wrapped)
-        flat_event = json.dumps({
-            "pane_id": "pane-x",
-            "agent_status": "idle",
-        }).encode() + b"\n"
+        flat_event = (
+            json.dumps(
+                {
+                    "pane_id": "pane-x",
+                    "agent_status": "idle",
+                }
+            ).encode()
+            + b"\n"
+        )
 
         async def run():
             reader = asyncio.StreamReader()
@@ -329,9 +352,7 @@ class TestHerdrInboxServiceReconcile:
         service.register_terminal("tid1", "pane-live")
         service.register_terminal("tid2", "pane-stale")
 
-        pane_list_response = json.dumps({
-            "result": {"panes": [{"pane_id": "pane-live"}]}
-        })
+        pane_list_response = json.dumps({"result": {"panes": [{"pane_id": "pane-live"}]}})
         ws_list_response = json.dumps({"result": {"workspaces": []}})
 
         def subprocess_side_effect(cmd, **_):
@@ -363,9 +384,9 @@ class TestHerdrInboxServiceReconcile:
         service.register_terminal("tid1", "pane-a")
         service.register_terminal("tid2", "pane-b")
 
-        pane_list_response = json.dumps({
-            "result": {"panes": [{"pane_id": "pane-a"}, {"pane_id": "pane-b"}]}
-        })
+        pane_list_response = json.dumps(
+            {"result": {"panes": [{"pane_id": "pane-a"}, {"pane_id": "pane-b"}]}}
+        )
         ws_list_response = json.dumps({"result": {"workspaces": []}})
 
         def subprocess_side_effect(cmd, **_):
@@ -404,24 +425,24 @@ class TestHerdrInboxServiceReconcile:
     @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
     @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
-    def test_reconcile_deletes_ghost_db_terminals(
-        self, mock_list_terminals, mock_delete, mock_run
-    ):
+    def test_reconcile_deletes_ghost_db_terminals(self, mock_list_terminals, mock_delete, mock_run):
         """Ghost DB terminals (tab not in herdr) are deleted; live terminals are kept."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service._workspace_to_session = {"ws-abc": "my-session"}
 
         pane_list_response = json.dumps({"result": {"panes": []}})
-        ws_list_response = json.dumps({
-            "result": {"workspaces": [{"workspace_id": "ws-abc", "label": "my-session"}]}
-        })
-        tab_list_response = json.dumps({
-            "result": {
-                "tabs": [
-                    {"label": "live-window", "tab_id": "ws-abc:1", "workspace_id": "ws-abc"}
-                ]
+        ws_list_response = json.dumps(
+            {"result": {"workspaces": [{"workspace_id": "ws-abc", "label": "my-session"}]}}
+        )
+        tab_list_response = json.dumps(
+            {
+                "result": {
+                    "tabs": [
+                        {"label": "live-window", "tab_id": "ws-abc:1", "workspace_id": "ws-abc"}
+                    ]
+                }
             }
-        })
+        )
 
         def subprocess_side_effect(cmd, **_):
             m = MagicMock()
@@ -448,9 +469,7 @@ class TestHerdrInboxServiceReconcile:
 
     @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
     @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
-    def test_reconcile_skips_db_check_when_tab_list_fails(
-        self, mock_list_terminals, mock_run
-    ):
+    def test_reconcile_skips_db_check_when_tab_list_fails(self, mock_list_terminals, mock_run):
         """When herdr tab list returns non-zero, list_terminals_by_session is never called."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service._workspace_to_session = {"ws-abc": "my-session"}
@@ -490,17 +509,19 @@ class TestHerdrInboxServiceReconcile:
         service._workspace_to_session = {"ws-abc": "my-session"}
 
         pane_list_response = json.dumps({"result": {"panes": []}})
-        ws_list_response = json.dumps({
-            "result": {"workspaces": [{"workspace_id": "ws-abc", "label": "my-session"}]}
-        })
-        tab_list_response = json.dumps({
-            "result": {
-                "tabs": [
-                    {"label": "window-one", "tab_id": "ws-abc:1", "workspace_id": "ws-abc"},
-                    {"label": "window-two", "tab_id": "ws-abc:2", "workspace_id": "ws-abc"},
-                ]
+        ws_list_response = json.dumps(
+            {"result": {"workspaces": [{"workspace_id": "ws-abc", "label": "my-session"}]}}
+        )
+        tab_list_response = json.dumps(
+            {
+                "result": {
+                    "tabs": [
+                        {"label": "window-one", "tab_id": "ws-abc:1", "workspace_id": "ws-abc"},
+                        {"label": "window-two", "tab_id": "ws-abc:2", "workspace_id": "ws-abc"},
+                    ]
+                }
             }
-        })
+        )
 
         def subprocess_side_effect(cmd, **_):
             m = MagicMock()
@@ -537,6 +558,7 @@ class TestHerdrInboxServiceStartupDbCleanup:
             else:
                 m.stdout = tab_response
             return m
+
         return side_effect
 
     @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
@@ -546,12 +568,18 @@ class TestHerdrInboxServiceStartupDbCleanup:
         """Ghost terminals (window not in live herdr tabs) are deleted at startup."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
 
-        ws_response = json.dumps({"result": {"workspaces": [
-            {"workspace_id": "ws-abc", "label": "my-session"}
-        ]}})
-        tab_response = json.dumps({"result": {"tabs": [
-            {"label": "live-window", "tab_id": "ws-abc:1", "workspace_id": "ws-abc"},
-        ]}})
+        ws_response = json.dumps(
+            {"result": {"workspaces": [{"workspace_id": "ws-abc", "label": "my-session"}]}}
+        )
+        tab_response = json.dumps(
+            {
+                "result": {
+                    "tabs": [
+                        {"label": "live-window", "tab_id": "ws-abc:1", "workspace_id": "ws-abc"},
+                    ]
+                }
+            }
+        )
         mock_run.side_effect = self._make_subprocess_side_effect(ws_response, tab_response)
         mock_list.return_value = [
             {"id": "tid-live", "tmux_window": "live-window"},
@@ -580,12 +608,18 @@ class TestHerdrInboxServiceStartupDbCleanup:
         """No deletions when all DB terminals have matching live tabs."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
 
-        ws_response = json.dumps({"result": {"workspaces": [
-            {"workspace_id": "ws-abc", "label": "my-session"}
-        ]}})
-        tab_response = json.dumps({"result": {"tabs": [
-            {"label": "conductor-10e0", "tab_id": "ws-abc:1", "workspace_id": "ws-abc"},
-        ]}})
+        ws_response = json.dumps(
+            {"result": {"workspaces": [{"workspace_id": "ws-abc", "label": "my-session"}]}}
+        )
+        tab_response = json.dumps(
+            {
+                "result": {
+                    "tabs": [
+                        {"label": "conductor-10e0", "tab_id": "ws-abc:1", "workspace_id": "ws-abc"},
+                    ]
+                }
+            }
+        )
         mock_run.side_effect = self._make_subprocess_side_effect(ws_response, tab_response)
         mock_list.return_value = [{"id": "tid-1", "tmux_window": "conductor-10e0"}]
 
@@ -684,14 +718,24 @@ class TestHerdrInboxServiceLifecycleEvents:
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service._workspace_to_session["ws-x"] = "sess-x"
 
-        pane_closed = json.dumps({
-            "type": "pane.closed",
-            "data": {"pane_id": "pane-gone"},
-        }).encode() + b"\n"
-        ws_closed = json.dumps({
-            "type": "workspace.closed",
-            "data": {"workspace_id": "ws-unknown"},
-        }).encode() + b"\n"
+        pane_closed = (
+            json.dumps(
+                {
+                    "type": "pane.closed",
+                    "data": {"pane_id": "pane-gone"},
+                }
+            ).encode()
+            + b"\n"
+        )
+        ws_closed = (
+            json.dumps(
+                {
+                    "type": "workspace.closed",
+                    "data": {"workspace_id": "ws-unknown"},
+                }
+            ).encode()
+            + b"\n"
+        )
 
         handled = []
 
@@ -736,6 +780,7 @@ class TestHerdrInboxServiceSocketPath:
 
         mock_home.return_value = PurePosixPath("/home/user")
         import os
+
         os.environ.pop("XDG_CONFIG_HOME", None)
         path = HerdrInboxService._default_socket_path("cao")
         assert path.endswith("/.config/herdr/sessions/cao/herdr.sock")

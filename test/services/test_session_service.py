@@ -105,7 +105,9 @@ class TestGetSession:
     def test_get_session_success(self, mock_get_backend, mock_list_terminals):
         """Test getting session successfully."""
         mock_get_backend.return_value.session_exists.return_value = True
-        mock_get_backend.return_value.list_sessions.return_value = [{"id": "cao-test", "name": "Test Session"}]
+        mock_get_backend.return_value.list_sessions.return_value = [
+            {"id": "cao-test", "name": "Test Session"}
+        ]
         mock_list_terminals.return_value = [{"id": "terminal1", "session": "cao-test"}]
 
         result = get_session("cao-test")

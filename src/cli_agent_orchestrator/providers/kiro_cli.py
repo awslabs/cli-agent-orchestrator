@@ -295,7 +295,9 @@ class KiroCliProvider(BaseProvider):
             Current TerminalStatus enum value
         """
         logger.debug(f"get_status: tail_lines={tail_lines}")
-        output = get_backend().get_history(self.session_name, self.window_name, tail_lines=tail_lines)
+        output = get_backend().get_history(
+            self.session_name, self.window_name, tail_lines=tail_lines
+        )
 
         # No output indicates a terminal error
         if not output:

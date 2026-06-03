@@ -106,25 +106,33 @@ class TestGetStatusFromFixtures:
 
     @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     def test_idle_splash_returns_idle(self, mock_tmux):
-        mock_tmux.return_value.get_history.return_value = load_fixture("opencode_cli_idle_splash.txt")
+        mock_tmux.return_value.get_history.return_value = load_fixture(
+            "opencode_cli_idle_splash.txt"
+        )
         provider = make_provider()
         assert provider.get_status() == TerminalStatus.IDLE
 
     @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     def test_idle_splash_ansi_returns_idle(self, mock_tmux):
-        mock_tmux.return_value.get_history.return_value = load_ansi_fixture("opencode_cli_idle_splash.ansi.txt")
+        mock_tmux.return_value.get_history.return_value = load_ansi_fixture(
+            "opencode_cli_idle_splash.ansi.txt"
+        )
         provider = make_provider()
         assert provider.get_status() == TerminalStatus.IDLE
 
     @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     def test_processing_returns_processing(self, mock_tmux):
-        mock_tmux.return_value.get_history.return_value = load_fixture("opencode_cli_processing.txt")
+        mock_tmux.return_value.get_history.return_value = load_fixture(
+            "opencode_cli_processing.txt"
+        )
         provider = make_provider()
         assert provider.get_status() == TerminalStatus.PROCESSING
 
     @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     def test_processing_ansi_returns_processing(self, mock_tmux):
-        mock_tmux.return_value.get_history.return_value = load_ansi_fixture("opencode_cli_processing.ansi.txt")
+        mock_tmux.return_value.get_history.return_value = load_ansi_fixture(
+            "opencode_cli_processing.ansi.txt"
+        )
         provider = make_provider()
         assert provider.get_status() == TerminalStatus.PROCESSING
 
@@ -136,21 +144,27 @@ class TestGetStatusFromFixtures:
 
     @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     def test_completed_ansi_returns_completed(self, mock_tmux):
-        mock_tmux.return_value.get_history.return_value = load_ansi_fixture("opencode_cli_completed.ansi.txt")
+        mock_tmux.return_value.get_history.return_value = load_ansi_fixture(
+            "opencode_cli_completed.ansi.txt"
+        )
         provider = make_provider()
         assert provider.get_status() == TerminalStatus.COMPLETED
 
     @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     def test_permission_ansi_returns_waiting_user_answer(self, mock_tmux):
         # ANSI fixture required: plain text loses the △ Permission required overlay.
-        mock_tmux.return_value.get_history.return_value = load_ansi_fixture("opencode_cli_permission.ansi.txt")
+        mock_tmux.return_value.get_history.return_value = load_ansi_fixture(
+            "opencode_cli_permission.ansi.txt"
+        )
         provider = make_provider()
         assert provider.get_status() == TerminalStatus.WAITING_USER_ANSWER
 
     @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     def test_idle_post_completion_returns_idle(self, mock_tmux):
         # Use plain fixture — ANSI variant reuses the completed frame (see OPENCODE_FIXTURES.md).
-        mock_tmux.return_value.get_history.return_value = load_fixture("opencode_cli_idle_post_completion.txt")
+        mock_tmux.return_value.get_history.return_value = load_fixture(
+            "opencode_cli_idle_post_completion.txt"
+        )
         provider = make_provider()
         assert provider.get_status() == TerminalStatus.IDLE
 

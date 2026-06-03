@@ -82,13 +82,10 @@ class HerdrBackend(TerminalBackend):
         """
         cmd = ["herdr", "--session", self._herdr_session] + args
         try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=30
-            )
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             if check and result.returncode != 0:
                 raise TerminalBackendError(
-                    f"herdr command failed: {' '.join(cmd)}\n"
-                    f"stderr: {result.stderr.strip()}"
+                    f"herdr command failed: {' '.join(cmd)}\n" f"stderr: {result.stderr.strip()}"
                 )
             return result
         except subprocess.TimeoutExpired as e:
@@ -169,9 +166,7 @@ class HerdrBackend(TerminalBackend):
             data = self._parse_herdr_json(result.stdout)
             workspaces = data.get("workspaces", []) if isinstance(data, dict) else data
         except json.JSONDecodeError as e:
-            raise TerminalBackendError(
-                f"Failed to parse herdr workspace list output: {e}"
-            ) from e
+            raise TerminalBackendError(f"Failed to parse herdr workspace list output: {e}") from e
 
         for ws in workspaces:
             if ws.get("label") == session_name:
@@ -311,9 +306,7 @@ class HerdrBackend(TerminalBackend):
             try:
                 self._run_herdr(["pane", "run", new_pane_id, window_shell])
             except TerminalBackendError as e:
-                logger.warning(
-                    f"create_window: pane run failed for {new_pane_id} (non-fatal): {e}"
-                )
+                logger.warning(f"create_window: pane run failed for {new_pane_id} (non-fatal): {e}")
 
         logger.info(f"Created herdr tab in workspace {session_name}")
         return window_name
@@ -323,9 +316,7 @@ class HerdrBackend(TerminalBackend):
         try:
             pane_id = self._resolve_pane_id_from_window(session_name, window_name)
         except TerminalBackendError:
-            logger.warning(
-                f"kill_window: could not resolve pane for {session_name}:{window_name}"
-            )
+            logger.warning(f"kill_window: could not resolve pane for {session_name}:{window_name}")
             return False
 
         result = self._run_herdr(["pane", "close", pane_id], check=False)
@@ -482,9 +473,7 @@ class HerdrBackend(TerminalBackend):
         """Herdr uses socket events for inbox delivery."""
         return True
 
-    def get_native_status(
-        self, session_name: str, window_name: str
-    ) -> Optional[TerminalStatus]:
+    def get_native_status(self, session_name: str, window_name: str) -> Optional[TerminalStatus]:
         """Query herdr's native agent_status for a pane.
 
         Uses herdr pane get to read the agent_status field directly, avoiding
@@ -633,7 +622,10 @@ class HerdrBackend(TerminalBackend):
             return None
 
     def _inject_env_vars(
-        self, session_name: str, window_name: str, terminal_id: str,
+        self,
+        session_name: str,
+        window_name: str,
+        terminal_id: str,
         pane_id: Optional[str] = None,
     ) -> None:
         """Inject CAO_TERMINAL_ID and CAO_SESSION_NAME into the specified pane.
