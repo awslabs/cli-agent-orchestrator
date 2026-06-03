@@ -17,6 +17,56 @@ Check if the server is running.
 
 ---
 
+## Providers
+
+### GET /agents/providers
+List available providers with installation status.
+
+**Response:** Array of provider objects
+```json
+[
+  {
+    "name": "kiro_cli",
+    "binary": "kiro-cli",
+    "installed": true
+  },
+  {
+    "name": "claude_code",
+    "binary": "claude",
+    "installed": true
+  },
+  {
+    "name": "q_cli",
+    "binary": "q",
+    "installed": false
+  },
+  {
+    "name": "codex",
+    "binary": "codex",
+    "installed": true
+  },
+  {
+    "name": "gemini_cli",
+    "binary": "gemini",
+    "installed": true
+  },
+  {
+    "name": "kimi_cli",
+    "binary": "kimi",
+    "installed": false
+  },
+  {
+    "name": "copilot_cli",
+    "binary": "copilot",
+    "installed": false
+  }
+]
+```
+
+**Note:** The `installed` field checks if the provider binary is available in the system PATH via `shutil.which()`.
+
+---
+
 ## Sessions
 
 ### POST /sessions

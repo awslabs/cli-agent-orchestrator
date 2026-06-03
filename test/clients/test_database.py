@@ -26,11 +26,13 @@ from cli_agent_orchestrator.clients.database import (
     get_terminal_metadata,
     init_db,
     list_flows,
+    list_pending_receiver_ids_by_provider,
     list_terminals_by_session,
     update_flow_enabled,
     update_flow_run_times,
     update_last_active,
     update_message_status,
+    update_terminal_shell_command,
 )
 from cli_agent_orchestrator.models.inbox import MessageStatus
 
@@ -74,6 +76,7 @@ class TestTerminalOperations:
         mock_terminal.tmux_window = "window-0"
         mock_terminal.provider = "kiro_cli"
         mock_terminal.agent_profile = "developer"
+        mock_terminal.allowed_tools = None
         mock_terminal.last_active = datetime.now()
 
         mock_query = MagicMock()
@@ -118,6 +121,41 @@ class TestTerminalOperations:
         update_last_active("test123")
 
         mock_session.commit.assert_called_once()
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_update_terminal_shell_command(self, mock_session_class):
+        """Test updating shell_command baseline for a terminal."""
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_terminal = MagicMock()
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = mock_terminal
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        result = update_terminal_shell_command("test123", "bash")
+
+        assert result is True
+        assert mock_terminal.shell_command == "bash"
+        mock_session.commit.assert_called_once()
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_update_terminal_shell_command_not_found(self, mock_session_class):
+        """Test updating shell_command for a terminal that doesn't exist."""
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = None
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        result = update_terminal_shell_command("nonexistent", "bash")
+
+        assert result is False
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_delete_terminal(self, mock_session_class):
@@ -176,6 +214,25 @@ class TestTerminalOperations:
 
         assert len(result) == 1
         assert result[0]["id"] == "test123"
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_list_pending_receiver_ids_by_provider(self, mock_session_class):
+        """Test listing pending receivers for a specific provider."""
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_query = MagicMock()
+        mock_query.join.return_value.filter.return_value.distinct.return_value.all.return_value = [
+            ("receiver-1",),
+            ("receiver-2",),
+        ]
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        result = list_pending_receiver_ids_by_provider("opencode_cli")
+
+        assert result == ["receiver-1", "receiver-2"]
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_delete_terminals_by_session(self, mock_session_class):
@@ -542,8 +599,69 @@ class TestInitDb:
     """Tests for init_db function."""
 
     @patch("cli_agent_orchestrator.clients.database.Base")
-    def test_init_db(self, mock_base):
+    @patch("cli_agent_orchestrator.clients.database._migrate_project_aliases_schema")
+    def test_init_db(self, mock_alias_migrate, mock_base):
         """Test database initialization."""
         init_db()
 
         mock_base.metadata.create_all.assert_called_once()
+
+
+class TestProjectAliasMigration:
+    """Tests for the project_aliases alias-only primary-key migration."""
+
+    def test_legacy_composite_pk_table_is_rebuilt(self, tmp_path, monkeypatch):
+        """A legacy table with composite PK (project_id, alias) is dropped."""
+        import sqlite3
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        db_file = tmp_path / "legacy.db"
+        with sqlite3.connect(str(db_file)) as conn:
+            conn.execute(
+                "CREATE TABLE project_aliases ("
+                "project_id TEXT NOT NULL, alias TEXT NOT NULL, kind TEXT NOT NULL, "
+                "created_at TEXT, PRIMARY KEY (project_id, alias))"
+            )
+            conn.execute("INSERT INTO project_aliases VALUES ('p1', 'a1', 'cwd_hash', NULL)")
+            conn.commit()
+
+        monkeypatch.setattr(db_mod, "DATABASE_FILE", db_file, raising=False)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.constants.DATABASE_FILE", db_file, raising=False
+        )
+
+        db_mod._migrate_project_aliases_schema()
+
+        with sqlite3.connect(str(db_file)) as conn:
+            exists = conn.execute(
+                "SELECT name FROM sqlite_master " "WHERE type='table' AND name='project_aliases'"
+            ).fetchone()
+        assert exists is None, "legacy table should be dropped for create_all to rebuild"
+
+    def test_alias_only_pk_table_is_left_intact(self, tmp_path, monkeypatch):
+        """A table already keyed on alias alone is not touched."""
+        import sqlite3
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        db_file = tmp_path / "current.db"
+        with sqlite3.connect(str(db_file)) as conn:
+            conn.execute(
+                "CREATE TABLE project_aliases ("
+                "alias TEXT PRIMARY KEY, project_id TEXT NOT NULL, kind TEXT NOT NULL, "
+                "created_at TEXT)"
+            )
+            conn.execute("INSERT INTO project_aliases VALUES ('a1', 'p1', 'cwd_hash', NULL)")
+            conn.commit()
+
+        monkeypatch.setattr(db_mod, "DATABASE_FILE", db_file, raising=False)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.constants.DATABASE_FILE", db_file, raising=False
+        )
+
+        db_mod._migrate_project_aliases_schema()
+
+        with sqlite3.connect(str(db_file)) as conn:
+            rows = conn.execute("SELECT alias, project_id FROM project_aliases").fetchall()
+        assert rows == [("a1", "p1")], "current-schema table must be left intact"

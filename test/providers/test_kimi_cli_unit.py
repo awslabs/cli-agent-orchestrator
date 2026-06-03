@@ -98,6 +98,7 @@ class TestKimiCliProviderInitialization:
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = "You are a helpful assistant"
         mock_profile.mcpServers = None
         mock_load.return_value = mock_profile
@@ -136,6 +137,7 @@ class TestKimiCliProviderInitialization:
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {
             "cao-mcp-server": {
@@ -550,6 +552,7 @@ class TestKimiCliProviderBuildCommand:
     def test_build_command_with_system_prompt(self, mock_load):
         """Test command with agent profile containing system prompt."""
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = "You are a developer"
         mock_profile.mcpServers = None
         mock_load.return_value = mock_profile
@@ -570,6 +573,7 @@ class TestKimiCliProviderBuildCommand:
     def test_build_command_with_mcp_config(self, mock_load, tmp_path):
         """Test command with MCP server configuration including CAO_TERMINAL_ID injection."""
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {"test-server": {"command": "npx", "args": ["test"]}}
         mock_load.return_value = mock_profile
@@ -591,6 +595,7 @@ class TestKimiCliProviderBuildCommand:
     def test_build_command_creates_agent_yaml(self, mock_load):
         """Test that agent YAML and system prompt files are created correctly."""
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = "Custom system prompt"
         mock_profile.mcpServers = None
         mock_load.return_value = mock_profile
@@ -625,6 +630,7 @@ class TestKimiCliProviderBuildCommand:
         type(mock_server).__instancecheck__ = lambda cls, inst: False
 
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {"my-server": mock_server}
         mock_load.return_value = mock_profile
@@ -641,6 +647,7 @@ class TestKimiCliProviderBuildCommand:
     def test_build_command_mcp_preserves_existing_env(self, mock_load):
         """Test that CAO_TERMINAL_ID injection preserves existing env vars."""
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {
             "test-server": {
@@ -668,6 +675,7 @@ class TestKimiCliProviderBuildCommand:
     def test_build_command_mcp_does_not_override_existing_terminal_id(self, mock_load):
         """Test that existing CAO_TERMINAL_ID in env is not overwritten."""
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {
             "test-server": {
@@ -698,6 +706,7 @@ class TestKimiCliProviderBuildCommand:
         avoiding race conditions when multiple workers are created in parallel.
         """
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {
             "cao-mcp-server": {"command": "uv", "args": ["run", "cao-mcp-server"]}
@@ -733,6 +742,7 @@ class TestKimiCliProviderBuildCommand:
     def test_build_command_mcp_timeout_only_once(self, mock_load, tmp_path):
         """Test that config.toml is only modified once even with multiple instances."""
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {
             "cao-mcp-server": {"command": "uv", "args": ["run", "cao-mcp-server"]}
@@ -763,6 +773,7 @@ class TestKimiCliProviderBuildCommand:
     def test_build_command_no_timeout_without_mcp(self, mock_load, tmp_path):
         """Test that MCP tool timeout is NOT modified when no MCP servers are configured."""
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = "You are helpful"
         mock_profile.mcpServers = None
         mock_load.return_value = mock_profile
@@ -787,6 +798,7 @@ class TestKimiCliProviderBuildCommand:
     def test_mcp_timeout_config_missing(self, mock_load, tmp_path):
         """Test graceful handling when ~/.kimi/config.toml doesn't exist."""
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {
             "cao-mcp-server": {"command": "uv", "args": ["run", "cao-mcp-server"]}
@@ -808,6 +820,7 @@ class TestKimiCliProviderBuildCommand:
     def test_mcp_timeout_already_high(self, mock_load, tmp_path):
         """Test that timeout is not downgraded if already >= 600000."""
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {
             "cao-mcp-server": {"command": "uv", "args": ["run", "cao-mcp-server"]}
@@ -833,6 +846,7 @@ class TestKimiCliProviderBuildCommand:
     def test_build_command_profile_no_system_prompt(self, mock_load):
         """Test command with profile that has no system prompt (no agent file, but temp dir exists)."""
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = None
         mock_profile.mcpServers = None
         mock_load.return_value = mock_profile
@@ -849,6 +863,7 @@ class TestKimiCliProviderBuildCommand:
     def test_build_command_profile_empty_system_prompt(self, mock_load):
         """Test command with profile that has empty string system prompt."""
         mock_profile = MagicMock()
+        mock_profile.model = None
         mock_profile.system_prompt = ""
         mock_profile.mcpServers = None
         mock_load.return_value = mock_profile
@@ -865,6 +880,36 @@ class TestKimiCliProviderBuildCommand:
 # =============================================================================
 # Misc / lifecycle tests
 # =============================================================================
+
+
+class TestKimiCliProviderModelFlag:
+    """Tests that profile.model is forwarded to Kimi CLI via --model."""
+
+    @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
+    def test_build_command_appends_model_when_set(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = "kimi-k2-turbo"
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_load.return_value = mock_profile
+
+        provider = KimiCliProvider("term-1", "sess", "win", "agent")
+        command = provider._build_kimi_command()
+
+        assert "--model kimi-k2-turbo" in command
+
+    @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
+    def test_build_command_omits_model_when_unset(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_load.return_value = mock_profile
+
+        provider = KimiCliProvider("term-1", "sess", "win", "agent")
+        command = provider._build_kimi_command()
+
+        assert "--model" not in command
 
 
 class TestKimiCliProviderMisc:

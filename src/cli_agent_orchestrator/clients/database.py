@@ -1,10 +1,19 @@
 """Minimal database client with only terminal metadata."""
 
 import logging
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import Boolean, Column, DateTime, Integer, String, create_engine
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    Integer,
+    String,
+    UniqueConstraint,
+    create_engine,
+)
 from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
 
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
@@ -26,6 +35,8 @@ class TerminalModel(Base):
     tmux_window = Column(String, nullable=False)  # "window-name"
     provider = Column(String, nullable=False)  # "q_cli", "claude_code"
     agent_profile = Column(String)  # "developer", "reviewer" (optional)
+    allowed_tools = Column(String, nullable=True)  # JSON-encoded list of CAO tool names
+    shell_command = Column(String, nullable=True)  # shell process name captured before kiro launch
     last_active = Column(DateTime, default=datetime.now)
 
 
@@ -40,6 +51,56 @@ class InboxModel(Base):
     message = Column(String, nullable=False)
     status = Column(String, nullable=False)  # MessageStatus enum value
     created_at = Column(DateTime, default=datetime.now)
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class MemoryMetadataModel(Base):
+    """SQLAlchemy model for memory metadata (Phase 2 U1).
+
+    SQLite is the source of truth for metadata queries; wiki markdown
+    files remain the content store. Each row corresponds to exactly one
+    wiki file on disk.
+    """
+
+    __tablename__ = "memory_metadata"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    key = Column(String, nullable=False)
+    memory_type = Column(String, nullable=False)
+    scope = Column(String, nullable=False)
+    scope_id = Column(String, nullable=True)
+    file_path = Column(String, nullable=False)
+    tags = Column(String, nullable=False, default="")
+    source_provider = Column(String, nullable=True)
+    source_terminal_id = Column(String, nullable=True)
+    token_estimate = Column(Integer, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=_utcnow)
+    updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
+
+    __table_args__ = (UniqueConstraint("key", "scope", "scope_id", name="uq_memory_key_scope"),)
+
+
+class ProjectAliasModel(Base):
+    """SQLAlchemy model for project identity aliases (Phase 2.5 U6).
+
+    Maps historical/alternate project identifiers (cwd hashes, manual labels)
+    to a canonical ``project_id`` so memory recall survives directory rename
+    and worktree layouts.
+    """
+
+    __tablename__ = "project_aliases"
+
+    # ``alias`` is the sole primary key: an alias maps to exactly one canonical
+    # project_id, so reverse lookups (get_project_id_by_alias) are stable. A
+    # cwd-hash first resolved via an override and later via its git remote
+    # upserts the same row rather than creating a second, ambiguous mapping.
+    alias = Column(String, primary_key=True)
+    project_id = Column(String, nullable=False, index=True)
+    kind = Column(String, nullable=False)  # "git_remote" | "cwd_hash" | "manual"
+    created_at = Column(DateTime(timezone=True), default=_utcnow)
 
 
 class FlowModel(Base):
@@ -65,8 +126,90 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
 def init_db() -> None:
-    """Initialize database tables."""
+    """Initialize database tables and apply schema migrations."""
+    _migrate_project_aliases_schema()
     Base.metadata.create_all(bind=engine)
+    _migrate_terminals_schema()
+    _migrate_memory_indexes()
+
+
+def _migrate_project_aliases_schema() -> None:
+    """Rebuild project_aliases if it predates the alias-only primary key.
+
+    The table originally used a composite PK ``(project_id, alias)``, which
+    allowed one alias to map to several project_ids and made reverse lookups
+    nondeterministic. The new schema keys on ``alias`` alone. SQLite cannot
+    alter a primary key in place, so drop and recreate. The table is an
+    opportunistic identity cache rebuilt by ``resolve_project_id`` on demand,
+    so dropping rows is safe. Runs before ``create_all`` so the fresh schema
+    is created with the new PK.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            row = conn.execute(
+                "SELECT name FROM sqlite_master " "WHERE type='table' AND name='project_aliases'"
+            ).fetchone()
+            if row is None:
+                return  # table doesn't exist yet — create_all builds it fresh
+            cols = conn.execute("PRAGMA table_info(project_aliases)").fetchall()
+            # PRAGMA returns rows: (cid, name, type, notnull, dflt_value, pk).
+            # In the legacy schema both project_id and alias have pk>0; in the
+            # new schema only alias does.
+            pk_cols = {c[1] for c in cols if c[5]}
+            if pk_cols != {"alias"}:
+                conn.execute("DROP TABLE project_aliases")
+                conn.commit()
+                logger.info("Migration: rebuilt project_aliases with alias-only primary key")
+    except Exception as e:
+        logger.debug(f"project_aliases migration skipped: {e}")
+
+
+def _migrate_memory_indexes() -> None:
+    """Add explicit indexes on memory_metadata for query performance."""
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory_metadata (scope, scope_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memory_updated ON memory_metadata (updated_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memory_type ON memory_metadata (memory_type)"
+            )
+    except Exception as e:
+        logger.debug(f"Memory index migration skipped: {e}")
+
+
+def _migrate_terminals_schema() -> None:
+    """Add allowed_tools and shell_command columns to terminals table if missing (schema migration)."""
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        conn = sqlite3.connect(str(DATABASE_FILE))
+        cursor = conn.execute("PRAGMA table_info(terminals)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "allowed_tools" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN allowed_tools TEXT")
+            conn.commit()
+            logger.info("Migration: added allowed_tools column to terminals table")
+        if "shell_command" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN shell_command TEXT")
+            conn.commit()
+            logger.info("Migration: added shell_command column to terminals table")
+        conn.close()
+    except Exception as e:
+        logger.warning(f"Migration check for terminals schema failed: {e}")
 
 
 def create_terminal(
@@ -75,8 +218,12 @@ def create_terminal(
     tmux_window: str,
     provider: str,
     agent_profile: Optional[str] = None,
+    allowed_tools: Optional[List[str]] = None,
+    shell_command: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record."""
+    import json as _json
+
     with SessionLocal() as db:
         terminal = TerminalModel(
             id=terminal_id,
@@ -84,6 +231,8 @@ def create_terminal(
             tmux_window=tmux_window,
             provider=provider,
             agent_profile=agent_profile,
+            allowed_tools=_json.dumps(allowed_tools) if allowed_tools else None,
+            shell_command=shell_command,
         )
         db.add(terminal)
         db.commit()
@@ -93,11 +242,15 @@ def create_terminal(
             "tmux_window": terminal.tmux_window,
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
+            "allowed_tools": allowed_tools,
+            "shell_command": terminal.shell_command,
         }
 
 
 def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
     """Get terminal metadata by ID."""
+    import json as _json
+
     with SessionLocal() as db:
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if not terminal:
@@ -106,12 +259,15 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
         logger.debug(
             f"Retrieved terminal metadata for {terminal_id}: provider={terminal.provider}, session={terminal.tmux_session}"
         )
+        allowed_tools = _json.loads(terminal.allowed_tools) if terminal.allowed_tools else None
         return {
             "id": terminal.id,
             "tmux_session": terminal.tmux_session,
             "tmux_window": terminal.tmux_window,
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
+            "allowed_tools": allowed_tools,
+            "shell_command": terminal.shell_command,
             "last_active": terminal.last_active,
         }
 
@@ -142,6 +298,50 @@ def update_last_active(terminal_id: str) -> bool:
             db.commit()
             return True
         return False
+
+
+def update_terminal_shell_command(terminal_id: str, shell_command: str) -> bool:
+    """Update the shell_command baseline for a terminal."""
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if terminal:
+            terminal.shell_command = shell_command
+            db.commit()
+            return True
+        return False
+
+
+def list_all_terminals() -> List[Dict[str, Any]]:
+    """List all terminals."""
+    with SessionLocal() as db:
+        terminals = db.query(TerminalModel).all()
+        return [
+            {
+                "id": t.id,
+                "tmux_session": t.tmux_session,
+                "tmux_window": t.tmux_window,
+                "provider": t.provider,
+                "agent_profile": t.agent_profile,
+                "last_active": t.last_active,
+            }
+            for t in terminals
+        ]
+
+
+def list_pending_receiver_ids_by_provider(provider: str) -> List[str]:
+    """List receiver terminal IDs with pending messages for a specific provider."""
+    with SessionLocal() as db:
+        rows = (
+            db.query(InboxModel.receiver_id)
+            .join(TerminalModel, TerminalModel.id == InboxModel.receiver_id)
+            .filter(
+                TerminalModel.provider == provider,
+                InboxModel.status == MessageStatus.PENDING.value,
+            )
+            .distinct()
+            .all()
+        )
+        return [row[0] for row in rows]
 
 
 def delete_terminal(terminal_id: str) -> bool:
@@ -221,6 +421,61 @@ def get_inbox_messages(
             )
             for msg in messages
         ]
+
+
+def record_project_alias(project_id: str, alias: str, kind: str) -> None:
+    """Idempotently record a project_id ↔ alias mapping (Phase 2.5 U6).
+
+    Used opportunistically by ``resolve_project_id`` to track historical
+    cwd-hash and git-remote-url aliases for a canonical project_id. Best-effort
+    only — DB errors are swallowed so identity resolution is never blocked.
+    """
+    if not project_id or not alias or project_id == alias:
+        return
+    try:
+        with SessionLocal() as db:
+            # Upsert by alias (the primary key). If the same alias was already
+            # mapped — e.g. recorded against an override id, then re-resolved
+            # via git remote — repoint it to the current canonical project_id
+            # so reverse lookups stay deterministic instead of duplicating.
+            existing = db.query(ProjectAliasModel).filter(ProjectAliasModel.alias == alias).first()
+            if existing is None:
+                db.add(ProjectAliasModel(project_id=project_id, alias=alias, kind=kind))
+                db.commit()
+            elif existing.project_id != project_id or existing.kind != kind:
+                existing.project_id = project_id
+                existing.kind = kind
+                db.commit()
+    except Exception as e:
+        logger.debug(f"record_project_alias failed (non-fatal): {e}")
+
+
+def get_project_id_by_alias(alias: str) -> Optional[str]:
+    """Return the canonical ``project_id`` for an alias, or None if unknown."""
+    if not alias:
+        return None
+    try:
+        with SessionLocal() as db:
+            row = db.query(ProjectAliasModel).filter(ProjectAliasModel.alias == alias).first()
+            return row.project_id if row else None
+    except Exception as e:
+        logger.debug(f"get_project_id_by_alias failed (non-fatal): {e}")
+        return None
+
+
+def list_aliases_for_project(project_id: str) -> List[Dict[str, Any]]:
+    """List all aliases recorded for a canonical ``project_id``."""
+    if not project_id:
+        return []
+    try:
+        with SessionLocal() as db:
+            rows = (
+                db.query(ProjectAliasModel).filter(ProjectAliasModel.project_id == project_id).all()
+            )
+            return [{"project_id": r.project_id, "alias": r.alias, "kind": r.kind} for r in rows]
+    except Exception as e:
+        logger.debug(f"list_aliases_for_project failed (non-fatal): {e}")
+        return []
 
 
 def update_message_status(message_id: int, status: MessageStatus) -> bool:

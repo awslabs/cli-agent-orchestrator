@@ -44,17 +44,21 @@ curl -X POST "http://localhost:9889/sessions?provider=kiro_cli&agent_profile=dev
 
 The Kiro CLI provider detects terminal states by analyzing ANSI-stripped output:
 
-- **IDLE**: Agent prompt visible (`[profile_name] >` pattern), no response content
+- **IDLE**: Agent prompt visible (legacy `[profile_name] >` or new TUI `ask a question, or describe a task`), no response content
 - **PROCESSING**: No idle prompt found in output (agent is generating response)
-- **COMPLETED**: Green arrow (`>`) response marker present + idle prompt after it
+- **COMPLETED**: Green arrow (`>`) response marker (legacy) or `▸ Credits:` marker (TUI) present + idle prompt after it
 - **WAITING_USER_ANSWER**: Permission prompt visible (`Allow this action? [y/n/t]:`)
 - **ERROR**: Known error indicators present (e.g., "Kiro is having trouble responding right now")
 
 Status detection priority: no prompt → PROCESSING → ERROR → WAITING_USER_ANSWER → COMPLETED → IDLE.
 
+The provider supports both the legacy UI prompt format and the new TUI format for all status detection and message extraction.
+
 ### Dynamic Prompt Pattern
 
-The idle prompt pattern is built dynamically from the agent profile name:
+The provider supports two prompt formats:
+
+**Legacy UI** (used with `--legacy-ui` flag):
 
 ```
 [developer] >          # Basic prompt
@@ -66,15 +70,34 @@ The idle prompt pattern is built dynamically from the agent profile name:
 
 Pattern: `\[{agent_profile}\]\s*(?:\d+%\s*)?(?:\u03bb\s*)?!?>\s*`
 
+**New TUI** (default in latest Kiro CLI):
+
+```
+code_supervisor · claude-opus-4.6-1m · ◔ 1%
+ ask a question, or describe a task ↵
+```
+
+The new TUI idle state is detected by the `ask a question, or describe a task` pattern, and completion is detected by the `▸ Credits:` marker followed by an idle prompt. The provider launches in TUI mode by default and auto-detects which format is active.
+
 ### Message Extraction
 
-The provider extracts the last assistant response using the green arrow indicator:
+The provider uses a dual-path extraction strategy:
 
+**Legacy mode** (green arrow markers):
 1. Strip ANSI codes from output
 2. Find all green arrow (`>`) markers (response start)
 3. Take the last one
 4. Find the next idle prompt after it (response end)
-5. Extract and clean text between them (strip ANSI, escape sequences, control characters)
+5. Extract and clean text between them
+
+**TUI mode** (separator + Credits markers):
+1. Find the last `▸ Credits:` line (response end marker)
+2. Find the last separator (`────`) before Credits (response start area)
+3. Extract text between separator and Credits
+4. Skip the first paragraph (user message echo)
+5. Clean remaining text (ANSI, escape sequences, control characters)
+
+The provider tries legacy extraction first; if no green arrows are found, it falls back to TUI extraction. This is backward compatible with `--legacy-ui` wrapper scripts.
 
 ### Permission Prompts
 
@@ -94,13 +117,13 @@ The profile name determines the prompt pattern used for status detection. Built-
 
 ### Launch Command
 
-The provider constructs a simple command:
+The provider launches using kiro-cli's default UI, with automatic `--legacy-ui` fallback:
 
 ```
 kiro-cli chat --agent developer
 ```
 
-No additional flags are needed for tmux compatibility.
+The provider auto-detects whether the terminal is in legacy or TUI mode and uses the appropriate detection patterns. If initialization times out, the provider automatically exits and retries with `--legacy-ui`. Both TUI and legacy detection patterns are fully supported.
 
 ## Implementation Notes
 
@@ -163,6 +186,13 @@ uv run pytest -m e2e test/e2e/test_supervisor_orchestration.py -v -k KiroCli -o 
    ```
 
 4. **Prompt Pattern Not Matching**:
-   - The prompt pattern is built from the agent profile name
-   - Custom profiles must use the standard `[name] >` prompt format
+   - The provider supports both legacy (`[name] >`) and new TUI (`ask a question, or describe a task`) formats
+   - TUI mode is the default; the provider auto-detects which format is active
+   - If you need legacy mode, add `--legacy-ui` via a wrapper script
    - Check with: `kiro-cli chat --agent your_profile`
+
+5. **JSON-Only Agent Profiles (AIM-Installed)**:
+   - Agents installed via AIM (Agent Install Manager) may only have `.json` profiles (e.g., `~/.kiro/agents/librarian/agent-spec.json`)
+   - CAO's `load_agent_profile()` primarily scans for `.md` files
+   - If the agent is not found, CAO gracefully falls back — kiro-cli resolves `.json` profiles natively
+   - As a workaround, you can create a stub `.md` file alongside the `.json` profile

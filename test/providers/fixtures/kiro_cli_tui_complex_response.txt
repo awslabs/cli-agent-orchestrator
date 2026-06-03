@@ -1,0 +1,32 @@
+────────────────────────────────────────────────────
+  Show me Python and JavaScript examples
+
+  Here's a detailed response with code examples.
+
+  ## Python Example
+
+  ```python
+  def hello_world():
+      print("Hello, World!")
+      return True
+  ```
+
+  ## JavaScript Example
+
+  ```javascript
+  function helloWorld() {
+      console.log("Hello, World!");
+      return true;
+  }
+  ```
+
+  Key points to consider:
+  1. Function naming conventions
+  2. Return values
+
+▸ Credits: 1.05 • Time: 12s
+
+────────────────────────────────────────────────────
+developer · claude-opus-4.6-1m · ◔ 5%              ~/project · (main)
+
+ Ask a question or describe a task ↵  ctrl+g: agent monitor

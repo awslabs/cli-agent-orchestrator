@@ -107,6 +107,19 @@ MCP servers from agent profiles are registered by writing directly to `~/.gemini
 
 When the provider's `cleanup()` method is called, it removes the registered entries from `~/.gemini/settings.json` directly (no Node.js subprocess needed).
 
+## Tool Restrictions
+
+Gemini CLI enforces tool restrictions via the **Policy Engine** — TOML deny rules written to `~/.gemini/policies/cao-{terminal_id}.toml`. Deny rules completely exclude tools from the model's memory, providing hard enforcement even in `--yolo` mode.
+
+| CAO `--yolo` | Behavior |
+|---|---|
+| **Yes** (`allowed_tools=["*"]`) | `gemini --yolo` only — fully unrestricted |
+| **No** (restricted tools) | `gemini --yolo` + TOML deny rules — auto-approve allowed tools, hard-block denied tools |
+
+Each terminal gets its own policy file (keyed by `terminal_id`), so concurrent sessions don't conflict. The file is cleaned up when the session ends.
+
+> **Note:** The previous `excludeTools` approach in `settings.json` was replaced because `--yolo` bypasses `excludeTools` (confirmed in Gemini CLI issue #20469). Policy Engine deny rules are the recommended replacement and work in all modes.
+
 ## Command Flags
 
 | Flag | Purpose |
@@ -122,7 +135,7 @@ When the provider's `cleanup()` method is called, it removes the registered entr
 2. **Status Detection**: Check bottom 50 lines for idle prompt + processing spinner (`IDLE_PROMPT_TAIL_LINES = 50`)
 3. **Message Extraction**: Line-based approach filtering TUI chrome
 4. **Exit**: Send `C-d` (Ctrl+D)
-5. **Cleanup**: Remove MCP servers, reset state
+5. **Cleanup**: Remove MCP servers, remove policy TOML file, reset state
 
 ### Terminal Output Format
 

@@ -1,0 +1,36 @@
+{
+    "id": "cao",
+    "version": "2.2.0",
+    "name": "CLI Agent Orchestrator",
+    "description": "Multi-agent orchestration framework for CLI-based AI coding agents",
+    "options": {
+        "version": {
+            "type": "string",
+            "default": "latest",
+            "description": "CAO version (git ref or 'latest')"
+        },
+        "webui": {
+            "type": "boolean",
+            "default": false,
+            "description": "Build and include the web UI"
+        },
+        "port": {
+            "type": "string",
+            "default": "9889",
+            "description": "Server port"
+        },
+        "autostart": {
+            "type": "boolean",
+            "default": false,
+            "description": "Auto-start cao-server on container start"
+        }
+    },
+    "dependsOn": {
+        "ghcr.io/devcontainers/features/python:1": {}
+    },
+    "installsAfter": [
+        "ghcr.io/devcontainers/features/node:1",
+        "ghcr.io/devcontainers/features/python:1"
+    ],
+    "entrypoint": "/usr/local/share/cao/entrypoint.sh"
+}

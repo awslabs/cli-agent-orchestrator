@@ -1,43 +1,80 @@
 """Single FastAPI entry point for all HTTP routes."""
 
 import asyncio
+import fcntl
+import json
 import logging
+import os
+import pty
+import signal
+import struct
+import subprocess
+import termios
 from contextlib import asynccontextmanager
-from typing import Annotated, Dict, List, Optional
+from pathlib import Path
+from typing import Annotated, Dict, List, Optional, cast
 
-from fastapi import FastAPI, HTTPException, Path, Query, status
+from fastapi import (
+    BackgroundTasks,
+    Body,
+    FastAPI,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field, field_validator
 
 from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
     get_inbox_messages,
+    get_terminal_metadata,
     init_db,
 )
 from cli_agent_orchestrator.constants import (
     ALLOWED_HOSTS,
+    CAO_HOME_DIR,
+    CORS_ORIGINS,
+    DEFAULT_PROVIDER,
     INBOX_POLLING_INTERVAL,
     SERVER_HOST,
     SERVER_PORT,
     SERVER_VERSION,
+    WS_ALLOWED_CLIENTS,
+    add_local_cors_origins,
 )
-from cli_agent_orchestrator.models.inbox import MessageStatus
+from cli_agent_orchestrator.models.flow import Flow
+from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalId
+from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services import (
     flow_service,
     session_service,
     terminal_service,
 )
-from cli_agent_orchestrator.services.cleanup_service import cleanup_old_data
+from cli_agent_orchestrator.services.cleanup_service import (
+    cleanup_expired_memories,
+    cleanup_old_data,
+)
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.inbox_service import inbox_service
+from cli_agent_orchestrator.services.install_service import InstallResult, install_agent
 from cli_agent_orchestrator.services.log_writer import log_writer
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.terminal_service import OutputMode
-from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
+from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.logging import setup_logging
-from cli_agent_orchestrator.utils.terminal import generate_session_name
+from cli_agent_orchestrator.utils.skills import (
+    SkillNameError,
+    load_skill_content,
+    validate_skill_name,
+)
+from cli_agent_orchestrator.utils.terminal import validate_tmux_name
 
 logger = logging.getLogger(__name__)
 
@@ -63,10 +100,28 @@ async def flow_daemon():
         await asyncio.sleep(60)
 
 
+async def opencode_inbox_delivery_daemon(registry: PluginRegistry) -> None:
+    """Background task to wake OpenCode inbox delivery for pending messages."""
+    logger.info("OpenCode inbox delivery poller started")
+    while True:
+        await asyncio.sleep(INBOX_POLLING_INTERVAL)
+        try:
+            await asyncio.to_thread(inbox_service.poll_opencode_pending_messages, registry)
+        except Exception:
+            logger.exception("OpenCode inbox delivery poller error")
+
+
 # Response Models
 class TerminalOutputResponse(BaseModel):
     output: str
     mode: str
+
+
+class SkillContentResponse(BaseModel):
+    """Response model for a skill content lookup."""
+
+    name: str
+    content: str
 
 
 class WorkingDirectoryResponse(BaseModel):
@@ -77,15 +132,49 @@ class WorkingDirectoryResponse(BaseModel):
     )
 
 
+class InstallAgentProfileRequest(BaseModel):
+    """Request body for installing an agent profile.
+
+    ``env_vars`` travels in the JSON body rather than as a query parameter so
+    that any secrets callers inject are not written to HTTP access logs.
+    """
+
+    source: str
+    provider: str = DEFAULT_PROVIDER
+    env_vars: Optional[Dict[str, str]] = None
+
+
+class CreateFlowRequest(BaseModel):
+    """Request model for creating a flow."""
+
+    name: str
+    schedule: str
+    agent_profile: str
+    provider: str = "kiro_cli"
+    prompt_template: str
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        """Prevent path traversal — flow name becomes a filename."""
+        if "/" in v or "\\" in v or ".." in v:
+            raise ValueError("Flow name must not contain '/', '\\', or '..'")
+        return v
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events."""
     logger.info("Starting CLI Agent Orchestrator server...")
     setup_logging()
     init_db()
+    registry = PluginRegistry()
+    await registry.load()
+    app.state.plugin_registry = registry
 
     # Run cleanup in background
     asyncio.create_task(asyncio.to_thread(cleanup_old_data))
+    asyncio.create_task(cleanup_expired_memories())
 
     # Start flow daemon as background task
     daemon_task = asyncio.create_task(flow_daemon())
@@ -99,6 +188,10 @@ async def lifespan(app: FastAPI):
     log_writer_task = asyncio.create_task(log_writer.run())
     inbox_service_task = asyncio.create_task(inbox_service.run())
     logger.info("Event bus consumers started (StatusMonitor, LogWriter, InboxService)")
+
+    # Start temporary OpenCode inbox poller. GH #115 tracks replacing this
+    # provider-specific wakeup path with a unified delivery engine.
+    opencode_inbox_task = asyncio.create_task(opencode_inbox_delivery_daemon(registry))
 
     yield
 
@@ -119,7 +212,44 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
 
+    # Cancel OpenCode inbox poller on shutdown
+    opencode_inbox_task.cancel()
+    try:
+        await opencode_inbox_task
+    except asyncio.CancelledError:
+        pass
+
+    await registry.teardown()
     logger.info("Shutting down CLI Agent Orchestrator server...")
+
+
+def get_plugin_registry(request: Request) -> PluginRegistry:
+    """Return the plugin registry stored on the FastAPI application state."""
+
+    return cast(PluginRegistry, request.app.state.plugin_registry)
+
+
+# Values that indicate ``TERM`` is effectively unusable and must be overridden
+# rather than inherited by the tmux attach subprocess. ``dumb`` is the common
+# fallback that containers and devcontainers ship with when no real terminal
+# is attached. Empty string and missing key behave the same way.
+_UNUSABLE_TERM_VALUES = frozenset({"", "dumb"})
+_DEFAULT_PTY_TERM = "xterm-256color"
+
+
+def _build_pty_env() -> Dict[str, str]:
+    """Build the env handed to the tmux PTY attach subprocess.
+
+    Copies the parent process environment so cao-server's normal config
+    (PATH, HOME, AWS_*, etc.) reaches tmux, and forces ``TERM`` to a usable
+    value when the inherited one would break terminal rendering. Explicit
+    non-dumb ``TERM`` values from the operator are preserved verbatim. See
+    issue #150.
+    """
+    env = os.environ.copy()
+    if env.get("TERM", "") in _UNUSABLE_TERM_VALUES:
+        env["TERM"] = _DEFAULT_PTY_TERM
+    return env
 
 
 app = FastAPI(
@@ -137,28 +267,232 @@ app.add_middleware(
     allowed_hosts=ALLOWED_HOSTS,
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 @app.get("/health")
 async def health_check():
     return {"status": "ok", "service": "cli-agent-orchestrator"}
 
 
+@app.get("/agents/profiles")
+async def list_agent_profiles_endpoint() -> List[Dict]:
+    """List all available agent profiles from all configured directories."""
+    try:
+        from cli_agent_orchestrator.utils.agent_profiles import list_agent_profiles
+
+        return list_agent_profiles()
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to list agent profiles: {str(e)}",
+        )
+
+
+@app.get("/agents/profiles/{name}")
+async def get_agent_profile_endpoint(name: str) -> Dict:
+    """Return the full parsed content of a named agent profile."""
+    try:
+        profile = load_agent_profile(name)
+        return profile.model_dump(exclude_none=True)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@app.post("/agents/profiles/install")
+async def install_agent_profile_endpoint(request: InstallAgentProfileRequest) -> InstallResult:
+    """Install an agent profile for a target provider.
+
+    HTTP (and transitively ``cao-ops-mcp``, which calls this endpoint) is an
+    untrusted surface. ``install_agent()`` only accepts bare profile names or
+    https:// URLs; local filesystem paths are handled by the CLI entry point
+    alone. A remote caller therefore cannot coerce the server into reading
+    arbitrary ``.md`` files from disk.
+    """
+    result = install_agent(
+        source=request.source,
+        provider=request.provider,
+        env_vars=request.env_vars,
+    )
+    if not result.success:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=result.message)
+
+    return result
+
+
+@app.get("/agents/providers")
+async def list_providers_endpoint() -> List[Dict]:
+    """List available providers with installation status."""
+    import shutil
+
+    provider_binaries = {
+        "kiro_cli": "kiro-cli",
+        "claude_code": "claude",
+        "q_cli": "q",
+        "codex": "codex",
+        "gemini_cli": "gemini",
+        "kimi_cli": "kimi",
+        "copilot_cli": "copilot",
+        "opencode_cli": "opencode",
+    }
+    result = []
+    for provider, binary in provider_binaries.items():
+        installed = shutil.which(binary) is not None
+        result.append({"name": provider, "binary": binary, "installed": installed})
+    return result
+
+
+@app.get("/settings/agent-dirs")
+async def get_agent_dirs_endpoint() -> Dict:
+    """Get configured agent directories per provider."""
+    from cli_agent_orchestrator.services.settings_service import (
+        get_agent_dirs,
+        get_extra_agent_dirs,
+    )
+
+    return {"agent_dirs": get_agent_dirs(), "extra_dirs": get_extra_agent_dirs()}
+
+
+class AgentDirsUpdate(BaseModel):
+    agent_dirs: Optional[Dict[str, str]] = None
+    extra_dirs: Optional[List[str]] = None
+
+
+@app.post("/settings/agent-dirs")
+async def set_agent_dirs_endpoint(body: AgentDirsUpdate) -> Dict:
+    """Update agent directories per provider."""
+    from cli_agent_orchestrator.services.settings_service import (
+        get_extra_agent_dirs,
+        set_agent_dirs,
+        set_extra_agent_dirs,
+    )
+
+    result_dirs = {}
+    result_extra = []
+    if body.agent_dirs:
+        result_dirs = set_agent_dirs(body.agent_dirs)
+    if body.extra_dirs is not None:
+        result_extra = set_extra_agent_dirs(body.extra_dirs)
+    return {
+        "agent_dirs": result_dirs or {},
+        "extra_dirs": result_extra or get_extra_agent_dirs(),
+    }
+
+
+@app.get("/skills/{name}", response_model=SkillContentResponse)
+async def get_skill_content(name: str) -> SkillContentResponse:
+    """Return the full Markdown body for an installed skill."""
+    try:
+        skill_name = validate_skill_name(name)
+        content = load_skill_content(skill_name)
+        return SkillContentResponse(name=name, content=content)
+    except SkillNameError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid skill name: {name}",
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to load skill: {str(e)}",
+        )
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Skill not found: {name}",
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to load skill: {str(e)}",
+        )
+
+
 @app.post("/sessions", response_model=Terminal, status_code=status.HTTP_201_CREATED)
 async def create_session(
-    provider: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
     agent_profile: str,
+    provider: Optional[str] = None,
     session_name: Optional[str] = None,
     working_directory: Optional[str] = None,
+    allowed_tools: Optional[str] = None,
+    memory_manager: Optional[str] = None,
+    env_vars: Optional[Dict[str, str]] = Body(default=None, embed=True),
 ) -> Terminal:
-    """Create a new session with exactly one terminal."""
+    """Create a new session with exactly one terminal.
+
+    When ``memory_manager`` is truthy, a sidecar ``memory_manager`` terminal is
+    spawned asynchronously in the same tmux session — provider initialization
+    can take 15-30s and would otherwise block the HTTP response past the
+    client's request timeout. The worker's first message may arrive before
+    the curator reaches IDLE; ``get_curated_memory_context`` falls back to
+    Phase 1 in that window.
+
+    ``env_vars`` (request body, optional) is the operator-forwarded env map
+    from ``cao launch --env``. It travels in the JSON body — not the query
+    string — so values potentially containing secrets do not land in
+    cao-server's HTTP access log. See issue #248.
+    """
     try:
-        result = await terminal_service.create_terminal(
+        if session_name is not None:
+            # terminal_service.create_terminal prepends SESSION_PREFIX
+            # ("cao-") if missing, so an API caller's 64-char valid name
+            # would become 68 chars and fail downstream validation. Check
+            # the *effective* prefixed value here so the rejection happens
+            # at the boundary with a clear message.
+            from cli_agent_orchestrator.constants import SESSION_PREFIX
+
+            effective = (
+                session_name
+                if session_name.startswith(SESSION_PREFIX)
+                else f"{SESSION_PREFIX}{session_name}"
+            )
+            validate_tmux_name(effective, "session_name")
+        # Parse comma-separated allowed_tools string into list
+        allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
+
+        result = await session_service.create_session(
             provider=provider,
             agent_profile=agent_profile,
             session_name=session_name,
-            new_session=True,
             working_directory=working_directory,
+            allowed_tools=allowed_tools_list,
+            registry=get_plugin_registry(request),
+            env_vars=env_vars,
         )
+
+        if memory_manager and str(memory_manager).lower() in ("true", "1", "yes"):
+            registry = get_plugin_registry(request)
+            sidecar_provider = provider or DEFAULT_PROVIDER
+            sidecar_session = result.session_name
+
+            async def _spawn_sidecar() -> None:
+                try:
+                    from cli_agent_orchestrator.services import terminal_service
+
+                    await terminal_service.create_terminal(
+                        provider=sidecar_provider,
+                        agent_profile="memory_manager",
+                        session_name=sidecar_session,
+                        working_directory=working_directory,
+                        registry=registry,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to spawn memory_manager sidecar: {e}")
+
+            background_tasks.add_task(_spawn_sidecar)
+
         return result
 
     except ValueError as e:
@@ -183,6 +517,12 @@ async def list_sessions() -> List[Dict]:
 
 @app.get("/sessions/{session_name}")
 async def get_session(session_name: str) -> Dict:
+    # Validate before entering the try block so a malformed name surfaces
+    # as 400 instead of being mapped to 404 by the not-found handler below.
+    try:
+        validate_tmux_name(session_name, "session_name")
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
         return session_service.get_session(session_name)
     except ValueError as e:
@@ -195,10 +535,14 @@ async def get_session(session_name: str) -> Dict:
 
 
 @app.delete("/sessions/{session_name}")
-async def delete_session(session_name: str) -> Dict:
+async def delete_session(request: Request, session_name: str) -> Dict:
     try:
-        success = session_service.delete_session(session_name)
-        return {"success": success}
+        validate_tmux_name(session_name, "session_name")
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    try:
+        result = session_service.delete_session(session_name, registry=get_plugin_registry(request))
+        return {"success": True, **result}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -214,20 +558,35 @@ async def delete_session(session_name: str) -> Dict:
     status_code=status.HTTP_201_CREATED,
 )
 async def create_terminal_in_session(
+    request: Request,
     session_name: str,
-    provider: str,
     agent_profile: str,
+    provider: Optional[str] = None,
     working_directory: Optional[str] = None,
+    allowed_tools: Optional[str] = None,
 ) -> Terminal:
     """Create additional terminal in existing session."""
     try:
-        resolved_provider = resolve_provider(agent_profile, fallback_provider=provider)
+        validate_tmux_name(session_name, "session_name")
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    try:
+        if provider is None:
+            resolved_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
+        else:
+            resolved_provider = provider
+
+        # Parse comma-separated allowed_tools string into list
+        allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
+
         result = await terminal_service.create_terminal(
             provider=resolved_provider,
             agent_profile=agent_profile,
             session_name=session_name,
             new_session=False,
             working_directory=working_directory,
+            allowed_tools=allowed_tools_list,
+            registry=get_plugin_registry(request),
         )
         return result
     except ValueError as e:
@@ -242,6 +601,10 @@ async def create_terminal_in_session(
 @app.get("/sessions/{session_name}/terminals")
 async def list_terminals_in_session(session_name: str) -> List[Dict]:
     """List all terminals in a session."""
+    try:
+        validate_tmux_name(session_name, "session_name")
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
         from cli_agent_orchestrator.clients.database import list_terminals_by_session
 
@@ -267,6 +630,30 @@ async def get_terminal(terminal_id: TerminalId) -> Terminal:
         )
 
 
+@app.get("/terminals/{terminal_id}/memory-context")
+async def get_terminal_memory_context(terminal_id: TerminalId):
+    """Return the CAO memory context block for a terminal as plain text.
+
+    Used by the Kiro AgentSpawn hook to inject memory into agent context.
+    Returns empty 200 if no memories exist for this terminal.
+    """
+    from fastapi.responses import PlainTextResponse
+
+    try:
+        from cli_agent_orchestrator.services.memory_service import MemoryService
+
+        svc = MemoryService()
+        context = svc.get_memory_context_for_terminal(terminal_id)
+        return PlainTextResponse(content=context)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get memory context: {str(e)}",
+        )
+
+
 @app.get("/terminals/{terminal_id}/working-directory", response_model=WorkingDirectoryResponse)
 async def get_terminal_working_directory(terminal_id: TerminalId) -> WorkingDirectoryResponse:
     """Get the current working directory of a terminal's pane."""
@@ -283,9 +670,21 @@ async def get_terminal_working_directory(terminal_id: TerminalId) -> WorkingDire
 
 
 @app.post("/terminals/{terminal_id}/input")
-async def send_terminal_input(terminal_id: TerminalId, message: str) -> Dict:
+async def send_terminal_input(
+    request: Request,
+    terminal_id: TerminalId,
+    message: str,
+    sender_id: Optional[str] = None,
+    orchestration_type: Optional[OrchestrationType] = None,
+) -> Dict:
     try:
-        success = terminal_service.send_input(terminal_id, message)
+        success = terminal_service.send_input(
+            terminal_id,
+            message,
+            registry=get_plugin_registry(request),
+            sender_id=sender_id,
+            orchestration_type=orchestration_type,
+        )
         return {"success": success}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -338,10 +737,12 @@ async def exit_terminal(terminal_id: TerminalId) -> Dict:
 
 
 @app.delete("/terminals/{terminal_id}")
-async def delete_terminal(terminal_id: TerminalId) -> Dict:
+async def delete_terminal(request: Request, terminal_id: TerminalId) -> Dict:
     """Delete a terminal."""
     try:
-        success = terminal_service.delete_terminal(terminal_id)
+        success = terminal_service.delete_terminal(
+            terminal_id, registry=get_plugin_registry(request)
+        )
         return {"success": success}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -354,11 +755,18 @@ async def delete_terminal(terminal_id: TerminalId) -> Dict:
 
 @app.post("/terminals/{receiver_id}/inbox/messages")
 async def create_inbox_message_endpoint(
-    receiver_id: TerminalId, sender_id: str, message: str
+    request: Request,
+    receiver_id: TerminalId,
+    sender_id: str,
+    message: str,
 ) -> Dict:
     """Create inbox message and attempt immediate delivery."""
     try:
-        inbox_msg = create_inbox_message(sender_id, receiver_id, message)
+        inbox_msg = create_inbox_message(
+            sender_id,
+            receiver_id,
+            message,
+        )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -370,7 +778,7 @@ async def create_inbox_message_endpoint(
     # Attempt immediate delivery if terminal is already IDLE.
     # If not, InboxService will deliver on next IDLE status event.
     try:
-        inbox_service.deliver_pending(receiver_id)
+        inbox_service.deliver_pending(receiver_id, registry=get_plugin_registry(request))
     except Exception as e:
         logger.warning(f"Immediate delivery attempt failed for {receiver_id}: {e}")
 
@@ -444,11 +852,334 @@ async def get_inbox_messages_endpoint(
         )
 
 
+@app.websocket("/terminals/{terminal_id}/ws")
+async def terminal_ws(websocket: WebSocket, terminal_id: str):
+    """WebSocket endpoint for live terminal streaming via tmux attach.
+
+    Security: This endpoint provides full PTY access with no authentication.
+    It is intended for localhost-only use. Do NOT expose the server to
+    untrusted networks (e.g. --host 0.0.0.0) without adding authentication.
+    """
+    # Reject connections from clients outside the configured allowlist.
+    # Defaults to loopback; operators running cao-server inside a container can
+    # extend the allowlist with the ``CAO_WS_ALLOWED_CLIENTS`` env var so the
+    # host browser (reaching the container via a bridge IP) can attach.
+    client_host = websocket.client.host if websocket.client else None
+    if client_host is not None and client_host not in WS_ALLOWED_CLIENTS:
+        await websocket.close(code=4003, reason="WebSocket access is restricted to allowed clients")
+        return
+
+    await websocket.accept()
+
+    metadata = get_terminal_metadata(terminal_id)
+    if not metadata:
+        await websocket.close(code=4004, reason="Terminal not found")
+        return
+
+    # Defence-in-depth: re-validate the names from the DB before they
+    # flow into a tmux subprocess argument. The POST /sessions handler
+    # now validates user-supplied session_name, but pre-existing rows
+    # or future code paths could still bypass that, and tmux parses
+    # ':' / '.' as target delimiters. Bind the validator return values
+    # so the sanitization is explicit at the actual sink below.
+    try:
+        session_name = validate_tmux_name(metadata["tmux_session"], "session_name")
+        window_name = validate_tmux_name(metadata["tmux_window"], "window_name")
+    except ValueError:
+        await websocket.close(code=4003, reason="Invalid tmux target name")
+        return
+
+    # Create PTY pair for tmux attach
+    master_fd, slave_fd = pty.openpty()
+
+    # Set initial terminal size
+    winsize = struct.pack("HHHH", 24, 80, 0, 0)
+    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
+
+    # Start tmux attach inside the PTY.
+    # Container/devcontainer environments often leave TERM unset or set to
+    # ``dumb``, which strips colours, breaks cursor positioning and corrupts
+    # the Ink-based TUIs that agent CLIs render. Force a sane default so the
+    # browser-side xterm.js renderer sees the escape sequences it expects.
+    # Any explicit non-dumb TERM the operator set is preserved.
+    pty_env = _build_pty_env()
+    proc = subprocess.Popen(
+        ["tmux", "-u", "attach-session", "-t", f"{session_name}:{window_name}"],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        close_fds=True,
+        preexec_fn=os.setsid,
+        env=pty_env,
+    )
+    os.close(slave_fd)
+
+    # Make master_fd non-blocking for event-driven reads
+    flag = fcntl.fcntl(master_fd, fcntl.F_GETFL)
+    fcntl.fcntl(master_fd, fcntl.F_SETFL, flag | os.O_NONBLOCK)
+
+    loop = asyncio.get_event_loop()
+    output_queue: asyncio.Queue[bytes] = asyncio.Queue()
+    done = asyncio.Event()
+
+    def _on_pty_data():
+        """Callback when PTY has data available."""
+        try:
+            data = os.read(master_fd, 65536)
+            if data:
+                output_queue.put_nowait(data)
+            else:
+                done.set()
+        except BlockingIOError:
+            pass
+        except OSError:
+            done.set()
+
+    loop.add_reader(master_fd, _on_pty_data)
+
+    async def _forward_output():
+        """Read from PTY queue and send to WebSocket."""
+        while not done.is_set():
+            try:
+                data = await asyncio.wait_for(output_queue.get(), timeout=1.0)
+                # Drain any additional pending data for batching
+                while not output_queue.empty():
+                    try:
+                        data += output_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                await websocket.send_bytes(data)
+            except asyncio.TimeoutError:
+                if proc.poll() is not None:
+                    break
+            except (Exception, asyncio.CancelledError):
+                break
+
+    async def _forward_input():
+        """Receive from WebSocket and write to PTY."""
+        try:
+            while not done.is_set():
+                msg = await websocket.receive_text()
+                payload = json.loads(msg)
+                if payload.get("type") == "input":
+                    raw = payload["data"].encode()
+                    # Write in chunks to avoid overflowing the PTY buffer
+                    chunk_size = 1024
+                    for i in range(0, len(raw), chunk_size):
+                        os.write(master_fd, raw[i : i + chunk_size])
+                        if i + chunk_size < len(raw):
+                            await asyncio.sleep(0.01)
+                elif payload.get("type") == "resize":
+                    rows = payload.get("rows", 24)
+                    cols = payload.get("cols", 80)
+                    winsize_data = struct.pack("HHHH", rows, cols, 0, 0)
+                    fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize_data)
+                    # Explicitly notify tmux of the size change —
+                    # TIOCSWINSZ on the master doesn't always deliver
+                    # SIGWINCH to the child process group.
+                    try:
+                        os.kill(proc.pid, signal.SIGWINCH)
+                    except OSError:
+                        pass
+        except WebSocketDisconnect:
+            pass
+        except (Exception, asyncio.CancelledError):
+            pass
+        finally:
+            done.set()
+
+    try:
+        await asyncio.gather(_forward_output(), _forward_input())
+    except (Exception, asyncio.CancelledError):
+        pass
+    finally:
+        done.set()
+        try:
+            loop.remove_reader(master_fd)
+        except Exception:
+            pass
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+        # Terminate tmux attach (just detaches, doesn't kill the session)
+        proc.terminate()
+        try:
+            await asyncio.wait_for(asyncio.to_thread(proc.wait), timeout=3.0)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await asyncio.to_thread(proc.wait)
+
+
+# ── Flow management endpoints ────────────────────────────────────────
+
+
+@app.get("/flows", response_model=List[Flow])
+async def list_flows() -> List[Flow]:
+    """List all flows."""
+    try:
+        return flow_service.list_flows()
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to list flows: {str(e)}",
+        )
+
+
+@app.get("/flows/{name}", response_model=Flow)
+async def get_flow(name: str) -> Flow:
+    """Get a specific flow by name."""
+    try:
+        return flow_service.get_flow(name)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get flow: {str(e)}",
+        )
+
+
+@app.post("/flows", response_model=Flow, status_code=status.HTTP_201_CREATED)
+async def create_flow(body: CreateFlowRequest) -> Flow:
+    """Create a new flow.
+
+    Writes a .flow.md file with YAML frontmatter and prompt body, then
+    registers it via flow_service.add_flow().
+    """
+    try:
+        flows_dir = CAO_HOME_DIR / "flows"
+        flows_dir.mkdir(parents=True, exist_ok=True)
+
+        file_path = flows_dir / f"{body.name}.flow.md"
+
+        # Build YAML frontmatter content
+        frontmatter_lines = [
+            "---",
+            f"name: {body.name}",
+            f'schedule: "{body.schedule}"',
+            f"agent_profile: {body.agent_profile}",
+            f"provider: {body.provider}",
+            "---",
+        ]
+        file_content = "\n".join(frontmatter_lines) + "\n" + body.prompt_template
+
+        file_path.write_text(file_content)
+
+        return flow_service.add_flow(str(file_path))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create flow: {str(e)}",
+        )
+
+
+@app.delete("/flows/{name}")
+async def remove_flow(name: str) -> Dict:
+    """Remove a flow."""
+    try:
+        flow_service.remove_flow(name)
+        return {"success": True}
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to remove flow: {str(e)}",
+        )
+
+
+@app.post("/flows/{name}/enable")
+async def enable_flow(name: str) -> Dict:
+    """Enable a flow."""
+    try:
+        flow_service.enable_flow(name)
+        return {"success": True}
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to enable flow: {str(e)}",
+        )
+
+
+@app.post("/flows/{name}/disable")
+async def disable_flow(name: str) -> Dict:
+    """Disable a flow."""
+    try:
+        flow_service.disable_flow(name)
+        return {"success": True}
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to disable flow: {str(e)}",
+        )
+
+
+@app.post("/flows/{name}/run")
+async def run_flow(name: str) -> Dict:
+    """Manually execute a flow."""
+    try:
+        executed = await flow_service.execute_flow(name)
+        return {"executed": executed}
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to execute flow: {str(e)}",
+        )
+
+
+# Static file serving for built web UI.
+# Anchored to the package via importlib.resources so it works for both
+# editable installs (uv sync) and wheel installs (uv tool install, pip install).
+from importlib.resources import files as _pkg_files
+
+WEB_DIST = Path(str(_pkg_files("cli_agent_orchestrator") / "web_ui"))
+if (WEB_DIST / "index.html").exists():
+    from starlette.staticfiles import StaticFiles
+
+    app.mount("/", StaticFiles(directory=str(WEB_DIST), html=True), name="web")
+
+
 def main():
     """Entry point for cao-server command."""
+    import argparse
+
     import uvicorn
 
-    uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT)
+    parser = argparse.ArgumentParser(description="CLI Agent Orchestrator Server")
+    parser.add_argument(
+        "--agents-dir",
+        type=str,
+        default=None,
+        help="Path to agents directory (overrides CAO_AGENTS_DIR env var)",
+    )
+    parser.add_argument("--host", type=str, default=None, help="Server host")
+    parser.add_argument("--port", type=int, default=None, help="Server port")
+    args = parser.parse_args()
+
+    if args.agents_dir:
+        os.environ["CAO_AGENTS_DIR"] = args.agents_dir
+        import cli_agent_orchestrator.constants as constants
+
+        constants.KIRO_AGENTS_DIR = Path(args.agents_dir)
+        logger.info(f"Using agents directory: {args.agents_dir}")
+
+    host = args.host or SERVER_HOST
+    port = args.port or SERVER_PORT
+    # Extend the CORS allowlist so a custom --host/--port still permits
+    # same-host browser access without requiring CAO_CORS_ORIGINS. The
+    # already-installed CORSMiddleware reads the list by reference, so
+    # mutating it before uvicorn starts is sufficient. See issue #151.
+    add_local_cors_origins(host, port)
+    uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":

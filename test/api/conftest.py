@@ -4,6 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from cli_agent_orchestrator.api.main import app
+from cli_agent_orchestrator.plugins import PluginRegistry
 
 
 class TestClientWithHost(TestClient):
@@ -27,4 +28,5 @@ class TestClientWithHost(TestClient):
 @pytest.fixture
 def client():
     """Test client with proper Host header for security middleware."""
+    app.state.plugin_registry = PluginRegistry()
     return TestClientWithHost(app)

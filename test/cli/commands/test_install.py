@@ -1,400 +1,230 @@
-"""Tests for the install CLI command."""
+"""Tests for the install CLI command wrapper."""
 
-import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-import frontmatter
 import pytest
 from click.testing import CliRunner
 
-from cli_agent_orchestrator.cli.commands.install import _download_agent, install
-
-
-class TestDownloadAgent:
-    """Tests for the _download_agent helper function."""
-
-    @patch("cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR")
-    @patch("cli_agent_orchestrator.cli.commands.install.requests.get")
-    def test_download_from_url_success(self, mock_get, mock_store_dir):
-        """Test downloading agent from URL."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            mock_store_dir.__truediv__ = lambda self, x: Path(tmpdir) / x
-            mock_store_dir.mkdir = MagicMock()
-
-            mock_response = MagicMock()
-            mock_response.text = "# Test Agent\nname: test"
-            mock_response.raise_for_status = MagicMock()
-            mock_get.return_value = mock_response
-
-            result = _download_agent("https://example.com/test-agent.md")
-
-            assert result == "test-agent"
-            mock_get.assert_called_once_with("https://example.com/test-agent.md")
-
-    @patch("cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR")
-    def test_download_from_url_invalid_extension(self, mock_store_dir):
-        """Test downloading agent from URL with invalid extension."""
-        mock_store_dir.mkdir = MagicMock()
-
-        with patch("cli_agent_orchestrator.cli.commands.install.requests.get") as mock_get:
-            mock_response = MagicMock()
-            mock_response.text = "content"
-            mock_response.raise_for_status = MagicMock()
-            mock_get.return_value = mock_response
-
-            with pytest.raises(ValueError, match="URL must point to a .md file"):
-                _download_agent("https://example.com/test-agent.txt")
-
-    def test_download_from_file_success(self):
-        """Test copying agent from local file."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Create source file
-            source_file = Path(tmpdir) / "source-agent.md"
-            source_file.write_text("# Test Agent\nname: test")
-
-            with patch(
-                "cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR",
-                Path(tmpdir) / "store",
-            ):
-                (Path(tmpdir) / "store").mkdir(parents=True, exist_ok=True)
-                result = _download_agent(str(source_file))
-
-                assert result == "source-agent"
-
-    def test_download_from_file_invalid_extension(self):
-        """Test copying agent from file with invalid extension."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            source_file = Path(tmpdir) / "source-agent.txt"
-            source_file.write_text("content")
-
-            with patch(
-                "cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR",
-                Path(tmpdir) / "store",
-            ):
-                with pytest.raises(ValueError, match="File must be a .md file"):
-                    _download_agent(str(source_file))
-
-    def test_download_source_not_found(self):
-        """Test downloading agent from non-existent source."""
-        with pytest.raises(FileNotFoundError, match="Source not found"):
-            _download_agent("/nonexistent/path/agent.md")
+from cli_agent_orchestrator.cli.commands.install import (
+    _copy_local_profile_to_store,
+    install,
+)
+from cli_agent_orchestrator.services.install_service import InstallResult
 
 
 class TestInstallCommand:
-    """Tests for the install command."""
+    """Tests for the thin CLI wrapper around install_service.install_agent."""
 
     @pytest.fixture
-    def runner(self):
+    def runner(self) -> CliRunner:
         """Create a CLI test runner."""
         return CliRunner()
 
-    @pytest.fixture
-    def mock_agent_profile(self):
-        """Create a mock agent profile."""
-        profile = MagicMock()
-        profile.name = "test-agent"
-        profile.description = "Test agent description"
-        profile.tools = ["*"]
-        profile.allowedTools = None
-        profile.mcpServers = None
-        profile.system_prompt = "Test system prompt"
-        profile.prompt = "Test prompt"
-        profile.toolAliases = None
-        profile.toolsSettings = None
-        profile.hooks = None
-        profile.model = None
-        return profile
+    def test_install_help_describes_env_workflow(self, runner: CliRunner) -> None:
+        """Help text should describe env file storage, ${VAR} syntax, and an example."""
+        result = runner.invoke(install, ["--help"])
 
-    @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
-    @patch("cli_agent_orchestrator.cli.commands.install.AGENT_CONTEXT_DIR")
-    @patch("cli_agent_orchestrator.cli.commands.install.KIRO_AGENTS_DIR")
-    @patch("cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR")
-    def test_install_builtin_agent_kiro_cli(
-        self,
-        mock_local_store,
-        mock_kiro_dir,
-        mock_context_dir,
-        mock_load,
-        runner,
-        mock_agent_profile,
-    ):
-        """Test installing built-in agent for kiro_cli provider."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmppath = Path(tmpdir)
-            mock_local_store.__truediv__ = lambda self, x: tmppath / "local" / x
-            mock_local_store.exists = MagicMock(return_value=False)
-            mock_kiro_dir.__truediv__ = lambda self, x: tmppath / "kiro" / x
-            mock_kiro_dir.mkdir = MagicMock()
-            mock_context_dir.__truediv__ = lambda self, x: tmppath / "context" / x
-            mock_context_dir.mkdir = MagicMock()
+        assert result.exit_code == 0
+        assert "~/.aws/cli-agent-orchestrator/.env" in result.output
+        assert "${VAR}" in result.output
+        assert "API_TOKEN=my-secret-token" in result.output
 
-            mock_load.return_value = mock_agent_profile
+    def test_install_success_outputs_result_details(self, runner: CliRunner) -> None:
+        """Successful installs should print the same user-facing summary lines."""
+        service_result = InstallResult(
+            success=True,
+            message="Agent 'developer' installed successfully",
+            agent_name="developer",
+            context_file="/tmp/agent-context/developer.md",
+            agent_file="/tmp/kiro/developer.json",
+            unresolved_vars=["BASE_URL"],
+            source_kind="name",
+        )
 
-            # Create mock for resources.files
-            with patch(
-                "cli_agent_orchestrator.cli.commands.install.resources.files"
-            ) as mock_resources:
-                mock_agent_store = MagicMock()
-                mock_agent_store.__truediv__ = lambda self, x: tmppath / "builtin" / x
-                mock_resources.return_value = mock_agent_store
+        with patch(
+            "cli_agent_orchestrator.cli.commands.install.install_agent",
+            return_value=service_result,
+        ) as mock_install:
+            result = runner.invoke(
+                install,
+                [
+                    "developer",
+                    "--provider",
+                    "kiro_cli",
+                    "--env",
+                    "API_TOKEN=secret-token",
+                ],
+            )
 
-                # Create builtin file
-                (tmppath / "builtin").mkdir(parents=True, exist_ok=True)
-                (tmppath / "builtin" / "test-agent.md").write_text("# Test\nname: test-agent")
-                (tmppath / "context").mkdir(parents=True, exist_ok=True)
-                (tmppath / "kiro").mkdir(parents=True, exist_ok=True)
+        assert result.exit_code == 0
+        assert "Agent 'developer' installed successfully" in result.output
+        assert "Set 1 env var(s)" in result.output
+        assert "Unresolved env var(s) in profile: BASE_URL" in result.output
+        assert "cao env set" in result.output
+        assert "Context file: /tmp/agent-context/developer.md" in result.output
+        assert "kiro_cli agent: /tmp/kiro/developer.json" in result.output
+        mock_install.assert_called_once_with(
+            "developer",
+            "kiro_cli",
+            {"API_TOKEN": "secret-token"},
+        )
 
-                result = runner.invoke(install, ["test-agent", "--provider", "kiro_cli"])
+    def test_install_url_source_prints_download_confirmation(self, runner: CliRunner) -> None:
+        """URL installs should print a download confirmation line."""
+        service_result = InstallResult(
+            success=True,
+            message="Agent 'remote' installed successfully",
+            agent_name="remote",
+            source_kind="url",
+        )
 
-                # Should not fail (may have issues with file writes in test env)
-                mock_load.assert_called_once_with("test-agent")
+        with patch(
+            "cli_agent_orchestrator.cli.commands.install.install_agent",
+            return_value=service_result,
+        ):
+            result = runner.invoke(
+                install,
+                ["https://example.com/remote.md", "--provider", "kiro_cli"],
+            )
 
-    @patch("cli_agent_orchestrator.cli.commands.install._download_agent")
-    @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
-    def test_install_from_url(self, mock_load, mock_download, runner, mock_agent_profile):
-        """Test installing agent from URL."""
-        mock_download.return_value = "downloaded-agent"
-        mock_load.side_effect = FileNotFoundError("Agent not found")
+        assert result.exit_code == 0
+        assert "Downloaded agent from URL to local store" in result.output
+        assert "Agent 'remote' installed successfully" in result.output
 
-        result = runner.invoke(install, ["https://example.com/agent.md"])
+    def test_install_file_source_prints_copy_confirmation(
+        self, runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """File path installs should copy to the store and print a copy confirmation.
 
-        mock_download.assert_called_once_with("https://example.com/agent.md")
+        File-handling lives entirely in the CLI: the service layer only sees
+        the validated bare stem. We verify the copy happened and the service
+        was called with the stem, not the original path.
+        """
+        local_store = tmp_path / "agent-store"
+        local_store.mkdir()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR",
+            local_store,
+        )
+        source_profile = tmp_path / "local.md"
+        source_profile.write_text("---\nname: local\ndescription: Test\n---\nBody\n")
 
-    @patch("cli_agent_orchestrator.cli.commands.install.Path")
-    @patch("cli_agent_orchestrator.cli.commands.install._download_agent")
-    @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
-    def test_install_from_file_path(
-        self, mock_load, mock_download, mock_path, runner, mock_agent_profile
-    ):
-        """Test installing agent from file path."""
-        mock_path_instance = MagicMock()
-        mock_path_instance.exists.return_value = True
-        mock_path.return_value = mock_path_instance
+        service_result = InstallResult(
+            success=True,
+            message="Agent 'local' installed successfully",
+            agent_name="local",
+            source_kind="name",
+        )
 
-        mock_download.return_value = "local-agent"
-        mock_load.side_effect = FileNotFoundError("Agent not found")
+        with patch(
+            "cli_agent_orchestrator.cli.commands.install.install_agent",
+            return_value=service_result,
+        ) as mock_install:
+            result = runner.invoke(
+                install,
+                [str(source_profile), "--provider", "kiro_cli"],
+            )
 
-        result = runner.invoke(install, ["./my-agent.md"])
+        assert result.exit_code == 0, result.output
+        assert "Copied agent from file to local store" in result.output
+        assert "Agent 'local' installed successfully" in result.output
+        # Service sees the validated stem, never the full user path.
+        mock_install.assert_called_once_with("local", "kiro_cli", None)
+        assert (local_store / "local.md").read_text() == source_profile.read_text()
 
-        mock_download.assert_called_once_with("./my-agent.md")
+    def test_install_file_source_missing_file_fails_fast(
+        self, runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A `.md`-suffixed path that doesn't exist should fail before the service call."""
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR",
+            tmp_path / "agent-store",
+        )
 
-    def test_install_file_not_found(self, runner):
-        """Test installing non-existent agent."""
-        result = runner.invoke(install, ["nonexistent-agent"])
+        with patch(
+            "cli_agent_orchestrator.cli.commands.install.install_agent",
+        ) as mock_install:
+            result = runner.invoke(install, [str(tmp_path / "missing.md")])
 
-        assert "Error" in result.output
+        assert result.exit_code != 0
+        assert "File not found" in result.output
+        mock_install.assert_not_called()
 
-    @patch("cli_agent_orchestrator.cli.commands.install.requests.get")
-    def test_install_url_request_error(self, mock_get, runner):
-        """Test installing from URL with request error."""
-        import requests
+    def test_install_file_source_rejects_unsafe_stem(
+        self, runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A local .md file whose stem contains unsafe characters must be refused."""
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR",
+            tmp_path / "agent-store",
+        )
+        bad = tmp_path / "evil space.md"
+        bad.write_text("---\nname: evil\ndescription: x\n---\nBody\n")
 
-        mock_get.side_effect = requests.RequestException("Connection failed")
+        with patch(
+            "cli_agent_orchestrator.cli.commands.install.install_agent",
+        ) as mock_install:
+            result = runner.invoke(install, [str(bad)])
 
-        result = runner.invoke(install, ["https://example.com/agent.md"])
+        assert result.exit_code != 0
+        assert "must match" in result.output
+        mock_install.assert_not_called()
 
-        assert "Error" in result.output
-        assert "Failed to download agent" in result.output
+    def test_install_failure_prints_error(self, runner: CliRunner) -> None:
+        """Service failures should be surfaced as CLI errors without raising."""
+        with patch(
+            "cli_agent_orchestrator.cli.commands.install.install_agent",
+            return_value=InstallResult(success=False, message="Source not found: missing"),
+        ):
+            result = runner.invoke(install, ["missing"])
 
-    @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
-    def test_install_general_error(self, mock_load, runner):
-        """Test installing agent with general error."""
-        mock_load.side_effect = Exception("Unexpected error")
+        assert result.exit_code == 0
+        assert "Error: Source not found: missing" in result.output
 
-        result = runner.invoke(install, ["test-agent"])
+    def test_install_invalid_env_format_returns_click_error(self, runner: CliRunner) -> None:
+        """Assignments without '=' should fail validation with a user-friendly error."""
+        result = runner.invoke(install, ["developer", "--env", "INVALID_FORMAT"])
 
-        assert "Error" in result.output
-        assert "Failed to install agent" in result.output
+        assert result.exit_code == 2
+        assert "Invalid value for --env" in result.output
+        assert "Expected format KEY=VALUE" in result.output
 
-    @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
-    @patch("cli_agent_orchestrator.cli.commands.install.AGENT_CONTEXT_DIR")
-    @patch("cli_agent_orchestrator.cli.commands.install.Q_AGENTS_DIR")
-    @patch("cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR")
-    def test_install_q_cli_provider(
-        self, mock_local_store, mock_q_dir, mock_context_dir, mock_load, runner, mock_agent_profile
-    ):
-        """Test installing agent for q_cli provider."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmppath = Path(tmpdir)
+    def test_install_empty_env_key_returns_click_error(self, runner: CliRunner) -> None:
+        """Assignments with an empty key should fail validation."""
+        result = runner.invoke(install, ["developer", "--env", "=value"])
 
-            # Setup local profile to exist (covers line 99)
-            local_path = tmppath / "local"
-            local_path.mkdir(parents=True, exist_ok=True)
-            local_profile = local_path / "test-agent.md"
-            local_profile.write_text("# Test\nname: test-agent")
+        assert result.exit_code == 2
+        assert "Invalid value for --env" in result.output
+        assert "Key must not be empty" in result.output
 
-            mock_local_store.__truediv__ = lambda self, x: local_path / x
-            mock_q_dir.__truediv__ = lambda self, x: tmppath / "q" / x
-            mock_q_dir.mkdir = MagicMock()
-            mock_context_dir.__truediv__ = lambda self, x: tmppath / "context" / x
-            mock_context_dir.mkdir = MagicMock()
 
-            mock_load.return_value = mock_agent_profile
+class TestCopyLocalProfileToStore:
+    """Tests for the file-handling helper that lives only in the CLI layer.
 
-            (tmppath / "context").mkdir(parents=True, exist_ok=True)
-            (tmppath / "q").mkdir(parents=True, exist_ok=True)
+    This helper is the reason ``install_service.install_agent`` can keep a
+    narrow, bare-name-or-URL contract: the CLI copies user files into the
+    local store itself and then forwards just the validated stem.
+    """
 
-            result = runner.invoke(install, ["test-agent", "--provider", "q_cli"])
+    def test_returns_none_for_url_source(self) -> None:
+        assert _copy_local_profile_to_store("https://example.com/a.md") is None
+        assert _copy_local_profile_to_store("http://example.com/a.md") is None
 
-            mock_load.assert_called_once_with("test-agent")
+    def test_returns_none_for_bare_name(self) -> None:
+        assert _copy_local_profile_to_store("developer") is None
 
-    @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
-    @patch("cli_agent_orchestrator.cli.commands.install.AGENT_CONTEXT_DIR")
-    @patch("cli_agent_orchestrator.cli.commands.install.KIRO_AGENTS_DIR")
-    @patch("cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR")
-    def test_install_with_mcp_servers(
-        self, mock_local_store, mock_kiro_dir, mock_context_dir, mock_load, runner
-    ):
-        """Test installing agent with MCP servers (covers lines 115-116)."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmppath = Path(tmpdir)
+    def test_copies_file_and_returns_stem(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store = tmp_path / "store"
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR", store
+        )
+        src = tmp_path / "my-agent.md"
+        src.write_text("body", encoding="utf-8")
 
-            # Create profile with mcpServers
-            profile = MagicMock()
-            profile.name = "test-agent"
-            profile.description = "Test agent"
-            profile.tools = ["*"]
-            profile.allowedTools = None  # Will trigger default with MCP servers
-            profile.mcpServers = {"server1": {"command": "test"}, "server2": {"command": "test2"}}
-            profile.prompt = "Test prompt"
-            profile.toolAliases = None
-            profile.toolsSettings = None
-            profile.hooks = None
-            profile.model = None
+        stem = _copy_local_profile_to_store(str(src))
 
-            local_path = tmppath / "local"
-            local_path.mkdir(parents=True, exist_ok=True)
-            local_profile = local_path / "test-agent.md"
-            local_profile.write_text("# Test\nname: test-agent")
-
-            mock_local_store.__truediv__ = lambda self, x: local_path / x
-            mock_kiro_dir.__truediv__ = lambda self, x: tmppath / "kiro" / x
-            mock_kiro_dir.mkdir = MagicMock()
-            mock_context_dir.__truediv__ = lambda self, x: tmppath / "context" / x
-            mock_context_dir.mkdir = MagicMock()
-
-            mock_load.return_value = profile
-
-            (tmppath / "context").mkdir(parents=True, exist_ok=True)
-            (tmppath / "kiro").mkdir(parents=True, exist_ok=True)
-
-            result = runner.invoke(install, ["test-agent", "--provider", "kiro_cli"])
-
-            mock_load.assert_called_once_with("test-agent")
-
-    @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
-    @patch("cli_agent_orchestrator.cli.commands.install.AGENT_CONTEXT_DIR")
-    @patch("cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR")
-    def test_install_without_provider_specific_config(
-        self, mock_local_store, mock_context_dir, mock_load, runner, mock_agent_profile
-    ):
-        """Test installing agent for claude_code provider (no agent file created)."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmppath = Path(tmpdir)
-
-            local_path = tmppath / "local"
-            local_path.mkdir(parents=True, exist_ok=True)
-            local_profile = local_path / "test-agent.md"
-            local_profile.write_text("# Test\nname: test-agent")
-
-            mock_local_store.__truediv__ = lambda self, x: local_path / x
-            mock_context_dir.__truediv__ = lambda self, x: tmppath / "context" / x
-            mock_context_dir.mkdir = MagicMock()
-
-            mock_load.return_value = mock_agent_profile
-
-            (tmppath / "context").mkdir(parents=True, exist_ok=True)
-
-            result = runner.invoke(install, ["test-agent", "--provider", "claude_code"])
-
-            assert "installed successfully" in result.output
-
-    @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
-    @patch("cli_agent_orchestrator.cli.commands.install.AGENT_CONTEXT_DIR")
-    @patch("cli_agent_orchestrator.cli.commands.install.COPILOT_AGENTS_DIR")
-    @patch("cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR")
-    def test_install_copilot_cli_provider(
-        self,
-        mock_local_store,
-        mock_copilot_dir,
-        mock_context_dir,
-        mock_load,
-        runner,
-        mock_agent_profile,
-    ):
-        """Test installing agent for copilot_cli provider."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmppath = Path(tmpdir)
-
-            local_path = tmppath / "local"
-            local_path.mkdir(parents=True, exist_ok=True)
-            local_profile = local_path / "test-agent.md"
-            local_profile.write_text("# Test\nname: test-agent")
-
-            context_path = tmppath / "context"
-            context_path.mkdir(parents=True, exist_ok=True)
-            copilot_path = tmppath / "copilot"
-            copilot_path.mkdir(parents=True, exist_ok=True)
-
-            mock_local_store.__truediv__ = lambda self, x: local_path / x
-            mock_context_dir.__truediv__ = lambda self, x: context_path / x
-            mock_context_dir.mkdir = MagicMock()
-            mock_copilot_dir.__truediv__ = lambda self, x: copilot_path / x
-            mock_copilot_dir.mkdir = MagicMock()
-            mock_load.return_value = mock_agent_profile
-
-            result = runner.invoke(install, ["test-agent", "--provider", "copilot_cli"])
-
-            assert result.exit_code == 0
-            assert "installed successfully" in result.output
-            assert "copilot_cli agent:" in result.output
-
-            agent_file = copilot_path / "test-agent.agent.md"
-            assert agent_file.exists()
-            post = frontmatter.loads(agent_file.read_text())
-            assert post.metadata["name"] == "test-agent"
-            assert post.metadata["description"] == "Test agent description"
-            assert "Test system prompt" in post.content
-
-    @patch("cli_agent_orchestrator.cli.commands.install.load_agent_profile")
-    @patch("cli_agent_orchestrator.cli.commands.install.AGENT_CONTEXT_DIR")
-    @patch("cli_agent_orchestrator.cli.commands.install.COPILOT_AGENTS_DIR")
-    @patch("cli_agent_orchestrator.cli.commands.install.LOCAL_AGENT_STORE_DIR")
-    def test_install_copilot_cli_provider_requires_prompt(
-        self,
-        mock_local_store,
-        mock_copilot_dir,
-        mock_context_dir,
-        mock_load,
-        runner,
-        mock_agent_profile,
-    ):
-        """Test copilot_cli install fails when profile has no prompt text."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmppath = Path(tmpdir)
-
-            local_path = tmppath / "local"
-            local_path.mkdir(parents=True, exist_ok=True)
-            local_profile = local_path / "test-agent.md"
-            local_profile.write_text("# Test\nname: test-agent")
-
-            context_path = tmppath / "context"
-            context_path.mkdir(parents=True, exist_ok=True)
-            copilot_path = tmppath / "copilot"
-            copilot_path.mkdir(parents=True, exist_ok=True)
-
-            mock_local_store.__truediv__ = lambda self, x: local_path / x
-            mock_context_dir.__truediv__ = lambda self, x: context_path / x
-            mock_context_dir.mkdir = MagicMock()
-            mock_copilot_dir.__truediv__ = lambda self, x: copilot_path / x
-            mock_copilot_dir.mkdir = MagicMock()
-
-            mock_agent_profile.system_prompt = ""
-            mock_agent_profile.prompt = ""
-            mock_load.return_value = mock_agent_profile
-
-            result = runner.invoke(install, ["test-agent", "--provider", "copilot_cli"])
-
-            assert "Failed to install agent" in result.output
-            assert "has no usable prompt content for Copilot" in result.output
+        assert stem == "my-agent"
+        assert (store / "my-agent.md").read_text(encoding="utf-8") == "body"

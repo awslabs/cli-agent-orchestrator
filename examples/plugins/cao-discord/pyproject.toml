@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cao-discord"
+version = "0.1.0"
+description = "Discord webhook plugin for CLI Agent Orchestrator"
+requires-python = ">=3.10"
+dependencies = [
+    "cli-agent-orchestrator",
+    "httpx>=0.27",
+    "python-dotenv>=1.0",
+]
+
+[project.entry-points."cao.plugins"]
+discord = "cao_discord.plugin:DiscordPlugin"

@@ -1,14 +1,54 @@
 """Tests for the session service."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
 from cli_agent_orchestrator.services.session_service import (
+    create_session,
     delete_session,
     get_session,
     list_sessions,
 )
+
+
+class TestCreateSession:
+    """Tests for create_session function."""
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.session_service.dispatch_plugin_event")
+    @patch("cli_agent_orchestrator.services.session_service.create_terminal")
+    @patch("cli_agent_orchestrator.services.session_service.resolve_provider")
+    async def test_create_session_resolves_provider_when_omitted(
+        self, mock_resolve, mock_create_terminal, mock_dispatch
+    ):
+        """When provider is None, resolve_provider is called and its result forwarded."""
+        mock_resolve.return_value = "claude_code"
+        mock_terminal = MagicMock()
+        mock_terminal.session_name = "cao-test"
+        mock_create_terminal.return_value = mock_terminal
+
+        await create_session(provider=None, agent_profile="my_agent")
+
+        mock_resolve.assert_called_once_with("my_agent", fallback_provider="kiro_cli")
+        assert mock_create_terminal.call_args.kwargs["provider"] == "claude_code"
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.session_service.dispatch_plugin_event")
+    @patch("cli_agent_orchestrator.services.session_service.create_terminal")
+    @patch("cli_agent_orchestrator.services.session_service.resolve_provider")
+    async def test_create_session_uses_explicit_provider(
+        self, mock_resolve, mock_create_terminal, mock_dispatch
+    ):
+        """When provider is explicitly passed, resolve_provider is NOT called."""
+        mock_terminal = MagicMock()
+        mock_terminal.session_name = "cao-test"
+        mock_create_terminal.return_value = mock_terminal
+
+        await create_session(provider="kiro_cli", agent_profile="my_agent")
+
+        mock_resolve.assert_not_called()
+        assert mock_create_terminal.call_args.kwargs["provider"] == "kiro_cli"
 
 
 class TestListSessions:
@@ -105,39 +145,35 @@ class TestGetSession:
 class TestDeleteSession:
     """Tests for delete_session function."""
 
-    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
-    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
-    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
-    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.tmux_client")
     def test_delete_session_success(
         self,
         mock_tmux,
         mock_list_terminals,
-        mock_get_metadata,
-        mock_provider_manager,
-        mock_db_delete,
-        mock_fifo_manager,
-        mock_status_monitor,
+        mock_delete_terminal,
     ):
-        """Test deleting session successfully."""
+        """Test deleting session successfully.
+
+        delete_session delegates per-terminal teardown (FIFO reader, status
+        buffer, provider, DB) to terminal_service.delete_terminal, then kills
+        the tmux session and returns the Dict result shape.
+        """
         mock_tmux.session_exists.return_value = True
         mock_list_terminals.return_value = [
             {"id": "terminal1"},
             {"id": "terminal2"},
         ]
-        mock_get_metadata.return_value = {
-            "tmux_session": "cao-test",
-            "tmux_window": "window",
-        }
-        mock_db_delete.return_value = True
 
         result = delete_session("cao-test")
 
-        assert result is True
+        assert result == {"deleted": ["cao-test"], "errors": []}
         mock_tmux.kill_session.assert_called_once_with("cao-test")
+        # Each terminal is torn down via the event-driven delete_terminal path.
+        assert mock_delete_terminal.call_count == 2
+        mock_delete_terminal.assert_any_call("terminal1", registry=ANY)
+        mock_delete_terminal.assert_any_call("terminal2", registry=ANY)
 
     @patch("cli_agent_orchestrator.services.session_service.tmux_client")
     def test_delete_session_not_found(self, mock_tmux):
@@ -147,17 +183,21 @@ class TestDeleteSession:
         with pytest.raises(ValueError, match="Session 'cao-nonexistent' not found"):
             delete_session("cao-nonexistent")
 
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.tmux_client")
-    def test_delete_session_no_terminals(self, mock_tmux, mock_list_terminals):
+    def test_delete_session_no_terminals(
+        self, mock_tmux, mock_list_terminals, mock_delete_terminal
+    ):
         """Test deleting session with no terminals."""
         mock_tmux.session_exists.return_value = True
         mock_list_terminals.return_value = []
 
         result = delete_session("cao-test")
 
-        assert result is True
+        assert result == {"deleted": ["cao-test"], "errors": []}
         mock_tmux.kill_session.assert_called_once_with("cao-test")
+        mock_delete_terminal.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.tmux_client")
@@ -168,3 +208,57 @@ class TestDeleteSession:
 
         with pytest.raises(Exception, match="Database error"):
             delete_session("cao-test")
+
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
+    def test_delete_session_continues_when_terminal_cleanup_fails(
+        self, mock_tmux, mock_list_terminals, mock_delete_terminal
+    ):
+        """Test that delete_session continues even when terminal teardown fails for some terminals."""
+        mock_tmux.session_exists.return_value = True
+        mock_list_terminals.return_value = [
+            {"id": "terminal1"},
+            {"id": "terminal2"},
+            {"id": "terminal3"},
+        ]
+
+        # First terminal teardown fails, others succeed
+        mock_delete_terminal.side_effect = [
+            Exception("Terminal teardown error for terminal1"),
+            None,  # terminal2 succeeds
+            None,  # terminal3 succeeds
+        ]
+
+        result = delete_session("cao-test")
+
+        # Session should still be deleted despite per-terminal teardown failure
+        assert result == {"deleted": ["cao-test"], "errors": []}
+        mock_tmux.kill_session.assert_called_once_with("cao-test")
+        # All three terminal teardowns were attempted
+        assert mock_delete_terminal.call_count == 3
+
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
+    def test_delete_session_cleans_up_each_terminal(
+        self, mock_tmux, mock_list_terminals, mock_delete_terminal
+    ):
+        """Test that delete_session tears down every terminal in the session via delete_terminal."""
+        mock_tmux.session_exists.return_value = True
+        mock_list_terminals.return_value = [
+            {"id": "term-aaa"},
+            {"id": "term-bbb"},
+            {"id": "term-ccc"},
+            {"id": "term-ddd"},
+        ]
+
+        result = delete_session("cao-multi-terminal")
+
+        assert result == {"deleted": ["cao-multi-terminal"], "errors": []}
+        # Verify delete_terminal was called for each terminal with the correct ID
+        assert mock_delete_terminal.call_count == 4
+        mock_delete_terminal.assert_any_call("term-aaa", registry=ANY)
+        mock_delete_terminal.assert_any_call("term-bbb", registry=ANY)
+        mock_delete_terminal.assert_any_call("term-ccc", registry=ANY)
+        mock_delete_terminal.assert_any_call("term-ddd", registry=ANY)

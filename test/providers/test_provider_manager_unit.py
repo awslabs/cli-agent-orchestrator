@@ -201,3 +201,66 @@ def test_list_providers():
         "t1": "CodexProvider",
         "t2": "ClaudeCodeProvider",
     }
+
+
+def test_get_provider_restores_shell_baseline_from_metadata():
+    """get_provider sets shell_baseline on the provider when DB metadata has shell_command."""
+    manager = ProviderManager()
+
+    with patch(
+        "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
+        return_value={
+            "provider": ProviderType.KIRO_CLI.value,
+            "tmux_session": "s1",
+            "tmux_window": "w1",
+            "agent_profile": "developer",
+            "shell_command": "bash",
+        },
+    ):
+        provider = manager.get_provider("t1")
+
+    assert provider.shell_baseline == "bash"
+
+
+def test_get_provider_marks_kiro_initialized_on_restore():
+    """Restoration path must set _initialized=True so KiroCliProvider's
+    post-launch shell-baseline IDLE check trusts the restored baseline.
+
+    Without this, a terminal restored from the DB after cao-server restart
+    would have shell_baseline set but _initialized=False, and get_status()
+    would report PROCESSING indefinitely once kiro exited back to the shell.
+    """
+    manager = ProviderManager()
+
+    with patch(
+        "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
+        return_value={
+            "provider": ProviderType.KIRO_CLI.value,
+            "tmux_session": "s1",
+            "tmux_window": "w1",
+            "agent_profile": "developer",
+            "shell_command": "zsh",
+        },
+    ):
+        provider = manager.get_provider("t1")
+
+    assert provider.shell_baseline == "zsh"
+    assert provider._initialized is True
+
+
+def test_get_provider_no_shell_baseline_when_metadata_missing_shell_command():
+    """get_provider leaves shell_baseline as None when DB metadata has no shell_command."""
+    manager = ProviderManager()
+
+    with patch(
+        "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
+        return_value={
+            "provider": ProviderType.KIRO_CLI.value,
+            "tmux_session": "s1",
+            "tmux_window": "w1",
+            "agent_profile": "developer",
+        },
+    ):
+        provider = manager.get_provider("t1")
+
+    assert provider.shell_baseline is None

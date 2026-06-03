@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import re
 import time
 import uuid
 from typing import Union
@@ -13,10 +14,45 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 
 logger = logging.getLogger(__name__)
 
+# Allowlist for tmux session/window names. tmux uses ':' and '.' as target
+# delimiters and treats leading '-' as an option, so we constrain names to
+# safe characters only. The 64-char cap matches typical tmux name lengths.
+_VALID_TMUX_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_\-]{0,63}$")
+
+
+def validate_tmux_name(name: str, kind: str = "name") -> str:
+    """Validate a tmux session or window name against an allowlist.
+
+    Rejects names containing tmux target delimiters (':', '.'), shell
+    metacharacters, leading dashes (parsed as flags), or any character
+    outside ``[A-Za-z0-9_-]``. The first character must be alphanumeric
+    or underscore.
+
+    Args:
+        name: Candidate session or window name.
+        kind: Label used in the error message (e.g. ``"session_name"``).
+
+    Returns:
+        The validated name unchanged.
+
+    Raises:
+        ValueError: If ``name`` is not a string or fails the allowlist.
+    """
+    # fullmatch() (not match()): Python's `$` anchor can match before a
+    # trailing newline, so `match()` would accept `"name\n"`. fullmatch
+    # forces the entire string to satisfy the pattern.
+    if not isinstance(name, str) or not _VALID_TMUX_NAME.fullmatch(name):
+        # Use repr() so control characters (newlines, escapes) in a hostile
+        # name cannot smuggle log/response-injection payloads through the
+        # error string.
+        raise ValueError(f"Invalid {kind}: {name!r}")
+    return name
+
 
 def generate_session_name() -> str:
     """Generate a unique session name with SESSION_PREFIX."""
-    return f"{SESSION_PREFIX}{uuid.uuid4().hex[:8]}"
+    session_uuid = uuid.uuid4().hex[:8]
+    return validate_tmux_name(f"{SESSION_PREFIX}{session_uuid}", "session_name")
 
 
 def generate_terminal_id() -> str:
@@ -26,7 +62,7 @@ def generate_terminal_id() -> str:
 
 def generate_window_name(agent_profile: str) -> str:
     """Generate window name from agent profile with unique suffix."""
-    return f"{agent_profile}-{uuid.uuid4().hex[:4]}"
+    return validate_tmux_name(f"{agent_profile}-{uuid.uuid4().hex[:4]}", "window_name")
 
 
 async def wait_for_shell(
@@ -95,6 +131,33 @@ async def wait_until_status(
         await asyncio.sleep(polling_interval)
     logger.warning(f"wait_until_status [{terminal_id}]: timeout waiting for {{{target_str}}}")
     return False
+
+
+def poll_until_done(terminal_id: str, timeout: float, polling_interval: float = 1.0) -> None:
+    """Poll terminal status until completed/error or timeout.
+
+    Raises click.ClickException on error, timeout, or request failure.
+    """
+    import click
+
+    start = time.time()
+    while True:
+        elapsed = time.time() - start
+        if elapsed > timeout:
+            raise click.ClickException(
+                f"Timed out after {int(elapsed)}s waiting for terminal {terminal_id}"
+            )
+        try:
+            resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}")
+            resp.raise_for_status()
+            status = resp.json().get("status")
+            if status == TerminalStatus.COMPLETED.value:
+                return
+            if status == TerminalStatus.ERROR.value:
+                raise click.ClickException("Terminal reached ERROR status")
+        except requests.exceptions.RequestException as e:
+            raise click.ClickException(f"Failed to poll terminal status: {e}")
+        time.sleep(polling_interval)
 
 
 def wait_until_terminal_status(

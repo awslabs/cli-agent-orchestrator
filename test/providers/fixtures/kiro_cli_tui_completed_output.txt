@@ -1,0 +1,18 @@
+────────────────────────────────────────────────────
+  What files are in this directory?
+
+  Here is a comprehensive response listing the files in the current directory.
+
+  The directory contains the following files:
+  - README.md
+  - package.json
+  - src/index.ts
+
+  This response includes multiple paragraphs to verify extraction.
+
+▸ Credits: 0.24 • Time: 3s
+
+────────────────────────────────────────────────────
+developer · claude-opus-4.6-1m · ◔ 4%              ~/project · (main)
+
+ Ask a question or describe a task ↵  ctrl+g: agent monitor

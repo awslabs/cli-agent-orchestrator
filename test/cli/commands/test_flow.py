@@ -1,7 +1,7 @@
 """Tests for the flow CLI command."""
 
 from datetime import datetime
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from click.testing import CliRunner
@@ -239,7 +239,8 @@ class TestFlowRunCommand:
     @patch("cli_agent_orchestrator.cli.commands.flow.flow_service")
     def test_run_executed(self, mock_service, mock_init_db, runner):
         """Test flow run that executes."""
-        mock_service.execute_flow.return_value = True
+        # execute_flow is async; the run command drives it via asyncio.run().
+        mock_service.execute_flow = AsyncMock(return_value=True)
 
         result = runner.invoke(flow, ["run", "test-flow"])
 
@@ -250,7 +251,8 @@ class TestFlowRunCommand:
     @patch("cli_agent_orchestrator.cli.commands.flow.flow_service")
     def test_run_skipped(self, mock_service, mock_init_db, runner):
         """Test flow run that is skipped."""
-        mock_service.execute_flow.return_value = False
+        # execute_flow is async; the run command drives it via asyncio.run().
+        mock_service.execute_flow = AsyncMock(return_value=False)
 
         result = runner.invoke(flow, ["run", "test-flow"])
 
@@ -261,7 +263,7 @@ class TestFlowRunCommand:
     @patch("cli_agent_orchestrator.cli.commands.flow.flow_service")
     def test_run_error(self, mock_service, mock_init_db, runner):
         """Test flow run with error."""
-        mock_service.execute_flow.side_effect = Exception("Flow not found")
+        mock_service.execute_flow = AsyncMock(side_effect=Exception("Flow not found"))
 
         result = runner.invoke(flow, ["run", "nonexistent"])
 

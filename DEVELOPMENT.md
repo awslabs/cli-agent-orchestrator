@@ -38,8 +38,35 @@ This command:
 uv run cao --help
 
 # Run a quick test to ensure everything is working
-uv run pytest test/providers/test_q_cli_unit.py -v -k "test_initialization"
+uv run pytest test/providers/test_kiro_cli_unit.py -v -k "test_initialization"
 ```
+
+## Web UI Development
+
+The web UI is a React + Vite + Tailwind app in `web/`.
+
+```bash
+# Install frontend dependencies
+cd web/
+npm install
+
+# Start dev server (hot-reloads on file changes)
+npm run dev        # http://localhost:5173
+
+# Build for production (outputs to src/cli_agent_orchestrator/web_ui/)
+npm run build
+```
+
+> **Important:** The build step is required before installing the package with
+> `uv tool install .`. Skipping it leaves `web_ui/` empty and causes `cao-server`
+> to return `404 Not Found` on every request to the web UI.
+> Run `npm run build` from `web/` first, then reinstall:
+> ```bash
+> cd web && npm run build
+> uv tool install --reinstall .
+> ```
+
+The Vite dev server proxies API calls to the backend at `localhost:9889`. Make sure `cao-server` is running before starting the frontend.
 
 ## Running Tests
 
@@ -49,10 +76,10 @@ Unit tests are fast and use mocked dependencies:
 
 ```bash
 # Run all unit tests (excludes E2E and integration tests)
-uv run pytest test/ --ignore=test/e2e --ignore=test/providers/test_q_cli_integration.py -v
+uv run pytest test/ --ignore=test/e2e -m "not integration" -v
 
 # Run with coverage report
-uv run pytest test/ --ignore=test/e2e --cov=src --cov-report=term-missing -v
+uv run pytest test/ --ignore=test/e2e -m "not integration" --cov=src --cov-report=term-missing -v
 
 # Run specific test file
 uv run pytest test/providers/test_claude_code_unit.py -v
@@ -66,8 +93,8 @@ uv run pytest test/providers/test_codex_provider_unit.py::TestCodexBuildCommand 
 Integration tests require the provider CLI to be installed and authenticated:
 
 ```bash
-# Run Q CLI integration tests (requires Q CLI setup)
-uv run pytest test/providers/test_q_cli_integration.py -v
+# Run integration tests for a specific provider (example: Kiro CLI)
+uv run pytest test/providers/test_kiro_cli_integration.py -v
 
 # Skip integration tests
 uv run pytest test/providers/ -m "not integration" -v
@@ -178,7 +205,7 @@ Add or update tests in `test/`
 
 ```bash
 # Run unit tests (fast, excludes E2E and integration)
-uv run pytest test/ --ignore=test/e2e --ignore=test/providers/test_q_cli_integration.py -v
+uv run pytest test/ --ignore=test/e2e -m "not integration" -v
 
 # Run all tests with coverage
 uv run pytest test/ --ignore=test/e2e --cov=src --cov-report=term-missing -v
@@ -227,30 +254,51 @@ Each provider has a dedicated workflow that runs only when its files change:
 
 Each includes unit tests (Python 3.10/3.11/3.12) and code quality checks (black, isort, mypy).
 
-## Working with the Q CLI Provider
+## Working with Providers
 
 ### Regenerate Test Fixtures
 
-If Q CLI output format changes:
+If a provider's CLI output format changes, regenerate the captured fixtures:
 
 ```bash
 uv run python test/providers/fixtures/generate_fixtures.py
 ```
 
-### Test Against Real Q CLI
+### Test Against a Real Provider CLI
+
+Integration tests exercise a real provider binary, so the CLI must be installed and authenticated before they can run. Using Kiro CLI as an example:
 
 ```bash
-# Ensure Q CLI is available
-which q
+# Ensure the provider CLI is on PATH
+which kiro
 
-# Ensure Q CLI is authenticated
-q status
+# Ensure it is authenticated (provider-specific; see docs/<provider>.md)
+kiro --help
 
-# Run integration tests
-uv run pytest test/providers/test_q_cli_integration.py -v
+# Run that provider's integration tests
+uv run pytest test/providers/test_kiro_cli_integration.py -v
 ```
 
+The same pattern applies to every provider that ships an `<provider>_integration.py` file — substitute the binary and the test filename.
+
+> **Note:** Q CLI is slated for deprecation. Do not build new development workflows around Q CLI; prefer Kiro CLI, Claude Code, or Codex CLI as your default provider while contributing.
+
 ## Troubleshooting
+
+### Web UI Shows "404 Not Found"
+
+The web UI assets are not committed to the repository — they are a build artifact.
+If `cao-server` starts successfully but the browser shows `{"detail":"Not Found"}`,
+the `web_ui/` bundle is missing from the installed package.
+
+```bash
+# 1. Build the frontend
+cd web && npm install && npm run build
+
+# 2. Reinstall the package so the built assets are picked up
+cd ..
+uv tool install --reinstall .
+```
 
 ### Import Errors
 
@@ -319,7 +367,7 @@ cli-agent-orchestrator/
 │       ├── clients/                # Database and tmux clients
 │       ├── mcp_server/             # MCP server implementation
 │       ├── models/                 # Data models
-│       ├── providers/              # Agent providers (Q CLI, Claude Code)
+│       ├── providers/              # Agent providers (Kiro CLI, Claude Code, Codex, Gemini, Kimi, Copilot, OpenCode, Q CLI [deprecated])
 │       ├── services/               # Business logic services
 │       └── utils/                  # Utility functions
 ├── test/                           # Test suite (511 tests, 84% coverage)

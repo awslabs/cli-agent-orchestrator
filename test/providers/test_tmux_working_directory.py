@@ -137,6 +137,27 @@ class TestTmuxClientWorkingDirectory:
         call_args = self.mock_server.new_session.call_args
         assert call_args[1]["start_directory"] == "/home/user/project"
 
+    def test_create_session_expands_tilde_in_working_directory(self):
+        """Test create_session expands ~ to home directory for remote clients."""
+        mock_session = Mock()
+        mock_window = Mock()
+        mock_window.name = "test-window"
+        mock_session.windows = [mock_window]
+
+        self.mock_server.new_session.return_value = mock_session
+
+        client = TmuxClient()
+        with patch("os.path.expanduser", return_value="/home/user/q/my-project"):
+            with patch("os.path.isdir", return_value=True):
+                with patch("os.path.realpath", return_value="/home/user/q/my-project"):
+                    result = client.create_session(
+                        "test-session", "test-window", "terminal-1", "~/q/my-project"
+                    )
+
+        assert result == "test-window"
+        call_args = self.mock_server.new_session.call_args
+        assert call_args[1]["start_directory"] == "/home/user/q/my-project"
+
     def test_create_window_with_working_directory(self):
         """Test create_window passes working_directory to tmux."""
         mock_session = Mock()

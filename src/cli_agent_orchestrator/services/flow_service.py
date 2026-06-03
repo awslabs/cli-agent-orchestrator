@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -12,18 +13,27 @@ from apscheduler.triggers.cron import CronTrigger  # type: ignore
 
 from cli_agent_orchestrator.clients.database import create_flow as db_create_flow
 from cli_agent_orchestrator.clients.database import delete_flow as db_delete_flow
+from cli_agent_orchestrator.clients.database import (
+    delete_terminals_by_session,
+)
 from cli_agent_orchestrator.clients.database import get_flow as db_get_flow
 from cli_agent_orchestrator.clients.database import get_flows_to_run as db_get_flows_to_run
 from cli_agent_orchestrator.clients.database import list_flows as db_list_flows
+from cli_agent_orchestrator.clients.database import (
+    list_terminals_by_session,
+)
 from cli_agent_orchestrator.clients.database import update_flow_enabled as db_update_flow_enabled
 from cli_agent_orchestrator.clients.database import (
     update_flow_run_times as db_update_flow_run_times,
 )
+from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.constants import DEFAULT_PROVIDER, PROVIDERS
 from cli_agent_orchestrator.models.flow import Flow
+from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.terminal_service import create_terminal, send_input
 from cli_agent_orchestrator.utils.template import render_template
-from cli_agent_orchestrator.utils.terminal import generate_session_name
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +77,8 @@ def add_flow(file_path: str) -> Flow:
                 raise ValueError(f"Missing required field: {field}")
 
         name = metadata["name"]
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", str(name)):
+            raise ValueError(f"Invalid flow name '{name}': must match ^[A-Za-z0-9_-]{{1,64}}$")
         schedule = metadata["schedule"]
         agent_profile = metadata["agent_profile"]
         provider = metadata.get(
@@ -99,9 +111,19 @@ def add_flow(file_path: str) -> Flow:
         raise
 
 
+def _enrich_flow_with_prompt(flow: Flow) -> Flow:
+    """Read the prompt template from the flow file and attach it."""
+    try:
+        _, prompt = _parse_flow_file(Path(flow.file_path))
+        flow.prompt_template = prompt.strip()
+    except Exception:
+        flow.prompt_template = None
+    return flow
+
+
 def list_flows() -> List[Flow]:
     """List all flows."""
-    return db_list_flows()
+    return [_enrich_flow_with_prompt(f) for f in db_list_flows()]
 
 
 def get_flow(name: str) -> Flow:
@@ -109,7 +131,7 @@ def get_flow(name: str) -> Flow:
     flow = db_get_flow(name)
     if not flow:
         raise ValueError(f"Flow '{name}' not found")
-    return flow
+    return _enrich_flow_with_prompt(flow)
 
 
 def remove_flow(name: str) -> bool:
@@ -140,6 +162,13 @@ def enable_flow(name: str) -> bool:
 
     logger.info(f"Enabled flow: {name}")
     return True
+
+
+def _is_terminal_busy(terminal_id: str) -> bool:
+    try:
+        return status_monitor.get_status(terminal_id) == TerminalStatus.PROCESSING
+    except Exception:
+        return False
 
 
 async def execute_flow(name: str) -> bool:
@@ -201,7 +230,20 @@ async def execute_flow(name: str) -> bool:
         rendered_prompt = render_template(prompt_template, output_dict)
 
         # Launch session
-        session_name = generate_session_name()
+        session_name = f"cao-flow-{flow.name}"
+        if tmux_client.session_exists(session_name):
+            terminals = list_terminals_by_session(session_name)
+            # Only check the first (conductor) terminal for busy status.
+            # Worker terminals spawned by the conductor may have stale status
+            # after /exit and should not block flow recycling.
+            conductor = terminals[0] if terminals else None
+            if conductor and _is_terminal_busy(conductor["id"]):
+                logger.info(f"Flow {name}: session {session_name} is busy, skipping")
+                return False
+            for t in terminals:
+                provider_manager.cleanup_provider(t["id"])
+            tmux_client.kill_session(session_name)
+            delete_terminals_by_session(session_name)
         terminal = await create_terminal(
             session_name=session_name,
             provider=flow.provider,

@@ -4,104 +4,377 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [Unreleased]
 
-## [1.1.0] - 2026-02-26
+## [2.2.0] - 2026-06-01
 
-### Fixed
+### Highlights
 
-- Fix `_handoff_impl()` only accepting IDLE as ready state: providers with initial prompts reach COMPLETED after processing the system prompt; updated to accept both IDLE and COMPLETED via multi-status `wait_until_terminal_status()`
-- Fix `wait_until_terminal_status()` only accepting a single status: now accepts `Union[TerminalStatus, set]` for polling multiple acceptable statuses
-- Fix handoff worker IDLE wait timeout too short (30s) for slow-initializing providers: some providers can exceed 30s during shell warm-up, CLI startup, and MCP server registration; increased to 120s to act as a fallback
-- Fix inbox message delivery failing for TUI-based providers: inbox service passed `tail_lines=5` to `get_status()` but TUI providers need 50+ lines to find the idle prompt; messages stayed PENDING forever because the supervisor was never detected as IDLE
-- Fix inbox watchdog log tail check (`_has_idle_pattern`) using only 5 lines, which missed the idle prompt for full-screen TUI providers where the prompt sits mid-screen with 30+ padding lines below; increased to 100 lines so the watchdog reliably triggers delivery when the terminal goes IDLE
-- Fix shell command injection risk in Q CLI and Kiro CLI providers: replace f-string command interpolation with `shlex.join()` for safe shell escaping of `agent_profile` values
-- Fix Claude Code provider not forwarding `CAO_TERMINAL_ID` to MCP server subprocesses: inject `CAO_TERMINAL_ID` into MCP server `env` config, matching other providers
-- Fix Claude Code provider failing to launch due to tmux `send-keys` corrupting single quotes in long commands; resolved by main branch's paste-buffer approach (`load-buffer` + `paste-buffer -p`)
-- Add missing `wait_for_shell` call to Claude Code provider `initialize()` to match other providers
-- Update Claude Code `IDLE_PROMPT_PATTERN` to match both `>` and `❯` prompt styles
-- Add `_handle_trust_prompt()` to Claude Code provider to auto-accept the workspace trust dialog when opened in a new/untrusted directory; exclude trust prompt from `WAITING_USER_ANSWER` detection
-- Fix Codex provider failing to launch in tmux: add warm-up `echo ready` command before starting codex to prevent immediate exit in fresh sessions
-- Fix Codex idle prompt detection for `--no-alt-screen` mode: replace `\Z`-anchored regex with bottom-N-lines approach (`IDLE_PROMPT_TAIL_LINES = 5`) since inline mode keeps scrollback history
-- Fix Codex trust prompt `›` falsely matching idle prompt pattern by checking trust prompt before idle prompt in `get_status()`
-- Fix Codex status detection not recognizing real interactive output format: update `ASSISTANT_PREFIX_PATTERN` to match `•` bullet responses and `USER_PREFIX_PATTERN` to match `›` user input prompts, enabling `get_status()` to return `COMPLETED` for real Codex output (previously always returned `IDLE`, causing handoff/assign to time out)
-- Fix `USER_PREFIX_PATTERN` crossing newline boundaries: use `[^\S\n]` (horizontal whitespace) instead of `\s` to prevent `› \n  ?` from matching as user input
-- Add `IDLE_PROMPT_STRICT_PATTERN` for extraction: matches only empty prompt lines (`› ` without text) to distinguish idle prompts from user input lines
-- Rewrite `extract_last_message_from_script()` to use user-message-based extraction as primary approach (works for both label and bullet formats) with assistant-marker fallback
-- Fix Codex MCP `tool_timeout_sec` not taking effect: change value from `600` (TOML integer) to `600.0` (TOML float) because Codex deserializes via `Option<f64>` and silently rejects integers, falling back to the 60s default
-- Fix handoff worker agents not returning results: prepend `[CAO Handoff]` context to the message in `_handoff_impl()` so the worker agent knows this is a blocking handoff and should output results directly instead of attempting to call `send_message` back to the supervisor (which fails because the worker doesn't have the supervisor's terminal ID)
-- Fix Codex TUI footer causing false IDLE during handoff: `› Summarize recent commits` in the TUI status bar matched `USER_PREFIX_PATTERN` as a user message, preventing COMPLETED detection; now detects TUI footer (`? for shortcuts` / `context left`) and excludes bottom lines from user-message matching
-- Fix Codex TUI progress spinner causing false COMPLETED: `• Working (0s • esc to interrupt)` matched `ASSISTANT_PREFIX_PATTERN` while TUI `›` hint matched idle prompt; added `TUI_PROGRESS_PATTERN` check to return PROCESSING when spinner is active
-- Fix Codex output extraction returning TUI chrome: apply same TUI footer detection to `extract_last_message_from_script()` and use `cutoff_pos` as extraction boundary when no strict idle prompt found
-- Fix Codex extraction of multi-line user messages: find first `•` assistant marker after user message instead of skipping one line, correctly handling wrapped `[CAO Handoff]` prefix text
-- Fix Claude Code worker agents blocking on workspace trust prompt during handoff/assign: add `--dangerously-skip-permissions` flag to bypass trust dialog since CAO already confirms workspace trust during `cao launch`
-- Fix Claude Code `PROCESSING_PATTERN` not matching newer Claude Code 2.x spinner format: broaden pattern to match both `(esc to interrupt)` and `(Ns · ↓ tokens · thinking)` formats
-- Fix all providers' `send_input()` using `tmux send_keys(literal=True)` which sends characters individually, allowing TUI hotkeys to intercept user messages; replace with `send_keys_via_paste()` using `tmux set-buffer` + `paste-buffer -p` (bracketed paste mode) to bypass per-character hotkey handling
+- **CAO memory** — Agents can now store and recall knowledge across sessions via `memory_store` / `memory_recall` / `memory_forget` MCP tools. Memories are scoped to `global` / `project` / `session` / `agent`, persisted as wiki-style markdown under `~/.aws/cli-agent-orchestrator/memory/`, indexed in SQLite with BM25 fallback retrieval, and auto-injected as `<cao-memory>` context at session start. Ships with CLI commands (`cao memory list/show/delete/clear`), tiered retention, file-lock concurrent-write safety, per-scope caps, and stable project identity via git remote. See [docs/memory.md](docs/memory.md). (#245, #254, #262)
+
+- **External tool integration: OpenClaw & Hermes Agent** — A new external-tool-integration skill lets CAO orchestrate non-CAO CLI agents (OpenClaw, Hermes Agent, etc.) as first-class workers. Hermes Agent is shipped as a worked end-to-end example. See [docs/external-tool-integration.md](docs/external-tool-integration.md). (#241, #253)
 
 ### Added
 
-- E2E assign callback round-trip test (`test_assign_with_callback`) for all providers: verifies full assign flow where worker completes task, result is sent to supervisor's inbox, inbox message delivered (status=DELIVERED), and supervisor processes the callback
-- E2E send_message test now verifies inbox message status = DELIVERED (not just stored), proving the inbox delivery pipeline works end-to-end for each provider
-- E2E supervisor orchestration test now verifies no inbox messages stuck as PENDING after supervisor completes, catching inbox delivery pipeline failures
-- Workspace trust confirmation prompt in `launch.py` before starting providers: asks "Do you trust all the actions in this folder?" since providers are granted full permissions (read, write, execute) in the working directory; supports `--yolo` flag to skip
-- Unit tests for `TmuxClient.send_keys` validating paste-buffer delivery (`test/clients/test_tmux_send_keys.py`)
-- Claude Code unit tests for `wait_for_shell` lifecycle, shell timeout, `❯` prompt detection, and ANSI-coded output
-- Trust prompt handling tests (6 tests) and workspace confirmation tests (4 tests)
-- Codex provider agent profile support: inject system prompt via `-c developer_instructions` config override, mirroring Claude Code's `--append-system-prompt` behavior
-- Codex provider MCP server support: inject MCP servers from agent profiles via `-c mcp_servers.<name>.<field>=<value>` config overrides (per-session, no global config changes), enabling tools like `handoff` and `send_message` for multi-agent orchestration
-- Codex MCP server `CAO_TERMINAL_ID` environment forwarding: automatically adds `env_vars=["CAO_TERMINAL_ID"]` to all MCP server configs so handoff can create new agent windows in the same tmux session
-- Codex `_build_codex_command()` method with `shlex.join()` for safe shell escaping and proper quote/backslash/newline handling
-- Codex launch flags: `--no-alt-screen` (inline mode for reliable tmux capture) and `--disable shell_snapshot` (prevent SIGTTIN in tmux)
-- Codex `_handle_trust_prompt()` to auto-accept workspace trust dialog during initialization
-- Codex unit tests: `TestCodexBuildCommand` (10 tests) for command building, agent profile injection, MCP server config, escaping, and error handling
-- Codex bullet-format status detection tests: `TestCodexBulletFormatStatusDetection` (7 tests) for COMPLETED, PROCESSING, IDLE, code blocks, error detection, multi-turn, and TUI status bar using real `•` bullet response format
-- Codex bullet-format extraction tests: `TestCodexBulletFormatExtraction` (5 tests) for single-line, multi-line, code block, multi-turn, and no-trailing-prompt extraction from `•` bullet format
-- Codex TUI spinner status detection tests: `test_get_status_processing_tui_spinner`, `test_get_status_processing_tui_thinking_spinner`, `test_get_status_processing_dynamic_spinner_text` (3 tests) verifying PROCESSING is returned when TUI progress spinner is active
-- Handoff message context tests: `TestHandoffMessageContext` (6 tests) in `test/mcp_server/test_handoff.py` verifying `[CAO Handoff]` prefix is prepended only for Codex provider, includes supervisor terminal ID, and preserves the original message
-- Multi-agent communication protocol section added to `developer.md` and `reviewer.md` agent profiles explaining handoff vs assign behavior
-- End-to-end test suite (`test/e2e/`) with 15 tests covering handoff, assign, and send_message flows across all 3 providers (codex, claude_code, kiro_cli); uses real `data_analyst` and `report_generator` profiles from `examples/assign/`; gated behind `@pytest.mark.e2e` marker, excluded from default `pytest` runs
-- Provider documentation: `docs/claude-code.md` and `docs/kiro-cli.md` covering status detection, message extraction, configuration, implementation notes, E2E testing, and troubleshooting
-- CI workflow `test-codex-provider.yml` for Codex provider-specific unit tests (path-triggered)
-- CI workflow `test-claude-code-provider.yml` for Claude Code provider-specific unit tests (path-triggered)
-- `BaseProvider.mark_input_received()` hook called by `terminal_service.send_input()` after delivering external input; allows providers to adjust status detection based on whether external input has been received since initialization
-- `TmuxClient.send_keys_via_paste()` method for sending text via bracketed paste mode (`tmux set-buffer` + `paste-buffer -p`), bypassing TUI hotkey interception
-- `TmuxClient.send_special_key()` method for sending tmux key sequences (e.g., `C-d`, `C-c`) non-literally, distinct from `send_keys()` which sends text literally
-- Supervisor orchestration E2E tests (`test/e2e/test_supervisor_orchestration.py`): tests across providers that verify the full supervisor→worker delegation flow via MCP tools (handoff and assign+handoff), using `analysis_supervisor` profile from `examples/assign/`
-- `terminal_service.send_special_key()` wrapper function for the new tmux client method
-- Exit terminal endpoint key sequence routing: `POST /terminals/{terminal_id}/exit` now detects `C-`/`M-` prefixed exit commands and sends them as tmux key sequences instead of literal text
-- New CLI commands: `cao info` (show session info) and `cao mcp-server` (start MCP server)
-- New example profiles: `data_analyst` and `report_generator` in `examples/assign/`
-- Kiro CLI provider: comprehensive docstrings and `shlex.join()` shell safety fix
-- Q CLI provider: `shlex.join()` shell safety fix
-- Session service: comprehensive docstrings
+- Build an MCP server for cao operations (#166)
 
-## [1.0.2] - 2026-01-30
+- auto-delete handoff terminals with snapshot-based restore (#233)
+
+- shell command tracking, flow recycling fixes, and inbox delivery reliability (#230)
+
+- eager inbox delivery for providers that buffer input during processing (#251)
+
+- forward `cao launch --env` vars to supervisor and child agents (#259)
+
+- add optional `codexProfile` field to AgentProfile for codex provider (#250)
+
+- add optional `permission_mode` field to AgentProfile for claude_code provider (#244)
+
+- auto-derive CORS origins from `cao-server --host/--port` (#261)
+
+- official devcontainer feature for CAO (#260)
+
+- memory: Phase 2.5 hardening — per-scope caps, ISO-8601 Z round-trip lock, durability + concurrent flock tests, `memory.enabled` short-circuit, stable project identity via git remote (#262)
+
+- enhance Web UI DashboardHome with filtering, sorting, grouping, and session deletion (#200)
+
+- add OpenCode provider label to Web UI (#217)
+
+
+### Documentation
+
+- reorganize README, split detail into topic docs, and add control-plane overview (#225)
+
+- fix Web UI build instructions and add 404 troubleshooting (#252)
+
+- add install with pypi in README.md (#214)
+
+
+### Fixed
+
+- mcp: reject `send_message` when `receiver_id` equals sender (#263)
+
+- tmux name validation hardening (CodeQL #66) (#258)
+
+- launch: resolve profile.provider regardless of yolo/allowed-tools branch (#257)
+
+- api: default TERM to xterm-256color for tmux PTY attach (#256)
+
+- api: make network allowlists configurable via env vars (#255)
+
+- tmux: filter environment to prevent 'command too long' errors (#246)
+
+- session-service: resolve profile.provider in `create_session()` (#198)
+
+- fix mcp worker provider resolution (#224)
+
+- fix ops mcp profile provider resolution (#229)
+
+- agent_profiles: guard agent-name path lookups against traversal (#228)
+
+- install: harden agent-profile install against SSRF and path injection (#226)
+
+- gemini_cli: isolate `GEMINI.md` per terminal in a dedicated workspace (#227)
+
+- kiro_cli: fix handoff hang for Q Developer Pro — Credits marker not emitted in TUI mode (#238)
+
+- kiro_cli: detect TUI `Initializing...` to prevent false IDLE (#215)
+
+- tmux: start panes at 220x50 to avoid kiro-cli SIGWINCH input death (#218)
+
+- launch: wait for idle before tmux attach on non-headless launch (#221)
+
+- opencode: add a poller to OpenCode CLI inbox delivery to drain stuck messages (#210)
+
+
+### Other
+
+- bump idna from 3.10 to 3.15 (#247)
+
+- bump authlib from 1.6.11 to 1.6.12 (#236)
+
+- bump urllib3 from 2.6.3 to 2.7.0 (#234)
+
+- bump python-multipart from 0.0.26 to 0.0.27 (#232)
+
+- bump vitest from 3.2.4 to 4.1.0 in /web (#267)
+
+
+## [2.1.1] - 2026-04-28
+
+### Added
+
+- Add OpenCode CLI provider support (#193)
+
+- add PyPI publish workflow and update pyproject.toml (#123)
+
+
+### Fixed
+
+- honour profile.provider when --provider flag is not given (#196)
+
+- eliminate PROCESSING false-positives from compaction and /exit (#199)
+
+- honor --yolo and profile.model at launch (#201)
+
+- recognise Copilot v1.0.31+ status bar and breadcrumb as footer lines for idle detection (#184)
+
+- fix the cliff github api timeout with env GITHUB_TOKEN for git cliff to pickup. Add retry mechanism in script (#212)
+
+
+### Other
+
+- Feat/publish cao to pypi (#209)
+
+- bump postcss from 8.5.8 to 8.5.12 in /web (#208)
+
+- switch to deploy key to bypass commit to main (#213)
+
+## [2.1.0] - 2026-04-22
+
+### Added
+
+- Add support for skills (#145)
+
+- Build support for external plugins (#172)
+
+- add cao session command, HTTP API refactor, and kiro-cli fixes (#187)
+
+
+### Documentation
+
+- add managed skills to README, restore developer.md orch… (#170)
+
+- cut 2.1.0 release notes (#195)
+
+- correct 2.1.0 entry — remove unmerged feature, fix refs (#197)
+
+
+### Fixed
+
+- Bundle built WebUI assets within Python wheel (#169)
+
+- prevent stale processing spinners from blocking inbox delivery (#104) (#106)
+
+- structural PROCESSING detection immune to ❯ position race (#177)
+
+- read GEMINI.md for Gemini skill catalog injection assertion (#180)
+
+- gracefully handle missing agent profiles in CAO store (#186)
+
+- handle Kiro CLI 2.0 Credits-before-separator layout (#188)
+
+- honor profile.model at terminal creation (#189)
+
+- position-aware 'Kiro is working' check prevents stale PROCESSING blocking handoffs (#185)
+
+- prevent false-positive IDLE on shell prompt during startup (#190)
+
+- only kill sessions this call created on cleanup (#191)
+
+
+### Other
+
+- bump pytest from 8.4.2 to 9.0.3 (#173)
+
+- bump python-multipart from 0.0.22 to 0.0.26 (#175)
+
+- bump authlib from 1.6.9 to 1.6.11 (#178)
+
+- bump python-dotenv from 1.1.1 to 1.2.2 (#194)
+
+## [2.0.2] - 2026-04-10
+
+### Added
+
+- Support agent-profile environment variable injection and loading (#156)
+
+- add cao-provider skill for new CLI agent providers (#154)
+
+- add full TUI mode support with --legacy-ui fallback (#159) (#163)
+
+
+### Fixed
+
+- improve Web UI terminal scroll and paste reliability (#162)
+
+
+### Other
+
+- Fix/providers endpoint missing entries (#158)
+
+- bump vite from 6.4.1 to 6.4.2 in /web (#160)
+
+- bump cryptography from 46.0.6 to 46.0.7 (#165)
+
+## [2.0.1] - 2026-04-03
+
+### Added
+
+- add allowedTools — universal tool restriction across … (#125)
+
+
+### Fixed
+
+- add --legacy-ui flag for new Kiro CLI TUI compatibility (#138)
+
+- add new TUI fallback patterns + fix #137 exception handling  (#140)
+
+- replace WAITING_USER_ANSWER regex to prevent stale scrollback false positives (#142)
+
+- honor child allowedTools=["*"] instead of inheriting parent restrictions (#141) (#144)
+
+- clarify prompt, add --auto-approve, document TOOL_MAPPING (#146)
+
+
+### Other
+
+- bump cryptography from 46.0.5 to 46.0.6 (#135)
+
+- bump pygments from 2.19.2 to 2.20.0 (#136)
+
+- bump fastmcp from 2.14.5 to 3.2.0 (#139)
+
+## [2.0.0] - 2026-03-26
+
+### Added
+
+- add Gemini CLI provider (#102)
+
+- Support provider override in agent profiles for cross-provider workflows (#101)
+
+- add Kimi CLI provider (#113)
+
+- add copilot_cli provider (#82)
+
+- add Web UI dashboard with configurable agent directories (#108)
+
+- auto-inject sender terminal ID in assign and send_message (#98)
+
+
+### Documentation
+
+- add cross-provider example profiles and fix missing gemini_cli in README (#109)
+
+
+### Fixed
+
+- accept IDLE or COMPLETED during terminal init (#111)
+
+- add extraction retry for TUI-based providers (Gemini CLI) (#117)
+
+- add CodeQL SafeAccessCheck guard for path injection (#121)
+
+- add DNS rebinding protection via Host header validation (#124)
+
+- pin trivy-action to SHA instead of mutable master ref (#126)
+
+- handle bypass permissions prompt on startup (#119) (#120)
+
+- bump vite 5→6.4.1 and vitest 2→3.2.4 to fix esbuild vulner… (#129)
+
+
+### Other
+
+- Fixes the `400 Bad Request` error when launching agents in directories outside `~/`, such as `/Volumes/workplace` on macOS.  (#110)
+
+- bump black from 25.9.0 to 26.3.1 (#114)
+
+- bump pyjwt from 2.11.0 to 2.12.0 (#118)
+
+- bump authlib from 1.6.7 to 1.6.9 (#122)
+
+- bump requests from 2.32.5 to 2.33.0 (#130)
+
+- Docs/update readme and changelog (#132)
+
+- Docs/update readme and changelog (#133)
+
+## [1.1.1] - 2026-03-09
+
+### Fixed
+
+- Fix regex to catch Claude Code Processing spinner (#92)
+
+- Update failing Q CLI unit tests due to working directory validation (#94)
+
+- Update Codex TUI footer detection for v0.111.0 (#99)
+
+
+### Other
+
+- bump authlib from 1.6.6 to 1.6.7 (#97)
+
+## [1.1.0] - 2026-02-27
+
+### Added
+
+- add --dangerously-skip-permissions, --yolo flag, tmux paste fix, and dep upgrades (#76)
+
+- rewrite Codex provider, framework improvements, security fix, and docs (#77)
+
+- add CLI commands, shell safety fixes, agent profiles, and docs (#83)
+
+
+### Fixed
+
+- detect active permission prompts using line-based counting (#71)
+
+
+### Other
+
+- bump cryptography from 46.0.1 to 46.0.5 (#72)
+
+- add comprehensive unit tests, E2E tests, and CI workflows (#81)
+
+## [1.0.3] - 2026-02-09
+
+### Fixed
+
+- Synchronize status detection with response completion (#62)
+
+- update IDLE_PROMPT_PATTERN_LOG to match actual kiro-cli ANSI output (#65)
+
+- prevent permission prompt pattern from matching stale prompts (#69)
+
+
+### Other
+
+- replace chunked send_keys with paste-buffer for instant delivery (#67)
+
+## [1.0.2] - 2026-02-05
+
+### Added
+
+- add dynamic working directory inheritance for spawned agents (#47)
+
 
 ### Fixed
 
 - Handle CLI prompts with trailing text (#61)
 
-### Added
-
-- Dynamic working directory inheritance for spawned agents (#47)
-
-## [1.0.1] - 2026-01-27
+## [1.0.1] - 2026-02-02
 
 ### Fixed
 
-- Release workflow version parsing (#60)
-- Escape newlines in Claude Code multiline system prompts (#59)
+- release workflow version parsing (#60)
 
-### Security
-
-- Bump python-multipart from 0.0.20 to 0.0.22 (#58)
-- Bump werkzeug from 3.1.1 to 3.1.5 (#55)
-- Bump starlette from 0.48.0 to 0.49.1 (#53)
-- Bump urllib3 from 2.5.0 to 2.6.3 (#52)
-- Bump authlib from 1.6.4 to 1.6.6 (#51)
 
 ### Other
 
+- bump authlib from 1.6.4 to 1.6.6 (#51)
+
+- bump urllib3 from 2.5.0 to 2.6.3 (#52)
+
 - Remove unused constants and enum values (#45)
+
+- bump starlette from 0.48.0 to 0.49.1 (#53)
+
+- bump werkzeug from 3.1.1 to 3.1.5 (#55)
+
+- bump python-multipart from 0.0.20 to 0.0.22 (#58)
+
+- Escape newlines in Claude Code multiline system prompts (#59)
 
 ## [1.0.0] - 2026-01-23
 
@@ -112,6 +385,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - add badge to deepwiki for weekly auto-refresh (#13)
 
 - add Codex CLI provider (#39)
+
+- add changelog and automated release workflow (#50)
 
 
 ### Changed
@@ -165,4 +440,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bump to v0.51.0, update method name (#31)
 
 - accept optional U+03BB (λ) after % in kiro and q CLIs (#44)
+
 

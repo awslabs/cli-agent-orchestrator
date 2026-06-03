@@ -101,6 +101,42 @@ The Codex provider automatically adds these flags for tmux compatibility:
 - `--no-alt-screen`: Runs Codex in inline mode so output stays in normal scrollback, making `tmux capture-pane` reliable
 - `--disable shell_snapshot`: Prevents TTY input conflicts (SIGTTIN) caused by the shell_snapshot subprocess inheriting stdin in tmux
 
+By default, CAO also passes `--yolo` (alias for `--dangerously-bypass-approvals-and-sandbox`) because CAO agents run in non-interactive tmux sessions where approval prompts block handoff/assign flows. Profiles can opt out via `codexProfile`; see [Custom Codex Profile](#custom-codex-profile). Any unrestricted allowed-tools configuration (`allowedTools: ["*"]`, `--allowed-tools '*'`, or `cao launch --yolo`) forces `--yolo` regardless of the profile setting.
+
+### Custom Codex Profile
+
+The `codexProfile` field on an agent profile names a `[profiles.<name>]` block in your `~/.codex/config.toml`. When set, CAO drops `--yolo` and passes `--profile <name>` instead, letting the user's named profile govern sandbox and approval behavior. Unrestricted allowed tools (`allowedTools: ["*"]`, `--allowed-tools '*'`, or `cao launch --yolo`) override this field and always force `--yolo`.
+
+**Important — non-interactive only**: CAO's status detector cannot interact with Codex's current boxed approval UI (`Command Approval Required / [a] Accept / [d] Decline`). Any `codexProfile` you reference MUST resolve to a non-interactive permission tier, or CAO sessions will time out waiting for input that nothing can deliver. Safe shapes:
+
+- **Read-only / audit agents**: `approval_policy = "never"` + `sandbox_mode = "read-only"` — write/network/escape attempts fail closed and return errors to the model.
+- **Write-permitted agents**: `approval_policy = "never"` + `sandbox_mode = "workspace-write"` — writes inside the workspace proceed; sandbox escapes fail closed.
+- **Smart Approvals (classifier-gated)**: `approval_policy = "on-request"` + `sandbox_mode = "workspace-write"` + `approvals_reviewer = "auto_review"` — the auto-review classifier decides escalations; denials fail closed without prompting.
+
+Avoid `approval_policy = "untrusted"` or `approval_policy = "on-request"` without `approvals_reviewer = "auto_review"` — those tiers prompt the user, which CAO cannot answer.
+
+Example — a reviewer that runs under Codex's read-only sandbox:
+
+```markdown
+---
+name: reviewer
+description: Code Reviewer
+provider: codex
+role: reviewer
+codexProfile: cao_reviewer
+---
+
+You review code for quality and correctness.
+```
+
+Matching `~/.codex/config.toml`:
+
+```toml
+[profiles.cao_reviewer]
+sandbox_mode = "read-only"
+approval_policy = "never"
+```
+
 ## Workflows
 
 ### 1. Interactive single-agent task

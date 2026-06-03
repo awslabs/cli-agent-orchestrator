@@ -2,13 +2,18 @@
 
 import click
 
+from cli_agent_orchestrator.cli.commands.env import env
 from cli_agent_orchestrator.cli.commands.flow import flow
 from cli_agent_orchestrator.cli.commands.info import info
 from cli_agent_orchestrator.cli.commands.init import init
 from cli_agent_orchestrator.cli.commands.install import install
 from cli_agent_orchestrator.cli.commands.launch import launch
 from cli_agent_orchestrator.cli.commands.mcp_server import mcp_server
+from cli_agent_orchestrator.cli.commands.memory import memory
+from cli_agent_orchestrator.cli.commands.session import session
 from cli_agent_orchestrator.cli.commands.shutdown import shutdown
+from cli_agent_orchestrator.cli.commands.skills import skills
+from cli_agent_orchestrator.cli.commands.terminal import terminal
 
 
 @click.group()
@@ -22,8 +27,13 @@ cli.add_command(init)
 cli.add_command(install)
 cli.add_command(shutdown)
 cli.add_command(flow)
+cli.add_command(env)
 cli.add_command(mcp_server)
 cli.add_command(info)
+cli.add_command(memory)
+cli.add_command(skills)
+cli.add_command(session)
+cli.add_command(terminal)
 
 
 if __name__ == "__main__":

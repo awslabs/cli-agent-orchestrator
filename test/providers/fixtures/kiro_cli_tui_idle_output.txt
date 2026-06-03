@@ -1,0 +1,4 @@
+────────────────────────────────────────────────────
+developer · claude-opus-4.6-1m · ◔ 3%              ~/project · (main)
+
+ Ask a question or describe a task ↵  ctrl+g: agent monitor

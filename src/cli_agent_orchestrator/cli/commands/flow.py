@@ -1,5 +1,6 @@
 """Flow commands for CLI Agent Orchestrator."""
 
+import asyncio
 from datetime import datetime
 
 import click
@@ -93,7 +94,9 @@ def enable(name):
 def run(name):
     """Manually run a flow."""
     try:
-        executed = flow_service.execute_flow(name)
+        # execute_flow is async in the event-driven architecture (it awaits the
+        # async create_terminal); drive it to completion from this sync command.
+        executed = asyncio.run(flow_service.execute_flow(name))
         if executed:
             click.echo(f"Flow '{name}' executed successfully")
         else:

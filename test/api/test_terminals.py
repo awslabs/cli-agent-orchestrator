@@ -1,6 +1,7 @@
 """Tests for terminal-related API endpoints including working directory and exit."""
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from typing import Dict
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -70,8 +71,8 @@ class TestSessionCreationWithWorkingDirectory:
 
     def test_create_session_passes_working_directory(self, client, tmp_path):
         """Test that working_directory parameter is passed to service."""
-        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.create_terminal = AsyncMock(
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(
                 return_value=Terminal(
                     id="abcd1234",
                     name="test-window",
@@ -92,13 +93,14 @@ class TestSessionCreationWithWorkingDirectory:
 
             assert response.status_code == 201
             # Verify working_directory was passed
-            call_kwargs = mock_svc.create_terminal.call_args.kwargs
+            call_kwargs = mock_svc.create_session.call_args.kwargs
             assert call_kwargs.get("working_directory") == str(tmp_path)
+            assert call_kwargs.get("registry") is not None
 
     def test_create_session_with_working_directory(self, client):
         """Test POST /sessions with working_directory parameter."""
-        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.create_terminal = AsyncMock(
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(
                 return_value=Terminal(
                     id="abcd1234",
                     name="test-window",
@@ -118,7 +120,7 @@ class TestSessionCreationWithWorkingDirectory:
             )
 
             assert response.status_code == 201
-            call_kwargs = mock_svc.create_terminal.call_args.kwargs
+            call_kwargs = mock_svc.create_session.call_args.kwargs
             assert call_kwargs.get("working_directory") == "/custom/path"
 
 
@@ -276,13 +278,354 @@ class TestExitTerminalEndpoint:
             assert response.status_code == 500
             assert "Failed to exit terminal" in response.json()["detail"]
 
+    def test_exit_terminal_provider_returns_none(self, client):
+        """Should return 404 when get_provider returns None (not ValueError)."""
+        with patch("cli_agent_orchestrator.api.main.provider_manager") as mock_pm:
+            mock_pm.get_provider.return_value = None
+
+            response = client.post("/terminals/deadbeef/exit")
+
+            assert response.status_code == 404
+            assert "Provider not found" in response.json()["detail"]
+
+
+class TestDeleteTerminalEndpoint:
+    """Test DELETE /terminals/{terminal_id} endpoint."""
+
+    def test_delete_terminal_success(self, client):
+        """DELETE /terminals/{terminal_id} deletes and returns success."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.delete_terminal.return_value = True
+
+            response = client.delete("/terminals/abcd1234")
+
+            assert response.status_code == 200
+            assert response.json() == {"success": True}
+            mock_svc.delete_terminal.assert_called_once_with("abcd1234", registry=ANY)
+
+    def test_delete_terminal_not_found(self, client):
+        """DELETE /terminals/{terminal_id} returns 404 for missing terminal."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.delete_terminal.side_effect = ValueError("Terminal not found")
+
+            response = client.delete("/terminals/deadbeef")
+
+            assert response.status_code == 404
+
+    def test_delete_terminal_server_error(self, client):
+        """DELETE /terminals/{terminal_id} returns 500 on internal error."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.delete_terminal.side_effect = Exception("TMux error")
+
+            response = client.delete("/terminals/abcd1234")
+
+            assert response.status_code == 500
+            assert "Failed to delete terminal" in response.json()["detail"]
+
+
+class TestCreateInboxMessageEndpoint:
+    """Test POST /terminals/{receiver_id}/inbox/messages endpoint."""
+
+    def test_create_inbox_message_success(self, client):
+        """POST creates an inbox message and returns success."""
+        mock_msg = MagicMock()
+        mock_msg.id = 1
+        mock_msg.sender_id = "sender1"
+        mock_msg.receiver_id = "abcd1234"
+        mock_msg.created_at.isoformat.return_value = "2026-03-13T12:00:00"
+
+        with (
+            patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create,
+            patch("cli_agent_orchestrator.api.main.inbox_service") as mock_inbox,
+        ):
+            mock_create.return_value = mock_msg
+
+            response = client.post(
+                "/terminals/abcd1234/inbox/messages",
+                params={"sender_id": "sender1", "message": "hello"},
+            )
+
+            assert response.status_code == 200
+            data = response.json()
+            assert data["success"] is True
+            assert data["message_id"] == 1
+            assert data["sender_id"] == "sender1"
+            mock_create.assert_called_once_with(
+                "sender1",
+                "abcd1234",
+                "hello",
+            )
+            mock_inbox.deliver_pending.assert_called_once_with("abcd1234", registry=ANY)
+
+    def test_create_inbox_message_delivery_failure_still_succeeds(self, client):
+        """Immediate delivery failure should not fail the API response."""
+        mock_msg = MagicMock()
+        mock_msg.id = 2
+        mock_msg.sender_id = "sender1"
+        mock_msg.receiver_id = "abcd1234"
+        mock_msg.created_at.isoformat.return_value = "2026-03-13T12:00:00"
+
+        with (
+            patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create,
+            patch("cli_agent_orchestrator.api.main.inbox_service") as mock_inbox,
+        ):
+            mock_create.return_value = mock_msg
+            mock_inbox.deliver_pending.side_effect = Exception("TMux busy")
+
+            response = client.post(
+                "/terminals/abcd1234/inbox/messages",
+                params={"sender_id": "sender1", "message": "hello"},
+            )
+
+            assert response.status_code == 200
+            assert response.json()["success"] is True
+
+    def test_create_inbox_message_not_found(self, client):
+        """POST returns 404 when terminal not found."""
+        with patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create:
+            mock_create.side_effect = ValueError("Terminal not found")
+
+            response = client.post(
+                "/terminals/deadbeef/inbox/messages",
+                params={"sender_id": "sender1", "message": "hello"},
+            )
+
+            assert response.status_code == 404
+
+    def test_create_inbox_message_server_error(self, client):
+        """POST returns 500 on internal error."""
+        with patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create:
+            mock_create.side_effect = Exception("DB error")
+
+            response = client.post(
+                "/terminals/abcd1234/inbox/messages",
+                params={"sender_id": "sender1", "message": "hello"},
+            )
+
+            assert response.status_code == 500
+            assert "Failed to create inbox message" in response.json()["detail"]
+
+
+class TestWebSocketLocalhostRestriction:
+    """Test that WebSocket endpoint rejects non-loopback clients."""
+
+    def test_websocket_rejects_non_loopback(self, client):
+        """WebSocket should close with 4003 for non-localhost clients."""
+        # TestClient uses "testclient" as host, which is not in the allowlist
+        with pytest.raises(Exception):
+            with client.websocket_connect("/terminals/abcd1234/ws"):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_websocket_endpoint_admits_client_in_allowlist(self):
+        """Direct-call unit test: a client whose host is in WS_ALLOWED_CLIENTS
+        passes the allowlist gate and reaches the next step (terminal lookup).
+
+        Driving the coroutine directly with a mock ``WebSocket`` lets us
+        observe the exact ``close`` calls without fighting the TestClient's
+        opaque mapping of post-accept closes to HTTP 400 denials.
+        """
+        from cli_agent_orchestrator.api.main import terminal_ws
+
+        ws = MagicMock()
+        ws.client = MagicMock(host="172.17.0.1")  # Docker bridge IP, simulating issue #149
+        ws.accept = AsyncMock()
+        ws.close = AsyncMock()
+
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.WS_ALLOWED_CLIENTS",
+                ["127.0.0.1", "::1", "localhost", "172.17.0.1"],
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.get_terminal_metadata",
+                return_value=None,
+            ),
+        ):
+            await terminal_ws(ws, "abcd1234")
+
+        # Allowlist let it through → accept happened.
+        ws.accept.assert_awaited_once()
+        # Terminal lookup returned None → close with 4004 (not 4003).
+        ws.close.assert_awaited_once()
+        kwargs = ws.close.call_args.kwargs
+        assert kwargs.get("code") == 4004
+
+    @pytest.mark.asyncio
+    async def test_websocket_endpoint_rejects_client_outside_allowlist(self):
+        """Direct-call unit test: a client whose host is not in the allowlist
+        is closed with policy code 4003 before any accept happens."""
+        from cli_agent_orchestrator.api.main import terminal_ws
+
+        ws = MagicMock()
+        ws.client = MagicMock(host="10.0.0.5")
+        ws.accept = AsyncMock()
+        ws.close = AsyncMock()
+
+        with patch(
+            "cli_agent_orchestrator.api.main.WS_ALLOWED_CLIENTS",
+            ["127.0.0.1", "::1", "localhost"],
+        ):
+            await terminal_ws(ws, "abcd1234")
+
+        # Rejected before accept.
+        ws.accept.assert_not_called()
+        ws.close.assert_awaited_once()
+        kwargs = ws.close.call_args.kwargs
+        assert kwargs.get("code") == 4003
+
+    @pytest.mark.asyncio
+    async def test_websocket_endpoint_rejects_invalid_tmux_metadata(self):
+        """Defence-in-depth: if a stored terminal row contains a tmux session
+        or window name with delimiter characters, the WS handler must close
+        the connection rather than splice the bad name into ``tmux -t``.
+        """
+        from cli_agent_orchestrator.api.main import terminal_ws
+
+        ws = MagicMock()
+        ws.client = MagicMock(host="127.0.0.1")
+        ws.accept = AsyncMock()
+        ws.close = AsyncMock()
+
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.WS_ALLOWED_CLIENTS",
+                ["127.0.0.1"],
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.get_terminal_metadata",
+                return_value={"tmux_session": "evil:name", "tmux_window": "win"},
+            ),
+        ):
+            await terminal_ws(ws, "abcd1234")
+
+        # Allowlist passed → accept happened, but validation failed → 4003.
+        ws.accept.assert_awaited_once()
+        ws.close.assert_awaited_once()
+        kwargs = ws.close.call_args.kwargs
+        assert kwargs.get("code") == 4003
+        assert "Invalid tmux target name" in kwargs.get("reason", "")
+
+
+class TestBuildPtyEnv:
+    """Tests for the tmux PTY attach environment builder (issue #150).
+
+    The helper is responsible for ensuring the tmux ``attach-session``
+    subprocess sees a usable ``TERM`` value. Container environments
+    routinely ship with ``TERM`` unset or set to ``dumb``, which breaks
+    xterm.js rendering on the browser side.
+    """
+
+    def _build(self, env_overrides):
+        """Run ``_build_pty_env`` under a controlled os.environ."""
+        from cli_agent_orchestrator.api.main import _build_pty_env
+
+        with patch.dict("os.environ", env_overrides, clear=True):
+            return _build_pty_env()
+
+    def test_unset_term_is_defaulted(self):
+        env = self._build({"HOME": "/root", "PATH": "/usr/bin"})
+        assert env["TERM"] == "xterm-256color"
+
+    def test_empty_string_term_is_defaulted(self):
+        env = self._build({"TERM": "", "HOME": "/root"})
+        assert env["TERM"] == "xterm-256color"
+
+    def test_dumb_term_is_overridden(self):
+        # The whole point of issue #150 — Docker's TERM=dumb is unusable.
+        env = self._build({"TERM": "dumb", "HOME": "/root"})
+        assert env["TERM"] == "xterm-256color"
+
+    def test_explicit_xterm_term_is_preserved(self):
+        env = self._build({"TERM": "xterm-256color", "HOME": "/root"})
+        assert env["TERM"] == "xterm-256color"
+
+    def test_custom_term_is_preserved(self):
+        # Operators that explicitly pick a different terminfo entry should
+        # see their choice respected — only unset/empty/dumb gets overridden.
+        env = self._build({"TERM": "screen-256color", "HOME": "/root"})
+        assert env["TERM"] == "screen-256color"
+
+    def test_other_env_vars_are_inherited(self):
+        env = self._build(
+            {
+                "HOME": "/home/cao",
+                "PATH": "/opt/cao/bin",
+                "AWS_REGION": "us-west-2",
+                "CAO_TERMINAL_ID": "abcd1234",
+            }
+        )
+        # The whole parent env must reach the subprocess so tmux can find its
+        # config and the agent CLIs can locate their credentials.
+        assert env["HOME"] == "/home/cao"
+        assert env["PATH"] == "/opt/cao/bin"
+        assert env["AWS_REGION"] == "us-west-2"
+        assert env["CAO_TERMINAL_ID"] == "abcd1234"
+
+
+class TestWebSocketSubprocessTerm:
+    """Wiring guard: ensure ``terminal_ws`` actually hands the PTY env
+    (with the corrected ``TERM``) to the tmux attach subprocess. Catches
+    a regression where the helper exists but never gets called from the
+    endpoint."""
+
+    @pytest.mark.asyncio
+    async def test_subprocess_popen_receives_corrected_term(self):
+        """When the parent process has TERM=dumb, the tmux attach Popen call
+        must receive ``env`` with ``TERM=xterm-256color`` instead of inheriting
+        the broken value.
+
+        We let Popen raise immediately after capture so the endpoint stops
+        before touching the real PTY/asyncio loop.
+        """
+        from cli_agent_orchestrator.api import main as main_module
+
+        ws = MagicMock()
+        ws.client = MagicMock(host="127.0.0.1")
+        ws.accept = AsyncMock()
+        ws.close = AsyncMock()
+
+        captured: Dict[str, object] = {}
+
+        def capture_and_stop(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            raise _StopHere("captured Popen args")
+
+        with (
+            patch.dict("os.environ", {"TERM": "dumb", "HOME": "/root"}, clear=True),
+            patch.object(
+                main_module,
+                "get_terminal_metadata",
+                return_value={"tmux_session": "cao-s", "tmux_window": "w"},
+            ),
+            patch.object(main_module.subprocess, "Popen", side_effect=capture_and_stop),
+            patch.object(main_module.pty, "openpty", return_value=(100, 101)),
+            patch.object(main_module.fcntl, "ioctl"),
+            patch.object(main_module.fcntl, "fcntl"),
+            patch.object(main_module.os, "close"),
+        ):
+            with pytest.raises(_StopHere):
+                await main_module.terminal_ws(ws, "abcd1234")
+
+        passed_env = captured["kwargs"].get("env")  # type: ignore[union-attr]
+        assert passed_env is not None, (
+            "tmux Popen must receive env=; without it the subprocess inherits "
+            "the parent's broken TERM (issue #150)"
+        )
+        assert passed_env["TERM"] == "xterm-256color"
+
+
+class _StopHere(Exception):
+    """Sentinel raised by the wiring test once Popen args are captured."""
+
 
 class TestCrossProviderResolution:
     """Test that create_terminal_in_session resolves provider from agent profile
     while create_session always uses the explicit provider parameter."""
 
     def test_create_terminal_uses_profile_provider(self, client):
-        """create_terminal_in_session should resolve provider from agent profile."""
+        """create_terminal_in_session should resolve provider from agent profile when omitted."""
         with (
             patch("cli_agent_orchestrator.api.main.resolve_provider") as mock_resolve,
             patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
@@ -301,13 +644,12 @@ class TestCrossProviderResolution:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
-                    "provider": "kiro_cli",
                     "agent_profile": "developer",
                 },
             )
 
             assert response.status_code == 201
-            # Verify resolve_provider was called with the fallback
+            # Verify resolve_provider was called with the default fallback
             mock_resolve.assert_called_once_with("developer", fallback_provider="kiro_cli")
             # Verify terminal_service got the resolved provider
             call_kwargs = mock_svc.create_terminal.call_args.kwargs
@@ -347,9 +689,9 @@ class TestCrossProviderResolution:
         """create_session should NOT call resolve_provider — CLI flag is the override."""
         with (
             patch("cli_agent_orchestrator.api.main.resolve_provider") as mock_resolve,
-            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+            patch("cli_agent_orchestrator.api.main.session_service") as mock_svc,
         ):
-            mock_svc.create_terminal = AsyncMock(
+            mock_svc.create_session = AsyncMock(
                 return_value=Terminal(
                     id="abcd1234",
                     name="test-window",
@@ -370,8 +712,8 @@ class TestCrossProviderResolution:
             assert response.status_code == 201
             # resolve_provider should NOT have been called
             mock_resolve.assert_not_called()
-            # terminal_service should get the raw provider param
-            call_kwargs = mock_svc.create_terminal.call_args.kwargs
+            # session_service should get the raw provider param
+            call_kwargs = mock_svc.create_session.call_args.kwargs
             assert call_kwargs["provider"] == "kiro_cli"
 
     def test_create_terminal_returns_500_on_resolve_error(self, client):
@@ -385,7 +727,6 @@ class TestCrossProviderResolution:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
-                    "provider": "kiro_cli",
                     "agent_profile": "developer",
                 },
             )

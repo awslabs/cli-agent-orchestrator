@@ -1,11 +1,12 @@
 """Claude Code provider implementation."""
 
-import asyncio
 import json
 import logging
 import re
 import shlex
+import subprocess
 import time
+from pathlib import Path
 from typing import Optional
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
@@ -32,12 +33,23 @@ RESPONSE_PATTERN = r"⏺(?:\x1b\[[0-9;]*m)*\s+"  # Handle any ANSI codes between
 # - New format: "✽ Cooking… (6s · ↓ 174 tokens · thinking)"
 # - Minimal format: "✻ Orbiting…" (no parenthesized status)
 # Common: spinner char + text + ellipsis, optionally followed by parenthesized status
-PROCESSING_PATTERN = r"[✶✢✽✻✳].*…"
+PROCESSING_PATTERN = r"[✶✢✽✻✳·].*\u2026"
+# Structural PROCESSING indicator (reference pattern — get_status uses an
+# inline last-separator-anchored version to avoid false positives from
+# mid-conversation compaction events like "✢ Compacting conversation…"):
+# a spinner line (spinner char + … ) immediately before the ────────
+# separator, allowing 0–2 blank lines between them.
+THINKING_BEFORE_SEPARATOR_PATTERN = re.compile(
+    r"[^\n]*[✶✢✽✻✳·][^\n]*\u2026[^\n]*\n(?:[^\n]*\n){0,2}(?:\x1b\[[0-9;]*m)*\u2500{20,}",
+    re.MULTILINE,
+)
 IDLE_PROMPT_PATTERN = r"[>❯][\s\xa0]"  # Handle both old ">" and new "❯" prompt styles
 WAITING_USER_ANSWER_PATTERN = (
-    r"❯.*\d+\."  # Pattern for Claude showing selection options with arrow cursor
+    r"↑/↓ to navigate"  # Ink TUI footer shown only while a selection widget is active
 )
 TRUST_PROMPT_PATTERN = r"Yes, I trust this folder"  # Workspace trust dialog
+BYPASS_PROMPT_PATTERN = r"Yes, I accept"  # Bypass permissions confirmation dialog
+IDLE_PROMPT_PATTERN_LOG = r"[>❯][\s\xa0]"  # Same pattern for log files
 
 
 class ClaudeCodeProvider(BaseProvider):
@@ -49,8 +61,11 @@ class ClaudeCodeProvider(BaseProvider):
         session_name: str,
         window_name: str,
         agent_profile: Optional[str] = None,
+        allowed_tools: Optional[list] = None,
+        skill_prompt: Optional[str] = None,
     ):
-        super().__init__(terminal_id, session_name, window_name)
+        """Initialize provider state."""
+        super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
 
@@ -59,71 +74,175 @@ class ClaudeCodeProvider(BaseProvider):
 
         Returns properly escaped shell command string that can be safely sent via tmux.
         Uses shlex.join() to handle multiline strings and special characters correctly.
+
+        Three routing paths based on agent profile state:
+        1. Profile with native_agent field -> pass --agent <native_agent> directly
+           (thin wrapper: Claude Code handles all config)
+        2. No CAO profile found -> pass --agent <name> directly to Claude Code's
+           native agent store (~/.claude/agents/)
+        3. Full CAO profile -> decompose into CLI flags (model, prompt, MCP, etc.)
         """
         # --dangerously-skip-permissions: bypass the workspace trust dialog and
         # tool permission prompts. CAO already confirms workspace access during
         # `cao launch` (or `--yolo`), so re-prompting each spawned agent
         # (supervisor and worker) is redundant and blocks handoff/assign flows.
-        command_parts = ["claude", "--dangerously-skip-permissions"]
+        yolo = bool(self._allowed_tools and "*" in self._allowed_tools)
 
+        profile = None
         if self._agent_profile is not None:
             try:
                 profile = load_agent_profile(self._agent_profile)
-
-                # Add system prompt - escape newlines to prevent tmux chunking issues
-                system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
-                if system_prompt:
-                    # Replace actual newlines with \n escape sequences
-                    # This prevents tmux send_keys chunking from breaking the command
-                    escaped_prompt = system_prompt.replace("\\", "\\\\").replace("\n", "\\n")
-                    command_parts.extend(["--append-system-prompt", escaped_prompt])
-
-                # Add MCP config if present.
-                # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
-                # can identify the current terminal for handoff/assign operations.
-                # Claude Code does not automatically forward parent shell env vars
-                # to MCP subprocesses, so we inject it explicitly via the env field.
-                if profile.mcpServers:
-                    mcp_config = {}
-                    for server_name, server_config in profile.mcpServers.items():
-                        if isinstance(server_config, dict):
-                            mcp_config[server_name] = dict(server_config)
-                        else:
-                            mcp_config[server_name] = server_config.model_dump(exclude_none=True)
-
-                        env = mcp_config[server_name].get("env", {})
-                        if "CAO_TERMINAL_ID" not in env:
-                            env["CAO_TERMINAL_ID"] = self.terminal_id
-                            mcp_config[server_name]["env"] = env
-
-                    mcp_json = json.dumps({"mcpServers": mcp_config})
-                    command_parts.extend(["--mcp-config", mcp_json])
-
+            except FileNotFoundError:
+                profile = None
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
+        # Determine permission mode for the base command
+        if profile and profile.permissionMode and not yolo:
+            command_parts = ["claude", "--permission-mode", profile.permissionMode]
+        else:
+            command_parts = ["claude", "--dangerously-skip-permissions"]
+
+        # Route based on profile state
+        native = getattr(profile, "native_agent", None) if profile else None
+        if profile is not None and isinstance(native, str) and native:
+            # Thin wrapper: CAO profile maps to a native Claude Code agent.
+            # Let Claude Code handle all config (MCP servers, hooks, tools, model).
+            # CAO_TERMINAL_ID propagates via tmux pane env inheritance.
+            command_parts.extend(["--agent", native])
+        elif self._agent_profile is not None and profile is None:
+            # No CAO profile exists — pass agent name directly to Claude Code's
+            # native agent store (~/.claude/agents/). Same thin-orchestrator
+            # pattern as the Kiro CLI provider.
+            command_parts.extend(["--agent", self._agent_profile])
+        elif profile is not None:
+            # Full CAO profile with config decomposition
+            if profile.model:
+                command_parts.extend(["--model", profile.model])
+
+            # Add system prompt - escape newlines to prevent tmux chunking issues
+            system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
+            system_prompt = self._apply_skill_prompt(system_prompt)
+            if system_prompt:
+                escaped_prompt = system_prompt.replace("\\", "\\\\").replace("\n", "\\n")
+                command_parts.extend(["--append-system-prompt", escaped_prompt])
+
+            # Add MCP config if present.
+            # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
+            # can identify the current terminal for handoff/assign operations.
+            # Claude Code does not automatically forward parent shell env vars
+            # to MCP subprocesses, so we inject it explicitly via the env field.
+            if profile.mcpServers:
+                mcp_config = {}
+                for server_name, server_config in profile.mcpServers.items():
+                    if isinstance(server_config, dict):
+                        mcp_config[server_name] = dict(server_config)
+                    else:
+                        mcp_config[server_name] = server_config.model_dump(exclude_none=True)
+
+                    env = mcp_config[server_name].get("env", {})
+                    if "CAO_TERMINAL_ID" not in env:
+                        env["CAO_TERMINAL_ID"] = self.terminal_id
+                        mcp_config[server_name]["env"] = env
+
+                mcp_json = json.dumps({"mcpServers": mcp_config})
+                command_parts.extend(["--mcp-config", mcp_json])
+
+        # Apply tool restrictions via --disallowedTools flags.
+        # --dangerously-skip-permissions bypasses prompts but --disallowedTools
+        # still prevents the agent from using the blocked tools entirely.
+        if self._allowed_tools and "*" not in self._allowed_tools:
+            from cli_agent_orchestrator.utils.tool_mapping import get_disallowed_tools
+
+            disallowed = get_disallowed_tools("claude_code", self._allowed_tools)
+            for tool in disallowed:
+                command_parts.extend(["--disallowedTools", tool])
+
         # Use shlex.join() for proper shell escaping of all arguments
         # This correctly handles multiline strings, quotes, and special characters
-        return shlex.join(command_parts)
+        claude_cmd = shlex.join(command_parts)
 
-    async def _handle_trust_prompt(self, timeout: float = 20.0) -> None:
-        """Auto-accept the workspace trust prompt if it appears.
+        # When cao-server runs inside a Claude Code session, CLAUDE* env vars
+        # leak into spawned tmux panes (via the tmux server's global env).
+        # Claude Code detects these and refuses to start ("nested session").
+        # Unset all matching vars except CLAUDE_CODE_USE_*,
+        # CLAUDE_CODE_SKIP_*_AUTH (needed for provider authentication:
+        # Bedrock, Vertex AI, Foundry), and CLAUDE_CODE_EFFORT_LEVEL (user pref).
+        unset_cmd = (
+            "unset $(env | sed -n 's/^\\(CLAUDE[A-Z_]*\\)=.*/\\1/p'"
+            " | grep -v -E 'CLAUDE_CODE_USE_(BEDROCK|VERTEX|FOUNDRY)"
+            "|CLAUDE_CODE_SKIP_(BEDROCK|VERTEX|FOUNDRY)_AUTH"
+            "|CLAUDE_CODE_EFFORT_LEVEL'"
+            ") 2>/dev/null"
+        )
+        return f"{unset_cmd}; {claude_cmd}"
 
-        Claude Code shows a trust dialog when opening an untrusted directory.
-        This sends Enter to accept 'Yes, I trust this folder'.
-        CAO assumes the user trusts the working directory since they initiated
-        the launch command.
+    @staticmethod
+    def _ensure_skip_bypass_prompt_setting() -> None:
+        """Ensure ``skipDangerousModePermissionPrompt`` is set in settings.
+
+        Claude Code (v2.1.41+) shows a bypass permissions confirmation dialog
+        on every launch with ``--dangerously-skip-permissions`` unless
+        ``skipDangerousModePermissionPrompt: true`` is persisted in
+        ``~/.claude/settings.json``.  CAO already uses the flag intentionally,
+        so the confirmation is redundant and blocks initialization.
+        """
+        settings_path = Path.home() / ".claude" / "settings.json"
+        settings: dict = {}
+        if settings_path.exists():
+            try:
+                with open(settings_path) as f:
+                    settings = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        if settings.get("skipDangerousModePermissionPrompt") is True:
+            return
+
+        settings["skipDangerousModePermissionPrompt"] = True
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(settings_path, "w") as f:
+            json.dump(settings, f, indent=2)
+        logger.info("Set skipDangerousModePermissionPrompt in ~/.claude/settings.json")
+
+    def _handle_startup_prompts(self, timeout: float = 20.0) -> None:
+        """Auto-accept startup prompts that may appear before the REPL is ready.
+
+        Claude Code may show up to two prompts during startup:
+
+        1. **Bypass permissions confirmation** (``--dangerously-skip-permissions``)
+           – shows "Yes, I accept" as option 2; requires ``Down`` + ``Enter``.
+           The settings-based fix (``_ensure_skip_bypass_prompt_setting``) prevents
+           this in most cases; this handler is a defensive fallback.
+        2. **Workspace trust dialog** – shows "Yes, I trust this folder";
+           requires ``Enter``.
         """
         start_time = time.time()
+        bypass_accepted = False
         while time.time() - start_time < timeout:
             output = tmux_client.get_history(self.session_name, self.window_name)
             if not output:
-                await asyncio.sleep(1.0)
+                time.sleep(1.0)
                 continue
 
-            # Clean ANSI codes for reliable text matching
             clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
 
+            # 1) Handle bypass permissions prompt (appears before trust prompt).
+            #    Only act once — the text stays in the buffer after dismissal.
+            if not bypass_accepted and re.search(BYPASS_PROMPT_PATTERN, clean_output):
+                logger.info("Bypass permissions prompt detected, auto-accepting")
+                target = f"{self.session_name}:{self.window_name}"
+                # Send raw Down arrow escape sequence (-l for literal) to move
+                # cursor to "Yes, I accept", then Enter to confirm.
+                # tmux send-keys "Down" doesn't work with Claude's Ink TUI.
+                subprocess.run(["tmux", "send-keys", "-t", target, "-l", "\x1b[B"], check=False)
+                time.sleep(0.5)
+                subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], check=False)
+                bypass_accepted = True
+                time.sleep(1.0)
+                continue  # Trust prompt may follow
+
+            # 2) Handle workspace trust prompt
             if re.search(TRUST_PROMPT_PATTERN, clean_output):
                 logger.info("Workspace trust prompt detected, auto-accepting")
                 session = tmux_client.server.sessions.get(session_name=self.session_name)
@@ -133,14 +252,16 @@ class ClaudeCodeProvider(BaseProvider):
                     pane.send_keys("", enter=True)
                 return
 
-            # Check if Claude Code has fully started (welcome banner visible)
-            # Use a specific pattern that only appears in the welcome screen
+            # 3) Claude Code fully started — no prompts needed
             if re.search(r"Welcome to|Claude Code v\d+", clean_output):
-                logger.info("Claude Code started without trust prompt")
+                logger.info("Claude Code started without prompts")
+                return
+            if re.search(IDLE_PROMPT_PATTERN, clean_output):
+                logger.info("Claude Code idle prompt detected, no prompts needed")
                 return
 
-            await asyncio.sleep(1.0)
-        logger.warning("Trust prompt handler timed out")
+            time.sleep(1.0)
+        logger.warning("Startup prompt handler timed out")
 
     async def initialize(self) -> bool:
         """Initialize Claude Code provider by starting claude command."""
@@ -148,18 +269,25 @@ class ClaudeCodeProvider(BaseProvider):
         if not await wait_for_shell(self.terminal_id, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
+        # Prevent bypass permissions dialog from appearing (settings-based fix).
+        self._ensure_skip_bypass_prompt_setting()
+
         # Build properly escaped command string
         command = self._build_claude_command()
 
         # Send Claude Code command using tmux client
         tmux_client.send_keys(self.session_name, self.window_name, command)
 
-        # Handle workspace trust prompt if it appears (new/untrusted directories)
-        await self._handle_trust_prompt(timeout=20.0)
+        # Handle startup prompts (bypass permissions + workspace trust)
+        self._handle_startup_prompts(timeout=20.0)
 
         # Wait for Claude Code prompt to be ready.
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
         # message that get_status() interprets as a completed response.
+        # The StatusMonitor push pipeline (FifoReader -> get_status(buffer))
+        # drives wait_until_status; it only fires once the provider's own
+        # get_status returns IDLE/COMPLETED on Claude-rendered content, so the
+        # old stale-zsh-prompt false-IDLE guard is no longer needed.
         if not await wait_until_status(
             self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
@@ -172,29 +300,116 @@ class ClaudeCodeProvider(BaseProvider):
         return True
 
     def get_status(self, output: str) -> TerminalStatus:
+        """Get Claude Code status by analyzing terminal output.
+
+        Uses a structural "thinking-before-separator" check as the primary
+        PROCESSING indicator, plus position-based fallbacks for edge cases.
+
+        Bug history:
+        1. Stale-spinner bug (#104): Old spinner lines persist in the tmux
+           scrollback after the agent returns to idle (Claude Code renders
+           inline, not alt-screen, inside a tmux pane). Position comparison
+           of last spinner vs last idle prompt catches this.
+
+        2. Mid-tool-execution race (this issue): The ❯ input prompt is ALWAYS
+           rendered at the bottom of the tmux pane (last position in the
+           scrollback buffer). Position-based comparisons against ❯ are
+           therefore unreliable — last_idle.start() is always greater than
+           any other marker when anything has been typed/executed.
+
+        V3 fix (structural): Check whether any line containing … (U+2026,
+        the ellipsis used in all Claude Code thinking/spinner text) appears
+        immediately before the ──────── separator line. Claude Code draws
+        this separator between the active-execution area and the input prompt.
+        When the agent is thinking/processing:
+        "· Swirling… (thinking)\n\n──────────────────────\n❯ "
+        When idle or completed:
+        "some response text\n──────────────────────\n❯ "
+        A stale old spinner line far back in scrollback will NOT be
+        immediately before the separator, so the structural check is immune
+        to the stale-spinner false-positive.
+
+        The buffer is supplied by the StatusMonitor push pipeline (the rolling
+        pipe-pane stream) — this method never reads tmux itself.
+
+        See: https://github.com/awslabs/cli-agent-orchestrator/issues/104
+        """
         if not output:
             return TerminalStatus.UNKNOWN
 
-        # Check for processing state first
-        if re.search(PROCESSING_PATTERN, output):
-            return TerminalStatus.PROCESSING
+        # PRIMARY PROCESSING check: walk backwards from the *last* separator.
+        # If we encounter a spinner line (spinner char + …) before we encounter
+        # another separator, the agent is actively processing.
+        # If we hit another separator first, the spinner belongs to a previously
+        # completed task — covers two distinct false-positive patterns:
+        # 1. Mid-conversation compaction: "✢ Compacting…" → sep → more output → last sep
+        # 2. Post-exit: live spinner → sep (task done) → ❯ /exit → last sep (exit menu)
+        _sep_re = re.compile(r"(?:\x1b\[[0-9;]*m)*\u2500{20,}")
+        _sep_positions = [m.start() for m in _sep_re.finditer(output)]
+        if _sep_positions:
+            pre_sep_lines = output[: _sep_positions[-1]].rstrip("\n").split("\n")
+            for line in reversed(pre_sep_lines):
+                if re.search(r"[✶✢✽✻✳·][^\n]*\u2026", line):
+                    return TerminalStatus.PROCESSING  # spinner before another separator
+                if _sep_re.search(line):
+                    break  # hit another separator first — spinner is from a completed task
 
-        # Check for waiting user answer (Claude asking for user selection)
-        # Exclude the workspace trust prompt which also matches the pattern
-        if re.search(WAITING_USER_ANSWER_PATTERN, output) and not re.search(
-            TRUST_PROMPT_PATTERN, output
+        # Find the LAST occurrence of each marker for fallback position checks.
+        last_processing = None
+        for m in re.finditer(PROCESSING_PATTERN, output):
+            last_processing = m
+
+        last_idle = None
+        for m in re.finditer(IDLE_PROMPT_PATTERN, output):
+            last_idle = m
+
+        last_response = None
+        for m in re.finditer(RESPONSE_PATTERN, output):
+            last_response = m
+
+        # FALLBACK PROCESSING: spinner visible AND no separator follows it yet
+        # (early in execution before the separator appears). Position comparison
+        # is used here only when no separator is present (safe case).
+        if last_processing and not re.search(r"\u2500{20,}", output):
+            if last_idle is None or last_processing.start() > last_idle.start():
+                return TerminalStatus.PROCESSING
+
+        # Check for waiting user answer via the active Ink selection footer.
+        # Exclude startup prompts (trust + bypass), which also render the footer.
+        if (
+            re.search(WAITING_USER_ANSWER_PATTERN, output)
+            and not re.search(TRUST_PROMPT_PATTERN, output)
+            and not re.search(BYPASS_PROMPT_PATTERN, output)
         ):
             return TerminalStatus.WAITING_USER_ANSWER
 
-        # Check for completed state (has response + ready prompt)
-        if re.search(RESPONSE_PATTERN, output) and re.search(IDLE_PROMPT_PATTERN, output):
+        # COMPLETED: ⏺ response exists AND ❯ prompt is visible (agent finished).
+        if last_response and last_idle:
             return TerminalStatus.COMPLETED
 
-        # Check for idle state (just ready prompt, no response)
-        if re.search(IDLE_PROMPT_PATTERN, output):
+        # IDLE: shell prompt visible but no response yet (e.g. just initialized).
+        if last_idle:
             return TerminalStatus.IDLE
 
         return TerminalStatus.UNKNOWN
+
+    @property
+    def accepts_input_while_processing(self) -> bool:
+        """Claude Code's Ink TUI buffers pasted input during processing.
+
+        Only true after initialization completes — during startup the REPL
+        isn't ready to accept input even though get_status() sees PROCESSING.
+        """
+        return self._initialized
+
+    def get_idle_pattern_for_log(self) -> str:
+        """Return Claude Code IDLE prompt pattern for log files."""
+        return IDLE_PROMPT_PATTERN_LOG
+
+    # Start-of-line idle prompt for extraction: ❯ or > at the beginning of a line
+    # (after optional ANSI codes).  Mid-line ">" in Java generics, git diffs, HTML
+    # etc. must NOT trigger the stop condition.
+    _SOL_IDLE_RE = re.compile(r"^\s*(?:\x1b\[[0-9;]*m)*[>❯](?:\x1b\[[0-9;]*m)*[\s\xa0]")
 
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract Claude's final response message using ⏺ indicator."""
@@ -208,7 +423,11 @@ class ClaudeCodeProvider(BaseProvider):
         last_match = matches[-1]
         start_pos = last_match.end()
 
-        # Extract everything after the last ⏺ until next prompt or separator
+        # Extract everything after the last ⏺ until:
+        # 1. A start-of-line idle prompt (❯ or >) — the definitive boundary
+        # 2. A completion stat line ("✻ Sautéed for 14s") — trims the stat
+        # Using start-of-line anchor avoids false stops on ">" inside
+        # response content (Java generics, git diffs, HTML tags, etc.).
         remaining_text = script_output[start_pos:]
 
         # Split by lines and extract response
@@ -216,12 +435,12 @@ class ClaudeCodeProvider(BaseProvider):
         response_lines = []
 
         for line in lines:
-            # Stop at next > prompt or separator line
-            if re.match(r">\s", line) or "────────" in line:
+            clean_line = re.sub(ANSI_CODE_PATTERN, "", line).strip()
+            if self._SOL_IDLE_RE.match(line):
+                break
+            if "────────" in line:
                 break
 
-            # Clean the line
-            clean_line = line.strip()
             response_lines.append(clean_line)
 
         if not response_lines or not any(line.strip() for line in response_lines):

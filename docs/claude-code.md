@@ -61,11 +61,13 @@ The provider extracts the last assistant response by finding the `⏺` response 
 
 ### Permission Bypass
 
-CAO launches Claude Code with `--dangerously-skip-permissions` to bypass:
+By default, CAO launches Claude Code with `--dangerously-skip-permissions` to bypass:
 - **Workspace trust dialog**: The "Yes, I trust this folder" prompt that appears for new directories
 - **Tool permission prompts**: Approval dialogs for file edits, command execution, etc.
 
 This is safe because CAO already confirms workspace trust during `cao launch` ("Do you trust all the actions in this folder?") or via `--yolo` flag. Without this flag, worker agents spawned via handoff/assign would block on the trust dialog with no way to accept it interactively.
+
+Profiles can opt into a stricter behavior by setting the `permissionMode` field, which causes the provider to pass `--permission-mode <value>` instead of `--dangerously-skip-permissions`. See [Permission Mode Override](#permission-mode-override) below. `cao launch --yolo` always forces `--dangerously-skip-permissions` regardless of the profile's `permissionMode`.
 
 A fallback `_handle_trust_prompt()` method also monitors for the trust dialog and sends Enter to accept it, in case the flag doesn't cover all scenarios.
 
@@ -86,6 +88,50 @@ The provider builds the command via `_build_claude_command()`:
 
 ```
 claude --dangerously-skip-permissions [--append-system-prompt "..."] [--mcp-config "..."]
+claude --permission-mode auto [--append-system-prompt "..."] [--mcp-config "..."]
+```
+
+### Permission Mode Override
+
+The `permissionMode` field on an agent profile lets you replace the default `--dangerously-skip-permissions` bypass with a stricter Claude Code permission tier.
+
+Allowed values: `default`, `acceptEdits`, `plan`, `auto`, `bypassPermissions`. See the [Claude Code permission modes reference](https://code.claude.com/docs/en/permission-modes) for what each tier does.
+
+When set, the provider passes `--permission-mode <value>` instead of `--dangerously-skip-permissions`. `cao launch --yolo` always overrides this field and forces `--dangerously-skip-permissions` regardless of the profile setting.
+
+Example — a reviewer that runs under the `auto` permission classifier instead of unconditional bypass:
+
+```markdown
+---
+name: reviewer
+description: Code Reviewer
+provider: claude_code
+role: reviewer
+permissionMode: auto
+---
+
+You review code for quality and correctness.
+```
+
+## Eager Inbox Delivery
+
+Claude Code's Ink TUI buffers pasted input even while the agent is processing. CAO exploits this to deliver queued inbox messages during PROCESSING and WAITING_USER_ANSWER states, eliminating inter-turn latency. Enable with `CAO_EAGER_INBOX_DELIVERY=true`.
+
+See [Inbox Delivery](inbox-delivery.md) for the full architecture, two-flag gate, and how to enable this for other providers.
+
+## Native Agent Routing
+
+When a CAO profile specifies a `native_agent` field, the provider passes `--agent <name>` directly to Claude Code's native agent store (`~/.claude/agents/`). This is a thin-wrapper mode where Claude Code handles all configuration (MCP servers, hooks, tools, model).
+
+If no CAO profile is found for the given agent name, the provider also falls back to `--agent <name>`, assuming it exists in the native store.
+
+```markdown
+---
+name: my-wrapper
+description: Thin wrapper for a native Claude Code agent
+provider: claude_code
+native_agent: my-native-agent
+---
 ```
 
 ## Implementation Notes
