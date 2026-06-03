@@ -231,6 +231,50 @@ class HerdrInboxService:
             except (json.JSONDecodeError, KeyError):
                 pass
 
+        # DB cross-check: find terminals in DB whose tab no longer exists in herdr.
+        # This catches ghost records from previous server runs where _pane_to_terminal
+        # starts empty (so the stale-pane diff below produces nothing).
+        tab_result = subprocess.run(
+            ["herdr", "--session", self._herdr_session, "tab", "list"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if tab_result.returncode == 0:
+            try:
+                tab_data = json.loads(tab_result.stdout)
+                tabs = tab_data.get("result", {}).get("tabs", [])
+                # Build: workspace_id -> set of live tab labels
+                live_tabs_by_workspace: Dict[str, set] = {}
+                for tab in tabs:
+                    ws_id = tab.get("workspace_id", "")
+                    label = tab.get("label", "")
+                    if ws_id and label:
+                        live_tabs_by_workspace.setdefault(ws_id, set()).add(label)
+
+                from cli_agent_orchestrator.clients.database import (
+                    delete_terminal,
+                    list_terminals_by_session,
+                )
+
+                for ws_id, session_name in self._workspace_to_session.items():
+                    live_labels = live_tabs_by_workspace.get(ws_id, set())
+                    db_terminals = list_terminals_by_session(session_name)
+                    for term in db_terminals:
+                        window = term.get("tmux_window", "")
+                        if window and window not in live_labels:
+                            logger.info(
+                                f"Reconcile: deleting ghost terminal {term['id']} "
+                                f"({session_name}:{window}) — tab not in herdr"
+                            )
+                            try:
+                                delete_terminal(term["id"])
+                            except Exception as e:
+                                logger.warning(
+                                    f"Reconcile: failed to delete ghost terminal "
+                                    f"{term['id']}: {e}"
+                                )
+            except (json.JSONDecodeError, KeyError) as e:
+                logger.warning(f"Reconcile: failed to parse tab list: {e}")
+
         # Find and prune stale panes
         stale_pane_ids = set(self._pane_to_terminal.keys()) - live_pane_ids
         if not stale_pane_ids:
