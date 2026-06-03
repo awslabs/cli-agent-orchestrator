@@ -117,7 +117,7 @@ def check_and_send_pending_messages(
     eager_eligible = (
         EAGER_INBOX_DELIVERY
         and provider.accepts_input_while_processing
-        and status in (TerminalStatus.PROCESSING, TerminalStatus.WAITING_USER_ANSWER)
+        and status in (TerminalStatus.PROCESSING,)
     )
 
     if status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED) and not eager_eligible:

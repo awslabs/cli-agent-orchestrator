@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import threading
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -51,6 +52,62 @@ class TestHerdrInboxServiceRegistration:
         """unregister_terminal for unknown terminal should not raise."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service.unregister_terminal("nonexistent")  # Should not raise
+
+
+class TestHerdrInboxServiceCrossThreadRegistration:
+    """Test that register_terminal works from threads without an event loop.
+
+    register_terminal may be called from a synchronous, non-event-loop thread.
+    When connected, it must schedule the subscribe coroutine onto the captured
+    loop via run_coroutine_threadsafe rather than asyncio.create_task (which
+    requires a running loop in the calling thread and would raise RuntimeError).
+    """
+
+    def test_register_from_non_event_loop_thread_subscribes(self):
+        """register_terminal from a non-loop thread should schedule subscribe via run_coroutine_threadsafe."""
+
+        async def run():
+            service = HerdrInboxService(socket_path="/tmp/test.sock")
+            service._connected = True
+            service._loop = asyncio.get_running_loop()
+            service._writer = AsyncMock()
+
+            # Call register from a separate thread that has no event loop of its own.
+            t = threading.Thread(
+                target=service.register_terminal, args=("tid_cross", "pane-cross")
+            )
+            t.start()
+            t.join()
+
+            # Give the cross-thread-scheduled coroutine time to run on this loop.
+            await asyncio.sleep(0.05)
+
+            # Subscribe message must have been written to the socket.
+            service._writer.write.assert_called_once()
+            written = service._writer.write.call_args[0][0]
+            msg = json.loads(written.decode().strip())
+            assert msg["method"] == "events.subscribe"
+            assert msg["params"]["subscriptions"][0]["type"] == "pane.agent_status_changed"
+            assert msg["params"]["subscriptions"][0]["pane_id"] == "pane-cross"
+
+        _run_async(run())
+
+    def test_register_before_start_does_not_subscribe(self):
+        """register_terminal before start (no loop, not connected) must not attempt subscribe."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service._writer = AsyncMock()
+
+        # Pre-start state: start() has not run, so no loop captured and not connected.
+        assert service._connected is False
+        assert service._loop is None
+
+        service.register_terminal("tid_early", "pane-early")
+
+        # Mapping is still recorded...
+        assert service._pane_to_terminal["pane-early"] == "tid_early"
+        assert service._terminal_to_pane["tid_early"] == "pane-early"
+        # ...but no subscribe was sent (guarded by _connected and _loop).
+        service._writer.write.assert_not_called()
 
 
 class TestHerdrInboxServiceDelivery:

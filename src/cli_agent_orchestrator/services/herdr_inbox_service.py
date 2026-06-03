@@ -68,6 +68,7 @@ class HerdrInboxService:
         self._reader: Optional[asyncio.StreamReader] = None
         self._writer: Optional[asyncio.StreamWriter] = None
         self._backoff = _BACKOFF_BASE
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     @staticmethod
     def _default_socket_path(session_name: str = "cao") -> str:
@@ -106,17 +107,11 @@ class HerdrInboxService:
 
         logger.info(f"Registered terminal {terminal_id} (pane={pane_id}, kiro={is_kiro})")
 
-        # Subscribe to events if connected and an event loop is running.
-        # register_terminal() is called from the synchronous create_terminal path,
-        # so we must guard against no running event loop.
-        if self._connected:
-            try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(self._subscribe_pane(pane_id))
-            except RuntimeError:
-                # No running event loop — subscription will happen on next reconnect
-                # via _resubscribe_all()
-                pass
+        # Subscribe to events if connected and event loop is captured.
+        # register_terminal() may be called from a synchronous/non-event-loop thread,
+        # so we use run_coroutine_threadsafe instead of create_task.
+        if self._connected and self._loop is not None:
+            asyncio.run_coroutine_threadsafe(self._subscribe_pane(pane_id), self._loop)
 
     def unregister_terminal(self, terminal_id: str) -> None:
         """Remove a terminal from managed set.
@@ -133,6 +128,7 @@ class HerdrInboxService:
 
     async def start(self) -> None:
         """Start the event loop: wait for first terminal, then connect and listen."""
+        self._loop = asyncio.get_running_loop()
         kiro_task = asyncio.ensure_future(self._kiro_supplement_loop())
         try:
             await self._socket_loop()
@@ -255,6 +251,8 @@ class HerdrInboxService:
                     if terminal_id not in self._working_since:
                         self._working_since[terminal_id] = time.time()
 
+    # TODO: _deliver() calls callback synchronously — if callback is async,
+    # this will need a threadsafe bridge (out of scope for this change).
     def _deliver(self, terminal_id: str) -> None:
         """Check and deliver pending messages for a terminal."""
         if self._delivery_callback:

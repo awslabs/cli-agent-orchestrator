@@ -31,6 +31,8 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field, field_validator
 from watchdog.observers.polling import PollingObserver
 
+from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
     get_inbox_messages,
@@ -66,7 +68,12 @@ from cli_agent_orchestrator.services.cleanup_service import (
     cleanup_expired_memories,
     cleanup_old_data,
 )
-from cli_agent_orchestrator.services.inbox_service import LogFileHandler
+from cli_agent_orchestrator.services.herdr_inbox_registry import set_herdr_inbox_service
+from cli_agent_orchestrator.services.herdr_inbox_service import HerdrInboxService
+from cli_agent_orchestrator.services.inbox_service import (
+    LogFileHandler,
+    check_and_send_pending_messages,
+)
 from cli_agent_orchestrator.services.install_service import InstallResult, install_agent
 from cli_agent_orchestrator.services.terminal_service import OutputMode, TerminalInputBlockedError
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
@@ -211,18 +218,44 @@ async def lifespan(app: FastAPI):
     # messages the immediate and watchdog paths missed (issue #131).
     inbox_reconcile_task = asyncio.create_task(inbox_reconciliation_daemon(registry))
 
-    # Start inbox watcher
-    inbox_observer = PollingObserver(timeout=INBOX_POLLING_INTERVAL)
-    inbox_observer.schedule(LogFileHandler(registry), str(TERMINAL_LOG_DIR), recursive=False)
-    inbox_observer.start()
-    logger.info("Inbox watcher started (PollingObserver)")
+    # Start inbox watcher — herdr uses socket events, tmux uses file polling
+    herdr_inbox_task: Optional[asyncio.Task] = None
+    inbox_observer: Optional[PollingObserver] = None
+
+    backend = get_backend()
+    if isinstance(backend, HerdrBackend):
+
+        def deliver_inbox(terminal_id: str) -> None:
+            check_and_send_pending_messages(terminal_id, registry=registry)
+
+        svc = HerdrInboxService(
+            herdr_session=backend.herdr_session,
+            delivery_callback=deliver_inbox,
+        )
+        set_herdr_inbox_service(svc)
+        herdr_inbox_task = asyncio.create_task(svc.start())
+        logger.info("Herdr inbox service started")
+    else:
+        inbox_observer = PollingObserver(timeout=INBOX_POLLING_INTERVAL)
+        inbox_observer.schedule(LogFileHandler(registry), str(TERMINAL_LOG_DIR), recursive=False)
+        inbox_observer.start()
+        logger.info("Inbox watcher started (PollingObserver)")
 
     yield
 
-    # Stop inbox observer
-    inbox_observer.stop()
-    inbox_observer.join()
-    logger.info("Inbox watcher stopped")
+    # Stop inbox watcher
+    if herdr_inbox_task is not None:
+        herdr_inbox_task.cancel()
+        try:
+            await herdr_inbox_task
+        except asyncio.CancelledError:
+            pass
+        set_herdr_inbox_service(None)
+        logger.info("Herdr inbox service stopped")
+    elif inbox_observer is not None:
+        inbox_observer.stop()
+        inbox_observer.join()
+        logger.info("Inbox watcher stopped")
 
     # Cancel daemon on shutdown
     daemon_task.cancel()

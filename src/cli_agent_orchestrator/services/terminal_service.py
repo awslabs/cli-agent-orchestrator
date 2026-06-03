@@ -43,6 +43,7 @@ from cli_agent_orchestrator.plugins import (
     PostSendMessageEvent,
 )
 from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
 from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
 from cli_agent_orchestrator.services.session_env import (
@@ -294,6 +295,16 @@ def create_terminal(
                 provider=provider,
             ),
         )
+
+        # Register with herdr inbox service for message delivery
+        svc = get_herdr_inbox_service()
+        if svc:
+            try:
+                pane_id = get_backend().get_pane_id(terminal_id, session_name, window_name)
+                is_kiro = provider == ProviderType.KIRO_CLI.value
+                svc.register_terminal(terminal_id, pane_id, is_kiro)
+            except Exception as e:
+                logger.warning(f"Failed to register terminal {terminal_id} with herdr inbox: {e}")
         return terminal
 
     except Exception as e:
@@ -616,6 +627,14 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
 def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) -> bool:
     """Delete terminal and kill its tmux window."""
     try:
+        # Unregister from herdr inbox service
+        svc = get_herdr_inbox_service()
+        if svc:
+            try:
+                svc.unregister_terminal(terminal_id)
+            except Exception as e:
+                logger.warning(f"Failed to unregister terminal {terminal_id} from herdr inbox: {e}")
+
         # Get metadata before deletion
         metadata = get_terminal_metadata(terminal_id)
 

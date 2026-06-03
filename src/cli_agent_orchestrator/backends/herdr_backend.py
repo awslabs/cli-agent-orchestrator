@@ -63,6 +63,11 @@ class HerdrBackend(TerminalBackend):
         self._window_to_terminal: Dict[str, str] = {}
         self._ensure_session_running()
 
+    @property
+    def herdr_session(self) -> str:
+        """The herdr session name this backend operates in."""
+        return self._herdr_session
+
     def _run_herdr(self, args: List[str], check: bool = True) -> subprocess.CompletedProcess:
         """Run a herdr CLI command and return the result.
 
