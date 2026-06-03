@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import re
+import subprocess
 import time
 from typing import Callable, Dict, Optional, Set
 
@@ -62,6 +63,9 @@ class HerdrInboxService:
         # Kiro-specific tracking for supplement check
         self._kiro_terminals: Set[str] = set()  # terminal_ids using kiro-cli
         self._working_since: Dict[str, float] = {}  # terminal_id → timestamp
+
+        # Workspace tracking for lifecycle events
+        self._workspace_to_session: Dict[str, str] = {}  # workspace_id → session_name
 
         # Connection state
         self._connected = False
@@ -159,10 +163,17 @@ class HerdrInboxService:
             try:
                 await self._connect()
                 self._connected = True
-                self._backoff = _BACKOFF_BASE  # Reset backoff on success
 
-                # Re-subscribe all managed panes
+                # Reconcile map against live herdr state before subscribing
+                await self._reconcile()
+
+                # Re-subscribe all managed panes (now only valid ones)
                 await self._resubscribe_all()
+
+                # Subscribe to lifecycle events for real-time cleanup
+                await self._subscribe_lifecycle_events()
+
+                self._backoff = _BACKOFF_BASE  # Reset backoff after successful setup
 
                 # Listen for events
                 await self._event_loop()
@@ -175,6 +186,114 @@ class HerdrInboxService:
                 logger.info(f"Reconnecting in {self._backoff}s...")
                 await asyncio.sleep(self._backoff)
                 self._backoff = min(self._backoff * _BACKOFF_MULTIPLIER, _BACKOFF_MAX)
+
+    async def _reconcile(self) -> None:
+        """Reconcile _pane_to_terminal map against live herdr state.
+
+        Prunes stale pane entries, deletes orphaned DB terminal records,
+        and kills workspaces with zero live terminals.
+        """
+        from cli_agent_orchestrator.backends.registry import get_backend
+        from cli_agent_orchestrator.clients.database import (
+            delete_terminal,
+            get_terminal_metadata,
+        )
+
+        # Get live panes from herdr
+        result = subprocess.run(
+            ["herdr", "--session", self._herdr_session, "pane", "list"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            logger.warning(f"Reconcile: herdr pane list failed: {result.stderr}")
+            return
+
+        try:
+            data = json.loads(result.stdout)
+            panes = data.get("result", {}).get("panes", [])
+            live_pane_ids = {p["pane_id"] for p in panes}
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.warning(f"Reconcile: failed to parse pane list: {e}")
+            return
+
+        # Build workspace_id -> session_name mapping
+        ws_result = subprocess.run(
+            ["herdr", "--session", self._herdr_session, "workspace", "list"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if ws_result.returncode == 0:
+            try:
+                ws_data = json.loads(ws_result.stdout)
+                workspaces = ws_data.get("result", {}).get("workspaces", [])
+                self._workspace_to_session = {
+                    ws["workspace_id"]: ws["label"] for ws in workspaces
+                }
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        # Find and prune stale panes
+        stale_pane_ids = set(self._pane_to_terminal.keys()) - live_pane_ids
+        if not stale_pane_ids:
+            logger.debug("Reconcile: all panes live, nothing to prune")
+            return
+
+        # Track which sessions lose terminals
+        affected_sessions: Dict[str, int] = {}  # session_name -> remaining count
+
+        for pane_id in stale_pane_ids:
+            terminal_id = self._pane_to_terminal.pop(pane_id, None)
+            if not terminal_id:
+                continue
+
+            # Get session name before deleting
+            meta = get_terminal_metadata(terminal_id)
+            session_name = meta["tmux_session"] if meta else None
+
+            # Remove from all maps
+            self._terminal_to_pane.pop(terminal_id, None)
+            self._kiro_terminals.discard(terminal_id)
+            self._working_since.pop(terminal_id, None)
+
+            # Delete orphaned DB record
+            try:
+                delete_terminal(terminal_id)
+            except Exception as e:
+                logger.warning(f"Reconcile: failed to delete terminal {terminal_id}: {e}")
+
+            if session_name:
+                affected_sessions.setdefault(session_name, 0)
+
+        # Count remaining terminals per affected session
+        for tid, _ in self._terminal_to_pane.items():
+            meta = get_terminal_metadata(tid)
+            if meta and meta["tmux_session"] in affected_sessions:
+                affected_sessions[meta["tmux_session"]] += 1
+
+        # Kill workspaces with zero remaining terminals
+        for session_name, remaining in affected_sessions.items():
+            if remaining == 0:
+                try:
+                    get_backend().kill_session(session_name)
+                    logger.info(f"Reconcile: killed empty workspace {session_name}")
+                except Exception as e:
+                    logger.warning(f"Reconcile: failed to kill workspace {session_name}: {e}")
+
+        logger.info(f"Reconcile: pruned {len(stale_pane_ids)} stale panes")
+
+    async def _subscribe_lifecycle_events(self) -> None:
+        """Subscribe to pane.closed and workspace.closed for real-time cleanup."""
+        message = {
+            "id": "sub_lifecycle",
+            "method": "events.subscribe",
+            "params": {
+                "subscriptions": [
+                    {"type": "pane.closed"},
+                    {"type": "workspace.closed"},
+                ]
+            },
+        }
+        await self._send(message)
+        logger.info("Subscribed to pane.closed and workspace.closed events")
 
     async def _connect(self) -> None:
         """Connect to the herdr socket."""
@@ -230,6 +349,12 @@ class HerdrInboxService:
             except json.JSONDecodeError:
                 continue
 
+            # Handle lifecycle events
+            event_type = event.get("type", "")
+            if event_type in ("pane.closed", "workspace.closed"):
+                self._handle_lifecycle_event(event_type, event.get("data", {}))
+                continue
+
             data = event.get("data", {})
             pane_id = data.get("pane_id", "")
             status = data.get("agent_status", "")
@@ -250,6 +375,79 @@ class HerdrInboxService:
                 if terminal_id in self._kiro_terminals:
                     if terminal_id not in self._working_since:
                         self._working_since[terminal_id] = time.time()
+
+    def _handle_lifecycle_event(self, event_type: str, data: dict) -> None:
+        """Handle pane.closed and workspace.closed events."""
+        from cli_agent_orchestrator.backends.registry import get_backend
+        from cli_agent_orchestrator.clients.database import (
+            delete_terminal,
+            delete_terminals_by_session,
+            get_terminal_metadata,
+        )
+
+        if event_type == "pane.closed":
+            pane_id = data.get("pane_id", "")
+            terminal_id = self._pane_to_terminal.get(pane_id)
+            if not terminal_id:
+                return
+
+            # Get session before cleanup
+            meta = get_terminal_metadata(terminal_id)
+            session_name = meta["tmux_session"] if meta else None
+
+            # Remove from maps
+            self._pane_to_terminal.pop(pane_id, None)
+            self._terminal_to_pane.pop(terminal_id, None)
+            self._kiro_terminals.discard(terminal_id)
+            self._working_since.pop(terminal_id, None)
+
+            # Delete DB record
+            try:
+                delete_terminal(terminal_id)
+            except Exception as e:
+                logger.warning(f"pane.closed: failed to delete terminal {terminal_id}: {e}")
+
+            logger.info(f"pane.closed: cleaned up terminal {terminal_id} (pane={pane_id})")
+
+            # If session has no more terminals in our map, kill workspace
+            remaining_in_session = [
+                t for t in self._pane_to_terminal.values()
+                if (m := get_terminal_metadata(t)) and m.get("tmux_session") == session_name
+            ]
+            if session_name and not remaining_in_session:
+                try:
+                    get_backend().kill_session(session_name)
+                    logger.info(f"pane.closed: killed empty workspace {session_name}")
+                except Exception as e:
+                    logger.warning(f"pane.closed: failed to kill workspace {session_name}: {e}")
+
+        elif event_type == "workspace.closed":
+            workspace_id = data.get("workspace_id", "")
+            session_name = self._workspace_to_session.get(workspace_id)
+            if not session_name:
+                return
+
+            # Delete all DB terminals for this session
+            try:
+                delete_terminals_by_session(session_name)
+            except Exception as e:
+                logger.warning(f"workspace.closed: failed to delete terminals for {session_name}: {e}")
+
+            # Prune maps — pane_ids from this workspace start with workspace_id prefix
+            to_remove = [
+                (pid, tid) for pid, tid in self._pane_to_terminal.items()
+                if pid.startswith(workspace_id)
+            ]
+            for pid, tid in to_remove:
+                self._pane_to_terminal.pop(pid, None)
+                self._terminal_to_pane.pop(tid, None)
+                self._kiro_terminals.discard(tid)
+                self._working_since.pop(tid, None)
+
+            self._workspace_to_session.pop(workspace_id, None)
+            logger.info(
+                f"workspace.closed: cleaned up session {session_name} ({len(to_remove)} terminals)"
+            )
 
     # TODO: _deliver() calls callback synchronously — if callback is async,
     # this will need a threadsafe bridge (out of scope for this change).

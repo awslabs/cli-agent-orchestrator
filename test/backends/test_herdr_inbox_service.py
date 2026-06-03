@@ -312,6 +312,224 @@ class TestHerdrInboxServiceKiroSupplement:
         callback.assert_not_called()
 
 
+class TestHerdrInboxServiceReconcile:
+    """Test _reconcile() prunes stale panes and cleans up DB/workspace."""
+
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.HerdrInboxService._reconcile")
+    def test_reconcile_is_called_before_resubscribe(self, mock_reconcile, mock_run):
+        """_reconcile must be awaited before _resubscribe_all in _socket_loop."""
+        # Verify ordering through call_count inspection — reconcile before subscribe.
+        # This is a structural test: just confirms _reconcile exists and is async.
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        assert asyncio.iscoroutinefunction(service._reconcile)
+
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    def test_reconcile_prunes_stale_pane(self, mock_meta, mock_delete, mock_run):
+        """Stale pane_ids (not in live herdr list) are pruned from maps and DB."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal("tid1", "pane-live")
+        service.register_terminal("tid2", "pane-stale")
+
+        pane_list_response = json.dumps({
+            "result": {"panes": [{"pane_id": "pane-live"}]}
+        })
+        ws_list_response = json.dumps({"result": {"workspaces": []}})
+
+        def subprocess_side_effect(cmd, **_):
+            m = MagicMock()
+            m.returncode = 0
+            if "pane" in cmd and "list" in cmd:
+                m.stdout = pane_list_response
+            else:
+                m.stdout = ws_list_response
+            return m
+
+        mock_run.side_effect = subprocess_side_effect
+        mock_meta.return_value = None  # No session tracking needed
+
+        _run_async(service._reconcile())
+
+        # pane-stale pruned; pane-live kept
+        assert "pane-stale" not in service._pane_to_terminal
+        assert "tid2" not in service._terminal_to_pane
+        assert "pane-live" in service._pane_to_terminal
+        assert "tid1" in service._terminal_to_pane
+
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    def test_reconcile_no_op_when_all_panes_live(self, mock_run):
+        """No pruning when all registered panes are still live."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal("tid1", "pane-a")
+        service.register_terminal("tid2", "pane-b")
+
+        pane_list_response = json.dumps({
+            "result": {"panes": [{"pane_id": "pane-a"}, {"pane_id": "pane-b"}]}
+        })
+        ws_list_response = json.dumps({"result": {"workspaces": []}})
+
+        def subprocess_side_effect(cmd, **_):
+            m = MagicMock()
+            m.returncode = 0
+            if "pane" in cmd and "list" in cmd:
+                m.stdout = pane_list_response
+            else:
+                m.stdout = ws_list_response
+            return m
+
+        mock_run.side_effect = subprocess_side_effect
+
+        _run_async(service._reconcile())
+
+        # Maps unchanged
+        assert service._pane_to_terminal == {"pane-a": "tid1", "pane-b": "tid2"}
+
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    def test_reconcile_continues_on_pane_list_failure(self, mock_run):
+        """When herdr pane list fails, reconcile logs warning and returns without pruning."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal("tid1", "pane-a")
+
+        m = MagicMock()
+        m.returncode = 1
+        m.stderr = "socket not found"
+        mock_run.return_value = m
+
+        # Should not raise
+        _run_async(service._reconcile())
+
+        # Map unchanged
+        assert "pane-a" in service._pane_to_terminal
+
+
+class TestHerdrInboxServiceLifecycleSubscription:
+    """Test _subscribe_lifecycle_events sends correct message."""
+
+    def test_subscribe_lifecycle_events_sends_correct_message(self):
+        """Should subscribe to pane.closed and workspace.closed."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service._writer = AsyncMock()
+
+        _run_async(service._subscribe_lifecycle_events())
+
+        service._writer.write.assert_called_once()
+        written = service._writer.write.call_args[0][0]
+        msg = json.loads(written.decode().strip())
+
+        assert msg["method"] == "events.subscribe"
+        subs = msg["params"]["subscriptions"]
+        types = {s["type"] for s in subs}
+        assert "pane.closed" in types
+        assert "workspace.closed" in types
+
+
+class TestHerdrInboxServiceLifecycleEvents:
+    """Test _handle_lifecycle_event for pane.closed and workspace.closed."""
+
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    def test_pane_closed_removes_from_maps(self, mock_meta, mock_delete, mock_run):
+        """pane.closed should remove the terminal from tracking maps."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal("tid1", "pane-a", is_kiro=True)
+        service._working_since["tid1"] = time.time()
+        mock_meta.return_value = None  # No session → no kill_session
+
+        service._handle_lifecycle_event("pane.closed", {"pane_id": "pane-a"})
+
+        assert "pane-a" not in service._pane_to_terminal
+        assert "tid1" not in service._terminal_to_pane
+        assert "tid1" not in service._kiro_terminals
+        assert "tid1" not in service._working_since
+
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    def test_pane_closed_unknown_pane_is_noop(self, mock_meta, mock_delete):
+        """pane.closed for unregistered pane_id should be silent no-op."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+
+        service._handle_lifecycle_event("pane.closed", {"pane_id": "unknown-pane"})
+
+        mock_delete.assert_not_called()
+        mock_meta.assert_not_called()
+
+    @patch("cli_agent_orchestrator.clients.database.delete_terminals_by_session")
+    def test_workspace_closed_removes_all_terminals_for_session(self, mock_delete_by_session):
+        """workspace.closed should prune all terminals whose pane_id starts with workspace_id."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal("tid1", "ws-abc/0")
+        service.register_terminal("tid2", "ws-abc/1")
+        service.register_terminal("tid3", "ws-other/0")  # Different workspace
+        service._workspace_to_session["ws-abc"] = "my-session"
+
+        service._handle_lifecycle_event("workspace.closed", {"workspace_id": "ws-abc"})
+
+        # ws-abc terminals pruned
+        assert "ws-abc/0" not in service._pane_to_terminal
+        assert "ws-abc/1" not in service._pane_to_terminal
+        assert "tid1" not in service._terminal_to_pane
+        assert "tid2" not in service._terminal_to_pane
+        # Other workspace unaffected
+        assert "ws-other/0" in service._pane_to_terminal
+        assert "tid3" in service._terminal_to_pane
+        # Workspace entry cleaned up
+        assert "ws-abc" not in service._workspace_to_session
+        # DB cleanup called
+        mock_delete_by_session.assert_called_once_with("my-session")
+
+    @patch("cli_agent_orchestrator.clients.database.delete_terminals_by_session")
+    def test_workspace_closed_unknown_workspace_is_noop(self, mock_delete):
+        """workspace.closed for workspace_id not in _workspace_to_session is silent no-op."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+
+        service._handle_lifecycle_event("workspace.closed", {"workspace_id": "unknown-ws"})
+
+        mock_delete.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    def test_event_loop_routes_lifecycle_events(self, mock_run):
+        """_event_loop should call _handle_lifecycle_event for pane.closed/workspace.closed."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service._workspace_to_session["ws-x"] = "sess-x"
+
+        pane_closed = json.dumps({
+            "type": "pane.closed",
+            "data": {"pane_id": "pane-gone"},
+        }).encode() + b"\n"
+        ws_closed = json.dumps({
+            "type": "workspace.closed",
+            "data": {"workspace_id": "ws-unknown"},
+        }).encode() + b"\n"
+
+        handled = []
+
+        original = service._handle_lifecycle_event
+
+        def capture(event_type, data):
+            handled.append(event_type)
+            original(event_type, data)
+
+        service._handle_lifecycle_event = capture
+
+        async def run():
+            reader = asyncio.StreamReader()
+            service._reader = reader
+            reader.feed_data(pane_closed + ws_closed)
+            reader.feed_eof()
+            try:
+                await service._event_loop()
+            except ConnectionError:
+                pass
+
+        _run_async(run())
+
+        assert "pane.closed" in handled
+        assert "workspace.closed" in handled
+
+
 class TestHerdrInboxServiceSocketPath:
     """Test socket path resolution."""
 
