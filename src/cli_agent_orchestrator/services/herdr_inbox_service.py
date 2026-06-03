@@ -133,11 +133,91 @@ class HerdrInboxService:
     async def start(self) -> None:
         """Start the event loop: wait for first terminal, then connect and listen."""
         self._loop = asyncio.get_running_loop()
+        # Run DB cleanup before starting the socket loop so ghost records from
+        # prior server runs are removed even when no terminals are registered yet.
+        await self._startup_db_cleanup()
         kiro_task = asyncio.ensure_future(self._kiro_supplement_loop())
         try:
             await self._socket_loop()
         finally:
             kiro_task.cancel()
+
+    async def _startup_db_cleanup(self) -> None:
+        """Delete ghost DB terminals whose herdr tabs no longer exist.
+
+        Runs once at server startup before any pane registrations.  Cannot
+        rely on _pane_to_terminal (empty at startup) or _workspace_to_session
+        (populated later by _reconcile).  Builds the workspace map directly
+        from herdr workspace list.
+        """
+        from cli_agent_orchestrator.clients.database import (
+            delete_terminal,
+            list_terminals_by_session,
+        )
+
+        ws_result = subprocess.run(
+            ["herdr", "--session", self._herdr_session, "workspace", "list"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if ws_result.returncode != 0:
+            logger.debug("Startup DB cleanup: herdr workspace list failed, skipping")
+            return
+
+        try:
+            ws_data = json.loads(ws_result.stdout)
+            workspaces = ws_data.get("result", {}).get("workspaces", [])
+            workspace_to_session = {
+                ws["workspace_id"]: ws["label"] for ws in workspaces
+            }
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.warning(f"Startup DB cleanup: failed to parse workspace list: {e}")
+            return
+
+        tab_result = subprocess.run(
+            ["herdr", "--session", self._herdr_session, "tab", "list"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if tab_result.returncode != 0:
+            logger.debug("Startup DB cleanup: herdr tab list failed, skipping")
+            return
+
+        try:
+            tab_data = json.loads(tab_result.stdout)
+            tabs = tab_data.get("result", {}).get("tabs", [])
+            live_tabs_by_workspace: Dict[str, set] = {}
+            for tab in tabs:
+                ws_id = tab.get("workspace_id", "")
+                label = tab.get("label", "")
+                if ws_id and label:
+                    live_tabs_by_workspace.setdefault(ws_id, set()).add(label)
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.warning(f"Startup DB cleanup: failed to parse tab list: {e}")
+            return
+
+        deleted = 0
+        for ws_id, session_name in workspace_to_session.items():
+            live_labels = live_tabs_by_workspace.get(ws_id, set())
+            db_terminals = list_terminals_by_session(session_name)
+            for term in db_terminals:
+                window = term.get("tmux_window", "")
+                if window and window not in live_labels:
+                    logger.info(
+                        f"Startup DB cleanup: deleting ghost terminal {term['id']} "
+                        f"({session_name}:{window}) — tab not in herdr"
+                    )
+                    try:
+                        delete_terminal(term["id"])
+                        deleted += 1
+                    except Exception as e:
+                        logger.warning(
+                            f"Startup DB cleanup: failed to delete ghost terminal "
+                            f"{term['id']}: {e}"
+                        )
+
+        if deleted:
+            logger.info(f"Startup DB cleanup: removed {deleted} ghost terminal(s)")
+        else:
+            logger.debug("Startup DB cleanup: no ghost terminals found")
 
     async def _kiro_supplement_loop(self) -> None:
         """Periodically check kiro terminals stuck in working state."""
