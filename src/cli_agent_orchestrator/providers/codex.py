@@ -39,7 +39,10 @@ ASSISTANT_PREFIX_PATTERN = r"^(?:(?:assistant|codex|agent)\s*:|[^\S\n]*•)"
 # "• Called cao-mcp-server.load_skill({...})". The body that follows
 # (└ ... lines) is the tool's return value, not the model's reply.
 # Used to skip these markers when locating the actual response start.
-MCP_TOOL_CALL_PATTERN = r"^[^\S\n]*•\s+Called\s+\S+"
+# The "<server>.<tool>(" shape (identifier.identifier followed by an open
+# paren) is required so legitimate model bullets like "• Called attention
+# to the bug" don't get filtered as tool calls.
+MCP_TOOL_CALL_PATTERN = r"^[^\S\n]*•\s+Called\s+[\w-]+\.[\w-]+\("
 # Match user input: "You ..." (label style) or "› text" (Codex interactive prompt).
 # The "›[^\S\n]*\S" alternative requires a non-whitespace character on the same line
 # to distinguish user input ("› what is your role?") from the empty idle prompt ("› ").
@@ -113,6 +116,27 @@ def _compute_tui_footer_cutoff(all_lines: list) -> int:
             break
 
     return len("\n".join(all_lines[:footer_start_idx]))
+
+
+def _find_assistant_marker(text: str) -> Optional[re.Match]:
+    """Find the first ASSISTANT_PREFIX_PATTERN match in ``text`` whose line
+    is not an MCP tool-call marker.
+
+    Codex emits ``• Called <server>.<tool>(...)`` when invoking an MCP tool;
+    that bullet matches ASSISTANT_PREFIX_PATTERN but is followed by tool
+    output, not the model's reply. Anchoring on it would conflate tool
+    output with the model response (status: false COMPLETED;
+    extraction: skill-body leak).
+    """
+    for m in re.finditer(ASSISTANT_PREFIX_PATTERN, text, re.IGNORECASE | re.MULTILINE):
+        line_end = text.find("\n", m.start())
+        if line_end == -1:
+            line_end = len(text)
+        line = text[m.start() : line_end]
+        if re.match(MCP_TOOL_CALL_PATTERN, line):
+            continue
+        return m
+    return None
 
 
 class ProviderError(Exception):
@@ -332,13 +356,10 @@ class CodexProvider(BaseProvider):
                 last_user = match
 
         output_after_last_user = clean_output[last_user.start() :] if last_user else clean_output
+        # Skip MCP tool-call markers — those mark "model invoked a tool", not
+        # "model has replied", and shouldn't gate WAITING/ERROR detection.
         assistant_after_last_user = bool(
-            last_user
-            and re.search(
-                ASSISTANT_PREFIX_PATTERN,
-                output_after_last_user,
-                re.IGNORECASE | re.MULTILINE,
-            )
+            last_user and _find_assistant_marker(output_after_last_user) is not None
         )
 
         # Check trust prompt early — the trust menu uses › which matches the idle prompt
@@ -384,13 +405,12 @@ class CodexProvider(BaseProvider):
             if re.search(TUI_PROGRESS_PATTERN, tail_output, re.MULTILINE):
                 return TerminalStatus.PROCESSING
 
-            # Consider COMPLETED only if we see an assistant marker after the last user message.
+            # Consider COMPLETED only if we see an assistant marker (skipping
+            # MCP tool-call markers) after the last user message. Without the
+            # tool-call filter, "• Called <server>.<tool>(...)" emitted before
+            # the model has actually replied would trip COMPLETED prematurely.
             if last_user is not None:
-                if re.search(
-                    ASSISTANT_PREFIX_PATTERN,
-                    clean_output[last_user.start() :],
-                    re.IGNORECASE | re.MULTILINE,
-                ):
+                if _find_assistant_marker(clean_output[last_user.start() :]) is not None:
                     return TerminalStatus.COMPLETED
 
                 return TerminalStatus.IDLE
@@ -439,25 +459,11 @@ class CodexProvider(BaseProvider):
             last_user = user_matches[-1]
 
             # Find the first assistant response marker (• or assistant:) after
-            # the user message, skipping "• Called <tool>(...)" MCP tool call
-            # markers — those are followed by tool output, not the model's
-            # reply. Anchoring on a tool call marker would pull tool output
-            # (e.g. skill body text) into the extracted response.
-            asst_after_user = None
-            for m in re.finditer(
-                ASSISTANT_PREFIX_PATTERN,
-                clean_output[last_user.start() :],
-                re.IGNORECASE | re.MULTILINE,
-            ):
-                line_start = last_user.start() + m.start()
-                line_end = clean_output.find("\n", line_start)
-                if line_end == -1:
-                    line_end = len(clean_output)
-                line = clean_output[line_start:line_end]
-                if re.match(MCP_TOOL_CALL_PATTERN, line):
-                    continue
-                asst_after_user = m
-                break
+            # the user message, skipping "• Called <server>.<tool>(...)" MCP
+            # tool call markers — those are followed by tool output, not the
+            # model's reply. Anchoring on a tool call marker would pull tool
+            # output (e.g. skill body text) into the extracted response.
+            asst_after_user = _find_assistant_marker(clean_output[last_user.start() :])
 
             if asst_after_user:
                 response_start = last_user.start() + asst_after_user.start()
