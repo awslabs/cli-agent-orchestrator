@@ -696,6 +696,45 @@ class TestCodexBulletFormatStatusDetection:
         assert status == TerminalStatus.IDLE
 
     @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_get_status_idle_when_only_tool_call_after_user(self, mock_tmux):
+        """IDLE when the only "•" bullet after the user prompt is an MCP
+        tool-call marker — the model hasn't actually replied yet.
+
+        Regression for the Copilot review on PR #274 that flagged COMPLETED
+        being satisfied by a tool-call marker. A "• Called <server>.<tool>(...)"
+        bullet must not trip COMPLETED on its own.
+        """
+        mock_tmux.get_history.return_value = (
+            "› [CAO Handoff] do task\n"
+            '• Called cao-mcp-server.load_skill({"name":"cao-worker-protocols"})\n'
+            "  └ skill body text\n"
+            "\n"
+            "› \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_get_status_completed_when_real_reply_after_tool_call(self, mock_tmux):
+        """COMPLETED when a real "•" reply follows the MCP tool-call marker."""
+        mock_tmux.get_history.return_value = (
+            "› [CAO Handoff] do task\n"
+            '• Called cao-mcp-server.load_skill({"name":"cao-worker-protocols"})\n'
+            "  └ skill body text\n"
+            "• Done — created the function.\n"
+            "\n"
+            "› \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
     def test_get_status_completed_bullet_with_code_block(self, mock_tmux):
         """COMPLETED with • response containing code blocks."""
         mock_tmux.get_history.return_value = (
@@ -904,6 +943,93 @@ class TestCodexV0111FooterFormat:
         assert status == TerminalStatus.PROCESSING
 
 
+class TestCodexV0136FooterFormat:
+    """Tests for Codex v0.136.0+ TUI footer format.
+
+    v0.136 dropped the "N% left" segment from the status bar; the footer is now
+    just "model · path". Without an updated TUI_FOOTER_PATTERN the suggestion
+    hint line ("› Run /review on my current changes") is mistaken for a real
+    user message, which hides any preceding • assistant response and keeps the
+    terminal status pinned at IDLE forever.
+    """
+
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_get_status_completed_v0136_footer(self, mock_tmux):
+        """COMPLETED with v0.136 footer (suggestion hint must not mask the • response)."""
+        mock_tmux.get_history.return_value = (
+            "› Create a Python function called 'greet'.\n"
+            "• def greet(name):\n"
+            '      return f"Hello, {name}!"\n'
+            "\n"
+            "› Run /review on my current changes\n"
+            "\n"
+            "  openai.gpt-5.5 medium · ~/project\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_get_status_idle_v0136_footer(self, mock_tmux):
+        """IDLE with v0.136 footer format (no user message, no response yet)."""
+        mock_tmux.get_history.return_value = (
+            "╭───────────────────────────────────────────╮\n"
+            "│ >_ OpenAI Codex (v0.136.0)                │\n"
+            "│ model: openai.gpt-5.5 medium              │\n"
+            "│ directory: ~/project                      │\n"
+            "╰───────────────────────────────────────────╯\n"
+            "\n"
+            "› Find and fix a bug in @filename\n"
+            "\n"
+            "  openai.gpt-5.5 medium · ~/project\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.IDLE
+
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_get_status_processing_v0136_spinner(self, mock_tmux):
+        """PROCESSING when TUI shows spinner with v0.136 footer."""
+        mock_tmux.get_history.return_value = (
+            "› [CAO Handoff] Do the task.\n"
+            "\n"
+            "• Working (0s • esc to interrupt)\n"
+            "\n"
+            "› Find and fix a bug in @filename\n"
+            "\n"
+            "  openai.gpt-5.5 medium · ~/project\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        status = provider.get_status()
+
+        assert status == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_extract_last_message_v0136_footer(self, mock_tmux):
+        """extract_last_message_from_script ignores v0.136 suggestion-hint footer."""
+        script_output = (
+            "› Create a Python function called 'greet'.\n"
+            "• def greet(name):\n"
+            '      return f"Hello, {name}!"\n'
+            "\n"
+            "› Run /review on my current changes\n"
+            "\n"
+            "  openai.gpt-5.5 medium · ~/project\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(script_output)
+
+        assert "def greet(name):" in message
+        assert "Hello, {name}!" in message
+        assert "Run /review" not in message
+
+
 class TestCodexProviderMessageExtraction:
     def test_extract_last_message_success(self):
         output = load_fixture("codex_completed_output.txt")
@@ -1021,6 +1147,103 @@ class TestCodexBulletFormatExtraction:
         message = provider.extract_last_message_from_script(output)
 
         assert "I've fixed the import issue" in message
+
+    def test_extract_skips_mcp_tool_call_marker(self):
+        """`• Called <tool>(...)` markers must not be treated as the response start.
+
+        Codex emits "• Called cao-mcp-server.load_skill({...})" when invoking an
+        MCP tool, followed by "└ <tool output>". The next "•" line is the actual
+        model reply. Anchoring on the tool-call marker would pull tool output
+        (e.g. skill body containing "[CAO Handoff]") into the extracted output.
+        """
+        output = (
+            "› [CAO Handoff] Create a Python function called 'add_numbers'.\n"
+            '• Called cao-mcp-server.load_skill({"name":"cao-worker-protocols"})\n'
+            "  └ # CAO Worker Protocols\n"
+            "\n"
+            "    Use this skill when acting as a worker agent.\n"
+            "    For example, Codex workers receive a `[CAO Handoff]` prefix.\n"
+            "\n"
+            "• def add_numbers(a, b):\n"
+            "      return a + b\n"
+            "\n"
+            "› \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert "def add_numbers(a, b):" in message
+        assert "return a + b" in message
+        assert "[CAO Handoff]" not in message
+        assert "CAO Worker Protocols" not in message
+        assert "Called cao-mcp-server" not in message
+
+    def test_extract_skips_tool_call_with_blank_separators(self):
+        """Tool-call filtering must work when blank lines separate the tool call
+        from later content. The ASSISTANT_PREFIX_PATTERN must anchor on the
+        bullet line itself — not on a preceding blank line — otherwise the
+        per-line tool-call check sees an empty line and is bypassed.
+        """
+        output = (
+            "› [CAO Handoff] do task\n"
+            "\n"
+            '• Called cao-mcp-server.load_skill({"name":"cao-worker-protocols"})\n'
+            "  └ skill body with [CAO Handoff] reference\n"
+            "\n"
+            "• def add_numbers(a, b):\n"
+            "      return a + b\n"
+            "\n"
+            "› \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert "def add_numbers(a, b):" in message
+        assert "[CAO Handoff]" not in message
+        assert "skill body" not in message
+
+    def test_extract_skips_multiple_tool_calls(self):
+        """Multiple consecutive tool calls before the final response."""
+        output = (
+            "› do the task\n"
+            '• Called cao-mcp-server.load_skill({"name":"foo"})\n'
+            "  └ skill body text\n"
+            "• Called cao-mcp-server.list_terminals({})\n"
+            '  └ [{"id":"abc"}]\n'
+            "• Done — created the function.\n"
+            "\n"
+            "› \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert "Done" in message
+        assert "created the function" in message
+        assert "skill body text" not in message
+        assert "list_terminals" not in message
+
+    def test_extract_does_not_filter_called_as_english_word(self):
+        """A model bullet starting "• Called <english word>" must NOT be filtered.
+
+        The MCP tool-call pattern requires a "<server>.<tool>(" shape.
+        Bullets like "• Called attention to the bug" are real model replies
+        and must survive extraction. Regression for the Copilot review on
+        PR #274 that flagged the previous loose pattern.
+        """
+        output = (
+            "› what did you do?\n"
+            "• Called attention to the import bug in main.py and fixed it.\n"
+            "\n"
+            "› \n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert "Called attention to the import bug" in message
 
 
 class TestCodexV0111Extraction:
