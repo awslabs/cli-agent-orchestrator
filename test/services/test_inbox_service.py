@@ -2,7 +2,7 @@
 
 import asyncio
 from datetime import datetime
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -366,7 +366,7 @@ class TestRun:
 
             await run_one()
 
-        svc.deliver_pending.assert_called_once_with("abc123")
+        svc.deliver_pending.assert_called_once_with("abc123", registry=None)
 
     @pytest.mark.asyncio
     async def test_processes_completed_status_event(self):
@@ -392,7 +392,7 @@ class TestRun:
             except asyncio.CancelledError:
                 pass
 
-        svc.deliver_pending.assert_called_once_with("xyz789")
+        svc.deliver_pending.assert_called_once_with("xyz789", registry=None)
 
     @pytest.mark.asyncio
     async def test_ignores_processing_status_event(self):
@@ -419,3 +419,71 @@ class TestRun:
                 pass
 
         svc.deliver_pending.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_threads_registry_to_delivery(self):
+        """run(registry) threads the plugin registry to deliver_pending so
+        status-driven deliveries fire PostSendMessageEvent hooks with the same
+        attribution as the immediate and OpenCode-poller paths (PR #273 review).
+        """
+        svc = InboxService()
+        svc.deliver_pending = MagicMock()
+        registry = MagicMock()
+
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "topic": "terminal.abc123.status",
+                "data": {"status": TerminalStatus.IDLE.value},
+            }
+        )
+
+        with patch("cli_agent_orchestrator.services.inbox_service.bus") as mock_bus:
+            mock_bus.subscribe.return_value = queue
+
+            task = asyncio.create_task(svc.run(registry))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        svc.deliver_pending.assert_called_once_with("abc123", registry=registry)
+
+    @pytest.mark.asyncio
+    async def test_offloads_delivery_to_thread(self):
+        """Delivery is offloaded via asyncio.to_thread so the consumer loop keeps
+        yielding to the event loop and never blocks StatusMonitor/LogWriter on
+        deliver_pending's synchronous DB + tmux I/O (PR #273 review; see the
+        threading discipline note in docs/event-driven-architecture.md).
+        """
+        svc = InboxService()
+        svc.deliver_pending = MagicMock()
+
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "topic": "terminal.abc123.status",
+                "data": {"status": TerminalStatus.IDLE.value},
+            }
+        )
+
+        with (
+            patch("cli_agent_orchestrator.services.inbox_service.bus") as mock_bus,
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.asyncio.to_thread",
+                new_callable=AsyncMock,
+            ) as mock_to_thread,
+        ):
+            mock_bus.subscribe.return_value = queue
+
+            task = asyncio.create_task(svc.run())
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        mock_to_thread.assert_awaited_once_with(svc.deliver_pending, "abc123", registry=None)

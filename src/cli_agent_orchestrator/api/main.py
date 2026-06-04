@@ -186,7 +186,7 @@ async def lifespan(app: FastAPI):
     # Start event bus consumers as background tasks
     status_monitor_task = asyncio.create_task(status_monitor.run())
     log_writer_task = asyncio.create_task(log_writer.run())
-    inbox_service_task = asyncio.create_task(inbox_service.run())
+    inbox_service_task = asyncio.create_task(inbox_service.run(registry))
     logger.info("Event bus consumers started (StatusMonitor, LogWriter, InboxService)")
 
     # Start temporary OpenCode inbox poller. GH #115 tracks replacing this

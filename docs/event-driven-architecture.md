@@ -113,7 +113,7 @@ Creates a named pipe (FIFO) per terminal and starts a daemon reader thread. tmux
 
 ### Status Monitor (`services/status_monitor.py`) — Publisher + Consumer
 
-Subscribes to `terminal.*.output`. Accumulates output into a rolling buffer (8KB) per terminal, detects status via the registered provider (or a generic shell prompt pattern before init), and publishes `terminal.{id}.status` on change. Also the source of truth for current terminal status.
+Subscribes to `terminal.*.output`. Accumulates output into a rolling buffer (8KB) per terminal, detects status via the registered provider (returning `UNKNOWN` until a provider is registered for the terminal), and publishes `terminal.{id}.status` on change. Also the source of truth for current terminal status.
 
 ### Log Writer (`services/log_writer.py`) — Consumer
 

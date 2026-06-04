@@ -51,32 +51,40 @@ class FifoManager:
         logger.info(f"Started FIFO reader for terminal {terminal_id}")
 
     def stop_reader(self, terminal_id: str) -> None:
-        """Stop reader thread and delete FIFO file."""
+        """Stop the reader thread (if running) and delete the FIFO file.
+
+        The unlink is best-effort and runs even when no in-memory reader is
+        tracked for ``terminal_id`` — e.g. retention cleanup iterating DB
+        terminals after a server restart, where ``_readers`` is empty but stale
+        ``*.fifo`` files may still be on disk. Without it those files would
+        accumulate unbounded.
+        """
         with self._lock:
             stop_flag = self._readers.pop(terminal_id, None)
             thread = self._threads.pop(terminal_id, None)
 
-        if not stop_flag or not thread:
-            return
-
-        stop_flag.set()
-
-        # Unblock thread if stuck on open() by briefly opening write side
         fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
-        try:
-            fd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
-            os.close(fd)
-        except OSError:
-            pass
 
-        thread.join(timeout=2.0)
+        if stop_flag and thread:
+            stop_flag.set()
 
+            # Unblock thread if stuck on open() by briefly opening write side
+            try:
+                fd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
+                os.close(fd)
+            except OSError:
+                pass
+
+            thread.join(timeout=2.0)
+            logger.info(f"Stopped FIFO reader for terminal {terminal_id}")
+
+        # Best-effort unlink regardless of whether a reader was tracked — when
+        # none is tracked there is no active reader holding the FIFO, so removing
+        # a stale file on disk is safe.
         try:
             fifo_path.unlink()
         except OSError:
             pass
-
-        logger.info(f"Stopped FIFO reader for terminal {terminal_id}")
 
     @staticmethod
     def _reader_loop(terminal_id: str, fifo_path, stop_flag: threading.Event) -> None:

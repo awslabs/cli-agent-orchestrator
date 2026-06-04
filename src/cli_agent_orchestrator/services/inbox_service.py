@@ -3,6 +3,7 @@
 Consumer: terminal.{id}.status
 """
 
+import asyncio
 import logging
 
 from cli_agent_orchestrator.clients.database import (
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 class InboxService:
     """Delivers one pending message per terminal per IDLE cycle."""
 
-    async def run(self) -> None:
+    async def run(self, registry: PluginRegistry | None = None) -> None:
         queue = bus.subscribe("terminal.*.status")
         logger.info("InboxService started")
 
@@ -37,7 +38,14 @@ class InboxService:
                 status_value = event["data"]["status"]
                 if status_value in (TerminalStatus.IDLE.value, TerminalStatus.COMPLETED.value):
                     terminal_id = terminal_id_from_topic(event["topic"])
-                    self.deliver_pending(terminal_id)
+                    # deliver_pending does blocking DB + tmux I/O. Offload it to a
+                    # worker thread so this consumer keeps yielding to the event loop
+                    # (StatusMonitor/LogWriter must not be starved — see the threading
+                    # note in docs/event-driven-architecture.md). The registry is
+                    # threaded through so status-driven deliveries fire
+                    # PostSendMessageEvent hooks with the same attribution as the
+                    # immediate and OpenCode-poller paths.
+                    await asyncio.to_thread(self.deliver_pending, terminal_id, registry=registry)
             except Exception as e:
                 logger.error(f"Error in InboxService: {e}")
 
