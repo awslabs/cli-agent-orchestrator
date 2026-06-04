@@ -42,7 +42,15 @@ class TestBackendFactoryHerdr:
         """HerdrBackend is returned when terminal_backend is 'herdr'."""
         config_file = tmp_path / "config.json"
         config_file.write_text(json.dumps({"terminal_backend": "herdr"}))
-        backend = BackendFactory.create(config_path=config_file)
+        # Patch os.path.exists so HerdrBackend.__init__ -> _ensure_session_running
+        # finds the session socket and skips the subprocess.Popen(["herdr", ...])
+        # startup, which would raise FileNotFoundError where herdr is not installed
+        # (e.g. CI). Mirrors the fixture in test_herdr_backend.py.
+        with patch(
+            "cli_agent_orchestrator.backends.herdr_backend.os.path.exists",
+            return_value=True,
+        ):
+            backend = BackendFactory.create(config_path=config_file)
         assert isinstance(backend, HerdrBackend)
 
 
