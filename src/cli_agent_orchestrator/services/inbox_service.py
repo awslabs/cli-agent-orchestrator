@@ -9,9 +9,13 @@ import logging
 from cli_agent_orchestrator.clients.database import (
     get_pending_messages,
     list_pending_receiver_ids_by_provider,
+    list_pending_receiver_ids_older_than,
     update_message_status,
 )
-from cli_agent_orchestrator.constants import EAGER_INBOX_DELIVERY
+from cli_agent_orchestrator.constants import (
+    EAGER_INBOX_DELIVERY,
+    INBOX_RECONCILE_GRACE_SECONDS,
+)
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -88,6 +92,14 @@ class InboxService:
                 return
 
         combined = "\n".join(m.message for m in messages)
+        # Mark DELIVERED before sending (#164). send_input() types into the tmux
+        # pane; that output flows back through the FIFO/StatusMonitor pipeline and
+        # can re-emit an IDLE/COMPLETED status event, re-entering deliver_pending.
+        # If the messages were still PENDING then, they would be delivered twice.
+        # Marking them DELIVERED first closes that window; the except path resets
+        # them to FAILED.
+        for message in messages:
+            update_message_status(message.id, MessageStatus.DELIVERED)
         try:
             if registry is None:
                 terminal_service.send_input(terminal_id, combined)
@@ -99,8 +111,6 @@ class InboxService:
                     sender_id=messages[0].sender_id,
                     orchestration_type=OrchestrationType.SEND_MESSAGE,
                 )
-            for message in messages:
-                update_message_status(message.id, MessageStatus.DELIVERED)
             logger.info(f"Delivered {len(messages)} message(s) to terminal {terminal_id}")
         except Exception as e:
             for message in messages:
@@ -119,6 +129,26 @@ class InboxService:
                 self.deliver_pending(terminal_id, registry=registry)
             except Exception as e:
                 logger.debug(f"OpenCode inbox poll failed for {terminal_id}: {e}")
+
+    def reconcile_orphaned_messages(self, registry: PluginRegistry | None = None) -> None:
+        """Re-attempt delivery for messages stuck in PENDING past the grace window.
+
+        Provider-agnostic safety net for issue #131: when a receiving terminal is
+        already idle, the immediate (on POST) delivery path may miss on a stale
+        status, and an idle terminal produces no new output so the event-driven
+        StatusMonitor never emits an IDLE/COMPLETED event to wake delivery —
+        leaving the message orphaned. This sweep finds any such message and routes
+        it back through the normal delivery gate (``deliver_pending``).
+
+        Only messages older than ``INBOX_RECONCILE_GRACE_SECONDS`` are considered,
+        so the sweep never competes with the fast paths for freshly queued
+        messages — it only adopts ones they have already missed.
+        """
+        for terminal_id in list_pending_receiver_ids_older_than(INBOX_RECONCILE_GRACE_SECONDS):
+            try:
+                self.deliver_pending(terminal_id, registry=registry)
+            except Exception as e:
+                logger.debug(f"Inbox reconciliation failed for {terminal_id}: {e}")
 
 
 inbox_service = InboxService()

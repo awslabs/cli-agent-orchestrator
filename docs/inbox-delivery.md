@@ -72,3 +72,22 @@ The `_initialized` gate is important -- it prevents delivery during startup when
 | Message delivered during PROCESSING gets lost (agent errors mid-turn) | Low | Message status is DELIVERED; acceptable for v1 |
 | Watchdog fires every 5s during long turns | Medium (bounded) | One DB query + one tmux call per interval; no amplification |
 | Feature causes regression in non-eager providers | None | Provider flag defaults to False; only opt-in providers affected |
+
+## Reconciliation Sweep
+
+The immediate and watchdog paths can both miss a message when the receiving terminal is *already idle* when the message is queued:
+
+- the single immediate attempt may observe a momentarily stale status and skip delivery, and
+- the watchdog only fires on log-file changes, which an already-idle agent that produces no further output never generates.
+
+When both miss, the message would otherwise stay `PENDING` forever (issue #131).
+
+A provider-agnostic background sweep closes this gap. Every `INBOX_RECONCILE_INTERVAL` (default 30s) it re-attempts delivery for any message left `PENDING` longer than `INBOX_RECONCILE_GRACE_SECONDS` (default 30s), routing it back through the same `check_and_send_pending_messages()` gate as the other paths. The work scales with the number of *backlogged* receivers, not the total agent count: when nothing is stuck the sweep runs one cheap query and returns.
+
+### Grace Window
+
+The sweep deliberately ignores messages younger than the grace window. The immediate and watchdog paths own delivery during that window; the sweep only adopts messages they have demonstrably had their chance at and missed. This keeps the sweep from competing with the fast paths on freshly queued messages and minimizes its overlap with them.
+
+### Relationship to the OpenCode Poller
+
+The sweep does not replace the OpenCode poller. They serve different roles: the OpenCode poller is a fast (5s) primary wakeup for a provider whose logs stop changing once its TUI settles, while the sweep is a slow, provider-agnostic safety net. Both reuse `check_and_send_pending_messages()` and so share its known duplicate-wakeup race; the grace window keeps the sweep from overlapping the fast paths in practice. GH #115 tracks unifying all of these wakeup sources into a single coordinated delivery engine that would make delivery atomic.

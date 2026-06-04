@@ -11,8 +11,14 @@ from unittest.mock import ANY, AsyncMock, MagicMock, Mock, call, patch
 
 import pytest
 
-from cli_agent_orchestrator.api.main import app, flow_daemon, opencode_inbox_delivery_daemon
+from cli_agent_orchestrator.api.main import (
+    app,
+    flow_daemon,
+    inbox_reconciliation_daemon,
+    opencode_inbox_delivery_daemon,
+)
 from cli_agent_orchestrator.models.terminal import Terminal
+from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.utils.skills import SkillNameError
 
 # ── Health endpoint ──────────────────────────────────────────────────
@@ -1005,6 +1011,37 @@ class TestOpenCodeInboxDeliveryDaemon:
         assert mock_to_thread.await_args.args[1] is registry
 
 
+class TestInboxReconciliationDaemon:
+    """Tests for the provider-agnostic inbox reconciliation sweep (issue #131)."""
+
+    @pytest.mark.asyncio
+    async def test_sweep_runs_one_iteration_then_cancels(self):
+        """Daemon sleeps, runs the sync sweep in a thread, then handles cancellation."""
+        sleep_calls = 0
+        registry = MagicMock()
+        mock_to_thread = AsyncMock()
+
+        async def fake_sleep(_seconds):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls > 1:
+                raise asyncio.CancelledError
+
+        with (
+            patch("asyncio.sleep", new=fake_sleep),
+            patch("asyncio.to_thread", mock_to_thread),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await inbox_reconciliation_daemon(registry)
+
+        mock_to_thread.assert_awaited_once()
+        # The sweep, not some other sync function, must be the dispatched work.
+        # reconcile_orphaned_messages is a bound method on the singleton now, so a
+        # fresh attribute access is a distinct object — compare by value, not id.
+        assert mock_to_thread.await_args.args[0] == inbox_service.reconcile_orphaned_messages
+        assert mock_to_thread.await_args.args[1] is registry
+
+
 # ── lifespan ─────────────────────────────────────────────────────────
 
 
@@ -1073,6 +1110,68 @@ class TestLifespan:
 
             # After exit — shutdown tears down the plugin registry.
             mock_teardown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_lifespan_cancels_inbox_reconciliation_on_shutdown(self):
+        """The reconciliation sweep task is cancelled when the server stops (issue #131).
+
+        The watchdog PollingObserver is gone in the event-driven model, so the
+        event-bus consumers are stubbed (as in the startup/shutdown test) and the
+        reconciliation daemon is replaced with one that records its cancellation.
+        """
+        from cli_agent_orchestrator.api import main as main_module
+        from cli_agent_orchestrator.api.main import lifespan
+
+        reconcile_cancelled = {"value": False}
+
+        async def fake_daemon():
+            await asyncio.sleep(3600)
+
+        async def fake_registry_daemon(_registry):
+            await asyncio.sleep(3600)
+
+        async def never_returns():
+            await asyncio.sleep(3600)
+
+        async def quick_return():
+            return None
+
+        async def fake_reconcile(_registry):
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                reconcile_cancelled["value"] = True
+                raise
+
+        with (
+            patch("cli_agent_orchestrator.api.main.setup_logging"),
+            patch("cli_agent_orchestrator.api.main.init_db"),
+            patch("cli_agent_orchestrator.api.main.cleanup_old_data"),
+            patch("cli_agent_orchestrator.api.main.cleanup_expired_memories", quick_return),
+            patch("cli_agent_orchestrator.api.main.flow_daemon", fake_daemon),
+            patch(
+                "cli_agent_orchestrator.api.main.opencode_inbox_delivery_daemon",
+                fake_registry_daemon,
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.inbox_reconciliation_daemon",
+                fake_reconcile,
+            ),
+            patch("cli_agent_orchestrator.api.main.bus"),
+            patch.object(
+                main_module.status_monitor, "run", new=AsyncMock(side_effect=never_returns)
+            ),
+            patch.object(main_module.log_writer, "run", new=AsyncMock(side_effect=never_returns)),
+            patch.object(
+                main_module.inbox_service, "run", new=AsyncMock(side_effect=never_returns)
+            ),
+            patch("cli_agent_orchestrator.plugins.PluginRegistry.load", new=AsyncMock()),
+            patch("cli_agent_orchestrator.plugins.PluginRegistry.teardown", new=AsyncMock()),
+        ):
+            async with lifespan(app):
+                pass
+
+        assert reconcile_cancelled["value"] is True
 
 
 # ── main() entry point ───────────────────────────────────────────────

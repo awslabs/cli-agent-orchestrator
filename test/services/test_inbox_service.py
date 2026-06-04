@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
+from cli_agent_orchestrator.constants import INBOX_RECONCILE_GRACE_SECONDS
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.inbox_service import InboxService
@@ -146,7 +147,42 @@ class TestDeliverPending:
         svc = InboxService()
         svc.deliver_pending("term-1")
 
-        mock_update.assert_called_once_with(1, MessageStatus.FAILED)
+        # Status is set to DELIVERED before send_input (#164), then reset to
+        # FAILED when the send raises.
+        mock_update.assert_has_calls(
+            [
+                call(1, MessageStatus.DELIVERED),
+                call(1, MessageStatus.FAILED),
+            ]
+        )
+        assert mock_update.call_count == 2
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_marks_delivered_before_send_input(
+        self, mock_get, mock_monitor, mock_term_svc, mock_update
+    ):
+        """Regression for the double-delivery race (#164).
+
+        send_input()'s output flows back through the FIFO/StatusMonitor pipeline
+        and can re-emit a status event that re-enters deliver_pending. The
+        message must already be DELIVERED by then, so the status update has to
+        happen before send_input is called.
+        """
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+
+        order = []
+        mock_update.side_effect = lambda *args, **kwargs: order.append(("update", args))
+        mock_term_svc.send_input.side_effect = lambda *args, **kwargs: order.append(("send", args))
+
+        svc = InboxService()
+        svc.deliver_pending("term-1")
+
+        assert order[0] == ("update", (1, MessageStatus.DELIVERED))
+        assert order[1][0] == "send"
 
 
 class TestEagerInboxDelivery:
@@ -331,6 +367,36 @@ class TestPollOpenCodePendingMessages:
         svc = InboxService()
         svc.deliver_pending = MagicMock(side_effect=[Exception("tmux busy"), None])
         svc.poll_opencode_pending_messages()
+
+        assert svc.deliver_pending.call_count == 2
+
+
+class TestReconcileOrphanedMessages:
+    """Tests for the provider-agnostic inbox reconciliation sweep (issue #131)."""
+
+    @patch("cli_agent_orchestrator.services.inbox_service.list_pending_receiver_ids_older_than")
+    def test_reconciles_stale_receivers(self, mock_list_receivers):
+        """Sweep attempts delivery for each receiver with an orphaned message."""
+        mock_list_receivers.return_value = ["receiver-1", "receiver-2"]
+
+        svc = InboxService()
+        svc.deliver_pending = MagicMock()
+        svc.reconcile_orphaned_messages()
+
+        mock_list_receivers.assert_called_once_with(INBOX_RECONCILE_GRACE_SECONDS)
+        assert svc.deliver_pending.call_args_list == [
+            call("receiver-1", registry=None),
+            call("receiver-2", registry=None),
+        ]
+
+    @patch("cli_agent_orchestrator.services.inbox_service.list_pending_receiver_ids_older_than")
+    def test_survives_per_receiver_failure(self, mock_list_receivers):
+        """One failed receiver does not stop the sweep."""
+        mock_list_receivers.return_value = ["receiver-1", "receiver-2"]
+
+        svc = InboxService()
+        svc.deliver_pending = MagicMock(side_effect=[Exception("tmux busy"), None])
+        svc.reconcile_orphaned_messages()
 
         assert svc.deliver_pending.call_count == 2
 
