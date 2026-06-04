@@ -612,7 +612,7 @@ def test_launch_yolo_still_resolves_profile_provider():
 
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run"),
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
         patch(
             "cli_agent_orchestrator.utils.agent_profiles.resolve_provider",
@@ -643,7 +643,7 @@ def test_launch_allowed_tools_still_resolves_profile_provider():
 
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run"),
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
         patch(
             "cli_agent_orchestrator.utils.agent_profiles.resolve_provider",
             return_value="gemini_cli",
@@ -683,7 +683,7 @@ def test_launch_explicit_provider_skips_profile_resolution():
 
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run"),
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
         patch("cli_agent_orchestrator.utils.agent_profiles.resolve_provider") as mock_resolve,
     ):
@@ -715,7 +715,7 @@ def test_launch_yolo_falls_back_to_default_when_profile_lacks_provider():
 
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run"),
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
         patch(
             "cli_agent_orchestrator.utils.agent_profiles.resolve_provider",
@@ -802,7 +802,7 @@ def test_launch_forwards_env_in_json_body_not_url():
 
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run"),
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
         mock_post.return_value.json.return_value = {
@@ -847,7 +847,7 @@ def test_launch_without_env_omits_request_body():
 
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run"),
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
         mock_post.return_value.json.return_value = {
