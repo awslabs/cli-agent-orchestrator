@@ -2,7 +2,7 @@
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import (
@@ -337,6 +337,36 @@ def list_pending_receiver_ids_by_provider(provider: str) -> List[str]:
             .filter(
                 TerminalModel.provider == provider,
                 InboxModel.status == MessageStatus.PENDING.value,
+            )
+            .distinct()
+            .all()
+        )
+        return [row[0] for row in rows]
+
+
+def list_pending_receiver_ids_older_than(min_age_seconds: int) -> List[str]:
+    """List receiver terminal IDs whose messages have been PENDING too long.
+
+    Returns the distinct receivers of any message still PENDING for longer than
+    ``min_age_seconds``. Used by the inbox reconciliation sweep to find messages
+    the immediate and watchdog delivery paths missed, without competing with
+    them for freshly queued ones (issue #131).
+
+    The join on ``terminals`` drops messages whose receiver terminal no longer
+    exists, so the sweep does not keep retrying deliveries to deleted agents.
+
+    ``created_at`` is stored local-naive (``InboxModel.created_at`` defaults to
+    ``datetime.now``), so the cutoff uses ``datetime.now()`` to match — the same
+    convention as the retention query in ``cleanup_service.cleanup_old_data``.
+    """
+    cutoff = datetime.now() - timedelta(seconds=min_age_seconds)
+    with SessionLocal() as db:
+        rows = (
+            db.query(InboxModel.receiver_id)
+            .join(TerminalModel, TerminalModel.id == InboxModel.receiver_id)
+            .filter(
+                InboxModel.status == MessageStatus.PENDING.value,
+                InboxModel.created_at < cutoff,
             )
             .distinct()
             .all()

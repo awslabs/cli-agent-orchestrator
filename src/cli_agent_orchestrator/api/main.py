@@ -42,6 +42,7 @@ from cli_agent_orchestrator.constants import (
     CORS_ORIGINS,
     DEFAULT_PROVIDER,
     INBOX_POLLING_INTERVAL,
+    INBOX_RECONCILE_INTERVAL,
     SERVER_HOST,
     SERVER_PORT,
     SERVER_VERSION,
@@ -109,6 +110,24 @@ async def opencode_inbox_delivery_daemon(registry: PluginRegistry) -> None:
             await asyncio.to_thread(inbox_service.poll_opencode_pending_messages, registry)
         except Exception:
             logger.exception("OpenCode inbox delivery poller error")
+
+
+async def inbox_reconciliation_daemon(registry: PluginRegistry) -> None:
+    """Background task that recovers inbox messages the fast paths missed.
+
+    Safety net for issue #131: the immediate (on POST) and watchdog (on log
+    change) delivery paths can both miss a message when the receiver is already
+    idle, leaving it PENDING forever. This sweep runs on a slower interval than
+    the watchdog and re-attempts delivery for anything left pending past the
+    grace window.
+    """
+    logger.info("Inbox reconciliation daemon started")
+    while True:
+        await asyncio.sleep(INBOX_RECONCILE_INTERVAL)
+        try:
+            await asyncio.to_thread(inbox_service.reconcile_orphaned_messages, registry)
+        except Exception:
+            logger.exception("Inbox reconciliation daemon error")
 
 
 # Response Models
@@ -183,6 +202,10 @@ async def lifespan(app: FastAPI):
     # provider-specific wakeup path with a unified delivery engine.
     opencode_inbox_task = asyncio.create_task(opencode_inbox_delivery_daemon(registry))
 
+    # Start provider-agnostic reconciliation sweep for orphaned PENDING
+    # messages the immediate and watchdog paths missed (issue #131).
+    inbox_reconcile_task = asyncio.create_task(inbox_reconciliation_daemon(registry))
+
     # Start inbox watcher
     inbox_observer = PollingObserver(timeout=INBOX_POLLING_INTERVAL)
     inbox_observer.schedule(LogFileHandler(registry), str(TERMINAL_LOG_DIR), recursive=False)
@@ -207,6 +230,13 @@ async def lifespan(app: FastAPI):
     opencode_inbox_task.cancel()
     try:
         await opencode_inbox_task
+    except asyncio.CancelledError:
+        pass
+
+    # Cancel inbox reconciliation sweep on shutdown
+    inbox_reconcile_task.cancel()
+    try:
+        await inbox_reconcile_task
     except asyncio.CancelledError:
         pass
 
