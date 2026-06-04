@@ -507,7 +507,7 @@ class CodexProvider(BaseProvider):
             line_end = clean_output.find("\n", m.start())
             if line_end == -1:
                 line_end = len(clean_output)
-            line = clean_output[m.start():line_end]
+            line = clean_output[m.start() : line_end]
             if re.match(MCP_TOOL_CALL_PATTERN, line):
                 continue
             matches.append(m)

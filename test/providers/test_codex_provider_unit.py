@@ -1119,7 +1119,7 @@ class TestCodexBulletFormatExtraction:
         """
         output = (
             "› [CAO Handoff] Create a Python function called 'add_numbers'.\n"
-            "• Called cao-mcp-server.load_skill({\"name\":\"cao-worker-protocols\"})\n"
+            '• Called cao-mcp-server.load_skill({"name":"cao-worker-protocols"})\n'
             "  └ # CAO Worker Protocols\n"
             "\n"
             "    Use this skill when acting as a worker agent.\n"
@@ -1149,7 +1149,7 @@ class TestCodexBulletFormatExtraction:
         output = (
             "› [CAO Handoff] do task\n"
             "\n"
-            "• Called cao-mcp-server.load_skill({\"name\":\"cao-worker-protocols\"})\n"
+            '• Called cao-mcp-server.load_skill({"name":"cao-worker-protocols"})\n'
             "  └ skill body with [CAO Handoff] reference\n"
             "\n"
             "• def add_numbers(a, b):\n"
@@ -1169,10 +1169,10 @@ class TestCodexBulletFormatExtraction:
         """Multiple consecutive tool calls before the final response."""
         output = (
             "› do the task\n"
-            "• Called cao-mcp-server.load_skill({\"name\":\"foo\"})\n"
+            '• Called cao-mcp-server.load_skill({"name":"foo"})\n'
             "  └ skill body text\n"
             "• Called cao-mcp-server.list_terminals({})\n"
-            "  └ [{\"id\":\"abc\"}]\n"
+            '  └ [{"id":"abc"}]\n'
             "• Done — created the function.\n"
             "\n"
             "› \n"
