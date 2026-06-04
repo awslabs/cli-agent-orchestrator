@@ -118,7 +118,7 @@ def _compute_tui_footer_cutoff(all_lines: list) -> int:
     return len("\n".join(all_lines[:footer_start_idx]))
 
 
-def _find_assistant_marker(text: str) -> Optional[re.Match]:
+def _find_assistant_marker(text: str) -> Optional[re.Match[str]]:
     """Find the first ASSISTANT_PREFIX_PATTERN match in ``text`` whose line
     is not an MCP tool-call marker.
 
