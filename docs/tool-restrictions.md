@@ -110,7 +110,7 @@ No `role` is needed — `allowedTools` is the full specification of what tools t
 | `@cao-mcp-server` | CAO orchestration tools | `handoff`, `assign`, `send_message`, `answer_user_prompt` | Same |
 | `*` | Everything (unrestricted) | All tools | All tools |
 
-CAO translates these to each provider's native tool names automatically. You write one vocabulary; it works across all 7 providers.
+CAO translates these to each provider's native tool names automatically. You write one vocabulary; it works across supported providers.
 
 ### 3. `--yolo` — The Escape Hatch
 

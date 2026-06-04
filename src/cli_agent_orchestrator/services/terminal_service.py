@@ -208,17 +208,7 @@ def create_terminal(
                 extra_env=get_session_env(session_name),
             )
 
-        # Step 3: Persist terminal metadata to database
-        db_create_terminal(
-            terminal_id,
-            session_name,
-            window_name,
-            provider,
-            agent_profile,
-            allowed_tools,
-        )
-
-        # Step 3b: Load the profile once for allowed tool resolution before
+        # Step 3: Load the profile once for allowed tool resolution before
         # provider initialization. The skill catalog is computed only for
         # providers that consume it at launch time (see RUNTIME_SKILL_PROMPT_PROVIDERS).
         try:
@@ -227,7 +217,7 @@ def create_terminal(
             profile = None
         skill_prompt = build_skill_catalog() if provider in RUNTIME_SKILL_PROMPT_PROVIDERS else None
 
-        # Step 3c: Resolve allowed_tools from profile if not explicitly provided
+        # Step 3b: Resolve allowed_tools from profile if not explicitly provided
         if allowed_tools is None and profile is not None:
             from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
 
@@ -235,6 +225,17 @@ def create_terminal(
             allowed_tools = resolve_allowed_tools(
                 profile.allowedTools, profile.role, mcp_server_names
             )
+
+        # Step 3c: Persist terminal metadata to database after restrictions
+        # are resolved so API reads and snapshots report the actual launch policy.
+        db_create_terminal(
+            terminal_id,
+            session_name,
+            window_name,
+            provider,
+            agent_profile,
+            allowed_tools,
+        )
 
         # Step 4: Create and initialize the CLI provider
         # This starts the agent (e.g., runs "kiro-cli chat --agent developer").
@@ -406,7 +407,7 @@ def send_input(
             raise TerminalInputBlockedError(
                 f"Terminal {terminal_id} is waiting for a user answer. "
                 "Use answer_user_prompt to submit a selection or approval before "
-                f"sending {orchestration_type} input."
+                f"sending {orchestration_value} input."
             )
 
         # Inject memory context into the very first user message after init.

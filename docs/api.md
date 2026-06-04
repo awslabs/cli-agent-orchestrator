@@ -155,6 +155,20 @@ Send input to a terminal.
 }
 ```
 
+### POST /terminals/{terminal_id}/key
+Send a tmux key sequence to a terminal. Use this for interactive prompts that
+require non-text key presses, such as Hermes clarify picker navigation.
+
+**Parameters:**
+- `key` (string, required): tmux key name, such as `Up`, `Down`, `Enter`, `C-c`, or `M-x`
+
+**Response:**
+```json
+{
+  "success": true
+}
+```
+
 ### GET /terminals/{terminal_id}/output
 Get terminal output.
 
