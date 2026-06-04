@@ -53,7 +53,9 @@ class TestTmuxBackendDelegation:
     def test_create_session_delegates(self, backend, mock_client):
         mock_client.create_session.return_value = "window-0"
         result = backend.create_session("cao-test", "window-0", "tid123", "/tmp")
-        mock_client.create_session.assert_called_once_with("cao-test", "window-0", "tid123", "/tmp")
+        mock_client.create_session.assert_called_once_with(
+            "cao-test", "window-0", "tid123", "/tmp", extra_env=None
+        )
         assert result == "window-0"
 
     def test_create_session_wraps_error(self, backend, mock_client):
@@ -81,7 +83,7 @@ class TestTmuxBackendDelegation:
         mock_client.create_window.return_value = "dev-1234"
         result = backend.create_window("cao-test", "dev-1234", "tid456", "/home")
         mock_client.create_window.assert_called_once_with(
-            "cao-test", "dev-1234", "tid456", "/home", None
+            "cao-test", "dev-1234", "tid456", "/home", None, extra_env=None
         )
         assert result == "dev-1234"
 

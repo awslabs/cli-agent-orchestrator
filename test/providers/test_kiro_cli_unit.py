@@ -1518,13 +1518,13 @@ class TestKiroCliTuiMode:
             "2 of 5 mcp servers initialized. ctrl-c to start chatting now",
         )
 
-    @patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
-    def test_mcp_server_init_yields_processing(self, mock_tmux):
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    def test_mcp_server_init_yields_processing(self, mock_backend):
         """Kiro shows the idle-prompt placeholder before MCP servers finish
         loading. A paste sent during this window is silently absorbed by
         the boot screen, so we must report PROCESSING until init completes.
         """
-        mock_tmux.get_history.return_value = (
+        mock_backend.return_value.get_history.return_value = (
             "0 of 1 mcp servers initialized. ctrl-c to start chatting now\n"
             "────────────────────────────────────────────────────\n"
             "[developer] !> Need help with features or setup? Use /help\n"

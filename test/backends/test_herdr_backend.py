@@ -603,15 +603,15 @@ class TestEnsureSessionRunning:
         assert cmd == ["herdr", "--session", "cao", "server"]
 
     def test_logs_warning_when_socket_never_appears(self):
-        """If socket never appears within 5s, a warning is logged and no error raised."""
-        # Simulate clock: first call returns 0.0 (sets deadline=5.0),
-        # all subsequent calls return 6.0 (past deadline, exits loop).
+        """If socket never appears within 15s, a warning is logged and no error raised."""
+        # Simulate clock: first call returns 0.0 (sets deadline=15.0),
+        # all subsequent calls return 16.0 (past deadline, exits loop).
         # Using a counter so exhaustion from logging internals is not an issue.
         call_count = {"n": 0}
 
         def fake_time():
             call_count["n"] += 1
-            return 0.0 if call_count["n"] == 1 else 6.0
+            return 0.0 if call_count["n"] == 1 else 16.0
 
         with patch(
             "cli_agent_orchestrator.backends.herdr_backend.os.path.exists",

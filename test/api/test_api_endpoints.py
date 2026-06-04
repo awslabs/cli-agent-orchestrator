@@ -1108,6 +1108,7 @@ class TestLifespan:
     async def test_lifespan_startup_and_shutdown(self):
         """lifespan starts background tasks on entry, cleans up on exit."""
         from cli_agent_orchestrator.api.main import lifespan
+        from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
 
         mock_observer = MagicMock()
 
@@ -1118,6 +1119,10 @@ class TestLifespan:
             patch("cli_agent_orchestrator.api.main.setup_logging"),
             patch("cli_agent_orchestrator.api.main.init_db"),
             patch("cli_agent_orchestrator.api.main.cleanup_old_data"),
+            patch(
+                "cli_agent_orchestrator.api.main.get_backend",
+                return_value=MagicMock(spec=TmuxBackend),
+            ),
             patch(
                 "cli_agent_orchestrator.api.main.PollingObserver",
                 return_value=mock_observer,

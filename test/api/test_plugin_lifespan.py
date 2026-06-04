@@ -7,6 +7,7 @@ import pytest
 from fastapi import Request
 
 from cli_agent_orchestrator.api.main import app, get_plugin_registry, lifespan
+from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
 from cli_agent_orchestrator.plugins import CaoPlugin, PluginRegistry, hook
 from cli_agent_orchestrator.plugins.events import PostSendMessageEvent
 
@@ -37,6 +38,10 @@ class TestPluginRegistryLifespan:
             patch("cli_agent_orchestrator.api.main.setup_logging"),
             patch("cli_agent_orchestrator.api.main.init_db"),
             patch("cli_agent_orchestrator.api.main.cleanup_old_data"),
+            patch(
+                "cli_agent_orchestrator.api.main.get_backend",
+                return_value=MagicMock(spec=TmuxBackend),
+            ),
             patch(
                 "cli_agent_orchestrator.api.main.PollingObserver",
                 return_value=mock_observer,

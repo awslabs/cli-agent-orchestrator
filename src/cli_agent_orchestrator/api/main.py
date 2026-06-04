@@ -338,7 +338,20 @@ app.add_middleware(
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "cli-agent-orchestrator"}
+    import shutil
+
+    def _probe(binary: str) -> str:
+        return "ok" if shutil.which(binary) else "unavailable"
+
+    return {
+        "status": "ok",
+        "service": "cli-agent-orchestrator",
+        "components": {
+            "cao": "ok",
+            "herdr": _probe("herdr"),
+            "claude": _probe("claude"),
+        },
+    }
 
 
 @app.get("/agents/profiles")
