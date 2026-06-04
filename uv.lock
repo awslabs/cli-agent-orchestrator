@@ -359,7 +359,7 @@ wheels = [
 
 [[package]]
 name = "cli-agent-orchestrator"
-version = "2.1.1"
+version = "2.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiofiles" },

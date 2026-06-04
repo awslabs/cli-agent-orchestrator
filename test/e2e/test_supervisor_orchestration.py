@@ -124,34 +124,46 @@ def _wait_for_supervisor_done(
     calls (e.g., after assign returns but before handoff starts). Requiring
     ``stable_count`` consecutive COMPLETED readings avoids these false positives.
 
+    The ``handoff`` MCP tool auto-deletes its worker terminal as soon as the
+    worker finishes. A point-in-time session listing taken after the
+    supervisor reports COMPLETED can therefore miss workers that came and
+    went during the run. To avoid this race we accumulate the union of every
+    unique terminal id observed across all polls — once seen, a worker
+    "counts" even if it has since been cleaned up.
+
     This function polls until BOTH conditions are true:
     - Terminal status is 'completed' for ``stable_count`` consecutive polls
-    - At least min_terminals exist in the session (supervisor + workers)
+    - At least min_terminals unique terminals have been observed in the
+      session at some point during the run (supervisor + workers)
 
-    Returns (last_status, terminals_list).
+    Returns (last_status, terminals_list) where terminals_list is the union
+    of all unique terminals seen during polling.
     """
     start = time.time()
     last_status = "unknown"
-    terminals = []
+    seen_terminals: dict = {}
     consecutive_completed = 0
 
     while time.time() - start < timeout:
         last_status = get_terminal_status(supervisor_id)
-        terminals = _list_terminals_in_session(session_name)
+        for t in _list_terminals_in_session(session_name):
+            tid = t.get("id")
+            if tid:
+                seen_terminals[tid] = t
 
         if last_status == "error":
-            return last_status, terminals
+            return last_status, list(seen_terminals.values())
 
-        if last_status == "completed" and len(terminals) >= min_terminals:
+        if last_status == "completed" and len(seen_terminals) >= min_terminals:
             consecutive_completed += 1
             if consecutive_completed >= stable_count:
-                return last_status, terminals
+                return last_status, list(seen_terminals.values())
         else:
             consecutive_completed = 0
 
         time.sleep(poll)
 
-    return last_status, terminals
+    return last_status, list(seen_terminals.values())
 
 
 def _run_supervisor_handoff_test(provider: str):

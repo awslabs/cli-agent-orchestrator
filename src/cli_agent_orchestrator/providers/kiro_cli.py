@@ -80,7 +80,13 @@ TUI_PROCESSING_PATTERN = r"Kiro is working"
 # premature IDLE verdict. "Initializing..." is cleared by Kiro once startup
 # finishes, so its presence unconditionally means PROCESSING (unlike the
 # "Kiro is working" ghost text, which can linger as stale after a redraw).
-TUI_INITIALIZING_PATTERN = r"Initializing\.\.\."
+#
+# Also covers the MCP-server boot line "M of N mcp servers initialized.
+# ctrl-c to start chatting now" — Kiro shows this *before* the idle prompt
+# is interactive, so a paste sent during this window is absorbed by the
+# pre-prompt boot screen and silently dropped (observed during e2e
+# allowed-tools tests).
+TUI_INITIALIZING_PATTERN = r"Initializing\.\.\.|\d+ of \d+ mcp servers initialized\.\s*ctrl-c to start chatting now"  # noqa: E501
 
 # TUI permission prompt: shown instead of legacy [y/n/t] format.
 # Requires all three options together to avoid false positives on "Yes"/"No" in agent output.
@@ -332,8 +338,15 @@ class KiroCliProvider(BaseProvider):
         # Check 3: If no idle prompt found, determine if kiro is still running.
         # Compare current pane command against the shell captured before kiro launched.
         # If they match, kiro has exited and the shell is showing again → IDLE.
+        #
+        # Gated on self._initialized: between send_keys("kiro-cli chat ...")
+        # and the moment kiro-cli exec's, the pane's current command still
+        # matches shell_baseline ("zsh"), and the buffer hasn't shown any
+        # idle prompt yet. Without this gate, get_status() returns IDLE
+        # immediately after launch, which lets pre-init pastes get absorbed
+        # by Kiro's boot screen and silently dropped.
         if not has_idle_prompt and not has_new_tui_idle:
-            if self.shell_baseline:
+            if self._initialized and self.shell_baseline:
                 current_cmd = tmux_client.get_pane_current_command(
                     self.session_name, self.window_name
                 )
