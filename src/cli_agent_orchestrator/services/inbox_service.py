@@ -151,8 +151,11 @@ def check_and_send_pending_messages(
         return True
     except TerminalNotFoundError as e:
         # The terminal's pane could not be resolved (e.g. herdr pane not found
-        # for this window). Treat as transient: leave the message PENDING for a
-        # later retry rather than marking it FAILED or silently misrouting.
+        # for this window). Treat as transient: reset to PENDING for a later
+        # retry rather than marking it FAILED or silently misrouting. We must
+        # reset explicitly because the status was optimistically set to
+        # DELIVERED above before the send was attempted.
+        update_message_status(message.id, MessageStatus.PENDING)
         logger.warning(
             f"Pane not resolvable for terminal {terminal_id}; leaving message "
             f"{message.id} pending for retry: {e}"

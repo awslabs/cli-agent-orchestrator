@@ -963,10 +963,10 @@ class TestCodexV0136FooterFormat:
     terminal status pinned at IDLE forever.
     """
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
     def test_get_status_completed_v0136_footer(self, mock_tmux):
         """COMPLETED with v0.136 footer (suggestion hint must not mask the • response)."""
-        mock_tmux.get_history.return_value = (
+        mock_tmux.return_value.get_history.return_value = (
             "› Create a Python function called 'greet'.\n"
             "• def greet(name):\n"
             '      return f"Hello, {name}!"\n'
@@ -981,10 +981,10 @@ class TestCodexV0136FooterFormat:
 
         assert status == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
     def test_get_status_idle_v0136_footer(self, mock_tmux):
         """IDLE with v0.136 footer format (no user message, no response yet)."""
-        mock_tmux.get_history.return_value = (
+        mock_tmux.return_value.get_history.return_value = (
             "╭───────────────────────────────────────────╮\n"
             "│ >_ OpenAI Codex (v0.136.0)                │\n"
             "│ model: openai.gpt-5.5 medium              │\n"
@@ -1001,10 +1001,10 @@ class TestCodexV0136FooterFormat:
 
         assert status == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
     def test_get_status_processing_v0136_spinner(self, mock_tmux):
         """PROCESSING when TUI shows spinner with v0.136 footer."""
-        mock_tmux.get_history.return_value = (
+        mock_tmux.return_value.get_history.return_value = (
             "› [CAO Handoff] Do the task.\n"
             "\n"
             "• Working (0s • esc to interrupt)\n"
@@ -1019,8 +1019,7 @@ class TestCodexV0136FooterFormat:
 
         assert status == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_extract_last_message_v0136_footer(self, mock_tmux):
+    def test_extract_last_message_v0136_footer(self):
         """extract_last_message_from_script ignores v0.136 suggestion-hint footer."""
         script_output = (
             "› Create a Python function called 'greet'.\n"

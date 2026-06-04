@@ -231,8 +231,9 @@ class TestCheckAndSendPendingMessages:
         """A TerminalNotFoundError during send leaves the message PENDING, not FAILED.
 
         Pane resolution can transiently fail (e.g. herdr pane not yet resolvable).
-        The message must remain pending for a later retry rather than being marked
-        FAILED or silently misrouted.
+        Status is optimistically set DELIVERED before send (to close the watchdog
+        re-entrancy race), so on a resolution failure it must be reset to PENDING
+        for a later retry — never left DELIVERED or marked FAILED.
         """
         mock_message = MagicMock()
         mock_message.id = 1
@@ -246,8 +247,9 @@ class TestCheckAndSendPendingMessages:
         result = check_and_send_pending_messages("test-terminal")
 
         assert result is False
-        # Message stays pending: status is never updated to DELIVERED or FAILED
-        mock_update_status.assert_not_called()
+        # Final status is PENDING (reset after the optimistic DELIVERED), never FAILED.
+        assert mock_update_status.call_args_list[-1] == call(1, MessageStatus.PENDING)
+        assert call(1, MessageStatus.FAILED) not in mock_update_status.call_args_list
 
 
 class TestEagerInboxDelivery:
