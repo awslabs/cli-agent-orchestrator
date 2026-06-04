@@ -296,6 +296,45 @@ class TestHerdrBackendCommands:
         assert "50" in cmd
 
     @patch("subprocess.run")
+    def test_get_history_strip_escapes_requests_text_format(self, mock_run, backend):
+        """strip_escapes=True maps to herdr's --format text (ANSI stripped)."""
+        ws = [{"label": "cao-test", "workspace_id": "w1"}]
+        tabs = [{"tab_id": "tab-0", "workspace_id": "w1", "label": "window-0"}]
+        panes = [{"tab_id": "tab-0", "pane_id": "w1-1", "workspace_id": "w1"}]
+
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),
+            _completed(_make_tab_list_response(tabs)),
+            _completed(_make_pane_list_response(panes)),
+            _completed(stdout="plain text"),  # pane read
+        ]
+
+        backend.get_history("cao-test", "window-0", tail_lines=50, strip_escapes=True)
+
+        cmd = mock_run.call_args_list[-1][0][0]
+        assert "--format" in cmd
+        assert cmd[cmd.index("--format") + 1] == "text"
+
+    @patch("subprocess.run")
+    def test_get_history_default_omits_format(self, mock_run, backend):
+        """strip_escapes=False leaves format unset (herdr default preserved)."""
+        ws = [{"label": "cao-test", "workspace_id": "w1"}]
+        tabs = [{"tab_id": "tab-0", "workspace_id": "w1", "label": "window-0"}]
+        panes = [{"tab_id": "tab-0", "pane_id": "w1-1", "workspace_id": "w1"}]
+
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),
+            _completed(_make_tab_list_response(tabs)),
+            _completed(_make_pane_list_response(panes)),
+            _completed(stdout="output"),  # pane read
+        ]
+
+        backend.get_history("cao-test", "window-0", tail_lines=50)
+
+        cmd = mock_run.call_args_list[-1][0][0]
+        assert "--format" not in cmd
+
+    @patch("subprocess.run")
     def test_get_pane_working_directory(self, mock_run, backend):
         """get_pane_working_directory should parse cwd from pane get."""
         ws = [{"label": "cao-test", "workspace_id": "w1"}]

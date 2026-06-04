@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from cli_agent_orchestrator.backends import registry
 from cli_agent_orchestrator.backends.registry import set_backend
 from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
 from cli_agent_orchestrator.clients.tmux import tmux_client
@@ -88,9 +89,16 @@ def use_tmux_backend():
     by BackendFactory which reads config.json, so on a host configured for
     herdr this would fail. Pin to tmux explicitly since the session fixture
     creates tmux sessions.
+
+    The backend registry is a module-level singleton, so the previous value is
+    saved and restored to avoid leaking the tmux pin into later tests.
     """
+    previous = registry._backend
     set_backend(TmuxBackend())
-    yield
+    try:
+        yield
+    finally:
+        registry._backend = previous
 
 
 @pytest.fixture

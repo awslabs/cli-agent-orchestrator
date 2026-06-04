@@ -617,7 +617,9 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
                 "get_output: %s response marker not found in full_history, returning partial",
                 terminal_id,
             )
-            return f"[PARTIAL RESPONSE - response marker not found in {_ESCALATION_STEPS[-1]} lines]\n{full_output}"
+            return (
+                f"[PARTIAL RESPONSE - response marker not found in full scrollback]\n{full_output}"
+            )
 
     except Exception as e:
         logger.error(f"Failed to get output from terminal {terminal_id}: {e}")

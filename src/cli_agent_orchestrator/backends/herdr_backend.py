@@ -407,6 +407,12 @@ class HerdrBackend(TerminalBackend):
             args.extend(["--source", "recent", "--lines", str(tail_lines)])
         else:
             args.extend(["--source", "recent", "--lines", "500"])
+        # Honor strip_escapes via herdr's native --format text (strips ANSI).
+        # The TerminalBackend contract only requires that strip_escapes=True
+        # yields plain text; when False we leave the format unset and take
+        # herdr's default so existing provider output parsing is unchanged.
+        if strip_escapes:
+            args.extend(["--format", "text"])
 
         result = self._run_herdr(args, check=False)
         if result.returncode != 0:
