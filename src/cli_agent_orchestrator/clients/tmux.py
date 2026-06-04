@@ -335,17 +335,17 @@ class TmuxClient:
                 # ?2004h for the pane — some TUIs (e.g. current Kiro) don't
                 # send ?2004h so -p is a no-op and \n becomes CR (Enter).
                 buf_content = b"\x1b[200~" + keys.encode() + b"\x1b[201~"
-                paste_flags = ["-r"]
+                paste_flag = "-r"
             else:
                 buf_content = keys.encode()
-                paste_flags = ["-p"]
+                paste_flag = "-p"
             subprocess.run(
                 ["tmux", "load-buffer", "-b", buf_name, "-"],
                 input=buf_content,
                 check=True,
             )
             subprocess.run(
-                ["tmux", "paste-buffer"] + paste_flags + ["-b", buf_name, "-t", target],
+                ["tmux", "paste-buffer", paste_flag, "-b", buf_name, "-t", target],
                 check=True,
             )
             # Brief delay to let the TUI process the bracketed paste end sequence
