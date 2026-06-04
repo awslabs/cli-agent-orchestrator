@@ -94,13 +94,14 @@ class TestAgentProviders:
 
         assert response.status_code == 200
         data = response.json()
-        assert len(data) == 8
+        assert len(data) == 9
         names = [p["name"] for p in data]
         assert "kiro_cli" in names
         assert "claude_code" in names
         assert "q_cli" in names
         assert "codex" in names
         assert "gemini_cli" in names
+        assert "hermes" in names
         assert "kimi_cli" in names
         assert "copilot_cli" in names
         assert "opencode_cli" in names

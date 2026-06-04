@@ -1494,7 +1494,7 @@ class MemoryService:
                 terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
                 if not terminal:
                     return None
-                ctx = {
+                ctx: dict[str, Any] = {
                     "terminal_id": terminal.id,
                     "session_name": terminal.tmux_session,
                     "provider": terminal.provider,

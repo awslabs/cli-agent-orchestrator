@@ -7,7 +7,6 @@ import pytest
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.hermes import HermesProvider, ProviderError
 
-
 HERMES_IDLE_OUTPUT = """
 Hermes Agent v0.15.1
 Profile: test-worker
@@ -188,8 +187,11 @@ my-themed-prompt ❯
 class TestHermesBuildCommand:
     def _profile(self, hermes_profile: str | None = "test-worker"):
         mock_profile = MagicMock()
+        mock_profile.name = "developer"
         mock_profile.hermesProfile = hermes_profile
         mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
         return mock_profile
 
     def test_build_command_without_agent_profile_uses_default_hermes(self):
@@ -208,9 +210,7 @@ class TestHermesBuildCommand:
         )
 
     @patch("cli_agent_orchestrator.providers.hermes.load_agent_profile")
-    def test_build_command_uses_default_hermes_when_profile_has_no_hermes_profile(
-        self, mock_load
-    ):
+    def test_build_command_uses_default_hermes_when_profile_has_no_hermes_profile(self, mock_load):
         mock_load.return_value = self._profile(None)
 
         provider = HermesProvider("tid", "sess", "win", "developer")
@@ -242,6 +242,8 @@ class TestHermesInitialization:
         mock_profile = MagicMock()
         mock_profile.hermesProfile = "test-worker"
         mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
         return mock_profile
 
     @patch("cli_agent_orchestrator.providers.hermes.load_agent_profile")

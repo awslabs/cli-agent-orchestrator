@@ -274,6 +274,7 @@ def create_terminal(
             provider=ProviderType(provider),
             session_name=session_name,
             agent_profile=agent_profile,
+            allowed_tools=allowed_tools,
             shell_command=shell_command,
             status=TerminalStatus.IDLE,
             last_active=datetime.now(),

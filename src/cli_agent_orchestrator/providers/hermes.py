@@ -20,11 +20,9 @@ IDLE_PROMPT_PATTERN = os.environ.get(
     r"^(?!.*(?:msg=interrupt|Ctrl\+C cancel|/queue|/bg|/steer|Tip:|│|─|╭|╰)).{0,80}(?:❯|✦)\s*$",
 )
 IDLE_PROMPT_PATTERN_LOG = os.environ.get("CAO_HERMES_IDLE_LOG_REGEX", r"⏲")
-PROCESSING_PATTERN = (
-    os.environ.get(
-        "CAO_HERMES_PROCESSING_REGEX",
-        r"(?:msg=interrupt|musing\.\.\.|Initializing agent|Ctrl\+C cancel|⏱\s*\d+s)",
-    )
+PROCESSING_PATTERN = os.environ.get(
+    "CAO_HERMES_PROCESSING_REGEX",
+    r"(?:msg=interrupt|musing\.\.\.|Initializing agent|Ctrl\+C cancel|⏱\s*\d+s)",
 )
 ACTIVE_PROCESSING_PATTERN = r"(?:msg=interrupt|musing\.\.\.|Ctrl\+C cancel|⏱\s*\d+s)"
 WAITING_PROMPT_PATTERN = (
@@ -162,8 +160,8 @@ class HermesProvider(BaseProvider):
 
         if self._skill_prompt:
             logger.warning(
-                "Hermes provider does not support CAO runtime skill prompt injection; "
-                "using skills configured on the selected Hermes profile"
+                "Hermes provider does not inject CAO runtime skill catalogs; "
+                "configure skills and MCP servers inside the selected Hermes profile"
             )
 
         if self._allowed_tools and "*" not in self._allowed_tools:

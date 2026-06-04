@@ -8,6 +8,9 @@ to route that agent through a specific Hermes profile wrapper.
 
 - Hermes Agent is installed and authenticated.
 - Hermes Agent is on `PATH`.
+- For CAO multi-agent orchestration from inside Hermes, configure the CAO MCP
+  server in the selected Hermes profile. CAO does not rewrite Hermes
+  `config.yaml` or inject `mcpServers` automatically.
 - Optional: a Hermes profile wrapper is on `PATH` if you want this CAO profile
   to use a non-default Hermes profile:
 
@@ -76,6 +79,42 @@ test-worker chat --yolo --accept-hooks --source cao
 
 If the CAO agent profile sets `model`, CAO appends `--model <value>`.
 
+## MCP Configuration
+
+Hermes reads MCP servers from the selected Hermes profile configuration. CAO
+launches Hermes with the right `CAO_TERMINAL_ID` environment variable, but it
+does not mutate Hermes profile files or create a temporary overlay config.
+
+To let a Hermes supervisor call CAO orchestration tools such as `assign`,
+`handoff`, and `send_message`, add `cao-mcp-server` to the Hermes profile used
+by `hermesProfile`:
+
+```yaml
+mcp_servers:
+  cao-mcp-server:
+    enabled: true
+    command: cao-mcp-server
+    env:
+      CAO_TERMINAL_ID: ${CAO_TERMINAL_ID}
+```
+
+If `cao-mcp-server` is not on `PATH` for Hermes, use an absolute path:
+
+```yaml
+mcp_servers:
+  cao-mcp-server:
+    enabled: true
+    command: /absolute/path/to/cao-mcp-server
+    env:
+      CAO_TERMINAL_ID: ${CAO_TERMINAL_ID}
+```
+
+Do this in the Hermes profile selected by `hermesProfile` (for example
+`~/.hermes/profiles/test-worker/config.yaml` when using a `test-worker` alias).
+The `CAO_TERMINAL_ID` environment entry is required so each Hermes-launched MCP
+server can identify the CAO terminal it belongs to when calling `send_message`,
+`assign`, or `handoff`.
+
 ## Prompt Detection
 
 Hermes themes can customize the visible prompt, prompt symbol, and assistant
@@ -105,9 +144,8 @@ narrower worker.
 
 ## Notes
 
-- Runtime skill catalogs from CAO are not injected into Hermes by this provider;
-  configure skills on the default Hermes profile or the profile referenced by
-  `hermesProfile`.
-- MCP/handoff support should be configured through the CAO agent profile and the
-  surrounding CAO session. Hermes-side profile customization remains isolated to
-  the selected Hermes profile.
+- Hermes does not have a CAO-native hard-deny flag for tool restrictions. Keep
+  strict tool policy inside the selected Hermes profile.
+- Runtime skills and MCP servers must be configured in the selected Hermes
+  profile. CAO deliberately avoids mutating Hermes profile configuration so
+  Hermes session history stays attached to the user's chosen profile.

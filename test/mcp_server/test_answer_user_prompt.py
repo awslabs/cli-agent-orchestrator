@@ -99,7 +99,9 @@ class TestAnswerUserPrompt:
 
         assert result["success"] is True
         assert result["message"] == "Hermes clarify custom answer delivered."
-        assert [call.kwargs["params"].get("key") for call in mock_requests.post.call_args_list[:4]] == [
+        assert [
+            call.kwargs["params"].get("key") for call in mock_requests.post.call_args_list[:4]
+        ] == [
             "Down",
             "Down",
             "Down",
