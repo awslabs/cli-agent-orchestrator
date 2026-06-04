@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
-## [2.2.0] - 2026-06-01
+## [2.2.0] - 2026-06-04
 
 ### Highlights
 
@@ -51,6 +51,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Fixed
+
+- codex: detect v0.136+ TUI footer (`model · path` without `N% left`) so handoff/assign workers reliably reach COMPLETED instead of pinning at IDLE
+
+- codex: skip `• Called <tool>(...)` MCP tool-call markers during last-message extraction so skill body text (including `[CAO Handoff]`) no longer leaks into worker output
+
+- ci: stop TestPyPI squats breaking the release smoke test by installing the package with `--no-deps` and resolving deps from PyPI alone (#270)
+
+- kiro_cli: treat MCP-server boot screen as PROCESSING and gate shell-baseline IDLE on `_initialized` to fix paste-into-boot-screen race that dropped the first message after launch (#268)
 
 - mcp: reject `send_message` when `receiver_id` equals sender (#263)
 
