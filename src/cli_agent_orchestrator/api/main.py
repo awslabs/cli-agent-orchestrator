@@ -416,6 +416,33 @@ async def set_agent_dirs_endpoint(body: AgentDirsUpdate) -> Dict:
     }
 
 
+@app.get("/settings/skill-dirs")
+async def get_skill_dirs_endpoint() -> Dict:
+    """Get the global skill store path and user-added extra skill directories."""
+    from cli_agent_orchestrator.constants import SKILLS_DIR
+    from cli_agent_orchestrator.services.settings_service import get_extra_skill_dirs
+
+    return {"skills_dir": str(SKILLS_DIR), "extra_dirs": get_extra_skill_dirs()}
+
+
+class SkillDirsUpdate(BaseModel):
+    extra_dirs: Optional[List[str]] = None
+
+
+@app.post("/settings/skill-dirs")
+async def set_skill_dirs_endpoint(body: SkillDirsUpdate) -> Dict:
+    """Update user-added extra skill directories."""
+    from cli_agent_orchestrator.services.settings_service import (
+        get_extra_skill_dirs,
+        set_extra_skill_dirs,
+    )
+
+    result_extra: List[str] = []
+    if body.extra_dirs is not None:
+        result_extra = set_extra_skill_dirs(body.extra_dirs)
+    return {"extra_dirs": result_extra or get_extra_skill_dirs()}
+
+
 @app.get("/skills/{name}", response_model=SkillContentResponse)
 async def get_skill_content(name: str) -> SkillContentResponse:
     """Return the full Markdown body for an installed skill."""

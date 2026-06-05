@@ -137,3 +137,19 @@ def set_extra_agent_dirs(dirs: List[str]) -> List[str]:
     settings["extra_agent_dirs"] = extra_agent_dirs
     _save(settings)
     return extra_agent_dirs
+
+
+def get_extra_skill_dirs() -> List[str]:
+    """Get extra skill scan directories (user-added custom paths)."""
+    settings = _load()
+    dirs = settings.get("extra_skill_dirs", [])
+    return dirs if isinstance(dirs, list) else []
+
+
+def set_extra_skill_dirs(dirs: List[str]) -> List[str]:
+    """Set extra skill scan directories."""
+    settings = _load()
+    extra_skill_dirs = [d for d in dirs if d.strip()]
+    settings["extra_skill_dirs"] = extra_skill_dirs
+    _save(settings)
+    return extra_skill_dirs

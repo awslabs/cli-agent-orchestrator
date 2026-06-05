@@ -2,7 +2,7 @@
 
 import logging
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import frontmatter
 from pydantic import ValidationError
@@ -70,38 +70,71 @@ def _load_skill_folder(skill_path: Path) -> Tuple[SkillMetadata, str]:
     return metadata, content
 
 
+def _skill_search_dirs() -> List[Path]:
+    """Return skill store directories in resolution order.
+
+    The global skill store (``SKILLS_DIR``) is searched first, followed by any
+    user-added directories from the ``extra_skill_dirs`` setting. This mirrors
+    agent-profile resolution (global store first, then extra user directories),
+    so a skill in the global store is never shadowed by a later extra directory.
+    """
+    from cli_agent_orchestrator.services.settings_service import get_extra_skill_dirs
+
+    dirs: List[Path] = [SKILLS_DIR]
+    dirs.extend(Path(extra) for extra in get_extra_skill_dirs())
+    return dirs
+
+
+def _resolve_skill_path(skill_name: str) -> Path:
+    """Locate a skill folder across the global store and extra directories.
+
+    Returns the first ``<dir>/<skill_name>`` that contains a ``SKILL.md``. When
+    nothing matches, falls back to ``SKILLS_DIR / skill_name`` so callers raise a
+    ``FileNotFoundError`` that references the canonical global path.
+    """
+    for directory in _skill_search_dirs():
+        candidate = directory / skill_name
+        if (candidate / "SKILL.md").is_file():
+            return candidate
+    return SKILLS_DIR / skill_name
+
+
 def load_skill_metadata(name: str) -> SkillMetadata:
     """Load validated metadata for a single installed skill."""
     skill_name = validate_skill_name(name)
-    skill_path = SKILLS_DIR / skill_name
-    metadata, _ = _load_skill_folder(skill_path)
+    metadata, _ = _load_skill_folder(_resolve_skill_path(skill_name))
     return metadata
 
 
 def load_skill_content(name: str) -> str:
     """Load the Markdown body content for a single installed skill."""
     skill_name = validate_skill_name(name)
-    skill_path = SKILLS_DIR / skill_name
-    _, content = _load_skill_folder(skill_path)
+    _, content = _load_skill_folder(_resolve_skill_path(skill_name))
     return content
 
 
 def list_skills() -> List[SkillMetadata]:
-    """Return all valid skills from the local skill store sorted by name."""
-    if not SKILLS_DIR.exists():
-        return []
+    """Return all valid skills from the global store and extra directories.
 
-    skills: List[SkillMetadata] = []
-    for item in SKILLS_DIR.iterdir():
-        if not item.is_dir():
+    Directories are scanned in resolution order (global store first, then
+    ``extra_skill_dirs``); the first occurrence of a skill name wins, so a skill
+    in the global store is not shadowed by one in a later extra directory.
+    Invalid skill folders are skipped. The result is sorted by name.
+    """
+    skills_by_name: Dict[str, SkillMetadata] = {}
+    for directory in _skill_search_dirs():
+        if not directory.exists():
             continue
+        for item in directory.iterdir():
+            if not item.is_dir() or item.name in skills_by_name:
+                continue
+            try:
+                metadata, _ = _load_skill_folder(item)
+                skills_by_name[item.name] = metadata
+            except Exception as exc:
+                logger.warning("Skipping invalid skill folder '%s': %s", item, exc)
 
-        try:
-            skills.append(load_skill_metadata(item.name))
-        except Exception as exc:
-            logger.warning("Skipping invalid skill folder '%s': %s", item, exc)
-
-    return sorted(skills, key=lambda skill: skill.name)
+    return sorted(skills_by_name.values(), key=lambda skill: skill.name)
 
 
 def build_skill_catalog() -> str:
