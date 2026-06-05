@@ -145,6 +145,17 @@ class BaseProvider(ABC):
         return False
 
     @property
+    def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:
+        """Whether assign/handoff should pause when the provider is waiting on UI input.
+
+        Some CLIs render interactive pickers or approval prompts where pasted
+        task text would be interpreted as the answer to that prompt. Providers
+        with those surfaces can opt in so CAO blocks orchestrated task delivery
+        while still allowing explicit user-prompt answers.
+        """
+        return False
+
+    @property
     def extraction_retries(self) -> int:
         """Number of extraction retries for transient TUI rendering issues.
 

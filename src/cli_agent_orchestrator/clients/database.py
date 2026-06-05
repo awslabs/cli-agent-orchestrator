@@ -3,7 +3,7 @@
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 from sqlalchemy import (
     Boolean,
@@ -487,7 +487,7 @@ def get_project_id_by_alias(alias: str) -> Optional[str]:
     try:
         with SessionLocal() as db:
             row = db.query(ProjectAliasModel).filter(ProjectAliasModel.alias == alias).first()
-            return row.project_id if row else None
+            return cast(Optional[str], row.project_id) if row else None
     except Exception as e:
         logger.debug(f"get_project_id_by_alias failed (non-fatal): {e}")
         return None
@@ -555,6 +555,7 @@ def create_flow(
             last_run=flow.last_run,
             next_run=flow.next_run,
             enabled=flow.enabled,
+            prompt_template=None,
         )
 
 
@@ -574,6 +575,7 @@ def get_flow(name: str) -> Optional[Flow]:
             last_run=flow.last_run,
             next_run=flow.next_run,
             enabled=flow.enabled,
+            prompt_template=None,
         )
 
 
@@ -592,6 +594,7 @@ def list_flows() -> List[Flow]:
                 last_run=f.last_run,
                 next_run=f.next_run,
                 enabled=f.enabled,
+                prompt_template=None,
             )
             for f in flows
         ]
@@ -648,6 +651,7 @@ def get_flows_to_run() -> List[Flow]:
                 last_run=f.last_run,
                 next_run=f.next_run,
                 enabled=f.enabled,
+                prompt_template=None,
             )
             for f in flows
         ]

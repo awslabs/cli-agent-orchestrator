@@ -65,6 +65,10 @@ _memory_injected_terminals: set = set()
 _memory_injected_lock = threading.Lock()
 
 
+class TerminalInputBlockedError(Exception):
+    """Raised when orchestrated input would answer an active interactive prompt."""
+
+
 def inject_memory_context(first_message: str, terminal_id: str) -> str:
     """Prepend <cao-memory> context block to the first user message.
 
@@ -204,17 +208,7 @@ def create_terminal(
                 extra_env=get_session_env(session_name),
             )
 
-        # Step 3: Persist terminal metadata to database
-        db_create_terminal(
-            terminal_id,
-            session_name,
-            window_name,
-            provider,
-            agent_profile,
-            allowed_tools,
-        )
-
-        # Step 3b: Load the profile once for allowed tool resolution before
+        # Step 3: Load the profile once for allowed tool resolution before
         # provider initialization. The skill catalog is computed only for
         # providers that consume it at launch time (see RUNTIME_SKILL_PROMPT_PROVIDERS).
         try:
@@ -223,7 +217,7 @@ def create_terminal(
             profile = None
         skill_prompt = build_skill_catalog() if provider in RUNTIME_SKILL_PROMPT_PROVIDERS else None
 
-        # Step 3c: Resolve allowed_tools from profile if not explicitly provided
+        # Step 3b: Resolve allowed_tools from profile if not explicitly provided
         if allowed_tools is None and profile is not None:
             from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
 
@@ -231,6 +225,17 @@ def create_terminal(
             allowed_tools = resolve_allowed_tools(
                 profile.allowedTools, profile.role, mcp_server_names
             )
+
+        # Step 3c: Persist terminal metadata to database after restrictions
+        # are resolved so API reads and snapshots report the actual launch policy.
+        db_create_terminal(
+            terminal_id,
+            session_name,
+            window_name,
+            provider,
+            agent_profile,
+            allowed_tools,
+        )
 
         # Step 4: Create and initialize the CLI provider
         # This starts the agent (e.g., runs "kiro-cli chat --agent developer").
@@ -270,6 +275,7 @@ def create_terminal(
             provider=ProviderType(provider),
             session_name=session_name,
             agent_profile=agent_profile,
+            allowed_tools=allowed_tools,
             shell_command=shell_command,
             status=TerminalStatus.IDLE,
             last_active=datetime.now(),
@@ -385,6 +391,25 @@ def send_input(
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
+        provider = provider_manager.get_provider(terminal_id)
+        orchestration_value = (
+            orchestration_type.value
+            if isinstance(orchestration_type, OrchestrationType)
+            else str(orchestration_type or "")
+        )
+        if (
+            provider
+            and provider.blocks_orchestrated_input_while_waiting_user_answer is True
+            and orchestration_value
+            in {OrchestrationType.ASSIGN.value, OrchestrationType.HANDOFF.value}
+            and provider.get_status() == TerminalStatus.WAITING_USER_ANSWER
+        ):
+            raise TerminalInputBlockedError(
+                f"Terminal {terminal_id} is waiting for a user answer. "
+                "Use answer_user_prompt to submit a selection or approval before "
+                f"sending {orchestration_value} input."
+            )
+
         # Inject memory context into the very first user message after init.
         # Phase 1 wires injection inline for every provider. The Kiro
         # AgentSpawn hook will replace this path once the plugin
@@ -397,7 +422,6 @@ def send_input(
         message = inject_memory_context(message, terminal_id)
 
         # Check how many Enter keys the provider needs after paste
-        provider = provider_manager.get_provider(terminal_id)
         enter_count = provider.paste_enter_count if provider else 1
 
         tmux_client.send_keys(

@@ -31,6 +31,7 @@ ENABLE_SENDER_ID_INJECTION = os.getenv("CAO_ENABLE_SENDER_ID_INJECTION", "false"
 
 # Terminal count threshold for cleanup nudge
 TERMINAL_CLEANUP_NUDGE_THRESHOLD = 10
+MAX_USER_PROMPT_ANSWER_LENGTH = 4000
 
 
 def _get_cleanup_nudge() -> str:
@@ -247,6 +248,140 @@ def _send_direct_input(
             "message": message,
             "sender_id": os.environ.get("CAO_TERMINAL_ID", "supervisor"),
             "orchestration_type": orchestration_type,
+        },
+        timeout=MCP_REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+
+
+def _send_user_prompt_answer(terminal_id: str, answer: str) -> Dict[str, Any]:
+    """Send an explicit answer to a terminal that is waiting on user input."""
+    if not answer.strip():
+        return {
+            "success": False,
+            "terminal_id": terminal_id,
+            "error": "answer must not be empty",
+        }
+    if len(answer) > MAX_USER_PROMPT_ANSWER_LENGTH:
+        return {
+            "success": False,
+            "terminal_id": terminal_id,
+            "error": f"answer must be {MAX_USER_PROMPT_ANSWER_LENGTH} characters or fewer",
+        }
+
+    try:
+        status_response = requests.get(
+            f"{API_BASE_URL}/terminals/{terminal_id}", timeout=MCP_REQUEST_TIMEOUT
+        )
+        status_response.raise_for_status()
+        terminal = status_response.json()
+        current_status = terminal.get("status")
+        if current_status != TerminalStatus.WAITING_USER_ANSWER.value:
+            return {
+                "success": False,
+                "terminal_id": terminal_id,
+                "status": current_status,
+                "message": (
+                    "Terminal is not waiting for a user answer. "
+                    "Use assign, handoff, or send_message for normal task delivery."
+                ),
+            }
+
+        if terminal.get("provider") == "hermes":
+            hermes_result = _try_send_hermes_prompt_answer(terminal_id, answer)
+            if hermes_result is not None:
+                return hermes_result
+
+        response = requests.post(
+            f"{API_BASE_URL}/terminals/{terminal_id}/input",
+            params={
+                "message": answer,
+                "sender_id": os.environ.get("CAO_TERMINAL_ID", "supervisor"),
+            },
+            timeout=MCP_REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        return {
+            "success": True,
+            "terminal_id": terminal_id,
+            "message": "User prompt answer delivered.",
+        }
+    except requests.HTTPError as exc:
+        detail = str(exc)
+        if exc.response is not None:
+            detail = _extract_error_detail(exc.response, detail)
+        return {"success": False, "terminal_id": terminal_id, "error": detail}
+    except requests.ConnectionError:
+        return {
+            "success": False,
+            "terminal_id": terminal_id,
+            "error": "Failed to connect to cao-server. The server may not be running.",
+        }
+    except Exception as exc:
+        return {"success": False, "terminal_id": terminal_id, "error": str(exc)}
+
+
+def _try_send_hermes_prompt_answer(terminal_id: str, answer: str) -> Optional[Dict[str, Any]]:
+    """Answer Hermes clarify pickers with navigation keys when needed."""
+    output_response = requests.get(
+        f"{API_BASE_URL}/terminals/{terminal_id}/output",
+        params={"mode": "full"},
+        timeout=MCP_REQUEST_TIMEOUT,
+    )
+    output_response.raise_for_status()
+    output = output_response.json().get("output", "")
+    if not any(
+        marker in output
+        for marker in (
+            "Hermes needs your input",
+            "Other (type your answer)",
+            "Other (type below)",
+            "↑/↓ to select",
+        )
+    ):
+        return None
+
+    stripped_answer = answer.strip()
+    if stripped_answer.isdigit() and 1 <= int(stripped_answer) <= 4:
+        selected_index = int(stripped_answer)
+        for _ in range(selected_index - 1):
+            _send_terminal_key(terminal_id, "Down")
+            time.sleep(0.05)
+        _send_terminal_key(terminal_id, "Enter")
+        return {
+            "success": True,
+            "terminal_id": terminal_id,
+            "message": f"Hermes clarify option {selected_index} selected.",
+        }
+
+    for _ in range(3):
+        _send_terminal_key(terminal_id, "Down")
+        time.sleep(0.05)
+    _send_terminal_key(terminal_id, "Enter")
+    time.sleep(0.2)
+    _send_terminal_input(terminal_id, answer)
+    return {
+        "success": True,
+        "terminal_id": terminal_id,
+        "message": "Hermes clarify custom answer delivered.",
+    }
+
+
+def _send_terminal_key(terminal_id: str, key: str) -> None:
+    response = requests.post(
+        f"{API_BASE_URL}/terminals/{terminal_id}/key",
+        params={"key": key},
+        timeout=MCP_REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+
+
+def _send_terminal_input(terminal_id: str, message: str) -> None:
+    response = requests.post(
+        f"{API_BASE_URL}/terminals/{terminal_id}/input",
+        params={
+            "message": message,
+            "sender_id": os.environ.get("CAO_TERMINAL_ID", "supervisor"),
         },
         timeout=MCP_REQUEST_TIMEOUT,
     )
@@ -503,7 +638,7 @@ if ENABLE_WORKING_DIRECTORY:
 else:
 
     @mcp.tool()
-    async def handoff(
+    async def handoff(  # type: ignore[misc]
         agent_profile: str = Field(
             description='The agent profile to hand off to (e.g., "developer", "analyst")'
         ),
@@ -663,7 +798,7 @@ if ENABLE_WORKING_DIRECTORY:
 else:
 
     @mcp.tool(description=_assign_description)
-    async def assign(
+    async def assign(  # type: ignore[misc]
         agent_profile: str = Field(
             description='The agent profile for the worker agent (e.g., "developer", "analyst")'
         ),
@@ -724,6 +859,24 @@ async def send_message(
         Dict with success status and message details
     """
     return _send_message_impl(receiver_id, message)
+
+
+@mcp.tool()
+async def answer_user_prompt(
+    terminal_id: str = Field(description="Target terminal ID waiting for user input"),
+    answer: str = Field(
+        description=(
+            "Answer text to submit to the active prompt, such as '1' for a "
+            "clarify choice, 'o' for approve once, or custom free-form text"
+        )
+    ),
+) -> Dict[str, Any]:
+    """Answer an active approval or clarify prompt in another terminal.
+
+    Use this only when the target terminal status is WAITING_USER_ANSWER. Normal
+    task delivery should use assign, handoff, or send_message instead.
+    """
+    return _send_user_prompt_answer(terminal_id, answer)
 
 
 @mcp.tool(description=LOAD_SKILL_TOOL_DESCRIPTION)

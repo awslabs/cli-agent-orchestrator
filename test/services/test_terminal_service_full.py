@@ -6,9 +6,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
+from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.terminal_service import (
     OutputMode,
+    TerminalInputBlockedError,
     create_terminal,
     delete_terminal,
     get_output,
@@ -56,6 +58,56 @@ class TestCreateTerminal:
         assert result.id == "test1234"
         mock_tmux.create_session.assert_called_once()
         mock_provider.initialize.assert_called_once()
+
+    @patch("cli_agent_orchestrator.utils.tool_mapping.resolve_allowed_tools")
+    @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    def test_create_terminal_persists_resolved_allowed_tools(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_log_dir,
+        mock_resolve_allowed,
+    ):
+        """Profile-derived restrictions should be persisted and used at launch."""
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = False
+        mock_load_profile.return_value = AgentProfile(
+            name="developer",
+            description="Developer",
+            allowedTools=["fs_read"],
+        )
+        mock_resolve_allowed.return_value = ["fs_read"]
+        mock_provider = MagicMock()
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_log_path = MagicMock()
+        mock_log_dir.__truediv__.return_value = mock_log_path
+
+        result = create_terminal("kiro_cli", "developer", new_session=True)
+
+        assert result.allowed_tools == ["fs_read"]
+        mock_db_create.assert_called_once_with(
+            "test1234",
+            "cao-session",
+            "developer-abcd",
+            "kiro_cli",
+            "developer",
+            ["fs_read"],
+        )
+        assert mock_provider_manager.create_provider.call_args.args[5] == ["fs_read"]
 
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
@@ -494,6 +546,81 @@ class TestSendInput:
             "developer-abcd",
             "test message",
             enter_count=2,
+            force_bracketed_paste=True,
+        )
+        mock_update.assert_called_once_with("test1234")
+
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_input_blocks_assign_when_provider_waits_for_user_answer(
+        self, mock_get_metadata, mock_tmux, mock_pm, mock_update
+    ):
+        """Orchestrated task text must not answer an active provider prompt."""
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_provider = mock_pm.get_provider.return_value
+        mock_provider.blocks_orchestrated_input_while_waiting_user_answer = True
+        mock_provider.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
+
+        with pytest.raises(TerminalInputBlockedError, match="waiting for a user answer"):
+            send_input("test1234", "new task", orchestration_type="assign")
+
+        mock_tmux.send_keys.assert_not_called()
+        mock_update.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_input_blocked_message_uses_enum_value(
+        self, mock_get_metadata, mock_tmux, mock_pm, mock_update
+    ):
+        """Conflict text should say 'assign', not 'OrchestrationType.ASSIGN'."""
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_provider = mock_pm.get_provider.return_value
+        mock_provider.blocks_orchestrated_input_while_waiting_user_answer = True
+        mock_provider.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
+
+        with pytest.raises(TerminalInputBlockedError) as exc_info:
+            send_input("test1234", "new task", orchestration_type=OrchestrationType.ASSIGN)
+
+        assert "sending assign input" in str(exc_info.value)
+        assert "OrchestrationType.ASSIGN" not in str(exc_info.value)
+        mock_tmux.send_keys.assert_not_called()
+        mock_update.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_input_allows_manual_answer_when_provider_waits_for_user_answer(
+        self, mock_get_metadata, mock_tmux, mock_pm, mock_update
+    ):
+        """Manual input can still answer clarify/approval prompts."""
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_provider = mock_pm.get_provider.return_value
+        mock_provider.blocks_orchestrated_input_while_waiting_user_answer = True
+        mock_provider.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
+        mock_provider.paste_enter_count = 1
+
+        result = send_input("test1234", "1")
+
+        assert result is True
+        mock_tmux.send_keys.assert_called_once_with(
+            "cao-session",
+            "developer-abcd",
+            "1",
+            enter_count=1,
             force_bracketed_paste=True,
         )
         mock_update.assert_called_once_with("test1234")
