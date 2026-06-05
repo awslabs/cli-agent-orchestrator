@@ -815,6 +815,51 @@ class TestSendTerminalInput:
         assert "Failed to send input" in response.json()["detail"]
 
 
+class TestSendTerminalKey:
+    """Tests for POST /terminals/{terminal_id}/key endpoint."""
+
+    def test_send_key_success(self, client):
+        """POST /terminals/{id}/key sends an allowed tmux key."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.send_special_key.return_value = True
+
+            response = client.post("/terminals/abcd1234/key", params={"key": "Down"})
+
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+        mock_svc.send_special_key.assert_called_once_with("abcd1234", "Down")
+
+    @pytest.mark.parametrize("key", ["", "C-C-C", "send-prefix", "C-;"])
+    def test_send_key_rejects_malformed_key_name(self, client, key):
+        """POST /terminals/{id}/key rejects malformed or unsupported key names."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            response = client.post("/terminals/abcd1234/key", params={"key": key})
+
+        assert response.status_code == 400
+        assert "Invalid tmux key name" in response.json()["detail"]
+        mock_svc.send_special_key.assert_not_called()
+
+    def test_send_key_terminal_not_found(self, client):
+        """POST /terminals/{id}/key returns 404 for nonexistent terminal."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.send_special_key.side_effect = ValueError("Terminal not found")
+
+            response = client.post("/terminals/deadbeef/key", params={"key": "Enter"})
+
+        assert response.status_code == 404
+        assert "Terminal not found" in response.json()["detail"]
+
+    def test_send_key_server_error(self, client):
+        """POST /terminals/{id}/key returns 500 on error."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.send_special_key.side_effect = Exception("TMux send failed")
+
+            response = client.post("/terminals/abcd1234/key", params={"key": "Enter"})
+
+        assert response.status_code == 500
+        assert "Failed to send key" in response.json()["detail"]
+
+
 class TestGetTerminalOutput:
     """Tests for GET /terminals/{terminal_id}/output endpoint."""
 

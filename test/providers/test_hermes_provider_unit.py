@@ -53,6 +53,19 @@ HERMES_WAITING_APPROVAL_OUTPUT = """
       Choice [o/s/a/D]:
 """
 
+HERMES_WAITING_APPROVAL_WITH_INTERRUPT_OUTPUT = """
+● Run a dangerous command
+
+  ⚠️  DANGEROUS COMMAND: overwrite project env/config file
+      cp .env.example .env
+
+      [o]nce  |  [s]ession  |  [a]lways  |  [d]eny
+
+      Choice [o/s/a/D]:
+
+⚕ ❯ msg=interrupt · /queue · /bg · /steer · Ctrl+C cancel
+"""
+
 HERMES_WAITING_APPROVAL_ZH_OUTPUT = """
 ● 运行一个危险命令
 
@@ -229,6 +242,17 @@ class TestHermesBuildCommand:
         assert "--model deepseek-v4-flash-free" in command
 
     @patch("cli_agent_orchestrator.providers.hermes.load_agent_profile")
+    def test_build_command_quotes_profile_with_spaces_or_shell_metacharacters(self, mock_load):
+        mock_load.return_value = self._profile("test worker; rm -rf /")
+
+        provider = HermesProvider("tid", "sess", "win", "developer")
+
+        assert (
+            provider._build_hermes_command()
+            == "'test worker; rm -rf /' chat --yolo --accept-hooks --source cao"
+        )
+
+    @patch("cli_agent_orchestrator.providers.hermes.load_agent_profile")
     def test_build_command_profile_load_failure(self, mock_load):
         mock_load.side_effect = RuntimeError("Profile not found")
         provider = HermesProvider("tid", "sess", "win", "missing")
@@ -312,6 +336,16 @@ class TestHermesStatusDetection:
         assert provider.get_status() == TerminalStatus.IDLE
 
     @patch("cli_agent_orchestrator.providers.hermes.tmux_client")
+    def test_get_status_frozen_idle_timer_does_not_pin_idle_forever(self, mock_tmux):
+        mock_tmux.get_history.return_value = HERMES_IDLE_UNKNOWN_SYMBOL_OUTPUT
+
+        provider = HermesProvider("tid", "sess", "win", None)
+        statuses = [provider.get_status() for _ in range(10)]
+
+        assert TerminalStatus.IDLE in statuses
+        assert statuses[-1] == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.hermes.tmux_client")
     def test_get_status_processing_excludes_interrupt_prompt(self, mock_tmux):
         mock_tmux.get_history.return_value = HERMES_PROCESSING_OUTPUT
 
@@ -329,6 +363,13 @@ class TestHermesStatusDetection:
     @patch("cli_agent_orchestrator.providers.hermes.tmux_client")
     def test_get_status_waiting_user_answer_for_hermes_approval_menu(self, mock_tmux):
         mock_tmux.get_history.return_value = HERMES_WAITING_APPROVAL_OUTPUT
+
+        provider = HermesProvider("tid", "sess", "win", None)
+        assert provider.get_status() == TerminalStatus.WAITING_USER_ANSWER
+
+    @patch("cli_agent_orchestrator.providers.hermes.tmux_client")
+    def test_get_status_waiting_prompt_wins_over_interrupt_marker(self, mock_tmux):
+        mock_tmux.get_history.return_value = HERMES_WAITING_APPROVAL_WITH_INTERRUPT_OUTPUT
 
         provider = HermesProvider("tid", "sess", "win", None)
         assert provider.get_status() == TerminalStatus.WAITING_USER_ANSWER

@@ -8,7 +8,7 @@
 
 ## What is CAO?
 
-CAO (pronounced "kay-oh") is a lightweight local orchestrator that sits between you and the CLI coding agents you already use. Instead of running a single agent at a time, CAO lets a supervisor agent launch, message, and coordinate multiple worker agents — each one a real CLI tool (Claude Code, Kiro, Codex, etc.) running in its own tmux terminal. Agents communicate through MCP-exposed primitives (**handoff**, **assign**, **send_message**, plus **answer_user_prompt** for active interactive prompts) and are managed via a CLI, a bundled Web UI, or an MCP management server. Because every agent is a full CLI process, CAO preserves tool behaviour, auth, and advanced features (Claude Code sub-agents, Q CLI custom agents, etc.) that a raw API wrapper cannot.
+CAO (pronounced "kay-oh") is a lightweight local orchestrator that sits between you and the CLI coding agents you already use. Instead of running a single agent at a time, CAO lets a supervisor agent launch, message, and coordinate multiple worker agents — each one a real CLI tool (Claude Code, Kiro, Codex, etc.) running in its own tmux terminal. Agents communicate through MCP-exposed primitives (**handoff**, **assign**, and **send_message**) and are managed via a CLI, a bundled Web UI, or an MCP management server. Because every agent is a full CLI process, CAO preserves tool behaviour, auth, and advanced features (Claude Code sub-agents, Q CLI custom agents, etc.) that a raw API wrapper cannot.
 
 ## Common use cases
 
@@ -29,7 +29,7 @@ CAO implements a hierarchical multi-agent system — one supervisor agent delega
 
 - **Hierarchical supervisor–worker orchestration** — a supervisor agent coordinates and delegates; workers focus on their domain. Preserves overall context without polluting workers.
 - **Session isolation via tmux** — every agent runs in its own tmux session. Clean context separation, real PTY access, humans can `tmux attach` to steer at any time.
-- **Orchestration primitives over MCP** — `handoff` (sync, wait for completion), `assign` (async, fire-and-forget), `send_message` (inbox delivery between agents), and `answer_user_prompt` (explicitly answer active approval/clarify prompts). See [Multi-Agent Orchestration](#multi-agent-orchestration).
+- **Orchestration primitives over MCP** — `handoff` (sync, wait for completion), `assign` (async, fire-and-forget), and `send_message` (inbox delivery between agents). Hermes workers also use `answer_user_prompt` for structured approval and clarify prompts; other providers may fall back to ordinary text delivery until they implement equivalent prompt states. See [Multi-Agent Orchestration](#multi-agent-orchestration).
 - **Cross-provider mixing** — run workers on different CLIs in the same session. Pin a profile to a provider via agent frontmatter. See [Cross-Provider Orchestration](#cross-provider-orchestration).
 - **Scheduled flows** — cron-like scheduling for unattended agent runs. See [docs/flows.md](docs/flows.md).
 - **Web UI, CLI, and MCP control planes** — manage sessions from the browser, `cao session` commands, or the `cao-ops-mcp` server. See [docs/control-planes.md](docs/control-planes.md).

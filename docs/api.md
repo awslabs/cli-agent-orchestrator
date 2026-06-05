@@ -159,8 +159,14 @@ Send input to a terminal.
 Send a tmux key sequence to a terminal. Use this for interactive prompts that
 require non-text key presses, such as Hermes clarify picker navigation.
 
+The endpoint is generic, but the only in-tree structured consumer today is the
+Hermes path of `answer_user_prompt`. Other providers can use it in the future
+when they expose equivalent prompt states or key-navigation flows.
+
 **Parameters:**
-- `key` (string, required): tmux key name, such as `Up`, `Down`, `Enter`, `C-c`, or `M-x`
+- `key` (string, required): allowed tmux key name: `Up`, `Down`, `Left`,
+  `Right`, `Enter`, `Tab`, `Escape`, `Space`, a single alphanumeric key, or a
+  `C-`, `M-`, or `S-` modifier combo such as `C-c` or `M-x`
 
 **Response:**
 ```json

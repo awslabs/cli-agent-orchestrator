@@ -31,6 +31,7 @@ ENABLE_SENDER_ID_INJECTION = os.getenv("CAO_ENABLE_SENDER_ID_INJECTION", "false"
 
 # Terminal count threshold for cleanup nudge
 TERMINAL_CLEANUP_NUDGE_THRESHOLD = 10
+MAX_USER_PROMPT_ANSWER_LENGTH = 4000
 
 
 def _get_cleanup_nudge() -> str:
@@ -255,6 +256,19 @@ def _send_direct_input(
 
 def _send_user_prompt_answer(terminal_id: str, answer: str) -> Dict[str, Any]:
     """Send an explicit answer to a terminal that is waiting on user input."""
+    if not answer.strip():
+        return {
+            "success": False,
+            "terminal_id": terminal_id,
+            "error": "answer must not be empty",
+        }
+    if len(answer) > MAX_USER_PROMPT_ANSWER_LENGTH:
+        return {
+            "success": False,
+            "terminal_id": terminal_id,
+            "error": f"answer must be {MAX_USER_PROMPT_ANSWER_LENGTH} characters or fewer",
+        }
+
     try:
         status_response = requests.get(
             f"{API_BASE_URL}/terminals/{terminal_id}", timeout=MCP_REQUEST_TIMEOUT
@@ -624,7 +638,7 @@ if ENABLE_WORKING_DIRECTORY:
 else:
 
     @mcp.tool()
-    async def handoff(
+    async def handoff(  # type: ignore[misc]
         agent_profile: str = Field(
             description='The agent profile to hand off to (e.g., "developer", "analyst")'
         ),
@@ -784,7 +798,7 @@ if ENABLE_WORKING_DIRECTORY:
 else:
 
     @mcp.tool(description=_assign_description)
-    async def assign(
+    async def assign(  # type: ignore[misc]
         agent_profile: str = Field(
             description='The agent profile for the worker agent (e.g., "developer", "analyst")'
         ),

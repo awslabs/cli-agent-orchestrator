@@ -44,6 +44,7 @@ ASSISTANT_HEADER_PATTERN = os.environ.get(
 STATUS_IDLE_TIMER_PATTERN = r"⏲\s*([^\s│]+)"
 SEPARATOR_PATTERN = r"^[\s─━═-]{10,}$|^[\s─━═-]+\s+.*\s+[\s─━═-]+$"
 STATUS_LINE_PATTERN = r"^.*(?:YOLO|ctx|⏲|⏱|msg=interrupt|Ctrl\+C cancel).*$"
+MAX_STABLE_IDLE_TIMER_POLLS = int(os.environ.get("CAO_HERMES_MAX_STABLE_IDLE_POLLS", "8"))
 
 
 class ProviderError(Exception):
@@ -247,7 +248,7 @@ class HermesProvider(BaseProvider):
             self._last_idle_timer = current_timer
             self._stable_idle_timer_count = 1
 
-        return self._stable_idle_timer_count >= 2
+        return 2 <= self._stable_idle_timer_count <= MAX_STABLE_IDLE_TIMER_POLLS
 
     def _has_extractable_response(self, clean_output: str) -> bool:
         try:

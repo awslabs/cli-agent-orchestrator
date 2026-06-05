@@ -16,7 +16,7 @@ From `cao-mcp-server`, supervisors orchestrate work with:
 - `assign(agent_profile, message)` for asynchronous work that returns immediately
 - `handoff(agent_profile, message)` for synchronous work that blocks until the worker finishes
 - `send_message(receiver_id, message)` for direct messages to an existing terminal
-- `answer_user_prompt(terminal_id, answer)` for answering an active approval or clarify prompt in an existing terminal
+- `answer_user_prompt(terminal_id, answer)` for answering a Hermes worker that reports `waiting_user_answer`
 
 Your own terminal ID is available in the `CAO_TERMINAL_ID` environment variable. Use it when you need workers to send results back to you.
 
@@ -71,7 +71,9 @@ When sending direct messages, include enough context that the receiver can act w
 
 ## Interactive Worker Prompts
 
-Some providers can stop on approval prompts or clarify pickers. If a worker terminal is waiting for a user answer, do not use `assign`, `handoff`, or `send_message` to answer it. Use `answer_user_prompt(terminal_id, answer)` with the exact selection or text to submit, such as `1`, `o`, or a custom answer.
+Hermes workers can stop on approval prompts or clarify pickers and report `waiting_user_answer`. When a Hermes worker is in that state, do not use `assign`, `handoff`, or `send_message` to answer it. Use `answer_user_prompt(terminal_id, answer)` with the exact selection or text to submit, such as `1`, `o`, or a custom answer.
+
+Other providers may still emit prompts in their terminal output without reporting `waiting_user_answer`. For those providers, treat the prompt as ordinary terminal output and answer it with `send_message` or direct input according to the workflow you are running.
 
 ## Practical Workflow
 

@@ -134,6 +134,25 @@ export CAO_HERMES_ASSISTANT_HEADER_REGEX='^--- assistant ---$'
 export CAO_HERMES_USER_PREFIX_REGEX='^User: '
 ```
 
+## Interactive Prompt Answers
+
+Hermes is currently the only in-tree provider that reports
+`WAITING_USER_ANSWER` and uses key-based navigation for structured approval
+prompts and clarify pickers. Supervisors can answer those prompts with
+`answer_user_prompt(terminal_id, answer)`.
+
+For clarify pickers, numeric answers select the corresponding option with
+`Down`/`Enter` key presses. Free-form answers navigate to the `Other` option
+and then submit text input. Other providers may show prompts in their terminal
+output, but they do not currently expose the same structured
+`WAITING_USER_ANSWER` behavior. When CAO adds that behavior to another
+provider, this document should be updated with that provider's prompt contract.
+
+Any agent with access to `cao-mcp-server` and a target terminal ID can answer a
+waiting Hermes prompt. CAO does not currently enforce a parent/supervisor
+relationship for `answer_user_prompt`, so profile authors should expose the MCP
+server only to agents that are trusted to coordinate the session.
+
 ## Tool Restrictions
 
 Hermes does not currently expose a CAO-native hard-deny flag equivalent to

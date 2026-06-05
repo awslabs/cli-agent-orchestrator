@@ -2,7 +2,10 @@
 
 from unittest.mock import MagicMock, patch
 
+import requests
+
 from cli_agent_orchestrator.constants import API_BASE_URL, MCP_REQUEST_TIMEOUT
+from cli_agent_orchestrator.mcp_server.server import MAX_USER_PROMPT_ANSWER_LENGTH
 
 
 class TestAnswerUserPrompt:
@@ -48,6 +51,45 @@ class TestAnswerUserPrompt:
         assert result["status"] == "idle"
         assert "not waiting for a user answer" in result["message"]
         mock_requests.post.assert_not_called()
+
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_rejects_empty_answer_before_api_call(self, mock_requests):
+        from cli_agent_orchestrator.mcp_server.server import _send_user_prompt_answer
+
+        result = _send_user_prompt_answer("abcd1234", "   ")
+
+        assert result["success"] is False
+        assert result["error"] == "answer must not be empty"
+        mock_requests.get.assert_not_called()
+        mock_requests.post.assert_not_called()
+
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_rejects_overlong_answer_before_api_call(self, mock_requests):
+        from cli_agent_orchestrator.mcp_server.server import _send_user_prompt_answer
+
+        result = _send_user_prompt_answer("abcd1234", "x" * (MAX_USER_PROMPT_ANSWER_LENGTH + 1))
+
+        assert result["success"] is False
+        assert f"{MAX_USER_PROMPT_ANSWER_LENGTH} characters or fewer" in result["error"]
+        mock_requests.get.assert_not_called()
+        mock_requests.post.assert_not_called()
+
+    @patch("cli_agent_orchestrator.mcp_server.server.requests.get")
+    def test_returns_error_when_terminal_lookup_is_404(self, mock_get):
+        from cli_agent_orchestrator.mcp_server.server import _send_user_prompt_answer
+
+        response = MagicMock()
+        response.json.return_value = {"detail": "Terminal not found"}
+        error = requests.HTTPError("404 Client Error")
+        error.response = response
+        status_response = MagicMock()
+        status_response.raise_for_status.side_effect = error
+        mock_get.return_value = status_response
+
+        result = _send_user_prompt_answer("deadbeef", "1")
+
+        assert result["success"] is False
+        assert result["error"] == "Terminal not found"
 
     @patch("cli_agent_orchestrator.mcp_server.server.time.sleep")
     @patch("cli_agent_orchestrator.mcp_server.server.requests")

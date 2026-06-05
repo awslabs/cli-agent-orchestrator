@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import pty
+import re
 import signal
 import struct
 import subprocess
@@ -77,6 +78,10 @@ from cli_agent_orchestrator.utils.skills import (
 from cli_agent_orchestrator.utils.terminal import generate_session_name, validate_tmux_name
 
 logger = logging.getLogger(__name__)
+
+TMUX_KEY_PATTERN = re.compile(
+    r"^(?:Up|Down|Left|Right|Enter|Tab|Escape|Space|[A-Za-z0-9]|[CMS]-[A-Za-z0-9])$"
+)
 
 
 async def flow_daemon():
@@ -692,6 +697,15 @@ async def send_terminal_input(
 @app.post("/terminals/{terminal_id}/key")
 async def send_terminal_key(terminal_id: TerminalId, key: str) -> Dict:
     """Send a tmux special key to a terminal."""
+    if not TMUX_KEY_PATTERN.fullmatch(key):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Invalid tmux key name. Allowed keys are arrow keys, Enter, Tab, "
+                "Escape, Space, single alphanumeric keys, and C-/M-/S- modifier combos."
+            ),
+        )
+
     try:
         success = terminal_service.send_special_key(terminal_id, key)
         return {"success": success}
