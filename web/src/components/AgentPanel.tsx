@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { useStore } from '../store'
 import { api, AgentProfileInfo, ProviderInfo } from '../api'
-import { Bot, Play, Trash2, ChevronRight, Terminal as TermIcon, Monitor, Package, FolderOpen, Search, Mail, Plus, LogOut, Send, FileText, X } from 'lucide-react'
+import { Bot, Play, Trash2, ChevronRight, Terminal as TermIcon, Monitor, Package, FolderOpen, Tag, Search, Mail, Plus, LogOut, Send, FileText, X } from 'lucide-react'
 import { TerminalView } from './TerminalView'
 import { ConfirmModal } from './ConfirmModal'
 import { InboxPanel } from './InboxPanel'
@@ -45,6 +45,7 @@ export function AgentPanel() {
   const [sessionSearch, setSessionSearch] = useState('')
   const [inboxTerminalId, setInboxTerminalId] = useState<string | null>(null)
   const [workingDirectory, setWorkingDirectory] = useState('')
+  const [sessionName, setSessionName] = useState('')
   const [terminalWorkDirs, setTerminalWorkDirs] = useState<Record<string, string | null>>({})
   const [showAddAgent, setShowAddAgent] = useState(false)
   const [addProvider, setAddProvider] = useState('kiro_cli')
@@ -138,11 +139,12 @@ export function AgentPanel() {
   const handleCreate = async () => {
     if (!profile.trim()) return
     setCreating(true)
-    await createSession(provider, profile.trim(), workingDirectory.trim() || undefined)
+    await createSession(provider, profile.trim(), workingDirectory.trim() || undefined, sessionName.trim() || undefined)
     setCreating(false)
     setShowSpawnModal(false)
     setProfile('')
     setWorkingDirectory('')
+    setSessionName('')
   }
 
   const openTerminal = (terminalId: string, provider?: string, agentProfile?: string | null) => {
@@ -561,6 +563,21 @@ export function AgentPanel() {
                     className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-sm rounded-lg px-3 py-2.5 focus:border-emerald-500 focus:outline-none"
                   />
                 )}
+              </div>
+
+              <div>
+                <label className="block text-xs text-gray-500 mb-1">Session Name <span className="text-gray-600">(optional)</span></label>
+                <div className="relative">
+                  <Tag size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" />
+                  <input
+                    type="text"
+                    value={sessionName}
+                    onChange={e => setSessionName(e.target.value)}
+                    onKeyDown={e => e.key === 'Enter' && handleCreate()}
+                    placeholder="my-session (or a random id like cao-a1b2c3d4)"
+                    className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-sm rounded-lg pl-9 pr-3 py-2.5 focus:border-emerald-500 focus:outline-none"
+                  />
+                </div>
               </div>
 
               <div>
