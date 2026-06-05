@@ -1,7 +1,7 @@
 """Tests for the database client."""
 
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -27,6 +27,7 @@ from cli_agent_orchestrator.clients.database import (
     init_db,
     list_flows,
     list_pending_receiver_ids_by_provider,
+    list_pending_receiver_ids_older_than,
     list_terminals_by_session,
     update_flow_enabled,
     update_flow_run_times,
@@ -233,6 +234,72 @@ class TestTerminalOperations:
         result = list_pending_receiver_ids_by_provider("opencode_cli")
 
         assert result == ["receiver-1", "receiver-2"]
+
+    def test_list_pending_receiver_ids_older_than(self, test_db):
+        """Only messages pending past the grace window — whose receiver
+        terminal still exists — are returned for reconciliation (issue #131).
+
+        Uses the real in-memory DB (not a mocked session) so the age cutoff,
+        status filter, and terminal join are actually exercised.
+        """
+        old = datetime.now() - timedelta(seconds=120)
+        fresh = datetime.now()
+
+        with test_db() as seed:
+            seed.add_all(
+                [
+                    TerminalModel(
+                        id="term-old",
+                        tmux_session="cao-s",
+                        tmux_window="w",
+                        provider="kiro_cli",
+                    ),
+                    TerminalModel(
+                        id="term-fresh",
+                        tmux_session="cao-s",
+                        tmux_window="w",
+                        provider="kiro_cli",
+                    ),
+                    # Stuck long enough to reconcile, receiver still alive — kept.
+                    InboxModel(
+                        sender_id="a",
+                        receiver_id="term-old",
+                        message="m",
+                        status=MessageStatus.PENDING.value,
+                        created_at=old,
+                    ),
+                    # Too recent — left to the immediate/watchdog paths.
+                    InboxModel(
+                        sender_id="a",
+                        receiver_id="term-fresh",
+                        message="m",
+                        status=MessageStatus.PENDING.value,
+                        created_at=fresh,
+                    ),
+                    # Already delivered — not pending.
+                    InboxModel(
+                        sender_id="a",
+                        receiver_id="term-old",
+                        message="m",
+                        status=MessageStatus.DELIVERED.value,
+                        created_at=old,
+                    ),
+                    # Receiver terminal is gone — dropped by the join.
+                    InboxModel(
+                        sender_id="a",
+                        receiver_id="term-ghost",
+                        message="m",
+                        status=MessageStatus.PENDING.value,
+                        created_at=old,
+                    ),
+                ]
+            )
+            seed.commit()
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            result = list_pending_receiver_ids_older_than(30)
+
+        assert result == ["term-old"]
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_delete_terminals_by_session(self, mock_session_class):

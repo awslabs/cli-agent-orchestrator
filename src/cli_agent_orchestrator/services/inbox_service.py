@@ -31,9 +31,14 @@ from watchdog.events import FileModifiedEvent, FileSystemEventHandler
 from cli_agent_orchestrator.clients.database import (
     get_pending_messages,
     list_pending_receiver_ids_by_provider,
+    list_pending_receiver_ids_older_than,
     update_message_status,
 )
-from cli_agent_orchestrator.constants import EAGER_INBOX_DELIVERY, TERMINAL_LOG_DIR
+from cli_agent_orchestrator.constants import (
+    EAGER_INBOX_DELIVERY,
+    INBOX_RECONCILE_GRACE_SECONDS,
+    TERMINAL_LOG_DIR,
+)
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -124,6 +129,13 @@ def check_and_send_pending_messages(
     # synchronous handoff/assign paths bypass the inbox and pass their own
     # orchestration_type directly to send_input().
     try:
+        # Mark DELIVERED before sending. send_input() types into the tmux pane,
+        # which writes to the terminal log file and re-triggers the watchdog's
+        # on_modified handler. If the status were still PENDING at that point,
+        # the re-entrant check would find the message and deliver it a second
+        # time. Updating the status first closes that race window. On failure
+        # the except block resets the status to FAILED.
+        update_message_status(message.id, MessageStatus.DELIVERED)
         if registry is None:
             terminal_service.send_input(terminal_id, message.message)
         else:
@@ -134,7 +146,6 @@ def check_and_send_pending_messages(
                 sender_id=message.sender_id,
                 orchestration_type=OrchestrationType.SEND_MESSAGE,
             )
-        update_message_status(message.id, MessageStatus.DELIVERED)
         logger.info(f"Delivered message {message.id} to terminal {terminal_id}")
         return True
     except Exception as e:
@@ -159,6 +170,34 @@ def poll_opencode_pending_messages(registry: PluginRegistry | None = None) -> No
             check_and_send_pending_messages(terminal_id, registry=registry)
         except Exception as e:
             logger.debug(f"OpenCode inbox poll failed for {terminal_id}: {e}")
+
+
+def reconcile_orphaned_messages(registry: PluginRegistry | None = None) -> None:
+    """Re-attempt delivery for messages stuck in PENDING past the grace window.
+
+    Provider-agnostic safety net for the gap described in issue #131: when a
+    receiving terminal is already idle, the immediate (on POST) delivery path
+    may miss on a stale status and the log-watching observer never fires again
+    (an idle agent produces no new log output), leaving the message orphaned.
+    This sweep finds any such message and routes it back through the normal
+    delivery gate.
+
+    Only messages older than ``INBOX_RECONCILE_GRACE_SECONDS`` are considered,
+    so the sweep never competes with the immediate and watchdog paths for
+    freshly queued messages — it only adopts ones they have already missed.
+
+    Like ``poll_opencode_pending_messages``, this reuses ``check_and_send_pending_messages``
+    and so inherits its known duplicate-wakeup race; the grace window keeps the
+    sweep from overlapping the fast paths in practice, and GH #115 tracks the
+    single coordinated delivery engine that would make delivery atomic.
+    """
+    receiver_ids = list_pending_receiver_ids_older_than(INBOX_RECONCILE_GRACE_SECONDS)
+
+    for terminal_id in receiver_ids:
+        try:
+            check_and_send_pending_messages(terminal_id, registry=registry)
+        except Exception as e:
+            logger.debug(f"Inbox reconciliation failed for {terminal_id}: {e}")
 
 
 class LogFileHandler(FileSystemEventHandler):
