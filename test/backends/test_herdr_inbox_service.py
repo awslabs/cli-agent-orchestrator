@@ -778,15 +778,27 @@ class TestHerdrInboxServiceLifecycleEvents:
         mock_delete.assert_not_called()
 
     def test_event_loop_routes_lifecycle_events(self):
-        """_event_loop should call _handle_lifecycle_event for pane.closed/workspace.closed."""
+        """_event_loop must route herdr's real lifecycle event wire format.
+
+        Captured live from herdr 0.6.8: lifecycle events carry the name in the
+        "event" key (NOT "type") using UNDERSCORE names:
+            {"event":"pane_closed","data":{"pane_id":...,"workspace_id":...}}
+            {"event":"workspace_closed","data":{"workspace_id":...}}
+        The agent-status event uses the DOTTED name in the same "event" key:
+            {"event":"pane.agent_status_changed","data":{...}}
+        """
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service._workspace_to_session["ws-x"] = "sess-x"
 
         pane_closed = (
             json.dumps(
                 {
-                    "type": "pane.closed",
-                    "data": {"pane_id": "pane-gone"},
+                    "event": "pane_closed",
+                    "data": {
+                        "pane_id": "pane-gone",
+                        "type": "pane_closed",
+                        "workspace_id": "ws-x",
+                    },
                 }
             ).encode()
             + b"\n"
@@ -794,8 +806,8 @@ class TestHerdrInboxServiceLifecycleEvents:
         ws_closed = (
             json.dumps(
                 {
-                    "type": "workspace.closed",
-                    "data": {"workspace_id": "ws-unknown"},
+                    "event": "workspace_closed",
+                    "data": {"type": "workspace_closed", "workspace_id": "ws-unknown"},
                 }
             ).encode()
             + b"\n"
@@ -823,8 +835,82 @@ class TestHerdrInboxServiceLifecycleEvents:
 
         _run_async(run())
 
+        # Both lifecycle events must be routed (normalized to dotted names).
         assert "pane.closed" in handled
         assert "workspace.closed" in handled
+
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    def test_event_loop_pane_closed_real_shape_cleans_up(self, mock_meta, mock_delete):
+        """End-to-end: a real-shape pane_closed event removes the managed terminal."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal("tid-x", "pane-x", is_kiro=False)
+        mock_meta.return_value = None  # no session → no kill_session
+
+        event = (
+            json.dumps(
+                {
+                    "event": "pane_closed",
+                    "data": {
+                        "pane_id": "pane-x",
+                        "type": "pane_closed",
+                        "workspace_id": "ws-x",
+                    },
+                }
+            ).encode()
+            + b"\n"
+        )
+
+        async def run():
+            reader = asyncio.StreamReader()
+            service._reader = reader
+            reader.feed_data(event)
+            reader.feed_eof()
+            try:
+                await service._event_loop()
+            except ConnectionError:
+                pass
+
+        _run_async(run())
+
+        assert "pane-x" not in service._pane_to_terminal
+        assert "tid-x" not in service._terminal_to_pane
+        mock_delete.assert_called_once_with("tid-x")
+
+    def test_event_loop_agent_status_real_shape_delivers(self):
+        """A real-shape agent_status_changed (event key, dotted name) triggers delivery."""
+        callback = MagicMock()
+        service = HerdrInboxService(socket_path="/tmp/test.sock", delivery_callback=callback)
+        service.register_terminal("tid-a", "pane-a", is_kiro=False)
+
+        idle_event = (
+            json.dumps(
+                {
+                    "event": "pane.agent_status_changed",
+                    "data": {
+                        "agent": "claude",
+                        "agent_status": "idle",
+                        "pane_id": "pane-a",
+                        "workspace_id": "ws-a",
+                    },
+                }
+            ).encode()
+            + b"\n"
+        )
+
+        async def run():
+            reader = asyncio.StreamReader()
+            service._reader = reader
+            reader.feed_data(idle_event)
+            reader.feed_eof()
+            try:
+                await service._event_loop()
+            except ConnectionError:
+                pass
+
+        _run_async(run())
+
+        callback.assert_called_once_with("tid-a")
 
 
 class TestHerdrInboxServiceSocketPath:

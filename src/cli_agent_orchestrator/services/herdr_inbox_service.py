@@ -487,10 +487,18 @@ class HerdrInboxService:
             except json.JSONDecodeError:
                 continue
 
+            # herdr identifies the event in the "event" key. Lifecycle events use
+            # underscore names (pane_closed / workspace_closed); the agent-status
+            # event uses the dotted name (pane.agent_status_changed). Normalize the
+            # name so routing does not depend on the separator herdr happens to use.
+            # (Older code read "type" and matched dotted lifecycle names, which never
+            # matched herdr's real wire format — lifecycle cleanup silently never ran.)
+            raw_event = event.get("event", "") or event.get("type", "")
+            event_name = raw_event.replace("_", ".")
+
             # Handle lifecycle events
-            event_type = event.get("type", "")
-            if event_type in ("pane.closed", "workspace.closed"):
-                self._handle_lifecycle_event(event_type, event.get("data", {}))
+            if event_name in ("pane.closed", "workspace.closed"):
+                self._handle_lifecycle_event(event_name, event.get("data", {}))
                 continue
 
             data = event.get("data", {})
