@@ -4,7 +4,7 @@ import logging
 import re
 import shlex
 import time
-from typing import Optional
+from typing import Any, Optional
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -116,6 +116,23 @@ def _compute_tui_footer_cutoff(all_lines: list) -> int:
             break
 
     return len("\n".join(all_lines[:footer_start_idx]))
+
+
+def _toml_scalar(value: Any) -> str:
+    """Serialize a Python scalar to a TOML literal for a ``-c key=<value>`` override.
+
+    Strings become quoted TOML basic strings (backslash/quote/newline escaped so
+    tmux ``send_keys`` keeps the launch command on one line); bools become
+    ``true``/``false``; ints and floats are emitted bare. ``bool`` is checked
+    before ``int`` because ``bool`` is a subclass of ``int`` in Python, so the
+    order here is load-bearing — a flipped order would render ``True`` as ``1``.
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    return f'"{escaped}"'
 
 
 def _find_assistant_marker(text: str) -> Optional[re.Match[str]]:
@@ -253,6 +270,17 @@ class CodexProvider(BaseProvider):
                     # is silently rejected and falls back to the 60s default.
                     if "tool_timeout_sec" not in cfg:
                         command_parts.extend(["-c", f"{prefix}.tool_timeout_sec=600.0"])
+
+            # Inline Codex config overrides (-c key=value). Lets a profile set
+            # per-agent Codex knobs — reasoning effort, service tier, fast mode,
+            # etc. — without editing the global ~/.codex/config.toml or
+            # maintaining named profile files. Keys may be dotted config paths
+            # (e.g. "features.fast_mode"); values are serialized to TOML
+            # scalars. Emitted last so they take precedence over CAO's own
+            # overrides and the profile/config defaults on key conflicts.
+            if profile.codexConfig:
+                for key, value in profile.codexConfig.items():
+                    command_parts.extend(["-c", f"{key}={_toml_scalar(value)}"])
 
         return shlex.join(command_parts)
 
