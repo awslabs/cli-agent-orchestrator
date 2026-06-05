@@ -53,23 +53,33 @@ class TestHerdrInboxServiceRegistration:
         service.unregister_terminal("nonexistent")  # Should not raise
 
 
-class TestHerdrInboxServiceCrossThreadRegistration:
-    """Test that register_terminal works from threads without an event loop.
+class TestHerdrInboxServiceRegisterReconnect:
+    """Registering a terminal on a live connection must force a reconnect, never
+    a second events.subscribe.
 
-    register_terminal may be called from a synchronous, non-event-loop thread.
-    When connected, it must schedule the subscribe coroutine onto the captured
-    loop via run_coroutine_threadsafe rather than asyncio.create_task (which
-    requires a running loop in the calling thread and would raise RuntimeError).
+    herdr 0.6.8 resets the entire connection when it receives a second
+    events.subscribe on a connection that already has an active subscription.
+    Because herdr exposes no incremental "add subscription" API, the only safe
+    way to start streaming events for a newly registered pane is to drop the
+    socket and rebuild the single combined subscription on a fresh connection.
+
+    register_terminal may be called from a synchronous, non-event-loop thread,
+    so it must schedule the reconnect onto the captured loop via
+    run_coroutine_threadsafe rather than asyncio.create_task (which requires a
+    running loop in the calling thread and would raise RuntimeError).
     """
 
-    def test_register_from_non_event_loop_thread_subscribes(self):
-        """register_terminal from a non-loop thread should schedule subscribe via run_coroutine_threadsafe."""
+    def test_register_while_connected_triggers_reconnect_not_second_subscribe(self):
+        """register from a non-loop thread, while connected, closes the socket to
+        force a reconnect and must NOT write a second events.subscribe."""
 
         async def run():
             service = HerdrInboxService(socket_path="/tmp/test.sock")
             service._connected = True
             service._loop = asyncio.get_running_loop()
-            service._writer = AsyncMock()
+            # close() is synchronous; use a plain MagicMock so write/close are tracked.
+            writer = MagicMock()
+            service._writer = writer
 
             # Call register from a separate thread that has no event loop of its own.
             t = threading.Thread(target=service.register_terminal, args=("tid_cross", "pane-cross"))
@@ -79,20 +89,20 @@ class TestHerdrInboxServiceCrossThreadRegistration:
             # Give the cross-thread-scheduled coroutine time to run on this loop.
             await asyncio.sleep(0.05)
 
-            # Subscribe message must have been written to the socket.
-            service._writer.write.assert_called_once()
-            written = service._writer.write.call_args[0][0]
-            msg = json.loads(written.decode().strip())
-            assert msg["method"] == "events.subscribe"
-            assert msg["params"]["subscriptions"][0]["type"] == "pane.agent_status_changed"
-            assert msg["params"]["subscriptions"][0]["pane_id"] == "pane-cross"
+            # Mapping recorded.
+            assert service._pane_to_terminal["pane-cross"] == "tid_cross"
+            # Reconnect forced by closing the writer...
+            writer.close.assert_called_once()
+            # ...and NO second events.subscribe was written on the live connection.
+            writer.write.assert_not_called()
 
         _run_async(run())
 
-    def test_register_before_start_does_not_subscribe(self):
-        """register_terminal before start (no loop, not connected) must not attempt subscribe."""
+    def test_register_before_start_does_not_reconnect(self):
+        """register_terminal before start (no loop, not connected) must not touch the socket."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        service._writer = AsyncMock()
+        writer = MagicMock()
+        service._writer = writer
 
         # Pre-start state: start() has not run, so no loop captured and not connected.
         assert service._connected is False
@@ -103,8 +113,9 @@ class TestHerdrInboxServiceCrossThreadRegistration:
         # Mapping is still recorded...
         assert service._pane_to_terminal["pane-early"] == "tid_early"
         assert service._terminal_to_pane["tid_early"] == "pane-early"
-        # ...but no subscribe was sent (guarded by _connected and _loop).
-        service._writer.write.assert_not_called()
+        # ...but the socket was left untouched (guarded by _connected and _loop).
+        writer.close.assert_not_called()
+        writer.write.assert_not_called()
 
 
 class TestHerdrInboxServiceDelivery:
@@ -134,22 +145,57 @@ class TestHerdrInboxServiceDelivery:
 
 
 class TestHerdrInboxServiceSubscription:
-    """Test event subscription message format."""
+    """Test combined event subscription message format.
 
-    def test_subscribe_pane_sends_correct_message(self):
-        """_subscribe_pane should send correct JSON to socket."""
+    herdr 0.6.8 resets the connection on a second events.subscribe, so all
+    subscriptions (every managed pane's agent-status plus the two lifecycle
+    events) must be sent in a SINGLE events.subscribe call.
+    """
+
+    def test_subscribe_all_events_sends_single_combined_message(self):
+        """_subscribe_all_events should send exactly one events.subscribe containing
+        every managed pane's agent-status subscription plus the lifecycle events."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service._writer = AsyncMock()
+        service._pane_to_terminal = {"pane-1": "tid1", "pane-2": "tid2"}
+        service._terminal_to_pane = {"tid1": "pane-1", "tid2": "pane-2"}
 
-        _run_async(service._subscribe_pane("w1-1"))
+        _run_async(service._subscribe_all_events())
 
+        # Exactly ONE write — never a second subscribe call.
         service._writer.write.assert_called_once()
         written = service._writer.write.call_args[0][0]
         msg = json.loads(written.decode().strip())
 
         assert msg["method"] == "events.subscribe"
-        assert msg["params"]["subscriptions"][0]["type"] == "pane.agent_status_changed"
-        assert msg["params"]["subscriptions"][0]["pane_id"] == "w1-1"
+        subs = msg["params"]["subscriptions"]
+
+        # Every managed pane has an agent-status subscription with its pane_id.
+        agent_subs = [s for s in subs if s["type"] == "pane.agent_status_changed"]
+        assert {s["pane_id"] for s in agent_subs} == {"pane-1", "pane-2"}
+
+        # Lifecycle events are included in the same single call.
+        types = {s["type"] for s in subs}
+        assert "pane.closed" in types
+        assert "workspace.closed" in types
+
+    def test_subscribe_all_events_with_no_panes_still_includes_lifecycle(self):
+        """With no managed panes, the single subscribe still covers lifecycle events."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service._writer = AsyncMock()
+
+        _run_async(service._subscribe_all_events())
+
+        service._writer.write.assert_called_once()
+        msg = json.loads(service._writer.write.call_args[0][0].decode().strip())
+        types = {s["type"] for s in msg["params"]["subscriptions"]}
+        assert types == {"pane.closed", "workspace.closed"}
+        # No agent-status entry without a pane_id (herdr rejects that as invalid_request).
+        assert all(
+            "pane_id" in s
+            for s in msg["params"]["subscriptions"]
+            if s["type"] == "pane.agent_status_changed"
+        )
 
 
 class TestHerdrInboxServiceEventParsing:
@@ -254,14 +300,13 @@ class TestHerdrInboxServiceEventParsing:
 
 
 class TestHerdrInboxServiceReconnect:
-    """Test reconnection re-subscribe behavior."""
+    """Test reconnect re-subscribe behavior: a single combined subscribe per connection."""
 
-    def test_resubscribe_sends_subscribe_for_all_managed_panes(self):
-        """_resubscribe_all should re-subscribe existing pane_ids without scanning pane list.
+    def test_reconnect_resubscribe_sends_single_call_for_all_panes(self):
+        """On reconnect, all managed panes are re-subscribed in ONE events.subscribe call.
 
-        CAO UUIDs in _terminal_to_pane do not match herdr's internal terminal_ids,
-        so re-resolution via pane list scan is incorrect. Re-subscribe with the
-        existing _pane_to_terminal mapping directly.
+        herdr resets the connection on a second events.subscribe, so re-subscribing
+        N panes must be one combined call, not N separate calls.
         """
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service._writer = AsyncMock()
@@ -271,10 +316,17 @@ class TestHerdrInboxServiceReconnect:
         service._terminal_to_pane["tid2"] = "pane-2"
         service._pane_to_terminal["pane-2"] = "tid2"
 
-        _run_async(service._resubscribe_all())
+        _run_async(service._subscribe_all_events())
 
-        # Should have sent 2 subscribe messages, one per pane
-        assert service._writer.write.call_count == 2
+        # Exactly ONE subscribe message for all panes (not one per pane).
+        service._writer.write.assert_called_once()
+        msg = json.loads(service._writer.write.call_args[0][0].decode().strip())
+        agent_panes = {
+            s["pane_id"]
+            for s in msg["params"]["subscriptions"]
+            if s["type"] == "pane.agent_status_changed"
+        }
+        assert agent_panes == {"pane-1", "pane-2"}
         # Mapping should be unchanged
         assert service._terminal_to_pane["tid1"] == "pane-1"
         assert service._terminal_to_pane["tid2"] == "pane-2"
@@ -337,11 +389,13 @@ class TestHerdrInboxServiceKiroSupplement:
 class TestHerdrInboxServiceReconcile:
     """Test _reconcile() prunes stale panes and cleans up DB/workspace."""
 
-    def test_reconcile_is_called_before_resubscribe(self):
-        """_reconcile must be awaited before _resubscribe_all in _socket_loop."""
-        # Structural test: confirms _reconcile is an async coroutine.
+    def test_reconcile_is_called_before_subscribe(self):
+        """_reconcile must be awaited before _subscribe_all_events in _socket_loop
+        so the combined subscription only covers live panes."""
+        # Structural test: confirms both are async coroutines.
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         assert inspect.iscoroutinefunction(service._reconcile)
+        assert inspect.iscoroutinefunction(service._subscribe_all_events)
 
     @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
@@ -628,25 +682,35 @@ class TestHerdrInboxServiceStartupDbCleanup:
         mock_delete.assert_not_called()
 
 
-class TestHerdrInboxServiceLifecycleSubscription:
-    """Test _subscribe_lifecycle_events sends correct message."""
+class TestHerdrInboxServiceSingleSubscribePerConnection:
+    """Guard against regressing to multiple events.subscribe calls per connection.
 
-    def test_subscribe_lifecycle_events_sends_correct_message(self):
-        """Should subscribe to pane.closed and workspace.closed."""
+    The reconnect storm (herdr 0.6.8 resets on a 2nd events.subscribe) is fixed
+    by sending exactly one combined subscribe. These tests pin that contract.
+    """
+
+    def test_no_separate_subscribe_pane_method(self):
+        """The per-pane _subscribe_pane helper is removed — its existence reintroduces
+        a second subscribe call when a terminal registers on a live connection."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        assert not hasattr(service, "_subscribe_pane")
+
+    def test_no_separate_lifecycle_subscribe_method(self):
+        """_subscribe_lifecycle_events is merged into _subscribe_all_events; a separate
+        method means a second subscribe call on the same connection."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        assert not hasattr(service, "_subscribe_lifecycle_events")
+
+    def test_socket_setup_issues_exactly_one_subscribe(self):
+        """A full connect cycle (reconcile already done) writes exactly one subscribe."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
         service._writer = AsyncMock()
+        service._pane_to_terminal = {"pane-1": "tid1"}
+        service._terminal_to_pane = {"tid1": "pane-1"}
 
-        _run_async(service._subscribe_lifecycle_events())
+        _run_async(service._subscribe_all_events())
 
         service._writer.write.assert_called_once()
-        written = service._writer.write.call_args[0][0]
-        msg = json.loads(written.decode().strip())
-
-        assert msg["method"] == "events.subscribe"
-        subs = msg["params"]["subscriptions"]
-        types = {s["type"] for s in subs}
-        assert "pane.closed" in types
-        assert "workspace.closed" in types
 
 
 class TestHerdrInboxServiceLifecycleEvents:

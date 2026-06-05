@@ -111,11 +111,20 @@ class HerdrInboxService:
 
         logger.info(f"Registered terminal {terminal_id} (pane={pane_id}, kiro={is_kiro})")
 
-        # Subscribe to events if connected and event loop is captured.
-        # register_terminal() may be called from a synchronous/non-event-loop thread,
-        # so we use run_coroutine_threadsafe instead of create_task.
+        # Start streaming events for the new pane by forcing a reconnect.
+        #
+        # herdr (0.6.8) resets the entire connection when it receives a SECOND
+        # events.subscribe on a connection that already has an active
+        # subscription, and it exposes no incremental "add subscription" API.
+        # So we cannot subscribe the new pane on the live connection — instead we
+        # close the socket, and _socket_loop reconnects and rebuilds the single
+        # combined subscription (all panes + lifecycle) in one call.
+        #
+        # register_terminal() may be called from a synchronous/non-event-loop
+        # thread, so we schedule the reconnect onto the captured loop via
+        # run_coroutine_threadsafe instead of create_task.
         if self._connected and self._loop is not None:
-            asyncio.run_coroutine_threadsafe(self._subscribe_pane(pane_id), self._loop)
+            asyncio.run_coroutine_threadsafe(self._force_reconnect(), self._loop)
 
     def unregister_terminal(self, terminal_id: str) -> None:
         """Remove a terminal from managed set.
@@ -249,11 +258,11 @@ class HerdrInboxService:
                 # Reconcile map against live herdr state before subscribing
                 await self._reconcile()
 
-                # Re-subscribe all managed panes (now only valid ones)
-                await self._resubscribe_all()
-
-                # Subscribe to lifecycle events for real-time cleanup
-                await self._subscribe_lifecycle_events()
+                # Subscribe to everything in ONE events.subscribe call: every
+                # managed pane's agent-status plus the lifecycle events. herdr
+                # resets the connection on a second events.subscribe, so this
+                # must be a single combined call.
+                await self._subscribe_all_events()
 
                 self._backoff = _BACKOFF_BASE  # Reset backoff after successful setup
 
@@ -410,61 +419,60 @@ class HerdrInboxService:
 
         logger.info(f"Reconcile: pruned {len(stale_pane_ids)} stale panes")
 
-    async def _subscribe_lifecycle_events(self) -> None:
-        """Subscribe to pane.closed and workspace.closed for real-time cleanup."""
-        message = {
-            "id": "sub_lifecycle",
-            "method": "events.subscribe",
-            "params": {
-                "subscriptions": [
-                    {"type": "pane.closed"},
-                    {"type": "workspace.closed"},
-                ]
-            },
-        }
-        await self._send(message)
-        logger.info("Subscribed to pane.closed and workspace.closed events")
-
     async def _connect(self) -> None:
         """Connect to the herdr socket."""
         self._reader, self._writer = await asyncio.open_unix_connection(self._socket_path)
         logger.info(f"Connected to herdr socket: {self._socket_path}")
 
-    async def _subscribe_pane(self, pane_id: str) -> None:
-        """Subscribe to agent_status_changed events for a pane.
+    async def _subscribe_all_events(self) -> None:
+        """Subscribe to all events in a SINGLE events.subscribe call.
 
-        Herdr requires per-pane subscription (wildcard not supported).
-        The correct format uses 'subscriptions' array with 'type' + 'pane_id'.
+        herdr (0.6.8) resets the entire connection when it receives a second
+        events.subscribe on a connection that already has an active
+        subscription. So every subscription this service needs — one
+        pane.agent_status_changed per managed pane (pane_id is required; herdr
+        rejects the wildcard form with invalid_request) plus the pane.closed and
+        workspace.closed lifecycle events — must be sent together in one call.
+
+        The pane_id → terminal_id mapping in _pane_to_terminal is already current:
+        a socket disconnect does not change pane_ids (only a herdr server restart
+        compacts them), and _reconcile() has already pruned stale panes before
+        this runs.
         """
+        subscriptions: list = [
+            {"type": "pane.agent_status_changed", "pane_id": pane_id}
+            for pane_id in self._pane_to_terminal
+        ]
+        subscriptions.append({"type": "pane.closed"})
+        subscriptions.append({"type": "workspace.closed"})
+
         message = {
-            "id": f"sub_{pane_id}",
+            "id": "sub_all",
             "method": "events.subscribe",
-            "params": {
-                "subscriptions": [
-                    {
-                        "type": "pane.agent_status_changed",
-                        "pane_id": pane_id,
-                    }
-                ]
-            },
+            "params": {"subscriptions": subscriptions},
         }
         await self._send(message)
+        logger.info(
+            f"Subscribed to {len(self._pane_to_terminal)} pane(s) + lifecycle events "
+            f"in one events.subscribe call"
+        )
 
-    async def _resubscribe_all(self) -> None:
-        """Re-subscribe all managed panes after socket reconnect.
+    async def _force_reconnect(self) -> None:
+        """Close the socket so _socket_loop reconnects and rebuilds the subscription.
 
-        The pane_id → terminal_id mapping in _pane_to_terminal is already current —
-        a socket disconnect does not change pane_ids (only a herdr server restart
-        compacts them). Re-subscribing with existing pane_ids is safe and correct.
-
-        Note: _terminal_to_pane keys are CAO UUIDs, not herdr-internal terminal_ids,
-        so we cannot match them against herdr pane list output. Use the existing
-        _pane_to_terminal mapping directly.
+        This is how a newly registered pane starts streaming events: herdr has no
+        incremental subscribe, and a second events.subscribe on the live
+        connection would reset it. Closing the writer makes the blocked
+        readline() in _event_loop return EOF, which raises ConnectionError and
+        drives _socket_loop through a fresh connect + combined re-subscribe.
         """
-        for pane_id in list(self._pane_to_terminal.keys()):
-            await self._subscribe_pane(pane_id)
-
-        logger.info(f"Re-subscribed {len(self._pane_to_terminal)} panes after reconnect")
+        writer = self._writer
+        if writer is None:
+            return
+        try:
+            writer.close()
+        except Exception as e:
+            logger.debug(f"Force reconnect: writer close raised (ignored): {e}")
 
     async def _event_loop(self) -> None:
         """Listen for events and dispatch delivery."""
