@@ -94,6 +94,15 @@ describe('API wrapper', () => {
     )
   })
 
+  it('createSession url-encodes provider and agent_profile', async () => {
+    mockResponse({ id: 't1' })
+    await api.createSession('kiro_cli', 'my agent/v2')
+    expect(mockFetch).toHaveBeenCalledWith(
+      expect.stringContaining('agent_profile=my%20agent%2Fv2'),
+      expect.any(Object)
+    )
+  })
+
   it('deleteSession sends DELETE', async () => {
     mockResponse({ success: true, deleted: [], errors: [] })
     await api.deleteSession('s1')
