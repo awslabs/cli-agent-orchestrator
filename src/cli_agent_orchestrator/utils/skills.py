@@ -123,10 +123,16 @@ def list_skills() -> List[SkillMetadata]:
     """
     skills_by_name: Dict[str, SkillMetadata] = {}
     for directory in _skill_search_dirs():
-        if not directory.exists():
+        if not directory.is_dir():
             continue
         for item in directory.iterdir():
             if not item.is_dir() or item.name in skills_by_name:
+                continue
+            # extra_skill_dirs may point at a broad project root, so only treat a
+            # subdirectory as a skill when it actually contains a SKILL.md;
+            # unrelated folders are skipped silently. A folder that has a
+            # SKILL.md but fails to load is still reported below.
+            if not (item / "SKILL.md").is_file():
                 continue
             try:
                 metadata, _ = _load_skill_folder(item)

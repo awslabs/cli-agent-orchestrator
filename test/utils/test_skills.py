@@ -257,6 +257,19 @@ class TestExtraSkillDirs:
         assert [skill.name for skill in skills] == ["task"]
         assert skills[0].description == "Global task"
 
+    def test_list_skips_non_skill_subdir_silently(self, tmp_path, monkeypatch, caplog):
+        global_dir = tmp_path / "global"
+        _write_skill(global_dir / "alpha", "alpha", "Global alpha")
+        extra = tmp_path / "project"
+        _write_skill(extra / "task", "task", "Project task")
+        (extra / "node_modules").mkdir(parents=True)  # unrelated folder, no SKILL.md
+        _use_skill_dirs(monkeypatch, global_dir, [extra])
+
+        skills = list_skills()
+
+        assert [skill.name for skill in skills] == ["alpha", "task"]
+        assert "node_modules" not in caplog.text
+
     def test_list_skips_missing_extra_dir(self, tmp_path, monkeypatch):
         global_dir = tmp_path / "global"
         _write_skill(global_dir / "alpha", "alpha", "Global alpha")

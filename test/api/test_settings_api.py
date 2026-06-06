@@ -217,7 +217,9 @@ class TestSetSkillDirsEndpoint:
             )
 
         assert response.status_code == 200
-        assert response.json()["extra_dirs"] == ["/new/skills"]
+        data = response.json()
+        assert "skills_dir" in data
+        assert data["extra_dirs"] == ["/new/skills"]
 
     def test_empty_body_returns_existing(self, client):
         """POST /settings/skill-dirs with empty body returns existing extra dirs."""

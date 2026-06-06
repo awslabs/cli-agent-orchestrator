@@ -99,8 +99,6 @@ This mirrors agent-profile resolution: a skill in the global store is not shadow
 |--------|----------|-------------|
 | `GET` | `/settings/agent-dirs` | Get current agent directories (merged with defaults) |
 | `POST` | `/settings/agent-dirs` | Update agent directories |
-| `GET` | `/settings/extra-agent-dirs` | Get extra custom directories |
-| `POST` | `/settings/extra-agent-dirs` | Set extra custom directories |
 | `GET` | `/settings/skill-dirs` | Get the global skill store path and extra skill directories |
 | `POST` | `/settings/skill-dirs` | Set extra custom skill directories |
 
