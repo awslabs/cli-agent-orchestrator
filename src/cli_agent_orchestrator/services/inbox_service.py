@@ -5,6 +5,7 @@ Consumer: terminal.{id}.status
 
 import asyncio
 import logging
+from itertools import groupby
 
 from cli_agent_orchestrator.clients.database import (
     get_pending_messages,
@@ -91,7 +92,6 @@ class InboxService:
             if not eager_eligible:
                 return
 
-        combined = "\n".join(m.message for m in messages)
         # Mark DELIVERED before sending (#164). send_input() types into the tmux
         # pane; that output flows back through the FIFO/StatusMonitor pipeline and
         # can re-emit an IDLE/COMPLETED status event, re-entering deliver_pending.
@@ -100,22 +100,31 @@ class InboxService:
         # them to FAILED.
         for message in messages:
             update_message_status(message.id, MessageStatus.DELIVERED)
-        try:
-            if registry is None:
-                terminal_service.send_input(terminal_id, combined)
-            else:
-                terminal_service.send_input(
-                    terminal_id,
-                    combined,
-                    registry=registry,
-                    sender_id=messages[0].sender_id,
-                    orchestration_type=OrchestrationType.SEND_MESSAGE,
-                )
-            logger.info(f"Delivered {len(messages)} message(s) to terminal {terminal_id}")
-        except Exception as e:
-            for message in messages:
-                logger.error(f"Failed to deliver message {message.id} to {terminal_id}: {e}")
-                update_message_status(message.id, MessageStatus.FAILED)
+
+        # Deliver in contiguous runs of the same sender. With the default
+        # num_messages=1 this is a single run; when draining all pending messages
+        # (num_messages=0) a batch can span multiple senders, so each run is sent
+        # separately to keep PostSendMessageEvent attribution correct — otherwise
+        # every message would be attributed to messages[0].sender_id.
+        for sender_id, group in groupby(messages, key=lambda m: m.sender_id):
+            batch = list(group)
+            combined = "\n".join(m.message for m in batch)
+            try:
+                if registry is None:
+                    terminal_service.send_input(terminal_id, combined)
+                else:
+                    terminal_service.send_input(
+                        terminal_id,
+                        combined,
+                        registry=registry,
+                        sender_id=sender_id,
+                        orchestration_type=OrchestrationType.SEND_MESSAGE,
+                    )
+                logger.info(f"Delivered {len(batch)} message(s) to terminal {terminal_id}")
+            except Exception as e:
+                for message in batch:
+                    logger.error(f"Failed to deliver message {message.id} to {terminal_id}: {e}")
+                    update_message_status(message.id, MessageStatus.FAILED)
 
     def poll_opencode_pending_messages(self, registry: PluginRegistry | None = None) -> None:
         """Poll OpenCode terminals for pending inbox messages.

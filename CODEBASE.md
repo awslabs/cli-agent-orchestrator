@@ -134,12 +134,14 @@ API: POST /terminals/{receiver_id}/inbox/messages
   ↓
 database.create_inbox_message()  # Status: PENDING
   ↓
-inbox_service.check_and_send_pending_messages()
+inbox_service.deliver_pending(receiver_id)  # immediate attempt on POST
   ↓
-If receiver IDLE → send immediately
-If receiver PROCESSING → DeliveryConsumer waits for status event
+If receiver IDLE/COMPLETED → send immediately (mark DELIVERED first, #164)
+If receiver busy → message stays PENDING
   ↓
-On status change to IDLE → DeliveryConsumer delivers message
+FIFO output → StatusMonitor publishes terminal.{id}.status on change
+  ↓
+InboxService (consumes terminal.*.status) calls deliver_pending() on IDLE/COMPLETED
   ↓
 Update message status: DELIVERED
 ```

@@ -180,6 +180,7 @@ Get terminal output.
 
 **Parameters:**
 - `mode` (string, optional): Output mode - "full" (default), "last", or "tail"
+  - `"full"` returns the StatusMonitor rolling buffer (most recent ~8KB of streamed output), not unbounded scrollback. Long sessions are truncated to the tail; use the on-disk terminal log for complete history.
 
 **Response:**
 ```json

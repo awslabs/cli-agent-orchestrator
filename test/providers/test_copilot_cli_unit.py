@@ -214,7 +214,7 @@ class TestCopilotCliProviderInitialization:
     @patch("cli_agent_orchestrator.providers.copilot_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.copilot_cli.tmux_client")
     @patch.object(CopilotCliProvider, "_accept_trust_prompts")
-    def test_initialize_success_with_ui_probe(
+    async def test_initialize_success(
         self,
         mock_accept,
         mock_tmux,
@@ -222,7 +222,19 @@ class TestCopilotCliProviderInitialization:
         _mock_async_sleep,
         mock_status_monitor,
     ):
-        pass
+        """initialize() launches the CLI and returns once the terminal is IDLE."""
+        mock_wait_shell.return_value = True
+        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+
+        result = await provider.initialize()
+
+        assert result is True
+        assert provider._initialized is True
+        # The CLI command is typed into the pane after the shell is ready.
+        mock_tmux.send_keys.assert_called_once()
+        mock_accept.assert_called()
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
@@ -230,8 +242,28 @@ class TestCopilotCliProviderInitialization:
     @patch("cli_agent_orchestrator.providers.copilot_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.copilot_cli.tmux_client")
     @patch.object(CopilotCliProvider, "_accept_trust_prompts")
-    async def _placeholder_success(self):
-        pass
+    async def test_initialize_handles_trust_prompt_then_idle(
+        self,
+        mock_accept,
+        mock_tmux,
+        mock_wait_shell,
+        _mock_async_sleep,
+        mock_status_monitor,
+    ):
+        """A WAITING_USER_ANSWER trust prompt is handled before reaching IDLE."""
+        mock_wait_shell.return_value = True
+        mock_status_monitor.get_status.side_effect = [
+            TerminalStatus.WAITING_USER_ANSWER,
+            TerminalStatus.IDLE,
+        ]
+
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+
+        result = await provider.initialize()
+
+        assert result is True
+        # Initial trust handling + the in-loop WAITING_USER_ANSWER handling.
+        assert mock_accept.call_count >= 2
 
 
 class TestCopilotCliProviderTrustPrompts:
