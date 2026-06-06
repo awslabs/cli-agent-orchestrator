@@ -54,7 +54,7 @@ Optionally specify the herdr session name (defaults to `"cao"`):
 Start the CAO server the same way as with tmux -- no additional flags needed:
 
 ```bash
-uv run cao-server
+cao-server
 ```
 
 CAO detects the backend from `config.json` and connects to herdr automatically.
@@ -135,6 +135,6 @@ herdr must be running before the CAO server starts. If you see socket errors:
 
 1. Confirm herdr is running: `herdr --session cao workspace list`
 2. If not running, start it: `herdr --session cao`
-3. Restart the CAO server: `uv run cao-server`
+3. Restart the CAO server: `cao-server`
 
 The default socket path is derived from the session name. If you use a non-default `herdr_session`, ensure herdr was started with the matching `--session` flag.
