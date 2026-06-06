@@ -1269,6 +1269,13 @@ def main():
     )
     parser.add_argument("--host", type=str, default=None, help="Server host")
     parser.add_argument("--port", type=int, default=None, help="Server port")
+    parser.add_argument(
+        "--terminal",
+        type=str,
+        choices=["tmux", "herdr"],
+        default=None,
+        help="Terminal backend to use, overriding terminal_backend in config.json",
+    )
     args = parser.parse_args()
 
     if args.agents_dir:
@@ -1277,6 +1284,16 @@ def main():
 
         constants.KIRO_AGENTS_DIR = Path(args.agents_dir)
         logger.info(f"Using agents directory: {args.agents_dir}")
+
+    # Resolve the backend before the server starts so the lifespan (and every
+    # get_backend() consumer) sees the CLI-selected backend. Without --terminal,
+    # the singleton stays lazy and BackendFactory reads config.json on first use.
+    if args.terminal:
+        from cli_agent_orchestrator.backends.factory import BackendFactory
+        from cli_agent_orchestrator.backends.registry import set_backend
+
+        set_backend(BackendFactory.create(backend_override=args.terminal))
+        logger.info(f"Terminal backend overridden via --terminal: {args.terminal}")
 
     host = args.host or SERVER_HOST
     port = args.port or SERVER_PORT

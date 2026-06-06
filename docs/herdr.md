@@ -51,13 +51,22 @@ Optionally specify the herdr session name (defaults to `"cao"`):
 
 ## Launching
 
-Start the CAO server the same way as with tmux -- no additional flags needed:
+With `terminal_backend` set in `config.json`, start the server the same way as
+with tmux -- CAO detects the backend and connects to herdr automatically:
 
 ```bash
 cao-server
 ```
 
-CAO detects the backend from `config.json` and connects to herdr automatically.
+To select herdr without editing `config.json`, pass `--terminal`:
+
+```bash
+cao-server --terminal herdr
+```
+
+The `--terminal` flag (`tmux` or `herdr`) overrides `terminal_backend` from
+`config.json` for that run. The `herdr_session` name, if set, is still read from
+`config.json`.
 
 ## Viewing and Attaching
 

@@ -27,11 +27,17 @@ class BackendFactory:
     """Factory that reads config and returns the appropriate backend instance."""
 
     @staticmethod
-    def create(config_path: Optional[Path] = None) -> TerminalBackend:
+    def create(
+        config_path: Optional[Path] = None, backend_override: Optional[str] = None
+    ) -> TerminalBackend:
         """Create a TerminalBackend based on configuration.
 
         Args:
             config_path: Optional override for config file path (for testing)
+            backend_override: Explicit backend name that takes precedence over
+                the config file (e.g. from ``cao-server --terminal herdr``).
+                When provided, ``terminal_backend`` in config.json is ignored,
+                though other keys (such as ``herdr_session``) are still read.
 
         Returns:
             A configured TerminalBackend instance
@@ -50,6 +56,10 @@ class BackendFactory:
                 backend_name = config.get("terminal_backend", "tmux")
             except (json.JSONDecodeError, OSError) as e:
                 logger.warning(f"Failed to read config from {path}: {e}; using default 'tmux'")
+
+        # An explicit override (CLI flag) wins over the config file value.
+        if backend_override:
+            backend_name = backend_override
 
         if backend_name == "tmux":
             from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
