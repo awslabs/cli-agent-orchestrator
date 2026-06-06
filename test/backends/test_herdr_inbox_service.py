@@ -744,24 +744,40 @@ class TestHerdrInboxServiceLifecycleEvents:
         mock_delete.assert_not_called()
         mock_meta.assert_not_called()
 
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
     @patch("cli_agent_orchestrator.clients.database.delete_terminals_by_session")
-    def test_workspace_closed_removes_all_terminals_for_session(self, mock_delete_by_session):
-        """workspace.closed should prune all terminals whose pane_id starts with workspace_id."""
+    def test_workspace_closed_removes_all_terminals_for_session(
+        self, mock_delete_by_session, mock_meta
+    ):
+        """workspace.closed prunes terminals by their DB session, not by a
+        pane_id/workspace_id string prefix.
+
+        Uses compact pane_ids that do NOT start with the workspace_id (herdr
+        renumbers panes and gives no prefix guarantee) to prove the prune keys
+        off DB session ownership rather than the pane_id string.
+        """
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        service.register_terminal("tid1", "ws-abc/0")
-        service.register_terminal("tid2", "ws-abc/1")
-        service.register_terminal("tid3", "ws-other/0")  # Different workspace
+        service.register_terminal("tid1", "p-7")
+        service.register_terminal("tid2", "p-8")
+        service.register_terminal("tid3", "p-9")  # Different session
         service._workspace_to_session["ws-abc"] = "my-session"
+
+        session_by_terminal = {
+            "tid1": {"tmux_session": "my-session"},
+            "tid2": {"tmux_session": "my-session"},
+            "tid3": {"tmux_session": "other-session"},
+        }
+        mock_meta.side_effect = lambda tid: session_by_terminal.get(tid)
 
         service._handle_lifecycle_event("workspace.closed", {"workspace_id": "ws-abc"})
 
-        # ws-abc terminals pruned
-        assert "ws-abc/0" not in service._pane_to_terminal
-        assert "ws-abc/1" not in service._pane_to_terminal
+        # my-session terminals pruned despite no pane_id/workspace_id prefix match
+        assert "p-7" not in service._pane_to_terminal
+        assert "p-8" not in service._pane_to_terminal
         assert "tid1" not in service._terminal_to_pane
         assert "tid2" not in service._terminal_to_pane
-        # Other workspace unaffected
-        assert "ws-other/0" in service._pane_to_terminal
+        # Terminal owned by a different session is untouched
+        assert "p-9" in service._pane_to_terminal
         assert "tid3" in service._terminal_to_pane
         # Workspace entry cleaned up
         assert "ws-abc" not in service._workspace_to_session

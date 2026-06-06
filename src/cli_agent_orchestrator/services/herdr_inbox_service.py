@@ -582,11 +582,15 @@ class HerdrInboxService:
                     f"workspace.closed: failed to delete terminals for {session_name}: {e}"
                 )
 
-            # Prune maps — pane_ids from this workspace start with workspace_id prefix
+            # Prune maps for terminals belonging to this session. Match on each
+            # terminal's DB session rather than a pane_id/workspace_id string
+            # prefix: herdr renumbers compact pane_ids and does not guarantee
+            # they begin with the workspace_id, so a prefix test is unreliable.
+            # This mirrors the session match used in the pane.closed handler.
             to_remove = [
                 (pid, tid)
                 for pid, tid in self._pane_to_terminal.items()
-                if pid.startswith(workspace_id)
+                if (m := get_terminal_metadata(tid)) and m.get("tmux_session") == session_name
             ]
             for pid, tid in to_remove:
                 self._pane_to_terminal.pop(pid, None)

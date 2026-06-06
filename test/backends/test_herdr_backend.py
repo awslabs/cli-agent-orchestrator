@@ -209,6 +209,135 @@ class TestHerdrBackendCommands:
         assert "CAO_TERMINAL_ID=tid1" in env_cmd[-1]
         assert "CAO_SESSION_NAME=cao-myproj" in env_cmd[-1]
 
+    @staticmethod
+    def _workspace_create_resp():
+        """workspace create response carrying a root pane_id for env injection."""
+        return _completed(
+            json.dumps(
+                {
+                    "id": "cli:workspace:create",
+                    "result": {
+                        "workspace_id": "w_new",
+                        "root_pane": {
+                            "pane_id": "w_new-1",
+                            "workspace_id": "w_new",
+                            "tab_id": "tab-0",
+                        },
+                        "type": "workspace_created",
+                    },
+                }
+            )
+        )
+
+    @patch("subprocess.run")
+    def test_create_session_forwards_extra_env(self, mock_run, backend):
+        """extra_env from cao launch --env is exported into the pane (shell-quoted)."""
+        mock_run.side_effect = [
+            self._workspace_create_resp(),  # workspace create
+            _completed(),  # tab rename
+            _completed(),  # pane send-text (env export)
+            _completed(),  # pane send-keys Enter
+        ]
+
+        backend.create_session(
+            "cao-myproj",
+            "window-0",
+            "tid1",
+            "/home/user/project",
+            extra_env={"AWS_REGION": "us-west-2", "MNEMOSYNE_DIR": "/root/mn"},
+        )
+
+        env_cmd = mock_run.call_args_list[2][0][0][-1]
+        assert "export AWS_REGION=us-west-2" in env_cmd
+        assert "export MNEMOSYNE_DIR=/root/mn" in env_cmd
+        # CAO identity vars still present
+        assert "CAO_TERMINAL_ID=tid1" in env_cmd
+
+    @patch("subprocess.run")
+    def test_create_session_drops_blocked_and_oversized_env(self, mock_run, backend):
+        """Blocked-prefix and oversized extra_env values are filtered out (tmux parity)."""
+        mock_run.side_effect = [
+            self._workspace_create_resp(),
+            _completed(),
+            _completed(),
+            _completed(),
+        ]
+
+        backend.create_session(
+            "cao-myproj",
+            "window-0",
+            "tid1",
+            "/home/user/project",
+            extra_env={
+                "CLAUDE_SECRET": "x",  # blocked prefix
+                "BIG": "x" * 2048,  # at the 2048-byte cap -> dropped
+                "OK": "kept",
+            },
+        )
+
+        env_cmd = mock_run.call_args_list[2][0][0][-1]
+        assert "CLAUDE_SECRET" not in env_cmd
+        assert "BIG=" not in env_cmd
+        assert "export OK=kept" in env_cmd
+
+    @patch("subprocess.run")
+    def test_create_session_quotes_env_values(self, mock_run, backend):
+        """Operator-supplied values are shell-quoted to stay injection-safe."""
+        mock_run.side_effect = [
+            self._workspace_create_resp(),
+            _completed(),
+            _completed(),
+            _completed(),
+        ]
+
+        backend.create_session(
+            "cao-myproj",
+            "window-0",
+            "tid1",
+            "/home/user/project",
+            extra_env={"DANGER": "a; rm -rf /"},
+        )
+
+        env_cmd = mock_run.call_args_list[2][0][0][-1]
+        # shlex.quote wraps the value so the embedded "; rm" cannot break out.
+        assert "export DANGER='a; rm -rf /'" in env_cmd
+
+    @patch("subprocess.run")
+    def test_create_window_forwards_extra_env(self, mock_run, backend):
+        """create_window threads extra_env into the injected exports too."""
+        ws = [{"label": "cao-test", "workspace_id": "w1"}]
+        tab_create_resp = _completed(
+            json.dumps(
+                {
+                    "id": "cli:tab:create",
+                    "result": {
+                        "root_pane": {
+                            "pane_id": "w1-2",
+                            "workspace_id": "w1",
+                            "tab_id": "tab-1",
+                        },
+                        "type": "tab_created",
+                    },
+                }
+            )
+        )
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),  # _resolve_workspace_id
+            tab_create_resp,  # tab create
+            _completed(),  # pane send-text (env export)
+            _completed(),  # pane send-keys Enter
+        ]
+
+        backend.create_window(
+            "cao-test",
+            "window-1",
+            "tid2",
+            extra_env={"AWS_REGION": "eu-central-1"},
+        )
+
+        send_text_call = next(c[0][0] for c in mock_run.call_args_list if "send-text" in c[0][0])
+        assert "export AWS_REGION=eu-central-1" in send_text_call[-1]
+
     @patch("subprocess.run")
     def test_kill_session_calls_workspace_close(self, mock_run, backend):
         """kill_session should resolve workspace_id then call herdr workspace close <id>."""

@@ -13,6 +13,7 @@ Design decisions:
 import json
 import logging
 import os
+import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -219,7 +220,9 @@ class HerdrBackend(TerminalBackend):
 
         # Inject CAO env vars into the initial pane so agents and cao info can
         # identify the terminal/session (mirrors TmuxClient env injection).
-        self._inject_env_vars(session_name, window_name, terminal_id, pane_id=new_pane_id)
+        self._inject_env_vars(
+            session_name, window_name, terminal_id, pane_id=new_pane_id, extra_env=extra_env
+        )
 
         logger.info(f"Created herdr workspace: {session_name} in {working_directory}")
         return window_name
@@ -298,7 +301,9 @@ class HerdrBackend(TerminalBackend):
         new_pane_id = self._parse_new_pane_id(result.stdout)
 
         # Inject CAO env vars using the known pane_id (no list scan needed)
-        self._inject_env_vars(session_name, window_name, terminal_id, pane_id=new_pane_id)
+        self._inject_env_vars(
+            session_name, window_name, terminal_id, pane_id=new_pane_id, extra_env=extra_env
+        )
 
         if window_shell is not None and new_pane_id is not None:
             # Wait for shell startup before sending the initial command.
@@ -633,11 +638,15 @@ class HerdrBackend(TerminalBackend):
         window_name: str,
         terminal_id: str,
         pane_id: Optional[str] = None,
+        extra_env: Optional[Dict[str, str]] = None,
     ) -> None:
-        """Inject CAO_TERMINAL_ID and CAO_SESSION_NAME into the specified pane.
+        """Inject CAO env vars (and operator-forwarded vars) into the pane.
 
         Called after create_session/create_window to export env vars into the
         pane's shell so agents and `cao info` can identify the terminal/session.
+        Operator-supplied ``extra_env`` (from ``cao launch --env``) is forwarded
+        too, filtered with the same rules TmuxClient applies to its ``-e`` argv
+        so the launch-env contract behaves identically across backends.
 
         Args:
             session_name: CAO session name
@@ -645,6 +654,7 @@ class HerdrBackend(TerminalBackend):
             terminal_id: Terminal identifier to inject
             pane_id: Pane ID from the create response. If None, falls back to
                 pane list scan (less reliable under concurrency).
+            extra_env: Operator-forwarded env vars from ``cao launch --env``.
         """
         try:
             # Use provided pane_id if available (from create response)
@@ -665,15 +675,51 @@ class HerdrBackend(TerminalBackend):
             if target_pane_id:
                 # Cache the mapping
                 self._pane_cache[terminal_id] = (target_pane_id, time.time())
-                # Send env export command
-                env_cmd = (
-                    f"export CAO_TERMINAL_ID={terminal_id}; "
-                    f"export CAO_SESSION_NAME={session_name}"
-                )
+                # Build export command: CAO identity vars first, then any
+                # operator-forwarded vars. terminal_id/session_name come from
+                # CAO internals (safe); extra_env values are operator-supplied,
+                # so quote them to keep the shell export injection-safe.
+                exports = [
+                    f"export CAO_TERMINAL_ID={terminal_id}",
+                    f"export CAO_SESSION_NAME={session_name}",
+                ]
+                exports.extend(self._build_extra_env_exports(extra_env))
+                env_cmd = "; ".join(exports)
                 self._run_herdr(["pane", "send-text", target_pane_id, env_cmd])
                 self._run_herdr(["pane", "send-keys", target_pane_id, "Enter"])
         except (TerminalBackendError, json.JSONDecodeError, KeyError) as e:
             logger.warning(f"Failed to inject env vars for {terminal_id}: {e}")
+
+    @staticmethod
+    def _build_extra_env_exports(extra_env: Optional[Dict[str, str]]) -> List[str]:
+        """Return shell ``export`` statements for operator-forwarded env vars.
+
+        Applies the same safety filtering TmuxClient uses for its ``-e`` argv
+        (blocked provider prefixes, per-value byte cap) so ``cao launch --env``
+        forwards the same set of vars under herdr as under tmux. Values are
+        shell-quoted because herdr injects via ``pane send-text`` (a shell
+        command line), unlike tmux's exec-style ``-e KEY=VALUE`` argv.
+        """
+        if not extra_env:
+            return []
+
+        # Reuse the tmux filtering policy so the two backends cannot drift.
+        from cli_agent_orchestrator.clients.tmux import TmuxClient
+
+        exports: List[str] = []
+        for key, value in extra_env.items():
+            if TmuxClient._is_blocked_env_key(key):
+                logger.warning("Dropping forwarded env var with blocked prefix: %s", key)
+                continue
+            if len(value.encode("utf-8")) >= TmuxClient._MAX_ENV_VALUE_BYTES:
+                logger.warning(
+                    "Dropping forwarded env var %s -- value exceeds %d bytes",
+                    key,
+                    TmuxClient._MAX_ENV_VALUE_BYTES,
+                )
+                continue
+            exports.append(f"export {key}={shlex.quote(value)}")
+        return exports
 
     def _resolve_tab_id(self, session_name: str, workspace_id: str, window_name: str) -> str:
         """Resolve window_name to its herdr tab_id in the given workspace.
