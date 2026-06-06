@@ -153,6 +153,8 @@ def disable_flow(name: str) -> bool:
 def enable_flow(name: str) -> bool:
     """Enable flow and recalculate next_run."""
     flow = get_flow(name)
+    if flow is None:
+        raise ValueError(f"Flow '{name}' not found")
 
     # Recalculate next_run from now
     next_run = _get_next_run_time(flow.schedule)

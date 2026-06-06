@@ -127,6 +127,13 @@ def require_opencode():
         pytest.skip("opencode CLI not installed")
 
 
+@pytest.fixture()
+def require_hermes():
+    """Skip test if Hermes CLI is not available."""
+    if not _cli_available("hermes"):
+        pytest.skip("Hermes CLI not installed")
+
+
 def create_terminal(
     provider: str,
     agent_profile: str,

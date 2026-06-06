@@ -107,10 +107,10 @@ No `role` is needed — `allowedTools` is the full specification of what tools t
 | `fs_list` | Search/list files | `Glob`, `Grep` | `list_directory`, `glob` |
 | `fs_*` | All filesystem ops | All of the above | All of the above |
 | `@builtin` | Provider built-in capabilities | (internal) | (internal) |
-| `@cao-mcp-server` | CAO orchestration tools | `handoff`, `assign`, `send_message` | Same |
+| `@cao-mcp-server` | CAO orchestration tools | `handoff`, `assign`, `send_message`, plus Hermes prompt answers via `answer_user_prompt` | Same |
 | `*` | Everything (unrestricted) | All tools | All tools |
 
-CAO translates these to each provider's native tool names automatically. You write one vocabulary; it works across all 7 providers.
+CAO translates these to each provider's native tool names automatically. You write one vocabulary; it works across supported providers.
 
 ### 3. `--yolo` — The Escape Hatch
 
@@ -243,6 +243,7 @@ As described in [How Tool Restrictions Are Enforced](#how-tool-restrictions-are-
 | **Gemini CLI** | Hard | Policy Engine TOML deny rules in `~/.gemini/policies/` |
 | **Kimi CLI** | Soft | Security system prompt only |
 | **Codex** | Soft | Security system prompt only |
+| **Hermes** | Profile-defined | CAO launches default `hermes` or the optional `hermesProfile` wrapper declared by the CAO profile; restrict tools in that Hermes profile |
 
 **Hard enforcement** = the agent physically cannot use denied tools, enforced by the provider runtime.
 
@@ -325,7 +326,7 @@ Each agent is restricted based on its own profile, not its parent's permissions.
 
 1. **Claude Code tool mapping is incomplete.** The current mapping covers `Bash`, `Read`, `Edit`, `Write`, `Glob`, and `Grep`. Claude Code also has [`WebFetch`](https://code.claude.com/docs/en/permissions#webfetch), `Agent` (subagent), and MCP tools that are not yet mapped to CAO vocabulary. These tools remain **unrestricted** even when `allowedTools` is set — they cannot be blocked via `--disallowedTools`. Future versions will add `web_fetch` and `subagent` to the CAO vocabulary.
 
-2. **`@cao-mcp-server` is a pass-through marker, not enforced at the provider level.** Including `@cao-mcp-server` in `allowedTools` signals intent (this agent should have orchestration tools), but it does **not** translate to any native `--disallowedTools` flag. MCP tools (`handoff`, `assign`, `send_message`) are always available to the agent regardless of `allowedTools` — providers do not currently support blocking individual MCP tools. Additionally, `@cao-mcp-server` is all-or-nothing: there is no way to allow only `send_message` while blocking `assign`. Future versions may support `@cao-mcp-server:send_message` syntax for per-tool MCP control.
+2. **`@cao-mcp-server` is a pass-through marker, not enforced at the provider level.** Including `@cao-mcp-server` in `allowedTools` signals intent (this agent should have orchestration tools), but it does **not** translate to any native `--disallowedTools` flag. MCP tools (`handoff`, `assign`, `send_message`, `answer_user_prompt`) are always available to the agent regardless of `allowedTools` — providers do not currently support blocking individual MCP tools. `answer_user_prompt` is exposed by the MCP server, but its structured prompt-navigation behavior is currently implemented for Hermes workers that report `waiting_user_answer`; other providers may only receive ordinary text input until they implement equivalent prompt states. Additionally, `@cao-mcp-server` is all-or-nothing: there is no way to allow only `send_message` while blocking `assign`. Future versions may support `@cao-mcp-server:send_message` syntax for per-tool MCP control.
 
 3. **Soft enforcement is best-effort.** Kimi CLI and Codex rely on system prompt instructions to restrict tools. The agent may ignore these restrictions. Do not rely on soft enforcement for security-critical workloads.
 

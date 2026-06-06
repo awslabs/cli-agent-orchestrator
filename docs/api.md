@@ -56,6 +56,11 @@ List available providers with installation status.
     "installed": false
   },
   {
+    "name": "hermes",
+    "binary": "hermes",
+    "installed": true
+  },
+  {
     "name": "copilot_cli",
     "binary": "copilot",
     "installed": false
@@ -73,7 +78,7 @@ List available providers with installation status.
 Create a new session with one terminal.
 
 **Parameters:**
-- `provider` (string, required): Provider type ("kiro_cli", "claude_code", "codex", "gemini_cli", "kimi_cli", "copilot_cli", or "q_cli")
+- `provider` (string, required): Provider type ("kiro_cli", "claude_code", "codex", "gemini_cli", "hermes", "kimi_cli", "copilot_cli", or "q_cli")
 - `agent_profile` (string, required): Agent profile name
 - `session_name` (string, optional): Custom session name
 - `working_directory` (string, optional): Working directory for the agent session
@@ -129,7 +134,7 @@ Get terminal details.
 {
   "id": "string",
   "name": "string",
-  "provider": "kiro_cli|claude_code|codex|gemini_cli|kimi_cli|copilot_cli|q_cli",
+  "provider": "kiro_cli|claude_code|codex|gemini_cli|hermes|kimi_cli|copilot_cli|q_cli",
   "session_name": "string",
   "agent_profile": "string",
   "status": "idle|processing|completed|waiting_user_answer|error",
@@ -142,6 +147,26 @@ Send input to a terminal.
 
 **Parameters:**
 - `message` (string, required): Message to send
+
+**Response:**
+```json
+{
+  "success": true
+}
+```
+
+### POST /terminals/{terminal_id}/key
+Send a tmux key sequence to a terminal. Use this for interactive prompts that
+require non-text key presses, such as Hermes clarify picker navigation.
+
+The endpoint is generic, but the only in-tree structured consumer today is the
+Hermes path of `answer_user_prompt`. Other providers can use it in the future
+when they expose equivalent prompt states or key-navigation flows.
+
+**Parameters:**
+- `key` (string, required): allowed tmux key name: `Up`, `Down`, `Left`,
+  `Right`, `Enter`, `Tab`, `Escape`, `Space`, a single alphanumeric key, or a
+  `C-`, `M-`, or `S-` modifier combo such as `C-c` or `M-x`
 
 **Response:**
 ```json
@@ -190,6 +215,7 @@ Send provider-specific exit command to terminal.
 | claude_code | `/exit` | Text |
 | codex | `/exit` | Text |
 | gemini_cli | `/exit` | Text |
+| hermes | `/exit` | Text |
 | kimi_cli | `/exit` | Text |
 | copilot_cli | `/exit` | Text |
 | q_cli | `/exit` | Text |
