@@ -121,9 +121,9 @@ def _compute_tui_footer_cutoff(all_lines: list) -> int:
 def _toml_scalar(value: Any) -> str:
     """Serialize a Python scalar to a TOML literal for a ``-c key=<value>`` override.
 
-    Strings become quoted TOML basic strings (backslash/quote/newline escaped so
+    Strings become quoted TOML basic strings (backslash, quote, tab, CR, and newline escaped so
     tmux ``send_keys`` keeps the launch command on one line); bools become
-    ``true``/``false``; ints and floats are emitted bare. ``bool`` is checked
+    ``true``/``false``; ints and floats are emitted bare. Non-scalar values (dict/list/None) raise ``TypeError`` so a misconfigured profile fails fast. ``bool`` is checked
     before ``int`` because ``bool`` is a subclass of ``int`` in Python, so the
     order here is load-bearing — a flipped order would render ``True`` as ``1``.
     """
@@ -131,7 +131,18 @@ def _toml_scalar(value: Any) -> str:
         return "true" if value else "false"
     if isinstance(value, (int, float)):
         return str(value)
-    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    if not isinstance(value, str):
+        raise TypeError(
+            "codexConfig values must be scalars (str, bool, int, or float); "
+            f"got {type(value).__name__}"
+        )
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\t", "\\t")
+        .replace("\r", "\\r")
+        .replace("\n", "\\n")
+    )
     return f'"{escaped}"'
 
 

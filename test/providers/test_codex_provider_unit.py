@@ -463,6 +463,15 @@ class TestTomlScalar:
         assert _toml_scalar("line1\nline2") == '"line1\\nline2"'
 
 
+    def test_string_escapes_tabs_and_carriage_returns(self):
+        assert _toml_scalar("a\tb\rc") == '"a\\tb\\rc"'
+
+    @pytest.mark.parametrize("value", [{"a": 1}, ["x"], None])
+    def test_rejects_non_scalar(self, value):
+        with pytest.raises(TypeError):
+            _toml_scalar(value)
+
+
 class TestCodexProviderCodexConfig:
     """Tests that profile.codexConfig emits inline ``-c key=value`` overrides."""
 
