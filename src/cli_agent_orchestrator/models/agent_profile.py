@@ -51,3 +51,12 @@ class AgentProfile(BaseModel):
     # example one created by `hermes profile alias <profile>`). When omitted,
     # the Hermes provider launches the default `hermes` command.
     hermesProfile: Optional[str] = Field(default=None, min_length=1)
+
+    # Claude Code-only. Per-agent Claude Code knobs mapped to CLI flags at
+    # launch: {"effort": "<low|medium|high|xhigh>"} -> `--effort <level>` and
+    # {"fallback_model": "<model>"} -> `--fallback-model <model>`. Lets a
+    # profile set per-agent reasoning effort without relying on the
+    # machine-global `effortLevel` in ~/.claude/settings.json. This is the
+    # Claude analog of codexConfig for the codex provider; the top-level
+    # `model` field still maps to `--model`.
+    claudeConfig: Optional[Dict[str, Any]] = None
