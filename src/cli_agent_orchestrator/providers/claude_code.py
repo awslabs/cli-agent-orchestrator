@@ -74,6 +74,14 @@ IDLE_PROMPT_PATTERN_LOG = r"[>❯][\s\xa0]"  # Same pattern for log files
 # The ``·`` glyph is intentionally excluded from the leading class so footer
 # lines like "high · /effort" cannot false-match.
 COMPLETION_SUMMARY_PATTERN = r"[✶✢✽✻✳][^\n…]*\bfor\s+\d+(?:\.\d+)?\s*s\b"
+# get_status completion detection tolerates the duration being CLIPPED off by
+# the raw redraw ("✻ Crunched for " with no "Ns"): past-tense glyph + "for",
+# no ellipsis (so a live "…ing…" spinner never matches). · and * stay excluded
+# so footer lines ("high · /effort") cannot false-match. Looser than
+# COMPLETION_SUMMARY_PATTERN (which extraction keeps strict to trim only real
+# stat lines), and only ever turns IDLE/PROCESSING into COMPLETED — the safe
+# direction — and only after the live-spinner PROCESSING checks have passed.
+GET_STATUS_COMPLETION_PATTERN = r"[✶✢✽✻✳][^\n…]*\bfor\b"
 # The newest Claude Code TUI renders the ❯ input prompt BOXED between two
 # horizontal separator lines (the older TUI used a single separator ABOVE ❯).
 # Detecting this box GATES the new-TUI status logic so legacy output is
@@ -424,7 +432,8 @@ class ClaudeCodeProvider(BaseProvider):
         # COMPLETED branch win. During genuine processing nothing but the footer
         # follows the last separator, so this never hides a live turn.
         _boxless_completion_tail = bool(
-            _sep_positions and re.search(COMPLETION_SUMMARY_PATTERN, output[_sep_positions[-1] :])
+            _sep_positions
+            and re.search(GET_STATUS_COMPLETION_PATTERN, output[_sep_positions[-1] :])
         )
         if _sep_positions and not _boxless_completion_tail:
             pre_sep_lines = output[: _sep_positions[-1]].rstrip("\n").split("\n")
@@ -451,7 +460,7 @@ class ClaudeCodeProvider(BaseProvider):
         # drops the ⏺ marker and shows this past-tense summary above the ❯ box
         # after a finished turn.
         last_completion = None
-        for m in re.finditer(COMPLETION_SUMMARY_PATTERN, output):
+        for m in re.finditer(GET_STATUS_COMPLETION_PATTERN, output):
             last_completion = m
 
         # FALLBACK PROCESSING: spinner visible AND no separator follows it yet

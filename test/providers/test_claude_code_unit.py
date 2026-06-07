@@ -713,6 +713,25 @@ class TestClaudeCodeProviderStatusDetection:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         assert provider.get_status(output) == TerminalStatus.COMPLETED
 
+    def test_get_status_clipped_completion_after_separator_beats_stale_spinner(self):
+        """COMPLETED when a CLIPPED completion ("✻ Crunched for ") is repainted
+        boxless after the last separator, above a stale spinner.
+
+        The spinner-before-separator walk would otherwise report PROCESSING off the
+        stale "✽ Deciphering…"; the clipped completion after the last separator is
+        the boxless-redraw signature and must take precedence. This is the
+        intermittent real-handoff failure (the settle frame randomly landed here).
+        """
+        box = "─" * 40
+        output = (
+            "● def greet(name):\n"
+            "✽ Deciphering… (2s · ↓ 57 tokens)\n\n❯ \n\n" + box + "\n"
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt ● high\n"
+            "✻ Crunched for \n❯ \n ← for agents\n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
 
 class TestClaudeCodeProviderMessageExtraction:
     """Tests for ClaudeCodeProvider message extraction."""
