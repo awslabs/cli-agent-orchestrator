@@ -69,6 +69,18 @@ class StatusMonitor:
         self._buffers.pop(terminal_id, None)
         self._last_status.pop(terminal_id, None)
 
+    def reset_buffer(self, terminal_id: str) -> None:
+        """Clear the rolling buffer + last-known status WITHOUT forgetting the
+        terminal.
+
+        Used when a provider relaunches a different CLI mode on the SAME
+        ``terminal_id`` (e.g. Kiro's TUI -> ``--legacy-ui`` fallback). Without
+        this, the retry re-derives status from a buffer still full of stale bytes
+        from the failed first attempt and can spuriously time out.
+        """
+        self._buffers[terminal_id] = ""
+        self._last_status.pop(terminal_id, None)
+
     def get_status(self, terminal_id: str) -> TerminalStatus:
         """Get current terminal status. Source of truth — derived from streaming output."""
         return self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)

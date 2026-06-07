@@ -250,6 +250,13 @@ async def create_terminal(
         fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
         tmux_client.pipe_pane(session_name, window_name, str(fifo_path))
 
+        # Nudge the shell so it re-renders its prompt AFTER pipe-pane attaches.
+        # pipe-pane only captures output produced after it starts; on a fast
+        # shell the initial prompt is drawn before the pipe attaches, leaving the
+        # StatusMonitor buffer empty so wait_for_shell() times out. A bare Enter
+        # produces a fresh prompt line that flows through the pipe.
+        tmux_client.send_special_key(session_name, window_name, "Enter")
+
         # Step 6: Create and initialize the CLI provider
         # This starts the agent (e.g., runs "kiro-cli chat --agent developer").
         # Only runtime-prompt providers (Claude Code, Codex, Gemini, Kimi) receive
@@ -441,6 +448,7 @@ def send_input(
             message,
             enter_count=enter_count,
             force_bracketed_paste=True,
+            submit_delay=provider.paste_submit_delay if provider else 0.3,
         )
 
         # Notify the provider that external input was received.

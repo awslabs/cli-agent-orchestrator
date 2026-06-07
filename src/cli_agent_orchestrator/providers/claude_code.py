@@ -14,6 +14,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
+from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,29 @@ WAITING_USER_ANSWER_PATTERN = (
 TRUST_PROMPT_PATTERN = r"Yes, I trust this folder"  # Workspace trust dialog
 BYPASS_PROMPT_PATTERN = r"Yes, I accept"  # Bypass permissions confirmation dialog
 IDLE_PROMPT_PATTERN_LOG = r"[>❯][\s\xa0]"  # Same pattern for log files
+# New Claude Code TUI completion summary, e.g. "✻ Sautéed for 1s" /
+# "✶ Cultivated for 12s". Unlike the active spinner (PROCESSING_PATTERN, which
+# always ends with the … ellipsis), the summary is past-tense + "for Ns" with NO
+# ellipsis. The newest TUI shows this (above an empty ❯ box) after a finished
+# turn INSTEAD of the old ⏺ response marker, so it is the COMPLETED signal there.
+# The ``·`` glyph is intentionally excluded from the leading class so footer
+# lines like "high · /effort" cannot false-match.
+COMPLETION_SUMMARY_PATTERN = r"[✶✢✽✻✳][^\n…]*\bfor\s+\d+(?:\.\d+)?\s*s\b"
+# The newest Claude Code TUI renders the ❯ input prompt BOXED between two
+# horizontal separator lines (the older TUI used a single separator ABOVE ❯).
+# Detecting this box GATES the new-TUI status logic so legacy output is
+# unaffected. The ❯ line must be essentially empty (just the prompt) so a
+# response/echo line like "❯ my task" does NOT match.
+# NOTE: separator length (─{8,}) and adjacency may need tuning against a
+# real new-TUI capture.
+NEW_TUI_BOX_PATTERN = re.compile(
+    r"─{8,}[^\n]*\n[ \t]*[>❯][ \t\xa0]*\n[ \t]*─{8,}",
+    re.MULTILINE,
+)
+# Live spinner in the new TUI: spinner glyph + a gerund ("…ing") + the … ellipsis,
+# e.g. "✻ Cultivating…", "· Swirling…". Tighter than PROCESSING_PATTERN so the
+# version status bar ("· latest:…") is not mistaken for a live spinner.
+NEW_TUI_SPINNER_PATTERN = r"[✶✢✽✻✳·][^\n]*ing…"
 
 
 class ClaudeCodeProvider(BaseProvider):
@@ -343,6 +367,15 @@ class ClaudeCodeProvider(BaseProvider):
         if not output:
             return TerminalStatus.UNKNOWN
 
+        # The StatusMonitor feeds the RAW pipe-pane buffer (cursor-positioning
+        # escapes, in-place redraws, OSC titles) — not a tmux-rendered snapshot.
+        # Strip escapes / normalize cursor moves to newlines so the structural
+        # checks below see clean, line-oriented text. On already-clean input
+        # (unit fixtures, capture-pane output) this is a near no-op.
+        output = strip_terminal_escapes(output)
+        if not output.strip():
+            return TerminalStatus.UNKNOWN
+
         # PRIMARY PROCESSING check: walk backwards from the *last* separator.
         # If we encounter a spinner line (spinner char + …) before we encounter
         # another separator, the agent is actively processing.
@@ -373,6 +406,13 @@ class ClaudeCodeProvider(BaseProvider):
         for m in re.finditer(RESPONSE_PATTERN, output):
             last_response = m
 
+        # New-TUI completion summary ("✻ Sautéed for 1s"): the newest Claude Code
+        # drops the ⏺ marker and shows this past-tense summary above the ❯ box
+        # after a finished turn.
+        last_completion = None
+        for m in re.finditer(COMPLETION_SUMMARY_PATTERN, output):
+            last_completion = m
+
         # FALLBACK PROCESSING: spinner visible AND no separator follows it yet
         # (early in execution before the separator appears). Position comparison
         # is used here only when no separator is present (safe case).
@@ -389,6 +429,35 @@ class ClaudeCodeProvider(BaseProvider):
         ):
             return TerminalStatus.WAITING_USER_ANSWER
 
+        # New Claude Code TUI: the ❯ input prompt is BOXED between two separator
+        # lines. Only when that box is present do we use the new-TUI signals;
+        # otherwise we fall through to the legacy ⏺-based logic unchanged, so
+        # older Claude Code builds behave exactly as before. The structural
+        # "spinner-before-separator" check above cannot see the new-TUI spinner
+        # because it renders ABOVE the box's top border.
+        if NEW_TUI_BOX_PATTERN.search(output):
+            last_live_spinner = None
+            for m in re.finditer(NEW_TUI_SPINNER_PATTERN, output):
+                last_live_spinner = m
+            # PROCESSING: a live "…ing…" spinner is the freshest status line
+            # (newer than any completion summary from a prior turn).
+            if last_live_spinner is not None and (
+                last_completion is None
+                or last_live_spinner.start() > last_completion.start()
+            ):
+                return TerminalStatus.PROCESSING
+            # COMPLETED: a "✻ <Verb>ed for Ns" summary sits above the empty ❯ box
+            # and is the freshest spinner-glyph line (newer than any live spinner).
+            if (
+                last_completion is not None
+                and last_idle is not None
+                and (
+                    last_live_spinner is None
+                    or last_completion.start() > last_live_spinner.start()
+                )
+            ):
+                return TerminalStatus.COMPLETED
+
         # COMPLETED: ⏺ response exists AND ❯ prompt is visible (agent finished).
         if last_response and last_idle:
             return TerminalStatus.COMPLETED
@@ -398,6 +467,15 @@ class ClaudeCodeProvider(BaseProvider):
             return TerminalStatus.IDLE
 
         return TerminalStatus.UNKNOWN
+
+    @property
+    def paste_submit_delay(self) -> float:
+        # The newest Claude Code Ink TUI needs noticeably longer than the 0.3s
+        # default to settle a bracketed paste before an Enter counts as "submit"
+        # rather than a literal newline; a too-early Enter is swallowed and the
+        # message sits unsubmitted in the prompt box (observed on Claude Code with
+        # the "/effort" + shift+tab bypass UI). 2.0s is conservative.
+        return 2.0
 
     @property
     def accepts_input_while_processing(self) -> bool:

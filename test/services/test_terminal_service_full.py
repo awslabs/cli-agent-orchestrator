@@ -611,6 +611,7 @@ class TestSendInput:
         }
         mock_provider = mock_pm.get_provider.return_value
         mock_provider.paste_enter_count = 2
+        mock_provider.paste_submit_delay = 0.3
 
         result = send_input("test1234", "test message")
 
@@ -621,6 +622,7 @@ class TestSendInput:
             "test message",
             enter_count=2,
             force_bracketed_paste=True,
+            submit_delay=0.3,
         )
         mock_update.assert_called_once_with("test1234")
 
@@ -689,6 +691,7 @@ class TestSendInput:
         mock_provider.blocks_orchestrated_input_while_waiting_user_answer = True
         mock_status_monitor.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
         mock_provider.paste_enter_count = 1
+        mock_provider.paste_submit_delay = 0.3
 
         result = send_input("test1234", "1")
 
@@ -699,6 +702,7 @@ class TestSendInput:
             "1",
             enter_count=1,
             force_bracketed_paste=True,
+            submit_delay=0.3,
         )
         mock_update.assert_called_once_with("test1234")
 

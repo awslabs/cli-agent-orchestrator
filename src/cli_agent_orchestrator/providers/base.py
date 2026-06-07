@@ -111,16 +111,36 @@ class BaseProvider(ABC):
     def get_status(self, buffer: str) -> TerminalStatus:
         """Detect terminal status from output buffer using provider-specific patterns.
 
-        Called by StatusMonitor with accumulated terminal output.
+        Called by StatusMonitor with the accumulated terminal output.
+
+        IMPORTANT — input contract: ``buffer`` is the **raw** pipe-pane byte
+        stream (cursor-positioning escapes, in-place ``\\r`` redraws, OSC titles),
+        NOT a tmux-rendered pane snapshot. Implementations that do structural /
+        line-oriented matching should run it through
+        ``cli_agent_orchestrator.utils.text.strip_terminal_escapes`` first
+        (which removes escapes and normalizes cursor moves to newlines).
+        Detectors calibrated against rendered snapshots will misfire on the raw
+        stream if they skip this step.
 
         Args:
-            buffer: Terminal output (up to ~8KB rolling buffer)
+            buffer: Raw terminal output (up to ~8KB rolling buffer).
 
         Returns:
             TerminalStatus - always returns a valid status.
             UNKNOWN if no pattern matched, ERROR only for matched error patterns.
         """
         pass
+
+    @property
+    def paste_submit_delay(self) -> float:
+        """Seconds to wait after a bracketed paste before sending the Enter key.
+
+        Some TUIs need time to finish processing the bracketed-paste end marker
+        before an Enter registers as "submit" rather than a literal newline.
+        Override per-provider when a CLI needs longer than the default (e.g. the
+        newest Claude Code, whose Ink renderer swallows an Enter sent too soon).
+        """
+        return 0.3
 
     @property
     def accepts_input_while_processing(self) -> bool:

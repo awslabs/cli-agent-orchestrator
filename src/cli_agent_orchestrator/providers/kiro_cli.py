@@ -267,6 +267,12 @@ class KiroCliProvider(BaseProvider):
             tmux_client.send_keys(self.session_name, self.window_name, "/exit")
             if not await wait_for_shell(self.terminal_id, timeout=10.0):
                 raise TimeoutError("Shell recovery timed out after --legacy-ui fallback")
+            # Clear the StatusMonitor buffer so the --legacy-ui attempt is detected
+            # against a clean buffer, not one still full of stale TUI marker bytes
+            # from the failed first attempt (which would otherwise time out too).
+            from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+            status_monitor.reset_buffer(self.terminal_id)
             legacy_args = ["kiro-cli", "chat", "--legacy-ui"]
             if model:
                 legacy_args.extend(["--model", model])

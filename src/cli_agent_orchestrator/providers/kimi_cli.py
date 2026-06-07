@@ -40,6 +40,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
+from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
 
@@ -388,8 +389,10 @@ class KimiCliProvider(BaseProvider):
         if not output:
             return TerminalStatus.UNKNOWN
 
-        # Strip ANSI codes for reliable pattern matching
-        clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
+        # Strip the RAW pipe-pane escapes (cursor positioning, in-place redraws),
+        # not just SGR colour codes, so the bottom-anchored prompt/processing
+        # checks see clean, line-oriented text on the raw stream.
+        clean_output = strip_terminal_escapes(output)
 
         # Check the bottom lines for the idle prompt.
         # Kimi's TUI has padding lines between prompt and status bar.

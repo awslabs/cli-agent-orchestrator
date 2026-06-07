@@ -12,6 +12,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
+from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
 
@@ -334,7 +335,10 @@ class CodexProvider(BaseProvider):
         if not output:
             return TerminalStatus.UNKNOWN
 
-        clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
+        # Strip the RAW pipe-pane escapes (cursor positioning, in-place redraws),
+        # not just SGR colour codes — otherwise cursor sequences survive and the
+        # idle ``›`` prompt / structural checks below misfire on the raw stream.
+        clean_output = strip_terminal_escapes(output)
         tail_output = "\n".join(clean_output.splitlines()[-25:])
 
         # Search for user messages, excluding the Codex TUI footer when present.
