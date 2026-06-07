@@ -492,6 +492,165 @@ class TestClaudeCodeProviderStatusDetection:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         assert provider.get_status(output) != TerminalStatus.PROCESSING
 
+    def test_get_status_new_tui_completed_box(self):
+        """Newest TUI: '✻ Sautéed for Ns' summary above an empty boxed ❯ → COMPLETED.
+
+        The box arrives with blank lines between separators and the ❯ (the form
+        strip_terminal_escapes produces from in-place CUU/CHA redraws).
+        """
+        output = (
+            "●def greet(name):\n" "✻ Sautéed for 1s\n" + "─" * 30 + "\n\n❯ \n\n" + "─" * 30 + "\n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+    def test_get_status_new_tui_live_spinner_box(self):
+        """Newest TUI: a live '…ing…' spinner above the boxed ❯ → PROCESSING.
+
+        The spinner renders ABOVE the box top border, where the structural
+        spinner-before-separator walk cannot see it; the box-gated branch must.
+        """
+        output = (
+            "●def greet(name):\n" "✢ Cultivating…\n" + "─" * 30 + "\n\n❯ \n\n" + "─" * 30 + "\n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    def test_get_status_boxless_completion_summary(self):
+        """Newest TUI, box rolled out of the buffer: summary + bare ❯ → COMPLETED.
+
+        A fast turn can push the box separators out of the rolling buffer while
+        the '✻ Sautéed for Ns' summary and trailing prompt survive; COMPLETED
+        must still be detected without the box gate.
+        """
+        output = "✻ Sautéed for 1s\n❯ \n← for agents\n"
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+    def test_get_status_new_tui_real_raw_capture_completed(self):
+        """Regression for the real raw FIFO capture of a finished newest-TUI turn.
+
+        Drives the full pipeline get_status -> strip_terminal_escapes -> box gate
+        on the actual captured bytes (escape/redraw sequences intact), unlike the
+        cleaned inline literals above. See the new-TUI box-adjacency fix.
+        """
+        from cli_agent_orchestrator.providers.claude_code import NEW_TUI_BOX_PATTERN
+        from cli_agent_orchestrator.utils.text import strip_terminal_escapes
+
+        fixture = Path(__file__).parent / "fixtures" / "claude_code_new_tui_completed_raw.txt"
+        raw = fixture.read_text(encoding="utf-8", errors="replace")
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status(raw) == TerminalStatus.COMPLETED
+        # Lock the gate behaviour the fix depends on: the box is detectable in the
+        # cleaned buffer despite the blank lines the redraw escapes introduce.
+        assert NEW_TUI_BOX_PATTERN.search(strip_terminal_escapes(raw))
+
+    def test_get_status_asterisk_spinner_frame_is_processing(self):
+        """A live spinner on its ASCII '*' animation frame → PROCESSING, not IDLE.
+
+        The newest TUI cycles its spinner glyph through "· ✢ * ✶ ✻ ✽"; the bare
+        '*' frame was previously absent from the spinner classes, so a turn whose
+        captured frame landed on '*' read as IDLE.
+        """
+        box = "─" * 30
+        output = "●working\n* Cultivating… (2s · ↓ 5 tokens)\n" + box + "\n\n❯\xa0\n\n" + box + "\n"
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    def test_get_status_asterisk_spinner_not_false_completed(self):
+        """An in-flight '*' spinner above the box wins over a completion-shaped
+        line embedded in the streamed answer → PROCESSING, never a false COMPLETED.
+        """
+        box = "─" * 30
+        output = (
+            "●Here is the expected render:\n✻ Sautéed for 1s\n...done.\n"
+            "* Cultivating… (2s · ↓ 5 tokens)\n" + box + "\n\n❯\xa0\n\n" + box + "\n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    def test_get_status_stale_spinner_above_response_in_box_not_processing(self):
+        """A stale spinner left ABOVE a response (empty box, no summary) is not the
+        line directly above the box → COMPLETED, not a false PROCESSING.
+        """
+        box = "─" * 24
+        output = "✢ Cultivating…\n⏺ Old response\n" + box + "\n❯ \n" + box + "\n"
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+    def test_get_status_mid_buffer_blockquote_box_not_processing(self):
+        """A separator-framed markdown blockquote in the response is NOT the input
+        box (it does not contain the last ❯), so a spinner-shaped bullet near it
+        must not trigger PROCESSING on a finished legacy ⏺ turn.
+        """
+        box = "─" * 24
+        output = (
+            "⏺ Done. Here is the markdown:\n· Refactoring…\n" + box + "\n\n> \n\n" + box + "\n❯ \n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+    def test_get_status_completed_survives_version_footer(self):
+        """A finished new-TUI turn whose footer shows the "· latest:…" version
+        notice must stay COMPLETED (the gerund-anchored spinner guard ignores the
+        status bar), not collapse to a timeout-inducing IDLE.
+        """
+        box = "─" * 30
+        output = (
+            "●done\n✻ Sautéed for 1s\n"
+            + box
+            + "\n\n❯\xa0\n\n"
+            + box
+            + "\n  current: 2.1.63 · latest:…"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+    def test_get_status_response_bullet_above_box_not_processing(self):
+        """A response bullet ending in '…' directly above the box is NOT a spinner.
+
+        The line-above-box check requires the gerund to be the FIRST word after the
+        glyph, so a markdown bullet like "* Remember to deploy…" cannot be mistaken
+        for a live "* Cultivating…" spinner and flip a finished turn to PROCESSING.
+        """
+        box = "─" * 30
+        output = (
+            "⏺ I updated the config and verified the tests pass.\n"
+            "* Remember to restart the service after deploying…\n" + box + "\n❯ \n" + box + "\n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+    def test_get_status_version_notice_above_box_not_processing(self):
+        """A "· latest: … update…" version notice directly above the box is not a
+        spinner (no first-word gerund) → COMPLETED, not a false PROCESSING.
+        """
+        box = "─" * 30
+        output = (
+            "⏺ All done. Anything else?\n"
+            "· latest: v2.1.50 available, run /upgrade to update…\n" + box + "\n❯ \n" + box + "\n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+    def test_get_status_multiword_compaction_spinner_above_box(self):
+        """The MULTI-WORD live spinner "✢ Compacting conversation…" directly above
+        the box → PROCESSING. The gerund need only be the FIRST word; the ellipsis
+        may follow later, so a real compaction frame is not misread as COMPLETED.
+        """
+        box = "─" * 75
+        output = (
+            "⏺ Starting work on the task…\n│ reading files\n\n"
+            "❯ refactor the auth module\n\n✢ Compacting conversation…\n\n\n"
+            + box
+            + "\n\n❯ \n\n"
+            + box
+            + "\n\n⏵⏵ bypass permissions on · esc to interrupt · high · /effort\n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
 
 class TestClaudeCodeProviderMessageExtraction:
     """Tests for ClaudeCodeProvider message extraction."""

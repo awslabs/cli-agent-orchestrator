@@ -34,7 +34,11 @@ RESPONSE_PATTERN = r"⏺(?:\x1b\[[0-9;]*m)*\s+"  # Handle any ANSI codes between
 # - New format: "✽ Cooking… (6s · ↓ 174 tokens · thinking)"
 # - Minimal format: "✻ Orbiting…" (no parenthesized status)
 # Common: spinner char + text + ellipsis, optionally followed by parenthesized status
-PROCESSING_PATTERN = r"[✶✢✽✻✳·].*\u2026"
+# The leading class includes the ASCII asterisk "*" (U+002A): the newest
+# Claude Code TUI cycles its spinner glyph through "· ✢ * ✶ ✻ ✽", so ~1 in 6
+# captured frames shows a bare "*". Omitting it left a live "* Cultivating…"
+# frame invisible to every processing detector (false IDLE/COMPLETED mid-turn).
+PROCESSING_PATTERN = r"[✶✢✽✻✳·*].*\u2026"
 # Structural PROCESSING indicator (reference pattern — get_status uses an
 # inline last-separator-anchored version to avoid false positives from
 # mid-conversation compaction events like "✢ Compacting conversation…"):
@@ -64,16 +68,32 @@ COMPLETION_SUMMARY_PATTERN = r"[✶✢✽✻✳][^\n…]*\bfor\s+\d+(?:\.\d+)?\s
 # Detecting this box GATES the new-TUI status logic so legacy output is
 # unaffected. The ❯ line must be essentially empty (just the prompt) so a
 # response/echo line like "❯ my task" does NOT match.
-# NOTE: separator length (─{8,}) and adjacency may need tuning against a
-# real new-TUI capture.
+#
+# The interior `(?:[ \t\xa0]*\n){0,2}` tolerates up to two WHITESPACE-ONLY
+# lines between each separator and the ❯ line. This is required against the
+# RAW pipe-pane stream: get_status runs strip_terminal_escapes first, which
+# converts the newest TUI's in-place CUU/CHA redraw escapes into newlines, so
+# the box arrives as "─…\n\n❯\xa0\n\n─…" (one blank line each side) rather than
+# the immediately-adjacent form a tmux-rendered snapshot would show. Only blank
+# lines are tolerated (not arbitrary content), so a "❯ my task" echo or a
+# "⏺ response"/compaction line between separators still cannot match, and the
+# {0,2} bound keeps the match local so it cannot span two distinct separators.
 NEW_TUI_BOX_PATTERN = re.compile(
-    r"─{8,}[^\n]*\n[ \t]*[>❯][ \t\xa0]*\n[ \t]*─{8,}",
+    r"─{8,}[^\n]*\n(?:[ \t\xa0]*\n){0,2}[ \t]*[>❯][ \t\xa0]*\n(?:[ \t\xa0]*\n){0,2}[ \t]*─{8,}",
     re.MULTILINE,
 )
 # Live spinner in the new TUI: spinner glyph + a gerund ("…ing") + the … ellipsis,
 # e.g. "✻ Cultivating…", "· Swirling…". Tighter than PROCESSING_PATTERN so the
 # version status bar ("· latest:…") is not mistaken for a live spinner.
-NEW_TUI_SPINNER_PATTERN = r"[✶✢✽✻✳·][^\n]*ing…"
+NEW_TUI_SPINNER_PATTERN = r"[✶✢✽✻✳·*][^\n]*ing…"
+# Spinner on the line DIRECTLY ABOVE the new-TUI input box. Tighter than
+# NEW_TUI_SPINNER_PATTERN: the FIRST word after the leading glyph must be a
+# gerund (ends in "ing"); the … ellipsis may follow later on the line so the
+# real multi-word compaction spinner "✢ Compacting conversation…" still matches.
+# Requiring the gerund as the FIRST word rejects a response bullet
+# ("* Remember to deploy…") or the version footer ("· latest: … update…")
+# sitting directly above the box from being misread as a live spinner.
+NEW_TUI_BOX_SPINNER_PATTERN = re.compile(r"^[ \t]*[✶✢✽✻✳·*][ \t]+\w*ing\b.*…")
 
 
 class ClaudeCodeProvider(BaseProvider):
@@ -413,6 +433,13 @@ class ClaudeCodeProvider(BaseProvider):
         for m in re.finditer(COMPLETION_SUMMARY_PATTERN, output):
             last_completion = m
 
+        # Live "…ing…" spinner of the new TUI (gerund-anchored, so the version
+        # status-bar "· latest:…" is not mistaken for one). Used by the ungated
+        # COMPLETED branch below to stay PROCESSING when a turn is still running.
+        last_live_spinner = None
+        for m in re.finditer(NEW_TUI_SPINNER_PATTERN, output):
+            last_live_spinner = m
+
         # FALLBACK PROCESSING: spinner visible AND no separator follows it yet
         # (early in execution before the separator appears). Position comparison
         # is used here only when no separator is present (safe case).
@@ -429,34 +456,43 @@ class ClaudeCodeProvider(BaseProvider):
         ):
             return TerminalStatus.WAITING_USER_ANSWER
 
-        # New Claude Code TUI: the ❯ input prompt is BOXED between two separator
-        # lines. Only when that box is present do we use the new-TUI signals;
-        # otherwise we fall through to the legacy ⏺-based logic unchanged, so
-        # older Claude Code builds behave exactly as before. The structural
-        # "spinner-before-separator" check above cannot see the new-TUI spinner
-        # because it renders ABOVE the box's top border.
-        if NEW_TUI_BOX_PATTERN.search(output):
-            last_live_spinner = None
-            for m in re.finditer(NEW_TUI_SPINNER_PATTERN, output):
-                last_live_spinner = m
-            # PROCESSING: a live "…ing…" spinner is the freshest status line
-            # (newer than any completion summary from a prior turn).
-            if last_live_spinner is not None and (
-                last_completion is None
-                or last_live_spinner.start() > last_completion.start()
-            ):
+        # New Claude Code TUI PROCESSING: the input prompt is BOXED between two
+        # separators, and the live spinner renders on the line DIRECTLY ABOVE the
+        # box's top border — where the structural "spinner-before-separator" walk
+        # above cannot see it (it breaks at the box's top separator). Anchor to
+        # the box that actually CONTAINS the last ❯ prompt, then require a spinner
+        # on the freshest non-blank line immediately above it. This rejects two
+        # false positives the prior "spinner anywhere + any box" gate allowed:
+        #   1. a stale spinner left above a response by an interrupted/finished
+        #      turn (the line above the box is the response, not the spinner), and
+        #   2. a mid-buffer separator-framed region (e.g. a markdown blockquote)
+        #      that is not the real input box (it does not contain the last ❯).
+        # Older builds (no box) fall through to the legacy ⏺-based logic unchanged.
+        input_box = None
+        if last_idle is not None:
+            for m in NEW_TUI_BOX_PATTERN.finditer(output):
+                if m.start() <= last_idle.start() < m.end():
+                    input_box = m
+        if input_box is not None:
+            line_above_box = output[: input_box.start()].rstrip("\n").rsplit("\n", 1)[-1]
+            if NEW_TUI_BOX_SPINNER_PATTERN.search(line_above_box):
                 return TerminalStatus.PROCESSING
-            # COMPLETED: a "✻ <Verb>ed for Ns" summary sits above the empty ❯ box
-            # and is the freshest spinner-glyph line (newer than any live spinner).
-            if (
-                last_completion is not None
-                and last_idle is not None
-                and (
-                    last_live_spinner is None
-                    or last_completion.start() > last_live_spinner.start()
-                )
-            ):
-                return TerminalStatus.COMPLETED
+
+        # New Claude Code TUI COMPLETED: a "✻ <Verb>ed for Ns" past-tense summary
+        # (no ellipsis) sits above the empty ❯ prompt after a finished turn,
+        # replacing the old ⏺ marker. Detected WITHOUT the box gate, because the
+        # newest TUI's final completion redraw can flatten the box separators out
+        # of the cleaned buffer while the summary + prompt survive. Suppressed by
+        # any fresher live "…ing…" spinner, so a still-running turn stays
+        # PROCESSING. (A broad PROCESSING-pattern guard is intentionally NOT used
+        # here: it would also match the version status-bar footer "· latest:…",
+        # wrongly suppressing a genuine COMPLETED into a timeout-inducing IDLE.)
+        if (
+            last_completion is not None
+            and last_idle is not None
+            and (last_live_spinner is None or last_completion.start() > last_live_spinner.start())
+        ):
+            return TerminalStatus.COMPLETED
 
         # COMPLETED: ⏺ response exists AND ❯ prompt is visible (agent finished).
         if last_response and last_idle:
