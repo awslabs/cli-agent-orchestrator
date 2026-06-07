@@ -29,6 +29,17 @@ class ProviderError(Exception):
 # Regex patterns for Claude Code output analysis
 ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
 RESPONSE_PATTERN = r"⏺(?:\x1b\[[0-9;]*m)*\s+"  # Handle any ANSI codes between marker and text
+# Response marker at the START of a line, for message EXTRACTION only (not
+# status detection). Matches the legacy "⏺" (U+23FA) and the newest TUI's
+# "●" (U+25CF) response glyphs. Anchored to line start (MULTILINE) so a
+# mid-line "●" — e.g. the footer effort indicator "… esc to interrupt ● high
+# · /effort" — is NOT mistaken for a response marker. Kept separate from
+# RESPONSE_PATTERN so get_status's legacy ⏺-COMPLETED check is unaffected (adding
+# "●" there could fire COMPLETED mid-stream while a response is still rendering).
+EXTRACTION_RESPONSE_PATTERN = re.compile(
+    r"^[ \t]*(?:\x1b\[[0-9;]*m)*[⏺●](?:\x1b\[[0-9;]*m)*\s+",
+    re.MULTILINE,
+)
 # Match Claude Code processing spinners:
 # - Old format: "✽ Cooking… (esc to interrupt)" / "✶ Thinking… (esc to interrupt)"
 # - New format: "✽ Cooking… (6s · ↓ 174 tokens · thinking)"
@@ -532,20 +543,22 @@ class ClaudeCodeProvider(BaseProvider):
     _SOL_IDLE_RE = re.compile(r"^\s*(?:\x1b\[[0-9;]*m)*[>❯](?:\x1b\[[0-9;]*m)*[\s\xa0]")
 
     def extract_last_message_from_script(self, script_output: str) -> str:
-        """Extract Claude's final response message using ⏺ indicator."""
-        # Find all matches of response pattern
-        matches = list(re.finditer(RESPONSE_PATTERN, script_output))
+        """Extract Claude's final response message using the ⏺/● response marker."""
+        # Find all matches of the response pattern (legacy ⏺ or newest-TUI ●).
+        matches = list(re.finditer(EXTRACTION_RESPONSE_PATTERN, script_output))
 
         if not matches:
-            raise ValueError("No Claude Code response found - no ⏺ pattern detected")
+            raise ValueError("No Claude Code response found - no ⏺/● pattern detected")
 
         # Get the last match (final answer)
         last_match = matches[-1]
         start_pos = last_match.end()
 
-        # Extract everything after the last ⏺ until:
+        # Extract everything after the last marker until:
         # 1. A start-of-line idle prompt (❯ or >) — the definitive boundary
-        # 2. A completion stat line ("✻ Sautéed for 14s") — trims the stat
+        # 2. A separator line (the box border above the input prompt)
+        # 3. A completion stat line ("✻ Sautéed for 14s" / "✻ Worked for 3s") —
+        #    the newest TUI renders this between the response and the prompt box.
         # Using start-of-line anchor avoids false stops on ">" inside
         # response content (Java generics, git diffs, HTML tags, etc.).
         remaining_text = script_output[start_pos:]
@@ -560,11 +573,13 @@ class ClaudeCodeProvider(BaseProvider):
                 break
             if "────────" in line:
                 break
+            if re.search(COMPLETION_SUMMARY_PATTERN, clean_line):
+                break
 
             response_lines.append(clean_line)
 
         if not response_lines or not any(line.strip() for line in response_lines):
-            raise ValueError("Empty Claude Code response - no content found after ⏺")
+            raise ValueError("Empty Claude Code response - no content found after ⏺/●")
 
         # Join lines and clean up
         final_answer = "\n".join(response_lines).strip()

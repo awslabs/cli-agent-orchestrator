@@ -742,6 +742,41 @@ More content
         assert "Response content" in result
         assert "More content" not in result
 
+    def test_extract_message_new_tui_circle_glyph(self):
+        """Newest TUI uses '●' (U+25CF) as the response marker instead of '⏺'.
+
+        Extraction must recognize '●', trim the '✻ Worked for Ns' completion stat,
+        and NOT mistake the footer's mid-line effort indicator '● high' for a
+        response marker.
+        """
+        output = (
+            "❯ Create a greet function\n\n"
+            "● def greet(name):\n"
+            '    return f"Hello, {name}!"\n\n'
+            "✻ Worked for 3s\n\n"
+            "────────────────────────────────\n"
+            "❯ \n"
+            "────────────────────────────────\n"
+            "  ⏵⏵ bypass permissions on · esc to interrupt ● high · /effort\n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        result = provider.extract_last_message_from_script(output)
+
+        assert "def greet(name):" in result
+        assert 'return f"Hello, {name}!"' in result
+        # completion stat + footer chrome must not leak
+        assert "Worked for 3s" not in result
+        assert "esc to interrupt" not in result
+        assert "high" not in result
+
+    def test_extract_message_circle_mid_line_not_a_marker(self):
+        """A '●' that is NOT at the start of a line (e.g. inside footer chrome with
+        no real response) yields no response, not a spurious extraction."""
+        output = "  ⏵⏵ bypass permissions on · esc to interrupt ● high · /effort\n❯ \n"
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        with pytest.raises(ValueError, match="No Claude Code response found"):
+            provider.extract_last_message_from_script(output)
+
 
 class TestClaudeCodeProviderMisc:
     """Tests for miscellaneous ClaudeCodeProvider methods."""
