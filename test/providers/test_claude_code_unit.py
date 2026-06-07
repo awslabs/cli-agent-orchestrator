@@ -673,6 +673,26 @@ class TestClaudeCodeProviderStatusDetection:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         assert provider.get_status(output) == TerminalStatus.COMPLETED
 
+    def test_get_status_boxless_completion_after_stale_spinner(self):
+        """COMPLETED when the finished turn is repainted BOXLESS below a stale
+        spinner + separator.
+
+        The newest TUI sometimes leaves the prior frame's spinner ("· …ing…") and
+        its box separator in the buffer, then paints "✻ <Verb>ed for Ns" + ❯
+        afterwards with no fresh separators. The spinner-before-separator walk must
+        NOT report PROCESSING off the stale spinner — the completion summary after
+        the last separator is the freshest state. (Real handoff capture otherwise
+        stuck at PROCESSING until timeout.)
+        """
+        box = "─" * 30
+        output = (
+            "· Whatchamacalliting… (1s · ↓ 13 tokens)\n❯ \n"
+            + box
+            + "\n✻ Cogitated for 1s\n❯ \n← for agents\n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
 
 class TestClaudeCodeProviderMessageExtraction:
     """Tests for ClaudeCodeProvider message extraction."""

@@ -416,7 +416,17 @@ class ClaudeCodeProvider(BaseProvider):
         # 2. Post-exit: live spinner → sep (task done) → ❯ /exit → last sep (exit menu)
         _sep_re = re.compile(r"(?:\x1b\[[0-9;]*m)*\u2500{20,}")
         _sep_positions = [m.start() for m in _sep_re.finditer(output)]
-        if _sep_positions:
+        # If a completion summary ("✻ <Verb>ed for Ns") appears AFTER the last
+        # separator, the newest TUI has repainted the finished turn BOXLESS below
+        # the last box's bottom border (its own separators flattened out of the
+        # cleaned buffer). The spinner still sitting above that separator is then
+        # stale, so suppress the spinner-before-separator walk and let the
+        # COMPLETED branch win. During genuine processing nothing but the footer
+        # follows the last separator, so this never hides a live turn.
+        _boxless_completion_tail = bool(
+            _sep_positions and re.search(COMPLETION_SUMMARY_PATTERN, output[_sep_positions[-1] :])
+        )
+        if _sep_positions and not _boxless_completion_tail:
             pre_sep_lines = output[: _sep_positions[-1]].rstrip("\n").split("\n")
             for line in reversed(pre_sep_lines):
                 if re.search(r"[✶✢✽✻✳·][^\n]*\u2026", line):
