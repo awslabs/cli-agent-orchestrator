@@ -10,6 +10,17 @@ import re
 # - \x1b[E / \x1b[nE   — CNL (Cursor Next Line)
 _LINE_START_CSI = re.compile(r"\x1b\[(?:1?G|\d*A|\d*E)")
 
+# Forward horizontal positioning on the SAME line: CHA to a column > 1
+# (\x1b[<n>G with n != 1) or cursor-forward (\x1b[<n>C). The TUI lays out spaced
+# words/columns with these instead of emitting literal spaces, e.g. the
+# completion summary "✻\x1b[3GWorked\x1b[10Gfor\x1b[14G3s" or a spinner
+# "✢\x1b[3GCultivating…". Stripping them to "" glues the words together
+# ("Workedfor3s", "✢Cultivating…") and breaks status patterns that rely on the
+# spacing ("<Verb>ed for Ns", "<glyph> <gerund>…"). Replace with a single space
+# so words stay separated. Runs AFTER _LINE_START_CSI, which has already turned
+# column-1 CHA into newlines, so only column>1 moves remain here.
+_FORWARD_CURSOR_CSI = re.compile(r"\x1b\[\d*[GC]")
+
 # CSI (Control Sequence Introducer) — covers SGR, cursor, erase, scroll, etc.
 # Per ECMA-48: ESC [ <params> <intermediates> <final byte>
 _CSI_PATTERN = re.compile(r"(\x9B|\x1B\[)[0-?]*[ -/]*[@-~]")
@@ -45,6 +56,8 @@ def strip_terminal_escapes(text: str) -> str:
     # These sequences mean "start writing from column 1" (e.g. spinner redraws,
     # prompt redraws) — semantically a new logical line for pattern matching.
     text = _LINE_START_CSI.sub("\n", text)
+    # Preserve word separation for column-positioned text (see _FORWARD_CURSOR_CSI).
+    text = _FORWARD_CURSOR_CSI.sub(" ", text)
     text = _CSI_PATTERN.sub("", text)
     text = _OSC_PATTERN.sub("", text)
     text = _CONTROL_CHARS_PATTERN.sub("", text)

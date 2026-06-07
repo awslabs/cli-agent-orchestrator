@@ -651,6 +651,28 @@ class TestClaudeCodeProviderStatusDetection:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         assert provider.get_status(output) == TerminalStatus.PROCESSING
 
+    def test_get_status_column_positioned_completion_summary(self):
+        """COMPLETED when the completion summary is laid out with column-move
+        escapes instead of literal spaces.
+
+        The newest TUI sometimes redraws the summary as
+        "✻\\x1b[3GWorked\\x1b[10Gfor\\x1b[14G3s" (each word positioned with CHA),
+        which has NO literal spaces. get_status -> strip_terminal_escapes must
+        re-insert spaces so "Worked for 3s" matches the completion pattern; a raw
+        capture from a real handoff otherwise stuck at IDLE forever.
+        """
+        box = "─" * 40
+        output = (
+            '●def greet(name):\n    return f"Hello, {name}!"\n\n\n'
+            "\x1b[38;5;246m✻\x1b[3GWorked\x1b[10Gfor\x1b[14G3s\x1b[39m\n\n\n"
+            + box
+            + "\n\x1b[3G❯\xa0\n"
+            + box
+            + "\n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
 
 class TestClaudeCodeProviderMessageExtraction:
     """Tests for ClaudeCodeProvider message extraction."""
