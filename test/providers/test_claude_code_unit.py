@@ -693,6 +693,26 @@ class TestClaudeCodeProviderStatusDetection:
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         assert provider.get_status(output) == TerminalStatus.COMPLETED
 
+    def test_get_status_completed_via_response_when_summary_clipped(self):
+        """COMPLETED via the ● response marker when the completion summary is
+        clipped to "✻ Crunched for " (no duration) by the redraw.
+
+        The newest TUI sometimes writes the summary's duration with a separate
+        cursor-positioned write that the raw stream splits off, leaving
+        "✻ Crunched for " (no "Ns") which COMPLETION_SUMMARY_PATTERN can't match.
+        A start-of-line ● response above the prompt is the robust completion
+        signal (real handoff capture otherwise stuck at IDLE until timeout).
+        """
+        box = "─" * 30
+        output = (
+            "● def multiply(a, b):\n    return a * b\n"
+            "· Multiplying…\n" + box + "\n❯ \n" + box + "\n"
+            "  ⏵⏵ bypass permissions on · esc to interrupt ● high · /effort\n"
+            "✻ Crunched for \n❯ \n ← for agents\n You've used 94% of your session limit\n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
 
 class TestClaudeCodeProviderMessageExtraction:
     """Tests for ClaudeCodeProvider message extraction."""

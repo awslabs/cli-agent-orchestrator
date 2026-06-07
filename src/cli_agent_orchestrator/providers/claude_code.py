@@ -454,13 +454,6 @@ class ClaudeCodeProvider(BaseProvider):
         for m in re.finditer(COMPLETION_SUMMARY_PATTERN, output):
             last_completion = m
 
-        # Live "…ing…" spinner of the new TUI (gerund-anchored, so the version
-        # status-bar "· latest:…" is not mistaken for one). Used by the ungated
-        # COMPLETED branch below to stay PROCESSING when a turn is still running.
-        last_live_spinner = None
-        for m in re.finditer(NEW_TUI_SPINNER_PATTERN, output):
-            last_live_spinner = m
-
         # FALLBACK PROCESSING: spinner visible AND no separator follows it yet
         # (early in execution before the separator appears). Position comparison
         # is used here only when no separator is present (safe case).
@@ -499,24 +492,25 @@ class ClaudeCodeProvider(BaseProvider):
             if NEW_TUI_BOX_SPINNER_PATTERN.search(line_above_box):
                 return TerminalStatus.PROCESSING
 
-        # New Claude Code TUI COMPLETED: a "✻ <Verb>ed for Ns" past-tense summary
-        # (no ellipsis) sits above the empty ❯ prompt after a finished turn,
-        # replacing the old ⏺ marker. Detected WITHOUT the box gate, because the
-        # newest TUI's final completion redraw can flatten the box separators out
-        # of the cleaned buffer while the summary + prompt survive. Suppressed by
-        # any fresher live "…ing…" spinner, so a still-running turn stays
-        # PROCESSING. (A broad PROCESSING-pattern guard is intentionally NOT used
-        # here: it would also match the version status-bar footer "· latest:…",
-        # wrongly suppressing a genuine COMPLETED into a timeout-inducing IDLE.)
-        if (
+        # COMPLETED: the finished turn left output behind — a "✻ <Verb>ed for Ns"
+        # completion summary OR a start-of-line response marker (legacy ⏺ or the
+        # newest TUI's ●) — and the input prompt is visible. This is reached only
+        # AFTER all the PROCESSING checks above, so any spinner still in the
+        # rolling buffer is a STALE frame, not the live turn; no spinner-freshness
+        # guard is applied here. (Such a guard wrongly pinned a finished turn at
+        # IDLE when the newest TUI clipped the completion summary's duration —
+        # "✻ Crunched for " — or rendered the summary on a · / * glyph frame that
+        # COMPLETION_SUMMARY_PATTERN excludes; the ● response marker is the robust
+        # fallback.) The ● is matched at line start only, so the footer effort
+        # indicator "… esc to interrupt ● high · /effort" is never counted.
+        last_sol_response = None
+        for m in re.finditer(EXTRACTION_RESPONSE_PATTERN, output):
+            last_sol_response = m
+        if last_idle is not None and (
             last_completion is not None
-            and last_idle is not None
-            and (last_live_spinner is None or last_completion.start() > last_live_spinner.start())
+            or last_sol_response is not None
+            or last_response is not None
         ):
-            return TerminalStatus.COMPLETED
-
-        # COMPLETED: ⏺ response exists AND ❯ prompt is visible (agent finished).
-        if last_response and last_idle:
             return TerminalStatus.COMPLETED
 
         # IDLE: shell prompt visible but no response yet (e.g. just initialized).
