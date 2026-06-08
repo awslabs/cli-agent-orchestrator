@@ -22,7 +22,7 @@ import re
 import shlex
 from typing import Optional
 
-from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import OPENCODE_CONFIG_DIR, OPENCODE_CONFIG_FILE
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
@@ -141,7 +141,7 @@ class OpenCodeCliProvider(BaseProvider):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
         command = self._build_launch_command()
-        tmux_client.send_keys(self.session_name, self.window_name, command)
+        get_backend().send_keys(self.session_name, self.window_name, command)
 
         # 120s covers first-run npm install (5–30s) and concurrent multi-agent launches.
         if not await wait_until_status(

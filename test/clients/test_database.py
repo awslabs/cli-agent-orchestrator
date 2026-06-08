@@ -636,11 +636,14 @@ class TestFlowOperations:
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_create_inbox_message(self, mock_session_class):
-        """Test creating an inbox message."""
+        """Test creating an inbox message when receiver terminal exists."""
         mock_session = MagicMock()
         mock_session.__enter__ = MagicMock(return_value=mock_session)
         mock_session.__exit__ = MagicMock(return_value=False)
         mock_session_class.return_value = mock_session
+
+        # Receiver terminal exists
+        mock_session.query.return_value.filter.return_value.first.return_value = MagicMock()
 
         # Setup mock to update message attributes on refresh
         def mock_refresh(msg):
@@ -660,6 +663,20 @@ class TestFlowOperations:
         assert result.message == "Hello"
         mock_session.add.assert_called_once()
         mock_session.commit.assert_called_once()
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_create_inbox_message_receiver_not_found(self, mock_session_class):
+        """create_inbox_message raises ValueError when receiver terminal does not exist."""
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        mock_session_class.return_value = mock_session
+
+        # Receiver terminal does not exist
+        mock_session.query.return_value.filter.return_value.first.return_value = None
+
+        with pytest.raises(ValueError, match="not found"):
+            create_inbox_message("sender-123", "dead-terminal", "Hello")
 
 
 class TestInitDb:

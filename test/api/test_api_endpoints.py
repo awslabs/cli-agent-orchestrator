@@ -28,12 +28,16 @@ class TestHealthCheck:
     """Tests for GET /health endpoint."""
 
     def test_health_check_returns_ok(self, client):
-        """GET /health returns status ok."""
+        """GET /health returns status ok with component health."""
         response = client.get("/health")
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "ok"
         assert data["service"] == "cli-agent-orchestrator"
+        components = data["components"]
+        assert components["cao"] == "ok"
+        assert components["herdr"] in ("ok", "unavailable")
+        assert components["claude"] in ("ok", "unavailable")
 
 
 # ── Agent profiles endpoint ──────────────────────────────────────────
@@ -1250,7 +1254,7 @@ class TestMainEntryPoint:
             patch("argparse.ArgumentParser.parse_args") as mock_args,
             patch("uvicorn.run") as mock_uvicorn,
         ):
-            mock_args.return_value = MagicMock(agents_dir=None, host=None, port=None)
+            mock_args.return_value = MagicMock(agents_dir=None, host=None, port=None, terminal=None)
 
             from cli_agent_orchestrator.api.main import main
 
@@ -1267,7 +1271,9 @@ class TestMainEntryPoint:
             patch("argparse.ArgumentParser.parse_args") as mock_args,
             patch("uvicorn.run") as mock_uvicorn,
         ):
-            mock_args.return_value = MagicMock(agents_dir=None, host="0.0.0.0", port=9999)
+            mock_args.return_value = MagicMock(
+                agents_dir=None, host="0.0.0.0", port=9999, terminal=None
+            )
 
             from cli_agent_orchestrator.api.main import main
 
@@ -1282,7 +1288,9 @@ class TestMainEntryPoint:
             patch("uvicorn.run"),
             patch("cli_agent_orchestrator.constants.KIRO_AGENTS_DIR") as _,
         ):
-            mock_args.return_value = MagicMock(agents_dir="/custom/agents", host=None, port=None)
+            mock_args.return_value = MagicMock(
+                agents_dir="/custom/agents", host=None, port=None, terminal=None
+            )
 
             from cli_agent_orchestrator.api.main import main
 
@@ -1304,7 +1312,9 @@ class TestMainEntryPoint:
         ):
             parent.attach_mock(mock_add, "add_cors")
             parent.attach_mock(mock_uvicorn, "uvicorn_run")
-            mock_args.return_value = MagicMock(agents_dir=None, host="0.0.0.0", port=9999)
+            mock_args.return_value = MagicMock(
+                agents_dir=None, host="0.0.0.0", port=9999, terminal=None
+            )
 
             from cli_agent_orchestrator.api.main import main
 
@@ -1314,3 +1324,37 @@ class TestMainEntryPoint:
                 call.add_cors("0.0.0.0", 9999),
                 call.uvicorn_run(app, host="0.0.0.0", port=9999),
             ]
+
+    def test_main_terminal_flag_overrides_backend(self):
+        """--terminal sets the backend via the factory before the server starts."""
+        with (
+            patch("argparse.ArgumentParser.parse_args") as mock_args,
+            patch("uvicorn.run"),
+            patch("cli_agent_orchestrator.backends.factory.BackendFactory.create") as mock_create,
+            patch("cli_agent_orchestrator.backends.registry.set_backend") as mock_set,
+        ):
+            mock_args.return_value = MagicMock(
+                agents_dir=None, host=None, port=None, terminal="herdr"
+            )
+
+            from cli_agent_orchestrator.api.main import main
+
+            main()
+
+            mock_create.assert_called_once_with(backend_override="herdr")
+            mock_set.assert_called_once_with(mock_create.return_value)
+
+    def test_main_no_terminal_flag_leaves_backend_lazy(self):
+        """Without --terminal, main() does not eagerly set the backend."""
+        with (
+            patch("argparse.ArgumentParser.parse_args") as mock_args,
+            patch("uvicorn.run"),
+            patch("cli_agent_orchestrator.backends.registry.set_backend") as mock_set,
+        ):
+            mock_args.return_value = MagicMock(agents_dir=None, host=None, port=None, terminal=None)
+
+            from cli_agent_orchestrator.api.main import main
+
+            main()
+
+            mock_set.assert_not_called()

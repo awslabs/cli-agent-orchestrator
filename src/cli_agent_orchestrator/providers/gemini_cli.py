@@ -38,7 +38,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import GEMINI_WORKSPACES_DIR
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
@@ -486,11 +486,11 @@ class GeminiCliProvider(BaseProvider):
         # tmux sessions where the shell environment is not fully loaded.
         # An echo round-trip ensures the shell has fully processed its init.
         warmup_marker = "CAO_SHELL_READY"
-        tmux_client.send_keys(self.session_name, self.window_name, f"echo {warmup_marker}")
+        get_backend().send_keys(self.session_name, self.window_name, f"echo {warmup_marker}")
         warmup_start = time.time()
         warmup_timeout = 15.0
         while time.time() - warmup_start < warmup_timeout:
-            output = tmux_client.get_history(self.session_name, self.window_name)
+            output = get_backend().get_history(self.session_name, self.window_name)
             if output and warmup_marker in output:
                 break
             await asyncio.sleep(0.5)
@@ -504,7 +504,9 @@ class GeminiCliProvider(BaseProvider):
         await asyncio.sleep(2)
 
         command = self._build_gemini_command()
-        tmux_client.send_keys(self.session_name, self.window_name, command)
+
+        # Send Gemini command to the tmux window
+        get_backend().send_keys(self.session_name, self.window_name, command)
 
         # Wait for Gemini CLI to finish initialization.
         # When -i is used: wait for COMPLETED specifically. The -i flag always

@@ -5,7 +5,7 @@ import re
 import shlex
 from typing import Optional
 
-from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
@@ -54,7 +54,7 @@ class QCliProvider(BaseProvider):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
         command = shlex.join(["q", "chat", "--agent", self._agent_profile])
-        tmux_client.send_keys(self.session_name, self.window_name, command)
+        get_backend().send_keys(self.session_name, self.window_name, command)
 
         if not await wait_until_status(
             self.terminal_id, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=30.0

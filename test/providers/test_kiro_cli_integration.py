@@ -22,6 +22,9 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
+from cli_agent_orchestrator.backends import registry
+from cli_agent_orchestrator.backends.registry import set_backend
+from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.manager import provider_manager
@@ -84,6 +87,26 @@ async def terminal(event_pipeline, mock_db, ensure_test_agent):
         tmux_client.kill_session(t.session_name)
     except Exception:
         pass
+
+
+@pytest.fixture(autouse=True)
+def use_tmux_backend():
+    """Pin the backend registry to TmuxBackend for these integration tests.
+
+    The provider/terminal flow calls get_backend() internally. The global
+    backend is set by BackendFactory which reads config.json, so on a host
+    configured for herdr this would fail. Pin to tmux explicitly since the
+    session fixture creates tmux sessions.
+
+    The backend registry is a module-level singleton, so the previous value is
+    saved and restored to avoid leaking the tmux pin into later tests.
+    """
+    previous = registry._backend
+    set_backend(TmuxBackend())
+    try:
+        yield
+    finally:
+        registry._backend = previous
 
 
 @pytest.fixture(autouse=True)

@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
+from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.constants import INBOX_RECONCILE_GRACE_SECONDS
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -183,6 +184,31 @@ class TestDeliverPending:
 
         assert order[0] == ("update", (1, MessageStatus.DELIVERED))
         assert order[1][0] == "send"
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_resolution_failure_leaves_message_pending(
+        self, mock_get, mock_monitor, mock_term_svc, mock_update
+    ):
+        """A TerminalNotFoundError during send leaves the message PENDING, not FAILED.
+
+        Pane resolution can transiently fail (e.g. herdr pane not yet resolvable).
+        Status is optimistically set DELIVERED before send (to close the
+        re-entrancy race), so on a resolution failure it must be reset to PENDING
+        for a later retry — never left DELIVERED or marked FAILED.
+        """
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_term_svc.send_input.side_effect = TerminalNotFoundError("s:w")
+
+        svc = InboxService()
+        svc.deliver_pending("term-1")
+
+        # Final status is PENDING (reset after the optimistic DELIVERED), never FAILED.
+        assert mock_update.call_args_list[-1] == call(1, MessageStatus.PENDING)
+        assert call(1, MessageStatus.FAILED) not in mock_update.call_args_list
 
 
 class TestEagerInboxDelivery:

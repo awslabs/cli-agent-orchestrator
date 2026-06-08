@@ -182,6 +182,8 @@ cao shutdown --session cao-my-session   # shut down a specific session
 
 All agent sessions run in tmux — you can `tmux attach -t <session-name>` to watch agents in real time. For the full list of tmux shortcuts and the interactive window selector, see [docs/tmux.md](docs/tmux.md).
 
+CAO also supports [herdr](https://herdr.dev/) as an experimental alternative backend. herdr is agent-aware, so it replaces tmux output polling with real-time status events. For setup and configuration, see [docs/herdr.md](docs/herdr.md).
+
 ## Web UI
 
 CAO ships a bundled web dashboard for managing agents, terminals, and flows from the browser. The pre-built UI is packaged inside the wheel, so there is nothing extra to install — just start the server:

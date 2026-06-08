@@ -7,6 +7,7 @@ import asyncio
 import logging
 from itertools import groupby
 
+from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.clients.database import (
     get_pending_messages,
     list_pending_receiver_ids_by_provider,
@@ -121,6 +122,17 @@ class InboxService:
                         orchestration_type=OrchestrationType.SEND_MESSAGE,
                     )
                 logger.info(f"Delivered {len(batch)} message(s) to terminal {terminal_id}")
+            except TerminalNotFoundError as e:
+                # Pane not resolvable yet (e.g. a herdr pane that isn't mapped
+                # for this window). Treat as transient: reset to PENDING so the
+                # reconcile sweep retries rather than marking FAILED. These were
+                # optimistically set to DELIVERED above. (#271 semantic.)
+                for message in batch:
+                    update_message_status(message.id, MessageStatus.PENDING)
+                logger.warning(
+                    f"Pane not resolvable for terminal {terminal_id}; leaving "
+                    f"{len(batch)} message(s) pending for retry: {e}"
+                )
             except Exception as e:
                 for message in batch:
                     logger.error(f"Failed to deliver message {message.id} to {terminal_id}: {e}")

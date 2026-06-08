@@ -1,12 +1,12 @@
 """Launch command for CLI Agent Orchestrator CLI."""
 
 import os
-import subprocess
 import time
 
 import click
 import requests
 
+from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import (
     API_BASE_URL,
     DEFAULT_PROVIDER,
@@ -314,7 +314,7 @@ def launch(
                         fg="yellow",
                     )
                 )
-            subprocess.run(["tmux", "attach-session", "-t", terminal["session_name"]])
+            get_backend().attach_session(terminal["session_name"])
         elif message:
             ready = wait_until_terminal_status(
                 terminal["id"],

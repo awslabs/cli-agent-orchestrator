@@ -47,7 +47,7 @@ class TestKimiCliProviderInitialization:
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.kimi_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.kimi_cli.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.kimi_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
     async def test_initialize_success(self, mock_tmux, mock_wait_shell, mock_wait_status):
         """Test successful initialization sends kimi command and reaches IDLE."""
         mock_wait_shell.return_value = True
@@ -58,13 +58,13 @@ class TestKimiCliProviderInitialization:
 
         assert result is True
         assert provider._initialized is True
-        mock_tmux.send_keys.assert_called_once()
+        mock_tmux.return_value.send_keys.assert_called_once()
         mock_wait_shell.assert_called_once()
         mock_wait_status.assert_called_once()
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.kimi_cli.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.kimi_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
     async def test_initialize_shell_timeout(self, mock_tmux, mock_wait_shell):
         """Test shell init timeout raises TimeoutError."""
         mock_wait_shell.return_value = False
@@ -76,7 +76,7 @@ class TestKimiCliProviderInitialization:
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.kimi_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.kimi_cli.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.kimi_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
     async def test_initialize_kimi_timeout(self, mock_tmux, mock_wait_shell, mock_wait_status):
         """Test Kimi CLI init timeout raises TimeoutError."""
         mock_wait_shell.return_value = True
@@ -89,7 +89,7 @@ class TestKimiCliProviderInitialization:
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.kimi_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.kimi_cli.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.kimi_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
     async def test_initialize_with_agent_profile(
         self, mock_load, mock_tmux, mock_wait_shell, mock_wait_status
@@ -108,7 +108,7 @@ class TestKimiCliProviderInitialization:
         assert result is True
 
         # Verify kimi command includes --agent-file
-        call_args = mock_tmux.send_keys.call_args
+        call_args = mock_tmux.return_value.send_keys.call_args
         command = call_args[0][2]
         assert "--agent-file" in command
         assert "--yolo" in command
@@ -128,7 +128,7 @@ class TestKimiCliProviderInitialization:
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.kimi_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.kimi_cli.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.kimi_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
     async def test_initialize_with_mcp_servers(
         self, mock_load, mock_tmux, mock_wait_shell, mock_wait_status
@@ -156,7 +156,7 @@ class TestKimiCliProviderInitialization:
             result = await provider.initialize()
         assert result is True
 
-        call_args = mock_tmux.send_keys.call_args
+        call_args = mock_tmux.return_value.send_keys.call_args
         command = call_args[0][2]
         assert "--mcp-config" in command
         # No --config flag in command (breaks OAuth authentication)
@@ -165,7 +165,7 @@ class TestKimiCliProviderInitialization:
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.kimi_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.kimi_cli.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.kimi_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
     async def test_initialize_sends_kimi_command(
         self, mock_tmux, mock_wait_shell, mock_wait_status
     ):
@@ -176,7 +176,7 @@ class TestKimiCliProviderInitialization:
         provider = KimiCliProvider("term-1", "session-1", "window-1")
         await provider.initialize()
 
-        call_args = mock_tmux.send_keys.call_args
+        call_args = mock_tmux.return_value.send_keys.call_args
         command = call_args[0][2]
         assert "cd " in command
         assert "TERM=xterm-256color" in command

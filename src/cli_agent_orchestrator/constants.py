@@ -68,7 +68,7 @@ STATE_BUFFER_MAX = 8192
 EVENT_BUS_MAX_QUEUE_SIZE = 1024
 
 # Eager inbox delivery: when enabled, deliver queued messages to terminals in
-# PROCESSING or WAITING_USER_ANSWER state for providers that declare
+# PROCESSING state for providers that declare
 # accepts_input_while_processing=True. Eliminates latency between agent turns
 # for capable providers (e.g., Claude Code).
 EAGER_INBOX_DELIVERY = os.environ.get("CAO_EAGER_INBOX_DELIVERY", "false").lower() == "true"

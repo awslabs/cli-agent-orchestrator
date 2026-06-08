@@ -20,11 +20,11 @@ class TestCodexProviderInitialization:
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
     async def test_initialize_success(self, mock_tmux, mock_wait_shell, mock_wait_status):
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
-        mock_tmux.get_history.return_value = "OpenAI Codex (v0.98.0)"
+        mock_tmux.return_value.get_history.return_value = "OpenAI Codex (v0.98.0)"
 
         provider = CodexProvider("test1234", "test-session", "window-0", None)
         result = await provider.initialize()
@@ -32,9 +32,9 @@ class TestCodexProviderInitialization:
         assert result is True
         mock_wait_shell.assert_called_once()
         # Two send_keys calls: warm-up echo + codex with tmux-compatible flags
-        assert mock_tmux.send_keys.call_count == 2
-        mock_tmux.send_keys.assert_any_call("test-session", "window-0", "echo ready")
-        mock_tmux.send_keys.assert_any_call(
+        assert mock_tmux.return_value.send_keys.call_count == 2
+        mock_tmux.return_value.send_keys.assert_any_call("test-session", "window-0", "echo ready")
+        mock_tmux.return_value.send_keys.assert_any_call(
             "test-session",
             "window-0",
             "codex --yolo --no-alt-screen --disable shell_snapshot",
@@ -43,7 +43,7 @@ class TestCodexProviderInitialization:
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
     async def test_initialize_shell_timeout(self, mock_tmux, mock_wait_shell):
         mock_wait_shell.return_value = False
 
@@ -55,11 +55,11 @@ class TestCodexProviderInitialization:
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
     async def test_initialize_codex_timeout(self, mock_tmux, mock_wait_shell, mock_wait_status):
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = False
-        mock_tmux.get_history.return_value = "OpenAI Codex (v0.98.0)"
+        mock_tmux.return_value.get_history.return_value = "OpenAI Codex (v0.98.0)"
 
         provider = CodexProvider("test1234", "test-session", "window-0", None)
 
@@ -263,13 +263,13 @@ class TestCodexBuildCommand:
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
     async def test_initialize_with_agent_profile(
         self, mock_tmux, mock_load_profile, mock_wait_shell, mock_wait_status
     ):
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
-        mock_tmux.get_history.return_value = "OpenAI Codex (v0.98.0)"
+        mock_tmux.return_value.get_history.return_value = "OpenAI Codex (v0.98.0)"
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.system_prompt = "You are a supervisor."
@@ -282,7 +282,7 @@ class TestCodexBuildCommand:
 
         assert result is True
         # The second send_keys call should contain developer_instructions
-        codex_call = mock_tmux.send_keys.call_args_list[1]
+        codex_call = mock_tmux.return_value.send_keys.call_args_list[1]
         assert "developer_instructions=" in codex_call.args[2]
         assert "You are a supervisor." in codex_call.args[2]
 
@@ -1277,10 +1277,10 @@ class TestCodexProviderTrustPrompt:
     """Tests for Codex workspace trust prompt handling."""
 
     @pytest.mark.asyncio
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
     async def test_handle_trust_prompt_detected_and_accepted(self, mock_tmux):
         """Test that trust prompt is detected and auto-accepted."""
-        mock_tmux.get_history.return_value = (
+        mock_tmux.return_value.get_history.return_value = (
             "> You are running Codex in /Users/test/project\n"
             "\n"
             "  Since this folder is version controlled, you may wish to "
@@ -1289,28 +1289,24 @@ class TestCodexProviderTrustPrompt:
             "› 1. Yes, allow Codex to work in this folder without asking for approval\n"
             "  2. No, ask me to approve edits and commands\n"
         )
-        mock_session = MagicMock()
-        mock_window = MagicMock()
-        mock_pane = MagicMock()
-        mock_tmux.server.sessions.get.return_value = mock_session
-        mock_session.windows.get.return_value = mock_window
-        mock_window.active_pane = mock_pane
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         await provider._handle_trust_prompt(timeout=2.0)
 
-        mock_pane.send_keys.assert_called_once_with("", enter=True)
+        mock_tmux.return_value.send_special_key.assert_called_once_with(
+            "test-session", "window-0", "Enter"
+        )
 
     @pytest.mark.asyncio
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
     async def test_handle_trust_prompt_not_needed(self, mock_tmux):
         """Test early return when Codex starts without trust prompt."""
-        mock_tmux.get_history.return_value = "OpenAI Codex (v0.98.0)\n› "
+        mock_tmux.return_value.get_history.return_value = "OpenAI Codex (v0.98.0)\n› "
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         await provider._handle_trust_prompt(timeout=2.0)
 
-        mock_tmux.server.sessions.get.assert_not_called()
+        mock_tmux.return_value.send_special_key.assert_not_called()
 
     def test_get_status_trust_prompt_is_waiting_user_answer(self):
         """Test that trust prompt reports WAITING_USER_ANSWER, not PROCESSING."""
@@ -1329,23 +1325,19 @@ class TestCodexProviderTrustPrompt:
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.codex.wait_until_status")
     @patch("cli_agent_orchestrator.providers.codex.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    @patch("cli_agent_orchestrator.providers.codex.get_backend")
     async def test_initialize_with_trust_prompt(self, mock_tmux, mock_wait_shell, mock_wait_status):
         """Test that initialize handles trust prompt during startup."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
-        mock_tmux.get_history.return_value = (
+        mock_tmux.return_value.get_history.return_value = (
             "allow Codex to work in this folder without asking for approval.\n"
         )
-        mock_session = MagicMock()
-        mock_window = MagicMock()
-        mock_pane = MagicMock()
-        mock_tmux.server.sessions.get.return_value = mock_session
-        mock_session.windows.get.return_value = mock_window
-        mock_window.active_pane = mock_pane
 
         provider = CodexProvider("test1234", "test-session", "window-0")
         result = await provider.initialize()
 
         assert result is True
-        mock_pane.send_keys.assert_called_with("", enter=True)
+        mock_tmux.return_value.send_special_key.assert_called_with(
+            "test-session", "window-0", "Enter"
+        )

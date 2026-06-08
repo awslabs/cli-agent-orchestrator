@@ -54,10 +54,10 @@ class TestCreateSession:
 class TestListSessions:
     """Tests for list_sessions function."""
 
-    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
-    def test_list_sessions_success(self, mock_tmux):
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_list_sessions_success(self, mock_get_backend):
         """Test listing sessions successfully."""
-        mock_tmux.list_sessions.return_value = [
+        mock_get_backend.return_value.list_sessions.return_value = [
             {"id": "cao-session1", "name": "Session 1"},
             {"id": "cao-session2", "name": "Session 2"},
             {"id": "other-session", "name": "Other"},
@@ -68,19 +68,19 @@ class TestListSessions:
         assert len(result) == 2
         assert all(s["id"].startswith("cao-") for s in result)
 
-    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
-    def test_list_sessions_empty(self, mock_tmux):
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_list_sessions_empty(self, mock_get_backend):
         """Test listing sessions when none exist."""
-        mock_tmux.list_sessions.return_value = []
+        mock_get_backend.return_value.list_sessions.return_value = []
 
         result = list_sessions()
 
         assert result == []
 
-    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
-    def test_list_sessions_no_cao_sessions(self, mock_tmux):
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_list_sessions_no_cao_sessions(self, mock_get_backend):
         """Test listing sessions when no CAO sessions exist."""
-        mock_tmux.list_sessions.return_value = [
+        mock_get_backend.return_value.list_sessions.return_value = [
             {"id": "other-session1", "name": "Other 1"},
             {"id": "other-session2", "name": "Other 2"},
         ]
@@ -89,10 +89,10 @@ class TestListSessions:
 
         assert result == []
 
-    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
-    def test_list_sessions_error(self, mock_tmux):
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_list_sessions_error(self, mock_get_backend):
         """Test listing sessions with error."""
-        mock_tmux.list_sessions.side_effect = Exception("Tmux error")
+        mock_get_backend.return_value.list_sessions.side_effect = Exception("Tmux error")
 
         result = list_sessions()
 
@@ -103,40 +103,42 @@ class TestGetSession:
     """Tests for get_session function."""
 
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
-    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
-    def test_get_session_success(self, mock_tmux, mock_list_terminals):
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_get_session_success(self, mock_get_backend, mock_list_terminals):
         """Test getting session successfully."""
-        mock_tmux.session_exists.return_value = True
-        mock_tmux.list_sessions.return_value = [{"id": "cao-test", "name": "Test Session"}]
+        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.list_sessions.return_value = [
+            {"id": "cao-test", "name": "Test Session"}
+        ]
         mock_list_terminals.return_value = [{"id": "terminal1", "session": "cao-test"}]
 
         result = get_session("cao-test")
 
         assert result["session"]["id"] == "cao-test"
         assert len(result["terminals"]) == 1
-        mock_tmux.session_exists.assert_called_once_with("cao-test")
+        mock_get_backend.return_value.session_exists.assert_called_once_with("cao-test")
 
-    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
-    def test_get_session_not_found(self, mock_tmux):
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_get_session_not_found(self, mock_get_backend):
         """Test getting non-existent session."""
-        mock_tmux.session_exists.return_value = False
+        mock_get_backend.return_value.session_exists.return_value = False
 
         with pytest.raises(ValueError, match="Session 'cao-nonexistent' not found"):
             get_session("cao-nonexistent")
 
-    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
-    def test_get_session_not_in_list(self, mock_tmux):
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_get_session_not_in_list(self, mock_get_backend):
         """Test getting session that exists but not in list."""
-        mock_tmux.session_exists.return_value = True
-        mock_tmux.list_sessions.return_value = []
+        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.list_sessions.return_value = []
 
         with pytest.raises(ValueError, match="Session 'cao-test' not found"):
             get_session("cao-test")
 
-    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
-    def test_get_session_error(self, mock_tmux):
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_get_session_error(self, mock_get_backend):
         """Test getting session with error."""
-        mock_tmux.session_exists.side_effect = Exception("Tmux error")
+        mock_get_backend.return_value.session_exists.side_effect = Exception("Tmux error")
 
         with pytest.raises(Exception, match="Tmux error"):
             get_session("cao-test")
@@ -147,10 +149,10 @@ class TestDeleteSession:
 
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
-    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_success(
         self,
-        mock_tmux,
+        mock_get_backend,
         mock_list_terminals,
         mock_delete_terminal,
     ):
@@ -158,9 +160,9 @@ class TestDeleteSession:
 
         delete_session delegates per-terminal teardown (FIFO reader, status
         buffer, provider, DB) to terminal_service.delete_terminal, then kills
-        the tmux session and returns the Dict result shape.
+        the backend session and returns the Dict result shape.
         """
-        mock_tmux.session_exists.return_value = True
+        mock_get_backend.return_value.session_exists.return_value = True
         mock_list_terminals.return_value = [
             {"id": "terminal1"},
             {"id": "terminal2"},
@@ -169,41 +171,50 @@ class TestDeleteSession:
         result = delete_session("cao-test")
 
         assert result == {"deleted": ["cao-test"], "errors": []}
-        mock_tmux.kill_session.assert_called_once_with("cao-test")
+        mock_get_backend.return_value.kill_session.assert_called_once_with("cao-test")
         # Each terminal is torn down via the event-driven delete_terminal path.
         assert mock_delete_terminal.call_count == 2
         mock_delete_terminal.assert_any_call("terminal1", registry=ANY)
         mock_delete_terminal.assert_any_call("terminal2", registry=ANY)
 
-    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
-    def test_delete_session_not_found(self, mock_tmux):
-        """Test deleting non-existent session."""
-        mock_tmux.session_exists.return_value = False
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_delete_session_when_backend_session_already_gone(
+        self, mock_get_backend, mock_list_terminals, mock_delete_terminal
+    ):
+        """Backend session already gone — delete_session should not raise and not
+        call kill_session, but still tear down each terminal via delete_terminal."""
+        mock_get_backend.return_value.session_exists.return_value = False
+        mock_list_terminals.return_value = [{"id": "terminal1"}]
 
-        with pytest.raises(ValueError, match="Session 'cao-nonexistent' not found"):
-            delete_session("cao-nonexistent")
+        result = delete_session("cao-test")
+
+        assert result == {"deleted": ["cao-test"], "errors": []}
+        mock_get_backend.return_value.kill_session.assert_not_called()
+        mock_delete_terminal.assert_called_once_with("terminal1", registry=ANY)
 
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
-    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_no_terminals(
-        self, mock_tmux, mock_list_terminals, mock_delete_terminal
+        self, mock_get_backend, mock_list_terminals, mock_delete_terminal
     ):
         """Test deleting session with no terminals."""
-        mock_tmux.session_exists.return_value = True
+        mock_get_backend.return_value.session_exists.return_value = True
         mock_list_terminals.return_value = []
 
         result = delete_session("cao-test")
 
         assert result == {"deleted": ["cao-test"], "errors": []}
-        mock_tmux.kill_session.assert_called_once_with("cao-test")
+        mock_get_backend.return_value.kill_session.assert_called_once_with("cao-test")
         mock_delete_terminal.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
-    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
-    def test_delete_session_error(self, mock_tmux, mock_list_terminals):
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_delete_session_error(self, mock_get_backend, mock_list_terminals):
         """Test deleting session with error."""
-        mock_tmux.session_exists.return_value = True
+        mock_get_backend.return_value.session_exists.return_value = True
         mock_list_terminals.side_effect = Exception("Database error")
 
         with pytest.raises(Exception, match="Database error"):
@@ -211,12 +222,12 @@ class TestDeleteSession:
 
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
-    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_continues_when_terminal_cleanup_fails(
-        self, mock_tmux, mock_list_terminals, mock_delete_terminal
+        self, mock_get_backend, mock_list_terminals, mock_delete_terminal
     ):
         """Test that delete_session continues even when terminal teardown fails for some terminals."""
-        mock_tmux.session_exists.return_value = True
+        mock_get_backend.return_value.session_exists.return_value = True
         mock_list_terminals.return_value = [
             {"id": "terminal1"},
             {"id": "terminal2"},
@@ -234,18 +245,18 @@ class TestDeleteSession:
 
         # Session should still be deleted despite per-terminal teardown failure
         assert result == {"deleted": ["cao-test"], "errors": []}
-        mock_tmux.kill_session.assert_called_once_with("cao-test")
+        mock_get_backend.return_value.kill_session.assert_called_once_with("cao-test")
         # All three terminal teardowns were attempted
         assert mock_delete_terminal.call_count == 3
 
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
-    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_cleans_up_each_terminal(
-        self, mock_tmux, mock_list_terminals, mock_delete_terminal
+        self, mock_get_backend, mock_list_terminals, mock_delete_terminal
     ):
         """Test that delete_session tears down every terminal in the session via delete_terminal."""
-        mock_tmux.session_exists.return_value = True
+        mock_get_backend.return_value.session_exists.return_value = True
         mock_list_terminals.return_value = [
             {"id": "term-aaa"},
             {"id": "term-bbb"},

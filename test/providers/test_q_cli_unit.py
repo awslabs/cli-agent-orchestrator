@@ -25,7 +25,7 @@ class TestQCliProviderInitialization:
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.q_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.q_cli.wait_until_status")
-    @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.q_cli.get_backend")
     async def test_initialize_success(self, mock_tmux, mock_wait_status, mock_wait_shell):
         """Test successful initialization."""
         mock_wait_shell.return_value = True
@@ -36,14 +36,14 @@ class TestQCliProviderInitialization:
 
         assert result is True
         mock_wait_shell.assert_called_once()
-        mock_tmux.send_keys.assert_called_once_with(
+        mock_tmux.return_value.send_keys.assert_called_once_with(
             "test-session", "window-0", "q chat --agent developer"
         )
         mock_wait_status.assert_called_once()
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.q_cli.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.q_cli.get_backend")
     async def test_initialize_shell_timeout(self, mock_tmux, mock_wait_shell):
         """Test initialization with shell timeout."""
         mock_wait_shell.return_value = False
@@ -56,7 +56,7 @@ class TestQCliProviderInitialization:
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.q_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.q_cli.wait_until_status")
-    @patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.q_cli.get_backend")
     async def test_initialize_q_cli_timeout(self, mock_tmux, mock_wait_status, mock_wait_shell):
         """Test initialization with Q CLI timeout."""
         mock_wait_shell.return_value = True
@@ -399,9 +399,9 @@ class TestQCliProviderRegexPatterns:
             "[developer] 100%>",
         )
         # Should match when an optional U+03BB lambda character appears before >
-        assert re.search(provider._idle_prompt_pattern, "[developer] 45%\u03bb>")
-        assert re.search(provider._idle_prompt_pattern, "[developer] 45%\u03bb >")
-        assert re.search(provider._idle_prompt_pattern, "[developer] 100%\u03bb>")
+        assert re.search(provider._idle_prompt_pattern, "[developer] 45%λ>")
+        assert re.search(provider._idle_prompt_pattern, "[developer] 45%λ >")
+        assert re.search(provider._idle_prompt_pattern, "[developer] 100%λ>")
 
     def test_idle_prompt_pattern_with_trailing_text(self):
         """Test idle prompt pattern matches with trailing text."""

@@ -15,9 +15,10 @@ def test_launch_passes_cwd_by_default():
 
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run") as mock_subprocess,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
+        mock_get_backend.return_value.attach_session.return_value = None
 
         mock_post.return_value.json.return_value = {
             "session_name": "test-session",
@@ -42,9 +43,10 @@ def test_launch_passes_explicit_working_directory():
 
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run") as mock_subprocess,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
+        mock_get_backend.return_value.attach_session.return_value = None
 
         mock_post.return_value.json.return_value = {
             "session_name": "test-session",
@@ -132,9 +134,10 @@ def test_launch_with_session_name():
 
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run") as mock_subprocess,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
+        mock_get_backend.return_value.attach_session.return_value = None
         mock_post.return_value.json.return_value = {
             "session_name": "custom-session",
             "id": "test-terminal-id",
@@ -183,12 +186,12 @@ def test_launch_generic_exception():
 
 
 def test_launch_headless_mode():
-    """Test launch in headless mode doesn't attach to tmux."""
+    """Test launch in headless mode doesn't attach to the backend."""
     runner = CliRunner()
 
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run") as mock_subprocess,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
     ):
         mock_post.return_value.json.return_value = {
             "session_name": "test-session",
@@ -199,16 +202,16 @@ def test_launch_headless_mode():
         result = runner.invoke(launch, ["--agents", "test-agent", "--headless", "--yolo"])
 
         assert result.exit_code == 0
-        # In headless mode, subprocess.run should not be called
-        mock_subprocess.assert_not_called()
+        # In headless mode, attach_session should not be called
+        mock_get_backend.return_value.attach_session.assert_not_called()
 
 
 def test_launch_non_headless_waits_for_idle_before_attach():
-    """Non-headless launch must wait for IDLE/COMPLETED before tmux attach.
+    """Non-headless launch must wait for IDLE/COMPLETED before attaching.
 
     Regression guard for #220: attaching before the TUI finishes initializing
     races with input-handler wiring and silently drops keystrokes. The wait
-    must be called with the terminal id before subprocess.run.
+    must be called with the terminal id before attach_session.
     """
     runner = CliRunner()
 
@@ -216,7 +219,7 @@ def test_launch_non_headless_waits_for_idle_before_attach():
 
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run") as mock_subprocess,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
         mock_post.return_value.json.return_value = {
@@ -234,7 +237,7 @@ def test_launch_non_headless_waits_for_idle_before_attach():
             call_order.append("attach")
 
         mock_wait.side_effect = record_wait
-        mock_subprocess.side_effect = record_attach
+        mock_get_backend.return_value.attach_session.side_effect = record_attach
 
         result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
 
@@ -248,14 +251,14 @@ def test_launch_non_headless_waits_for_idle_before_attach():
 def test_launch_non_headless_attaches_even_if_wait_times_out():
     """Non-headless launch warns but still attaches if the idle wait times out.
 
-    The wait is advisory: orphaning the session in tmux (by refusing to attach)
+    The wait is advisory: orphaning the session (by refusing to attach)
     would be worse than letting the user inspect a slow-initializing session.
     """
     runner = CliRunner()
 
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run") as mock_subprocess,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
         mock_post.return_value.json.return_value = {
@@ -265,14 +268,13 @@ def test_launch_non_headless_attaches_even_if_wait_times_out():
         }
         mock_post.return_value.raise_for_status.return_value = None
         mock_wait.return_value = False
+        mock_get_backend.return_value.attach_session.return_value = None
 
         result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
 
         assert result.exit_code == 0
         assert "did not reach idle within 120s" in result.output
-        mock_subprocess.assert_called_once()
-        attach_cmd = mock_subprocess.call_args.args[0]
-        assert attach_cmd[:2] == ["tmux", "attach-session"]
+        mock_get_backend.return_value.attach_session.assert_called_once_with("test-session")
 
 
 def test_launch_workspace_confirmation_accepted():
@@ -281,7 +283,7 @@ def test_launch_workspace_confirmation_accepted():
 
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run") as mock_subprocess,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
     ):
         mock_post.return_value.json.return_value = {
             "session_name": "test-session",
@@ -323,7 +325,7 @@ def test_launch_workspace_confirmation_skipped_with_yolo_flag():
 
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run") as mock_subprocess,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
     ):
         mock_post.return_value.json.return_value = {
             "session_name": "test-session",
@@ -348,7 +350,7 @@ def test_launch_workspace_confirmation_for_default_provider():
 
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run") as mock_subprocess,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
     ):
         mock_post.return_value.json.return_value = {
             "session_name": "test-session",
@@ -370,7 +372,7 @@ def test_launch_yolo_sets_unrestricted_allowed_tools():
 
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run") as mock_subprocess,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
         mock_post.return_value.json.return_value = {
@@ -395,7 +397,7 @@ def test_launch_allowed_tools_override():
 
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run") as mock_subprocess,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
     ):
         mock_post.return_value.json.return_value = {
             "session_name": "test-session",
@@ -429,7 +431,7 @@ def test_launch_builtin_profile_resolves_role_defaults():
 
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run") as mock_subprocess,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
     ):
         mock_post.return_value.json.return_value = {
             "session_name": "test-session",
@@ -573,7 +575,7 @@ def test_launch_honors_profile_provider_when_flag_not_given():
 
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run"),
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
         patch(
             "cli_agent_orchestrator.utils.agent_profiles.resolve_provider",
             return_value="claude_code",
@@ -610,7 +612,7 @@ def test_launch_yolo_still_resolves_profile_provider():
 
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run"),
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
         patch(
             "cli_agent_orchestrator.utils.agent_profiles.resolve_provider",
@@ -641,7 +643,7 @@ def test_launch_allowed_tools_still_resolves_profile_provider():
 
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run"),
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
         patch(
             "cli_agent_orchestrator.utils.agent_profiles.resolve_provider",
             return_value="gemini_cli",
@@ -681,7 +683,7 @@ def test_launch_explicit_provider_skips_profile_resolution():
 
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run"),
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
         patch("cli_agent_orchestrator.utils.agent_profiles.resolve_provider") as mock_resolve,
     ):
@@ -713,7 +715,7 @@ def test_launch_yolo_falls_back_to_default_when_profile_lacks_provider():
 
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run"),
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
         patch(
             "cli_agent_orchestrator.utils.agent_profiles.resolve_provider",
@@ -800,7 +802,7 @@ def test_launch_forwards_env_in_json_body_not_url():
 
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run"),
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
         mock_post.return_value.json.return_value = {
@@ -845,7 +847,7 @@ def test_launch_without_env_omits_request_body():
 
     with (
         patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
-        patch("cli_agent_orchestrator.cli.commands.launch.subprocess.run"),
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
         patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
     ):
         mock_post.return_value.json.return_value = {

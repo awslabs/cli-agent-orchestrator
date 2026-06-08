@@ -48,10 +48,10 @@ class TestGeminiCliProviderInitialization:
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.gemini_cli.asyncio.sleep", return_value=None)
     @patch("cli_agent_orchestrator.providers.gemini_cli.wait_for_shell", return_value=True)
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.gemini_cli.get_backend")
     async def test_initialize_success(self, mock_tmux, mock_wait_shell, mock_async_sleep):
         """Test successful initialization sends warm-up + gemini command and reaches IDLE."""
-        mock_tmux.get_history.return_value = "CAO_SHELL_READY"
+        mock_tmux.return_value.get_history.return_value = "CAO_SHELL_READY"
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
 
         mock_monitor = MagicMock()
@@ -68,13 +68,15 @@ class TestGeminiCliProviderInitialization:
 
         assert result is True
         assert provider._initialized is True
-        assert mock_tmux.send_keys.call_count == 2  # warm-up echo + gemini command
-        mock_tmux.send_keys.assert_any_call("session-1", "window-1", "echo CAO_SHELL_READY")
+        assert mock_tmux.return_value.send_keys.call_count == 2  # warm-up echo + gemini command
+        mock_tmux.return_value.send_keys.assert_any_call(
+            "session-1", "window-1", "echo CAO_SHELL_READY"
+        )
         mock_wait_shell.assert_called_once()
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.gemini_cli.wait_for_shell", return_value=False)
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.gemini_cli.get_backend")
     async def test_initialize_shell_timeout(self, mock_tmux, mock_wait_shell):
         """Test shell init timeout raises TimeoutError."""
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
@@ -85,7 +87,7 @@ class TestGeminiCliProviderInitialization:
     @patch("cli_agent_orchestrator.providers.gemini_cli.asyncio.sleep", return_value=None)
     @patch("cli_agent_orchestrator.providers.gemini_cli.time")
     @patch("cli_agent_orchestrator.providers.gemini_cli.wait_for_shell", return_value=True)
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.gemini_cli.get_backend")
     async def test_initialize_gemini_timeout(
         self, mock_tmux, mock_wait_shell, mock_time, mock_async_sleep
     ):
@@ -97,7 +99,7 @@ class TestGeminiCliProviderInitialization:
             return call_count[0] * 10.0
 
         mock_time.time.side_effect = advancing_time
-        mock_tmux.get_history.return_value = "CAO_SHELL_READY"
+        mock_tmux.return_value.get_history.return_value = "CAO_SHELL_READY"
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
 
         mock_monitor = MagicMock()
@@ -110,13 +112,13 @@ class TestGeminiCliProviderInitialization:
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.gemini_cli.asyncio.sleep", return_value=None)
     @patch("cli_agent_orchestrator.providers.gemini_cli.wait_for_shell", return_value=True)
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.gemini_cli.get_backend")
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
     async def test_initialize_with_mcp_servers(
         self, mock_load, mock_tmux, mock_wait_shell, mock_async_sleep, tmp_path
     ):
         """Test initialization with MCP servers writes to settings.json."""
-        mock_tmux.get_history.return_value = "CAO_SHELL_READY"
+        mock_tmux.return_value.get_history.return_value = "CAO_SHELL_READY"
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.system_prompt = None
@@ -150,7 +152,7 @@ class TestGeminiCliProviderInitialization:
         assert "cao-mcp-server" in settings["mcpServers"]
         assert settings["mcpServers"]["cao-mcp-server"]["command"] == "npx"
         assert settings["mcpServers"]["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"] == "term-1"
-        call_args = mock_tmux.send_keys.call_args_list[1]
+        call_args = mock_tmux.return_value.send_keys.call_args_list[1]
         command = call_args[0][2]
         assert command == "gemini --yolo --sandbox false"
         assert "cao-mcp-server" in provider._mcp_server_names
@@ -158,12 +160,12 @@ class TestGeminiCliProviderInitialization:
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.gemini_cli.asyncio.sleep", return_value=None)
     @patch("cli_agent_orchestrator.providers.gemini_cli.wait_for_shell", return_value=True)
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.gemini_cli.get_backend")
     async def test_initialize_sends_gemini_command(
         self, mock_tmux, mock_wait_shell, mock_async_sleep
     ):
         """Test that initialize sends warm-up echo then the correct gemini --yolo command."""
-        mock_tmux.get_history.return_value = "CAO_SHELL_READY"
+        mock_tmux.return_value.get_history.return_value = "CAO_SHELL_READY"
         provider = GeminiCliProvider("term-1", "session-1", "window-1")
 
         mock_monitor = MagicMock()
@@ -171,8 +173,11 @@ class TestGeminiCliProviderInitialization:
         with patch("cli_agent_orchestrator.services.status_monitor.status_monitor", mock_monitor):
             await provider.initialize()
 
-        assert mock_tmux.send_keys.call_args_list[0][0][2] == "echo CAO_SHELL_READY"
-        assert mock_tmux.send_keys.call_args_list[1][0][2] == "gemini --yolo --sandbox false"
+        assert mock_tmux.return_value.send_keys.call_args_list[0][0][2] == "echo CAO_SHELL_READY"
+        assert (
+            mock_tmux.return_value.send_keys.call_args_list[1][0][2]
+            == "gemini --yolo --sandbox false"
+        )
 
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
     def test_initialize_with_invalid_profile(self, mock_load):
@@ -186,7 +191,7 @@ class TestGeminiCliProviderInitialization:
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.gemini_cli.asyncio.sleep", return_value=None)
     @patch("cli_agent_orchestrator.providers.gemini_cli.wait_for_shell", return_value=True)
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.gemini_cli.get_backend")
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
     async def test_initialize_with_prompt_interactive_waits_for_completed(
         self, mock_load, mock_tmux, mock_wait_shell, mock_async_sleep
@@ -197,8 +202,8 @@ class TestGeminiCliProviderInitialization:
         mock_profile.system_prompt = "You are a supervisor."
         mock_profile.mcpServers = {}
         mock_load.return_value = mock_profile
-        mock_tmux.get_history.return_value = "CAO_SHELL_READY"
-        mock_tmux.get_pane_working_directory.return_value = None
+        mock_tmux.return_value.get_history.return_value = "CAO_SHELL_READY"
+        mock_tmux.return_value.get_pane_working_directory.return_value = None
 
         # First status check returns IDLE (should be skipped for -i), then COMPLETED
         mock_monitor = MagicMock()
@@ -220,7 +225,7 @@ class TestGeminiCliProviderInitialization:
         assert provider._uses_prompt_interactive is False
 
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.gemini_cli.get_backend")
     def test_build_command_sets_prompt_interactive_flag(self, mock_tmux, mock_load):
         """Test _build_gemini_command sets _uses_prompt_interactive when -i is used."""
         mock_profile = MagicMock()
@@ -228,7 +233,7 @@ class TestGeminiCliProviderInitialization:
         mock_profile.system_prompt = "You are a supervisor."
         mock_profile.mcpServers = {}
         mock_load.return_value = mock_profile
-        mock_tmux.get_pane_working_directory.return_value = None
+        mock_tmux.return_value.get_pane_working_directory.return_value = None
 
         provider = GeminiCliProvider("term-1", "session-1", "window-1", agent_profile="supervisor")
         command = provider._build_gemini_command()
@@ -237,7 +242,7 @@ class TestGeminiCliProviderInitialization:
         assert "-i" in command
 
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.gemini_cli.get_backend")
     def test_build_command_no_prompt_interactive_without_system_prompt(self, mock_tmux, mock_load):
         """Test _uses_prompt_interactive stays False when profile has no system prompt."""
         mock_profile = MagicMock()
@@ -980,10 +985,10 @@ class TestEnsureWorkspacesParentTrusted:
 class TestGeminiCliProviderModelFlag:
     """Tests that profile.model is forwarded to Gemini CLI via --model."""
 
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.gemini_cli.get_backend")
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
     def test_build_command_appends_model_when_set(self, mock_load, mock_tmux, tmp_path):
-        mock_tmux.get_pane_working_directory.return_value = str(tmp_path)
+        mock_tmux.return_value.get_pane_working_directory.return_value = str(tmp_path)
         mock_profile = MagicMock()
         mock_profile.model = "gemini-2.5-pro"
         mock_profile.name = "agent"
@@ -996,10 +1001,10 @@ class TestGeminiCliProviderModelFlag:
 
         assert "--model gemini-2.5-pro" in command
 
-    @patch("cli_agent_orchestrator.providers.gemini_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.gemini_cli.get_backend")
     @patch("cli_agent_orchestrator.providers.gemini_cli.load_agent_profile")
     def test_build_command_omits_model_when_unset(self, mock_load, mock_tmux, tmp_path):
-        mock_tmux.get_pane_working_directory.return_value = str(tmp_path)
+        mock_tmux.return_value.get_pane_working_directory.return_value = str(tmp_path)
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.name = "agent"

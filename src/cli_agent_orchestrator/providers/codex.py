@@ -7,7 +7,7 @@ import shlex
 import time
 from typing import Optional
 
-from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -267,7 +267,7 @@ class CodexProvider(BaseProvider):
         """
         start_time = time.time()
         while time.time() - start_time < timeout:
-            output = tmux_client.get_history(self.session_name, self.window_name)
+            output = get_backend().get_history(self.session_name, self.window_name)
             if not output:
                 await asyncio.sleep(1.0)
                 continue
@@ -277,17 +277,7 @@ class CodexProvider(BaseProvider):
 
             if re.search(TRUST_PROMPT_PATTERN, clean_output):
                 logger.info("Codex workspace trust prompt detected, auto-accepting")
-                session = tmux_client.server.sessions.get(session_name=self.session_name)
-                if session is None:
-                    time.sleep(1.0)
-                    continue
-                window = session.windows.get(window_name=self.window_name)
-                if window is None:
-                    time.sleep(1.0)
-                    continue
-                pane = window.active_pane
-                if pane:
-                    pane.send_keys("", enter=True)
+                get_backend().send_special_key(self.session_name, self.window_name, "Enter")
                 return
 
             # Check if Codex has fully started (welcome banner visible)
@@ -306,7 +296,7 @@ class CodexProvider(BaseProvider):
         # Send a warm-up command before launching codex.
         # Codex exits immediately in freshly-created tmux sessions where the shell
         # has not yet processed a full interactive command cycle.
-        tmux_client.send_keys(self.session_name, self.window_name, "echo ready")
+        get_backend().send_keys(self.session_name, self.window_name, "echo ready")
         await asyncio.sleep(2.0)
 
         # Build command with flags and agent profile (developer_instructions).
@@ -315,7 +305,7 @@ class CodexProvider(BaseProvider):
         # --disable shell_snapshot: avoid TTY input conflicts (SIGTTIN) in tmux
         #   caused by the shell_snapshot subprocess inheriting stdin.
         command = self._build_codex_command()
-        tmux_client.send_keys(self.session_name, self.window_name, command)
+        get_backend().send_keys(self.session_name, self.window_name, command)
 
         # Handle workspace trust prompt if it appears (new/untrusted directories)
         await self._handle_trust_prompt(timeout=20.0)

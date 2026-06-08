@@ -2,7 +2,7 @@
 
 import re
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -326,7 +326,7 @@ class TestInitialize:
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.opencode_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     async def test_initialize_success_returns_true(self, mock_tmux, mock_shell, mock_wait):
         mock_shell.return_value = True
         mock_wait.return_value = True
@@ -336,7 +336,7 @@ class TestInitialize:
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.opencode_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     async def test_initialize_uses_120s_timeout(self, mock_tmux, mock_shell, mock_wait):
         mock_shell.return_value = True
         mock_wait.return_value = True
@@ -348,42 +348,42 @@ class TestInitialize:
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.opencode_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     async def test_initialize_sends_agent_flag(self, mock_tmux, mock_shell, mock_wait):
         mock_shell.return_value = True
         mock_wait.return_value = True
         provider = make_provider(agent_profile="developer")
         await provider.initialize()
-        sent_cmd = mock_tmux.send_keys.call_args[0][2]
+        sent_cmd = mock_tmux.return_value.send_keys.call_args[0][2]
         assert "--agent developer" in sent_cmd
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.opencode_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     async def test_initialize_includes_model_when_set(self, mock_tmux, mock_shell, mock_wait):
         mock_shell.return_value = True
         mock_wait.return_value = True
         provider = make_provider(model="anthropic/claude-sonnet-4-6")
         await provider.initialize()
-        sent_cmd = mock_tmux.send_keys.call_args[0][2]
+        sent_cmd = mock_tmux.return_value.send_keys.call_args[0][2]
         assert "--model anthropic/claude-sonnet-4-6" in sent_cmd
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.opencode_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     async def test_initialize_no_model_flag_when_unset(self, mock_tmux, mock_shell, mock_wait):
         mock_shell.return_value = True
         mock_wait.return_value = True
         provider = make_provider(model=None)
         await provider.initialize()
-        sent_cmd = mock_tmux.send_keys.call_args[0][2]
+        sent_cmd = mock_tmux.return_value.send_keys.call_args[0][2]
         assert "--model" not in sent_cmd
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.opencode_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     async def test_initialize_raises_on_shell_timeout(self, mock_tmux, mock_shell):
         mock_shell.return_value = False
         provider = make_provider()
@@ -393,7 +393,7 @@ class TestInitialize:
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.opencode_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     async def test_initialize_raises_on_opencode_timeout(self, mock_tmux, mock_shell, mock_wait):
         mock_shell.return_value = True
         mock_wait.return_value = False
@@ -404,13 +404,13 @@ class TestInitialize:
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.opencode_cli.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.opencode_cli.tmux_client")
+    @patch("cli_agent_orchestrator.providers.opencode_cli.get_backend")
     async def test_initialize_sets_env_vars_in_command(self, mock_tmux, mock_shell, mock_wait):
         mock_shell.return_value = True
         mock_wait.return_value = True
         provider = make_provider()
         await provider.initialize()
-        sent_cmd = mock_tmux.send_keys.call_args[0][2]
+        sent_cmd = mock_tmux.return_value.send_keys.call_args[0][2]
         assert "OPENCODE_DISABLE_AUTOUPDATE=1" in sent_cmd
         assert "OPENCODE_DISABLE_MOUSE=1" in sent_cmd
         assert "OPENCODE_CLIENT=cao" in sent_cmd

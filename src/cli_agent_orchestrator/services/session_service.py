@@ -22,8 +22,8 @@ Session Lifecycle:
 import logging
 from typing import Dict, List
 
+from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import list_terminals_by_session
-from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.constants import SESSION_PREFIX
 from cli_agent_orchestrator.models.terminal import Terminal
 from cli_agent_orchestrator.plugins import (
@@ -83,7 +83,7 @@ async def create_session(
 def list_sessions() -> List[Dict]:
     """List all sessions from tmux."""
     try:
-        tmux_sessions = tmux_client.list_sessions()
+        tmux_sessions = get_backend().list_sessions()
         return [s for s in tmux_sessions if s["id"].startswith(SESSION_PREFIX)]
     except Exception as e:
         logger.error(f"Failed to list sessions: {e}")
@@ -93,10 +93,10 @@ def list_sessions() -> List[Dict]:
 def get_session(session_name: str) -> Dict:
     """Get session with terminals."""
     try:
-        if not tmux_client.session_exists(session_name):
+        if not get_backend().session_exists(session_name):
             raise ValueError(f"Session '{session_name}' not found")
 
-        tmux_sessions = tmux_client.list_sessions()
+        tmux_sessions = get_backend().list_sessions()
         session_data = next((s for s in tmux_sessions if s["id"] == session_name), None)
 
         if not session_data:
@@ -118,8 +118,7 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
     """
     result: Dict = {"deleted": [], "errors": []}
     try:
-        if not tmux_client.session_exists(session_name):
-            raise ValueError(f"Session '{session_name}' not found")
+        session_alive = get_backend().session_exists(session_name)
 
         from cli_agent_orchestrator.services import terminal_service
 
@@ -133,8 +132,9 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
             except Exception as e:
                 logger.warning(f"Failed to cleanup terminal {terminal['id']}: {e}")
 
-        # Kill tmux session
-        tmux_client.kill_session(session_name)
+        # Kill backend session only if it still exists
+        if session_alive:
+            get_backend().kill_session(session_name)
 
         # Drop the per-session forwarded-env mapping (issue #248). Safe
         # even when no vars were forwarded — the helper is a no-op then.
