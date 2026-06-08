@@ -85,8 +85,13 @@ def _add_terminal_in_session(
 ):
     """Add a terminal to an existing session via the API.
 
-    The ``provider`` param is the *fallback* — if the agent profile declares
-    its own provider, ``resolve_provider()`` overrides it.
+    The cross-provider override lives in the worker's agent profile (its
+    ``provider:`` frontmatter key). The ``POST .../terminals`` endpoint only
+    consults ``resolve_provider()`` (which reads that key) when no explicit
+    ``provider`` query param is sent — an explicit param is taken as
+    authoritative and would suppress the override. So we deliberately do NOT
+    send ``provider`` here; the worker's provider is resolved from its profile.
+    ``provider`` is retained only as the display fallback in the return value.
 
     Retries on 500 errors (typically init timeouts) up to ``retries`` times.
 
@@ -99,7 +104,6 @@ def _add_terminal_in_session(
         resp = requests.post(
             f"{API_BASE_URL}/sessions/{session_name}/terminals",
             params={
-                "provider": provider,
                 "agent_profile": agent_profile,
             },
         )
@@ -315,4 +319,36 @@ class TestCrossProviderClaudeToGemini:
             supervisor_provider="claude_code",
             worker_profile="data_analyst_gemini_cli",
             expected_worker_provider="gemini_cli",
+        )
+
+
+@pytest.mark.e2e
+class TestCrossProviderClaudeToKimi:
+    """Claude Code supervisor session, worker runs on Kimi CLI.
+
+    NOTE: Cannot run inside Claude Code (nested session blocked).
+    """
+
+    def test_assign_cross_provider(self, require_claude, require_kimi):
+        """Worker profile declares provider: kimi_cli, overriding claude_code fallback."""
+        _run_cross_provider_test(
+            supervisor_provider="claude_code",
+            worker_profile="data_analyst_kimi_cli",
+            expected_worker_provider="kimi_cli",
+        )
+
+
+@pytest.mark.e2e
+class TestCrossProviderKimiToClaude:
+    """Kimi CLI supervisor session, worker runs on Claude Code.
+
+    NOTE: Cannot run inside Claude Code (nested session blocked).
+    """
+
+    def test_assign_cross_provider(self, require_kimi, require_claude):
+        """Worker profile declares provider: claude_code, overriding kimi_cli fallback."""
+        _run_cross_provider_test(
+            supervisor_provider="kimi_cli",
+            worker_profile="data_analyst_claude_code",
+            expected_worker_provider="claude_code",
         )

@@ -1068,3 +1068,48 @@ class TestKimiCliProviderPatterns:
         """Test tail lines constant is reasonable for Kimi's TUI layout."""
         assert IDLE_PROMPT_TAIL_LINES >= 40  # Must cover tall terminals (46+ rows)
         assert IDLE_PROMPT_TAIL_LINES <= 100  # Not unreasonably large
+
+
+# ---------------------------------------------------------------------------
+# Newest "Kimi Code" TUI status detection (regression for the redesigned CLI)
+#
+# These fixtures are REAL pipe-pane captures (last ~8KB rolling-buffer window)
+# of the redesigned Kimi Code TUI, which has no ✨/💫 prompt — readiness is the
+# "agent (<model> ●)" status bar / "context: N%" footer with an empty
+# "── input ──" box, and a turn-in-flight is a braille spinner ("⠧ Thinking…
+# Ns · N tokens"). The legacy emoji-prompt detector timed out at init on this
+# build; get_status() must classify these raw buffers correctly.
+# ---------------------------------------------------------------------------
+_KIMI_FIXTURES = Path(__file__).parent / "fixtures"
+
+
+class TestKimiCodeNewTuiStatus:
+    """get_status() against real captured raw buffers of the new Kimi Code TUI."""
+
+    def _provider(self):
+        return KimiCliProvider("term-x", "session-x", "window-x", agent_profile="developer")
+
+    def test_new_tui_idle_raw_capture(self):
+        """A freshly-initialized terminal (no task yet) reads IDLE — this is the
+        init readiness signal the legacy emoji detector missed."""
+        buf = (_KIMI_FIXTURES / "kimi_code_tui_idle_raw.txt").read_text(encoding="utf-8")
+        assert self._provider().get_status(buf) == TerminalStatus.IDLE
+
+    def test_new_tui_processing_raw_capture(self):
+        """A turn in flight (braille spinner is the freshest output) reads PROCESSING."""
+        buf = (_KIMI_FIXTURES / "kimi_code_tui_processing_raw.txt").read_text(encoding="utf-8")
+        assert self._provider().get_status(buf) == TerminalStatus.PROCESSING
+
+    def test_new_tui_completed_raw_capture(self):
+        """A finished turn (response present, spinner cleared, prompt visible)
+        reads COMPLETED even though stale spinner frames linger in the buffer."""
+        buf = (_KIMI_FIXTURES / "kimi_code_tui_completed_raw.txt").read_text(encoding="utf-8")
+        assert self._provider().get_status(buf) == TerminalStatus.COMPLETED
+
+    def test_new_tui_stale_spinner_does_not_block_completed(self):
+        """Position-based detection: a stale braille frame earlier in the buffer
+        must not be mistaken for a live turn once the prompt has redrawn."""
+        buf = (_KIMI_FIXTURES / "kimi_code_tui_completed_raw.txt").read_text(encoding="utf-8")
+        # Sanity: the completed fixture really does contain stale braille frames.
+        assert any("⠀" <= ch <= "⣿" for ch in buf)
+        assert self._provider().get_status(buf) != TerminalStatus.PROCESSING

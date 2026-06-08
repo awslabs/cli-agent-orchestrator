@@ -114,6 +114,28 @@ THINKING_BULLET_RAW_PATTERN = r"\x1b\[38;5;244m\s*•"
 # Used to identify TUI chrome that should be excluded from content analysis.
 STATUS_BAR_PATTERN = r"\d+:\d+\s+.*(?:agent|shell)\s*\("
 
+# ---------------------------------------------------------------------------
+# Newest "Kimi Code" TUI (the redesigned CLI). Older builds rendered an emoji
+# prompt (✨/💫) at the input line; the redesign instead shows a boxed input
+# area ("── input ──"), a bottom status bar ("yolo  agent (<model> ●) …"), and a
+# "context: 12.3% (n/Nk)" usage line — with NO bare emoji prompt. Detection that
+# keyed on the emoji therefore never observed IDLE and timed out at init.
+# ---------------------------------------------------------------------------
+# Either of these confirms the new TUI is up at its prompt: the context-usage
+# footer, or the status bar's "agent (<model> ●)" segment (● = U+25CF).
+NEW_TUI_STATUS_PATTERN = r"context:\s*\d+(?:\.\d+)?%|agent\s*\([^)]*●"
+# Live working indicator: the new TUI animates a braille spinner
+# ("⠧ Thinking… 5s · 220 tokens") that is cleared when the turn finishes. Any
+# braille glyph (U+2800–U+28FF) means a turn is in flight. Stale spinner frames
+# linger higher in the rolling buffer, so this is matched ONLY against the
+# freshest tail lines (not the whole buffer).
+NEW_TUI_SPINNER_PATTERN = r"[⠀-⣿]"
+# A response/thinking bullet ("• …") at line start. Its presence means a turn
+# has produced output — used to latch "input received" on the new TUI (the
+# welcome banner / update nag contain no "•", so this won't false-trigger at
+# init).
+ANY_BULLET_PATTERN = r"(?m)^\s*•"
+
 # Generic error patterns for detecting failure states in terminal output.
 ERROR_PATTERN = (
     r"^(?:Error:|ERROR:|Traceback \(most recent call last\):|ConnectionError:|APIError:)"
@@ -394,6 +416,47 @@ class KimiCliProvider(BaseProvider):
         # checks see clean, line-oriented text on the raw stream.
         clean_output = strip_terminal_escapes(output)
 
+        # --- Newest "Kimi Code" TUI (redesigned CLI) ---
+        # This build has no bare ✨/💫 prompt; readiness is the bottom status bar
+        # ("agent (<model> ●)") / "context: N%" footer with the empty "── input ──"
+        # box, and a turn-in-flight is a braille spinner ("⠧ Thinking… Ns · N
+        # tokens") that is cleared on completion. Gate on the new-TUI markers so
+        # legacy (emoji-prompt) builds keep the path below unchanged.
+        if re.search(NEW_TUI_STATUS_PATTERN, clean_output):
+            # A "•" bullet appears only once a turn produces output (thinking or
+            # response); the welcome banner / update nag have none. Latch it so a
+            # long response that scrolls the bullets out of the rolling buffer
+            # still reads COMPLETED rather than IDLE. Crucially, nothing latches
+            # at init, so a freshly-launched terminal reads IDLE (not COMPLETED),
+            # avoiding a premature-completion race when the first task is sent.
+            if re.search(ANY_BULLET_PATTERN, clean_output):
+                self._has_received_input = True
+
+            # PROCESSING vs ready by POSITION, not a fixed tail window: when a
+            # turn finishes, the spinner line is cleared and the empty input box
+            # (many blank lines) + status bar are redrawn last, but stale spinner
+            # frames remain higher in the rolling buffer. Compare the last line
+            # bearing a braille spinner against the last line bearing the ready
+            # chrome (status bar / context footer): if the spinner is the more
+            # recent of the two, a turn is in flight.
+            lines = clean_output.splitlines()
+            last_spinner = max(
+                (i for i, line in enumerate(lines) if re.search(NEW_TUI_SPINNER_PATTERN, line)),
+                default=-1,
+            )
+            last_ready = max(
+                (i for i, line in enumerate(lines) if re.search(NEW_TUI_STATUS_PATTERN, line)),
+                default=-1,
+            )
+            if last_spinner > last_ready:
+                return TerminalStatus.PROCESSING
+
+            if re.search(ERROR_PATTERN, clean_output, re.MULTILINE):
+                return TerminalStatus.ERROR
+
+            return TerminalStatus.COMPLETED if self._has_received_input else TerminalStatus.IDLE
+
+        # --- Legacy emoji-prompt TUI ---
         # Check the bottom lines for the idle prompt.
         # Kimi's TUI has padding lines between prompt and status bar.
         # Use end-of-line anchor (\s*$) to distinguish a bare prompt ("user@dir💫")
