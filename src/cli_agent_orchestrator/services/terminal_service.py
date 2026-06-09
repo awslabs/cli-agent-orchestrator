@@ -672,14 +672,37 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
             except ValueError:
                 pass
 
-            # Full scrollback also failed — return partial.
-            logger.warning(
-                "get_output: %s response marker not found in full_history, returning partial",
-                terminal_id,
-            )
-            return (
-                f"[PARTIAL RESPONSE - response marker not found in full scrollback]\n{full_output}"
-            )
+            # Full scrollback also failed — distinguish overflow from no response.
+            # If the buffer is close to full (>=90% of last escalation cap), the
+            # response marker was likely produced but pushed past the scrollback
+            # limit (overflow).  If the buffer is mostly empty, the agent never
+            # produced a text response (e.g. only tool calls, crash, or timeout).
+            actual_lines = len(full_output.splitlines())
+            overflow_threshold = int(_ESCALATION_STEPS[-1] * 0.9)
+            if actual_lines >= overflow_threshold:
+                logger.warning(
+                    "get_output: %s response marker not found, buffer near-full "
+                    "(%d lines >= %d threshold) — likely overflow",
+                    terminal_id,
+                    actual_lines,
+                    overflow_threshold,
+                )
+                return (
+                    f"[PARTIAL RESPONSE - response marker not found, buffer overflow likely "
+                    f"({actual_lines} lines retrieved)]\n{full_output}"
+                )
+            else:
+                logger.warning(
+                    "get_output: %s response marker not found, buffer sparse "
+                    "(%d lines < %d threshold) — agent likely produced no text response",
+                    terminal_id,
+                    actual_lines,
+                    overflow_threshold,
+                )
+                return (
+                    f"[NO RESPONSE - agent completed without producing a text response "
+                    f"({actual_lines} lines in buffer)]\n{full_output}"
+                )
 
     except Exception as e:
         logger.error(f"Failed to get output from terminal {terminal_id}: {e}")

@@ -856,15 +856,16 @@ class TestGetOutput:
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_get_output_last_escalates_all_steps_then_partial(
+    def test_get_output_last_escalates_all_steps_then_no_response(
         self, mock_get_metadata, mock_tmux, mock_status_monitor, mock_provider_manager
     ):
-        """Escalating fetch: marker never found — returns PARTIAL RESPONSE prefix."""
+        """Escalating fetch: marker never found, sparse buffer — returns NO RESPONSE prefix."""
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
             "tmux_window": "developer-abcd",
         }
         mock_status_monitor.get_buffer.return_value = "buffered output"
+        # Short output (few lines) — agent never produced text response
         mock_tmux.get_history.return_value = "raw tail content"
         mock_provider = MagicMock(
             spec=[
@@ -877,13 +878,47 @@ class TestGetOutput:
 
         result = get_output("test1234", OutputMode.LAST)
 
-        assert result.startswith("[PARTIAL RESPONSE")
+        assert result.startswith("[NO RESPONSE")
+        assert "agent completed without producing a text response" in result
         assert "raw tail content" in result
         # 4 escalation steps + 1 full_history attempt = 5 total
         assert mock_tmux.get_history.call_count == 5
         # Last call must use full_history=True
         _, last_kwargs = mock_tmux.get_history.call_args
         assert last_kwargs.get("full_history") is True
+
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_get_output_last_escalates_all_steps_then_partial_overflow(
+        self, mock_get_metadata, mock_tmux, mock_status_monitor, mock_provider_manager
+    ):
+        """Escalating fetch: marker never found, buffer near-full — returns PARTIAL RESPONSE (overflow)."""
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_status_monitor.get_buffer.return_value = "buffered output"
+        # Simulate near-full buffer (>= 90% of 5000 = 4500 lines)
+        large_output = "\n".join(f"line {i}" for i in range(4800))
+        mock_tmux.get_history.return_value = large_output
+        mock_provider = MagicMock(
+            spec=[
+                "extract_last_message_from_script",
+                "extraction_retries",
+            ]
+        )  # no extraction_tail_lines attribute → escalation path
+        mock_provider.extract_last_message_from_script.side_effect = ValueError("no marker")
+        mock_provider_manager.get_provider.return_value = mock_provider
+
+        result = get_output("test1234", OutputMode.LAST)
+
+        assert result.startswith("[PARTIAL RESPONSE")
+        assert "buffer overflow likely" in result
+        assert "4800 lines retrieved" in result
+        # 4 escalation steps + 1 full_history attempt = 5 total
+        assert mock_tmux.get_history.call_count == 5
 
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
