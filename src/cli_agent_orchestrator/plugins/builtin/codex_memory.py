@@ -163,18 +163,18 @@ class CodexMemoryPlugin(CaoPlugin):
         new_content = f"{stripped}{separator}{BEGIN_MARKER}\n{context_block}\n{END_MARKER}\n"
         target.write_text(new_content, encoding="utf-8")
 
-@staticmethod
-def _strip_existing_block(content: str) -> str:
-    """Remove any prior cao-memory block so we replace rather than append."""
+    @staticmethod
+    def _strip_existing_block(content: str) -> str:
+        """Remove any prior cao-memory block so we replace rather than append."""
 
-    while BEGIN_MARKER in content and END_MARKER in content:
-        before, _, rest = content.partition(BEGIN_MARKER)
-        _, _, after = rest.partition(END_MARKER)
-        before = before.rstrip("\n")
-        after = after.lstrip("\n")
-        if before and after:
-            content = f"{before}\n{after}"
-        else:
-            content = before or after
+        while BEGIN_MARKER in content and END_MARKER in content:
+            before, _, rest = content.partition(BEGIN_MARKER)
+            _, _, after = rest.partition(END_MARKER)
+            before = before.rstrip("\n")
+            after = after.lstrip("\n")
+            if before and after:
+                content = f"{before}\n{after}"
+            else:
+                content = before or after
 
-    return content
+        return content
