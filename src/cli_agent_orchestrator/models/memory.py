@@ -41,6 +41,9 @@ class Memory(BaseModel):
     )
     created_at: datetime = Field(..., description="Creation timestamp")
     updated_at: datetime = Field(..., description="Last update timestamp")
+    access_count: int = Field(
+        default=0, description="Phase 3 U4 — recall hit count, feeds the usage scoring factor"
+    )
     content: str = Field(default="", description="Memory content loaded from wiki file")
     action: Optional[str] = Field(
         default=None,

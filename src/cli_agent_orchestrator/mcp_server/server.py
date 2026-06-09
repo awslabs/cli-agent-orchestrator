@@ -1039,11 +1039,16 @@ async def memory_recall(
         le=100,
     ),
     search_mode: str = "hybrid",
+    sort_by: str = Field(
+        default="recency",
+        description='Ranking: "recency" (default), "score" (BM25+recency+usage), or "usage".',
+    ),
 ) -> Dict[str, Any]:
     """Retrieve memories matching a query and optional filters.
 
-    Returns content from matching wiki files, sorted by recency.
-    When no scope is specified, results follow scope precedence: session > project > global.
+    Returns content from matching wiki files, ranked by ``sort_by`` (default
+    recency). When no scope is specified, results follow scope precedence:
+    session > project > global.
 
     Use this to check if relevant knowledge already exists before asking the user.
     """
@@ -1068,6 +1073,7 @@ async def memory_recall(
             limit=limit,
             terminal_context=terminal_context,
             search_mode=search_mode,
+            sort_by=sort_by,
         )
         return {
             "success": True,

@@ -79,6 +79,12 @@ class MemoryMetadataModel(Base):
     token_estimate = Column(Integer, nullable=True)
     created_at = Column(DateTime(timezone=True), default=_utcnow)
     updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
+    # Phase 3 U4 — 3-factor scoring. ``access_count`` feeds the usage factor;
+    # ``last_accessed_at`` backs a server-side rate-limit on increments. NOT
+    # NULL DEFAULT 0 so existing rows read as "never recalled" without a
+    # backfill. Migrated onto existing DBs by ``_migrate_add_access_count``.
+    access_count = Column(Integer, nullable=False, default=0, server_default="0")
+    last_accessed_at = Column(DateTime, nullable=True, default=None)
 
     __table_args__ = (UniqueConstraint("key", "scope", "scope_id", name="uq_memory_key_scope"),)
 
@@ -131,6 +137,7 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _migrate_terminals_schema()
     _migrate_memory_indexes()
+    _migrate_add_access_count()
 
 
 def _migrate_project_aliases_schema() -> None:
@@ -187,6 +194,36 @@ def _migrate_memory_indexes() -> None:
             )
     except Exception as e:
         logger.debug(f"Memory index migration skipped: {e}")
+
+
+def _migrate_add_access_count() -> None:
+    """Add access_count and last_accessed_at columns to memory_metadata if missing.
+
+    Phase 3 U4. Idempotent: PRAGMA table_info gate, ALTER TABLE ADD COLUMN only
+    when missing. Fresh DBs already have the columns from
+    ``Base.metadata.create_all``. Existing rows get ``0`` / ``NULL`` — the
+    correct values for "never recalled".
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        conn = sqlite3.connect(str(DATABASE_FILE))
+        cursor = conn.execute("PRAGMA table_info(memory_metadata)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "access_count" not in columns:
+            conn.execute(
+                "ALTER TABLE memory_metadata ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0"
+            )
+            logger.info("Migration: added access_count column to memory_metadata")
+        if "last_accessed_at" not in columns:
+            conn.execute("ALTER TABLE memory_metadata ADD COLUMN last_accessed_at DATETIME")
+            logger.info("Migration: added last_accessed_at column to memory_metadata")
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.debug(f"Migration check for access_count failed: {e}")
 
 
 def _migrate_terminals_schema() -> None:

@@ -333,6 +333,33 @@ class MemoryService:
     # Scope resolution
     # -------------------------------------------------------------------------
 
+    @staticmethod
+    def resolve_caller_scope(terminal_context: Optional[dict]) -> str:
+        """Phase 3 U4 (T1) — derive the caller's effective scope.
+
+        Used by ``store()`` as the upper bound for cross-scope writes. The
+        caller may declare an explicit ``caller_scope`` in
+        ``terminal_context`` (trust-equivalent to the operator); otherwise
+        we default to ``"global"`` (the most permissive, operator/CLI
+        semantics).
+
+        Inferred downgrade from ``terminal_id``/``agent_profile``/
+        ``session_name`` was deliberately rejected: it broke legacy callers
+        that pass full terminal contexts while legitimately writing
+        ``scope="global"``. The threat-model intent (T1) is preserved — a
+        caller that must be constrained sets ``caller_scope`` explicitly.
+        """
+        ctx = terminal_context or {}
+        explicit = ctx.get("caller_scope")
+        if isinstance(explicit, str) and explicit in {
+            "session",
+            "project",
+            "agent",
+            "global",
+        }:
+            return explicit
+        return "global"
+
     def resolve_scope_id(
         self,
         scope: str,
@@ -530,6 +557,25 @@ class MemoryService:
         # Validate
         MemoryScope(scope)
         MemoryType(memory_type)
+
+        # Phase 3 U4 (T1) — store-time cross-scope write guard. A caller may
+        # only write a scope it is authorised for (SCOPE_RANK). The caller
+        # scope defaults to "global" (operator) unless terminal_context sets
+        # an explicit ``caller_scope`` — so existing CLI/operator callers are
+        # unaffected. The rejection log carries no content bytes (T6).
+        from cli_agent_orchestrator.services.memory_scoring import scope_write_allowed
+
+        caller_scope = self.resolve_caller_scope(terminal_context)
+        if not scope_write_allowed(caller_scope, scope):
+            logger.warning(
+                "cross_scope_store_rejected caller=%s target=%s key=%s",
+                caller_scope,
+                scope,
+                key,
+            )
+            raise PermissionError(
+                f"caller scope {caller_scope!r} may not write target scope {scope!r}"
+            )
 
         scope_id = self.resolve_scope_id(scope, terminal_context)
         # Non-global scoped memories require a resolvable scope_id for
@@ -798,6 +844,7 @@ class MemoryService:
         terminal_context: Optional[dict] = None,
         scan_all: bool = False,
         search_mode: str = "hybrid",
+        sort_by: str = "recency",
     ) -> list[Memory]:
         """Recall memories matching query and filters.
 
@@ -805,6 +852,12 @@ class MemoryService:
           - ``metadata``: substring match against key/tags/content via index.md walk.
           - ``bm25``: BM25 ranking over wiki bodies (content-aware).
           - ``hybrid``: metadata results first, then BM25 fills with what metadata missed.
+
+        ``sort_by`` (Phase 3 U4 — orthogonal to ``search_mode``):
+          - ``recency``: Phase 1/2 ordering (``-updated_at`` + scope precedence).
+            DEFAULT — byte-identical to pre-U4 behaviour (architect §3 invariant).
+          - ``score``: composite 3-factor (BM25 + recency + usage).
+          - ``usage``: most-accessed first.
 
         Returns ``[]`` when ``memory.enabled`` is False (U5 / SC-6).
         """
@@ -816,6 +869,13 @@ class MemoryService:
                 f"Invalid search_mode {search_mode!r}; expected one of {VALID_SEARCH_MODES}"
             )
 
+        # Phase 3 U4 (T9) — whitelist sort_by BEFORE any DB/file work so a
+        # typo surfaces to the caller (MCP tool) rather than silently
+        # falling back.
+        from cli_agent_orchestrator.services.memory_scoring import validate_sort_by
+
+        validate_sort_by(sort_by)
+
         if search_mode == "bm25":
             if not query:
                 return []
@@ -824,7 +884,7 @@ class MemoryService:
                 if scope and scope != MemoryScope.GLOBAL.value and terminal_context
                 else None
             )
-            return self._bm25_search(
+            bm25_only = self._bm25_search(
                 query=query,
                 scope=scope,
                 scope_id=scope_id,
@@ -834,6 +894,7 @@ class MemoryService:
                 terminal_context=terminal_context,
                 scan_all=scan_all,
             )
+            return self._apply_sort_and_increment(bm25_only, scope, sort_by, limit)
 
         metadata_results = await self._metadata_recall(
             query=query,
@@ -845,13 +906,13 @@ class MemoryService:
         )
 
         if search_mode == "metadata" or not query:
-            return metadata_results
+            return self._apply_sort_and_increment(metadata_results, scope, sort_by, limit)
 
         # hybrid: top up with BM25 hits not already in metadata results
         exclude_keys = {m.key for m in metadata_results}
         remaining = max(0, limit - len(metadata_results))
         if remaining == 0:
-            return metadata_results
+            return self._apply_sort_and_increment(metadata_results, scope, sort_by, limit)
 
         scope_id = (
             self.resolve_scope_id(scope, terminal_context)
@@ -868,7 +929,137 @@ class MemoryService:
             terminal_context=terminal_context,
             scan_all=scan_all,
         )
-        return metadata_results + bm25_results
+        return self._apply_sort_and_increment(
+            metadata_results + bm25_results, scope, sort_by, limit
+        )
+
+    def _apply_sort_and_increment(
+        self, results: list, scope: Optional[str], sort_by: str, limit: int
+    ) -> list:
+        """Phase 3 U4 — apply sort mode, slice, then best-effort access bump.
+
+        ``recency`` is the byte-identical Phase 1/2 path: the per-source
+        sorts in ``_metadata_recall``/``_bm25_search`` already produced that
+        order, so we leave ``results`` untouched and only slice. ``score``/
+        ``usage`` enrich ``access_count`` from SQLite (recall builds Memory
+        objects from wiki files, which carry no usage data), compute the
+        composite, then apply a stable scope-precedence pass so scope
+        dominance (T4) holds in every mode.
+        """
+        from cli_agent_orchestrator.services.memory_scoring import (
+            SCOPE_PRECEDENCE,
+            score_memory,
+        )
+
+        if sort_by != "recency":
+            self._enrich_access_counts(results)
+            now_utc = datetime.now(timezone.utc)
+            if sort_by == "usage":
+                results.sort(
+                    key=lambda m: (
+                        -int(getattr(m, "access_count", 0) or 0),
+                        -m.updated_at.timestamp(),
+                        m.key,
+                    )
+                )
+            else:  # "score"
+                composite = {
+                    m.key: score_memory(
+                        0.0,
+                        m.updated_at,
+                        int(getattr(m, "access_count", 0) or 0),
+                        now=now_utc,
+                    )
+                    for m in results
+                }
+                results.sort(
+                    key=lambda m: (
+                        -composite[m.key],
+                        -m.updated_at.timestamp(),
+                        -int(getattr(m, "access_count", 0) or 0),
+                        m.key,
+                    )
+                )
+            if not scope:
+                # Stable scope-precedence sort AFTER score/usage preserves
+                # within-scope ordering while enforcing scope dominance (T4).
+                results.sort(key=lambda m: SCOPE_PRECEDENCE.get(m.scope, 99))
+
+        sliced = results[:limit]
+
+        # Best-effort access_count increment (T6 non-blocking).
+        try:
+            self._increment_access_count(sliced)
+        except Exception as e:  # noqa: BLE001 — non-blocking promise
+            logger.warning(
+                "memory_increment_failed attempted=%d scope=%s",
+                len(sliced),
+                scope or "<all>",
+            )
+            logger.debug(f"recall increment failure detail: {e}")
+
+        return sliced
+
+    def _enrich_access_counts(self, memories: list) -> None:
+        """Phase 3 U4 — populate ``access_count`` on Memory objects from SQLite.
+
+        Recall builds Memory objects by parsing wiki markdown files, which do
+        not carry usage data; the scoring/usage sort needs ``access_count``
+        from the metadata table. Best-effort: on any DB error the objects keep
+        their default ``0`` and scoring degrades to recency-like behaviour.
+        """
+        if not memories:
+            return
+        try:
+            from cli_agent_orchestrator.clients.database import MemoryMetadataModel
+
+            keys = list({m.key for m in memories})
+            with self._get_db_session() as db:
+                rows = db.query(MemoryMetadataModel).filter(MemoryMetadataModel.key.in_(keys)).all()
+                # Prefer an exact (key, scope) match; fall back to key-only.
+                by_key_scope = {(r.key, r.scope): int(r.access_count or 0) for r in rows}
+                by_key = {r.key: int(r.access_count or 0) for r in rows}
+            for m in memories:
+                m.access_count = by_key_scope.get((m.key, m.scope), by_key.get(m.key, 0))
+        except Exception as e:  # noqa: BLE001 — best-effort enrichment
+            logger.debug(f"access_count enrichment skipped: {e}")
+
+    def _increment_access_count(self, memories: list) -> None:
+        """Phase 3 U4 — batch UPDATE access_count and last_accessed_at.
+
+        T2 §3.2 mitigation: 60s rate-limit via server-side ``julianday("now")``,
+        not caller clock. Each row increments at most once per recall and at
+        most once per 60s. Filtered rows still appear in results — only the
+        increment is suppressed.
+
+        Re-raises on DB error so the caller's handler produces the §3.6
+        WARNING with row counts only (no content bytes).
+        """
+        if not memories:
+            return
+        from sqlalchemy import func, or_, update
+
+        from cli_agent_orchestrator.clients.database import MemoryMetadataModel
+
+        keys = list({m.key for m in memories})
+        with self._get_db_session() as db:
+            stmt = (
+                update(MemoryMetadataModel)
+                .where(MemoryMetadataModel.key.in_(keys))
+                .where(
+                    or_(
+                        MemoryMetadataModel.last_accessed_at.is_(None),
+                        func.julianday("now") - func.julianday(MemoryMetadataModel.last_accessed_at)
+                        >= 60.0 / 86400.0,
+                    )
+                )
+                .values(
+                    access_count=MemoryMetadataModel.access_count + 1,
+                    last_accessed_at=func.datetime("now"),
+                )
+            )
+            db.execute(stmt)
+            db.commit()
 
     async def _metadata_recall(
         self,
