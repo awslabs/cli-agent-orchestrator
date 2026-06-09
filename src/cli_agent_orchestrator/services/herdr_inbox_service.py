@@ -522,6 +522,38 @@ class HerdrInboxService:
                     if terminal_id not in self._working_since:
                         self._working_since[terminal_id] = time.time()
 
+    def _label_still_live(self, window_name: str) -> bool:
+        """Return True if a tab with this label is still live in herdr.
+
+        Used to disambiguate herdr's reused compact pane_ids on replayed
+        pane_closed events. The tab label is unique per incarnation, so a live
+        label means the close event refers to an older incarnation and is stale.
+
+        Fails toward False (not live) when herdr can't be queried, so the caller
+        proceeds with cleanup rather than leaving a possibly-closed terminal.
+        """
+        try:
+            result = subprocess.run(
+                ["herdr", "--session", self._herdr_session, "tab", "list"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode != 0:
+                logger.warning(
+                    "_label_still_live: herdr tab list failed (rc=%s): %s",
+                    result.returncode,
+                    result.stderr.strip(),
+                )
+                return False
+            tab_data = json.loads(result.stdout)
+            tabs = tab_data.get("result", {}).get("tabs", [])
+            live_labels = {tab.get("label", "") for tab in tabs}
+            return window_name in live_labels
+        except (subprocess.SubprocessError, json.JSONDecodeError, KeyError, OSError) as e:
+            logger.warning("_label_still_live: could not query herdr (%s)", e)
+            return False
+
     def _handle_lifecycle_event(self, event_type: str, data: dict) -> None:
         """Handle pane.closed and workspace.closed events."""
         from cli_agent_orchestrator.backends.registry import get_backend
@@ -540,6 +572,31 @@ class HerdrInboxService:
             # Get session before cleanup
             meta = get_terminal_metadata(terminal_id)
             session_name = meta["tmux_session"] if meta else None
+
+            # Guard against herdr's compact pane_id reuse + event replay.
+            #
+            # herdr (0.6.8) reuses compact pane_ids when a tab is killed and a
+            # new tab takes the same index, AND replays the ENTIRE pane_closed
+            # history on every fresh events.subscribe (which register_terminal
+            # triggers via _force_reconnect). So a replayed close for an OLD
+            # incarnation of this pane_id arrives mapped to the terminal that now
+            # occupies the reused index — deleting a live terminal.
+            #
+            # The tab label (tmux_window) is unique per incarnation, so confirm
+            # the label is genuinely gone from herdr before deleting. If the
+            # label is still live, this close is stale (replayed) — ignore it.
+            # If herdr can't be queried, fall toward delete: never leave a
+            # terminal we think is open when it may actually be closed.
+            window_name = meta["tmux_window"] if meta else None
+            if window_name and self._label_still_live(window_name):
+                logger.info(
+                    "pane.closed: ignoring stale close for %s (pane=%s) — "
+                    "label %s still live in herdr (compact pane_id reused)",
+                    terminal_id,
+                    pane_id,
+                    window_name,
+                )
+                return
 
             # Remove from maps
             self._pane_to_terminal.pop(pane_id, None)
