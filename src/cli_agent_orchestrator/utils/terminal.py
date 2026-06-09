@@ -65,6 +65,23 @@ def generate_window_name(agent_profile: str) -> str:
     return validate_tmux_name(f"{agent_profile}-{uuid.uuid4().hex[:4]}", "window_name")
 
 
+def _resolve_window(terminal_id: str) -> "tuple[str, str] | None":
+    """Resolve (session_name, window_name) for a terminal from its provider.
+
+    The provider is registered (provider_manager.create_provider) before
+    initialize() runs, so it is the most reliable in-process source for the
+    backend coordinates the wait helpers need when they have to query the
+    backend directly. Returns None if no provider is registered for
+    ``terminal_id`` yet.
+    """
+    from cli_agent_orchestrator.providers.manager import provider_manager
+
+    provider = provider_manager.get_provider(terminal_id)
+    if provider is None:
+        return None
+    return provider.session_name, provider.window_name
+
+
 async def wait_for_shell(
     terminal_id: str,
     timeout: float = 10.0,
@@ -73,15 +90,47 @@ async def wait_for_shell(
 ) -> bool:
     """Wait for shell to be ready by checking if the output buffer is stable and non-empty.
 
-    Reads the StatusMonitor's in-memory buffer (populated by the FIFO reader
-    → event bus → StatusMonitor pipeline). Returns True when the buffer is
-    non-empty and has not changed for *stable_duration* seconds.
+    For pipe-pane backends (tmux) this reads the StatusMonitor's in-memory
+    buffer, populated by the FIFO reader → event bus → StatusMonitor pipeline.
+    Returns True when the buffer is non-empty and has not changed for
+    *stable_duration* seconds.
+
+    Event-inbox backends (herdr) deliberately skip that pipeline — their
+    pipe_pane is a no-op and create_terminal() never starts a FIFO reader for
+    them (the FIFO setup is gated on ``not supports_event_inbox()``), so the
+    StatusMonitor buffer would stay empty forever and this would always time
+    out. For those backends we read pane output directly via
+    ``backend.get_history()`` instead.
 
     This does NOT use provider-specific status detection because the provider
     is already registered before initialize() runs, and provider patterns
     don't match raw shell output.
     """
+    from cli_agent_orchestrator.backends.registry import get_backend
     from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+    backend = get_backend()
+    window = _resolve_window(terminal_id) if backend.supports_event_inbox() else None
+    if backend.supports_event_inbox() and window is None:
+        logger.warning(
+            f"wait_for_shell [{terminal_id}]: event-inbox backend but no provider "
+            f"registered; falling back to (empty) StatusMonitor buffer"
+        )
+
+    if window is not None:
+        session_name, window_name = window
+
+        def read_buffer() -> str:
+            try:
+                return backend.get_history(session_name, window_name, strip_escapes=True)
+            except Exception as e:
+                logger.debug(f"wait_for_shell [{terminal_id}]: backend history read failed: {e}")
+                return ""
+
+    else:
+
+        def read_buffer() -> str:
+            return status_monitor.get_buffer(terminal_id)
 
     logger.info(f"Waiting for shell to be ready for terminal {terminal_id}...")
 
@@ -90,7 +139,7 @@ async def wait_for_shell(
     last_change = time.time()
 
     while time.time() < deadline:
-        buf = status_monitor.get_buffer(terminal_id)
+        buf = read_buffer()
 
         if buf != previous_buffer:
             previous_buffer = buf
@@ -114,7 +163,13 @@ async def wait_until_status(
     timeout: float = 30.0,
     polling_interval: float = 1.0,
 ) -> bool:
-    """Wait until terminal reaches target status by polling status_monitor."""
+    """Wait until terminal reaches target status by polling status_monitor.
+
+    status_monitor.get_status() is backend-aware: for pipe-pane backends (tmux)
+    it returns the pushed pipeline status, and for event-inbox backends (herdr)
+    it derives status on demand from the provider's native status. So this poll
+    works for both backends without special-casing here.
+    """
     from cli_agent_orchestrator.services.status_monitor import status_monitor
 
     targets = target_status if isinstance(target_status, set) else {target_status}

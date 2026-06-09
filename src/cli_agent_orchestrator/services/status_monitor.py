@@ -82,7 +82,33 @@ class StatusMonitor:
         self._last_status.pop(terminal_id, None)
 
     def get_status(self, terminal_id: str) -> TerminalStatus:
-        """Get current terminal status. Source of truth — derived from streaming output."""
+        """Get current terminal status — the single source of truth for both backends.
+
+        Pipe-pane backends (tmux) return the last status pushed by the FIFO →
+        EventBus → _process_chunk pipeline. Event-inbox backends (herdr) don't
+        feed that pipeline (no FIFO reader is started for them), so _last_status
+        would stay UNKNOWN forever; for those we derive status on demand from the
+        provider, whose get_status() consults backend.get_native_status(). Doing
+        it here means every caller (API status, init waits, busy checks, curator
+        liveness) works on herdr without each having to special-case the backend.
+        """
+        from cli_agent_orchestrator.backends.registry import get_backend
+
+        if get_backend().supports_event_inbox():
+            try:
+                provider = provider_manager.get_provider(terminal_id)
+            except Exception:
+                provider = None
+            if provider is not None:
+                try:
+                    # The native (herdr) path ignores the buffer arg; pass the
+                    # rolling buffer (empty for herdr) so the rare
+                    # get_native_status()==None fallback still gets what we have.
+                    return provider.get_status(self._buffers.get(terminal_id, ""))
+                except Exception as e:
+                    logger.error(f"Error deriving native status for {terminal_id}: {e}")
+                    return TerminalStatus.UNKNOWN
+
         return self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
 
     def get_buffer(self, terminal_id: str) -> str:

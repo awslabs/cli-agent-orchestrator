@@ -172,6 +172,76 @@ class TestWaitForShell:
         assert result is False
 
 
+class TestWaitForShellEventInbox:
+    """wait_for_shell on event-inbox backends (herdr) must read backend history,
+    not the (always-empty) StatusMonitor buffer."""
+
+    def _backend(self, *, history, event_inbox=True):
+        backend = MagicMock()
+        backend.supports_event_inbox.return_value = event_inbox
+        backend.get_history.return_value = history
+        return backend
+
+    def _provider(self):
+        provider = MagicMock()
+        provider.session_name = "sess"
+        provider.window_name = "win"
+        return provider
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.manager.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    async def test_reads_backend_history_when_event_inbox(
+        self, mock_monitor, mock_get_backend, mock_pm
+    ):
+        # StatusMonitor buffer is empty (herdr never feeds it); readiness must
+        # still be detected from the backend's pane history.
+        mock_monitor.get_buffer.return_value = ""
+        backend = self._backend(history="user@host:~$ ")
+        mock_get_backend.return_value = backend
+        mock_pm.get_provider.return_value = self._provider()
+
+        result = await wait_for_shell("t1", timeout=2.0, stable_duration=0.3, polling_interval=0.1)
+
+        assert result is True
+        backend.get_history.assert_called_with("sess", "win", strip_escapes=True)
+        mock_monitor.get_buffer.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.manager.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    async def test_times_out_when_backend_history_empty(
+        self, mock_monitor, mock_get_backend, mock_pm
+    ):
+        mock_get_backend.return_value = self._backend(history="")
+        mock_pm.get_provider.return_value = self._provider()
+
+        result = await wait_for_shell("t1", timeout=0.4, stable_duration=0.2, polling_interval=0.1)
+
+        assert result is False
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.manager.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    async def test_tmux_backend_still_uses_status_monitor(
+        self, mock_monitor, mock_get_backend, mock_pm
+    ):
+        # Pipe-pane backend: behavior unchanged — read the StatusMonitor buffer,
+        # never touch backend.get_history.
+        mock_monitor.get_buffer.return_value = "prompt $"
+        backend = self._backend(history="ignored", event_inbox=False)
+        mock_get_backend.return_value = backend
+
+        result = await wait_for_shell("t1", timeout=2.0, stable_duration=0.3, polling_interval=0.1)
+
+        assert result is True
+        backend.get_history.assert_not_called()
+        mock_pm.get_provider.assert_not_called()
+
+
 class TestWaitUntilStatus:
     """Tests for wait_until_status function."""
 
