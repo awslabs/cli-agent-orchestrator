@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -93,6 +94,54 @@ def is_memory_enabled() -> bool:
         logger.warning(f"Failed to read memory.enabled, defaulting to True: {e}")
         return True
     return bool(value)
+
+
+def get_compile_mode() -> str:
+    """Return the active wiki-compilation mode.
+
+    Precedence:
+        1. ``CAO_MEMORY_COMPILE_MODE`` env var (case-insensitive). Accepted
+           values: ``llm``, ``append``. Unknown values are ignored with a
+           WARNING and fall through to settings/default.
+        2. ``memory.compile_mode`` nested key in settings.json.
+        3. Default ``"llm"``.
+
+    Read errors fall through to ``"append"`` — the safe default that never
+    invokes the LLM and reproduces Phase 1/2 behaviour.
+    """
+    env_raw = os.environ.get("CAO_MEMORY_COMPILE_MODE")
+    if env_raw is not None:
+        v = env_raw.strip().lower()
+        if v in ("llm", "append"):
+            return v
+        if v != "":
+            logger.warning(
+                f"Ignoring unknown CAO_MEMORY_COMPILE_MODE={env_raw!r}; "
+                "falling through to settings.json"
+            )
+    try:
+        value = get_memory_settings().get("compile_mode", "llm")
+    except Exception as e:
+        logger.warning(f"Failed to read memory.compile_mode, defaulting to append: {e}")
+        return "append"
+    if isinstance(value, str) and value.strip().lower() in ("llm", "append"):
+        return value.strip().lower()
+    return "append"
+
+
+def get_compile_timeout_s() -> float:
+    """Return the wall-clock timeout (seconds) for the wiki compile call.
+
+    Generous by default: compilation drives a coding-agent CLI that can
+    cold-start in tens of seconds, and it runs in the background so the
+    timeout never blocks store().
+    """
+    try:
+        value = get_memory_settings().get("compile_timeout_s", 120.0)
+        return float(value)
+    except Exception as e:
+        logger.warning(f"Failed to read memory.compile_timeout_s, defaulting to 120.0: {e}")
+        return 120.0
 
 
 def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:

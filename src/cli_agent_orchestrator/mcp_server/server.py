@@ -1043,6 +1043,14 @@ async def memory_recall(
         default="recency",
         description='Ranking: "recency" (default), "score" (BM25+recency+usage), or "usage".',
     ),
+    include_related: bool = Field(
+        default=False,
+        description=(
+            "When True, expand each result's cross-references and append "
+            "related articles after the primary results. Default False "
+            "preserves the non-expanded recall behaviour."
+        ),
+    ),
 ) -> Dict[str, Any]:
     """Retrieve memories matching a query and optional filters.
 
@@ -1074,6 +1082,7 @@ async def memory_recall(
             terminal_context=terminal_context,
             search_mode=search_mode,
             sort_by=sort_by,
+            include_related=bool(include_related) if isinstance(include_related, bool) else False,
         )
         return {
             "success": True,

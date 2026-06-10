@@ -1,13 +1,12 @@
-"""Phase 3 U4 — 3-Factor Composite Scoring tests.
+"""3-Factor Composite Scoring tests.
 
 Covers:
 - U7.3 plan cases (weights_sum_to_one, recent_entry_scores_higher,
   frequently_accessed_scores_higher, access_count_increments_on_recall,
   sort_by_recency_reproduces_phase1_order).
-- Per-STRIDE-row tests T1–T10 from
-  ``aidlc-docs/phase3/u4-threat-model.md`` §2.
+- Threat-model coverage: scope guard, rate-limit, clamps, log hygiene.
 - Critical regression: ``sort_by="recency"`` byte-identical to current
-  Phase 1/2 ordering on a fixture corpus (architect §3 invariant).
+  the pre-scoring ordering on a fixture corpus (load-bearing invariant).
 
 The score function is pure; sort/integration paths are exercised through
 ``MemoryService.store()`` / ``recall()`` against a per-test SQLite DB.
@@ -189,7 +188,7 @@ class TestU73PlanCases:
         assert row_after.last_accessed_at is not None
 
     def test_sort_by_recency_reproduces_phase1_order(self, svc, db_engine):
-        """Architect §3 LOAD-BEARING invariant: ``sort_by="recency"`` returns
+        """LOAD-BEARING invariant: ``sort_by="recency"`` returns
         the same ordering as the pre-U4 path (sort by ``-updated_at``, then
         scope-precedence sort when scope is None).
         """
@@ -937,7 +936,7 @@ class TestNormaliseBm25Scores:
 
 
 # ===========================================================================
-# NFR — score_memory perf budget (< 50µs per call per architect §9)
+# Perf budget — score_memory < 50µs per call
 # ===========================================================================
 
 
@@ -952,5 +951,5 @@ class TestScorePerf:
             score_memory(0.5, when, i, now=now)
         elapsed = time.perf_counter() - start
         per_call_us = (elapsed / N) * 1_000_000
-        # Generous bound for CI noise; architect §9 target is < 50µs.
+        # Generous bound for CI noise; the target is < 50µs.
         assert per_call_us < 200, f"score_memory {per_call_us:.1f}µs/call > 200µs budget"

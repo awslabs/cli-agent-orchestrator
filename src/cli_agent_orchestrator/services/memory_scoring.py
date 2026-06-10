@@ -1,4 +1,4 @@
-"""Phase 3 U4 — 3-factor composite scoring for memory recall.
+"""3-factor composite scoring for memory recall.
 
 Pure functions only. No I/O, no SQL, no clock dependency beyond ``datetime.now``
 which is injectable via ``now=`` for deterministic tests. Callers (recall path
@@ -10,9 +10,8 @@ Composite formula:
     score = 0.50 * bm25_norm + 0.30 * recency + 0.20 * usage
 
 All factors are clamped to ``[0.0, 1.0]`` so the composite is bounded
-``[0.0, 1.0]`` for any input. See ``aidlc-docs/phase3/u4-design.md`` §1 for
-the contract and ``aidlc-docs/phase3/u4-threat-model.md`` §3.3 for the
-defensive clamps (T5 negative wrap, T7 future-dated timestamp).
+``[0.0, 1.0]`` for any input, with defensive clamps for negative wrap
+and future-dated timestamps.
 """
 
 import math
@@ -30,12 +29,12 @@ RECENCY_HALF_LIFE_DAYS = 30.0
 # Usage saturates at ~1.0 once access_count reaches USAGE_NORMALISER.
 USAGE_NORMALISER = 100
 
-# Whitelist for ``recall(sort_by=...)`` validation (T9). Anything outside this
+# Whitelist for ``recall(sort_by=...)`` validation. Anything outside this
 # set raises ``ValueError`` — no silent fallback.
 SortBy = Literal["score", "recency", "usage"]
 SORT_BY_VALUES: frozenset = frozenset({"score", "recency", "usage"})
 
-# Scope precedence (T4 invariant). Lower index = higher precedence in the
+# Scope precedence. Lower index = higher precedence in the
 # final scope-stable sort that runs AFTER score sorting in ``recall()``.
 SCOPE_PRECEDENCE: dict = {
     "session": 0,
@@ -44,7 +43,7 @@ SCOPE_PRECEDENCE: dict = {
     "agent": 3,
 }
 
-# Cross-scope write authorisation table (T1). Caller may write a target
+# Cross-scope write authorisation table. Caller may write a target
 # scope iff ``SCOPE_RANK[caller] >= SCOPE_RANK[target]``. ``agent`` and
 # ``project`` share rank 1 — siblings; cross-sibling writes are rejected.
 SCOPE_RANK: dict = {
@@ -96,7 +95,7 @@ def normalise_bm25_scores(raw_scores: dict) -> dict:
     values divided by the batch max. If the max is ``<= 0`` (degenerate
     corpus, all-zero batch), every value collapses to ``0.0``.
 
-    Per devsecops §3.7: this dict is purely local to ``recall()`` — must not
+    This dict is purely local to ``recall()`` — it must not
     be stored on ``self`` or any class attribute (side-channel for raw BM25
     scores into tool results).
     """
@@ -109,14 +108,14 @@ def normalise_bm25_scores(raw_scores: dict) -> dict:
 
 
 def validate_sort_by(sort_by: str) -> str:
-    """Whitelist sort-mode (T9). Raises ``ValueError`` on unknown value."""
+    """Whitelist sort-mode. Raises ``ValueError`` on unknown value."""
     if sort_by not in SORT_BY_VALUES:
         raise ValueError(f"sort_by must be one of {sorted(SORT_BY_VALUES)}; got {sort_by!r}")
     return sort_by
 
 
 def scope_write_allowed(caller: str, target: str) -> bool:
-    """T1 store-time scope guard.
+    """Store-time scope guard.
 
     Returns True iff a caller running at ``caller`` scope is permitted to
     write a memory at ``target`` scope. ``agent`` and ``project`` are
@@ -130,6 +129,6 @@ def scope_write_allowed(caller: str, target: str) -> bool:
         return True
     # Strictly broader rank required when names differ — this rejects
     # cross-sibling writes between ``project`` and ``agent`` (both rank 1)
-    # per devsecops T1: "Cross-sibling writes (project caller → agent
+    # by design: "Cross-sibling writes (project caller → agent
     # scope) are rejected."
     return bool(SCOPE_RANK[caller] > SCOPE_RANK[target])
