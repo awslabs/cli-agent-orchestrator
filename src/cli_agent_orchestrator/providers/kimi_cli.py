@@ -568,8 +568,16 @@ class KimiCliProvider(BaseProvider):
             if re.search(PROMPT_WITH_INPUT_PATTERN, line):
                 prompt_input_idx = i
 
-        # Choose the best anchor: prefer input box (more precise), fall back to prompt-with-input
-        if box_end_idx is not None:
+        # Choose the best anchor: the LATEST marker wins. The newest "Kimi
+        # Code" TUI draws decorative ╰─ boxes during boot (its own welcome box
+        # and MCP-server banners like FastMCP's) but renders user messages as
+        # ✨-prefixed prompt lines — so a box-end can match boot chrome ABOVE
+        # the real message and box-first priority would slice the response
+        # from the boot screen. The response always follows the LAST user
+        # input, whichever marker style rendered it.
+        if box_end_idx is not None and prompt_input_idx is not None:
+            response_start = max(box_end_idx, prompt_input_idx) + 1
+        elif box_end_idx is not None:
             response_start = box_end_idx + 1
         elif prompt_input_idx is not None:
             response_start = prompt_input_idx + 1
@@ -577,11 +585,22 @@ class KimiCliProvider(BaseProvider):
             # Neither marker found — long response scrolled everything out
             return self._extract_without_input_box(raw_lines, clean_lines)
 
-        # Find the next idle prompt line (bare prompt, no text after it)
+        # Find where the response ends: the next bare idle prompt
+        # (legacy/v1.20 TUIs), or the newest-TUI footer chrome — the
+        # "── input ──" box rule or the status bar / context footer
+        # (NEW_TUI_STATUS_PATTERN). Without the footer stops, a newest-TUI
+        # response would run to end-of-capture and drag the empty input box
+        # and status bar into the extracted message.
         idle_prompt_eol = IDLE_PROMPT_PATTERN + r"\s*$"
+        new_tui_input_rule = r"^\s*─{2,}\s*input\s*─{2,}"
         prompt_idx = len(clean_lines)  # default: end of output
         for i in range(response_start, len(clean_lines)):
-            if re.search(idle_prompt_eol, clean_lines[i]):
+            line = clean_lines[i]
+            if (
+                re.search(idle_prompt_eol, line)
+                or re.match(new_tui_input_rule, line)
+                or re.search(NEW_TUI_STATUS_PATTERN, line)
+            ):
                 prompt_idx = i
                 break
 

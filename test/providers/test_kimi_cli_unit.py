@@ -1113,3 +1113,50 @@ class TestKimiCodeNewTuiStatus:
         # Sanity: the completed fixture really does contain stale braille frames.
         assert any("⠀" <= ch <= "⣿" for ch in buf)
         assert self._provider().get_status(buf) != TerminalStatus.PROCESSING
+
+
+class TestKimiCodeNewTuiExtraction:
+    """Extraction for the newest "Kimi Code" TUI (✨ prompt, • bullets).
+
+    Ground truth from a live Kimi Code session: user messages render as
+    ✨-prefixed lines (no ╭─ input box), responses as • bullets, and the
+    footer is a "── input ──" rule + status bar. Decorative ╰─ boxes from
+    boot banners (Kimi welcome box, FastMCP server banner) appear ABOVE the
+    conversation — anchoring on the last box-end used to slice the
+    "response" out of the boot screen and run it to end-of-capture.
+    """
+
+    NEW_TUI_CAPTURE = (
+        "╭──────────────────────────────╮\n"
+        "│  ▐█▛█▛█▌  Welcome to Kimi Code CLI!  │\n"
+        "│  Directory: /tmp/cao_kimi_x  │\n"
+        "╰──────────────────────────────╯\n"
+        "╭──────────────────────────────╮\n"
+        "│  🖥  Server: cao-mcp-server, 3.4.2  │\n"
+        "╰──────────────────────────────╯\n"
+        "✨ What is 17*23? Reply with just the number and one short sentence.\n"
+        "\n"
+        "• The user is asking for a simple multiplication: 17 * 23.\n"
+        "\n"
+        "• 391. The product of 17 and 23 is 391.\n"
+        "\n"
+        "── input ─────────────────────────────────\n"
+        "\n"
+        "\n"
+        "──────────────────────────────────────────\n"
+        "yolo  agent (Kimi-k2.6 ●)  /tmp/cao_kimi_x  ctrl-o: editor\n"
+        "context: 4.0% (10.4k/262.1k)\n"
+    )
+
+    def test_extracts_response_after_sparkle_prompt(self):
+        provider = KimiCliProvider("test123", "test-session", "window-0")
+        result = provider.extract_last_message_from_script(self.NEW_TUI_CAPTURE)
+        assert "391" in result
+
+    def test_extraction_excludes_footer_chrome_and_boot_banners(self):
+        provider = KimiCliProvider("test123", "test-session", "window-0")
+        result = provider.extract_last_message_from_script(self.NEW_TUI_CAPTURE)
+        assert "input ─" not in result
+        assert "context:" not in result
+        assert "Welcome to Kimi Code CLI" not in result
+        assert "cao-mcp-server, 3.4.2" not in result
