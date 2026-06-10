@@ -15,11 +15,23 @@ logger = logging.getLogger(__name__)
 # Keys are provider names, values map CAO tool names to lists of native tool names.
 TOOL_MAPPING: Dict[str, Dict[str, List[str]]] = {
     "claude_code": {
-        "execute_bash": ["Bash"],
+        # Everything execution-capable gates with execute_bash — a restricted
+        # agent escapes otherwise (observed live in the allowed-tools e2e):
+        # - Task spawns a subagent with its own full toolset ("the file was
+        #   created via a delegated subagent that ran the write through a
+        #   shell command");
+        # - Monitor runs arbitrary shell scripts in the background ("I used
+        #   the Monitor tool" to write the forbidden file);
+        # - BashOutput/KillShell are the Bash family's companions.
+        # Privilege-equivalence: anything these can do, Bash can too, so
+        # profiles allowed execute_bash lose nothing by keeping them.
+        "execute_bash": ["Bash", "BashOutput", "KillShell", "Task", "Monitor"],
         "fs_read": ["Read"],
-        "fs_write": ["Edit", "Write"],
+        # NotebookEdit writes .ipynb files — it must gate with fs_write or a
+        # write-restricted agent keeps a file-modification path.
+        "fs_write": ["Edit", "Write", "NotebookEdit"],
         "fs_list": ["Glob", "Grep"],
-        "fs_*": ["Read", "Edit", "Write", "Glob", "Grep"],
+        "fs_*": ["Read", "Edit", "Write", "NotebookEdit", "Glob", "Grep"],
     },
     "copilot_cli": {
         "execute_bash": ["shell"],
