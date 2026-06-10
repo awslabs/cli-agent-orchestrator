@@ -1448,14 +1448,44 @@ class TestKiroCliTuiMode:
         """Kiro shows the idle-prompt placeholder before MCP servers finish
         loading. A paste sent during this window is silently absorbed by
         the boot screen, so we must report PROCESSING until init completes.
+
+        Fixture mirrors real Kiro boot output: while the "M of N mcp servers
+        initialized..." line is on screen, only the new-TUI placeholder
+        ("Ask a question or describe a task") is visible — the real
+        ``[agent] !>`` prompt does NOT appear until init completes.
         """
         output = (
             "0 of 1 mcp servers initialized. ctrl-c to start chatting now\n"
             "────────────────────────────────────────────────────\n"
-            "[developer] !> Need help with features or setup? Use /help\n"
+            "developer · auto · ◔ 0%\n"
+            " Ask a question or describe a task ↵\n"
         )
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    def test_mcp_server_init_with_post_init_prompt_yields_idle(self, mock_backend):
+        """Stale ``M of N mcp servers initialized`` line + real interactive
+        prompt below means init has finished and we're idle.
+
+        Surfaced by event-driven FIFO pipeline (PR #273): the rolling byte
+        stream retains the boot-line bytes even after the TUI redraws over
+        them, so the init pattern keeps matching forever. Without the
+        position-aware check, ``--legacy-ui`` (and yolo, which forces
+        legacy) would report PROCESSING for the entire session and
+        ``wait_until_status: idle`` would time out (kiro yolo e2e: 0/11).
+        Treat the init line as PROCESSING only when no real ``[agent] >``
+        prompt appears AFTER it.
+        """
+        output = (
+            "0 of 1 mcp servers initialized. ctrl-c to start chatting now\n"
+            "1 of 1 mcp servers initialized.\n"
+            "[developer] 1% !> Need help with features or setup? Use /help\n"
+        )
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        provider._initialized = True
+        provider.shell_baseline = None
+        assert provider.get_status(output) == TerminalStatus.IDLE
 
     def test_tui_permission_pattern(self):
         """Test TUI permission pattern matches expected formats."""
