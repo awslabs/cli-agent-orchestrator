@@ -30,3 +30,15 @@ class TestStripTerminalEscapes:
     def test_column_move_does_not_eat_following_text(self):
         # A spinner glyph positioned with CHA keeps its separating space.
         assert strip_terminal_escapes("✢\x1b[3GCultivating…") == "✢ Cultivating…"
+
+    def test_cup_to_column_1_becomes_newline(self):
+        """CUP (\\x1b[<row>;1H) to column 1 starts a new logical line.
+
+        Codex's TUI lays out its bottom prompt + status bar via CUP rather
+        than CHA (e.g. ``\\x1b[46;1H›``). Without normalising CUP-to-col-1,
+        the ``›`` idle prompt stays glued mid-stream and the per-line idle
+        check at codex.py:get_status never matches (regression: PR #273
+        codex e2e: 0/12 timing out on wait_until_status idle).
+        """
+        assert strip_terminal_escapes("hello\x1b[46;1H›") == "hello\n›"
+        assert strip_terminal_escapes("a\x1b[1;1Hb") == "a\nb"

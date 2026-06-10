@@ -5,10 +5,15 @@ import re
 # Cursor-to-column-1 sequences that semantically start a new logical line.
 # Must be replaced with \n BEFORE the general CSI strip, otherwise the text
 # that follows gets glued to the previous content and ^ anchors fail.
-# - \x1b[1G / \x1b[G  — CHA (Cursor Horizontal Absolute) to column 1
+# - \x1b[1G / \x1b[G   — CHA (Cursor Horizontal Absolute) to column 1
 # - \x1b[nA            — CUU (Cursor Up), used with CHA for spinner redraws
 # - \x1b[E / \x1b[nE   — CNL (Cursor Next Line)
-_LINE_START_CSI = re.compile(r"\x1b\[(?:1?G|\d*A|\d*E)")
+# - \x1b[<row>;1H      — CUP (Cursor Position) to column 1 of any row.
+#   Codex's TUI lays out its bottom prompt + status bar via CUP rather than CHA
+#   (e.g. ``\x1b[46;1H›``), so without normalising CUP-to-col-1 the ``›`` idle
+#   prompt stays glued mid-stream and the per-line idle check at
+#   codex.py:get_status never matches.
+_LINE_START_CSI = re.compile(r"\x1b\[(?:1?G|\d*A|\d*E|\d+;1H)")
 
 # Forward horizontal positioning on the SAME line: CHA to a column > 1
 # (\x1b[<n>G with n != 1) or cursor-forward (\x1b[<n>C). The TUI lays out spaced
