@@ -486,6 +486,8 @@ class GeminiCliProvider(BaseProvider):
         # tmux sessions where the shell environment is not fully loaded.
         # An echo round-trip ensures the shell has fully processed its init.
         warmup_marker = "CAO_SHELL_READY"
+        # Arm the stickiness gate so the warm-up echo can transition state.
+        status_monitor.notify_input_sent(self.terminal_id)
         get_backend().send_keys(self.session_name, self.window_name, f"echo {warmup_marker}")
         warmup_start = time.time()
         warmup_timeout = 15.0
@@ -505,7 +507,10 @@ class GeminiCliProvider(BaseProvider):
 
         command = self._build_gemini_command()
 
-        # Send Gemini command to the tmux window
+        # Send Gemini command to the tmux window. Arm the stickiness gate so
+        # the launching command can drive the IDLE/COMPLETED → PROCESSING
+        # transition past any previously-latched ready status from the warm-up.
+        status_monitor.notify_input_sent(self.terminal_id)
         get_backend().send_keys(self.session_name, self.window_name, command)
 
         # Wait for Gemini CLI to finish initialization.
@@ -632,6 +637,29 @@ class GeminiCliProvider(BaseProvider):
         in the tmux capture buffer.  Retry extraction to wait for spinners
         to clear."""
         return 3
+
+    @property
+    def extraction_tail_lines(self) -> int:
+        """Capture deep scrollback for Ink-TUI redraw recovery.
+
+        Gemini's Ink renderer uses cursor-positioning escapes to repaint the
+        viewport in place (status bar, footer, spinner). The query-box ``>``
+        marker and the ``✦`` response prefix scroll into tmux's history-buffer
+        only when fresh lines push them off the visible viewport — until then
+        they live in the live pane. The escalating-fetch path
+        (``200 → 500 → 1000 → 5000``) issues a single ``capture-pane`` per step
+        with NO retries between widening, so a response that is still being
+        rendered at extraction time falls through to the ``[PARTIAL RESPONSE]``
+        sentinel, which leaves the TUI footer in the output and trips the
+        ``? for shortcuts not in output`` assertion.
+
+        Setting this attribute routes extraction through the fixed-tail-lines
+        path which honours ``extraction_retries`` (3 × 10 s waits between
+        captures) — exactly the behaviour Gemini's spinner-after-completion
+        delay requires. 5000 lines covers any realistic single-turn response
+        (over 4500 lines of content) without truncating the query box.
+        """
+        return 5000
 
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract Gemini's final response from terminal output.

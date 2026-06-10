@@ -276,7 +276,10 @@ class CodexProvider(BaseProvider):
             clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
 
             if re.search(TRUST_PROMPT_PATTERN, clean_output):
+                from cli_agent_orchestrator.services.status_monitor import status_monitor
+
                 logger.info("Codex workspace trust prompt detected, auto-accepting")
+                status_monitor.notify_input_sent(self.terminal_id)
                 get_backend().send_special_key(self.session_name, self.window_name, "Enter")
                 return
 
@@ -290,12 +293,18 @@ class CodexProvider(BaseProvider):
 
     async def initialize(self) -> bool:
         """Initialize Codex provider by starting codex command."""
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
         if not await wait_for_shell(self.terminal_id, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
         # Send a warm-up command before launching codex.
         # Codex exits immediately in freshly-created tmux sessions where the shell
         # has not yet processed a full interactive command cycle.
+        # Arm the StatusMonitor stickiness gate: each send_keys here represents
+        # external input that must be allowed to drive PROCESSING transitions
+        # past any previously-latched ready state.
+        status_monitor.notify_input_sent(self.terminal_id)
         get_backend().send_keys(self.session_name, self.window_name, "echo ready")
         await asyncio.sleep(2.0)
 
@@ -305,6 +314,7 @@ class CodexProvider(BaseProvider):
         # --disable shell_snapshot: avoid TTY input conflicts (SIGTTIN) in tmux
         #   caused by the shell_snapshot subprocess inheriting stdin.
         command = self._build_codex_command()
+        status_monitor.notify_input_sent(self.terminal_id)
         get_backend().send_keys(self.session_name, self.window_name, command)
 
         # Handle workspace trust prompt if it appears (new/untrusted directories)
@@ -412,6 +422,17 @@ class CodexProvider(BaseProvider):
 
                 return TerminalStatus.IDLE
 
+            # No user-message marker in the cleaned buffer. Two cases:
+            # - Fresh init: no assistant content either → IDLE.
+            # - Long-running response: the › user marker has been evicted from
+            #   the 8KB rolling buffer by the time the response settles, but an
+            #   assistant bullet is still visible. Without this branch we'd
+            #   return IDLE forever and ``wait_for_status(completed)`` in the
+            #   e2e tests would time out.
+            # Search above the TUI footer cutoff so the › suggestion-hint and
+            # status-bar lines aren't confused with a model reply.
+            if _find_assistant_marker(clean_output[:cutoff_pos]) is not None:
+                return TerminalStatus.COMPLETED
             return TerminalStatus.IDLE
 
         # If we're not at an idle prompt and we don't see explicit errors/permission prompts,
