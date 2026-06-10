@@ -492,10 +492,24 @@ class ClaudeCodeProvider(BaseProvider):
         # stale, so suppress the spinner-before-separator walk and let the
         # COMPLETED branch win. During genuine processing nothing but the footer
         # follows the last separator, so this never hides a live turn.
-        _boxless_completion_tail = bool(
-            _sep_positions
-            and re.search(GET_STATUS_COMPLETION_PATTERN, output[_sep_positions[-1] :])
-        )
+        _boxless_completion_tail = False
+        if _sep_positions:
+            _tail = output[_sep_positions[-1] :]
+            _last_summary = None
+            for _m in re.finditer(GET_STATUS_COMPLETION_PATTERN, _tail):
+                _last_summary = _m
+            # The summary only marks the turn finished if no LIVE spinner
+            # renders after it. Claude prints interim summaries mid-turn
+            # ("✻ Pondered for 8s") and then keeps working — e.g. a handoff
+            # MCP call shows "● Calling cao-mcp-server…" with a fresh
+            # "✢ Misting… (33s · ↑ 332 tokens)" spinner below the interim
+            # summary. Treating that tail as completed mis-reports an active
+            # MCP call as COMPLETED (and the StatusMonitor ready-latch then
+            # pins it until the next input).
+            if _last_summary is not None and not re.search(
+                r"[✶✢✽✻✳·*][ \t]+\w*ing\b[^\n]*…", _tail[_last_summary.end() :]
+            ):
+                _boxless_completion_tail = True
         if _sep_positions and not _boxless_completion_tail:
             pre_sep_lines = output[: _sep_positions[-1]].rstrip("\n").split("\n")
             for line in reversed(pre_sep_lines):
@@ -555,9 +569,17 @@ class ClaudeCodeProvider(BaseProvider):
                 if m.start() <= last_idle.start() < m.end():
                     input_box = m
         if input_box is not None:
-            line_above_box = output[: input_box.start()].rstrip("\n").rsplit("\n", 1)[-1]
-            if NEW_TUI_BOX_SPINNER_PATTERN.search(line_above_box):
-                return TerminalStatus.PROCESSING
+            # Walk up from the box past footer chrome — "⎿ Tip: …" hint lines
+            # and blanks render BETWEEN the live spinner and the box's top
+            # border, so checking only the single line above the box misses
+            # an active spinner (false COMPLETED during MCP calls).
+            above_lines = output[: input_box.start()].rstrip("\n").split("\n")
+            for line in reversed(above_lines[-4:]):
+                if not line.strip() or line.lstrip().startswith("⎿"):
+                    continue
+                if NEW_TUI_BOX_SPINNER_PATTERN.search(line):
+                    return TerminalStatus.PROCESSING
+                break
 
         # COMPLETED: the finished turn left output behind — a "✻ <Verb>ed for Ns"
         # completion summary OR a start-of-line response marker (legacy ⏺ or the

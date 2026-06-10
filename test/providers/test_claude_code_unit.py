@@ -1453,3 +1453,55 @@ class TestClaudeCodeProviderSettings:
 
         result = json.loads(settings_file.read_text())
         assert result["skipDangerousModePermissionPrompt"] is True
+
+
+class TestClaudeCodeMcpCallNotCompleted:
+    """A live MCP call must not read as COMPLETED.
+
+    Real failure (supervisor handoff e2e): the supervisor shows an interim
+    completion summary from an earlier thinking phase, then keeps working —
+    "● Calling cao-mcp-server… (ctrl+o to expand)" with a live
+    "✢ Misting… (33s · ↑ 332 tokens)" spinner and a "⎿ Tip: …" hint line
+    between the spinner and the input box. get_status() returned COMPLETED
+    mid-call; with the StatusMonitor ready-latch that false COMPLETED is
+    pinned until the next input, so the test extracted mid-flight output.
+    """
+
+    def test_live_spinner_above_tip_line_is_processing(self):
+        """Spinner above a ⎿ Tip line above the input box → PROCESSING."""
+        box = "─" * 30
+        output = (
+            "✻ Pondered for 8s\n"
+            "● Calling cao-mcp-server… (ctrl+o to expand)\n"
+            "✢ Misting… (33s · ↑ 332 tokens)\n"
+            "⎿  Tip: Use /btw to ask a quick side question\n"
+            + box
+            + "\n❯ \n"
+            + box
+            + "\n  ⏵⏵ bypass permissions on · esc to interrupt\n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    def test_live_spinner_after_interim_summary_in_tail_is_processing(self):
+        """A live spinner AFTER an interim summary in the post-separator tail
+        keeps the turn PROCESSING (the summary is interim, not final)."""
+        box = "─" * 30
+        output = (
+            "● Working on the report…\n"
+            "✢ Misting… (10s · ↑ 12 tokens)\n" + box + "\n✻ Pondered for 8s\n"
+            "✢ Churning… (2s · ↑ 4 tokens)\n❯ \n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    def test_summary_without_following_spinner_still_completed(self):
+        """No live spinner after the summary → boxless completion still wins."""
+        box = "─" * 30
+        output = (
+            "· Whatchamacalliting… (1s · ↓ 13 tokens)\n❯ \n"
+            + box
+            + "\n✻ Cogitated for 1s\n❯ \n← for agents\n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
