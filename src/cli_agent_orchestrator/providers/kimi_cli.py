@@ -32,6 +32,7 @@ import re
 import shlex
 import shutil
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -125,11 +126,31 @@ STATUS_BAR_PATTERN = r"\d+:\d+\s+.*(?:agent|shell)\s*\("
 # footer, or the status bar's "agent (<model> ●)" segment (● = U+25CF).
 NEW_TUI_STATUS_PATTERN = r"context:\s*\d+(?:\.\d+)?%|agent\s*\([^)]*●"
 # Live working indicator: the new TUI animates a braille spinner
-# ("⠧ Thinking… 5s · 220 tokens") that is cleared when the turn finishes. Any
-# braille glyph (U+2800–U+28FF) means a turn is in flight. Stale spinner frames
-# linger higher in the rolling buffer, so this is matched ONLY against the
-# freshest tail lines (not the whole buffer).
-NEW_TUI_SPINNER_PATTERN = r"[⠀-⣿]"
+# ("⠧ Thinking… 5s · 220 tokens", "⠹ Using handoff({...})") and a moon-phase
+# thinking glyph (🌑…🌘) that are cleared when the turn finishes. Any such
+# glyph means a turn-in-flight FRAME was rendered; freshness relative to the
+# last response bullet decides whether the turn is still going (see
+# get_status).
+NEW_TUI_SPINNER_PATTERN = r"[⠁-⣿]|[🌑🌒🌓🌔🌕🌖🌗🌘]"
+# Boot/MCP chrome also renders braille glyphs while the terminal is genuinely
+# idle at the welcome screen ("⠧ MCP Servers: 0/1 connected", "⠦ cao-mcp-server
+# (connecting)", "⠋ Resolving dependencies..."). Those must NOT count as a
+# live turn-in-flight spinner or a freshly-booted terminal would never read
+# IDLE.
+NEW_TUI_BOOT_CHROME_PATTERN = re.compile(
+    r"MCP Servers|\(connecting\)|Resolving dependencies|connecting to mcp servers"
+    r"|Loading configuration|Loading agent|Restoring conversation",
+    re.IGNORECASE,
+)
+
+
+def _is_live_turn_spinner_line(line: str) -> bool:
+    """True when ``line`` carries a live turn-in-flight spinner glyph."""
+    return bool(
+        re.search(NEW_TUI_SPINNER_PATTERN, line) and not NEW_TUI_BOOT_CHROME_PATTERN.search(line)
+    )
+
+
 # A response/thinking bullet ("• …") at line start. Its presence means a turn
 # has produced output — used to latch "input received" on the new TUI (the
 # welcome banner / update nag contain no "•", so this won't false-trigger at
@@ -180,11 +201,32 @@ class KimiCliProvider(BaseProvider):
         # Without this, get_status() returns IDLE instead of COMPLETED after
         # the agent finishes processing, causing handoff to time out.
         self._has_received_input = False
+        # Wallclock of the last send_input() dispatch (terminal_service calls
+        # mark_input_received). Used by the newest-TUI status path: right
+        # after a paste, the TUI repaints the ready chrome (status bar) before
+        # the spinner's first frame, so a position-based spinner-vs-ready
+        # compare reads COMPLETED ~100ms into the new turn. With the
+        # StatusMonitor ready-latch, that false COMPLETED is pinned for the
+        # whole turn (observed: supervisor-assign e2e extracting mid-flight
+        # output). A short dispatch grace bridges the gap until the first
+        # spinner frame arrives.
+        self._last_dispatch_time = 0.0
 
     @property
     def paste_enter_count(self) -> int:
         """Kimi CLI's prompt_toolkit submits on single Enter after bracketed paste."""
         return 1
+
+    def mark_input_received(self) -> None:
+        """Record a dispatched task (called by terminal_service after send_input).
+
+        Latches ``_has_received_input`` (the buffer-evidence latch can miss it
+        when a long paste scrolls the echo out of the rolling window) and
+        stamps ``_last_dispatch_time`` for the newest-TUI dispatch-grace check
+        in get_status().
+        """
+        self._has_received_input = True
+        self._last_dispatch_time = time.time()
 
     def _build_kimi_command(self) -> str:
         """Build Kimi CLI command with agent profile and MCP config if provided.
@@ -432,24 +474,72 @@ class KimiCliProvider(BaseProvider):
             if re.search(ANY_BULLET_PATTERN, clean_output):
                 self._has_received_input = True
 
-            # PROCESSING vs ready by POSITION, not a fixed tail window: when a
-            # turn finishes, the spinner line is cleared and the empty input box
-            # (many blank lines) + status bar are redrawn last, but stale spinner
-            # frames remain higher in the rolling buffer. Compare the last line
-            # bearing a braille spinner against the last line bearing the ready
-            # chrome (status bar / context footer): if the spinner is the more
-            # recent of the two, a turn is in flight.
+            # PROCESSING vs ready. A spinner-vs-status-bar position compare is
+            # unreliable here: the TUI renders the live spinner BETWEEN the
+            # "── input ──" rule and the status bar and repaints the status
+            # bar with every frame, so the ready chrome is the freshest
+            # content even mid-turn (observed: a supervisor turn flapping
+            # completed↔processing 29 times in one 57KB stream, which the
+            # StatusMonitor ready-latch then pinned at a false COMPLETED).
+            # Two in-flight signals, validated by replaying captured live
+            # streams; either one means a turn is running:
+            # - spinner glyph (braille/moon, incl. tool-call lines like
+            #   "⠹ Using handoff({…})") within the freshest tail lines —
+            #   frames land every ~100ms while the agent works, and the
+            #   turn-finished repaint (input rule + ~12 blank box lines +
+            #   separator + status bar + context footer) pushes stale frames
+            #   beyond this window;
+            # - the last spinner glyph rendered AFTER the last "•" bullet —
+            #   catches chunk boundaries mid-repaint where streamed thinking
+            #   text has temporarily pushed the spinner out of the tail
+            #   window (a finished turn always ends with bullets as the
+            #   freshest non-chrome content).
             lines = clean_output.splitlines()
             last_spinner = max(
-                (i for i, line in enumerate(lines) if re.search(NEW_TUI_SPINNER_PATTERN, line)),
+                (i for i, line in enumerate(lines) if _is_live_turn_spinner_line(line)),
                 default=-1,
             )
-            last_ready = max(
-                (i for i, line in enumerate(lines) if re.search(NEW_TUI_STATUS_PATTERN, line)),
+            last_bullet = max(
+                (i for i, line in enumerate(lines) if re.match(r"\s*•", line)),
                 default=-1,
             )
-            if last_spinner > last_ready:
+            spinner_in_tail = last_spinner >= 0 and last_spinner >= len(lines) - 15
+            if spinner_in_tail or last_spinner > last_bullet:
                 return TerminalStatus.PROCESSING
+
+            # Dispatch grace: for a few seconds after send_input(), trust the
+            # dispatch over the chrome. The paste repaints the status bar
+            # (ready chrome lands LAST in the stream) before the turn's first
+            # spinner frame, so the checks above briefly read "ready" ~100ms
+            # into a new turn — and the StatusMonitor ready-latch would pin
+            # that false COMPLETED until the next input.
+            if self._last_dispatch_time and time.time() - self._last_dispatch_time < 5.0:
+                return TerminalStatus.PROCESSING
+
+            # The stream looks ready — confirm against the RENDERED pane.
+            # A ready-looking chunk boundary is byte-identical mid-turn vs at
+            # real completion (measured on captured streams: stale spinner
+            # ~21 lines back, bullets 2-3 from the end in BOTH), so the raw
+            # stream alone cannot split them. The rendered pane can: tmux's
+            # compositor has resolved every in-place redraw, so a spinner
+            # glyph visible in the pane tail is live, not stale. Gated to
+            # post-dispatch only (boot screens legitimately show braille
+            # like '⠧ MCP Servers: 0/1' while idle at the welcome screen,
+            # and init readiness is already handled by the stream path).
+            if self._last_dispatch_time:
+                try:
+                    pane_tail = get_backend().get_history(
+                        self.session_name,
+                        self.window_name,
+                        tail_lines=25,
+                        strip_escapes=True,
+                    )
+                    if any(_is_live_turn_spinner_line(line) for line in pane_tail.splitlines()):
+                        return TerminalStatus.PROCESSING
+                except Exception:
+                    # Pane unavailable (deleted window, backend hiccup) —
+                    # fall through to the stream-derived ready status.
+                    pass
 
             if re.search(ERROR_PATTERN, clean_output, re.MULTILINE):
                 return TerminalStatus.ERROR

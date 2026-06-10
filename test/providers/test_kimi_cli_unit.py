@@ -1160,3 +1160,73 @@ class TestKimiCodeNewTuiExtraction:
         assert "context:" not in result
         assert "Welcome to Kimi Code CLI" not in result
         assert "cao-mcp-server, 3.4.2" not in result
+
+
+class TestKimiCodeDispatchGrace:
+    """Newest-TUI: a fresh dispatch must read PROCESSING even when the ready
+    chrome (status bar) is the freshest content in the buffer.
+
+    Real failure (supervisor-assign e2e): the paste repaints the status bar
+    before the turn's first spinner frame, so the spinner-vs-ready position
+    compare read COMPLETED ~130ms after send_input(); the StatusMonitor
+    ready-latch then pinned the false COMPLETED for the entire turn and the
+    test extracted mid-flight output.
+    """
+
+    NEW_TUI_READY_CHROME = (
+        "✨ Analyze the datasets and report back.\n"
+        "\n"
+        "• Dispatching analysts now.\n"
+        "── input ─────────────────────────────────\n"
+        "\n"
+        "──────────────────────────────────────────\n"
+        "yolo  agent (Kimi-k2.6 ●)  /tmp/cao_kimi_x  ctrl-o: editor\n"
+        "context: 4.0% (10.4k/262.1k)\n"
+    )
+
+    def test_fresh_dispatch_reads_processing(self):
+        provider = KimiCliProvider("test123", "test-session", "window-0")
+        provider.mark_input_received()
+        assert provider.get_status(self.NEW_TUI_READY_CHROME) == TerminalStatus.PROCESSING
+
+    def test_grace_expires_to_completed_when_pane_clear(self):
+        import time as _time
+
+        provider = KimiCliProvider("test123", "test-session", "window-0")
+        provider.mark_input_received()
+        provider._last_dispatch_time = _time.time() - 6.0
+        with patch("cli_agent_orchestrator.providers.kimi_cli.get_backend") as mock_backend:
+            # Rendered pane shows the same ready chrome — no live spinner.
+            mock_backend.return_value.get_history.return_value = self.NEW_TUI_READY_CHROME
+            assert provider.get_status(self.NEW_TUI_READY_CHROME) == TerminalStatus.COMPLETED
+
+    def test_ready_stream_with_live_pane_spinner_is_processing(self):
+        """A ready-looking chunk boundary mid-turn: the stream shows the ready
+        chrome, but the RENDERED pane still shows a live spinner — must stay
+        PROCESSING (this is the frame the StatusMonitor latch would otherwise
+        pin as a false COMPLETED)."""
+        import time as _time
+
+        provider = KimiCliProvider("test123", "test-session", "window-0")
+        provider.mark_input_received()
+        provider._last_dispatch_time = _time.time() - 6.0
+        pane = self.NEW_TUI_READY_CHROME.replace("── input ─", "⠹ Using handoff({...})\n── input ─")
+        with patch("cli_agent_orchestrator.providers.kimi_cli.get_backend") as mock_backend:
+            mock_backend.return_value.get_history.return_value = pane
+            assert provider.get_status(self.NEW_TUI_READY_CHROME) == TerminalStatus.PROCESSING
+
+    def test_pane_read_failure_falls_back_to_stream(self):
+        import time as _time
+
+        provider = KimiCliProvider("test123", "test-session", "window-0")
+        provider.mark_input_received()
+        provider._last_dispatch_time = _time.time() - 6.0
+        with patch("cli_agent_orchestrator.providers.kimi_cli.get_backend") as mock_backend:
+            mock_backend.return_value.get_history.side_effect = RuntimeError("pane gone")
+            assert provider.get_status(self.NEW_TUI_READY_CHROME) == TerminalStatus.COMPLETED
+
+    def test_no_dispatch_unaffected(self):
+        provider = KimiCliProvider("test123", "test-session", "window-0")
+        # bullet in buffer latches _has_received_input → COMPLETED, as before;
+        # no dispatch yet → pane confirmation is skipped entirely.
+        assert provider.get_status(self.NEW_TUI_READY_CHROME) == TerminalStatus.COMPLETED
