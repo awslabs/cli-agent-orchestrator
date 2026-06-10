@@ -5,6 +5,7 @@ Publisher: terminal.{id}.status
 """
 
 import logging
+import threading
 from typing import Dict
 
 from cli_agent_orchestrator.constants import STATE_BUFFER_MAX
@@ -42,6 +43,15 @@ class StatusMonitor:
     """Accumulates terminal output into rolling buffers and detects status changes."""
 
     def __init__(self):
+        # Guards _buffers/_last_status/_allow_processing_revert. State is
+        # touched from the asyncio consumer (_process_chunk), FastAPI's
+        # threadpool (send_input → notify_input_sent, get_status), inbox
+        # delivery worker threads, and cleanup_old_data's thread. Individual
+        # dict ops are GIL-atomic, but the latch logic is a read-modify-write
+        # sequence (read armed → decide transition → consume arm) that must
+        # not interleave with notify_input_sent, or a freshly-armed gate can
+        # be consumed by a decision taken against stale state.
+        self._lock = threading.RLock()
         self._buffers: Dict[str, str] = {}
         self._last_status: Dict[str, TerminalStatus] = {}
         # Per-terminal flag: when True, the next provider-detected PROCESSING
@@ -67,15 +77,14 @@ class StatusMonitor:
 
     def _process_chunk(self, terminal_id: str, chunk: str) -> None:
         """Append chunk to rolling buffer and check for status changes."""
-        if terminal_id not in self._buffers:
-            self._buffers[terminal_id] = ""
-        self._buffers[terminal_id] += chunk
+        with self._lock:
+            buffer = self._buffers.get(terminal_id, "") + chunk
+            if len(buffer) > STATE_BUFFER_MAX:
+                buffer = buffer[-STATE_BUFFER_MAX:]
+            self._buffers[terminal_id] = buffer
 
-        if len(self._buffers[terminal_id]) > STATE_BUFFER_MAX:
-            self._buffers[terminal_id] = self._buffers[terminal_id][-STATE_BUFFER_MAX:]
-
-        detected = self._detect_status(terminal_id, self._buffers[terminal_id])
-        last = self._last_status.get(terminal_id)
+        # Provider regex analysis can be slow — run it outside the lock.
+        detected = self._detect_status(terminal_id, buffer)
 
         # Stickiness: once a ready status is latched, refuse downgrades unless
         # notify_input_sent() armed a revert.
@@ -100,27 +109,47 @@ class StatusMonitor:
         # polling miss the brief ready windows — manifesting as PR #273 codex
         # 60s init timeouts, gemini 240s init timeouts, and completion
         # timeouts.
-        armed = self._allow_processing_revert.get(terminal_id, False)
-        if not armed:
-            if last in _STICKY_READY_STATUSES and detected in (
-                TerminalStatus.PROCESSING,
-                TerminalStatus.UNKNOWN,
-            ):
-                return
-            if last == TerminalStatus.COMPLETED and detected == TerminalStatus.IDLE:
+        with self._lock:
+            last = self._last_status.get(terminal_id)
+            armed = self._allow_processing_revert.get(terminal_id, False)
+            if not armed:
+                if last in _STICKY_READY_STATUSES and detected in (
+                    TerminalStatus.PROCESSING,
+                    TerminalStatus.UNKNOWN,
+                ):
+                    return
+                if last == TerminalStatus.COMPLETED and detected == TerminalStatus.IDLE:
+                    return
+
+            if detected == last:
                 return
 
-        if detected != last:
-            bus.publish(f"terminal.{terminal_id}.status", {"status": detected.value})
-            logger.info(f"Terminal {terminal_id} status changed: {detected.value}")
             self._last_status[terminal_id] = detected
-            # PROCESSING transition consumed; require a fresh notify before
-            # the next revert is allowed. Fresh ready latches always re-arm
-            # the gate to "blocked".
-            if detected in _STICKY_READY_STATUSES:
+            # Consume the arm on the transitions that mean "the cycle the
+            # input started has been observed":
+            # - PROCESSING: the intended consumption — the agent picked up
+            #   the input; subsequent ready latches re-block flaps.
+            # - non-ready → ready: init-style upgrade (UNKNOWN/PROCESSING →
+            #   IDLE); the cycle completed without a visible PROCESSING
+            #   window.
+            # A ready → ready transition while armed must KEEP the arm: it is
+            # an eviction flap (e.g. COMPLETED → IDLE when a large paste
+            # evicts the response markers, or WAITING_USER_ANSWER → IDLE
+            # after a permission keystroke), and the input's genuine
+            # PROCESSING transition hasn't been seen yet. Consuming the arm
+            # here would block that PROCESSING, leaving the terminal reading
+            # "ready" while the agent is busy — and InboxService delivers on
+            # IDLE/COMPLETED, so a queued message could be pasted into the
+            # middle of an active response.
+            if detected == TerminalStatus.PROCESSING:
                 self._allow_processing_revert[terminal_id] = False
-            elif detected == TerminalStatus.PROCESSING:
+            elif detected in _STICKY_READY_STATUSES and last not in _STICKY_READY_STATUSES:
                 self._allow_processing_revert[terminal_id] = False
+
+        # Publish outside the lock — subscribers must never be able to
+        # re-enter StatusMonitor while the latch state is mid-update.
+        bus.publish(f"terminal.{terminal_id}.status", {"status": detected.value})
+        logger.info(f"Terminal {terminal_id} status changed: {detected.value}")
 
     def notify_input_sent(self, terminal_id: str) -> None:
         """Arm the next PROCESSING transition.
@@ -130,7 +159,8 @@ class StatusMonitor:
         and CLI-launch keystrokes). Without this, a previously-latched
         IDLE/COMPLETED would block the genuine PROCESSING transition.
         """
-        self._allow_processing_revert[terminal_id] = True
+        with self._lock:
+            self._allow_processing_revert[terminal_id] = True
 
     def _detect_status(self, terminal_id: str, buffer: str) -> TerminalStatus:
         """Detect status: provider-specific patterns or UNKNOWN if no provider."""
@@ -146,9 +176,10 @@ class StatusMonitor:
 
     def clear_terminal(self, terminal_id: str) -> None:
         """Free buffer and status for a deleted terminal."""
-        self._buffers.pop(terminal_id, None)
-        self._last_status.pop(terminal_id, None)
-        self._allow_processing_revert.pop(terminal_id, None)
+        with self._lock:
+            self._buffers.pop(terminal_id, None)
+            self._last_status.pop(terminal_id, None)
+            self._allow_processing_revert.pop(terminal_id, None)
 
     def reset_buffer(self, terminal_id: str) -> None:
         """Clear the rolling buffer + last-known status WITHOUT forgetting the
@@ -159,9 +190,10 @@ class StatusMonitor:
         this, the retry re-derives status from a buffer still full of stale bytes
         from the failed first attempt and can spuriously time out.
         """
-        self._buffers[terminal_id] = ""
-        self._last_status.pop(terminal_id, None)
-        self._allow_processing_revert.pop(terminal_id, None)
+        with self._lock:
+            self._buffers[terminal_id] = ""
+            self._last_status.pop(terminal_id, None)
+            self._allow_processing_revert.pop(terminal_id, None)
 
     def get_status(self, terminal_id: str) -> TerminalStatus:
         """Get current terminal status — the single source of truth for both backends.
@@ -182,20 +214,26 @@ class StatusMonitor:
             except Exception:
                 provider = None
             if provider is not None:
+                with self._lock:
+                    buffer = self._buffers.get(terminal_id, "")
                 try:
                     # The native (herdr) path ignores the buffer arg; pass the
                     # rolling buffer (empty for herdr) so the rare
                     # get_native_status()==None fallback still gets what we have.
-                    return provider.get_status(self._buffers.get(terminal_id, ""))
+                    # provider.get_status may shell out to the herdr CLI — call
+                    # it outside the lock.
+                    return provider.get_status(buffer)
                 except Exception as e:
                     logger.error(f"Error deriving native status for {terminal_id}: {e}")
                     return TerminalStatus.UNKNOWN
 
-        return self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
+        with self._lock:
+            return self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
 
     def get_buffer(self, terminal_id: str) -> str:
         """Get accumulated output buffer for a terminal."""
-        return self._buffers.get(terminal_id, "")
+        with self._lock:
+            return self._buffers.get(terminal_id, "")
 
 
 # Module-level singleton
