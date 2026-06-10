@@ -211,6 +211,8 @@ class KiroCliProvider(BaseProvider):
         Raises:
             TimeoutError: If shell or Kiro CLI initialization times out
         """
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
         # Step 1: Wait for shell prompt to appear in the tmux window
         # This ensures the terminal is ready before we send commands
         if not await wait_for_shell(self.terminal_id, timeout=10.0):
@@ -250,6 +252,9 @@ class KiroCliProvider(BaseProvider):
             base_args.extend(["--model", model])
         base_args.extend(["--agent", self._agent_profile])
         command = shlex.join(base_args)
+        # Arm the StatusMonitor stickiness gate before launching the CLI so
+        # the IDLE → PROCESSING → IDLE/COMPLETED transition is honored.
+        status_monitor.notify_input_sent(self.terminal_id)
         get_backend().send_keys(self.session_name, self.window_name, command)
 
         # Step 3: Wait for Kiro CLI to fully initialize and show the agent prompt.
@@ -264,20 +269,20 @@ class KiroCliProvider(BaseProvider):
             # Non-yolo TUI mode failed — fall back to --legacy-ui
             logger.warning("Kiro CLI TUI initialization timed out, retrying with --legacy-ui")
             # Exit the current session and start fresh with --legacy-ui
+            status_monitor.notify_input_sent(self.terminal_id)
             get_backend().send_keys(self.session_name, self.window_name, "/exit")
             if not await wait_for_shell(self.terminal_id, timeout=10.0):
                 raise TimeoutError("Shell recovery timed out after --legacy-ui fallback")
             # Clear the StatusMonitor buffer so the --legacy-ui attempt is detected
             # against a clean buffer, not one still full of stale TUI marker bytes
             # from the failed first attempt (which would otherwise time out too).
-            from cli_agent_orchestrator.services.status_monitor import status_monitor
-
             status_monitor.reset_buffer(self.terminal_id)
             legacy_args = ["kiro-cli", "chat", "--legacy-ui"]
             if model:
                 legacy_args.extend(["--model", model])
             legacy_args.extend(["--agent", self._agent_profile])
             legacy_command = shlex.join(legacy_args)
+            status_monitor.notify_input_sent(self.terminal_id)
             get_backend().send_keys(self.session_name, self.window_name, legacy_command)
             if not await wait_until_status(
                 self.terminal_id, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=30.0

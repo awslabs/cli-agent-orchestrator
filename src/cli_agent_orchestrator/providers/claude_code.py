@@ -296,12 +296,16 @@ class ClaudeCodeProvider(BaseProvider):
             # 1) Handle bypass permissions prompt (appears before trust prompt).
             #    Only act once — the text stays in the buffer after dismissal.
             if not bypass_accepted and re.search(BYPASS_PROMPT_PATTERN, clean_output):
+                from cli_agent_orchestrator.services.status_monitor import status_monitor
+
                 logger.info("Bypass permissions prompt detected, auto-accepting")
                 # Send Down arrow to move cursor to "Yes, I accept", then Enter.
+                status_monitor.notify_input_sent(self.terminal_id)
                 get_backend().send_keys(
                     self.session_name, self.window_name, "\x1b[B", enter_count=0
                 )
                 time.sleep(0.5)
+                status_monitor.notify_input_sent(self.terminal_id)
                 get_backend().send_special_key(self.session_name, self.window_name, "Enter")
                 bypass_accepted = True
                 time.sleep(1.0)
@@ -309,7 +313,10 @@ class ClaudeCodeProvider(BaseProvider):
 
             # 2) Handle workspace trust prompt
             if re.search(TRUST_PROMPT_PATTERN, clean_output):
+                from cli_agent_orchestrator.services.status_monitor import status_monitor
+
                 logger.info("Workspace trust prompt detected, auto-accepting")
+                status_monitor.notify_input_sent(self.terminal_id)
                 get_backend().send_special_key(self.session_name, self.window_name, "Enter")
                 return
 
@@ -326,6 +333,8 @@ class ClaudeCodeProvider(BaseProvider):
 
     async def initialize(self) -> bool:
         """Initialize Claude Code provider by starting claude command."""
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
         # Wait for shell prompt to appear in the tmux window
         if not await wait_for_shell(self.terminal_id, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
@@ -336,7 +345,10 @@ class ClaudeCodeProvider(BaseProvider):
         # Build properly escaped command string
         command = self._build_claude_command()
 
-        # Send Claude Code command using the backend
+        # Send Claude Code command using the backend. Arm the StatusMonitor
+        # stickiness gate so the launching command can drive a fresh
+        # PROCESSING transition past any stale ready latch.
+        status_monitor.notify_input_sent(self.terminal_id)
         get_backend().send_keys(self.session_name, self.window_name, command)
 
         # Handle startup prompts (bypass permissions + workspace trust)

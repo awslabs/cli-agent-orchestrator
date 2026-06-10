@@ -457,6 +457,13 @@ def send_input(
         # Check how many Enter keys the provider needs after paste
         enter_count = provider.paste_enter_count if provider else 1
 
+        # Arm the StatusMonitor stickiness gate so that the next provider-
+        # detected PROCESSING transition is honored (overriding the latched
+        # IDLE/COMPLETED). Without this, sticky ready-status would block
+        # the genuine PROCESSING signal that arrives once the agent starts
+        # working on the new message.
+        status_monitor.notify_input_sent(terminal_id)
+
         get_backend().send_keys(
             metadata["tmux_session"],
             metadata["tmux_window"],
@@ -515,6 +522,11 @@ def send_special_key(terminal_id: str, key: str) -> bool:
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
+        # Arm StatusMonitor stickiness: special keys (Enter on a permission
+        # prompt, C-c interrupting work, C-d sending EOF) all initiate a new
+        # processing cycle that must be allowed to push past any latched
+        # ready status.
+        status_monitor.notify_input_sent(terminal_id)
         get_backend().send_special_key(metadata["tmux_session"], metadata["tmux_window"], key)
 
         update_last_active(terminal_id)
