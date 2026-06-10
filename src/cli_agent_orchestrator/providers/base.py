@@ -116,11 +116,14 @@ class BaseProvider(ABC):
         IMPORTANT — input contract: ``buffer`` is the **raw** pipe-pane byte
         stream (cursor-positioning escapes, in-place ``\\r`` redraws, OSC titles),
         NOT a tmux-rendered pane snapshot. Implementations that do structural /
-        line-oriented matching should run it through
+        line-oriented matching MAY run it through
         ``cli_agent_orchestrator.utils.text.strip_terminal_escapes`` first
         (which removes escapes and normalizes cursor moves to newlines).
         Detectors calibrated against rendered snapshots will misfire on the raw
-        stream if they skip this step.
+        stream if they skip this step. This is deliberately not a hard
+        requirement: some providers depend on the raw escapes (kiro_cli
+        preserves ``\\r`` for permission-prompt detection — see the comment in
+        its get_status) and must NOT be "fixed" to comply.
 
         Args:
             buffer: Raw terminal output (up to ~8KB rolling buffer).

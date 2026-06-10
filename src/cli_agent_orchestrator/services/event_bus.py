@@ -25,14 +25,26 @@ class EventBus:
         self._lock = threading.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
-    def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
-        """Register the asyncio event loop (required for thread-safe publishing)."""
+    def set_loop(self, loop: Optional[asyncio.AbstractEventLoop]) -> None:
+        """Register the asyncio event loop (required for thread-safe publishing).
+
+        Pass ``None`` to detach the bus from a loop (used by test fixtures and
+        at shutdown) — publish() becomes a no-op until a loop is set again.
+        """
         self._loop = loop
 
     def publish(self, topic: str, data: dict) -> None:
         """Publish event to all matching subscribers. Safe to call from any thread."""
-        if self._loop:
-            self._loop.call_soon_threadsafe(self._dispatch, topic, data)
+        loop = self._loop
+        if loop is None:
+            return
+        try:
+            loop.call_soon_threadsafe(self._dispatch, topic, data)
+        except RuntimeError:
+            # Loop already closed (server shutting down while a FIFO reader
+            # thread drains its last chunks) — drop the event instead of
+            # crashing the publisher thread.
+            logger.debug(f"Event bus loop closed; dropping event: {topic}")
 
     def subscribe(self, pattern: str) -> asyncio.Queue:
         """Subscribe to a topic pattern (e.g., 'terminal.*.output'). Returns async queue."""

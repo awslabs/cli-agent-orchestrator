@@ -31,7 +31,10 @@ class LogWriter:
 
     @staticmethod
     def _write(path, data: str) -> None:
-        with open(path, "a") as f:
+        # Explicit UTF-8: the platform default encoding can be non-UTF-8
+        # (e.g. POSIX/C locale), and a single unencodable chunk would raise
+        # UnicodeEncodeError and stop log persistence for the terminal.
+        with open(path, "a", encoding="utf-8", errors="replace") as f:
             f.write(data)
 
 
