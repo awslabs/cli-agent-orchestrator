@@ -67,6 +67,22 @@ STATE_BUFFER_MAX = 8192
 # Max events buffered per subscriber queue before dropping
 EVENT_BUS_MAX_QUEUE_SIZE = 1024
 
+# pyte-rendered status detection. When enabled, the StatusMonitor feeds each
+# terminal's output through a pyte terminal emulator and runs detection against
+# the COMPOSITED screen (redraws/cursor-moves resolved) instead of the raw
+# byte stream — but only for providers that opt in via
+# ``supports_screen_detection`` AND only after the rendered screen goes
+# byte-stable (quiescence debounce). Empirically, rendering without the
+# debounce is WORSE than the raw path (it catches mid-redraw frames); the
+# debounce is what collapses status flaps to ~0. Default OFF so the raw path
+# stays the shipped behavior until validated.
+CAO_PYTE_STATUS = os.environ.get("CAO_PYTE_STATUS", "false").lower() == "true"
+
+# pyte screen geometry — mirror the tmux pane size (clients/tmux.py x=220 y=50)
+# so the rendered viewport matches what the agent's TUI actually drew.
+PYTE_SCREEN_COLS = 220
+PYTE_SCREEN_ROWS = 50
+
 # Eager inbox delivery: when enabled, deliver queued messages to terminals in
 # PROCESSING state for providers that declare
 # accepts_input_while_processing=True. Eliminates latency between agent turns
