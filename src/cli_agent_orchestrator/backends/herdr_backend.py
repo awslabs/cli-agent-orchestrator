@@ -39,11 +39,12 @@ _HERDR_ALLOWED_SUBCOMMANDS = frozenset(
     }
 )
 
-# Pattern for safe argument values passed to herdr.  Rejects shell
-# metacharacters and control characters that could alter command semantics.
+# Pattern for safe argument values passed to herdr.  Rejects control
+# characters and shell metacharacters that could alter command semantics.
 # Allows alphanumerics, hyphens, underscores, dots, slashes, colons, equals,
-# commas, spaces, and @ (covers paths, UUIDs, labels, JSON snippets).
-_SAFE_ARG_RE = re.compile(r"^[\w\-./: =,@{}\[\]\"'\\~+#]+$", re.UNICODE)
+# commas, spaces, parentheses, and @ (covers filesystem paths, UUIDs, labels,
+# JSON snippets).
+_SAFE_ARG_RE = re.compile(r"^[\w\-./: =,@(){}\[\]\"'\\~+#]+$", re.UNICODE)
 
 
 def _sanitize_herdr_args(args: List[str]) -> List[str]:
