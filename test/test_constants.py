@@ -185,9 +185,10 @@ class TestAddLocalCorsOrigins:
     def test_custom_host_adds_that_host_only(self):
         mod = self._reload_constants()
         mod.add_local_cors_origins("cao.internal", 9889)
-        assert "http://cao.internal:9889" in mod.CORS_ORIGINS
-        assert "http://localhost:9889" not in mod.CORS_ORIGINS
-        assert "http://127.0.0.1:9889" not in mod.CORS_ORIGINS
+        origins = set(mod.CORS_ORIGINS)  # exact-match set lookup (not URL substring check)
+        assert "http://cao.internal:9889" in origins
+        assert "http://localhost:9889" not in origins
+        assert "http://127.0.0.1:9889" not in origins
 
     def test_idempotent_when_called_twice(self):
         mod = self._reload_constants()

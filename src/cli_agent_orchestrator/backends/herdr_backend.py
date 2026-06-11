@@ -13,6 +13,7 @@ Design decisions:
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 import time
@@ -27,6 +28,57 @@ from cli_agent_orchestrator.backends.base import (
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
 logger = logging.getLogger(__name__)
+
+# Herdr CLI subcommands that _run_herdr is allowed to invoke.
+_HERDR_ALLOWED_SUBCOMMANDS = frozenset(
+    {
+        "workspace",
+        "tab",
+        "pane",
+        "session",
+    }
+)
+
+# Pattern for safe argument values passed to herdr.  Rejects shell
+# metacharacters and control characters that could alter command semantics.
+# Allows alphanumerics, hyphens, underscores, dots, slashes, colons, equals,
+# commas, spaces, and @ (covers paths, UUIDs, labels, JSON snippets).
+_SAFE_ARG_RE = re.compile(r"^[\w\-./: =,@{}\[\]\"'\\~+#]+$", re.UNICODE)
+
+
+def _validate_herdr_args(args: List[str]) -> None:
+    """Raise ValueError if any arg contains unsafe characters.
+
+    herdr is invoked with shell=False (list form) so shell injection is not
+    possible, but argument injection (e.g. injecting ``--session other``) could
+    redirect commands to unintended targets.  This validator ensures that:
+    1. The first positional arg is a known herdr subcommand.
+    2. All structural arguments (subcommand, flags, identifiers) match a safe
+       character set.  Terminal input payloads (the text body of ``pane
+       send-text``) are exempt because they are literal content typed into a
+       terminal pane, not arguments that alter herdr's own behavior.
+    """
+    if not args:
+        raise ValueError("herdr args must not be empty")
+    subcommand = args[0]
+    if subcommand not in _HERDR_ALLOWED_SUBCOMMANDS:
+        raise ValueError(
+            f"herdr subcommand '{subcommand}' not in allowlist: "
+            f"{sorted(_HERDR_ALLOWED_SUBCOMMANDS)}"
+        )
+    # Determine how many args are structural (subcommand + action + flags/ids).
+    # ``pane send-text <pane_id> <text>`` and ``pane run <pane_id> <cmd>``
+    # carry a terminal-input / shell-command payload at index 3+ that is
+    # exempt from validation (it is content, not an argument that alters
+    # herdr's own routing or behavior).
+    if len(args) >= 2 and args[0] == "pane" and args[1] in ("send-text", "run"):
+        structural_args = args[:3]
+    else:
+        structural_args = args
+    for arg in structural_args:
+        if not _SAFE_ARG_RE.match(arg):
+            raise ValueError(f"herdr argument contains unsafe characters: {arg!r}")
+
 
 # Cache TTL for pane_id resolution (seconds).
 # Used by _resolve_pane_id() (inbox service path, herdr-native terminal_ids) and
@@ -80,10 +132,12 @@ class HerdrBackend(TerminalBackend):
 
         Raises:
             TerminalBackendError: If check=True and command fails
+            ValueError: If args contain unsafe characters or unknown subcommands
         """
+        _validate_herdr_args(args)
         cmd = ["herdr", "--session", self._herdr_session] + args
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)  # noqa: S603
             if check and result.returncode != 0:
                 raise TerminalBackendError(
                     f"herdr command failed: {' '.join(cmd)}\n" f"stderr: {result.stderr.strip()}"
