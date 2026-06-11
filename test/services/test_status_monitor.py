@@ -99,6 +99,11 @@ class _SequencedMonitor:
     def feed(self, status):
         provider = MagicMock()
         provider.get_status.return_value = status
+        # These tests exercise the RAW detection path's latch logic. Pin
+        # supports_screen_detection False so they are independent of the
+        # CAO_PYTE_STATUS default (a bare MagicMock would be truthy and route
+        # through the pyte screen path).
+        provider.supports_screen_detection = False
         bus = MagicMock()
         bus.publish.side_effect = lambda topic, data: self.published.append(data["status"])
         with (
