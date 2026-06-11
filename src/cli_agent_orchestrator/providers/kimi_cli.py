@@ -605,6 +605,53 @@ class KimiCliProvider(BaseProvider):
         # No prompt visible and no error: Kimi is actively processing/streaming
         return TerminalStatus.PROCESSING
 
+    # Opt in to pyte rendered-screen detection (gated by CAO_PYTE_STATUS).
+    supports_screen_detection = True
+
+    def get_status_from_screen(self, screen_lines: list) -> TerminalStatus:
+        """Detect status from a pyte-composited viewport (escape-free rows).
+
+        The composited screen removes the need for the raw-stream hacks the
+        buffer path carries (the get_history re-capture and the dispatch-grace
+        window): a spinner visible in the rendered pane tail is unambiguously
+        live, and the response bullets are present without eviction. Called by
+        the StatusMonitor only on settled / rising-edge frames.
+        """
+        rows = [ln.rstrip() for ln in screen_lines if ln.strip()]
+        if not rows:
+            return TerminalStatus.UNKNOWN
+        joined = "\n".join(rows)
+        tail = rows[-18:]
+
+        # Newest "Kimi Code" TUI: readiness is the status bar / context footer.
+        if re.search(NEW_TUI_STATUS_PATTERN, joined):
+            if any(_is_live_turn_spinner_line(ln) for ln in tail):
+                return TerminalStatus.PROCESSING
+            if re.search(ERROR_PATTERN, joined, re.MULTILINE):
+                return TerminalStatus.ERROR
+            return (
+                TerminalStatus.COMPLETED
+                if re.search(ANY_BULLET_PATTERN, joined)
+                else TerminalStatus.IDLE
+            )
+
+        # Legacy emoji-prompt TUI: bare ✨/💫 prompt visible at the bottom.
+        if any(re.search(IDLE_PROMPT_PATTERN, ln) for ln in tail):
+            return (
+                TerminalStatus.COMPLETED
+                if re.search(ANY_BULLET_PATTERN, joined)
+                else TerminalStatus.IDLE
+            )
+
+        if re.search(ERROR_PATTERN, joined, re.MULTILINE):
+            return TerminalStatus.ERROR
+        # No Kimi TUI chrome on the composited screen at all (boot screen, or a
+        # torn-down pane back at the shell). On the RAW path "no prompt = still
+        # streaming" is a safe default, but on a fully rendered screen the
+        # absence of all TUI chrome means we are NOT looking at an active Kimi
+        # turn — so report UNKNOWN rather than a false PROCESSING.
+        return TerminalStatus.UNKNOWN
+
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract Kimi's final response from terminal output.
 

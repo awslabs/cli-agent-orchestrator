@@ -608,6 +608,54 @@ class ClaudeCodeProvider(BaseProvider):
 
         return TerminalStatus.UNKNOWN
 
+    # Opt in to pyte rendered-screen detection (gated by CAO_PYTE_STATUS). The
+    # detector below is tuned for a COMPOSITED viewport, not the raw stream.
+    supports_screen_detection = True
+
+    def get_status_from_screen(self, screen_lines: list) -> TerminalStatus:
+        """Detect status from a pyte-composited viewport (escape-free rows).
+
+        Anchors on the bottom of the rendered screen — exactly what a human
+        sees — rather than scanning a raw redraw stream. The StatusMonitor only
+        calls this on settled / rising-edge frames (quiescence debounce), so it
+        does not need to tolerate mid-repaint frames.
+
+        Precedence: a live spinner in the bottom region wins (PROCESSING); then
+        the Ink selection footer (WAITING_USER_ANSWER); then, if the input
+        prompt is visible, COMPLETED when a response/completion-summary is on
+        screen above it, else IDLE.
+        """
+        rows = [ln.rstrip() for ln in screen_lines if ln.strip()]
+        if not rows:
+            return TerminalStatus.UNKNOWN
+        joined = "\n".join(rows)
+        bottom = rows[-25:]
+
+        # Live spinner: "✻ <gerund>… (…)" — the boxed-prompt spinner or a bare
+        # spinner line. Visible in a composited frame ⇒ genuinely working.
+        if any(
+            NEW_TUI_BOX_SPINNER_PATTERN.search(ln) or re.search(NEW_TUI_SPINNER_PATTERN, ln)
+            for ln in bottom
+        ):
+            return TerminalStatus.PROCESSING
+
+        bottom_joined = "\n".join(bottom)
+        if (
+            re.search(WAITING_USER_ANSWER_PATTERN, bottom_joined)
+            and not re.search(TRUST_PROMPT_PATTERN, joined)
+            and not re.search(BYPASS_PROMPT_PATTERN, joined)
+        ):
+            return TerminalStatus.WAITING_USER_ANSWER
+
+        if any(re.search(IDLE_PROMPT_PATTERN, ln) for ln in bottom):
+            if re.search(
+                GET_STATUS_COMPLETION_PATTERN, joined
+            ) or EXTRACTION_RESPONSE_PATTERN.search(joined):
+                return TerminalStatus.COMPLETED
+            return TerminalStatus.IDLE
+
+        return TerminalStatus.UNKNOWN
+
     @property
     def paste_submit_delay(self) -> float:
         # The newest Claude Code Ink TUI needs noticeably longer than the 0.3s

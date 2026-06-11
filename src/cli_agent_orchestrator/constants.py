@@ -83,6 +83,14 @@ CAO_PYTE_STATUS = os.environ.get("CAO_PYTE_STATUS", "false").lower() == "true"
 PYTE_SCREEN_COLS = 220
 PYTE_SCREEN_ROWS = 50
 
+# Quiescence debounce for rendered-screen detection (seconds). Detection runs on
+# two edges: the RISING edge (output resumes after quiet → likely PROCESSING)
+# and QUIESCENCE (no new output for this long → the TUI repaint has settled, so
+# the screen reflects the true end state → COMPLETED/IDLE/WAITING). Detecting
+# only on these edges — never mid-burst — is what avoids the flaps that naive
+# per-chunk rendered detection produces (measured worse than the raw path).
+PYTE_QUIESCENCE_DELAY_S = 0.2
+
 # Eager inbox delivery: when enabled, deliver queued messages to terminals in
 # PROCESSING state for providers that declare
 # accepts_input_while_processing=True. Eliminates latency between agent turns
