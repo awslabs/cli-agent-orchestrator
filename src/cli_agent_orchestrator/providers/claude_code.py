@@ -655,7 +655,11 @@ class ClaudeCodeProvider(BaseProvider):
 
         # Real input box: a prompt line within 2 rows of a separator line.
         sep_idx = [i for i, ln in enumerate(rows) if re.search(r"─{8,}", ln)]
-        prompt_idx = [i for i, ln in enumerate(rows) if re.search(IDLE_PROMPT_PATTERN, ln)]
+        # Prompt line: ❯/> followed by whitespace OR alone at end-of-line. The
+        # bare-glyph case matters because rows are rstrip()ed: an EMPTY prompt
+        # box renders as "❯" + pyte's space padding, which rstrip reduces to a
+        # bare "❯" that IDLE_PROMPT_PATTERN (glyph + whitespace) cannot match.
+        prompt_idx = [i for i, ln in enumerate(rows) if re.search(r"[>❯](?:[\s\xa0]|$)", ln)]
         boxed_prompt = any(any(abs(pi - si) <= 2 for si in sep_idx) for pi in prompt_idx)
         if boxed_prompt:
             if re.search(

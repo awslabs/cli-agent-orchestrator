@@ -1505,3 +1505,66 @@ class TestClaudeCodeMcpCallNotCompleted:
         )
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+
+class TestClaudeCodeScreenDetection:
+    """Viewport detector (get_status_from_screen) — pyte-composited screens.
+
+    These fixtures replicate the LIVE failures the screen path hit during
+    validation, so they are the regression net for the pyte detection mode.
+    """
+
+    def _p(self):
+        return ClaudeCodeProvider("test123", "test-session", "window-0")
+
+    def test_ready_screen_with_boxed_prompt_is_idle(self):
+        screen = [
+            "─" * 60,
+            '❯ Try "fix typecheck errors"',
+            "─" * 60,
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+        ]
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.IDLE
+
+    def test_launch_echo_is_not_idle(self):
+        """During launch the echoed command (system prompt contains '> ') must
+        NOT read as an idle prompt — observed live as premature IDLE that made
+        the first task hit a not-ready agent."""
+        screen = [
+            "rkram@host:/tmp$ claude --append-system-prompt '...",
+            "> `memory_store` and `memory_recall` are CAO tools",
+            "- **cao-session-management**: ...",
+        ]
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.UNKNOWN
+
+    def test_live_spinner_is_processing(self):
+        screen = [
+            "● Working on the task",
+            "✻ Cultivating… (12s · ↓ 1.2k tokens)",
+            "─" * 60,
+            "❯ ",
+            "─" * 60,
+        ]
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.PROCESSING
+
+    def test_response_plus_prompt_is_completed(self):
+        screen = [
+            "● Done — fib.py created and tests pass.",
+            "✻ Crunched for 12s",
+            "─" * 60,
+            "❯ ",
+            "─" * 60,
+        ]
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.COMPLETED
+
+    def test_selection_widget_is_waiting_user_answer(self):
+        screen = [
+            "Do you want to proceed?",
+            "  1. Yes",
+            "  2. No",
+            "  ↑/↓ to navigate · enter to select",
+        ]
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_empty_screen_is_unknown(self):
+        assert self._p().get_status_from_screen(["", "", ""]) == TerminalStatus.UNKNOWN
