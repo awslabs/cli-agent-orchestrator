@@ -46,6 +46,21 @@ _HERDR_ALLOWED_SUBCOMMANDS = frozenset(
 # JSON snippets).
 _SAFE_ARG_RE = re.compile(r"^[\w\-./: =,@(){}\[\]\"'\\~+#]+$", re.UNICODE)
 
+# Flags that _run_herdr is allowed to pass to the herdr CLI.  Any argument
+# starting with "--" that is not in this set is rejected to prevent argument
+# injection (e.g. a crafted ``--session other`` overriding the backend's
+# session selection).
+_HERDR_ALLOWED_FLAGS = frozenset(
+    {
+        "--cwd",
+        "--format",
+        "--label",
+        "--lines",
+        "--source",
+        "--workspace",
+    }
+)
+
 
 def _sanitize_herdr_args(args: List[str]) -> List[str]:
     """Validate and return a sanitized copy of herdr CLI arguments.
@@ -84,6 +99,10 @@ def _sanitize_herdr_args(args: List[str]) -> List[str]:
     for arg in structural_args:
         if not _SAFE_ARG_RE.fullmatch(arg):
             raise ValueError(f"herdr argument contains unsafe characters: {arg!r}")
+        if arg.startswith("--") and arg not in _HERDR_ALLOWED_FLAGS:
+            raise ValueError(
+                f"herdr flag '{arg}' not in allowlist: {sorted(_HERDR_ALLOWED_FLAGS)}"
+            )
     # Return fresh str copies to break taint tracking from the original inputs.
     return [str(a) for a in args]
 
