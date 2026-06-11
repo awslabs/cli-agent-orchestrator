@@ -142,6 +142,16 @@ class StatusMonitor:
         """
         with self._lock:
             last = self._last_status.get(terminal_id)
+
+            # UNKNOWN is "no signal", not a state: never let it overwrite a
+            # known status. Mid-turn the screen can momentarily show neither a
+            # spinner nor the prompt (e.g. while a tool runs), which the
+            # detector reports as UNKNOWN; downgrading a known PROCESSING to
+            # UNKNOWN there is a spurious transition. The initial UNKNOWN (when
+            # last is None, nothing detected yet) is still allowed through.
+            if detected == TerminalStatus.UNKNOWN and last is not None:
+                return
+
             armed = self._allow_processing_revert.get(terminal_id, False)
             if not armed:
                 if last in _STICKY_READY_STATUSES and detected in (

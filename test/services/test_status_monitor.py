@@ -223,3 +223,23 @@ class TestStickyLatching:
         m.feed(TerminalStatus.UNKNOWN)
         m.feed(TerminalStatus.IDLE)
         assert m.published == ["completed"]
+
+    def test_unknown_does_not_overwrite_known_processing(self):
+        """UNKNOWN is 'no signal', not a state: a mid-turn UNKNOWN (e.g. the
+        screen momentarily shows neither spinner nor prompt while a tool runs)
+        must not downgrade a known PROCESSING. Observed live as a spurious
+        processing→unknown→completed blip."""
+        m = _SequencedMonitor()
+        m.feed(TerminalStatus.IDLE)
+        m.sm.notify_input_sent("t1")
+        m.feed(TerminalStatus.PROCESSING)
+        m.feed(TerminalStatus.UNKNOWN)
+        assert m.status() == TerminalStatus.PROCESSING
+
+    def test_initial_unknown_is_published(self):
+        """The first detection (last is None) may legitimately be UNKNOWN —
+        e.g. a freshly created terminal before any marker renders."""
+        m = _SequencedMonitor()
+        m.feed(TerminalStatus.UNKNOWN)
+        assert m.status() == TerminalStatus.UNKNOWN
+        assert m.published == ["unknown"]

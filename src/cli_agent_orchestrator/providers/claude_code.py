@@ -621,9 +621,15 @@ class ClaudeCodeProvider(BaseProvider):
         does not need to tolerate mid-repaint frames.
 
         Precedence: a live spinner in the bottom region wins (PROCESSING); then
-        the Ink selection footer (WAITING_USER_ANSWER); then, if the input
+        the Ink selection footer (WAITING_USER_ANSWER); then, if the BOXED input
         prompt is visible, COMPLETED when a response/completion-summary is on
         screen above it, else IDLE.
+
+        The prompt must be the real input box — a ``❯``/``>`` line adjacent to a
+        ``────`` separator — NOT any line containing ``> ``. During launch the
+        echoed command (whose system-prompt text contains ``> ``) would
+        otherwise read as an idle prompt and declare the terminal ready before
+        Claude's TUI has even rendered, breaking init (observed live).
         """
         rows = [ln.rstrip() for ln in screen_lines if ln.strip()]
         if not rows:
@@ -647,7 +653,11 @@ class ClaudeCodeProvider(BaseProvider):
         ):
             return TerminalStatus.WAITING_USER_ANSWER
 
-        if any(re.search(IDLE_PROMPT_PATTERN, ln) for ln in bottom):
+        # Real input box: a prompt line within 2 rows of a separator line.
+        sep_idx = [i for i, ln in enumerate(rows) if re.search(r"─{8,}", ln)]
+        prompt_idx = [i for i, ln in enumerate(rows) if re.search(IDLE_PROMPT_PATTERN, ln)]
+        boxed_prompt = any(any(abs(pi - si) <= 2 for si in sep_idx) for pi in prompt_idx)
+        if boxed_prompt:
             if re.search(
                 GET_STATUS_COMPLETION_PATTERN, joined
             ) or EXTRACTION_RESPONSE_PATTERN.search(joined):
