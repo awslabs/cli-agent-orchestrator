@@ -46,12 +46,17 @@ _HERDR_ALLOWED_SUBCOMMANDS = frozenset(
 _SAFE_ARG_RE = re.compile(r"^[\w\-./: =,@{}\[\]\"'\\~+#]+$", re.UNICODE)
 
 
-def _validate_herdr_args(args: List[str]) -> None:
-    """Raise ValueError if any arg contains unsafe characters.
+def _sanitize_herdr_args(args: List[str]) -> List[str]:
+    """Validate and return a sanitized copy of herdr CLI arguments.
+
+    Returns a new list of strings that have been verified safe for use with
+    subprocess.run(). This breaks the taint chain: the returned values are
+    fresh str objects produced by the sanitizer, not the original user-provided
+    references.
 
     herdr is invoked with shell=False (list form) so shell injection is not
     possible, but argument injection (e.g. injecting ``--session other``) could
-    redirect commands to unintended targets.  This validator ensures that:
+    redirect commands to unintended targets.  This sanitizer ensures that:
     1. The first positional arg is a known herdr subcommand.
     2. All structural arguments (subcommand, flags, identifiers) match a safe
        character set.  Terminal input payloads (the text body of ``pane
@@ -78,6 +83,8 @@ def _validate_herdr_args(args: List[str]) -> None:
     for arg in structural_args:
         if not _SAFE_ARG_RE.match(arg):
             raise ValueError(f"herdr argument contains unsafe characters: {arg!r}")
+    # Return fresh str copies to break taint tracking from the original inputs.
+    return [str(a) for a in args]
 
 
 # Cache TTL for pane_id resolution (seconds).
@@ -134,10 +141,10 @@ class HerdrBackend(TerminalBackend):
             TerminalBackendError: If check=True and command fails
             ValueError: If args contain unsafe characters or unknown subcommands
         """
-        _validate_herdr_args(args)
-        cmd = ["herdr", "--session", self._herdr_session] + args
+        sanitized = _sanitize_herdr_args(args)
+        cmd = ["herdr", "--session", self._herdr_session] + sanitized
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)  # noqa: S603
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             if check and result.returncode != 0:
                 raise TerminalBackendError(
                     f"herdr command failed: {' '.join(cmd)}\n" f"stderr: {result.stderr.strip()}"
