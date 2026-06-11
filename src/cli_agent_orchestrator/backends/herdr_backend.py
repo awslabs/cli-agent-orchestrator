@@ -81,7 +81,7 @@ def _sanitize_herdr_args(args: List[str]) -> List[str]:
     else:
         structural_args = args
     for arg in structural_args:
-        if not _SAFE_ARG_RE.match(arg):
+        if not _SAFE_ARG_RE.fullmatch(arg):
             raise ValueError(f"herdr argument contains unsafe characters: {arg!r}")
     # Return fresh str copies to break taint tracking from the original inputs.
     return [str(a) for a in args]
@@ -138,20 +138,27 @@ class HerdrBackend(TerminalBackend):
             CompletedProcess result
 
         Raises:
-            TerminalBackendError: If check=True and command fails
-            ValueError: If args contain unsafe characters or unknown subcommands
+            TerminalBackendError: If check=True and command fails, or if args
+                contain unsafe characters or unknown subcommands.
         """
-        sanitized = _sanitize_herdr_args(args)
+        try:
+            sanitized = _sanitize_herdr_args(args)
+        except ValueError as e:
+            raise TerminalBackendError(f"herdr argument validation failed: {e}") from e
         cmd = ["herdr", "--session", self._herdr_session] + sanitized
+        # Redact payload args (send-text/run content) from error messages to
+        # avoid leaking sensitive terminal input into logs/responses.
+        cmd_display = cmd[:5] + (["<redacted>"] if len(cmd) > 5 else [])
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             if check and result.returncode != 0:
                 raise TerminalBackendError(
-                    f"herdr command failed: {' '.join(cmd)}\n" f"stderr: {result.stderr.strip()}"
+                    f"herdr command failed: {' '.join(cmd_display)}\n"
+                    f"stderr: {result.stderr.strip()}"
                 )
             return result
         except subprocess.TimeoutExpired as e:
-            raise TerminalBackendError(f"herdr command timed out: {' '.join(cmd)}") from e
+            raise TerminalBackendError(f"herdr command timed out: {' '.join(cmd_display)}") from e
         except FileNotFoundError as e:
             raise TerminalBackendError(
                 "herdr CLI not found. Install herdr to use terminal_backend='herdr'."
