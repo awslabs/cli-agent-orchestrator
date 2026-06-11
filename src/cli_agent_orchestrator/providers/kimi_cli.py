@@ -623,6 +623,17 @@ class KimiCliProvider(BaseProvider):
         joined = "\n".join(rows)
         tail = rows[-18:]
 
+        # Boot gate: Kimi draws its status bar BEFORE it can accept input —
+        # while MCP servers are still connecting it shows "connecting to mcp
+        # servers" / "cao-mcp-server (connecting)" / "MCP Servers: 0/1
+        # connected". Reporting IDLE here is premature: a message delivered in
+        # this window is pasted into the boot screen and silently absorbed
+        # (observed live — an inbox message delivered 1.3s after a premature
+        # IDLE left the receiver stuck). Treat the connecting state as
+        # PROCESSING so init waits for a real ready prompt.
+        if re.search(r"connecting to mcp servers|\(connecting\)", joined, re.IGNORECASE):
+            return TerminalStatus.PROCESSING
+
         # Newest "Kimi Code" TUI: readiness is the status bar / context footer.
         if re.search(NEW_TUI_STATUS_PATTERN, joined):
             if any(_is_live_turn_spinner_line(ln) for ln in tail):
