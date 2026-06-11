@@ -100,9 +100,7 @@ def _sanitize_herdr_args(args: List[str]) -> List[str]:
         if not _SAFE_ARG_RE.fullmatch(arg):
             raise ValueError(f"herdr argument contains unsafe characters: {arg!r}")
         if arg.startswith("--") and arg not in _HERDR_ALLOWED_FLAGS:
-            raise ValueError(
-                f"herdr flag '{arg}' not in allowlist: {sorted(_HERDR_ALLOWED_FLAGS)}"
-            )
+            raise ValueError(f"herdr flag '{arg}' not in allowlist: {sorted(_HERDR_ALLOWED_FLAGS)}")
     # Return fresh str copies to break taint tracking from the original inputs.
     return [str(a) for a in args]
 
