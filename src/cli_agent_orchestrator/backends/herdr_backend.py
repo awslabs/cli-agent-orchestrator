@@ -63,21 +63,23 @@ _HERDR_ALLOWED_FLAGS = frozenset(
 
 
 def _sanitize_herdr_args(args: List[str]) -> List[str]:
-    """Validate and return a sanitized copy of herdr CLI arguments.
+    """Validate herdr CLI arguments and return a shallow copy.
 
-    Returns a new list of strings that have been verified safe for use with
-    subprocess.run(). This breaks the taint chain: the returned values are
-    fresh str objects produced by the sanitizer, not the original user-provided
-    references.
+    Checks that all structural arguments (subcommand, flags, identifiers) are
+    safe before they reach subprocess.run().  Returns a new list so static
+    analysis tools see the subprocess receiving values that passed through
+    this validation gate rather than the original caller-provided references.
 
     herdr is invoked with shell=False (list form) so shell injection is not
     possible, but argument injection (e.g. injecting ``--session other``) could
     redirect commands to unintended targets.  This sanitizer ensures that:
     1. The first positional arg is a known herdr subcommand.
-    2. All structural arguments (subcommand, flags, identifiers) match a safe
-       character set.  Terminal input payloads (the text body of ``pane
-       send-text``) are exempt because they are literal content typed into a
-       terminal pane, not arguments that alter herdr's own behavior.
+    2. All structural arguments match a safe character set.
+    3. Any ``--flag`` is in the allowed set (``--session`` is excluded since
+       ``_run_herdr`` injects it from a trusted instance attribute).
+    Terminal input payloads (the text body of ``pane send-text`` / ``pane run``)
+    are exempt because they are literal content typed into a terminal pane, not
+    arguments that alter herdr's own behavior.
     """
     if not args:
         raise ValueError("herdr args must not be empty")
@@ -100,9 +102,10 @@ def _sanitize_herdr_args(args: List[str]) -> List[str]:
         if not _SAFE_ARG_RE.fullmatch(arg):
             raise ValueError(f"herdr argument contains unsafe characters: {arg!r}")
         if arg.startswith("--") and arg not in _HERDR_ALLOWED_FLAGS:
-            raise ValueError(f"herdr flag '{arg}' not in allowlist: {sorted(_HERDR_ALLOWED_FLAGS)}")
-    # Return fresh str copies to break taint tracking from the original inputs.
-    return [str(a) for a in args]
+            raise ValueError(
+                f"herdr flag '{arg}' not in allowlist: " f"{sorted(_HERDR_ALLOWED_FLAGS)}"
+            )
+    return list(args)
 
 
 # Cache TTL for pane_id resolution (seconds).
@@ -164,9 +167,16 @@ class HerdrBackend(TerminalBackend):
         except ValueError as e:
             raise TerminalBackendError(f"herdr argument validation failed: {e}") from e
         cmd = ["herdr", "--session", self._herdr_session] + sanitized
-        # Redact payload args (send-text/run content) from error messages to
-        # avoid leaking sensitive terminal input into logs/responses.
-        cmd_display = cmd[:5] + (["<redacted>"] if len(cmd) > 5 else [])
+        # Redact only send-text/run payloads from error messages to avoid
+        # leaking sensitive terminal input. Other commands keep full args
+        # for debuggability.
+        has_payload = (
+            len(sanitized) >= 3 and sanitized[0] == "pane" and sanitized[1] in ("send-text", "run")
+        )
+        if has_payload:
+            cmd_display = cmd[:6] + ["<redacted>"]
+        else:
+            cmd_display = cmd
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             if check and result.returncode != 0:
