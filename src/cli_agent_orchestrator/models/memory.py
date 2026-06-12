@@ -12,11 +12,13 @@ from pydantic import (
     field_validator,
 )
 
+
 def _reject_control_chars(value: str) -> str:
     """Reject control characters to prevent newline/NULL bypasses of `$`-anchored regexes."""
     if any(ch in value for ch in ("\n", "\r", "\x00")):
         raise ValueError("must not contain control characters")
     return value
+
 
 # Mirrors the CLI validation rule (cli/commands/memory.py) — reject-first, so
 # malformed keys 422 at the API layer instead of being silently sanitized.
@@ -25,6 +27,7 @@ MemoryKey = Annotated[
     StringConstraints(pattern=r"^[a-z0-9-]{1,60}$"),
     AfterValidator(_reject_control_chars),
 ]
+
 
 def _reject_all_dots(value: str) -> str:
     """Reject '.', '..', '...' so traversal tokens 422 at the boundary instead
