@@ -28,8 +28,8 @@ MemoryKey = Annotated[
 
 def _reject_all_dots(value: str) -> str:
     """Reject '.', '..', '...' so traversal tokens 422 at the boundary instead
-    of relying on the get_wiki_path guard deeper down. A validator rather than
-    a lookahead because pydantic-core's regex engine has no look-around."""
+    of relying on the get_wiki_path guard deeper down."""
+    _reject_control_chars(value)
     if set(value) == {"."}:
         raise ValueError("scope_id must not consist solely of dots")
     return value
