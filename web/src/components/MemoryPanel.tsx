@@ -303,7 +303,7 @@ export function MemoryPanel() {
       <ConfirmModal
         open={!!pendingClear}
         title="Clear Scope"
-        message="This will permanently remove every memory in the selected scope — including any not shown by the current type filter or search. This action cannot be undone."
+        message="This attempts to permanently remove all memories in the selected scope (best-effort) — including any not shown by the current type filter or search. This action cannot be undone."
         details={pendingClear ? [
           { label: 'Scope', value: pendingClear },
         ] : []}

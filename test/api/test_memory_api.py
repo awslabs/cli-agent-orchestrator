@@ -145,6 +145,17 @@ class TestListMemories:
         assert client.get("/memory?scope_id=.").status_code == 422
         mock_service.recall.assert_not_awaited()
 
+    def test_list_scope_id_excludes_globals(self, client, mock_service):
+        """scope_id strictly narrows: global memories (scope_id=None) never match."""
+        mock_service.recall.return_value = [
+            _make_memory(key="global-one", scope="global"),
+            _make_memory(key="mine", scope="project", project_dir="proj-mine"),
+        ]
+        response = client.get("/memory?scope_id=proj-mine")
+
+        assert response.status_code == 200
+        assert [m["key"] for m in response.json()] == ["mine"]
+
     def test_list_filters_session_by_native_scope_id(self, client, mock_service):
         mock_service.recall.return_value = [
             _make_memory(key="s-one", scope="session", scope_id="sess-1"),

@@ -1333,9 +1333,11 @@ def _memory_scope_id(mem, base_dir: Path) -> Optional[str]:
 
 
 def _memory_matches_scope_id(mem, scope_id: str, base_dir: Path) -> bool:
-    """True when a recalled memory belongs to the given scope_id (global always matches)."""
-    if mem.scope == MemoryScope.GLOBAL.value:
-        return True
+    """True when a recalled memory belongs to the given scope_id.
+
+    Global memories have no scope_id (resolved as None), so they never match —
+    scope_id strictly narrows to one project/session/agent.
+    """
     return _memory_scope_id(mem, base_dir) == scope_id
 
 
@@ -1504,7 +1506,7 @@ async def clear_memories_endpoint(
                 status_code=status.HTTP_404_NOT_FOUND, detail="Memory system is disabled"
             )
         except Exception as e:
-            logger.warning(f"Failed to delete memory '{mem.key}' during clear: {e}")
+            logger.warning("Failed to delete memory %r during clear: %s", mem.key, e)
     return {"success": True, "deleted_count": deleted_count}
 
 
