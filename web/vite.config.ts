@@ -23,6 +23,7 @@ export default defineConfig({
       '/agents': { target: 'http://localhost:9889', changeOrigin: true },
       '/settings': { target: 'http://localhost:9889', changeOrigin: true },
       '/flows': { target: 'http://localhost:9889', changeOrigin: true },
+      '/memory': { target: 'http://localhost:9889', changeOrigin: true },
     },
   },
 })

@@ -12,6 +12,7 @@ import struct
 import subprocess
 import termios
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Dict, List, Optional, cast
 
@@ -54,6 +55,12 @@ from cli_agent_orchestrator.constants import (
 )
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
+from cli_agent_orchestrator.models.memory import (
+    MemoryKey,
+    MemoryScope,
+    MemoryScopeId,
+    MemoryType,
+)
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalId
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.manager import provider_manager
@@ -171,6 +178,26 @@ class InstallAgentProfileRequest(BaseModel):
     source: str
     provider: str = DEFAULT_PROVIDER
     env_vars: Optional[Dict[str, str]] = None
+
+
+class MemorySummary(BaseModel):
+    """Memory list entry. Excludes file_path (absolute server filesystem path)."""
+
+    key: str
+    scope: str
+    scope_id: Optional[str] = Field(
+        description="Native for session/agent, derived from storage path for project, None for global"
+    )
+    memory_type: str
+    tags: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class MemoryDetail(MemorySummary):
+    """Full memory view — adds the latest wiki section content."""
+
+    content: str
 
 
 class CreateFlowRequest(BaseModel):
@@ -450,6 +477,14 @@ async def get_agent_dirs_endpoint() -> Dict:
 class AgentDirsUpdate(BaseModel):
     agent_dirs: Optional[Dict[str, str]] = None
     extra_dirs: Optional[List[str]] = None
+
+
+@app.get("/settings/memory")
+async def get_memory_settings_endpoint() -> Dict:
+    """Return whether the memory subsystem is enabled (for UI feature discovery)."""
+    from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+    return {"enabled": is_memory_enabled()}
 
 
 @app.post("/settings/agent-dirs")
@@ -1246,6 +1281,231 @@ async def run_flow(name: str) -> Dict:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to execute flow: {str(e)}",
         )
+
+
+# ── Memory endpoints ─────────────────────────────────────────────────
+# REST mirror of `cao memory list/show/delete/clear` (issue #286). The server
+# has no meaningful cwd, so project scope is addressed by an explicit scope_id
+# query param instead of terminal_context — passing a client cwd would be
+# routed through resolve_project_id(), whose CAO_PROJECT_ID override applies
+# unconditionally and could silently target the wrong project.
+
+
+def _get_memory_service():
+    """Build a MemoryService (lazy import mirrors the circular-import guard
+    in memory_service._is_memory_enabled; module-level factory so tests can
+    patch it like the CLI's _get_memory_service)."""
+    from cli_agent_orchestrator.services.memory_service import MemoryService
+
+    return MemoryService()
+
+
+def _require_memory_enabled() -> None:
+    """Raise 404 when the memory subsystem is disabled.
+
+    recall() silently returns [] when disabled, so the gate must be explicit
+    rather than inferred from empty results.
+    """
+    from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+    if not is_memory_enabled():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Memory system is disabled"
+        )
+
+
+def _memory_scope_id(mem, base_dir: Path) -> Optional[str]:
+    """Resolve the response scope_id for a recalled memory.
+
+    session/agent results carry scope_id natively; project membership is only
+    recoverable from the storage path (base_dir/<project_id>/wiki/project/...);
+    global has none.
+    """
+    if mem.scope_id:
+        return str(mem.scope_id)
+    if mem.scope != MemoryScope.PROJECT.value:
+        return None
+    try:
+        relative = Path(mem.file_path).resolve().relative_to(base_dir.resolve())
+        return relative.parts[0]
+    except (ValueError, IndexError):
+        return None
+
+
+def _memory_matches_scope_id(mem, scope_id: str, base_dir: Path) -> bool:
+    """True when a recalled memory belongs to the given scope_id (global always matches)."""
+    if mem.scope == MemoryScope.GLOBAL.value:
+        return True
+    return _memory_scope_id(mem, base_dir) == scope_id
+
+
+def _to_memory_summary(mem, base_dir: Path) -> MemorySummary:
+    return MemorySummary(
+        key=mem.key,
+        scope=mem.scope,
+        scope_id=_memory_scope_id(mem, base_dir),
+        memory_type=mem.memory_type,
+        tags=mem.tags,
+        created_at=mem.created_at,
+        updated_at=mem.updated_at,
+    )
+
+
+@app.get("/memory", response_model=List[MemorySummary])
+async def list_memories_endpoint(
+    scope: Optional[MemoryScope] = None,
+    memory_type: Optional[MemoryType] = Query(default=None, alias="type"),
+    scope_id: Optional[MemoryScopeId] = None,
+    limit: int = Query(default=50, ge=1, le=100),
+) -> List[MemorySummary]:
+    """List stored memories across all projects (mirrors `cao memory list --all`)."""
+    _require_memory_enabled()
+    svc = _get_memory_service()
+    try:
+        # Internal limit 1000: recall truncates BEFORE the scope_id filter
+        # below, so filtering a small page could return an under-filled result.
+        # metadata mode: no query to rank, and it avoids the BM25 path.
+        memories = await svc.recall(
+            scope=scope.value if scope else None,
+            memory_type=memory_type.value if memory_type else None,
+            limit=1000,
+            scan_all=True,
+            search_mode="metadata",
+        )
+        if scope_id is not None:
+            memories = [m for m in memories if _memory_matches_scope_id(m, scope_id, svc.base_dir)]
+        return [_to_memory_summary(m, svc.base_dir) for m in memories[:limit]]
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to list memories: {str(e)}",
+        )
+
+
+@app.get("/memory/{key}", response_model=MemoryDetail)
+async def get_memory_endpoint(
+    key: MemoryKey,
+    scope: Optional[MemoryScope] = None,
+    scope_id: Optional[MemoryScopeId] = None,
+) -> MemoryDetail:
+    """Show a memory by key (mirrors `cao memory show`; first match wins)."""
+    _require_memory_enabled()
+    svc = _get_memory_service()
+    try:
+        memories = await svc.recall(
+            query=key,
+            scope=scope.value if scope else None,
+            limit=1000,
+            scan_all=True,
+            search_mode="metadata",
+        )
+        for mem in memories:
+            if mem.key != key:
+                continue
+            if scope_id is not None and not _memory_matches_scope_id(mem, scope_id, svc.base_dir):
+                continue
+            return MemoryDetail(
+                content=mem.content,
+                **_to_memory_summary(mem, svc.base_dir).model_dump(),
+            )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"Memory '{key}' not found"
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get memory: {str(e)}",
+        )
+
+
+@app.delete("/memory/{key}")
+async def delete_memory_endpoint(
+    key: MemoryKey,
+    scope: MemoryScope = MemoryScope.PROJECT,
+    scope_id: Optional[MemoryScopeId] = None,
+) -> Dict:
+    """Delete a memory by key (mirrors `cao memory delete`).
+
+    Unlike the MCP memory_forget tool (which resolves context from
+    CAO_TERMINAL_ID), non-global scopes require an explicit scope_id.
+    """
+    from cli_agent_orchestrator.services.memory_service import MemoryDisabledError
+
+    _require_memory_enabled()
+    if scope != MemoryScope.GLOBAL and scope_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"scope '{scope.value}' requires scope_id",
+        )
+    svc = _get_memory_service()
+    try:
+        deleted = await svc.forget(key=key, scope=scope.value, scope_id=scope_id)
+    except MemoryDisabledError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Memory system is disabled"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete memory: {str(e)}",
+        )
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Memory '{key}' not found in scope '{scope.value}'",
+        )
+    return {"success": True}
+
+
+@app.delete("/memory")
+async def clear_memories_endpoint(
+    scope: MemoryScope,
+    scope_id: Optional[MemoryScopeId] = None,
+) -> Dict:
+    """Clear all memories in a scope (mirrors `cao memory clear`).
+
+    Best-effort per-item loop (warn-and-continue), reporting deleted_count —
+    deliberately not all-or-nothing.
+    """
+    from cli_agent_orchestrator.services.memory_service import MemoryDisabledError
+
+    _require_memory_enabled()
+    if scope != MemoryScope.GLOBAL and scope_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"scope '{scope.value}' requires scope_id",
+        )
+    svc = _get_memory_service()
+    try:
+        memories = await svc.recall(
+            scope=scope.value, limit=1000, scan_all=True, search_mode="metadata"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to clear memories: {str(e)}",
+        )
+    if scope_id is not None:
+        memories = [m for m in memories if _memory_matches_scope_id(m, scope_id, svc.base_dir)]
+
+    deleted_count = 0
+    for mem in memories:
+        try:
+            # session/agent results carry scope_id natively; project results
+            # need the query param (their recalled scope_id is None).
+            if await svc.forget(key=mem.key, scope=scope.value, scope_id=mem.scope_id or scope_id):
+                deleted_count += 1
+        except MemoryDisabledError:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Memory system is disabled"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to delete memory '{mem.key}' during clear: {e}")
+    return {"success": True, "deleted_count": deleted_count}
 
 
 # Static file serving for built web UI.

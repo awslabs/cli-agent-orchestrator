@@ -267,6 +267,106 @@ Send a message to another terminal's inbox.
 
 ---
 
+## Memory
+
+REST mirror of the `cao memory` CLI. All `/memory` endpoints return `404` with
+`"Memory system is disabled"` when `memory.enabled` is false in settings.json;
+use `GET /settings/memory` to discover the enabled state (e.g. for hiding UI).
+
+Keys must match `^[a-z0-9-]{1,60}$` and `scope_id` must match
+`^[a-zA-Z0-9._-]{1,128}$`; malformed values return `422`.
+
+Because the server's working directory is not the user's project, project scope
+is addressed by an explicit `scope_id` query parameter (the resolved project
+ID). This intentionally diverges from the MCP `memory_forget` tool, which
+resolves context from the calling terminal.
+
+Known inconsistency: the internal `GET /terminals/{id}/memory-context` endpoint
+predates this contract and returns an empty `200` (not `404`) when memory is
+disabled.
+
+### GET /settings/memory
+Return whether the memory subsystem is enabled.
+
+**Response:**
+```json
+{
+  "enabled": true
+}
+```
+
+### GET /memory
+List stored memories across all projects (the CLI's `cao memory list --all`).
+
+**Parameters:**
+- `scope` (string, optional): Filter by scope (`global`, `project`, `session`, `agent`)
+- `type` (string, optional): Filter by memory type (`user`, `feedback`, `project`, `reference`)
+- `scope_id` (string, optional): Filter to one project/session/agent
+- `limit` (integer, optional): Max results, 1–100 (default: 50)
+
+**Response:**
+```json
+[
+  {
+    "key": "string",
+    "scope": "string",
+    "scope_id": "string|null",
+    "memory_type": "string",
+    "tags": "string",
+    "created_at": "timestamp",
+    "updated_at": "timestamp"
+  }
+]
+```
+
+`scope_id` is the project ID for project memories, the session/agent ID for
+those scopes, and `null` for global.
+
+### GET /memory/{key}
+Show a memory by key (first match wins when the same key exists in several
+scopes; narrow with `scope`/`scope_id`).
+
+**Parameters:**
+- `scope` (string, optional): Scope to search in
+- `scope_id` (string, optional): Project/session/agent to search in
+
+**Response:** the list entry shape plus `"content"` (the latest wiki section).
+`404` if no exact key match.
+
+### DELETE /memory/{key}
+Delete a memory by key.
+
+**Parameters:**
+- `scope` (string, optional): Scope of the memory (default: `project`)
+- `scope_id` (string): Required for `project`, `session`, and `agent` scopes (`400` if missing)
+
+**Response:**
+```json
+{
+  "success": true
+}
+```
+
+`404` if the key does not exist in the scope.
+
+### DELETE /memory
+Clear all memories in a scope. Best-effort: deletion continues past
+per-item failures and reports how many were removed.
+
+**Parameters:**
+- `scope` (string, required): Scope to clear
+- `scope_id` (string): Required for `project`, `session`, and `agent` scopes (`400` if missing)
+
+**Response:**
+```json
+{
+  "success": true,
+  "deleted_count": 3
+}
+```
+
+---
+
 ## Error Responses
 
 All endpoints return standard HTTP status codes:
