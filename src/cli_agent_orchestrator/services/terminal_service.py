@@ -130,6 +130,7 @@ async def create_terminal(
     allowed_tools: Optional[list[str]] = None,
     registry: PluginRegistry | None = None,
     env_vars: Optional[dict[str, str]] = None,
+    caller_id: Optional[str] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -152,6 +153,10 @@ async def create_terminal(
             ``new_session=False``, the persisted session vars are merged in
             automatically; the explicit ``env_vars`` argument is ignored to
             keep the per-session view consistent. See issue #248.
+        caller_id: Terminal ID of the supervisor that created this terminal
+            via handoff/assign. Recorded so send_message can route callbacks
+            structurally instead of parsing IDs out of message text (issue #284).
+            None for operator-launched terminals.
 
     Returns:
         Terminal object with all metadata populated
@@ -238,6 +243,7 @@ async def create_terminal(
             provider,
             agent_profile,
             allowed_tools,
+            caller_id=caller_id,
         )
 
         # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
@@ -294,6 +300,7 @@ async def create_terminal(
             provider=ProviderType(provider),
             session_name=session_name,
             agent_profile=agent_profile,
+            caller_id=caller_id,
             allowed_tools=allowed_tools,
             shell_command=shell_command,
             status=TerminalStatus.IDLE,
@@ -367,6 +374,7 @@ def get_terminal(terminal_id: str) -> Dict:
             "provider": metadata["provider"],
             "session_name": metadata["tmux_session"],
             "agent_profile": metadata["agent_profile"],
+            "caller_id": metadata.get("caller_id"),
             "allowed_tools": metadata.get("allowed_tools"),
             "status": status,
             "last_active": metadata["last_active"],
@@ -717,6 +725,7 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
                         metadata["tmux_session"], metadata["tmux_window"]
                     ),
                     "allowed_tools": metadata.get("allowed_tools"),
+                    "caller_id": metadata.get("caller_id"),
                 }
                 snapshot_path = TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json"
                 snapshot_path.write_text(_json.dumps(snapshot, indent=2), encoding="utf-8")

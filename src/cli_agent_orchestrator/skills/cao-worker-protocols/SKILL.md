@@ -26,17 +26,15 @@ Do not call `send_message` for ordinary handoff completion unless the task expli
 
 ## Rules for Assigned Tasks
 
-When the task came through `assign`, the task message should include a callback terminal ID. After you finish the work:
+When the task came through `assign`, send your results back after you finish the work:
 
-1. Extract the callback terminal ID from the task message.
-2. Format the result clearly and concisely.
-3. Call `send_message(receiver_id=..., message=...)` with the completed result.
+1. Format the result clearly and concisely.
+2. Call `send_message(message=...)` — omitting `receiver_id` routes the result to the terminal that assigned the task (the recorded caller). This is the reliable default.
+3. If the task message names a different callback terminal (directly or in an appended suffix such as `[Assigned by terminal ...]`), pass that ID as `receiver_id` instead.
 
 Do not stop after writing a normal response if the assignment explicitly requires a callback. The requesting terminal depends on `send_message` to receive the result.
 
-Assigned tasks may include callback instructions directly in the main message or in an appended suffix such as `[Assigned by terminal ...]`. Treat that callback terminal ID as authoritative.
-
-Your own `CAO_TERMINAL_ID` identifies your terminal, not the callback target. Send results to the receiver specified in the task.
+Your own `CAO_TERMINAL_ID` identifies your terminal, not the callback target. Never pass it as `receiver_id`.
 
 ## Message Formatting
 
@@ -54,7 +52,7 @@ If the task asks you to create files, write them before reporting completion. Wh
 
 ## Reliability Guidelines
 
-- Parse the callback terminal ID before you start expensive work.
+- If the task names an explicit callback terminal, note its ID before you start expensive work; otherwise rely on the default routing (omit `receiver_id`).
 - If `send_message` is available and the task requires a callback, call it directly rather than ending with prose alone.
 - Keep callback messages structured so the supervisor can merge them into a larger workflow.
 - For handoff tasks, return the completed output directly and let the orchestrator handle delivery.

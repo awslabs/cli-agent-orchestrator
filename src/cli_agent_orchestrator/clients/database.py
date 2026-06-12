@@ -37,6 +37,7 @@ class TerminalModel(Base):
     agent_profile = Column(String)  # "developer", "reviewer" (optional)
     allowed_tools = Column(String, nullable=True)  # JSON-encoded list of CAO tool names
     shell_command = Column(String, nullable=True)  # shell process name captured before kiro launch
+    caller_id = Column(String, nullable=True)  # terminal that created this one (callback target)
     last_active = Column(DateTime, default=datetime.now)
 
 
@@ -207,6 +208,10 @@ def _migrate_terminals_schema() -> None:
             conn.execute("ALTER TABLE terminals ADD COLUMN shell_command TEXT")
             conn.commit()
             logger.info("Migration: added shell_command column to terminals table")
+        if "caller_id" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN caller_id TEXT")
+            conn.commit()
+            logger.info("Migration: added caller_id column to terminals table")
         conn.close()
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
@@ -220,6 +225,7 @@ def create_terminal(
     agent_profile: Optional[str] = None,
     allowed_tools: Optional[List[str]] = None,
     shell_command: Optional[str] = None,
+    caller_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record."""
     import json as _json
@@ -233,6 +239,7 @@ def create_terminal(
             agent_profile=agent_profile,
             allowed_tools=_json.dumps(allowed_tools) if allowed_tools else None,
             shell_command=shell_command,
+            caller_id=caller_id,
         )
         db.add(terminal)
         db.commit()
@@ -244,6 +251,7 @@ def create_terminal(
             "agent_profile": terminal.agent_profile,
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
+            "caller_id": terminal.caller_id,
         }
 
 
@@ -268,6 +276,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "agent_profile": terminal.agent_profile,
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
+            "caller_id": terminal.caller_id,
             "last_active": terminal.last_active,
         }
 

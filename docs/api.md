@@ -118,6 +118,7 @@ Create an additional terminal in an existing session.
 - `provider` (string, required): Provider type
 - `agent_profile` (string, required): Agent profile name
 - `working_directory` (string, optional): Working directory for the terminal
+- `caller_id` (string, optional): Terminal ID of the creating terminal (8-character hexadecimal). Recorded so `send_message` can default replies to the caller (issue #284).
 
 **Response:** Terminal object (201 Created)
 
@@ -137,6 +138,7 @@ Get terminal details.
   "provider": "kiro_cli|claude_code|codex|gemini_cli|hermes|kimi_cli|copilot_cli|q_cli",
   "session_name": "string",
   "agent_profile": "string",
+  "caller_id": "string|null",
   "status": "idle|processing|completed|waiting_user_answer|error",
   "last_active": "timestamp"
 }

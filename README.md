@@ -223,7 +223,8 @@ Example: sequential code review workflow.
 **2. Assign** — spawn an agent to work independently (async).
 
 - Creates a new terminal, sends the task with callback instructions, returns immediately
-- The assigned agent sends results back via `send_message` when done; messages queue if the supervisor is busy
+- The supervisor's terminal ID is appended to the task message automatically (disable with `CAO_ENABLE_SENDER_ID_INJECTION=false`), and recorded on the worker terminal so callbacks route structurally
+- The assigned agent sends results back via `send_message` when done — omitting `receiver_id` routes the reply to the assigning terminal; messages queue if the supervisor is busy
 - Use for **asynchronous** execution or fire-and-forget operations
 
 Example: a supervisor assigns parallel data-analysis tasks to multiple analysts while using handoff to generate a report template, then combines results. See [examples/assign](examples/assign).
