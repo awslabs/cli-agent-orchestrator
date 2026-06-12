@@ -39,11 +39,11 @@ _HERDR_ALLOWED_SUBCOMMANDS = frozenset(
     }
 )
 
-# Pattern for safe argument values passed to herdr.  Rejects control
-# characters and shell metacharacters that could alter command semantics.
-# Allows alphanumerics, hyphens, underscores, dots, slashes, colons, equals,
-# commas, spaces, parentheses, and @ (covers filesystem paths, UUIDs, labels,
-# JSON snippets).
+# Pattern for safe structural argument values passed to herdr.  The goal is
+# preventing argument injection (crafted --flags) under shell=False, NOT shell
+# injection (which list-form subprocess already prevents).  Rejects control
+# characters and NUL bytes; allows printable characters needed for filesystem
+# paths, UUIDs, labels, and JSON snippets.
 _SAFE_ARG_RE = re.compile(r"^[\w\-./: =,@(){}\[\]\"'\\~+#]+$", re.UNICODE)
 
 # Flags that _run_herdr is allowed to pass to the herdr CLI.  Any argument

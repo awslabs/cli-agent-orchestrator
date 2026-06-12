@@ -983,3 +983,94 @@ class TestGetNativeStatus:
 
         result = backend.get_native_status("s", "w")
         assert result is None
+
+
+# --- Tests for _sanitize_herdr_args (security boundary) ---
+
+
+class TestSanitizeHerdrArgs:
+    """Tests for the argument validation/sanitization gate."""
+
+    def test_happy_path_workspace_create(self):
+        from cli_agent_orchestrator.backends.herdr_backend import _sanitize_herdr_args
+
+        result = _sanitize_herdr_args(["workspace", "create", "--label", "my-session"])
+        assert result == ["workspace", "create", "--label", "my-session"]
+
+    def test_happy_path_pane_list(self):
+        from cli_agent_orchestrator.backends.herdr_backend import _sanitize_herdr_args
+
+        result = _sanitize_herdr_args(["pane", "list"])
+        assert result == ["pane", "list"]
+
+    def test_happy_path_with_path_containing_parens(self):
+        from cli_agent_orchestrator.backends.herdr_backend import _sanitize_herdr_args
+
+        result = _sanitize_herdr_args(
+            ["workspace", "create", "--cwd", "/Users/foo/My Project (1)/src"]
+        )
+        assert result == ["workspace", "create", "--cwd", "/Users/foo/My Project (1)/src"]
+
+    def test_rejects_empty_args(self):
+        from cli_agent_orchestrator.backends.herdr_backend import _sanitize_herdr_args
+
+        with pytest.raises(ValueError, match="must not be empty"):
+            _sanitize_herdr_args([])
+
+    def test_rejects_unknown_subcommand(self):
+        from cli_agent_orchestrator.backends.herdr_backend import _sanitize_herdr_args
+
+        with pytest.raises(ValueError, match="not in allowlist"):
+            _sanitize_herdr_args(["exec", "rm", "-rf", "/"])
+
+    def test_rejects_control_characters(self):
+        from cli_agent_orchestrator.backends.herdr_backend import _sanitize_herdr_args
+
+        with pytest.raises(ValueError, match="unsafe characters"):
+            _sanitize_herdr_args(["workspace", "create", "--label", "evil\x00name"])
+
+    def test_rejects_newline_in_arg(self):
+        from cli_agent_orchestrator.backends.herdr_backend import _sanitize_herdr_args
+
+        with pytest.raises(ValueError, match="unsafe characters"):
+            _sanitize_herdr_args(["pane", "list\n"])
+
+    def test_rejects_unknown_flag(self):
+        from cli_agent_orchestrator.backends.herdr_backend import _sanitize_herdr_args
+
+        with pytest.raises(ValueError, match="not in allowlist"):
+            _sanitize_herdr_args(["workspace", "create", "--session", "attacker"])
+
+    def test_rejects_session_flag_injection(self):
+        from cli_agent_orchestrator.backends.herdr_backend import _sanitize_herdr_args
+
+        with pytest.raises(ValueError, match="not in allowlist"):
+            _sanitize_herdr_args(["pane", "list", "--session", "evil"])
+
+    def test_send_text_payload_exempt_from_validation(self):
+        from cli_agent_orchestrator.backends.herdr_backend import _sanitize_herdr_args
+
+        payload = "export FOO=bar; rm -rf /; echo $(whoami)"
+        result = _sanitize_herdr_args(["pane", "send-text", "w1-1", payload])
+        assert result[3] == payload
+
+    def test_pane_run_payload_exempt_from_validation(self):
+        from cli_agent_orchestrator.backends.herdr_backend import _sanitize_herdr_args
+
+        payload = "cat '/path/file'; exec /bin/bash -l"
+        result = _sanitize_herdr_args(["pane", "run", "w1-1", payload])
+        assert result[3] == payload
+
+    def test_send_text_pane_id_still_validated(self):
+        from cli_agent_orchestrator.backends.herdr_backend import _sanitize_herdr_args
+
+        with pytest.raises(ValueError, match="unsafe characters"):
+            _sanitize_herdr_args(["pane", "send-text", "evil\x00pane", "hello"])
+
+    def test_returns_new_list(self):
+        from cli_agent_orchestrator.backends.herdr_backend import _sanitize_herdr_args
+
+        original = ["pane", "list"]
+        result = _sanitize_herdr_args(original)
+        assert result == original
+        assert result is not original
