@@ -321,3 +321,30 @@ async def test_missing_working_dir_does_not_escape_handler(
     plugin = KiroCliMemoryPlugin()
     # Must not raise.
     await plugin.on_post_create_terminal(_event())
+
+
+@pytest.mark.asyncio
+async def test_steering_write_is_atomic_no_tmp_left_behind(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The temp file used for the atomic replace must not survive the write."""
+
+    _install_metadata_and_cwd(monkeypatch, tmp_path)
+
+    class FakeMemoryService:
+        def get_memory_context_for_terminal(self, terminal_id: str) -> str:
+            return "<cao-memory>X</cao-memory>"
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory.MemoryService",
+        lambda: FakeMemoryService(),
+    )
+
+    plugin = KiroCliMemoryPlugin()
+    await plugin.on_post_create_terminal(_event())
+
+    target = tmp_path / STEERING_SUBDIR / MEMORY_FILENAME
+    assert target.exists()
+    assert "<cao-memory>X</cao-memory>" in target.read_text(encoding="utf-8")
+    leftovers = [p for p in target.parent.iterdir() if p.suffix == ".tmp"]
+    assert leftovers == []

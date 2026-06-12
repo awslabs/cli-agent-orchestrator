@@ -13,6 +13,7 @@ error path rather than crashing ``cao-server``.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 from cli_agent_orchestrator.clients.database import get_terminal_metadata
@@ -89,7 +90,16 @@ class KiroCliMemoryPlugin(CaoPlugin):
 
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(context_block + "\n", encoding="utf-8")
+            # Atomic temp-file + replace: Kiro loads every *.md under
+            # .kiro/steering/, so a partial file from an interrupted write
+            # would still be picked up (same idiom as utils/skill_injection.py).
+            temp_path = target.with_suffix(target.suffix + ".tmp")
+            try:
+                temp_path.write_text(context_block + "\n", encoding="utf-8")
+                os.replace(temp_path, target)
+            finally:
+                if temp_path.exists():
+                    temp_path.unlink()
         except Exception as exc:
             logger.warning(
                 "kiro_cli_memory: write failed for %s: %s",

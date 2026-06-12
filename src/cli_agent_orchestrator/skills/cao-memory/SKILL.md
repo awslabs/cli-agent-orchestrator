@@ -39,7 +39,7 @@ already told you, search memory first.
 memory_recall(query="database widgets endpoint testing")
 ```
 
-Omit `scope` to search all scopes (results follow precedence session → project → global).
+Omit `scope` to search all scopes (results follow precedence session → project → global → agent).
 Filter with `scope=` or `memory_type=` when you know where to look. Recall is for searching
 *beyond* what was auto-injected (see below) — don't re-recall what's already in front of you.
 

@@ -356,3 +356,40 @@ async def test_missing_working_dir_does_not_escape_handler(
     plugin = CodexMemoryPlugin()
     # Must not raise.
     await plugin.on_post_create_terminal(_event())
+
+
+def test_strip_existing_block_removes_multiple_blocks() -> None:
+    """AGENTS.md corrupted with several injected blocks must be fully cleaned
+    so repeated runs converge to exactly one block (Copilot finding on #269)."""
+
+    content = (
+        "# Agents readme\n"
+        f"{BEGIN_MARKER}\nold one\n{END_MARKER}\n"
+        "middle text\n"
+        f"{BEGIN_MARKER}\nold two\n{END_MARKER}\n"
+        "tail text\n"
+    )
+
+    stripped = CodexMemoryPlugin._strip_existing_block(content)
+
+    assert BEGIN_MARKER not in stripped
+    assert END_MARKER not in stripped
+    assert "old one" not in stripped
+    assert "old two" not in stripped
+    assert "# Agents readme" in stripped
+    assert "middle text" in stripped
+    assert "tail text" in stripped
+
+
+def test_write_block_is_atomic_no_tmp_left_behind(tmp_path: Path) -> None:
+    """The temp file used for the atomic replace must not survive the write."""
+
+    target = tmp_path / "AGENTS.md"
+    plugin = CodexMemoryPlugin()
+
+    plugin._write_block(target, "<cao-memory>X</cao-memory>")
+
+    assert target.exists()
+    assert "<cao-memory>X</cao-memory>" in target.read_text(encoding="utf-8")
+    leftovers = [p for p in target.parent.iterdir() if p.suffix == ".tmp"]
+    assert leftovers == []

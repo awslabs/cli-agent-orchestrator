@@ -19,6 +19,7 @@ rather than crashing ``cao-server``.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 from cli_agent_orchestrator.clients.database import get_terminal_metadata
@@ -161,7 +162,16 @@ class CodexMemoryPlugin(CaoPlugin):
 
         separator = "" if not stripped or stripped.endswith("\n") else "\n"
         new_content = f"{stripped}{separator}{BEGIN_MARKER}\n{context_block}\n{END_MARKER}\n"
-        target.write_text(new_content, encoding="utf-8")
+        # Atomic temp-file + replace: AGENTS.md is user-authored, so an
+        # interrupted write must never truncate it (same idiom as
+        # utils/skill_injection.py).
+        temp_path = target.with_suffix(target.suffix + ".tmp")
+        try:
+            temp_path.write_text(new_content, encoding="utf-8")
+            os.replace(temp_path, target)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink()
 
     @staticmethod
     def _strip_existing_block(content: str) -> str:
