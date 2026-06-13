@@ -44,6 +44,11 @@ dependencies = [
 "cao-mcp-server" = "cli_agent_orchestrator.mcp_server.server:main"
 "cao-ops-mcp-server" = "cli_agent_orchestrator.ops_mcp_server.server:main"
 
+[project.entry-points."cao.plugins"]
+claude_code_memory = "cli_agent_orchestrator.plugins.builtin.claude_code_memory:ClaudeCodeMemoryPlugin"
+kiro_cli_memory = "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory:KiroCliMemoryPlugin"
+codex_memory = "cli_agent_orchestrator.plugins.builtin.codex_memory:CodexMemoryPlugin"
+
 [project.urls]
 Homepage = "https://github.com/awslabs/cli-agent-orchestrator"
 Repository = "https://github.com/awslabs/cli-agent-orchestrator"
