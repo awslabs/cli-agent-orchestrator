@@ -1,0 +1,11 @@
+Welcome to Cursor Agent
+──────────────────────
+❯ Summarize this file
+──────────────────────
+Here is a comprehensive response from the Cursor agent.
+
+It contains multiple paragraphs explaining the implementation
+choices and trade-offs involved in the refactor.
+
+──────────────────────
+❯

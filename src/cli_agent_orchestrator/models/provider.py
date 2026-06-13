@@ -13,3 +13,4 @@ class ProviderType(str, Enum):
     COPILOT_CLI = "copilot_cli"
     OPENCODE_CLI = "opencode_cli"
     HERMES = "hermes"
+    CURSOR_CLI = "cursor_cli"
