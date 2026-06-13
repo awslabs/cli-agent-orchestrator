@@ -381,6 +381,41 @@ def test_strip_existing_block_removes_multiple_blocks() -> None:
     assert "tail text" in stripped
 
 
+def test_strip_existing_block_preserves_content_around_stray_begin() -> None:
+    """A stray unclosed BEGIN must not pair with a later block's END and delete
+    the user content in between (Copilot finding on #269). Only the stray marker
+    token is removed; surrounding text and the real block survive for re-strip."""
+
+    content = (
+        "# Agents readme\n"
+        f"{BEGIN_MARKER}\n"  # stray, unclosed
+        "important user notes\n"
+        f"{BEGIN_MARKER}\nreal block\n{END_MARKER}\n"
+        "tail text\n"
+    )
+
+    stripped = CodexMemoryPlugin._strip_existing_block(content)
+
+    assert BEGIN_MARKER not in stripped
+    assert END_MARKER not in stripped
+    assert "important user notes" in stripped
+    assert "# Agents readme" in stripped
+    assert "tail text" in stripped
+    assert "real block" not in stripped
+
+
+def test_strip_existing_block_keeps_content_when_end_missing() -> None:
+    """A BEGIN with no END anywhere drops only the marker, keeping all text."""
+
+    content = f"# Agents readme\n{BEGIN_MARKER}\nuser wrote this\nmore text\n"
+
+    stripped = CodexMemoryPlugin._strip_existing_block(content)
+
+    assert BEGIN_MARKER not in stripped
+    assert "user wrote this" in stripped
+    assert "more text" in stripped
+
+
 def test_write_block_is_atomic_no_tmp_left_behind(tmp_path: Path) -> None:
     """The temp file used for the atomic replace must not survive the write."""
 

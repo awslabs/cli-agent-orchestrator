@@ -167,13 +167,27 @@ class ClaudeCodeMemoryPlugin(CaoPlugin):
 
     @staticmethod
     def _strip_existing_block(content: str) -> str:
-        """Remove any prior cao-memory block so we replace rather than append."""
+        """Remove any prior cao-memory block so we replace rather than append.
 
-        while BEGIN_MARKER in content and END_MARKER in content:
-            before, _, rest = content.partition(BEGIN_MARKER)
-            _, _, after = rest.partition(END_MARKER)
-            before = before.rstrip("\n")
-            after = after.lstrip("\n")
+        Each BEGIN is paired with the END that follows it. A stray BEGIN with
+        no following END (or with another BEGIN before its END) is treated as
+        corruption: only the marker token is removed, never the user content
+        around it. This stops a stale unclosed BEGIN from later pairing with an
+        unrelated block's END and deleting everything in between.
+        """
+
+        while True:
+            begin = content.find(BEGIN_MARKER)
+            if begin == -1:
+                break
+            end = content.find(END_MARKER, begin + len(BEGIN_MARKER))
+            next_begin = content.find(BEGIN_MARKER, begin + len(BEGIN_MARKER))
+            if end == -1 or (next_begin != -1 and next_begin < end):
+                # Stray/unclosed BEGIN: drop only the marker, keep all content.
+                content = content[:begin] + content[begin + len(BEGIN_MARKER) :]
+                continue
+            before = content[:begin].rstrip("\n")
+            after = content[end + len(END_MARKER) :].lstrip("\n")
             if before and after:
                 content = f"{before}\n{after}"
             else:
