@@ -86,11 +86,11 @@ class MemoryMetadataModel(Base):
     # NULL DEFAULT 0 so existing rows read as "never recalled" without a
     # backfill. Migrated onto existing DBs by ``_migrate_add_access_count``.
     access_count = Column(Integer, nullable=False, default=0, server_default="0")
-    last_accessed_at = Column(DateTime, nullable=True, default=None)
+    last_accessed_at = Column(DateTime(timezone=True), nullable=True, default=None)
     # LLM wiki compilation. NULL = never LLM-compiled (pre-existing rows, or
     # every compile attempt fell back to append). Non-NULL = UTC timestamp of
     # the last successful compile.
-    last_compiled_at = Column(DateTime, nullable=True, default=None)
+    last_compiled_at = Column(DateTime(timezone=True), nullable=True, default=None)
     # Comma-separated sanitised keys of cross-referenced articles. NULL =
     # never computed (pre-existing rows or LLM error). ``""`` = computed, no
     # related found (success — distinct from NULL to avoid endless retries).

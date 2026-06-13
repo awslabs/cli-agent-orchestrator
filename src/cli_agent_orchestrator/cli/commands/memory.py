@@ -263,8 +263,11 @@ def lint_cmd(scope, out_format):
     except Exception as e:
         raise click.ClickException(f"lint run failed: {e}")
 
-    # Emit a top-line completion summary for visibility even when the
-    # result list is empty.
+    is_json = out_format.lower() == "json"
+
+    # Emit a top-line completion summary for visibility even when the result
+    # list is empty. Routed to stderr under --format json so stdout stays a
+    # clean, parseable JSON stream.
     completion = next(
         (
             i.description
@@ -273,9 +276,9 @@ def lint_cmd(scope, out_format):
         ),
         "lint_run_completed: 0/5",
     )
-    click.echo(completion)
+    click.echo(completion, err=is_json)
 
-    if out_format.lower() == "json":
+    if is_json:
         payload = [
             {
                 "issue_type": i.issue_type,

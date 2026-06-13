@@ -113,6 +113,16 @@ def _set_related_keys(db_engine, key: str, scope: str, raw: Optional[str]) -> No
         db.commit()
 
 
+def _extract_id_line(prompt: str) -> str:
+    """Pull the existing ``<!-- id: ... -->`` line out of a compile prompt so
+    a stub can echo it verbatim (output rule 4b requires byte-for-byte
+    preservation of the existing id header)."""
+    for line in prompt.splitlines():
+        if wiki_compiler._ID_HEADER_RE.match(line.strip()):
+            return line.strip()
+    raise AssertionError("no id header line found in compile prompt")
+
+
 async def _drain_compiles(svc: MemoryService) -> None:
     """Await every scheduled background compile task to completion."""
     pending = list(svc._compile_tasks)
@@ -133,19 +143,21 @@ class TestAcceptanceSeeAlso:
         ``related_keys`` cell is populated.
         """
         ctx = _ctx()
-        compiled_article = (
-            "# testing-conventions\n"
-            "<!-- id: abc123 | scope: global | type: reference | tags: testing -->\n"
-            "\n"
-            "Prefer pytest with pytest-asyncio for async tests. Add coverage\n"
-            "for retry logic.\n"
-        )
 
         async def _seq(_client, system, user, *, timeout_s):
             stubbed_llm["calls"].append({"system": system, "user": user, "timeout_s": timeout_s})
             # First call is the compile pass; second is find_related.
             if "wiki compiler" in system.lower():
-                return compiled_article
+                # A compliant LLM preserves the existing id header byte-for-byte
+                # (output rule 4b); echo the real id line from the prompt.
+                id_line = _extract_id_line(user)
+                return (
+                    "# testing-conventions\n"
+                    f"{id_line}\n"
+                    "\n"
+                    "Prefer pytest with pytest-asyncio for async tests. Add coverage\n"
+                    "for retry logic.\n"
+                )
             return '["auth-issues"]'
 
         monkeypatch.setattr(wiki_compiler, "_llm_call", _seq)
@@ -211,11 +223,15 @@ class TestAcceptanceSeeAlso:
         store() that scheduled it.
         """
         ctx = _ctx(provider="kimi_cli", terminal="term-prov")
-        stubbed_llm["response"] = (
-            "# prov-topic\n"
-            "<!-- id: abc123 | scope: global | type: reference | tags: t -->\n"
-            "\nmerged body\n"
-        )
+
+        async def _seq(_client, system, user, *, timeout_s):
+            stubbed_llm["calls"].append({"system": system, "user": user, "timeout_s": timeout_s})
+            if "wiki compiler" in system.lower():
+                # Preserve the real id header (output rule 4b).
+                return f"# prov-topic\n{_extract_id_line(user)}\n\nmerged body\n"
+            return "[]"
+
+        monkeypatch.setattr(wiki_compiler, "_llm_call", _seq)
 
         async def _scenario():
             await svc.store(

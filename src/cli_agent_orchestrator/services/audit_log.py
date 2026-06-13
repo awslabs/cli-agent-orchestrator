@@ -360,9 +360,11 @@ async def write_audit(event_type: str, summary: str, **fields: Any) -> None:
 def write_audit_nowait(event_type: str, summary: str, **fields: Any) -> None:
     """Schedule an audit write without awaiting it.
 
-    Falls back to ``asyncio.run`` in a worker thread when no running loop
-    is reachable so synchronous callers (the dominant case for
-    ``MemoryService.store/recall/forget``) still get audited.
+    When a running loop is reachable (the server's dominant case) the write is
+    scheduled as a background task and the caller returns immediately. When no
+    loop is reachable (sync CLI/test paths), it falls back to ``asyncio.run``
+    in the caller's thread — a short, blocking append, treated as best-effort
+    (any error is dropped). This fallback is NOT offloaded to a worker thread.
     """
     try:
         loop = asyncio.get_running_loop()

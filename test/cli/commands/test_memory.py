@@ -8,7 +8,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from click.testing import CliRunner
 
-from cli_agent_orchestrator.cli.commands.memory import clear, delete, list_memories, show
+from cli_agent_orchestrator.cli.commands.memory import (
+    clear,
+    delete,
+    lint_cmd,
+    list_memories,
+    show,
+)
 from cli_agent_orchestrator.models.memory import Memory
 
 # ---------------------------------------------------------------------------
@@ -308,3 +314,27 @@ class TestMemoryClearRequiresScope:
 
         assert result.exit_code == 0
         assert "No session-scoped memories to clear" in result.output
+
+
+class TestMemoryLint:
+    """cao memory lint — JSON output must be a clean, parseable stream."""
+
+    @patch("cli_agent_orchestrator.services.wiki_lint.run_lint", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.cli.commands.memory._get_memory_service")
+    def test_lint_json_stdout_is_pure_json(self, mock_get_svc, mock_run_lint):
+        """The completion line must not pollute stdout under --format json."""
+        import json
+
+        mock_svc = MagicMock()
+        mock_svc.resolve_scope_id = MagicMock(return_value="proj-abc")
+        mock_get_svc.return_value = mock_svc
+        mock_run_lint.return_value = []  # no issues
+
+        runner = CliRunner()
+        result = runner.invoke(lint_cmd, ["--format", "json"])
+
+        assert result.exit_code == 0
+        # stdout parses cleanly; the "lint_run_completed" line went to stderr.
+        assert json.loads(result.stdout) == []
+        assert "lint_run_completed" not in result.stdout
+        assert "lint_run_completed" in result.stderr

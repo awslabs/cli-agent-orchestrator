@@ -311,19 +311,26 @@ class TestT2ArticlePoisoning:
         assert EXISTING_HEADER in result.compiled_content
         assert "attacker-controlled" not in result.compiled_content
 
-    def test_compile_truncates_oversize_existing_from_top(self, fake_llm):
-        """T2(a): oversize ``existing_content`` is top-truncated with elision
-        marker before being placed in the prompt.
+    def test_compile_truncates_oversize_existing_preserving_header(self, fake_llm):
+        """T2(a): oversize ``existing_content`` is truncated with an elision
+        marker before being placed in the prompt, but the leading header line
+        is preserved (so the LLM can reproduce it and rule 4b can pin the id).
         """
         fake_llm.set_response(_good_compiled())
-        head = "HEAD-MARKER\n"
-        bulk = "y" * (wiki_compiler.EXISTING_MAX_BYTES + 1024)
+        # A distinctive header line, then a middle region that must be elided,
+        # then the id-header tail.
+        head = "# prefer-pytest\nUNIQUE-HEADER-CONTENT\n"
+        bulk = "y" * (wiki_compiler.EXISTING_MAX_BYTES + 8192)
         oversized = head + bulk + f"\n{EXISTING_HEADER}\n"
         _run(wiki_compiler.compile(oversized, NEW_ENTRY, topic_key="prefer-pytest", timeout_s=5.0))
         rendered_user = fake_llm.calls[0]["user"]
-        assert "HEAD-MARKER" not in rendered_user  # top truncated away
+        assert "# prefer-pytest" in rendered_user  # header line preserved at top
         assert wiki_compiler.ELISION_MARKER.strip() in rendered_user
         assert EXISTING_HEADER in rendered_user  # tail preserved
+        # The elided middle means the rendered article is bounded near the cap,
+        # not the full oversized input.
+        sanitised = wiki_compiler._truncate_existing(oversized)
+        assert len(sanitised.encode("utf-8")) <= wiki_compiler.EXISTING_MAX_BYTES
 
     def test_compile_rejects_4x_growth(self, fake_llm):
         """T2(d) / rule 9: reject if compiled is >4× max(input, 1 KiB)."""
@@ -397,6 +404,33 @@ class TestT4LinkInjection:
             f"{EXISTING_HEADER}\n# prefer-pytest\n\n"
             "see [x](https://example.com) for details. " * 3
         )
+        fake_llm.set_response(bad)
+        result = _run(
+            wiki_compiler.compile(
+                EXISTING_BODY, NEW_ENTRY, topic_key="prefer-pytest", timeout_s=5.0
+            )
+        )
+        assert result.used_llm is False
+        assert "output_validation:7" in (result.fallback_reason or "")
+
+    def test_compile_rejects_reference_style_link(self, fake_llm):
+        """Rule 7 must catch reference-style links, not just inline ones."""
+        bad = (
+            f"{EXISTING_HEADER}\n# prefer-pytest\n\n"
+            + "see [x][ref] for details.\n\n[ref]: https://evil.example.com\n" * 2
+        )
+        fake_llm.set_response(bad)
+        result = _run(
+            wiki_compiler.compile(
+                EXISTING_BODY, NEW_ENTRY, topic_key="prefer-pytest", timeout_s=5.0
+            )
+        )
+        assert result.used_llm is False
+        assert "output_validation:7" in (result.fallback_reason or "")
+
+    def test_compile_rejects_autolink(self, fake_llm):
+        """Rule 7 must catch ``<scheme://...>`` autolinks."""
+        bad = f"{EXISTING_HEADER}\n# prefer-pytest\n\n" "visit <https://evil.example.com> now. " * 3
         fake_llm.set_response(bad)
         result = _run(
             wiki_compiler.compile(
@@ -576,6 +610,41 @@ class TestT7HeaderOverride:
         )
         assert result.used_llm is False
         assert "output_validation:4" in (result.fallback_reason or "")
+
+    def test_compile_rejects_rewritten_id_header(self, fake_llm):
+        """Rule 4b: an existing ``<!-- id: ... -->`` line carries downstream
+        metadata (id/scope/type/tags). If the LLM rewrites it — even keeping a
+        single id line and the first header — validation must reject and fall
+        back, so tampered metadata never reaches disk."""
+        existing = (
+            "# prefer-pytest\n"
+            "<!-- id: abc123 | scope: project | type: feedback | tags: testing -->\n"
+            "\n## 2026-01-01T00:00:00Z\nbody.\n"
+        )
+        # Same first header line + exactly one id line, but scope spoofed.
+        tampered = (
+            "# prefer-pytest\n"
+            "<!-- id: abc123 | scope: global | type: feedback | tags: testing -->\n"
+            "\nmerged body.\n"
+        )
+        fake_llm.set_response(tampered)
+        result = _run(
+            wiki_compiler.compile(existing, NEW_ENTRY, topic_key="prefer-pytest", timeout_s=5.0)
+        )
+        assert result.used_llm is False
+        assert "output_validation:4b" in (result.fallback_reason or "")
+
+    def test_compile_accepts_preserved_id_header(self, fake_llm):
+        """Rule 4b passes when the id line is reproduced byte-for-byte."""
+        id_line = "<!-- id: abc123 | scope: project | type: feedback | tags: testing -->"
+        existing = f"# prefer-pytest\n{id_line}\n\n## 2026-01-01T00:00:00Z\nbody.\n"
+        good = f"# prefer-pytest\n{id_line}\n\nmerged body with the new fact.\n"
+        fake_llm.set_response(good)
+        result = _run(
+            wiki_compiler.compile(existing, NEW_ENTRY, topic_key="prefer-pytest", timeout_s=5.0)
+        )
+        assert result.used_llm is True
+        assert id_line in result.compiled_content
 
 
 # ===========================================================================

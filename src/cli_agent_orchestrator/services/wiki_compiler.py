@@ -53,7 +53,17 @@ ELISION_MARKER = "[... earlier content elided by CAO compiler — see git histor
 _SENTINEL_STRIP_RE = re.compile(r"<<<CAO_(NEW_OBSERVATION|EXISTING_ARTICLE)_(BEGIN|END)_v\d+>>>")
 _ID_HEADER_RE = re.compile(r"^<!--\s*id:\s*([^\s>][^>]*?)\s*-->")
 _FENCE_RE = re.compile(r"^```", re.MULTILINE)
-_MD_LINK_RE = re.compile(r"\[[^\]]*\]\([^)]+\)")
+# Matches every markdown link form so none bypass rule 7's "no links except
+# the canonical See Also bullet" contract: inline ``[text](url)``,
+# reference-style ``[text][id]`` and its ``[id]: url`` definition, and
+# autolinks ``<scheme://...>``.
+_MD_LINK_RE = re.compile(
+    r"\[[^\]]*\]\([^)]+\)"  # inline [text](url)
+    r"|\[[^\]]*\]\[[^\]]*\]"  # reference [text][id]
+    r"|^\s*\[[^\]]+\]:\s*\S+"  # reference definition [id]: url
+    r"|<[a-zA-Z][a-zA-Z0-9+.-]*://[^>\s]+>",  # autolink <scheme://...>
+    re.MULTILINE,
+)
 _CRED_RE = re.compile(r"(sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|xoxb-[0-9A-Za-z-]{20,})")
 _HTML_DANGER_RE = re.compile(r"<\s*(script|iframe|object|embed|style)\b", re.IGNORECASE)
 # The ONLY link shape permitted in compiled articles is the
@@ -131,8 +141,38 @@ def _truncate_existing(existing: str) -> str:
     encoded = existing.encode("utf-8")
     if len(encoded) <= EXISTING_MAX_BYTES:
         return existing
-    tail = encoded[-EXISTING_MAX_BYTES:].decode("utf-8", errors="ignore")
-    return ELISION_MARKER + tail
+    # Preserve the header block (``# {key}`` + ``<!-- id: ... -->`` lines) so
+    # the LLM can reproduce the header byte-for-byte (output rule 3) and the
+    # id line stays pinned (output rule 4b). The remaining byte budget is
+    # taken from the tail, with the elision marker between them.
+    header = _header_prefix(existing)
+    header_bytes = header.encode("utf-8")
+    marker_bytes = ELISION_MARKER.encode("utf-8")
+    tail_budget = EXISTING_MAX_BYTES - len(header_bytes) - len(marker_bytes)
+    if tail_budget <= 0:
+        # Pathologically large header — fall back to plain tail truncation.
+        tail = encoded[-EXISTING_MAX_BYTES:].decode("utf-8", errors="ignore")
+        return ELISION_MARKER + tail
+    tail = encoded[-tail_budget:].decode("utf-8", errors="ignore")
+    return header + ELISION_MARKER + tail
+
+
+def _header_prefix(existing: str) -> str:
+    """Return the leading header block: the first non-empty line plus an
+    immediately-following ``<!-- id: ... -->`` line if present (the layout
+    ``store()`` writes). Trailing newline included so the elision marker that
+    follows starts on its own line."""
+    lines = existing.splitlines()
+    prefix: list[str] = []
+    for line in lines:
+        if line.strip():
+            prefix.append(line)
+            break
+    if len(prefix) == 1:
+        idx = lines.index(prefix[0])
+        if idx + 1 < len(lines) and _ID_HEADER_RE.match(lines[idx + 1].strip()):
+            prefix.append(lines[idx + 1])
+    return "\n".join(prefix) + "\n" if prefix else ""
 
 
 def _expected_header(topic_key: str, existing: str) -> str:
@@ -196,6 +236,19 @@ def _validate_output(
     id_header_lines = [line for line in compiled.splitlines() if _ID_HEADER_RE.match(line.strip())]
     if len(id_header_lines) > 1:
         return "output_validation:4"
+
+    # 4b. An existing `<!-- id: ... -->` line must survive byte-for-byte.
+    # Downstream metadata (id/scope/type/tags) is re-parsed from this line, so
+    # any LLM rewrite of it could corrupt metadata or spoof scope/type. If the
+    # existing article had such a line, the compiled output must contain it
+    # exactly (whitespace-stripped) and unchanged.
+    existing_id_lines = [
+        line.strip() for line in existing.splitlines() if _ID_HEADER_RE.match(line.strip())
+    ]
+    if existing_id_lines:
+        compiled_id_lines = {line.strip() for line in id_header_lines}
+        if existing_id_lines[0] not in compiled_id_lines:
+            return "output_validation:4b"
 
     # 5. No dangerous HTML tag outside fenced code
     in_fence = False
