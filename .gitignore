@@ -36,6 +36,7 @@ src/cli_agent_orchestrator/web_ui/
 .ralph/
 .ralphrc
 work/
+.codegraph/
 
 # AI tool configs
 .claude/

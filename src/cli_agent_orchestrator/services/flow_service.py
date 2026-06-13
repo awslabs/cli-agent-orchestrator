@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Tuple, cast
 import frontmatter  # type: ignore
 from apscheduler.triggers.cron import CronTrigger  # type: ignore
 
+from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import create_flow as db_create_flow
 from cli_agent_orchestrator.clients.database import delete_flow as db_delete_flow
 from cli_agent_orchestrator.clients.database import (
@@ -26,11 +27,12 @@ from cli_agent_orchestrator.clients.database import update_flow_enabled as db_up
 from cli_agent_orchestrator.clients.database import (
     update_flow_run_times as db_update_flow_run_times,
 )
-from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.constants import DEFAULT_PROVIDER, PROVIDERS
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.services.fifo_reader import fifo_manager
+from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.terminal_service import create_terminal, send_input
 from cli_agent_orchestrator.utils.template import render_template
 
@@ -152,6 +154,8 @@ def disable_flow(name: str) -> bool:
 def enable_flow(name: str) -> bool:
     """Enable flow and recalculate next_run."""
     flow = get_flow(name)
+    if flow is None:
+        raise ValueError(f"Flow '{name}' not found")
 
     # Recalculate next_run from now
     next_run = _get_next_run_time(flow.schedule)
@@ -165,12 +169,12 @@ def enable_flow(name: str) -> bool:
 
 def _is_terminal_busy(terminal_id: str) -> bool:
     try:
-        return provider_manager.get_provider(terminal_id).get_status() == TerminalStatus.PROCESSING
+        return status_monitor.get_status(terminal_id) == TerminalStatus.PROCESSING
     except Exception:
         return False
 
 
-def execute_flow(name: str) -> bool:
+async def execute_flow(name: str) -> bool:
     """Execute flow: run script, render prompt, launch session."""
     try:
         logger.info(f"Executing flow: {name}")
@@ -230,7 +234,7 @@ def execute_flow(name: str) -> bool:
 
         # Launch session
         session_name = f"cao-flow-{flow.name}"
-        if tmux_client.session_exists(session_name):
+        if get_backend().session_exists(session_name):
             terminals = list_terminals_by_session(session_name)
             # Only check the first (conductor) terminal for busy status.
             # Worker terminals spawned by the conductor may have stale status
@@ -241,9 +245,21 @@ def execute_flow(name: str) -> bool:
                 return False
             for t in terminals:
                 provider_manager.cleanup_provider(t["id"])
-            tmux_client.kill_session(session_name)
+                # Tear down the event-driven pipeline for each recycled terminal:
+                # stop the FIFO reader thread (and unlink its *.fifo file) and clear
+                # the StatusMonitor buffers. Without this, repeated flow runs leak
+                # background reader threads and stale FIFO files / status entries.
+                try:
+                    fifo_manager.stop_reader(t["id"])
+                except Exception as e:
+                    logger.warning(f"Failed to stop FIFO reader for {t['id']}: {e}")
+                try:
+                    status_monitor.clear_terminal(t["id"])
+                except Exception as e:
+                    logger.warning(f"Failed to clear status buffers for {t['id']}: {e}")
+            get_backend().kill_session(session_name)
             delete_terminals_by_session(session_name)
-        terminal = create_terminal(
+        terminal = await create_terminal(
             session_name=session_name,
             provider=flow.provider,
             agent_profile=flow.agent_profile,

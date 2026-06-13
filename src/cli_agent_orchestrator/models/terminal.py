@@ -13,6 +13,7 @@ TerminalId = Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{8}$")]
 class TerminalStatus(str, Enum):
     """Terminal status enumeration with provider-aware states."""
 
+    UNKNOWN = "unknown"
     IDLE = "idle"
     PROCESSING = "processing"
     COMPLETED = "completed"

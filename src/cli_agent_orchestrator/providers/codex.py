@@ -1,16 +1,18 @@
 """Codex CLI provider implementation."""
 
+import asyncio
 import logging
 import re
 import shlex
 import time
 from typing import Optional
 
-from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
+from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
 
@@ -28,10 +30,20 @@ IDLE_PROMPT_TAIL_LINES = 5
 # is active.  This is intentionally permissive — _has_idle_pattern() is a
 # lightweight pre-check; the real status decision is made by get_status()
 # which uses capture-pane (rendered screen).
-IDLE_PROMPT_PATTERN_LOG = r"\? for shortcuts"
 # Match assistant response start: "assistant:/codex:/agent:" (label style from synthetic
 # test fixtures) or "•" bullet point (real Codex interactive output format).
-ASSISTANT_PREFIX_PATTERN = r"^(?:(?:assistant|codex|agent)\s*:|\s*•)"
+# [^\S\n]* matches horizontal whitespace only (not newlines) so the match anchors
+# on the actual bullet line — using \s* would let the match start on a blank
+# line above the bullet, breaking per-line tool-call filtering downstream.
+ASSISTANT_PREFIX_PATTERN = r"^(?:(?:assistant|codex|agent)\s*:|[^\S\n]*•)"
+# MCP tool call marker emitted by Codex when invoking a tool, e.g.
+# "• Called cao-mcp-server.load_skill({...})". The body that follows
+# (└ ... lines) is the tool's return value, not the model's reply.
+# Used to skip these markers when locating the actual response start.
+# The "<server>.<tool>(" shape (identifier.identifier followed by an open
+# paren) is required so legitimate model bullets like "• Called attention
+# to the bug" don't get filtered as tool calls.
+MCP_TOOL_CALL_PATTERN = r"^[^\S\n]*•\s+Called\s+[\w-]+\.[\w-]+\("
 # Match user input: "You ..." (label style) or "› text" (Codex interactive prompt).
 # The "›[^\S\n]*\S" alternative requires a non-whitespace character on the same line
 # to distinguish user input ("› what is your role?") from the empty idle prompt ("› ").
@@ -50,7 +62,10 @@ ERROR_PATTERN = r"^(?:Error:|ERROR:|Traceback \(most recent call last\):|panic:)
 # Used to detect when the bottom lines contain TUI chrome rather than user input.
 # v0.110 and earlier: "? for shortcuts" and "N% context left"
 # v0.111+: "model · N% left · path" (PR #13202 restored draft footer hints)
-TUI_FOOTER_PATTERN = r"(?:\?\s+for shortcuts|context left|\d+%\s+left)"
+# v0.136+: "model · path" (the "N% left" segment was removed)
+# The "·\s+[~/]" alternative anchors on the path component of the footer,
+# which is shared across v0.111 and v0.136 status bars.
+TUI_FOOTER_PATTERN = r"(?:\?\s+for shortcuts|context left|\d+%\s+left|·\s+[~/])"
 # Codex TUI progress spinner: "• Working (0s • esc to interrupt)",
 # "• Thinking (2s ...)", "• Starting script creation (10s • esc to interrupt)".
 # The prefix text varies but the "(Ns • esc to interrupt)" format is consistent.
@@ -102,6 +117,27 @@ def _compute_tui_footer_cutoff(all_lines: list) -> int:
             break
 
     return len("\n".join(all_lines[:footer_start_idx]))
+
+
+def _find_assistant_marker(text: str) -> Optional[re.Match[str]]:
+    """Find the first ASSISTANT_PREFIX_PATTERN match in ``text`` whose line
+    is not an MCP tool-call marker.
+
+    Codex emits ``• Called <server>.<tool>(...)`` when invoking an MCP tool;
+    that bullet matches ASSISTANT_PREFIX_PATTERN but is followed by tool
+    output, not the model's reply. Anchoring on it would conflate tool
+    output with the model response (status: false COMPLETED;
+    extraction: skill-body leak).
+    """
+    for m in re.finditer(ASSISTANT_PREFIX_PATTERN, text, re.IGNORECASE | re.MULTILINE):
+        line_end = text.find("\n", m.start())
+        if line_end == -1:
+            line_end = len(text)
+        line = text[m.start() : line_end]
+        if re.match(MCP_TOOL_CALL_PATTERN, line):
+            continue
+        return m
+    return None
 
 
 class ProviderError(Exception):
@@ -221,7 +257,7 @@ class CodexProvider(BaseProvider):
 
         return shlex.join(command_parts)
 
-    def _handle_trust_prompt(self, timeout: float = 20.0) -> None:
+    async def _handle_trust_prompt(self, timeout: float = 20.0) -> None:
         """Auto-accept the workspace trust prompt if it appears.
 
         Codex shows a folder approval dialog when opening a new directory.
@@ -231,21 +267,20 @@ class CodexProvider(BaseProvider):
         """
         start_time = time.time()
         while time.time() - start_time < timeout:
-            output = tmux_client.get_history(self.session_name, self.window_name)
+            output = get_backend().get_history(self.session_name, self.window_name)
             if not output:
-                time.sleep(1.0)
+                await asyncio.sleep(1.0)
                 continue
 
             # Clean ANSI codes for reliable text matching
             clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
 
             if re.search(TRUST_PROMPT_PATTERN, clean_output):
+                from cli_agent_orchestrator.services.status_monitor import status_monitor
+
                 logger.info("Codex workspace trust prompt detected, auto-accepting")
-                session = tmux_client.server.sessions.get(session_name=self.session_name)
-                window = session.windows.get(window_name=self.window_name)
-                pane = window.active_pane
-                if pane:
-                    pane.send_keys("", enter=True)
+                status_monitor.notify_input_sent(self.terminal_id)
+                get_backend().send_special_key(self.session_name, self.window_name, "Enter")
                 return
 
             # Check if Codex has fully started (welcome banner visible)
@@ -253,19 +288,25 @@ class CodexProvider(BaseProvider):
                 logger.info("Codex started without trust prompt")
                 return
 
-            time.sleep(1.0)
+            await asyncio.sleep(1.0)
         logger.warning("Codex trust prompt handler timed out")
 
-    def initialize(self) -> bool:
+    async def initialize(self) -> bool:
         """Initialize Codex provider by starting codex command."""
-        if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        if not await wait_for_shell(self.terminal_id, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
         # Send a warm-up command before launching codex.
         # Codex exits immediately in freshly-created tmux sessions where the shell
         # has not yet processed a full interactive command cycle.
-        tmux_client.send_keys(self.session_name, self.window_name, "echo ready")
-        time.sleep(2.0)
+        # Arm the StatusMonitor stickiness gate: each send_keys here represents
+        # external input that must be allowed to drive PROCESSING transitions
+        # past any previously-latched ready state.
+        status_monitor.notify_input_sent(self.terminal_id)
+        get_backend().send_keys(self.session_name, self.window_name, "echo ready")
+        await asyncio.sleep(2.0)
 
         # Build command with flags and agent profile (developer_instructions).
         # --no-alt-screen: run in inline mode so output stays in normal scrollback,
@@ -273,13 +314,14 @@ class CodexProvider(BaseProvider):
         # --disable shell_snapshot: avoid TTY input conflicts (SIGTTIN) in tmux
         #   caused by the shell_snapshot subprocess inheriting stdin.
         command = self._build_codex_command()
-        tmux_client.send_keys(self.session_name, self.window_name, command)
+        status_monitor.notify_input_sent(self.terminal_id)
+        get_backend().send_keys(self.session_name, self.window_name, command)
 
         # Handle workspace trust prompt if it appears (new/untrusted directories)
-        self._handle_trust_prompt(timeout=20.0)
+        await self._handle_trust_prompt(timeout=20.0)
 
-        if not wait_until_status(
-            self,
+        if not await wait_until_status(
+            self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
             timeout=60.0,
             polling_interval=1.0,
@@ -289,14 +331,14 @@ class CodexProvider(BaseProvider):
         self._initialized = True
         return True
 
-    def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
-        """Get Codex status by analyzing terminal output."""
-        output = tmux_client.get_history(self.session_name, self.window_name, tail_lines=tail_lines)
-
+    def get_status(self, output: str) -> TerminalStatus:
         if not output:
-            return TerminalStatus.ERROR
+            return TerminalStatus.UNKNOWN
 
-        clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
+        # Strip the RAW pipe-pane escapes (cursor positioning, in-place redraws),
+        # not just SGR colour codes — otherwise cursor sequences survive and the
+        # idle ``›`` prompt / structural checks below misfire on the raw stream.
+        clean_output = strip_terminal_escapes(output)
         tail_output = "\n".join(clean_output.splitlines()[-25:])
 
         # Search for user messages, excluding the Codex TUI footer when present.
@@ -321,13 +363,10 @@ class CodexProvider(BaseProvider):
                 last_user = match
 
         output_after_last_user = clean_output[last_user.start() :] if last_user else clean_output
+        # Skip MCP tool-call markers — those mark "model invoked a tool", not
+        # "model has replied", and shouldn't gate WAITING/ERROR detection.
         assistant_after_last_user = bool(
-            last_user
-            and re.search(
-                ASSISTANT_PREFIX_PATTERN,
-                output_after_last_user,
-                re.IGNORECASE | re.MULTILINE,
-            )
+            last_user and _find_assistant_marker(output_after_last_user) is not None
         )
 
         # Check trust prompt early — the trust menu uses › which matches the idle prompt
@@ -373,26 +412,32 @@ class CodexProvider(BaseProvider):
             if re.search(TUI_PROGRESS_PATTERN, tail_output, re.MULTILINE):
                 return TerminalStatus.PROCESSING
 
-            # Consider COMPLETED only if we see an assistant marker after the last user message.
+            # Consider COMPLETED only if we see an assistant marker (skipping
+            # MCP tool-call markers) after the last user message. Without the
+            # tool-call filter, "• Called <server>.<tool>(...)" emitted before
+            # the model has actually replied would trip COMPLETED prematurely.
             if last_user is not None:
-                if re.search(
-                    ASSISTANT_PREFIX_PATTERN,
-                    clean_output[last_user.start() :],
-                    re.IGNORECASE | re.MULTILINE,
-                ):
+                if _find_assistant_marker(clean_output[last_user.start() :]) is not None:
                     return TerminalStatus.COMPLETED
 
                 return TerminalStatus.IDLE
 
+            # No user-message marker in the cleaned buffer. Two cases:
+            # - Fresh init: no assistant content either → IDLE.
+            # - Long-running response: the › user marker has been evicted from
+            #   the 8KB rolling buffer by the time the response settles, but an
+            #   assistant bullet is still visible. Without this branch we'd
+            #   return IDLE forever and ``wait_for_status(completed)`` in the
+            #   e2e tests would time out.
+            # Search above the TUI footer cutoff so the › suggestion-hint and
+            # status-bar lines aren't confused with a model reply.
+            if _find_assistant_marker(clean_output[:cutoff_pos]) is not None:
+                return TerminalStatus.COMPLETED
             return TerminalStatus.IDLE
 
         # If we're not at an idle prompt and we don't see explicit errors/permission prompts,
         # assume the CLI is still producing output.
         return TerminalStatus.PROCESSING
-
-    def get_idle_pattern_for_log(self) -> str:
-        """Return Codex IDLE prompt pattern for log files."""
-        return IDLE_PROMPT_PATTERN_LOG
 
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract Codex's final response from terminal output.
@@ -428,13 +473,12 @@ class CodexProvider(BaseProvider):
             last_user = user_matches[-1]
 
             # Find the first assistant response marker (• or assistant:) after
-            # the user message. This correctly skips multi-line user messages
-            # that wrap across several lines in the Codex TUI.
-            asst_after_user = re.search(
-                ASSISTANT_PREFIX_PATTERN,
-                clean_output[last_user.start() :],
-                re.IGNORECASE | re.MULTILINE,
-            )
+            # the user message, skipping "• Called <server>.<tool>(...)" MCP
+            # tool call markers — those are followed by tool output, not the
+            # model's reply. Anchoring on a tool call marker would pull tool
+            # output (e.g. skill body text) into the extracted response.
+            asst_after_user = _find_assistant_marker(clean_output[last_user.start() :])
+
             if asst_after_user:
                 response_start = last_user.start() + asst_after_user.start()
             else:
@@ -473,9 +517,20 @@ class CodexProvider(BaseProvider):
                 return response_text.strip()
 
         # Fallback: assistant marker based extraction (no user message found).
-        matches = list(
+        # Filter out "• Called <tool>(...)" MCP tool call markers so we anchor
+        # on the model's actual reply, not tool output.
+        all_matches = list(
             re.finditer(ASSISTANT_PREFIX_PATTERN, clean_output, re.IGNORECASE | re.MULTILINE)
         )
+        matches = []
+        for m in all_matches:
+            line_end = clean_output.find("\n", m.start())
+            if line_end == -1:
+                line_end = len(clean_output)
+            line = clean_output[m.start() : line_end]
+            if re.match(MCP_TOOL_CALL_PATTERN, line):
+                continue
+            matches.append(m)
 
         if not matches:
             raise ValueError("No Codex response found - no assistant marker detected")

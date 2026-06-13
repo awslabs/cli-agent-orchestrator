@@ -295,6 +295,7 @@ class TmuxClient:
         keys: str,
         enter_count: int = 1,
         force_bracketed_paste: bool = False,
+        submit_delay: float = 0.3,
     ) -> None:
         """Send keys to window using tmux paste-buffer for instant delivery.
 
@@ -335,23 +336,25 @@ class TmuxClient:
                 # ?2004h for the pane — some TUIs (e.g. current Kiro) don't
                 # send ?2004h so -p is a no-op and \n becomes CR (Enter).
                 buf_content = b"\x1b[200~" + keys.encode() + b"\x1b[201~"
-                paste_flags = ["-r"]
+                paste_flag = "-r"
             else:
                 buf_content = keys.encode()
-                paste_flags = ["-p"]
+                paste_flag = "-p"
             subprocess.run(
                 ["tmux", "load-buffer", "-b", buf_name, "-"],
                 input=buf_content,
                 check=True,
             )
             subprocess.run(
-                ["tmux", "paste-buffer"] + paste_flags + ["-b", buf_name, "-t", target],
+                ["tmux", "paste-buffer", paste_flag, "-b", buf_name, "-t", target],
                 check=True,
             )
-            # Brief delay to let the TUI process the bracketed paste end sequence
-            # before sending Enter. Without this, some TUIs (e.g., Claude Code 2.x)
-            # swallow the Enter that immediately follows paste-buffer -p.
-            time.sleep(0.3)
+            # Delay to let the TUI process the bracketed paste end sequence before
+            # sending Enter. Without enough delay, some TUIs (e.g. the newest
+            # Claude Code Ink renderer) swallow the Enter that immediately follows
+            # paste-buffer, leaving the message unsubmitted. The duration is
+            # provider-tunable via ``submit_delay`` (BaseProvider.paste_submit_delay).
+            time.sleep(submit_delay)
             for i in range(enter_count):
                 if i > 0:
                     # Delay between Enter presses for TUIs that need time to

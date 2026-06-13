@@ -13,9 +13,11 @@ Run:
     uv run pytest -m e2e test/e2e/test_skills.py -v -k ClaudeCode
 """
 
+import re
 import subprocess
 import time
 import uuid
+from pathlib import Path
 from test.e2e.conftest import (
     cleanup_terminal,
     create_terminal,
@@ -35,17 +37,27 @@ def ensure_skills_seeded():
     seed_default_skills()
 
 
-def _capture_full_scrollback(session_name: str, window_name: str) -> str:
+def _capture_full_scrollback(
+    session_name: str, window_name: str, join_wrapped: bool = False
+) -> str:
     """Capture the full tmux scrollback buffer for a pane.
 
     Uses ``tmux capture-pane -p -S -`` to capture from the very start of
     the scrollback buffer, not just the last N lines. This ensures the
     initial CLI command (which contains the injected skill catalog) is
     included even if the agent's output has pushed it far up.
+
+    With ``join_wrapped=True``, adds ``-J`` so lines the terminal soft-wrapped
+    are rejoined — required when parsing paths out of a long launch command,
+    which the pane width otherwise splits mid-token.
     """
     target = f"{session_name}:{window_name}"
+    cmd = ["tmux", "capture-pane", "-p"]
+    if join_wrapped:
+        cmd.append("-J")
+    cmd.extend(["-S", "-", "-t", target])
     result = subprocess.run(
-        ["tmux", "capture-pane", "-p", "-S", "-", "-t", target],
+        cmd,
         capture_output=True,
         text=True,
         timeout=10,
@@ -103,6 +115,26 @@ def _run_skill_injection_test(provider: str, agent_profile: str):
             # GEMINI.md directly.
             payload = _read_gemini_md(terminal_id)
             source = "GEMINI.md"
+        elif provider == "kimi_cli":
+            # Kimi writes the system prompt (including the skill catalog) to
+            # <temp_dir>/system.md, referenced by the agent.yaml passed via
+            # --agent-file. The launch command in scrollback carries only the
+            # temp-dir path: parse it (capture with -J so the pane's soft
+            # wrapping can't split the path mid-token) and read the payload
+            # from disk. The full-screen Kimi Code TUI also clears the visible
+            # screen on startup, so the command itself is the only reliable
+            # scrollback artifact.
+            resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}")
+            assert resp.status_code == 200
+            window_name = resp.json()["name"]
+            scrollback = _capture_full_scrollback(actual_session, window_name, join_wrapped=True)
+            m = re.search(r"cd (\S*/cao_kimi_\w+)", scrollback)
+            assert m, (
+                "kimi launch command with cao_kimi_* temp dir not found in "
+                f"tmux scrollback. First 500 chars: {scrollback[:500]}"
+            )
+            payload = Path(m.group(1), "system.md").read_text(encoding="utf-8")
+            source = f"kimi system.md ({m.group(1)})"
         else:
             # Capture the full tmux scrollback (capture-pane -S - reads from the
             # very start of the buffer so the initial CLI command with the

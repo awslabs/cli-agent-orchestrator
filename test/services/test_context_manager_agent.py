@@ -130,13 +130,17 @@ class TestGetCuratedMemoryContext:
         return_value={"id": "cm-1", "agent_profile": "memory_manager"},
     )
     @patch("cli_agent_orchestrator.providers.manager.provider_manager")
-    def test_falls_back_when_context_manager_busy(self, mock_pm, mock_find, mock_phase1):
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    def test_falls_back_when_context_manager_busy(
+        self, mock_status_monitor, mock_pm, mock_find, mock_phase1
+    ):
         from cli_agent_orchestrator.models.terminal import TerminalStatus
         from cli_agent_orchestrator.services.memory_service import MemoryService
 
-        mock_provider = MagicMock()
-        mock_provider.get_status.return_value = TerminalStatus.PROCESSING
-        mock_pm.get_provider.return_value = mock_provider
+        # Curator liveness comes from the StatusMonitor (event-driven source of
+        # truth); a busy curator means we skip dispatch and fall back.
+        mock_status_monitor.get_status.return_value = TerminalStatus.PROCESSING
+        mock_pm.get_provider.return_value = MagicMock()
 
         svc = MemoryService()
         result = svc.get_curated_memory_context("t1", "Fix the bug")
@@ -161,19 +165,20 @@ class TestGetCuratedMemoryContext:
     @patch("cli_agent_orchestrator.services.terminal_service.send_input")
     @patch("cli_agent_orchestrator.services.terminal_service.get_output")
     @patch("cli_agent_orchestrator.providers.manager.provider_manager")
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
     def test_returns_curated_response_from_context_manager(
-        self, mock_pm, mock_get_output, mock_send_input, mock_find, mock_phase1
+        self, mock_status_monitor, mock_pm, mock_get_output, mock_send_input, mock_find, mock_phase1
     ):
         from cli_agent_orchestrator.models.terminal import TerminalStatus
         from cli_agent_orchestrator.services.memory_service import MemoryService
 
-        mock_provider = MagicMock()
-        # First call: IDLE (heartbeat check), then COMPLETED after send_input
-        mock_provider.get_status.side_effect = [
+        # Curator liveness is gated on the StatusMonitor: IDLE for the pre-send
+        # heartbeat, then COMPLETED once the curator finishes the dispatched task.
+        mock_status_monitor.get_status.side_effect = [
             TerminalStatus.IDLE,
             TerminalStatus.COMPLETED,
         ]
-        mock_pm.get_provider.return_value = mock_provider
+        mock_pm.get_provider.return_value = MagicMock()
 
         mock_get_output.return_value = (
             "<cao-memory>\n## Curated\n- [global] pref: use pytest\n</cao-memory>"

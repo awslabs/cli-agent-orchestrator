@@ -365,17 +365,18 @@ class TestEnableFlow:
 class TestExecuteFlow:
     """Tests for execute_flow function."""
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
     @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
-    @patch("cli_agent_orchestrator.services.flow_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.flow_service.get_backend")
     @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
     @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
-    def test_execute_flow_without_script(
+    async def test_execute_flow_without_script(
         self,
         mock_db_get,
         mock_update_times,
-        mock_tmux_client,
+        mock_get_backend,
         mock_list_terminals,
         mock_create_terminal,
         mock_send_input,
@@ -405,30 +406,31 @@ Simple prompt without variables.
             next_run=datetime.now(),
         )
         mock_db_get.return_value = mock_flow
-        mock_tmux_client.session_exists.return_value = False
+        mock_get_backend.return_value.session_exists.return_value = False
 
         mock_terminal = MagicMock()
         mock_terminal.id = "terminal-123"
         mock_create_terminal.return_value = mock_terminal
 
-        result = execute_flow("simple-flow")
+        result = await execute_flow("simple-flow")
 
         assert result is True
         mock_create_terminal.assert_called_once()
         mock_send_input.assert_called_once()
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.flow_service.subprocess.run")
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
     @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
-    @patch("cli_agent_orchestrator.services.flow_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.flow_service.get_backend")
     @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
     @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
-    def test_execute_flow_with_script_execute_true(
+    async def test_execute_flow_with_script_execute_true(
         self,
         mock_db_get,
         mock_update_times,
-        mock_tmux_client,
+        mock_get_backend,
         mock_list_terminals,
         mock_create_terminal,
         mock_send_input,
@@ -463,7 +465,7 @@ Value is [[value]].
                 next_run=datetime.now(),
             )
             mock_db_get.return_value = mock_flow
-            mock_tmux_client.session_exists.return_value = False
+            mock_get_backend.return_value.session_exists.return_value = False
 
             # Mock script output
             mock_subprocess.return_value = MagicMock(
@@ -476,7 +478,7 @@ Value is [[value]].
             mock_terminal.id = "terminal-123"
             mock_create_terminal.return_value = mock_terminal
 
-            result = execute_flow("scripted-flow")
+            result = await execute_flow("scripted-flow")
 
             assert result is True
             mock_subprocess.assert_called_once()
@@ -485,10 +487,11 @@ Value is [[value]].
             call_args = mock_send_input.call_args
             assert "42" in call_args[0][1]
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.flow_service.subprocess.run")
     @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
     @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
-    def test_execute_flow_with_script_execute_false(
+    async def test_execute_flow_with_script_execute_false(
         self, mock_db_get, mock_update_times, mock_subprocess
     ):
         """Test executing a flow with script that returns execute=false."""
@@ -527,21 +530,23 @@ Prompt.
                 stderr="",
             )
 
-            result = execute_flow("skip-flow")
+            result = await execute_flow("skip-flow")
 
             assert result is False  # Flow was skipped
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
-    def test_execute_flow_not_found(self, mock_db_get):
+    async def test_execute_flow_not_found(self, mock_db_get):
         """Test executing a non-existent flow raises error."""
         mock_db_get.return_value = None
 
         with pytest.raises(ValueError, match="Flow 'nonexistent' not found"):
-            execute_flow("nonexistent")
+            await execute_flow("nonexistent")
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.flow_service.subprocess.run")
     @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
-    def test_execute_flow_script_fails(self, mock_db_get, mock_subprocess):
+    async def test_execute_flow_script_fails(self, mock_db_get, mock_subprocess):
         """Test that script failure raises error."""
         with tempfile.TemporaryDirectory() as tmpdir:
             flow_path = Path(tmpdir) / "flow.md"
@@ -574,11 +579,12 @@ Prompt.
             mock_subprocess.return_value = MagicMock(returncode=1, stdout="", stderr="Script error")
 
             with pytest.raises(ValueError, match="Script failed"):
-                execute_flow("fail-flow")
+                await execute_flow("fail-flow")
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.flow_service.subprocess.run")
     @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
-    def test_execute_flow_script_invalid_json(self, mock_db_get, mock_subprocess):
+    async def test_execute_flow_script_invalid_json(self, mock_db_get, mock_subprocess):
         """Test that invalid JSON from script raises error."""
         with tempfile.TemporaryDirectory() as tmpdir:
             flow_path = Path(tmpdir) / "flow.md"
@@ -613,22 +619,23 @@ Prompt.
             )
 
             with pytest.raises(ValueError, match="not valid JSON"):
-                execute_flow("bad-json-flow")
+                await execute_flow("bad-json-flow")
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
-    @patch("cli_agent_orchestrator.services.flow_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.flow_service.status_monitor")
     @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
-    @patch("cli_agent_orchestrator.services.flow_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.flow_service.get_backend")
     @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
     @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
-    def test_execute_flow_skips_when_session_busy(
+    async def test_execute_flow_skips_when_session_busy(
         self,
         mock_db_get,
         mock_update_times,
-        mock_tmux_client,
+        mock_get_backend,
         mock_list_terminals,
-        mock_provider_manager,
+        mock_status_monitor,
         mock_create_terminal,
         mock_send_input,
     ):
@@ -649,32 +656,34 @@ Prompt.
                 next_run=datetime.now(),
             )
         mock_db_get.return_value = mock_flow
-        mock_tmux_client.session_exists.return_value = True
+        mock_get_backend.return_value.session_exists.return_value = True
         mock_list_terminals.return_value = [{"id": "t1", "agent_profile": "developer"}]
-        mock_provider = MagicMock()
-        mock_provider.get_status.return_value = TerminalStatus.PROCESSING
-        mock_provider_manager.get_provider.return_value = mock_provider
+        # Conductor terminal reports PROCESSING via the status monitor → busy.
+        mock_status_monitor.get_status.return_value = TerminalStatus.PROCESSING
 
-        result = execute_flow("busy-flow")
+        result = await execute_flow("busy-flow")
 
         assert result is False
         mock_create_terminal.assert_not_called()
-        mock_tmux_client.kill_session.assert_not_called()
+        mock_get_backend.return_value.kill_session.assert_not_called()
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.flow_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
     @patch("cli_agent_orchestrator.services.flow_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.flow_service.status_monitor")
     @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
-    @patch("cli_agent_orchestrator.services.flow_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.flow_service.get_backend")
     @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
     @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
-    def test_execute_flow_kills_idle_session_and_proceeds(
+    async def test_execute_flow_kills_idle_session_and_proceeds(
         self,
         mock_db_get,
         mock_update_times,
-        mock_tmux_client,
+        mock_get_backend,
         mock_list_terminals,
+        mock_status_monitor,
         mock_provider_manager,
         mock_create_terminal,
         mock_send_input,
@@ -697,42 +706,44 @@ Prompt.
                 next_run=datetime.now(),
             )
         mock_db_get.return_value = mock_flow
-        mock_tmux_client.session_exists.return_value = True
+        mock_get_backend.return_value.session_exists.return_value = True
         mock_list_terminals.return_value = [{"id": "t1"}]
-        mock_provider = MagicMock()
-        mock_provider.get_status.return_value = TerminalStatus.IDLE
-        mock_provider_manager.get_provider.return_value = mock_provider
+        # Conductor terminal reports IDLE → not busy, so flow recycles the session.
+        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
         mock_terminal = MagicMock()
         mock_terminal.id = "terminal-123"
         mock_create_terminal.return_value = mock_terminal
 
-        result = execute_flow("idle-flow")
+        result = await execute_flow("idle-flow")
 
         assert result is True
-        mock_tmux_client.kill_session.assert_called_once()
+        mock_get_backend.return_value.kill_session.assert_called_once()
         mock_provider_manager.cleanup_provider.assert_called_once_with("t1")
         mock_create_terminal.assert_called_once()
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.flow_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
     @patch("cli_agent_orchestrator.services.flow_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.flow_service.status_monitor")
     @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
-    @patch("cli_agent_orchestrator.services.flow_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.flow_service.get_backend")
     @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
     @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
-    def test_execute_flow_handles_unknown_provider_as_non_busy(
+    async def test_execute_flow_handles_unknown_provider_as_non_busy(
         self,
         mock_db_get,
         mock_update_times,
-        mock_tmux_client,
+        mock_get_backend,
         mock_list_terminals,
+        mock_status_monitor,
         mock_provider_manager,
         mock_create_terminal,
         mock_send_input,
         mock_delete_terminals,
     ):
-        """get_provider raises ValueError — terminal treated as non-busy, flow proceeds."""
+        """Status lookup raises (unknown terminal) — treated as non-busy, flow proceeds."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             f.write(
                 "---\nname: orphan-provider-flow\nschedule: '* * * * *'\nagent_profile: developer\n---\nPrompt.\n"
@@ -749,39 +760,44 @@ Prompt.
                 next_run=datetime.now(),
             )
         mock_db_get.return_value = mock_flow
-        mock_tmux_client.session_exists.return_value = True
+        mock_get_backend.return_value.session_exists.return_value = True
         mock_list_terminals.return_value = [{"id": "t1"}]
-        mock_provider_manager.get_provider.side_effect = ValueError("unknown terminal")
+        # Status monitor cannot resolve the orphaned terminal → _is_terminal_busy
+        # swallows the error and treats it as non-busy, so the flow proceeds.
+        mock_status_monitor.get_status.side_effect = ValueError("unknown terminal")
         mock_terminal = MagicMock()
         mock_terminal.id = "terminal-123"
         mock_create_terminal.return_value = mock_terminal
 
-        result = execute_flow("orphan-provider-flow")
+        result = await execute_flow("orphan-provider-flow")
 
         assert result is True
-        mock_tmux_client.kill_session.assert_called_once()
+        mock_get_backend.return_value.kill_session.assert_called_once()
         mock_create_terminal.assert_called_once()
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.flow_service.delete_terminals_by_session")
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
     @patch("cli_agent_orchestrator.services.flow_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.flow_service.status_monitor")
     @patch("cli_agent_orchestrator.services.flow_service.list_terminals_by_session")
-    @patch("cli_agent_orchestrator.services.flow_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.flow_service.get_backend")
     @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
     @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
-    def test_execute_flow_kills_orphaned_session(
+    async def test_execute_flow_kills_orphaned_session(
         self,
         mock_db_get,
         mock_update_times,
-        mock_tmux_client,
+        mock_get_backend,
         mock_list_terminals,
+        mock_status_monitor,
         mock_provider_manager,
         mock_create_terminal,
         mock_send_input,
         mock_delete_terminals,
     ):
-        """Session exists but has no terminals — flow should kill and proceed without calling get_provider."""
+        """Session exists but has no terminals — flow should kill and proceed without checking status."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
             f.write(
                 "---\nname: empty-session-flow\nschedule: '* * * * *'\nagent_profile: developer\n---\nPrompt.\n"
@@ -798,18 +814,19 @@ Prompt.
                 next_run=datetime.now(),
             )
         mock_db_get.return_value = mock_flow
-        mock_tmux_client.session_exists.return_value = True
+        mock_get_backend.return_value.session_exists.return_value = True
         mock_list_terminals.return_value = []
         mock_terminal = MagicMock()
         mock_terminal.id = "terminal-123"
         mock_create_terminal.return_value = mock_terminal
 
-        result = execute_flow("empty-session-flow")
+        result = await execute_flow("empty-session-flow")
 
         assert result is True
-        mock_tmux_client.kill_session.assert_called_once()
+        mock_get_backend.return_value.kill_session.assert_called_once()
         mock_create_terminal.assert_called_once()
-        mock_provider_manager.get_provider.assert_not_called()
+        # No conductor terminal exists, so the busy check never queries status.
+        mock_status_monitor.get_status.assert_not_called()
 
 
 class TestGetFlowsToRun:

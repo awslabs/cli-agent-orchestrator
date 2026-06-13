@@ -130,3 +130,38 @@ class TestFormatToolSummary:
 
     def test_empty_list(self):
         assert format_tool_summary([]) == ""
+
+
+class TestClaudeCodeSubagentEscape:
+    """A tool-restricted claude_code agent must not escape via subagents.
+
+    Observed in the allowed-tools e2e: a reviewer (no Bash/Write) created a
+    file anyway — first "via a delegated subagent that ran the write through
+    a shell command" (Task), then on retry via "the Monitor tool" (background
+    shell scripts). Everything execution-capable must gate with execute_bash;
+    NotebookEdit writes .ipynb files, so it must gate with fs_write.
+    """
+
+    def test_restricted_supervisor_blocks_task(self):
+        disallowed = get_disallowed_tools("claude_code", ["@cao-mcp-server"])
+        assert "Task" in disallowed
+        assert "Bash" in disallowed
+        assert "Monitor" in disallowed
+        assert "NotebookEdit" in disallowed
+
+    def test_reviewer_blocks_task_and_notebook_write(self):
+        disallowed = get_disallowed_tools("claude_code", ["fs_read", "fs_list"])
+        assert "Task" in disallowed
+        assert "Monitor" in disallowed
+        assert "NotebookEdit" in disallowed
+        assert "Write" in disallowed
+
+    def test_developer_with_bash_keeps_task(self):
+        disallowed = get_disallowed_tools(
+            "claude_code", ["@builtin", "fs_*", "execute_bash", "@cao-mcp-server"]
+        )
+        assert "Task" not in disallowed
+        assert disallowed == []
+
+    def test_unrestricted_star_keeps_everything(self):
+        assert get_disallowed_tools("claude_code", ["*"]) == []

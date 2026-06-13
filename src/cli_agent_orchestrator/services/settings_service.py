@@ -25,7 +25,9 @@ def _load() -> Dict[str, Any]:
     """Load settings from disk."""
     if SETTINGS_FILE.exists():
         try:
-            return json.loads(SETTINGS_FILE.read_text())
+            data = json.loads(SETTINGS_FILE.read_text())
+            if isinstance(data, dict):
+                return data
         except Exception as e:
             logger.warning(f"Failed to read settings: {e}")
     return {}
@@ -124,12 +126,14 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
 def get_extra_agent_dirs() -> List[str]:
     """Get extra agent scan directories (user-added custom paths)."""
     settings = _load()
-    return settings.get("extra_agent_dirs", [])
+    dirs = settings.get("extra_agent_dirs", [])
+    return dirs if isinstance(dirs, list) else []
 
 
 def set_extra_agent_dirs(dirs: List[str]) -> List[str]:
     """Set extra agent scan directories."""
     settings = _load()
-    settings["extra_agent_dirs"] = [d for d in dirs if d.strip()]
+    extra_agent_dirs = [d for d in dirs if d.strip()]
+    settings["extra_agent_dirs"] = extra_agent_dirs
     _save(settings)
-    return settings["extra_agent_dirs"]
+    return extra_agent_dirs

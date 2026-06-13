@@ -46,3 +46,8 @@ class AgentProfile(BaseModel):
     # empty string from silently degrading to --yolo, since this is a
     # permission-floor knob.
     codexProfile: Optional[str] = Field(default=None, min_length=1)
+
+    # Hermes-only. Optionally names a Hermes profile wrapper command (for
+    # example one created by `hermes profile alias <profile>`). When omitted,
+    # the Hermes provider launches the default `hermes` command.
+    hermesProfile: Optional[str] = Field(default=None, min_length=1)

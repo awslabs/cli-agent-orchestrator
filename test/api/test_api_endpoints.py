@@ -11,8 +11,14 @@ from unittest.mock import ANY, AsyncMock, MagicMock, Mock, call, patch
 
 import pytest
 
-from cli_agent_orchestrator.api.main import app, flow_daemon, opencode_inbox_delivery_daemon
+from cli_agent_orchestrator.api.main import (
+    app,
+    flow_daemon,
+    inbox_reconciliation_daemon,
+    opencode_inbox_delivery_daemon,
+)
 from cli_agent_orchestrator.models.terminal import Terminal
+from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.utils.skills import SkillNameError
 
 # ── Health endpoint ──────────────────────────────────────────────────
@@ -22,12 +28,16 @@ class TestHealthCheck:
     """Tests for GET /health endpoint."""
 
     def test_health_check_returns_ok(self, client):
-        """GET /health returns status ok."""
+        """GET /health returns status ok with component health."""
         response = client.get("/health")
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "ok"
         assert data["service"] == "cli-agent-orchestrator"
+        components = data["components"]
+        assert components["cao"] == "ok"
+        assert components["herdr"] in ("ok", "unavailable")
+        assert components["claude"] in ("ok", "unavailable")
 
 
 # ── Agent profiles endpoint ──────────────────────────────────────────
@@ -94,13 +104,14 @@ class TestAgentProviders:
 
         assert response.status_code == 200
         data = response.json()
-        assert len(data) == 8
+        assert len(data) == 9
         names = [p["name"] for p in data]
         assert "kiro_cli" in names
         assert "claude_code" in names
         assert "q_cli" in names
         assert "codex" in names
         assert "gemini_cli" in names
+        assert "hermes" in names
         assert "kimi_cli" in names
         assert "copilot_cli" in names
         assert "opencode_cli" in names
@@ -240,7 +251,9 @@ class TestCreateSession:
             agent_profile="developer",
         )
         with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
-            mock_svc.create_session.return_value = mock_terminal
+            # The endpoint awaits session_service.create_session, so the patched
+            # attribute must be an AsyncMock to return an awaitable.
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
 
             response = client.post(
                 "/sessions",
@@ -275,7 +288,9 @@ class TestCreateSession:
             agent_profile="developer",
         )
         with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
-            mock_svc.create_session.return_value = mock_terminal
+            # The endpoint awaits session_service.create_session, so the patched
+            # attribute must be an AsyncMock to return an awaitable.
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
 
             response = client.post(
                 "/sessions",
@@ -379,12 +394,16 @@ class TestCreateSession:
         from cli_agent_orchestrator.models.terminal import Terminal as TerminalModel
 
         with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
-            mock_svc.create_session.return_value = TerminalModel(
-                id="abcd1234",
-                name="w",
-                session_name=prefixed,
-                provider="kiro_cli",
-                agent_profile="developer",
+            # The endpoint awaits session_service.create_session, so the patched
+            # attribute must be an AsyncMock to return an awaitable.
+            mock_svc.create_session = AsyncMock(
+                return_value=TerminalModel(
+                    id="abcd1234",
+                    name="w",
+                    session_name=prefixed,
+                    provider="kiro_cli",
+                    agent_profile="developer",
+                )
             )
             response = client.post(
                 "/sessions",
@@ -577,7 +596,9 @@ class TestCreateTerminalInSession:
             agent_profile="reviewer",
         )
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.create_terminal.return_value = mock_terminal
+            # The endpoint awaits terminal_service.create_terminal, so the
+            # patched attribute must be an AsyncMock to return an awaitable.
+            mock_svc.create_terminal = AsyncMock(return_value=mock_terminal)
 
             response = client.post(
                 "/sessions/test-session/terminals",
@@ -782,6 +803,24 @@ class TestSendTerminalInput:
         assert response.status_code == 404
         assert "Terminal not found" in response.json()["detail"]
 
+    def test_send_input_blocked_returns_conflict(self, client):
+        """POST /terminals/{id}/input returns 409 for protected interactive prompts."""
+        from cli_agent_orchestrator.services.terminal_service import TerminalInputBlockedError
+
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.TerminalInputBlockedError = TerminalInputBlockedError
+            mock_svc.send_input.side_effect = TerminalInputBlockedError(
+                "Terminal abcd1234 is waiting for a user answer"
+            )
+
+            response = client.post(
+                "/terminals/abcd1234/input",
+                params={"message": "new task", "orchestration_type": "assign"},
+            )
+
+        assert response.status_code == 409
+        assert "waiting for a user answer" in response.json()["detail"]
+
     def test_send_input_server_error(self, client):
         """POST /terminals/{id}/input returns 500 on error."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
@@ -794,6 +833,51 @@ class TestSendTerminalInput:
 
         assert response.status_code == 500
         assert "Failed to send input" in response.json()["detail"]
+
+
+class TestSendTerminalKey:
+    """Tests for POST /terminals/{terminal_id}/key endpoint."""
+
+    def test_send_key_success(self, client):
+        """POST /terminals/{id}/key sends an allowed tmux key."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.send_special_key.return_value = True
+
+            response = client.post("/terminals/abcd1234/key", params={"key": "Down"})
+
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+        mock_svc.send_special_key.assert_called_once_with("abcd1234", "Down")
+
+    @pytest.mark.parametrize("key", ["", "C-C-C", "send-prefix", "C-;"])
+    def test_send_key_rejects_malformed_key_name(self, client, key):
+        """POST /terminals/{id}/key rejects malformed or unsupported key names."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            response = client.post("/terminals/abcd1234/key", params={"key": key})
+
+        assert response.status_code == 400
+        assert "Invalid tmux key name" in response.json()["detail"]
+        mock_svc.send_special_key.assert_not_called()
+
+    def test_send_key_terminal_not_found(self, client):
+        """POST /terminals/{id}/key returns 404 for nonexistent terminal."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.send_special_key.side_effect = ValueError("Terminal not found")
+
+            response = client.post("/terminals/deadbeef/key", params={"key": "Enter"})
+
+        assert response.status_code == 404
+        assert "Terminal not found" in response.json()["detail"]
+
+    def test_send_key_server_error(self, client):
+        """POST /terminals/{id}/key returns 500 on error."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.send_special_key.side_effect = Exception("TMux send failed")
+
+            response = client.post("/terminals/abcd1234/key", params={"key": "Enter"})
+
+        assert response.status_code == 500
+        assert "Failed to send key" in response.json()["detail"]
 
 
 class TestGetTerminalOutput:
@@ -995,6 +1079,37 @@ class TestOpenCodeInboxDeliveryDaemon:
         assert mock_to_thread.await_args.args[1] is registry
 
 
+class TestInboxReconciliationDaemon:
+    """Tests for the provider-agnostic inbox reconciliation sweep (issue #131)."""
+
+    @pytest.mark.asyncio
+    async def test_sweep_runs_one_iteration_then_cancels(self):
+        """Daemon sleeps, runs the sync sweep in a thread, then handles cancellation."""
+        sleep_calls = 0
+        registry = MagicMock()
+        mock_to_thread = AsyncMock()
+
+        async def fake_sleep(_seconds):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls > 1:
+                raise asyncio.CancelledError
+
+        with (
+            patch("asyncio.sleep", new=fake_sleep),
+            patch("asyncio.to_thread", mock_to_thread),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await inbox_reconciliation_daemon(registry)
+
+        mock_to_thread.assert_awaited_once()
+        # The sweep, not some other sync function, must be the dispatched work.
+        # reconcile_orphaned_messages is a bound method on the singleton now, so a
+        # fresh attribute access is a distinct object — compare by value, not id.
+        assert mock_to_thread.await_args.args[0] == inbox_service.reconcile_orphaned_messages
+        assert mock_to_thread.await_args.args[1] is registry
+
+
 # ── lifespan ─────────────────────────────────────────────────────────
 
 
@@ -1003,32 +1118,128 @@ class TestLifespan:
 
     @pytest.mark.asyncio
     async def test_lifespan_startup_and_shutdown(self):
-        """lifespan starts background tasks on entry, cleans up on exit."""
-        from cli_agent_orchestrator.api.main import lifespan
+        """lifespan starts the event-bus consumers on entry, cleans up on exit.
 
-        mock_observer = MagicMock()
+        The watchdog PollingObserver inbox watcher was replaced by event-bus
+        consumers: startup registers the running loop with the event bus
+        (``bus.set_loop``) and spins up StatusMonitor/LogWriter/InboxService as
+        background tasks (plus the flow daemon and OpenCode inbox poller). On
+        exit the plugin registry is torn down.
+        """
+        from cli_agent_orchestrator.api import main as main_module
+        from cli_agent_orchestrator.api.main import lifespan
 
         async def fake_daemon():
             await asyncio.sleep(3600)
+
+        async def fake_registry_daemon(_registry):
+            await asyncio.sleep(3600)
+
+        async def quick_return():
+            return None
+
+        async def never_returns():
+            await asyncio.sleep(3600)
+
+        mock_load = AsyncMock()
+        mock_teardown = AsyncMock()
 
         with (
             patch("cli_agent_orchestrator.api.main.setup_logging"),
             patch("cli_agent_orchestrator.api.main.init_db"),
             patch("cli_agent_orchestrator.api.main.cleanup_old_data"),
-            patch(
-                "cli_agent_orchestrator.api.main.PollingObserver",
-                return_value=mock_observer,
-            ),
+            patch("cli_agent_orchestrator.api.main.cleanup_expired_memories", quick_return),
             patch("cli_agent_orchestrator.api.main.flow_daemon", fake_daemon),
+            patch(
+                "cli_agent_orchestrator.api.main.opencode_inbox_delivery_daemon",
+                fake_registry_daemon,
+            ),
+            patch("cli_agent_orchestrator.api.main.bus") as mock_bus,
+            patch.object(
+                main_module.status_monitor, "run", new=AsyncMock(side_effect=never_returns)
+            ),
+            patch.object(main_module.log_writer, "run", new=AsyncMock(side_effect=never_returns)),
+            patch.object(
+                main_module.inbox_service, "run", new=AsyncMock(side_effect=never_returns)
+            ),
+            patch("cli_agent_orchestrator.plugins.PluginRegistry.load", mock_load),
+            patch("cli_agent_orchestrator.plugins.PluginRegistry.teardown", mock_teardown),
         ):
             async with lifespan(app):
-                # Inside the lifespan — startup completed
-                mock_observer.schedule.assert_called_once()
-                mock_observer.start.assert_called_once()
+                # Inside the lifespan — startup completed.
+                # The registry was loaded and stored on app state.
+                mock_load.assert_awaited_once()
+                assert app.state.plugin_registry is not None
+                # The event loop was registered with the event bus so the
+                # thread-safe publishers can reach the asyncio consumers.
+                mock_bus.set_loop.assert_called_once()
+                loop_arg = mock_bus.set_loop.call_args.args[0]
+                assert loop_arg is asyncio.get_running_loop()
 
-            # After exit — shutdown cleanup
-            mock_observer.stop.assert_called_once()
-            mock_observer.join.assert_called_once()
+            # After exit — shutdown tears down the plugin registry.
+            mock_teardown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_lifespan_cancels_inbox_reconciliation_on_shutdown(self):
+        """The reconciliation sweep task is cancelled when the server stops (issue #131).
+
+        The watchdog PollingObserver is gone in the event-driven model, so the
+        event-bus consumers are stubbed (as in the startup/shutdown test) and the
+        reconciliation daemon is replaced with one that records its cancellation.
+        """
+        from cli_agent_orchestrator.api import main as main_module
+        from cli_agent_orchestrator.api.main import lifespan
+
+        reconcile_cancelled = {"value": False}
+
+        async def fake_daemon():
+            await asyncio.sleep(3600)
+
+        async def fake_registry_daemon(_registry):
+            await asyncio.sleep(3600)
+
+        async def never_returns():
+            await asyncio.sleep(3600)
+
+        async def quick_return():
+            return None
+
+        async def fake_reconcile(_registry):
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                reconcile_cancelled["value"] = True
+                raise
+
+        with (
+            patch("cli_agent_orchestrator.api.main.setup_logging"),
+            patch("cli_agent_orchestrator.api.main.init_db"),
+            patch("cli_agent_orchestrator.api.main.cleanup_old_data"),
+            patch("cli_agent_orchestrator.api.main.cleanup_expired_memories", quick_return),
+            patch("cli_agent_orchestrator.api.main.flow_daemon", fake_daemon),
+            patch(
+                "cli_agent_orchestrator.api.main.opencode_inbox_delivery_daemon",
+                fake_registry_daemon,
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.inbox_reconciliation_daemon",
+                fake_reconcile,
+            ),
+            patch("cli_agent_orchestrator.api.main.bus"),
+            patch.object(
+                main_module.status_monitor, "run", new=AsyncMock(side_effect=never_returns)
+            ),
+            patch.object(main_module.log_writer, "run", new=AsyncMock(side_effect=never_returns)),
+            patch.object(
+                main_module.inbox_service, "run", new=AsyncMock(side_effect=never_returns)
+            ),
+            patch("cli_agent_orchestrator.plugins.PluginRegistry.load", new=AsyncMock()),
+            patch("cli_agent_orchestrator.plugins.PluginRegistry.teardown", new=AsyncMock()),
+        ):
+            async with lifespan(app):
+                pass
+
+        assert reconcile_cancelled["value"] is True
 
 
 # ── main() entry point ───────────────────────────────────────────────
@@ -1043,7 +1254,7 @@ class TestMainEntryPoint:
             patch("argparse.ArgumentParser.parse_args") as mock_args,
             patch("uvicorn.run") as mock_uvicorn,
         ):
-            mock_args.return_value = MagicMock(agents_dir=None, host=None, port=None)
+            mock_args.return_value = MagicMock(agents_dir=None, host=None, port=None, terminal=None)
 
             from cli_agent_orchestrator.api.main import main
 
@@ -1060,7 +1271,9 @@ class TestMainEntryPoint:
             patch("argparse.ArgumentParser.parse_args") as mock_args,
             patch("uvicorn.run") as mock_uvicorn,
         ):
-            mock_args.return_value = MagicMock(agents_dir=None, host="0.0.0.0", port=9999)
+            mock_args.return_value = MagicMock(
+                agents_dir=None, host="0.0.0.0", port=9999, terminal=None
+            )
 
             from cli_agent_orchestrator.api.main import main
 
@@ -1075,7 +1288,9 @@ class TestMainEntryPoint:
             patch("uvicorn.run"),
             patch("cli_agent_orchestrator.constants.KIRO_AGENTS_DIR") as _,
         ):
-            mock_args.return_value = MagicMock(agents_dir="/custom/agents", host=None, port=None)
+            mock_args.return_value = MagicMock(
+                agents_dir="/custom/agents", host=None, port=None, terminal=None
+            )
 
             from cli_agent_orchestrator.api.main import main
 
@@ -1097,7 +1312,9 @@ class TestMainEntryPoint:
         ):
             parent.attach_mock(mock_add, "add_cors")
             parent.attach_mock(mock_uvicorn, "uvicorn_run")
-            mock_args.return_value = MagicMock(agents_dir=None, host="0.0.0.0", port=9999)
+            mock_args.return_value = MagicMock(
+                agents_dir=None, host="0.0.0.0", port=9999, terminal=None
+            )
 
             from cli_agent_orchestrator.api.main import main
 
@@ -1107,3 +1324,37 @@ class TestMainEntryPoint:
                 call.add_cors("0.0.0.0", 9999),
                 call.uvicorn_run(app, host="0.0.0.0", port=9999),
             ]
+
+    def test_main_terminal_flag_overrides_backend(self):
+        """--terminal sets the backend via the factory before the server starts."""
+        with (
+            patch("argparse.ArgumentParser.parse_args") as mock_args,
+            patch("uvicorn.run"),
+            patch("cli_agent_orchestrator.backends.factory.BackendFactory.create") as mock_create,
+            patch("cli_agent_orchestrator.backends.registry.set_backend") as mock_set,
+        ):
+            mock_args.return_value = MagicMock(
+                agents_dir=None, host=None, port=None, terminal="herdr"
+            )
+
+            from cli_agent_orchestrator.api.main import main
+
+            main()
+
+            mock_create.assert_called_once_with(backend_override="herdr")
+            mock_set.assert_called_once_with(mock_create.return_value)
+
+    def test_main_no_terminal_flag_leaves_backend_lazy(self):
+        """Without --terminal, main() does not eagerly set the backend."""
+        with (
+            patch("argparse.ArgumentParser.parse_args") as mock_args,
+            patch("uvicorn.run"),
+            patch("cli_agent_orchestrator.backends.registry.set_backend") as mock_set,
+        ):
+            mock_args.return_value = MagicMock(agents_dir=None, host=None, port=None, terminal=None)
+
+            from cli_agent_orchestrator.api.main import main
+
+            main()
+
+            mock_set.assert_not_called()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -16,7 +17,7 @@ from typing import Optional
 
 from libtmux.exc import LibTmuxException
 
-from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.terminal import wait_for_shell
@@ -81,7 +82,7 @@ class CopilotCliProvider(BaseProvider):
 
     def _history(self, tail_lines: Optional[int] = None) -> str:
         try:
-            raw = tmux_client.get_history(
+            raw = get_backend().get_history(
                 self.session_name, self.window_name, tail_lines=tail_lines
             )
         except (
@@ -145,7 +146,7 @@ class CopilotCliProvider(BaseProvider):
 
         command_parts.extend(["--config-dir", str(config_dir)])
         try:
-            pane_working_dir = tmux_client.get_pane_working_directory(
+            pane_working_dir = get_backend().get_pane_working_directory(
                 self.session_name,
                 self.window_name,
             )
@@ -179,6 +180,7 @@ class CopilotCliProvider(BaseProvider):
         merged_servers: dict = {}
         venv_script = Path(sys.executable).with_name("cao-mcp-server")
         found_script = shutil.which("cao-mcp-server")
+        mcp_args: list[str]
         if venv_script.exists():
             mcp_command = str(venv_script)
             mcp_args = []
@@ -198,10 +200,10 @@ class CopilotCliProvider(BaseProvider):
         return json.dumps({"mcpServers": merged_servers}, ensure_ascii=False)
 
     def _send_enter(self) -> None:
-        tmux_client.send_special_key(self.session_name, self.window_name, "Enter")
+        get_backend().send_special_key(self.session_name, self.window_name, "Enter")
 
     def _send_key(self, key: str) -> None:
-        tmux_client.send_special_key(self.session_name, self.window_name, key)
+        get_backend().send_special_key(self.session_name, self.window_name, key)
 
     def _accept_trust_prompts(self, timeout: float = 30.0) -> None:
         start = time.time()
@@ -263,11 +265,11 @@ class CopilotCliProvider(BaseProvider):
             self.window_name,
         )
 
-    def initialize(self) -> bool:
+    async def initialize(self) -> bool:
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
         try:
-            shell_ready = wait_for_shell(
-                tmux_client, self.session_name, self.window_name, timeout=30.0
-            )
+            shell_ready = await wait_for_shell(self.terminal_id, timeout=30.0)
         except Exception as exc:
             logger.warning(
                 "wait_for_shell failed for %s:%s, retrying with provider history: %s",
@@ -280,15 +282,15 @@ class CopilotCliProvider(BaseProvider):
         if not shell_ready:
             raise TimeoutError("Shell initialization timed out after 30 seconds")
 
-        tmux_client.send_keys(self.session_name, self.window_name, self._command())
+        get_backend().send_keys(self.session_name, self.window_name, self._command())
 
         deadline = time.time() + 60.0
         self._accept_trust_prompts(timeout=10.0)
         while time.time() < deadline:
-            status = self.get_status()
+            status = status_monitor.get_status(self.terminal_id)
             if status == TerminalStatus.WAITING_USER_ANSWER:
                 self._accept_trust_prompts(timeout=5.0)
-                time.sleep(1.0)
+                await asyncio.sleep(1.0)
                 continue
             if status in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
                 # Return on the first ready state like the other providers.
@@ -297,7 +299,7 @@ class CopilotCliProvider(BaseProvider):
                 # handling before the terminal is actually usable.
                 self._initialized = True
                 return True
-            time.sleep(1.0)
+            await asyncio.sleep(1.0)
 
         raise TimeoutError("Copilot initialization timed out after 60 seconds")
 
@@ -414,11 +416,13 @@ class CopilotCliProvider(BaseProvider):
             break
         return trimmed
 
-    def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
-        effective_tail_lines = tail_lines if tail_lines is not None else 220
-        output = self._history(tail_lines=effective_tail_lines)
+    def get_status(self, output: str) -> TerminalStatus:
+        if not output or not output.strip():
+            return TerminalStatus.UNKNOWN
+
+        output = self._clean(output)
         if not output.strip():
-            return TerminalStatus.PROCESSING
+            return TerminalStatus.UNKNOWN
 
         lines = output.splitlines()
         has_idle_prompt_at_end = self._has_idle_prompt_near_end(lines)

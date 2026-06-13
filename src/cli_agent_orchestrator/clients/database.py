@@ -2,8 +2,8 @@
 
 import logging
 import uuid
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, cast
 
 from sqlalchemy import (
     Boolean,
@@ -344,6 +344,36 @@ def list_pending_receiver_ids_by_provider(provider: str) -> List[str]:
         return [row[0] for row in rows]
 
 
+def list_pending_receiver_ids_older_than(min_age_seconds: int) -> List[str]:
+    """List receiver terminal IDs whose messages have been PENDING too long.
+
+    Returns the distinct receivers of any message still PENDING for longer than
+    ``min_age_seconds``. Used by the inbox reconciliation sweep to find messages
+    the immediate and watchdog delivery paths missed, without competing with
+    them for freshly queued ones (issue #131).
+
+    The join on ``terminals`` drops messages whose receiver terminal no longer
+    exists, so the sweep does not keep retrying deliveries to deleted agents.
+
+    ``created_at`` is stored local-naive (``InboxModel.created_at`` defaults to
+    ``datetime.now``), so the cutoff uses ``datetime.now()`` to match — the same
+    convention as the retention query in ``cleanup_service.cleanup_old_data``.
+    """
+    cutoff = datetime.now() - timedelta(seconds=min_age_seconds)
+    with SessionLocal() as db:
+        rows = (
+            db.query(InboxModel.receiver_id)
+            .join(TerminalModel, TerminalModel.id == InboxModel.receiver_id)
+            .filter(
+                InboxModel.status == MessageStatus.PENDING.value,
+                InboxModel.created_at < cutoff,
+            )
+            .distinct()
+            .all()
+        )
+        return [row[0] for row in rows]
+
+
 def delete_terminal(terminal_id: str) -> bool:
     """Delete terminal metadata."""
     with SessionLocal() as db:
@@ -363,8 +393,14 @@ def delete_terminals_by_session(tmux_session: str) -> int:
 
 
 def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> InboxMessage:
-    """Create inbox message with status=MessageStatus.PENDING."""
+    """Create inbox message with status=MessageStatus.PENDING.
+
+    Raises:
+        ValueError: If the receiver terminal does not exist.
+    """
     with SessionLocal() as db:
+        if not db.query(TerminalModel).filter(TerminalModel.id == receiver_id).first():
+            raise ValueError(f"Terminal '{receiver_id}' not found")
         inbox_msg = InboxModel(
             sender_id=sender_id,
             receiver_id=receiver_id,
@@ -457,7 +493,7 @@ def get_project_id_by_alias(alias: str) -> Optional[str]:
     try:
         with SessionLocal() as db:
             row = db.query(ProjectAliasModel).filter(ProjectAliasModel.alias == alias).first()
-            return row.project_id if row else None
+            return cast(Optional[str], row.project_id) if row else None
     except Exception as e:
         logger.debug(f"get_project_id_by_alias failed (non-fatal): {e}")
         return None
@@ -525,6 +561,7 @@ def create_flow(
             last_run=flow.last_run,
             next_run=flow.next_run,
             enabled=flow.enabled,
+            prompt_template=None,
         )
 
 
@@ -544,6 +581,7 @@ def get_flow(name: str) -> Optional[Flow]:
             last_run=flow.last_run,
             next_run=flow.next_run,
             enabled=flow.enabled,
+            prompt_template=None,
         )
 
 
@@ -562,6 +600,7 @@ def list_flows() -> List[Flow]:
                 last_run=f.last_run,
                 next_run=f.next_run,
                 enabled=f.enabled,
+                prompt_template=None,
             )
             for f in flows
         ]
@@ -618,6 +657,7 @@ def get_flows_to_run() -> List[Flow]:
                 last_run=f.last_run,
                 next_run=f.next_run,
                 enabled=f.enabled,
+                prompt_template=None,
             )
             for f in flows
         ]

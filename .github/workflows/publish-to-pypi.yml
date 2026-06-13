@@ -82,11 +82,26 @@ jobs:
       - name: Install from TestPyPI (retry while index propagates)
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          # Install in two steps so TestPyPI never participates in dependency
+          # resolution. TestPyPI is a public sandbox full of squatted/junk
+          # packages — e.g. a bogus "FASTAPI 1.0" whose version outranks the
+          # real fastapi. With TestPyPI as a resolution index, pip picks the
+          # squat and the build fails. So: pull only our package from TestPyPI
+          # with --no-deps, then resolve every dependency from real PyPI alone.
           for attempt in 1 2 3 4 5 6; do
+            # Chain both installs with && so an attempt only succeeds when BOTH
+            # the TestPyPI fetch and the PyPI dependency resolution pass. If the
+            # second install were inside the if-body, its failure would be
+            # masked by the following unconditional exit 0 and a release with a
+            # broken dependency would slip through the smoke test. Re-running the
+            # first install on a retry is cheap (--no-deps, and pip caches it).
             if pip install \
-                --index-url https://test.pypi.org/simple/ \
-                --extra-index-url https://pypi.org/simple/ \
-                "cli-agent-orchestrator==${VERSION}"; then
+                  --index-url https://test.pypi.org/simple/ \
+                  --no-deps \
+                  "cli-agent-orchestrator==${VERSION}" \
+               && pip install \
+                  --index-url https://pypi.org/simple/ \
+                  "cli-agent-orchestrator==${VERSION}"; then
               exit 0
             fi
             echo "Attempt ${attempt} failed; sleeping 15s before retry..."

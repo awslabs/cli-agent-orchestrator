@@ -24,6 +24,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Dict, Optional
 
+from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (
@@ -31,8 +32,7 @@ from cli_agent_orchestrator.clients.database import (
     update_last_active,
     update_terminal_shell_command,
 )
-from cli_agent_orchestrator.clients.tmux import tmux_client
-from cli_agent_orchestrator.constants import SESSION_PREFIX, TERMINAL_LOG_DIR
+from cli_agent_orchestrator.constants import FIFO_DIR, SESSION_PREFIX, TERMINAL_LOG_DIR
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
@@ -43,6 +43,8 @@ from cli_agent_orchestrator.plugins import (
     PostSendMessageEvent,
 )
 from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.services.fifo_reader import fifo_manager
+from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
 from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
 from cli_agent_orchestrator.services.session_env import (
@@ -50,6 +52,7 @@ from cli_agent_orchestrator.services.session_env import (
     get_session_env,
     set_session_env,
 )
+from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
 from cli_agent_orchestrator.utils.terminal import (
@@ -63,6 +66,10 @@ logger = logging.getLogger(__name__)
 # Track terminals that have already received memory injection (first message only).
 _memory_injected_terminals: set = set()
 _memory_injected_lock = threading.Lock()
+
+
+class TerminalInputBlockedError(Exception):
+    """Raised when orchestrated input would answer an active interactive prompt."""
 
 
 def inject_memory_context(first_message: str, terminal_id: str) -> str:
@@ -114,7 +121,7 @@ RUNTIME_SKILL_PROMPT_PROVIDERS = {
 }
 
 
-def create_terminal(
+async def create_terminal(
     provider: str,
     agent_profile: str,
     session_name: Optional[str] = None,
@@ -170,7 +177,7 @@ def create_terminal(
                 session_name = f"{SESSION_PREFIX}{session_name}"
 
             # Prevent duplicate sessions
-            if tmux_client.session_exists(session_name):
+            if get_backend().session_exists(session_name):
                 raise ValueError(f"Session '{session_name}' already exists")
 
             # Wipe any stale mapping a prior aborted lifecycle for this name
@@ -178,7 +185,7 @@ def create_terminal(
             clear_session_env(session_name)
 
             # Create new tmux session with initial window
-            tmux_client.create_session(
+            get_backend().create_session(
                 session_name,
                 window_name,
                 terminal_id,
@@ -194,9 +201,9 @@ def create_terminal(
                 set_session_env(session_name, env_vars)
         else:
             # Add window to existing session
-            if not tmux_client.session_exists(session_name):
+            if not get_backend().session_exists(session_name):
                 raise ValueError(f"Session '{session_name}' not found")
-            window_name = tmux_client.create_window(
+            window_name = get_backend().create_window(
                 session_name,
                 window_name,
                 terminal_id,
@@ -204,7 +211,26 @@ def create_terminal(
                 extra_env=get_session_env(session_name),
             )
 
-        # Step 3: Persist terminal metadata to database
+        # Step 3: Load the profile once for allowed tool resolution before
+        # provider initialization. The skill catalog is computed only for
+        # providers that consume it at launch time (see RUNTIME_SKILL_PROMPT_PROVIDERS).
+        try:
+            profile = load_agent_profile(agent_profile)
+        except FileNotFoundError:
+            profile = None
+        skill_prompt = build_skill_catalog() if provider in RUNTIME_SKILL_PROMPT_PROVIDERS else None
+
+        # Step 3b: Resolve allowed_tools from profile if not explicitly provided
+        if allowed_tools is None and profile is not None:
+            from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
+
+            mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
+            allowed_tools = resolve_allowed_tools(
+                profile.allowedTools, profile.role, mcp_server_names
+            )
+
+        # Step 3c: Persist terminal metadata to database after restrictions
+        # are resolved so API reads and snapshots report the actual launch policy.
         db_create_terminal(
             terminal_id,
             session_name,
@@ -214,25 +240,29 @@ def create_terminal(
             allowed_tools,
         )
 
-        # Step 3b: Load the profile once for allowed tool resolution before
-        # provider initialization. The skill catalog is computed only for
-        # providers that consume it at launch time (see RUNTIME_SKILL_PROMPT_PROVIDERS).
-        try:
-            profile = load_agent_profile(agent_profile)
-        except FileNotFoundError:
-            profile = None
-        skill_prompt = build_skill_catalog() if provider in RUNTIME_SKILL_PROMPT_PROVIDERS else None
+        # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
+        # backends (tmux). Event-inbox backends (herdr) deliver via their own
+        # socket events and their pipe_pane is a no-op, so skip the FIFO there and
+        # rely on the herdr inbox registration below.
+        if not get_backend().supports_event_inbox():
+            # Reader must exist BEFORE pipe-pane starts so it captures from the start.
+            fifo_manager.create_reader(terminal_id)
 
-        # Step 3c: Resolve allowed_tools from profile if not explicitly provided
-        if allowed_tools is None and profile is not None:
-            from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
+            # Configure pipe-pane to stream output to the FIFO. This enables
+            # real-time event-driven processing via StatusMonitor and LogWriter
+            # (LogWriter writes TERMINAL_LOG_DIR/{id}.log from the FIFO). A pane
+            # has a single pipe-pane target, so we pipe ONLY to the FIFO.
+            fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
+            get_backend().pipe_pane(session_name, window_name, str(fifo_path))
 
-            mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
-            allowed_tools = resolve_allowed_tools(
-                profile.allowedTools, profile.role, mcp_server_names
-            )
+            # Nudge the shell so it re-renders its prompt AFTER pipe-pane attaches.
+            # pipe-pane only captures output produced after it starts; on a fast
+            # shell the initial prompt is drawn before the pipe attaches, leaving
+            # the StatusMonitor buffer empty so wait_for_shell() times out. A bare
+            # Enter produces a fresh prompt line that flows through the pipe.
+            get_backend().send_special_key(session_name, window_name, "Enter")
 
-        # Step 4: Create and initialize the CLI provider
+        # Step 6: Create and initialize the CLI provider
         # This starts the agent (e.g., runs "kiro-cli chat --agent developer").
         # Only runtime-prompt providers (Claude Code, Codex, Gemini, Kimi) receive
         # the skill catalog here; Kiro (skill:// resources) and OpenCode
@@ -248,7 +278,7 @@ def create_terminal(
             skill_prompt=skill_prompt,
             model=profile.model if profile else None,
         )
-        provider_instance.initialize()
+        await provider_instance.initialize()
 
         # Persist shell_command baseline if the provider captured one
         shell_command = provider_instance.shell_baseline
@@ -257,12 +287,6 @@ def create_terminal(
         if shell_command:
             update_terminal_shell_command(terminal_id, shell_command)
 
-        # Step 5: Set up terminal logging via tmux pipe-pane
-        # This captures all terminal output to a log file for inbox monitoring
-        log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
-        log_path.touch()  # Ensure file exists before watching
-        tmux_client.pipe_pane(session_name, window_name, str(log_path))
-
         # Build and return the Terminal object
         terminal = Terminal(
             id=terminal_id,
@@ -270,6 +294,7 @@ def create_terminal(
             provider=ProviderType(provider),
             session_name=session_name,
             agent_profile=agent_profile,
+            allowed_tools=allowed_tools,
             shell_command=shell_command,
             status=TerminalStatus.IDLE,
             last_active=datetime.now(),
@@ -288,18 +313,36 @@ def create_terminal(
                 provider=provider,
             ),
         )
+
+        # Register with herdr inbox service for message delivery
+        svc = get_herdr_inbox_service()
+        if svc:
+            try:
+                pane_id = get_backend().get_pane_id(terminal_id, session_name, window_name)
+                is_kiro = provider == ProviderType.KIRO_CLI.value
+                svc.register_terminal(terminal_id, pane_id, is_kiro)
+            except Exception as e:
+                logger.warning(f"Failed to register terminal {terminal_id} with herdr inbox: {e}")
         return terminal
 
     except Exception as e:
-        # Cleanup on failure: clean up provider resources and kill session
+        # Cleanup on failure: clean up FIFO reader, status monitor, provider, and session
         logger.error(f"Failed to create terminal: {e}")
+        try:
+            fifo_manager.stop_reader(terminal_id)
+        except Exception:
+            pass  # Ignore cleanup errors
+        try:
+            status_monitor.clear_terminal(terminal_id)
+        except Exception:
+            pass  # Ignore cleanup errors
         try:
             provider_manager.cleanup_provider(terminal_id)
         except Exception:
             pass  # Ignore cleanup errors
         if session_created and session_name:
             try:
-                tmux_client.kill_session(session_name)
+                get_backend().kill_session(session_name)
             except:
                 pass  # Ignore cleanup errors
             # Session is gone, drop any forwarded env we stashed for it so
@@ -316,11 +359,7 @@ def get_terminal(terminal_id: str) -> Dict:
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        # Get status from provider
-        provider = provider_manager.get_provider(terminal_id)
-        if provider is None:
-            raise ValueError(f"Provider not found for terminal {terminal_id}")
-        status = provider.get_status().value
+        status = status_monitor.get_status(terminal_id).value
 
         return {
             "id": metadata["id"],
@@ -356,7 +395,7 @@ def get_working_directory(terminal_id: str) -> Optional[str]:
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        working_dir = tmux_client.get_pane_working_directory(
+        working_dir = get_backend().get_pane_working_directory(
             metadata["tmux_session"], metadata["tmux_window"]
         )
         return working_dir
@@ -385,6 +424,25 @@ def send_input(
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
+        provider = provider_manager.get_provider(terminal_id)
+        orchestration_value = (
+            orchestration_type.value
+            if isinstance(orchestration_type, OrchestrationType)
+            else str(orchestration_type or "")
+        )
+        if (
+            provider
+            and provider.blocks_orchestrated_input_while_waiting_user_answer is True
+            and orchestration_value
+            in {OrchestrationType.ASSIGN.value, OrchestrationType.HANDOFF.value}
+            and status_monitor.get_status(terminal_id) == TerminalStatus.WAITING_USER_ANSWER
+        ):
+            raise TerminalInputBlockedError(
+                f"Terminal {terminal_id} is waiting for a user answer. "
+                "Use answer_user_prompt to submit a selection or approval before "
+                f"sending {orchestration_value} input."
+            )
+
         # Inject memory context into the very first user message after init.
         # Phase 1 wires injection inline for every provider. The Kiro
         # AgentSpawn hook will replace this path once the plugin
@@ -397,15 +455,22 @@ def send_input(
         message = inject_memory_context(message, terminal_id)
 
         # Check how many Enter keys the provider needs after paste
-        provider = provider_manager.get_provider(terminal_id)
         enter_count = provider.paste_enter_count if provider else 1
 
-        tmux_client.send_keys(
+        # Arm the StatusMonitor stickiness gate so that the next provider-
+        # detected PROCESSING transition is honored (overriding the latched
+        # IDLE/COMPLETED). Without this, sticky ready-status would block
+        # the genuine PROCESSING signal that arrives once the agent starts
+        # working on the new message.
+        status_monitor.notify_input_sent(terminal_id)
+
+        get_backend().send_keys(
             metadata["tmux_session"],
             metadata["tmux_window"],
             message,
             enter_count=enter_count,
             force_bracketed_paste=True,
+            submit_delay=provider.paste_submit_delay if provider else 0.3,
         )
 
         # Notify the provider that external input was received.
@@ -457,7 +522,12 @@ def send_special_key(terminal_id: str, key: str) -> bool:
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        tmux_client.send_special_key(metadata["tmux_session"], metadata["tmux_window"], key)
+        # Arm StatusMonitor stickiness: special keys (Enter on a permission
+        # prompt, C-c interrupting work, C-d sending EOF) all initiate a new
+        # processing cycle that must be allowed to push past any latched
+        # ready status.
+        status_monitor.notify_input_sent(terminal_id)
+        get_backend().send_special_key(metadata["tmux_session"], metadata["tmux_window"], key)
 
         update_last_active(terminal_id)
         logger.info(f"Sent special key '{key}' to terminal: {terminal_id}")
@@ -471,60 +541,137 @@ def send_special_key(terminal_id: str, key: str) -> bool:
 def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
     """Get terminal output.
 
+    ``FULL`` mode returns the StatusMonitor rolling buffer (the streamed output
+    accumulated from the FIFO pipeline), which is bounded to the most recent
+    ``STATE_BUFFER_MAX`` bytes (8KB); it falls back to a tmux history capture
+    only when that buffer is empty. This is a deliberate trade-off in the
+    event-driven architecture (instant, no tmux call) — it is *not* unbounded
+    scrollback, so very long sessions are truncated to the tail. Use the
+    on-disk ``{id}.log`` (LogWriter) or the delete-time ``{id}.scrollback``
+    snapshot when complete history is required.
+
     For ``LAST`` mode, if the provider declares ``extraction_retries > 0``,
     retries extraction with 10 s delays between attempts.  This handles
     TUI-based providers (e.g. Gemini CLI's Ink renderer) whose notification
     spinners can temporarily obscure response text in the tmux capture buffer.
 
-    If the provider exposes an ``extraction_tail_lines`` attribute, the
-    history capture for LAST mode uses that value instead of the default
-    ``TMUX_HISTORY_LINES``. Status-check captures are unaffected (they go
-    through get_status directly). A single capture-pane call is made per
-    get_output invocation.
+    If the provider exposes an ``extraction_tail_lines`` attribute, that
+    fixed value is used for the history capture and the escalating-fetch
+    logic below is skipped.
+
+    Otherwise, extraction uses an escalating fetch strategy: start with a
+    small capture window and widen until the response marker is found.
+    Steps: 200 -> 500 -> 1000 -> 5000.  If no marker is found at 5000 lines,
+    the raw tail is returned with a [PARTIAL RESPONSE] prefix so the caller
+    knows the output may be incomplete.
     """
+    # Escalation steps used when the provider does not declare extraction_tail_lines.
+    _ESCALATION_STEPS = [200, 500, 1000, 5000]
+
     try:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
+        # Get output from StatusMonitor buffer (instant, no tmux call)
+        full_output = status_monitor.get_buffer(terminal_id)
+        if not full_output:
+            # Fallback to backend history only if buffer not available (edge case)
+            full_output = get_backend().get_history(
+                metadata["tmux_session"], metadata["tmux_window"]
+            )
+
         if mode == OutputMode.FULL:
-            return tmux_client.get_history(metadata["tmux_session"], metadata["tmux_window"])
+            return full_output
         elif mode == OutputMode.LAST:
             provider = provider_manager.get_provider(terminal_id)
             if provider is None:
                 raise ValueError(f"Provider not found for terminal {terminal_id}")
 
-            # Capability check: providers that need deeper scrollback for extraction
-            # opt in by defining ``extraction_tail_lines``. Base providers don't.
-            extract_lines = getattr(provider, "extraction_tail_lines", None)
-            full_output = tmux_client.get_history(
-                metadata["tmux_session"],
-                metadata["tmux_window"],
-                tail_lines=extract_lines,
-            )
-
-            retries = provider.extraction_retries
-            last_err: Exception | None = None
-            for attempt in range(1 + retries):
-                try:
-                    if attempt > 0:
-                        time.sleep(10.0)
-                        full_output = tmux_client.get_history(
-                            metadata["tmux_session"],
-                            metadata["tmux_window"],
-                            tail_lines=extract_lines,
+            # If the provider pins a fixed scrollback depth, honour it and skip
+            # escalation — the provider knows what it needs.
+            fixed_extract_lines = getattr(provider, "extraction_tail_lines", None)
+            if fixed_extract_lines is not None:
+                full_output = get_backend().get_history(
+                    metadata["tmux_session"],
+                    metadata["tmux_window"],
+                    tail_lines=fixed_extract_lines,
+                )
+                retries = provider.extraction_retries
+                last_err: Exception | None = None
+                for attempt in range(1 + retries):
+                    try:
+                        if attempt > 0:
+                            time.sleep(10.0)
+                            full_output = get_backend().get_history(
+                                metadata["tmux_session"],
+                                metadata["tmux_window"],
+                                tail_lines=fixed_extract_lines,
+                            )
+                        return provider.extract_last_message_from_script(full_output)
+                    except ValueError as exc:
+                        last_err = exc
+                        logger.debug(
+                            "Output extraction attempt %d/%d for %s failed: %s",
+                            attempt + 1,
+                            1 + retries,
+                            terminal_id,
+                            exc,
                         )
-                    return provider.extract_last_message_from_script(full_output)
+                raise last_err  # type: ignore[misc]
+
+            # Escalating fetch: try progressively larger capture windows until
+            # the response marker is found or we hit the cap.
+            last_err = None
+            full_output = ""
+            for step_lines in _ESCALATION_STEPS:
+                full_output = get_backend().get_history(
+                    metadata["tmux_session"],
+                    metadata["tmux_window"],
+                    tail_lines=step_lines,
+                )
+                try:
+                    result = provider.extract_last_message_from_script(full_output)
+                    if step_lines > _ESCALATION_STEPS[0]:
+                        logger.debug(
+                            "get_output: %s marker found at %d lines",
+                            terminal_id,
+                            step_lines,
+                        )
+                    return result
                 except ValueError as exc:
                     last_err = exc
                     logger.debug(
-                        "Output extraction attempt %d/%d for %s failed: %s",
-                        attempt + 1,
-                        1 + retries,
+                        "get_output: %s no marker at %d lines, escalating",
                         terminal_id,
-                        exc,
+                        step_lines,
                     )
-            raise last_err  # type: ignore[misc]
+
+            # All tail-based steps failed — try full scrollback before giving up.
+            logger.debug(
+                "get_output: %s escalation exhausted, trying full_history",
+                terminal_id,
+            )
+            full_output = get_backend().get_history(
+                metadata["tmux_session"],
+                metadata["tmux_window"],
+                full_history=True,
+            )
+            try:
+                result = provider.extract_last_message_from_script(full_output)
+                logger.debug("get_output: %s marker found in full_history", terminal_id)
+                return result
+            except ValueError:
+                pass
+
+            # Full scrollback also failed — return partial.
+            logger.warning(
+                "get_output: %s response marker not found in full_history, returning partial",
+                terminal_id,
+            )
+            return (
+                f"[PARTIAL RESPONSE - response marker not found in full scrollback]\n{full_output}"
+            )
 
     except Exception as e:
         logger.error(f"Failed to get output from terminal {terminal_id}: {e}")
@@ -534,6 +681,14 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
 def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) -> bool:
     """Delete terminal and kill its tmux window."""
     try:
+        # Unregister from herdr inbox service
+        svc = get_herdr_inbox_service()
+        if svc:
+            try:
+                svc.unregister_terminal(terminal_id)
+            except Exception as e:
+                logger.warning(f"Failed to unregister terminal {terminal_id} from herdr inbox: {e}")
+
         # Get metadata before deletion
         metadata = get_terminal_metadata(terminal_id)
 
@@ -541,7 +696,7 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
             # Snapshot scrollback + metadata before killing (for debugging/restore)
             try:
                 # Capture plain text full scrollback (no -e, no line cap)
-                scrollback = tmux_client.get_history(
+                scrollback = get_backend().get_history(
                     metadata["tmux_session"],
                     metadata["tmux_window"],
                     strip_escapes=True,
@@ -558,7 +713,7 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
                     "window_name": metadata["tmux_window"],
                     "agent_profile": metadata.get("agent_profile"),
                     "provider": metadata["provider"],
-                    "working_directory": tmux_client.get_pane_working_directory(
+                    "working_directory": get_backend().get_pane_working_directory(
                         metadata["tmux_session"], metadata["tmux_window"]
                     ),
                     "allowed_tools": metadata.get("allowed_tools"),
@@ -570,13 +725,27 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
 
             # Stop pipe-pane logging
             try:
-                tmux_client.stop_pipe_pane(metadata["tmux_session"], metadata["tmux_window"])
+                get_backend().stop_pipe_pane(metadata["tmux_session"], metadata["tmux_window"])
             except Exception as e:
                 logger.warning(f"Failed to stop pipe-pane for {terminal_id}: {e}")
 
+            # Stop FIFO reader and cleanup FIFO file. Must run BEFORE kill_window
+            # so the reader thread (which reopens the FIFO on EOF) unblocks and
+            # joins before the pane disappears.
+            try:
+                fifo_manager.stop_reader(terminal_id)
+            except Exception as e:
+                logger.warning(f"Failed to stop FIFO reader for {terminal_id}: {e}")
+
+            # Clear state detector buffers for this terminal
+            try:
+                status_monitor.clear_terminal(terminal_id)
+            except Exception as e:
+                logger.warning(f"Failed to clear state detector for {terminal_id}: {e}")
+
             # Kill the tmux window (this terminates the agent process)
             try:
-                tmux_client.kill_window(metadata["tmux_session"], metadata["tmux_window"])
+                get_backend().kill_window(metadata["tmux_session"], metadata["tmux_window"])
             except Exception as e:
                 logger.warning(f"Failed to kill tmux window for {terminal_id}: {e}")
 

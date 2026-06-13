@@ -7,6 +7,7 @@ import pytest
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
+from cli_agent_orchestrator.providers.hermes import HermesProvider
 from cli_agent_orchestrator.providers.manager import ProviderManager
 
 
@@ -35,6 +36,20 @@ def test_create_provider_copilot_stores_mapping():
     )
 
     assert isinstance(provider, CopilotCliProvider)
+    assert manager.get_provider("t1") is provider
+
+
+def test_create_provider_hermes_stores_mapping():
+    manager = ProviderManager()
+    provider = manager.create_provider(
+        ProviderType.HERMES.value,
+        terminal_id="t1",
+        tmux_session="s1",
+        tmux_window="w1",
+        agent_profile=None,
+    )
+
+    assert isinstance(provider, HermesProvider)
     assert manager.get_provider("t1") is provider
 
 
@@ -220,6 +235,32 @@ def test_get_provider_restores_shell_baseline_from_metadata():
         provider = manager.get_provider("t1")
 
     assert provider.shell_baseline == "bash"
+
+
+def test_get_provider_marks_kiro_initialized_on_restore():
+    """Restoration path must set _initialized=True so KiroCliProvider's
+    post-launch shell-baseline IDLE check trusts the restored baseline.
+
+    Without this, a terminal restored from the DB after cao-server restart
+    would have shell_baseline set but _initialized=False, and get_status()
+    would report PROCESSING indefinitely once kiro exited back to the shell.
+    """
+    manager = ProviderManager()
+
+    with patch(
+        "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
+        return_value={
+            "provider": ProviderType.KIRO_CLI.value,
+            "tmux_session": "s1",
+            "tmux_window": "w1",
+            "agent_profile": "developer",
+            "shell_command": "zsh",
+        },
+    ):
+        provider = manager.get_provider("t1")
+
+    assert provider.shell_baseline == "zsh"
+    assert provider._initialized is True
 
 
 def test_get_provider_no_shell_baseline_when_metadata_missing_shell_command():

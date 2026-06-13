@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import pty
+import re
 import signal
 import struct
 import subprocess
@@ -28,8 +29,10 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field, field_validator
-from watchdog.observers.polling import PollingObserver
 
+from cli_agent_orchestrator.backends import TerminalNotFoundError
+from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
     get_inbox_messages,
@@ -42,10 +45,10 @@ from cli_agent_orchestrator.constants import (
     CORS_ORIGINS,
     DEFAULT_PROVIDER,
     INBOX_POLLING_INTERVAL,
+    INBOX_RECONCILE_INTERVAL,
     SERVER_HOST,
     SERVER_PORT,
     SERVER_VERSION,
-    TERMINAL_LOG_DIR,
     WS_ALLOWED_CLIENTS,
     add_local_cors_origins,
 )
@@ -56,7 +59,6 @@ from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services import (
     flow_service,
-    inbox_service,
     session_service,
     terminal_service,
 )
@@ -64,9 +66,14 @@ from cli_agent_orchestrator.services.cleanup_service import (
     cleanup_expired_memories,
     cleanup_old_data,
 )
-from cli_agent_orchestrator.services.inbox_service import LogFileHandler
+from cli_agent_orchestrator.services.event_bus import bus
+from cli_agent_orchestrator.services.herdr_inbox_registry import set_herdr_inbox_service
+from cli_agent_orchestrator.services.herdr_inbox_service import HerdrInboxService
+from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.services.install_service import InstallResult, install_agent
-from cli_agent_orchestrator.services.terminal_service import OutputMode
+from cli_agent_orchestrator.services.log_writer import log_writer
+from cli_agent_orchestrator.services.status_monitor import status_monitor
+from cli_agent_orchestrator.services.terminal_service import OutputMode, TerminalInputBlockedError
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.logging import setup_logging
 from cli_agent_orchestrator.utils.skills import (
@@ -74,9 +81,13 @@ from cli_agent_orchestrator.utils.skills import (
     load_skill_content,
     validate_skill_name,
 )
-from cli_agent_orchestrator.utils.terminal import generate_session_name, validate_tmux_name
+from cli_agent_orchestrator.utils.terminal import validate_tmux_name
 
 logger = logging.getLogger(__name__)
+
+TMUX_KEY_PATTERN = re.compile(
+    r"^(?:Up|Down|Left|Right|Enter|Tab|Escape|Space|[A-Za-z0-9]|[CMS]-[A-Za-z0-9])$"
+)
 
 
 async def flow_daemon():
@@ -87,7 +98,7 @@ async def flow_daemon():
             flows = flow_service.get_flows_to_run()
             for flow in flows:
                 try:
-                    executed = flow_service.execute_flow(flow.name)
+                    executed = await flow_service.execute_flow(flow.name)
                     if executed:
                         logger.info(f"Flow '{flow.name}' executed successfully")
                     else:
@@ -109,6 +120,24 @@ async def opencode_inbox_delivery_daemon(registry: PluginRegistry) -> None:
             await asyncio.to_thread(inbox_service.poll_opencode_pending_messages, registry)
         except Exception:
             logger.exception("OpenCode inbox delivery poller error")
+
+
+async def inbox_reconciliation_daemon(registry: PluginRegistry) -> None:
+    """Background task that recovers inbox messages the fast paths missed.
+
+    Safety net for issue #131: the immediate (on POST) delivery path and the
+    event-driven StatusMonitor pipeline can both miss a message when the receiver
+    is already idle, leaving it PENDING forever. This sweep runs on a slower
+    interval and re-attempts delivery for anything left pending past the grace
+    window.
+    """
+    logger.info("Inbox reconciliation daemon started")
+    while True:
+        await asyncio.sleep(INBOX_RECONCILE_INTERVAL)
+        try:
+            await asyncio.to_thread(inbox_service.reconcile_orphaned_messages, registry)
+        except Exception:
+            logger.exception("Inbox reconciliation daemon error")
 
 
 # Response Models
@@ -179,27 +208,70 @@ async def lifespan(app: FastAPI):
     # Start flow daemon as background task
     daemon_task = asyncio.create_task(flow_daemon())
 
+    # Register event loop with event bus for thread-safe publishing
+    loop = asyncio.get_running_loop()
+    bus.set_loop(loop)
+
+    # Start event bus consumers as background tasks
+    status_monitor_task = asyncio.create_task(status_monitor.run())
+    log_writer_task = asyncio.create_task(log_writer.run())
+    inbox_service_task = asyncio.create_task(inbox_service.run(registry))
+    logger.info("Event bus consumers started (StatusMonitor, LogWriter, InboxService)")
+
     # Start temporary OpenCode inbox poller. GH #115 tracks replacing this
     # provider-specific wakeup path with a unified delivery engine.
     opencode_inbox_task = asyncio.create_task(opencode_inbox_delivery_daemon(registry))
 
-    # Start inbox watcher
-    inbox_observer = PollingObserver(timeout=INBOX_POLLING_INTERVAL)
-    inbox_observer.schedule(LogFileHandler(registry), str(TERMINAL_LOG_DIR), recursive=False)
-    inbox_observer.start()
-    logger.info("Inbox watcher started (PollingObserver)")
+    # Start provider-agnostic reconciliation sweep for orphaned PENDING messages
+    # the immediate and event-driven status paths missed (issue #131).
+    inbox_reconcile_task = asyncio.create_task(inbox_reconciliation_daemon(registry))
+
+    # Herdr delivers inbox via its own socket events; the tmux backend uses the
+    # FIFO -> EventBus pipeline (StatusMonitor / LogWriter / InboxService) started
+    # above. Start the herdr inbox service only when the herdr backend is active
+    # (additive; no-op for tmux). See #271.
+    herdr_inbox_task: Optional[asyncio.Task] = None
+    backend = get_backend()
+    if isinstance(backend, HerdrBackend):
+
+        def deliver_inbox(terminal_id: str) -> None:
+            inbox_service.deliver_pending(terminal_id, registry=registry)
+
+        svc = HerdrInboxService(
+            herdr_session=backend.herdr_session,
+            delivery_callback=deliver_inbox,
+        )
+        set_herdr_inbox_service(svc)
+        herdr_inbox_task = asyncio.create_task(svc.start())
+        logger.info("Herdr inbox service started")
 
     yield
 
-    # Stop inbox observer
-    inbox_observer.stop()
-    inbox_observer.join()
-    logger.info("Inbox watcher stopped")
+    # Stop herdr inbox service on shutdown
+    if herdr_inbox_task is not None:
+        herdr_inbox_task.cancel()
+        try:
+            await herdr_inbox_task
+        except asyncio.CancelledError:
+            pass
+        set_herdr_inbox_service(None)
+        logger.info("Herdr inbox service stopped")
 
+    # Cancel consumer tasks on shutdown
+    status_monitor_task.cancel()
+    log_writer_task.cancel()
+    inbox_service_task.cancel()
     # Cancel daemon on shutdown
     daemon_task.cancel()
+
     try:
-        await daemon_task
+        await asyncio.gather(
+            status_monitor_task,
+            log_writer_task,
+            inbox_service_task,
+            daemon_task,
+            return_exceptions=True,
+        )
     except asyncio.CancelledError:
         pass
 
@@ -207,6 +279,13 @@ async def lifespan(app: FastAPI):
     opencode_inbox_task.cancel()
     try:
         await opencode_inbox_task
+    except asyncio.CancelledError:
+        pass
+
+    # Cancel inbox reconciliation sweep on shutdown
+    inbox_reconcile_task.cancel()
+    try:
+        await inbox_reconcile_task
     except asyncio.CancelledError:
         pass
 
@@ -269,7 +348,20 @@ app.add_middleware(
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "cli-agent-orchestrator"}
+    import shutil
+
+    def _probe(binary: str) -> str:
+        return "ok" if shutil.which(binary) else "unavailable"
+
+    return {
+        "status": "ok",
+        "service": "cli-agent-orchestrator",
+        "components": {
+            "cao": "ok",
+            "herdr": _probe("herdr"),
+            "claude": _probe("claude"),
+        },
+    }
 
 
 @app.get("/agents/profiles")
@@ -332,6 +424,7 @@ async def list_providers_endpoint() -> List[Dict]:
         "q_cli": "q",
         "codex": "codex",
         "gemini_cli": "gemini",
+        "hermes": "hermes",
         "kimi_cli": "kimi",
         "copilot_cli": "copilot",
         "opencode_cli": "opencode",
@@ -453,7 +546,7 @@ async def create_session(
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
-        result = session_service.create_session(
+        result = await session_service.create_session(
             provider=provider,
             agent_profile=agent_profile,
             session_name=session_name,
@@ -468,11 +561,11 @@ async def create_session(
             sidecar_provider = provider or DEFAULT_PROVIDER
             sidecar_session = result.session_name
 
-            def _spawn_sidecar() -> None:
+            async def _spawn_sidecar() -> None:
                 try:
                     from cli_agent_orchestrator.services import terminal_service
 
-                    terminal_service.create_terminal(
+                    await terminal_service.create_terminal(
                         provider=sidecar_provider,
                         agent_profile="memory_manager",
                         session_name=sidecar_session,
@@ -570,7 +663,7 @@ async def create_terminal_in_session(
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
-        result = terminal_service.create_terminal(
+        result = await terminal_service.create_terminal(
             provider=resolved_provider,
             agent_profile=agent_profile,
             session_name=session_name,
@@ -613,6 +706,8 @@ async def get_terminal(terminal_id: TerminalId) -> Terminal:
         terminal = terminal_service.get_terminal(terminal_id)
         return Terminal(**terminal)
     except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except TerminalNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
         raise HTTPException(
@@ -677,12 +772,38 @@ async def send_terminal_input(
             orchestration_type=orchestration_type,
         )
         return {"success": success}
+    except TerminalInputBlockedError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to send input: {str(e)}",
+        )
+
+
+@app.post("/terminals/{terminal_id}/key")
+async def send_terminal_key(terminal_id: TerminalId, key: str) -> Dict:
+    """Send a tmux special key to a terminal."""
+    if not TMUX_KEY_PATTERN.fullmatch(key):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Invalid tmux key name. Allowed keys are arrow keys, Enter, Tab, "
+                "Escape, Space, single alphanumeric keys, and C-/M-/S- modifier combos."
+            ),
+        )
+
+    try:
+        success = terminal_service.send_special_key(terminal_id, key)
+        return {"success": success}
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to send key: {str(e)}",
         )
 
 
@@ -766,14 +887,10 @@ async def create_inbox_message_endpoint(
             detail=f"Failed to create inbox message: {str(e)}",
         )
 
-    # Best-effort immediate delivery. If the receiver terminal is idle, the
-    # message is delivered now; otherwise the watchdog will deliver it when
-    # the terminal becomes idle. Delivery failures must not cause the API
-    # to report an error — the message was already persisted above.
+    # Attempt immediate delivery if terminal is already IDLE.
+    # If not, InboxService will deliver on next IDLE status event.
     try:
-        inbox_service.check_and_send_pending_messages(
-            receiver_id, registry=get_plugin_registry(request)
-        )
+        inbox_service.deliver_pending(receiver_id, registry=get_plugin_registry(request))
     except Exception as e:
         logger.warning(f"Immediate delivery attempt failed for {receiver_id}: {e}")
 
@@ -1120,7 +1237,7 @@ async def disable_flow(name: str) -> Dict:
 async def run_flow(name: str) -> Dict:
     """Manually execute a flow."""
     try:
-        executed = flow_service.execute_flow(name)
+        executed = await flow_service.execute_flow(name)
         return {"executed": executed}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -1158,6 +1275,13 @@ def main():
     )
     parser.add_argument("--host", type=str, default=None, help="Server host")
     parser.add_argument("--port", type=int, default=None, help="Server port")
+    parser.add_argument(
+        "--terminal",
+        type=str,
+        choices=["tmux", "herdr"],
+        default=None,
+        help="Terminal backend to use, overriding terminal_backend in config.json",
+    )
     args = parser.parse_args()
 
     if args.agents_dir:
@@ -1166,6 +1290,16 @@ def main():
 
         constants.KIRO_AGENTS_DIR = Path(args.agents_dir)
         logger.info(f"Using agents directory: {args.agents_dir}")
+
+    # Resolve the backend before the server starts so the lifespan (and every
+    # get_backend() consumer) sees the CLI-selected backend. Without --terminal,
+    # the singleton stays lazy and BackendFactory reads config.json on first use.
+    if args.terminal:
+        from cli_agent_orchestrator.backends.factory import BackendFactory
+        from cli_agent_orchestrator.backends.registry import set_backend
+
+        set_backend(BackendFactory.create(backend_override=args.terminal))
+        logger.info(f"Terminal backend overridden via --terminal: {args.terminal}")
 
     host = args.host or SERVER_HOST
     port = args.port or SERVER_PORT

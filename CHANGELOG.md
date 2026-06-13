@@ -8,7 +8,109 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Persistent agent memory system (Phase 1)** — Agents can now store and recall knowledge across sessions using `memory_store`, `memory_recall`, and `memory_forget` MCP tools. Memories are scoped to `global`, `project`, `session`, or `agent` and stored as wiki markdown files under `~/.aws/cli-agent-orchestrator/memory/`. CAO automatically injects relevant memories as `<cao-memory>` context at session start. Includes CLI commands (`cao memory list/show/delete/clear`), tiered retention, and concurrent-write safety via file locking. Hook-driven auto-save is shipped via per-provider plugins in a subsequent PR. See [docs/memory.md](docs/memory.md).
+- add built-in Hermes provider support through profile-configured `hermesProfile` wrappers
+
+## [2.2.0] - 2026-06-04
+
+### Highlights
+
+- **CAO memory** — Agents can now store and recall knowledge across sessions via `memory_store` / `memory_recall` / `memory_forget` MCP tools. Memories are scoped to `global` / `project` / `session` / `agent`, persisted as wiki-style markdown under `~/.aws/cli-agent-orchestrator/memory/`, indexed in SQLite with BM25 fallback retrieval, and auto-injected as `<cao-memory>` context at session start. Ships with CLI commands (`cao memory list/show/delete/clear`), tiered retention, file-lock concurrent-write safety, per-scope caps, and stable project identity via git remote. See [docs/memory.md](docs/memory.md). (#245, #254, #262)
+
+- **External tool integration: OpenClaw & Hermes Agent** — A new external-tool-integration skill lets CAO orchestrate non-CAO CLI agents (OpenClaw, Hermes Agent, etc.) as first-class workers. Hermes Agent is shipped as a worked end-to-end example. See [docs/external-tool-integration.md](docs/external-tool-integration.md). (#241, #253)
+
+### Added
+
+- Build an MCP server for cao operations (#166)
+
+- auto-delete handoff terminals with snapshot-based restore (#233)
+
+- shell command tracking, flow recycling fixes, and inbox delivery reliability (#230)
+
+- eager inbox delivery for providers that buffer input during processing (#251)
+
+- forward `cao launch --env` vars to supervisor and child agents (#259)
+
+- add optional `codexProfile` field to AgentProfile for codex provider (#250)
+
+- add optional `permission_mode` field to AgentProfile for claude_code provider (#244)
+
+- auto-derive CORS origins from `cao-server --host/--port` (#261)
+
+- official devcontainer feature for CAO (#260)
+
+- memory: Phase 2.5 hardening — per-scope caps, ISO-8601 Z round-trip lock, durability + concurrent flock tests, `memory.enabled` short-circuit, stable project identity via git remote (#262)
+
+- enhance Web UI DashboardHome with filtering, sorting, grouping, and session deletion (#200)
+
+- add OpenCode provider label to Web UI (#217)
+
+
+### Documentation
+
+- reorganize README, split detail into topic docs, and add control-plane overview (#225)
+
+- fix Web UI build instructions and add 404 troubleshooting (#252)
+
+- add install with pypi in README.md (#214)
+
+
+### Fixed
+
+- codex: detect v0.136+ TUI footer (`model · path` without `N% left`) so handoff/assign workers reliably reach COMPLETED instead of pinning at IDLE
+
+- codex: skip `• Called <tool>(...)` MCP tool-call markers during last-message extraction so skill body text (including `[CAO Handoff]`) no longer leaks into worker output
+
+- ci: stop TestPyPI squats breaking the release smoke test by installing the package with `--no-deps` and resolving deps from PyPI alone (#270)
+
+- kiro_cli: treat MCP-server boot screen as PROCESSING and gate shell-baseline IDLE on `_initialized` to fix paste-into-boot-screen race that dropped the first message after launch (#268)
+
+- mcp: reject `send_message` when `receiver_id` equals sender (#263)
+
+- tmux name validation hardening (CodeQL #66) (#258)
+
+- launch: resolve profile.provider regardless of yolo/allowed-tools branch (#257)
+
+- api: default TERM to xterm-256color for tmux PTY attach (#256)
+
+- api: make network allowlists configurable via env vars (#255)
+
+- tmux: filter environment to prevent 'command too long' errors (#246)
+
+- session-service: resolve profile.provider in `create_session()` (#198)
+
+- fix mcp worker provider resolution (#224)
+
+- fix ops mcp profile provider resolution (#229)
+
+- agent_profiles: guard agent-name path lookups against traversal (#228)
+
+- install: harden agent-profile install against SSRF and path injection (#226)
+
+- gemini_cli: isolate `GEMINI.md` per terminal in a dedicated workspace (#227)
+
+- kiro_cli: fix handoff hang for Q Developer Pro — Credits marker not emitted in TUI mode (#238)
+
+- kiro_cli: detect TUI `Initializing...` to prevent false IDLE (#215)
+
+- tmux: start panes at 220x50 to avoid kiro-cli SIGWINCH input death (#218)
+
+- launch: wait for idle before tmux attach on non-headless launch (#221)
+
+- opencode: add a poller to OpenCode CLI inbox delivery to drain stuck messages (#210)
+
+
+### Other
+
+- bump idna from 3.10 to 3.15 (#247)
+
+- bump authlib from 1.6.11 to 1.6.12 (#236)
+
+- bump urllib3 from 2.6.3 to 2.7.0 (#234)
+
+- bump python-multipart from 0.0.26 to 0.0.27 (#232)
+
+- bump vitest from 3.2.4 to 4.1.0 in /web (#267)
+
 
 ## [2.1.1] - 2026-04-28
 
@@ -350,5 +452,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bump to v0.51.0, update method name (#31)
 
 - accept optional U+03BB (λ) after % in kiro and q CLIs (#44)
-
-

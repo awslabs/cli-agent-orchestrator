@@ -10,6 +10,7 @@ from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
 from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
 from cli_agent_orchestrator.providers.gemini_cli import GeminiCliProvider
+from cli_agent_orchestrator.providers.hermes import HermesProvider
 from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
 from cli_agent_orchestrator.providers.opencode_cli import OpenCodeCliProvider
@@ -112,6 +113,15 @@ class ProviderManager:
                     allowed_tools,
                     model=model,
                 )
+            elif provider_type == ProviderType.HERMES.value:
+                provider = HermesProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    skill_prompt=skill_prompt,
+                )
             else:
                 raise ValueError(f"Unknown provider type: {provider_type}")
 
@@ -156,9 +166,16 @@ class ProviderManager:
             metadata["tmux_window"],
             metadata["agent_profile"],
         )
-        # Restore shell_command baseline from DB so get_status() can detect kiro exit
+        # Restore shell_command baseline from DB so get_status() can detect kiro exit.
+        # The terminal already exists in the DB, so its CLI has long since
+        # launched — mark the provider as initialized so KiroCliProvider's
+        # post-launch checks (Check 3) trust the restored baseline. Without
+        # this, a restored terminal that has returned to the shell would be
+        # misreported as PROCESSING indefinitely.
         if metadata.get("shell_command"):
             provider.shell_baseline = metadata["shell_command"]
+            if hasattr(provider, "_initialized"):
+                provider._initialized = True
         logger.info(f"Created provider on-demand for terminal {terminal_id}")
         return provider
 

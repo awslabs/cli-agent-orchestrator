@@ -32,14 +32,16 @@ import re
 import shlex
 import shutil
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional
 
-from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
+from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +115,48 @@ THINKING_BULLET_RAW_PATTERN = r"\x1b\[38;5;244m\s*•"
 # Used to identify TUI chrome that should be excluded from content analysis.
 STATUS_BAR_PATTERN = r"\d+:\d+\s+.*(?:agent|shell)\s*\("
 
+# ---------------------------------------------------------------------------
+# Newest "Kimi Code" TUI (the redesigned CLI). Older builds rendered an emoji
+# prompt (✨/💫) at the input line; the redesign instead shows a boxed input
+# area ("── input ──"), a bottom status bar ("yolo  agent (<model> ●) …"), and a
+# "context: 12.3% (n/Nk)" usage line — with NO bare emoji prompt. Detection that
+# keyed on the emoji therefore never observed IDLE and timed out at init.
+# ---------------------------------------------------------------------------
+# Either of these confirms the new TUI is up at its prompt: the context-usage
+# footer, or the status bar's "agent (<model> ●)" segment (● = U+25CF).
+NEW_TUI_STATUS_PATTERN = r"context:\s*\d+(?:\.\d+)?%|agent\s*\([^)]*●"
+# Live working indicator: the new TUI animates a braille spinner
+# ("⠧ Thinking… 5s · 220 tokens", "⠹ Using handoff({...})") and a moon-phase
+# thinking glyph (🌑…🌘) that are cleared when the turn finishes. Any such
+# glyph means a turn-in-flight FRAME was rendered; freshness relative to the
+# last response bullet decides whether the turn is still going (see
+# get_status).
+NEW_TUI_SPINNER_PATTERN = r"[⠁-⣿]|[🌑🌒🌓🌔🌕🌖🌗🌘]"
+# Boot/MCP chrome also renders braille glyphs while the terminal is genuinely
+# idle at the welcome screen ("⠧ MCP Servers: 0/1 connected", "⠦ cao-mcp-server
+# (connecting)", "⠋ Resolving dependencies..."). Those must NOT count as a
+# live turn-in-flight spinner or a freshly-booted terminal would never read
+# IDLE.
+NEW_TUI_BOOT_CHROME_PATTERN = re.compile(
+    r"MCP Servers|\(connecting\)|Resolving dependencies|connecting to mcp servers"
+    r"|Loading configuration|Loading agent|Restoring conversation",
+    re.IGNORECASE,
+)
+
+
+def _is_live_turn_spinner_line(line: str) -> bool:
+    """True when ``line`` carries a live turn-in-flight spinner glyph."""
+    return bool(
+        re.search(NEW_TUI_SPINNER_PATTERN, line) and not NEW_TUI_BOOT_CHROME_PATTERN.search(line)
+    )
+
+
+# A response/thinking bullet ("• …") at line start. Its presence means a turn
+# has produced output — used to latch "input received" on the new TUI (the
+# welcome banner / update nag contain no "•", so this won't false-trigger at
+# init).
+ANY_BULLET_PATTERN = r"(?m)^\s*•"
+
 # Generic error patterns for detecting failure states in terminal output.
 ERROR_PATTERN = (
     r"^(?:Error:|ERROR:|Traceback \(most recent call last\):|ConnectionError:|APIError:)"
@@ -157,11 +201,32 @@ class KimiCliProvider(BaseProvider):
         # Without this, get_status() returns IDLE instead of COMPLETED after
         # the agent finishes processing, causing handoff to time out.
         self._has_received_input = False
+        # Wallclock of the last send_input() dispatch (terminal_service calls
+        # mark_input_received). Used by the newest-TUI status path: right
+        # after a paste, the TUI repaints the ready chrome (status bar) before
+        # the spinner's first frame, so a position-based spinner-vs-ready
+        # compare reads COMPLETED ~100ms into the new turn. With the
+        # StatusMonitor ready-latch, that false COMPLETED is pinned for the
+        # whole turn (observed: supervisor-assign e2e extracting mid-flight
+        # output). A short dispatch grace bridges the gap until the first
+        # spinner frame arrives.
+        self._last_dispatch_time = 0.0
 
     @property
     def paste_enter_count(self) -> int:
         """Kimi CLI's prompt_toolkit submits on single Enter after bracketed paste."""
         return 1
+
+    def mark_input_received(self) -> None:
+        """Record a dispatched task (called by terminal_service after send_input).
+
+        Latches ``_has_received_input`` (the buffer-evidence latch can miss it
+        when a long paste scrolls the echo out of the rolling window) and
+        stamps ``_last_dispatch_time`` for the newest-TUI dispatch-grace check
+        in get_status().
+        """
+        self._has_received_input = True
+        self._last_dispatch_time = time.time()
 
     def _build_kimi_command(self) -> str:
         """Build Kimi CLI command with agent profile and MCP config if provided.
@@ -319,7 +384,7 @@ class KimiCliProvider(BaseProvider):
 
         cls._mcp_timeout_configured = True
 
-    def initialize(self) -> bool:
+    async def initialize(self) -> bool:
         """Initialize Kimi CLI provider by starting the kimi command.
 
         Steps:
@@ -334,22 +399,22 @@ class KimiCliProvider(BaseProvider):
             TimeoutError: If shell or Kimi CLI doesn't start within timeout
         """
         # Wait for shell prompt to appear in the tmux window
-        if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
+        if not await wait_for_shell(self.terminal_id, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
         # Build properly escaped command string
         command = self._build_kimi_command()
 
         # Send Kimi command to the tmux window
-        tmux_client.send_keys(self.session_name, self.window_name, command)
+        get_backend().send_keys(self.session_name, self.window_name, command)
 
         # Wait for Kimi CLI to reach IDLE or COMPLETED state (prompt visible).
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
         # message that get_status() interprets as a completed response.
         # Longer timeout (120s) to account for first-run setup and when
         # multiple Kimi instances are starting concurrently (e.g. assign flow).
-        if not wait_until_status(
-            self,
+        if not await wait_until_status(
+            self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
             timeout=120.0,
             polling_interval=1.0,
@@ -359,18 +424,17 @@ class KimiCliProvider(BaseProvider):
         self._initialized = True
         return True
 
-    def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
+    def get_status(self, output: str) -> TerminalStatus:
         """Get Kimi CLI status by analyzing terminal output.
 
         Status detection logic:
-        1. Capture tmux pane output (full or tail)
-        2. Strip ANSI codes for reliable text matching
-        3. Latch ``_has_received_input`` when user input box (╭─) is detected
-        4. Check bottom N lines for the idle prompt pattern
-        5. If prompt found + input was received → COMPLETED
-        6. If prompt found + no input yet → IDLE
-        7. If no prompt: agent is PROCESSING (streaming response)
-        8. Check for ERROR patterns as fallback
+        1. Strip ANSI codes for reliable text matching
+        2. Latch ``_has_received_input`` when user input box (╭─) is detected
+        3. Check bottom N lines for the idle prompt pattern
+        4. If prompt found + input was received → COMPLETED
+        5. If prompt found + no input yet → IDLE
+        6. If no prompt: agent is PROCESSING (streaming response)
+        7. Check for ERROR patterns as fallback
 
         The latching flag approach is necessary because:
         - Long responses (>200 lines) push the user input box out of the
@@ -381,19 +445,108 @@ class KimiCliProvider(BaseProvider):
           IS still visible in the capture, and persists through completion
 
         Args:
-            tail_lines: Optional number of lines to capture from bottom
+            output: Terminal output buffer (up to ~8KB rolling buffer)
 
         Returns:
             TerminalStatus indicating current state
         """
-        output = tmux_client.get_history(self.session_name, self.window_name, tail_lines=tail_lines)
-
         if not output:
-            return TerminalStatus.ERROR
+            return TerminalStatus.UNKNOWN
 
-        # Strip ANSI codes for reliable pattern matching
-        clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
+        # Strip the RAW pipe-pane escapes (cursor positioning, in-place redraws),
+        # not just SGR colour codes, so the bottom-anchored prompt/processing
+        # checks see clean, line-oriented text on the raw stream.
+        clean_output = strip_terminal_escapes(output)
 
+        # --- Newest "Kimi Code" TUI (redesigned CLI) ---
+        # This build has no bare ✨/💫 prompt; readiness is the bottom status bar
+        # ("agent (<model> ●)") / "context: N%" footer with the empty "── input ──"
+        # box, and a turn-in-flight is a braille spinner ("⠧ Thinking… Ns · N
+        # tokens") that is cleared on completion. Gate on the new-TUI markers so
+        # legacy (emoji-prompt) builds keep the path below unchanged.
+        if re.search(NEW_TUI_STATUS_PATTERN, clean_output):
+            # A "•" bullet appears only once a turn produces output (thinking or
+            # response); the welcome banner / update nag have none. Latch it so a
+            # long response that scrolls the bullets out of the rolling buffer
+            # still reads COMPLETED rather than IDLE. Crucially, nothing latches
+            # at init, so a freshly-launched terminal reads IDLE (not COMPLETED),
+            # avoiding a premature-completion race when the first task is sent.
+            if re.search(ANY_BULLET_PATTERN, clean_output):
+                self._has_received_input = True
+
+            # PROCESSING vs ready. A spinner-vs-status-bar position compare is
+            # unreliable here: the TUI renders the live spinner BETWEEN the
+            # "── input ──" rule and the status bar and repaints the status
+            # bar with every frame, so the ready chrome is the freshest
+            # content even mid-turn (observed: a supervisor turn flapping
+            # completed↔processing 29 times in one 57KB stream, which the
+            # StatusMonitor ready-latch then pinned at a false COMPLETED).
+            # Two in-flight signals, validated by replaying captured live
+            # streams; either one means a turn is running:
+            # - spinner glyph (braille/moon, incl. tool-call lines like
+            #   "⠹ Using handoff({…})") within the freshest tail lines —
+            #   frames land every ~100ms while the agent works, and the
+            #   turn-finished repaint (input rule + ~12 blank box lines +
+            #   separator + status bar + context footer) pushes stale frames
+            #   beyond this window;
+            # - the last spinner glyph rendered AFTER the last "•" bullet —
+            #   catches chunk boundaries mid-repaint where streamed thinking
+            #   text has temporarily pushed the spinner out of the tail
+            #   window (a finished turn always ends with bullets as the
+            #   freshest non-chrome content).
+            lines = clean_output.splitlines()
+            last_spinner = max(
+                (i for i, line in enumerate(lines) if _is_live_turn_spinner_line(line)),
+                default=-1,
+            )
+            last_bullet = max(
+                (i for i, line in enumerate(lines) if re.match(r"\s*•", line)),
+                default=-1,
+            )
+            spinner_in_tail = last_spinner >= 0 and last_spinner >= len(lines) - 15
+            if spinner_in_tail or last_spinner > last_bullet:
+                return TerminalStatus.PROCESSING
+
+            # Dispatch grace: for a few seconds after send_input(), trust the
+            # dispatch over the chrome. The paste repaints the status bar
+            # (ready chrome lands LAST in the stream) before the turn's first
+            # spinner frame, so the checks above briefly read "ready" ~100ms
+            # into a new turn — and the StatusMonitor ready-latch would pin
+            # that false COMPLETED until the next input.
+            if self._last_dispatch_time and time.time() - self._last_dispatch_time < 5.0:
+                return TerminalStatus.PROCESSING
+
+            # The stream looks ready — confirm against the RENDERED pane.
+            # A ready-looking chunk boundary is byte-identical mid-turn vs at
+            # real completion (measured on captured streams: stale spinner
+            # ~21 lines back, bullets 2-3 from the end in BOTH), so the raw
+            # stream alone cannot split them. The rendered pane can: tmux's
+            # compositor has resolved every in-place redraw, so a spinner
+            # glyph visible in the pane tail is live, not stale. Gated to
+            # post-dispatch only (boot screens legitimately show braille
+            # like '⠧ MCP Servers: 0/1' while idle at the welcome screen,
+            # and init readiness is already handled by the stream path).
+            if self._last_dispatch_time:
+                try:
+                    pane_tail = get_backend().get_history(
+                        self.session_name,
+                        self.window_name,
+                        tail_lines=25,
+                        strip_escapes=True,
+                    )
+                    if any(_is_live_turn_spinner_line(line) for line in pane_tail.splitlines()):
+                        return TerminalStatus.PROCESSING
+                except Exception:
+                    # Pane unavailable (deleted window, backend hiccup) —
+                    # fall through to the stream-derived ready status.
+                    pass
+
+            if re.search(ERROR_PATTERN, clean_output, re.MULTILINE):
+                return TerminalStatus.ERROR
+
+            return TerminalStatus.COMPLETED if self._has_received_input else TerminalStatus.IDLE
+
+        # --- Legacy emoji-prompt TUI ---
         # Check the bottom lines for the idle prompt.
         # Kimi's TUI has padding lines between prompt and status bar.
         # Use end-of-line anchor (\s*$) to distinguish a bare prompt ("user@dir💫")
@@ -452,14 +605,6 @@ class KimiCliProvider(BaseProvider):
         # No prompt visible and no error: Kimi is actively processing/streaming
         return TerminalStatus.PROCESSING
 
-    def get_idle_pattern_for_log(self) -> str:
-        """Return Kimi CLI idle prompt pattern for log file monitoring.
-
-        Used by the inbox service for quick IDLE state detection in pipe-pane
-        log files before calling the full get_status() method.
-        """
-        return IDLE_PROMPT_PATTERN_LOG
-
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract Kimi's final response from terminal output.
 
@@ -513,8 +658,16 @@ class KimiCliProvider(BaseProvider):
             if re.search(PROMPT_WITH_INPUT_PATTERN, line):
                 prompt_input_idx = i
 
-        # Choose the best anchor: prefer input box (more precise), fall back to prompt-with-input
-        if box_end_idx is not None:
+        # Choose the best anchor: the LATEST marker wins. The newest "Kimi
+        # Code" TUI draws decorative ╰─ boxes during boot (its own welcome box
+        # and MCP-server banners like FastMCP's) but renders user messages as
+        # ✨-prefixed prompt lines — so a box-end can match boot chrome ABOVE
+        # the real message and box-first priority would slice the response
+        # from the boot screen. The response always follows the LAST user
+        # input, whichever marker style rendered it.
+        if box_end_idx is not None and prompt_input_idx is not None:
+            response_start = max(box_end_idx, prompt_input_idx) + 1
+        elif box_end_idx is not None:
             response_start = box_end_idx + 1
         elif prompt_input_idx is not None:
             response_start = prompt_input_idx + 1
@@ -522,11 +675,22 @@ class KimiCliProvider(BaseProvider):
             # Neither marker found — long response scrolled everything out
             return self._extract_without_input_box(raw_lines, clean_lines)
 
-        # Find the next idle prompt line (bare prompt, no text after it)
+        # Find where the response ends: the next bare idle prompt
+        # (legacy/v1.20 TUIs), or the newest-TUI footer chrome — the
+        # "── input ──" box rule or the status bar / context footer
+        # (NEW_TUI_STATUS_PATTERN). Without the footer stops, a newest-TUI
+        # response would run to end-of-capture and drag the empty input box
+        # and status bar into the extracted message.
         idle_prompt_eol = IDLE_PROMPT_PATTERN + r"\s*$"
+        new_tui_input_rule = r"^\s*─{2,}\s*input\s*─{2,}"
         prompt_idx = len(clean_lines)  # default: end of output
         for i in range(response_start, len(clean_lines)):
-            if re.search(idle_prompt_eol, clean_lines[i]):
+            line = clean_lines[i]
+            if (
+                re.search(idle_prompt_eol, line)
+                or re.match(new_tui_input_rule, line)
+                or re.search(NEW_TUI_STATUS_PATTERN, line)
+            ):
                 prompt_idx = i
                 break
 

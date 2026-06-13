@@ -34,6 +34,7 @@ Define the agent's role, responsibilities, and behavior here.
 - `model` (string): AI model to use
 - `permissionMode` (string, `claude_code` only): One of `"default"`, `"acceptEdits"`, `"plan"`, `"auto"`, `"bypassPermissions"`. When set, the `claude_code` provider passes `--permission-mode <value>` instead of `--dangerously-skip-permissions`. `cao launch --yolo` overrides this and forces bypass. See [Claude Code permission modes](https://code.claude.com/docs/en/permission-modes).
 - `native_agent` (string, `claude_code` only): Name of a native Claude Code agent (`~/.claude/agents/`). When set, the provider passes `--agent <name>` directly and skips system prompt / MCP config decomposition (thin-wrapper mode). See [Claude Code native agent routing](claude-code.md#native-agent-routing).
+- `hermesProfile` (string, `hermes` only): Optional Hermes profile wrapper command CAO should launch instead of the default `hermes`, for example one created with `hermes profile alias test-worker`. This is intentionally separate from `codexProfile`: Codex consumes profile names via `codex --profile <name>`, while Hermes aliases are executable commands launched directly as `<alias> chat ...`. See [Hermes Provider](hermes.md).
 - `prompt` (string): Additional prompt text
 
 ## Tool Restrictions
@@ -97,7 +98,7 @@ Agent profiles can declare which provider they should run on via the `provider` 
 
 When the supervisor calls `assign` or `handoff`, CAO reads the worker's agent profile and uses the declared `provider` if it is a valid value. If the key is missing or the value is not recognized, the worker inherits the supervisor's provider.
 
-Valid values: `q_cli`, `kiro_cli`, `claude_code`, `codex`, `gemini_cli`, `kimi_cli`, `copilot_cli`.
+Valid values: `q_cli`, `kiro_cli`, `claude_code`, `codex`, `gemini_cli`, `hermes`, `kimi_cli`, `copilot_cli`, `opencode_cli`.
 
 ### Example
 

@@ -72,12 +72,14 @@ class TestSessionCreationWithWorkingDirectory:
     def test_create_session_passes_working_directory(self, client, tmp_path):
         """Test that working_directory parameter is passed to service."""
         with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
-            mock_svc.create_session.return_value = Terminal(
-                id="abcd1234",
-                name="test-window",
-                session_name="test-session",
-                provider="q_cli",
-                agent_profile="developer",
+            mock_svc.create_session = AsyncMock(
+                return_value=Terminal(
+                    id="abcd1234",
+                    name="test-window",
+                    session_name="test-session",
+                    provider="q_cli",
+                    agent_profile="developer",
+                )
             )
 
             response = client.post(
@@ -98,12 +100,14 @@ class TestSessionCreationWithWorkingDirectory:
     def test_create_session_with_working_directory(self, client):
         """Test POST /sessions with working_directory parameter."""
         with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
-            mock_svc.create_session.return_value = Terminal(
-                id="abcd1234",
-                name="test-window",
-                session_name="test-session",
-                provider="q_cli",
-                agent_profile="developer",
+            mock_svc.create_session = AsyncMock(
+                return_value=Terminal(
+                    id="abcd1234",
+                    name="test-window",
+                    session_name="test-session",
+                    provider="q_cli",
+                    agent_profile="developer",
+                )
             )
 
             response = client.post(
@@ -132,12 +136,14 @@ class TestTerminalCreationWithWorkingDirectory:
             ),
             patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
         ):
-            mock_svc.create_terminal.return_value = Terminal(
-                id="abcd5678",
-                name="test-window",
-                session_name="test-session",
-                provider="q_cli",
-                agent_profile="analyst",
+            mock_svc.create_terminal = AsyncMock(
+                return_value=Terminal(
+                    id="abcd5678",
+                    name="test-window",
+                    session_name="test-session",
+                    provider="q_cli",
+                    agent_profile="analyst",
+                )
             )
 
             response = client.post(
@@ -162,12 +168,14 @@ class TestTerminalCreationWithWorkingDirectory:
             ),
             patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
         ):
-            mock_svc.create_terminal.return_value = Terminal(
-                id="abcd5678",
-                name="test-window",
-                session_name="test-session",
-                provider="q_cli",
-                agent_profile="analyst",
+            mock_svc.create_terminal = AsyncMock(
+                return_value=Terminal(
+                    id="abcd5678",
+                    name="test-window",
+                    session_name="test-session",
+                    provider="q_cli",
+                    agent_profile="analyst",
+                )
             )
 
             response = client.post(
@@ -347,9 +355,7 @@ class TestCreateInboxMessageEndpoint:
                 "abcd1234",
                 "hello",
             )
-            mock_inbox.check_and_send_pending_messages.assert_called_once_with(
-                "abcd1234", registry=ANY
-            )
+            mock_inbox.deliver_pending.assert_called_once_with("abcd1234", registry=ANY)
 
     def test_create_inbox_message_delivery_failure_still_succeeds(self, client):
         """Immediate delivery failure should not fail the API response."""
@@ -364,7 +370,7 @@ class TestCreateInboxMessageEndpoint:
             patch("cli_agent_orchestrator.api.main.inbox_service") as mock_inbox,
         ):
             mock_create.return_value = mock_msg
-            mock_inbox.check_and_send_pending_messages.side_effect = Exception("TMux busy")
+            mock_inbox.deliver_pending.side_effect = Exception("TMux busy")
 
             response = client.post(
                 "/terminals/abcd1234/inbox/messages",
@@ -625,12 +631,14 @@ class TestCrossProviderResolution:
             patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
         ):
             mock_resolve.return_value = "claude_code"
-            mock_svc.create_terminal.return_value = Terminal(
-                id="abcd1234",
-                name="test-window",
-                session_name="test-session",
-                provider="claude_code",
-                agent_profile="developer",
+            mock_svc.create_terminal = AsyncMock(
+                return_value=Terminal(
+                    id="abcd1234",
+                    name="test-window",
+                    session_name="test-session",
+                    provider="claude_code",
+                    agent_profile="developer",
+                )
             )
 
             response = client.post(
@@ -655,12 +663,14 @@ class TestCrossProviderResolution:
         ):
             # resolve_provider returns the fallback (no profile provider key)
             mock_resolve.return_value = "kiro_cli"
-            mock_svc.create_terminal.return_value = Terminal(
-                id="abcd5678",
-                name="test-window",
-                session_name="test-session",
-                provider="kiro_cli",
-                agent_profile="reviewer",
+            mock_svc.create_terminal = AsyncMock(
+                return_value=Terminal(
+                    id="abcd5678",
+                    name="test-window",
+                    session_name="test-session",
+                    provider="kiro_cli",
+                    agent_profile="reviewer",
+                )
             )
 
             response = client.post(
@@ -681,12 +691,14 @@ class TestCrossProviderResolution:
             patch("cli_agent_orchestrator.api.main.resolve_provider") as mock_resolve,
             patch("cli_agent_orchestrator.api.main.session_service") as mock_svc,
         ):
-            mock_svc.create_session.return_value = Terminal(
-                id="abcd1234",
-                name="test-window",
-                session_name="test-session",
-                provider="kiro_cli",
-                agent_profile="supervisor",
+            mock_svc.create_session = AsyncMock(
+                return_value=Terminal(
+                    id="abcd1234",
+                    name="test-window",
+                    session_name="test-session",
+                    provider="kiro_cli",
+                    agent_profile="supervisor",
+                )
             )
 
             response = client.post(

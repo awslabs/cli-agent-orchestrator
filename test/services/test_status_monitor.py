@@ -1,0 +1,225 @@
+"""Tests for StatusMonitor — focus on backend-aware get_status().
+
+get_status() is the single source of truth for terminal status. For pipe-pane
+backends (tmux) it returns the pushed pipeline status; for event-inbox backends
+(herdr), which never feed the pipeline, it derives status on demand from the
+provider's native status. These tests pin both paths.
+"""
+
+from unittest.mock import MagicMock, patch
+
+from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.services.status_monitor import StatusMonitor
+
+
+def _backend(event_inbox):
+    backend = MagicMock()
+    backend.supports_event_inbox.return_value = event_inbox
+    return backend
+
+
+class TestGetStatusTmux:
+    """Pipe-pane backend: get_status returns the pushed _last_status, unchanged."""
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_returns_pushed_status(self, mock_get_backend):
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+
+        assert sm.get_status("t1") == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_unknown_when_never_seen(self, mock_get_backend):
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        sm = StatusMonitor()
+
+        assert sm.get_status("missing") == TerminalStatus.UNKNOWN
+
+
+class TestGetStatusEventInbox:
+    """Event-inbox backend (herdr): derive status on demand from the provider."""
+
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_derives_from_provider_native_status(self, mock_get_backend, mock_pm):
+        mock_get_backend.return_value = _backend(event_inbox=True)
+        provider = MagicMock()
+        provider.get_status.return_value = TerminalStatus.IDLE
+        mock_pm.get_provider.return_value = provider
+
+        sm = StatusMonitor()
+        # _last_status is empty (herdr never feeds the pipeline) — the old code
+        # would return UNKNOWN here.
+        assert sm.get_status("t1") == TerminalStatus.IDLE
+        provider.get_status.assert_called_once()
+
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_unknown_when_no_provider(self, mock_get_backend, mock_pm):
+        mock_get_backend.return_value = _backend(event_inbox=True)
+        mock_pm.get_provider.return_value = None
+
+        sm = StatusMonitor()
+        assert sm.get_status("t1") == TerminalStatus.UNKNOWN
+
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_unknown_when_provider_lookup_raises(self, mock_get_backend, mock_pm):
+        mock_get_backend.return_value = _backend(event_inbox=True)
+        mock_pm.get_provider.side_effect = ValueError("terminal not in db")
+
+        sm = StatusMonitor()
+        assert sm.get_status("t1") == TerminalStatus.UNKNOWN
+
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_unknown_when_provider_get_status_raises(self, mock_get_backend, mock_pm):
+        mock_get_backend.return_value = _backend(event_inbox=True)
+        provider = MagicMock()
+        provider.get_status.side_effect = RuntimeError("herdr cli failed")
+        mock_pm.get_provider.return_value = provider
+
+        sm = StatusMonitor()
+        assert sm.get_status("t1") == TerminalStatus.UNKNOWN
+
+
+class _SequencedMonitor:
+    """Drive _process_chunk with a scripted sequence of detected statuses.
+
+    Patches provider get_status to pop from the script and the event bus to
+    record published status events, so each test reads as: feed detections,
+    assert latched status + published transitions.
+    """
+
+    def __init__(self):
+        self.sm = StatusMonitor()
+        self.published = []
+
+    def feed(self, status):
+        provider = MagicMock()
+        provider.get_status.return_value = status
+        bus = MagicMock()
+        bus.publish.side_effect = lambda topic, data: self.published.append(data["status"])
+        with (
+            patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as mock_pm,
+            patch("cli_agent_orchestrator.services.status_monitor.bus", bus),
+        ):
+            mock_pm.get_provider.return_value = provider
+            self.sm._process_chunk("t1", "x")
+
+    def status(self):
+        return self.sm._last_status.get("t1")
+
+
+class TestStickyLatching:
+    """Pin the sticky ready-status latch + notify_input_sent state machine."""
+
+    def test_idle_to_processing_blocked_without_arm(self):
+        m = _SequencedMonitor()
+        m.feed(TerminalStatus.IDLE)
+        m.feed(TerminalStatus.PROCESSING)  # eviction flap
+        assert m.status() == TerminalStatus.IDLE
+        assert m.published == ["idle"]
+
+    def test_ready_to_unknown_blocked_without_arm(self):
+        m = _SequencedMonitor()
+        m.feed(TerminalStatus.COMPLETED)
+        m.feed(TerminalStatus.UNKNOWN)
+        assert m.status() == TerminalStatus.COMPLETED
+
+    def test_completed_to_idle_blocked_without_arm(self):
+        """Codex-style: user marker evicts before assistant bullet."""
+        m = _SequencedMonitor()
+        m.feed(TerminalStatus.COMPLETED)
+        m.feed(TerminalStatus.IDLE)
+        assert m.status() == TerminalStatus.COMPLETED
+
+    def test_idle_to_completed_always_allowed(self):
+        m = _SequencedMonitor()
+        m.feed(TerminalStatus.IDLE)
+        m.feed(TerminalStatus.COMPLETED)
+        assert m.status() == TerminalStatus.COMPLETED
+
+    def test_arm_allows_processing_then_reblocks(self):
+        """The normal cycle: input → PROCESSING accepted → COMPLETED → flap blocked."""
+        m = _SequencedMonitor()
+        m.feed(TerminalStatus.IDLE)
+        m.sm.notify_input_sent("t1")
+        m.feed(TerminalStatus.PROCESSING)
+        assert m.status() == TerminalStatus.PROCESSING
+        m.feed(TerminalStatus.COMPLETED)
+        m.feed(TerminalStatus.PROCESSING)  # post-completion eviction flap
+        assert m.status() == TerminalStatus.COMPLETED
+
+    def test_arm_survives_ready_to_ready_flap(self):
+        """A large paste can evict the response markers BEFORE the agent
+        starts working, flapping COMPLETED → IDLE. That flap must not consume
+        the arm — otherwise the genuine PROCESSING that follows is blocked,
+        the terminal reads IDLE while the agent is busy, and InboxService
+        (which delivers on IDLE/COMPLETED) can paste a queued message into
+        the middle of an active response."""
+        m = _SequencedMonitor()
+        m.feed(TerminalStatus.COMPLETED)
+        m.sm.notify_input_sent("t1")
+        m.feed(TerminalStatus.IDLE)  # paste evicted markers — flap
+        assert m.status() == TerminalStatus.IDLE
+        m.feed(TerminalStatus.PROCESSING)  # genuine cycle start
+        assert m.status() == TerminalStatus.PROCESSING
+        m.feed(TerminalStatus.COMPLETED)
+        m.feed(TerminalStatus.PROCESSING)  # post-completion flap re-blocked
+        assert m.status() == TerminalStatus.COMPLETED
+
+    def test_arm_survives_waiting_user_answer_to_idle(self):
+        """Answering a permission prompt (send_special_key arms the gate)
+        can flap WAITING_USER_ANSWER → IDLE before the agent resumes."""
+        m = _SequencedMonitor()
+        m.feed(TerminalStatus.WAITING_USER_ANSWER)
+        m.sm.notify_input_sent("t1")
+        m.feed(TerminalStatus.IDLE)  # prompt cleared, redraw flap
+        m.feed(TerminalStatus.PROCESSING)  # agent resumes the task
+        assert m.status() == TerminalStatus.PROCESSING
+
+    def test_arm_consumed_by_init_style_upgrade(self):
+        """non-ready → ready latch consumes the arm (CLI launch reaching its
+        first idle prompt without a visible PROCESSING window)."""
+        m = _SequencedMonitor()
+        m.sm.notify_input_sent("t1")  # launch keystroke
+        m.feed(TerminalStatus.IDLE)  # TUI ready
+        m.feed(TerminalStatus.PROCESSING)  # redraw flap — must be blocked
+        assert m.status() == TerminalStatus.IDLE
+
+    def test_processing_consumes_arm_once(self):
+        m = _SequencedMonitor()
+        m.feed(TerminalStatus.IDLE)
+        m.sm.notify_input_sent("t1")
+        m.feed(TerminalStatus.PROCESSING)
+        m.feed(TerminalStatus.IDLE)
+        m.feed(TerminalStatus.PROCESSING)  # no new input — blocked
+        assert m.status() == TerminalStatus.IDLE
+
+    def test_reset_buffer_clears_arm(self):
+        m = _SequencedMonitor()
+        m.feed(TerminalStatus.IDLE)
+        m.sm.notify_input_sent("t1")
+        m.sm.reset_buffer("t1")
+        m.feed(TerminalStatus.IDLE)
+        m.feed(TerminalStatus.PROCESSING)  # arm gone — blocked
+        assert m.status() == TerminalStatus.IDLE
+
+    def test_clear_terminal_clears_arm(self):
+        m = _SequencedMonitor()
+        m.feed(TerminalStatus.IDLE)
+        m.sm.notify_input_sent("t1")
+        m.sm.clear_terminal("t1")
+        assert "t1" not in m.sm._allow_processing_revert
+
+    def test_no_event_published_for_blocked_downgrade(self):
+        """Blocked flaps must not publish status events — InboxService
+        subscribes to them and a spurious ready event could double-deliver."""
+        m = _SequencedMonitor()
+        m.feed(TerminalStatus.COMPLETED)
+        m.feed(TerminalStatus.PROCESSING)
+        m.feed(TerminalStatus.UNKNOWN)
+        m.feed(TerminalStatus.IDLE)
+        assert m.published == ["completed"]

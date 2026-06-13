@@ -99,7 +99,7 @@ class BaseProvider(ABC):
         return 2
 
     @abstractmethod
-    def initialize(self) -> bool:
+    async def initialize(self) -> bool:
         """Initialize the provider (e.g., start CLI tool, send setup commands).
 
         Returns:
@@ -108,39 +108,64 @@ class BaseProvider(ABC):
         pass
 
     @abstractmethod
-    def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
-        """Get current provider status by analyzing terminal output.
+    def get_status(self, buffer: str) -> TerminalStatus:
+        """Detect terminal status from output buffer using provider-specific patterns.
+
+        Called by StatusMonitor with the accumulated terminal output.
+
+        IMPORTANT — input contract: ``buffer`` is the **raw** pipe-pane byte
+        stream (cursor-positioning escapes, in-place ``\\r`` redraws, OSC titles),
+        NOT a tmux-rendered pane snapshot. Implementations that do structural /
+        line-oriented matching MAY run it through
+        ``cli_agent_orchestrator.utils.text.strip_terminal_escapes`` first
+        (which removes escapes and normalizes cursor moves to newlines).
+        Detectors calibrated against rendered snapshots will misfire on the raw
+        stream if they skip this step. This is deliberately not a hard
+        requirement: some providers depend on the raw escapes (kiro_cli
+        preserves ``\\r`` for permission-prompt detection — see the comment in
+        its get_status) and must NOT be "fixed" to comply.
 
         Args:
-            tail_lines: Number of lines to capture from terminal (default: provider-specific)
+            buffer: Raw terminal output (up to ~8KB rolling buffer).
 
         Returns:
-            TerminalStatus: Current status of the provider
+            TerminalStatus - always returns a valid status.
+            UNKNOWN if no pattern matched, ERROR only for matched error patterns.
         """
         pass
 
-    @abstractmethod
-    def get_idle_pattern_for_log(self) -> str:
-        """Get pattern that indicates IDLE state in log file output.
+    @property
+    def paste_submit_delay(self) -> float:
+        """Seconds to wait after a bracketed paste before sending the Enter key.
 
-        Used for quick detection in file watcher before calling full get_status().
-        Should return a simple pattern that appears in the IDLE prompt.
-
-        Returns:
-            str: Pattern to search for in log file tail
+        Some TUIs need time to finish processing the bracketed-paste end marker
+        before an Enter registers as "submit" rather than a literal newline.
+        Override per-provider when a CLI needs longer than the default (e.g. the
+        newest Claude Code, whose Ink renderer swallows an Enter sent too soon).
         """
-        pass
+        return 0.3
 
     @property
     def accepts_input_while_processing(self) -> bool:
         """Whether this provider buffers pasted input during PROCESSING for next-turn pickup.
 
         When True AND CAO_EAGER_INBOX_DELIVERY is enabled, the inbox service will
-        deliver messages to this terminal even when its status is PROCESSING or
-        WAITING_USER_ANSWER, rather than waiting for IDLE/COMPLETED.
+        deliver messages to this terminal even when its status is PROCESSING,
+        rather than waiting for IDLE/COMPLETED.
 
         Override in subclasses for providers whose TUI buffers input at all times
         (e.g., Claude Code's Ink renderer).
+        """
+        return False
+
+    @property
+    def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:
+        """Whether assign/handoff should pause when the provider is waiting on UI input.
+
+        Some CLIs render interactive pickers or approval prompts where pasted
+        task text would be interpreted as the answer to that prompt. Providers
+        with those surfaces can opt in so CAO blocks orchestrated task delivery
+        while still allowing explicit user-prompt answers.
         """
         return False
 
@@ -186,9 +211,6 @@ class BaseProvider(ABC):
 
         Called by the terminal service after send_input() delivers a message.
         Providers can override this to adjust status detection behavior.
-        For example, providers with initial prompts can use this to
-        distinguish post-init idle (ready for first input) from
-        post-task completed.
         """
         pass
 
