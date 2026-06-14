@@ -1270,6 +1270,21 @@ class TestKimiScreenDetection:
         ]
         assert self._p().get_status_from_screen(screen) == TerminalStatus.COMPLETED
 
+    def test_response_mentioning_connecting_is_not_boot_gated(self):
+        """A COMPLETED turn whose "•" response bullet merely MENTIONS the boot
+        chrome ("connecting to mcp servers" / "(connecting)") must not be
+        re-stranded as PROCESSING. The boot gate scans non-bullet boot chrome
+        only; a whole-screen scan would pin this terminal at PROCESSING and
+        InboxService (delivers on IDLE/COMPLETED) would never deliver to it."""
+        screen = [
+            "✨ How does kimi boot?",
+            "• It logs 'connecting to mcp servers' and shows cao-mcp-server (connecting) until ready.",
+            "── input ──────────────",
+            "yolo  agent (Kimi-k2.6 ●)  /tmp/x",
+            "context: 4.0% (10.4k/262.1k)",
+        ]
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.COMPLETED
+
     def test_live_spinner_is_processing(self):
         screen = [
             "✨ Analyze the data",

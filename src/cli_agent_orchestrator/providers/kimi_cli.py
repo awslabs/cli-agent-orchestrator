@@ -625,13 +625,27 @@ class KimiCliProvider(BaseProvider):
 
         # Boot gate: Kimi draws its status bar BEFORE it can accept input —
         # while MCP servers are still connecting it shows "connecting to mcp
-        # servers" / "cao-mcp-server (connecting)" / "MCP Servers: 0/1
-        # connected". Reporting IDLE here is premature: a message delivered in
-        # this window is pasted into the boot screen and silently absorbed
-        # (observed live — an inbox message delivered 1.3s after a premature
-        # IDLE left the receiver stuck). Treat the connecting state as
-        # PROCESSING so init waits for a real ready prompt.
-        if re.search(r"connecting to mcp servers|\(connecting\)", joined, re.IGNORECASE):
+        # servers" / "cao-mcp-server (connecting)". Reporting IDLE here is
+        # premature: a message delivered in this window is pasted into the boot
+        # screen and silently absorbed (observed live — an inbox message
+        # delivered 1.3s after a premature IDLE left the receiver stuck). Treat
+        # the connecting state as PROCESSING so init waits for a real ready
+        # prompt.
+        #
+        # Scan only NON-bullet lines. This boot chrome renders in the status-bar
+        # / spinner region (braille-prefixed status lines, the "connecting to mcp
+        # servers" progress line), never as a "•" response bullet. Searching the
+        # whole composited screen would re-strand a genuinely COMPLETED turn as
+        # PROCESSING whenever its response text merely MENTIONS "(connecting)" /
+        # "connecting to mcp servers" — plausible in an MCP orchestrator — and
+        # since the boot gate precedes the ready check and re-fires on every
+        # settled frame, the inbox (delivers only on IDLE/COMPLETED) would then
+        # never deliver to that terminal.
+        if any(
+            re.search(r"connecting to mcp servers|\(connecting\)", ln, re.IGNORECASE)
+            for ln in rows
+            if not re.match(r"\s*•", ln)
+        ):
             return TerminalStatus.PROCESSING
 
         # Newest "Kimi Code" TUI: readiness is the status bar / context footer.
