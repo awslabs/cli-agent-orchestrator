@@ -149,8 +149,11 @@ class BaseProvider(ABC):
         viewport rows with all cursor moves and in-place redraws already
         resolved, escape-free, right-padded with spaces. The StatusMonitor
         calls this (instead of get_status) when CAO_PYTE_STATUS is enabled AND
-        ``supports_screen_detection`` is True, and only once the screen has
-        gone byte-stable (quiescence debounce).
+        ``supports_screen_detection`` is True. It is invoked on two edges only —
+        the RISING edge (output resumes after a quiet period) and at QUIESCENCE
+        (no new output for the debounce window) — never mid-burst, so a frame is
+        either freshly-resumed or fully settled, not half-drawn. Detectors must
+        not assume every frame is fully settled.
 
         Default implementation joins the rows into a newline-delimited string
         and delegates to get_status — a safe no-op fallback for providers that

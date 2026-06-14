@@ -241,6 +241,28 @@ class TestStickyLatching:
         m.feed(TerminalStatus.UNKNOWN)
         assert m.status() == TerminalStatus.PROCESSING
 
+    def test_armed_unknown_then_ready_rerender_keeps_processing(self):
+        """Guards against a tempting-but-wrong "suppress UNKNOWN only when not
+        armed" change (so an armed new turn could clear a stale ready status).
+
+        If an armed terminal's rising-edge frame reads UNKNOWN (a torn paste
+        frame) and then re-renders the PRIOR turn's COMPLETED before the new
+        spinner draws, letting that UNKNOWN through would make the
+        UNKNOWN->COMPLETED bounce a non-ready->ready upgrade that CONSUMES the
+        revert arm. The genuine PROCESSING that follows would then be latch-
+        blocked, stranding the terminal at COMPLETED for the whole busy turn —
+        and InboxService (delivers on IDLE/COMPLETED) would paste into a working
+        agent. Suppressing UNKNOWN unconditionally keeps the arm intact so the
+        real PROCESSING wins."""
+        m = _SequencedMonitor()
+        m.feed(TerminalStatus.COMPLETED)
+        m.sm.notify_input_sent("t1")
+        m.feed(TerminalStatus.UNKNOWN)  # torn rising-edge frame after the paste
+        m.feed(TerminalStatus.COMPLETED)  # prior turn re-rendered at quiescence
+        m.feed(TerminalStatus.PROCESSING)  # genuine new-turn processing
+        assert m.status() == TerminalStatus.PROCESSING
+        assert m.published == ["completed", "processing"]
+
     def test_initial_unknown_is_published(self):
         """The first detection (last is None) may legitimately be UNKNOWN —
         e.g. a freshly created terminal before any marker renders."""

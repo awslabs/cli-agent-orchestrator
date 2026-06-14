@@ -143,12 +143,25 @@ class StatusMonitor:
         with self._lock:
             last = self._last_status.get(terminal_id)
 
-            # UNKNOWN is "no signal", not a state: never let it overwrite a
-            # known status. Mid-turn the screen can momentarily show neither a
-            # spinner nor the prompt (e.g. while a tool runs), which the
-            # detector reports as UNKNOWN; downgrading a known PROCESSING to
-            # UNKNOWN there is a spurious transition. The initial UNKNOWN (when
-            # last is None, nothing detected yet) is still allowed through.
+            # UNKNOWN is "no signal", not a state: never let it overwrite a known
+            # status. Mid-turn the screen can momentarily show neither a spinner
+            # nor the prompt (e.g. while a tool runs), which the detector reports
+            # as UNKNOWN; downgrading a known PROCESSING to UNKNOWN there is a
+            # spurious transition (observed live as processing->unknown->completed).
+            #
+            # Do NOT narrow this to "suppress only when not armed" (to let an
+            # armed new turn clear a stale ready status). It does not actually
+            # close that window — the rising-edge frame right after a paste still
+            # composites the PREVIOUS turn's COMPLETED box, so get_status() reports
+            # ready whether or not UNKNOWN is let through — and it opens a worse
+            # one: an armed ready->UNKNOWN->ready re-render (torn paste frame, then
+            # the prior turn repainted before the new spinner draws) makes the
+            # bounce back to COMPLETED a non-ready->ready upgrade that CONSUMES the
+            # revert arm. The genuine PROCESSING that follows is then latch-blocked
+            # and the terminal reads ready for the entire busy turn — exactly what
+            # InboxService must never paste into. See
+            # test_armed_unknown_then_ready_rerender_keeps_processing. The initial
+            # UNKNOWN (last is None, nothing detected yet) is still allowed through.
             if detected == TerminalStatus.UNKNOWN and last is not None:
                 return
 
