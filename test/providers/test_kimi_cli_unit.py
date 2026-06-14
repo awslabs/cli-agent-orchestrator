@@ -1230,3 +1230,71 @@ class TestKimiCodeDispatchGrace:
         # bullet in buffer latches _has_received_input → COMPLETED, as before;
         # no dispatch yet → pane confirmation is skipped entirely.
         assert provider.get_status(self.NEW_TUI_READY_CHROME) == TerminalStatus.COMPLETED
+
+
+class TestKimiScreenDetection:
+    """Viewport detector (get_status_from_screen) — pyte-composited screens."""
+
+    def _p(self):
+        return KimiCliProvider("test123", "test-session", "window-0")
+
+    def test_mcp_connecting_is_processing_not_idle(self):
+        """Kimi draws its status bar BEFORE accepting input; during
+        'connecting to mcp servers' a premature IDLE lets the inbox paste a
+        message into the boot screen where it is absorbed (observed live)."""
+        screen = [
+            "⠧ MCP Servers: 0/1 connected, 0 tools",
+            "⠦ cao-mcp-server (connecting)",
+            "── input ──────────────",
+            "yolo  agent (Kimi-k2.6 ●)  /tmp/x",
+            "connecting to mcp servers...",
+        ]
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.PROCESSING
+
+    def test_ready_status_bar_no_bullet_is_idle(self):
+        screen = [
+            "▐█▛█▛█▌  Welcome to Kimi Code CLI!",
+            "── input ──────────────",
+            "yolo  agent (Kimi-k2.6 ●)  /tmp/x",
+            "context: 1.0% (2.6k/262.1k)",
+        ]
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.IDLE
+
+    def test_status_bar_with_bullet_is_completed(self):
+        screen = [
+            "✨ What is 17*23?",
+            "• 391. The product of 17 and 23 is 391.",
+            "── input ──────────────",
+            "yolo  agent (Kimi-k2.6 ●)  /tmp/x",
+            "context: 4.0% (10.4k/262.1k)",
+        ]
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.COMPLETED
+
+    def test_response_mentioning_connecting_is_not_boot_gated(self):
+        """A COMPLETED turn whose "•" response bullet merely MENTIONS the boot
+        chrome ("connecting to mcp servers" / "(connecting)") must not be
+        re-stranded as PROCESSING. The boot gate scans non-bullet boot chrome
+        only; a whole-screen scan would pin this terminal at PROCESSING and
+        InboxService (delivers on IDLE/COMPLETED) would never deliver to it."""
+        screen = [
+            "✨ How does kimi boot?",
+            "• It logs 'connecting to mcp servers' and shows cao-mcp-server (connecting) until ready.",
+            "── input ──────────────",
+            "yolo  agent (Kimi-k2.6 ●)  /tmp/x",
+            "context: 4.0% (10.4k/262.1k)",
+        ]
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.COMPLETED
+
+    def test_live_spinner_is_processing(self):
+        screen = [
+            "✨ Analyze the data",
+            "• Working through it.",
+            "⠹ Using handoff({...})",
+            "── input ──────────────",
+            "yolo  agent (Kimi-k2.6 ●)  /tmp/x",
+        ]
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.PROCESSING
+
+    def test_torn_down_shell_is_unknown(self):
+        screen = ["Bye!", "rkram@host:/tmp/x$"]
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.UNKNOWN

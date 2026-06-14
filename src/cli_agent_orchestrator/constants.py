@@ -67,6 +67,36 @@ STATE_BUFFER_MAX = 8192
 # Max events buffered per subscriber queue before dropping
 EVENT_BUS_MAX_QUEUE_SIZE = 1024
 
+# pyte-rendered status detection. When enabled, the StatusMonitor feeds each
+# terminal's output through a pyte terminal emulator and runs detection against
+# the COMPOSITED screen (redraws/cursor-moves resolved) instead of the raw
+# byte stream — but only for providers that opt in via
+# ``supports_screen_detection`` AND only after the rendered screen goes
+# byte-stable (quiescence debounce). Empirically, rendering without the
+# debounce is WORSE than the raw path (it catches mid-redraw frames); the
+# debounce is what collapses status flaps to ~0. Default ON: validated live on
+# real Claude + Kimi turns (init, multi-turn, send_message, handoff) and by the
+# full e2e gauntlet in pyte mode (allowed-tools, assign, cross-provider,
+# handoff, send_message, skills, supervisor orchestration — every test green;
+# the only failures traced to network outages and a slow uvx MCP launch path,
+# not detection). Only providers that opt in via supports_screen_detection
+# (claude_code, kimi_cli) use it; all others and the herdr backend are
+# unaffected. Set CAO_PYTE_STATUS=false to fall back to the raw-stream path.
+CAO_PYTE_STATUS = os.environ.get("CAO_PYTE_STATUS", "true").lower() == "true"
+
+# pyte screen geometry — mirror the tmux pane size (clients/tmux.py x=220 y=50)
+# so the rendered viewport matches what the agent's TUI actually drew.
+PYTE_SCREEN_COLS = 220
+PYTE_SCREEN_ROWS = 50
+
+# Quiescence debounce for rendered-screen detection (seconds). Detection runs on
+# two edges: the RISING edge (output resumes after quiet → likely PROCESSING)
+# and QUIESCENCE (no new output for this long → the TUI repaint has settled, so
+# the screen reflects the true end state → COMPLETED/IDLE/WAITING). Detecting
+# only on these edges — never mid-burst — is what avoids the flaps that naive
+# per-chunk rendered detection produces (measured worse than the raw path).
+PYTE_QUIESCENCE_DELAY_S = 0.2
+
 # Eager inbox delivery: when enabled, deliver queued messages to terminals in
 # PROCESSING state for providers that declare
 # accepts_input_while_processing=True. Eliminates latency between agent turns

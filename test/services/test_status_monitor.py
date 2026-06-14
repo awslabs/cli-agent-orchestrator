@@ -6,6 +6,7 @@ backends (tmux) it returns the pushed pipeline status; for event-inbox backends
 provider's native status. These tests pin both paths.
 """
 
+import threading
 from unittest.mock import MagicMock, patch
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -99,6 +100,11 @@ class _SequencedMonitor:
     def feed(self, status):
         provider = MagicMock()
         provider.get_status.return_value = status
+        # These tests exercise the RAW detection path's latch logic. Pin
+        # supports_screen_detection False so they are independent of the
+        # CAO_PYTE_STATUS default (a bare MagicMock would be truthy and route
+        # through the pyte screen path).
+        provider.supports_screen_detection = False
         bus = MagicMock()
         bus.publish.side_effect = lambda topic, data: self.published.append(data["status"])
         with (
@@ -223,3 +229,98 @@ class TestStickyLatching:
         m.feed(TerminalStatus.UNKNOWN)
         m.feed(TerminalStatus.IDLE)
         assert m.published == ["completed"]
+
+    def test_unknown_does_not_overwrite_known_processing(self):
+        """UNKNOWN is 'no signal', not a state: a mid-turn UNKNOWN (e.g. the
+        screen momentarily shows neither spinner nor prompt while a tool runs)
+        must not downgrade a known PROCESSING. Observed live as a spurious
+        processing→unknown→completed blip."""
+        m = _SequencedMonitor()
+        m.feed(TerminalStatus.IDLE)
+        m.sm.notify_input_sent("t1")
+        m.feed(TerminalStatus.PROCESSING)
+        m.feed(TerminalStatus.UNKNOWN)
+        assert m.status() == TerminalStatus.PROCESSING
+
+    def test_armed_unknown_then_ready_rerender_keeps_processing(self):
+        """Guards against a tempting-but-wrong "suppress UNKNOWN only when not
+        armed" change (so an armed new turn could clear a stale ready status).
+
+        If an armed terminal's rising-edge frame reads UNKNOWN (a torn paste
+        frame) and then re-renders the PRIOR turn's COMPLETED before the new
+        spinner draws, letting that UNKNOWN through would make the
+        UNKNOWN->COMPLETED bounce a non-ready->ready upgrade that CONSUMES the
+        revert arm. The genuine PROCESSING that follows would then be latch-
+        blocked, stranding the terminal at COMPLETED for the whole busy turn —
+        and InboxService (delivers on IDLE/COMPLETED) would paste into a working
+        agent. Suppressing UNKNOWN unconditionally keeps the arm intact so the
+        real PROCESSING wins."""
+        m = _SequencedMonitor()
+        m.feed(TerminalStatus.COMPLETED)
+        m.sm.notify_input_sent("t1")
+        m.feed(TerminalStatus.UNKNOWN)  # torn rising-edge frame after the paste
+        m.feed(TerminalStatus.COMPLETED)  # prior turn re-rendered at quiescence
+        m.feed(TerminalStatus.PROCESSING)  # genuine new-turn processing
+        assert m.status() == TerminalStatus.PROCESSING
+        assert m.published == ["completed", "processing"]
+
+    def test_initial_unknown_is_published(self):
+        """The first detection (last is None) may legitimately be UNKNOWN —
+        e.g. a freshly created terminal before any marker renders."""
+        m = _SequencedMonitor()
+        m.feed(TerminalStatus.UNKNOWN)
+        assert m.status() == TerminalStatus.UNKNOWN
+        assert m.published == ["unknown"]
+
+
+class TestQuiescenceTimerCancel:
+    """The pyte quiescence timer is an asyncio.TimerHandle owned by the
+    StatusMonitor's loop. clear_terminal/reset_buffer can run off that loop
+    thread (cleanup_old_data is dispatched via asyncio.to_thread), and
+    TimerHandle.cancel() is not thread-safe, so the cancel must be marshaled
+    onto the owning loop, never called directly cross-thread."""
+
+    def test_cancel_marshaled_when_off_loop_thread(self):
+        sm = StatusMonitor()
+        loop = MagicMock()
+        sm._loop = loop
+        handle = MagicMock()
+        sm._quiesce_handle["t1"] = handle
+
+        # clear_terminal from a worker thread (which has no running loop).
+        t = threading.Thread(target=sm.clear_terminal, args=("t1",))
+        t.start()
+        t.join()
+
+        handle.cancel.assert_not_called()
+        loop.call_soon_threadsafe.assert_called_once_with(handle.cancel)
+
+    def test_reset_buffer_cancel_marshaled_when_off_loop_thread(self):
+        sm = StatusMonitor()
+        loop = MagicMock()
+        sm._loop = loop
+        handle = MagicMock()
+        sm._quiesce_handle["t1"] = handle
+
+        t = threading.Thread(target=sm.reset_buffer, args=("t1",))
+        t.start()
+        t.join()
+
+        handle.cancel.assert_not_called()
+        loop.call_soon_threadsafe.assert_called_once_with(handle.cancel)
+
+    def test_cancel_direct_when_no_loop_captured(self):
+        """Offline/unit path (no loop ever scheduled a timer): a direct cancel
+        is correct because there is no foreign loop to race."""
+        sm = StatusMonitor()
+        handle = MagicMock()
+        sm._quiesce_handle["t1"] = handle
+        sm.clear_terminal("t1")  # sm._loop is None
+        handle.cancel.assert_called_once()
+
+    def test_no_handle_is_a_noop(self):
+        sm = StatusMonitor()
+        sm._loop = MagicMock()
+        # No timer scheduled for this terminal — must not blow up.
+        sm.clear_terminal("missing")
+        sm._loop.call_soon_threadsafe.assert_not_called()
