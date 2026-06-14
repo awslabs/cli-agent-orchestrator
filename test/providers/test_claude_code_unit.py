@@ -1537,6 +1537,19 @@ class TestClaudeCodeScreenDetection:
         ]
         assert self._p().get_status_from_screen(screen) == TerminalStatus.UNKNOWN
 
+    def test_launch_echo_with_nearby_separator_is_not_idle(self):
+        """A launch-echo frame where a single early-painted ──── rule lands near
+        an echoed '> ' system-prompt quote must NOT read as a ready box. Only one
+        rail is present; the real box has a rail both above AND below the prompt.
+        A one-sided separator adjacency misread this as IDLE, breaking init."""
+        screen = [
+            "rkram@host:/tmp$ claude --append-system-prompt '...",
+            "─" * 40,
+            "> `memory_store` and `memory_recall` are CAO tools",
+            "- **cao-session-management**: ...",
+        ]
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.UNKNOWN
+
     def test_live_spinner_is_processing(self):
         screen = [
             "● Working on the task",

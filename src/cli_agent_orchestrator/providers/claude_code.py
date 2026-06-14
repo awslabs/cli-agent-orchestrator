@@ -660,14 +660,26 @@ class ClaudeCodeProvider(BaseProvider):
         ):
             return TerminalStatus.WAITING_USER_ANSWER
 
-        # Real input box: a prompt line within 2 rows of a separator line.
+        # Real input box: a prompt line with a "────" rail BOTH within 2 rows
+        # above AND within 2 rows below — the "──── / ❯ / ────" box Claude pins
+        # to the bottom of the viewport.
         sep_idx = [i for i, ln in enumerate(rows) if re.search(r"─{8,}", ln)]
         # Prompt line: ❯/> followed by whitespace OR alone at end-of-line. The
         # bare-glyph case matters because rows are rstrip()ed: an EMPTY prompt
         # box renders as "❯" + pyte's space padding, which rstrip reduces to a
         # bare "❯" that IDLE_PROMPT_PATTERN (glyph + whitespace) cannot match.
+        # We deliberately do NOT require the prompt line to be empty — a ready
+        # box carries placeholder text (❯ Try "fix typecheck errors").
         prompt_idx = [i for i, ln in enumerate(rows) if re.search(r"[>❯](?:[\s\xa0]|$)", ln)]
-        boxed_prompt = any(any(abs(pi - si) <= 2 for si in sep_idx) for pi in prompt_idx)
+        # Require BOTH rails, not just one nearby separator: during launch the
+        # echoed "> " system-prompt quote can land within 2 rows of a single
+        # early-painted ──── rule, which a one-sided adjacency misread as a ready
+        # prompt (premature IDLE on init — the first task then hits a not-ready
+        # agent). The real box always has a rail above AND below the prompt.
+        boxed_prompt = any(
+            any(0 < pi - si <= 2 for si in sep_idx) and any(0 < si - pi <= 2 for si in sep_idx)
+            for pi in prompt_idx
+        )
         if boxed_prompt:
             if re.search(
                 GET_STATUS_COMPLETION_PATTERN, joined
