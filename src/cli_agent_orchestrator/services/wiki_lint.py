@@ -127,12 +127,22 @@ def _make_issue(
     description: str = "",
     severity: str = "warning",
 ) -> LintIssue:
-    """T6.a — sanitise description ONCE at construction; truncate to 200."""
+    """T6.a — sanitise key/related_key/description ONCE at construction.
+
+    ``key``/``related_key`` can originate from filesystem stems (e.g.
+    ``orphan_page`` walks ``wiki/*.md``), so they carry the same single-line
+    contract as ``description`` to keep raw control chars/newlines out of the
+    rendered table and logs.
+    """
     sanitized = _sanitize_for_log(description, max_len=DESCRIPTION_MAX_CHARS)
     return LintIssue(
         issue_type=issue_type,
-        key=key,
-        related_key=related_key,
+        key=_sanitize_for_log(key, max_len=DESCRIPTION_MAX_CHARS),
+        related_key=(
+            _sanitize_for_log(related_key, max_len=DESCRIPTION_MAX_CHARS)
+            if related_key is not None
+            else None
+        ),
         description=sanitized,
         severity=severity,
     )
@@ -260,7 +270,7 @@ def _detect_orphan_pages(
             _make_issue(
                 issue_type="lint_error",
                 key="orphan_page",
-                description=f"orphan_page truncated: had {len(candidates) - len(issues) + truncated} files (cap {cap}/scope)",
+                description=f"orphan_page truncated: had {len(issues) + truncated} files (cap {cap}/scope)",
                 severity="warning",
             )
         )

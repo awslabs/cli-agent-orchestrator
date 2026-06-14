@@ -470,6 +470,12 @@ async def _default_llm_call(
                 proc.kill()
             except ProcessLookupError:
                 pass
+            # Reap the killed child so it doesn't linger as a zombie until GC
+            # finalisers run; best-effort, never mask the original timeout.
+            try:
+                await proc.wait()
+            except Exception:
+                pass
             raise
 
         if proc.returncode != 0:

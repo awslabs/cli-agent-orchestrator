@@ -253,6 +253,70 @@ class TestU72PlanCases:
         assert compute_exit_code(issues) == 0
 
 
+class TestMakeIssueSanitisation:
+    """``_make_issue`` sanitises key/related_key, not just description.
+
+    Keys can originate from filesystem stems (orphan_page walks wiki/*.md),
+    so raw control chars/newlines must not survive into the rendered table.
+    """
+
+    def test_key_newline_and_control_chars_stripped(self):
+        issue = _make_issue(
+            issue_type="orphan_page",
+            key="evil\nINJECTED key\rcarriage",
+            description="x",
+        )
+        # Raw line breaks are escaped/stripped so the key stays single-line.
+        assert "\n" not in issue.key
+        assert "\r" not in issue.key
+
+    def test_related_key_sanitised_when_present(self):
+        issue = _make_issue(
+            issue_type="contradiction",
+            key="a",
+            related_key="b\nFORGED LINE",
+            description="x",
+        )
+        assert "\n" not in issue.related_key
+
+    def test_related_key_none_passes_through(self):
+        issue = _make_issue(issue_type="orphan_page", key="ok", description="x")
+        assert issue.related_key is None
+
+
+class TestOrphanTruncationCount:
+    """The orphan truncation summary reports total orphans, not a figure
+    that can exceed the candidate count when the cap is hit.
+    """
+
+    def test_truncation_count_equals_total_orphans(self, tmp_path):
+        cap = ISSUE_CAPS["orphan_page"]
+        n = cap + 5  # five over the cap → truncated == 5
+        scope_dir = tmp_path / "global"
+        wiki = scope_dir / "wiki"
+        wiki.mkdir(parents=True)
+        for i in range(n):
+            (wiki / f"orphan-{i:03d}.md").write_text("body\n", encoding="utf-8")
+
+        issues = _detect_orphan_pages(
+            project_dir=scope_dir,
+            scope="global",
+            scope_id=None,
+            db_keys=set(),
+            base_resolved=tmp_path.resolve(),
+        )
+        orphans = [i for i in issues if i.issue_type == "orphan_page"]
+        summary = [
+            i
+            for i in issues
+            if i.issue_type == "lint_error" and "orphan_page truncated" in i.description
+        ]
+        assert len(orphans) == cap
+        assert len(summary) == 1
+        # had {len(issues)+truncated} = cap + 5 = n; never exceeds candidates.
+        assert f"had {n} files" in summary[0].description
+
+
 # ===========================================================================
 # T1 — Contradiction prompt injection / strict JSON schema
 # ===========================================================================

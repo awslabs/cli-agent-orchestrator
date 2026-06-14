@@ -278,6 +278,15 @@ def lint_cmd(scope, out_format):
     )
     click.echo(completion, err=is_json)
 
+    # The completion summary is echoed above; drop it from the rendered
+    # payload/table and the exit-code computation so it isn't duplicated and
+    # the "No lint issues found." branch can still fire on a clean run.
+    issues = [
+        i
+        for i in issues
+        if not (i.issue_type == "lint_error" and i.description.startswith("lint_run_completed:"))
+    ]
+
     if is_json:
         payload = [
             {

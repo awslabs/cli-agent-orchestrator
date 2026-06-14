@@ -230,19 +230,17 @@ def _migrate_add_access_count() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        conn = sqlite3.connect(str(DATABASE_FILE))
-        cursor = conn.execute("PRAGMA table_info(memory_metadata)")
-        columns = {row[1] for row in cursor.fetchall()}
-        if "access_count" not in columns:
-            conn.execute(
-                "ALTER TABLE memory_metadata ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0"
-            )
-            logger.info("Migration: added access_count column to memory_metadata")
-        if "last_accessed_at" not in columns:
-            conn.execute("ALTER TABLE memory_metadata ADD COLUMN last_accessed_at DATETIME")
-            logger.info("Migration: added last_accessed_at column to memory_metadata")
-        conn.commit()
-        conn.close()
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            cursor = conn.execute("PRAGMA table_info(memory_metadata)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if "access_count" not in columns:
+                conn.execute(
+                    "ALTER TABLE memory_metadata ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0"
+                )
+                logger.info("Migration: added access_count column to memory_metadata")
+            if "last_accessed_at" not in columns:
+                conn.execute("ALTER TABLE memory_metadata ADD COLUMN last_accessed_at DATETIME")
+                logger.info("Migration: added last_accessed_at column to memory_metadata")
     except Exception as e:
         logger.debug(f"Migration check for access_count failed: {e}")
 
@@ -259,14 +257,12 @@ def _migrate_add_last_compiled_at() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        conn = sqlite3.connect(str(DATABASE_FILE))
-        cursor = conn.execute("PRAGMA table_info(memory_metadata)")
-        columns = {row[1] for row in cursor.fetchall()}
-        if "last_compiled_at" not in columns:
-            conn.execute("ALTER TABLE memory_metadata ADD COLUMN last_compiled_at DATETIME")
-            conn.commit()
-            logger.info("Migration: added last_compiled_at column to memory_metadata")
-        conn.close()
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            cursor = conn.execute("PRAGMA table_info(memory_metadata)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if "last_compiled_at" not in columns:
+                conn.execute("ALTER TABLE memory_metadata ADD COLUMN last_compiled_at DATETIME")
+                logger.info("Migration: added last_compiled_at column to memory_metadata")
     except Exception as e:
         logger.debug(f"Migration check for last_compiled_at failed: {e}")
 
@@ -285,14 +281,12 @@ def _migrate_add_related_keys() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        conn = sqlite3.connect(str(DATABASE_FILE))
-        cursor = conn.execute("PRAGMA table_info(memory_metadata)")
-        columns = {row[1] for row in cursor.fetchall()}
-        if "related_keys" not in columns:
-            conn.execute("ALTER TABLE memory_metadata ADD COLUMN related_keys TEXT")
-            conn.commit()
-            logger.info("Migration: added related_keys column to memory_metadata")
-        conn.close()
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            cursor = conn.execute("PRAGMA table_info(memory_metadata)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if "related_keys" not in columns:
+                conn.execute("ALTER TABLE memory_metadata ADD COLUMN related_keys TEXT")
+                logger.info("Migration: added related_keys column to memory_metadata")
     except Exception as e:
         logger.debug(f"Migration check for related_keys failed: {e}")
 
