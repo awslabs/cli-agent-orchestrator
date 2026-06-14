@@ -34,7 +34,7 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -177,6 +177,18 @@ class KimiCliProvider(BaseProvider):
     # 3 data_analyst workers via assign). Without this, concurrent read/write to
     # the config file causes race conditions and file corruption.
     _mcp_timeout_configured = False
+
+    # Class-level prompt regex shared between status detection
+    # and ``extract_session_context``. Bounded quantifiers
+    # (no unbounded ``*`` / ``+`` — defeats ReDoS on pathological pane bytes).
+    # Matches the v1.20+ idle-line shape ``[user@host]💫 message`` AND the
+    # bare-emoji ``💫 message`` form. The optional ``\S`` tail matches "user
+    # text follows on the same line" — used to slice the message off after
+    # the prompt marker.
+    _KIMI_PROMPT_RE = re.compile(r"(?:\w{1,32}@[\w.\-]{1,64})?[✨💫][^\S\n]{1,4}\S")
+    # Response/thinking markers used to bound a user message line. Matches
+    # the same ``• `` bullet the IDLE/PROCESSING path uses.
+    _KIMI_RESPONSE_MARKER_RE = re.compile(r"^•\s")
 
     def __init__(
         self,
@@ -795,6 +807,80 @@ class KimiCliProvider(BaseProvider):
         We use /exit as it's the most reliable and consistent.
         """
         return "/exit"
+
+    async def extract_session_context(self) -> Dict[str, Any]:
+        """Tmux-primary session extraction for Kimi.
+
+        Mirrors the universal pattern used by the other 5 providers
+        (Claude Code / Codex / Kiro / Q / Gemini). Returns the locked
+        6-field shape from ``_build_context_dict``. Empty tmux history
+        returns the LITERAL empty dict ``{}``. All
+        emitted strings flow through ``_sanitize_for_log`` at this
+        producer layer (sanitised at both produce and consume). Never raises
+        out — top-level ``except Exception`` returns ``{}`` with a
+        sanitised WARNING. ``KeyboardInterrupt`` and ``SystemExit``
+        propagate.
+        """
+        from cli_agent_orchestrator.services.wiki_compiler import _sanitize_for_log
+
+        try:
+            output = get_backend().get_history(self.session_name, self.window_name)
+            if not output:
+                return {}  # literal empty dict, not a populated-empty one
+
+            clean = re.sub(ANSI_CODE_PATTERN, "", output)
+
+            user_messages: list = []
+            lines = clean.splitlines()
+            i = 0
+            while i < len(lines):
+                m = self._KIMI_PROMPT_RE.search(lines[i])
+                if not m:
+                    i += 1
+                    continue
+                msg_lines: list = []
+                # Text after the prompt emoji on the same line.
+                after = lines[i][m.end() - 1 :].strip()
+                if after:
+                    msg_lines.append(after)
+                i += 1
+                while i < len(lines):
+                    if self._KIMI_PROMPT_RE.search(lines[i]) or self._KIMI_RESPONSE_MARKER_RE.match(
+                        lines[i]
+                    ):
+                        break
+                    if lines[i].strip():
+                        msg_lines.append(lines[i].strip())
+                    i += 1
+                if msg_lines:
+                    user_messages.append(" ".join(msg_lines))
+
+            last_response = ""
+            try:
+                last_response = self.extract_last_message_from_script(output)
+            except ValueError:
+                pass
+
+            return self._build_context_dict(
+                provider_name="kimi_cli",
+                last_task=_sanitize_for_log(user_messages[-1] if user_messages else ""),
+                key_decisions=[
+                    _sanitize_for_log(s) for s in self._extract_decisions(last_response)
+                ],
+                open_questions=[
+                    _sanitize_for_log(s) for s in self._extract_questions(user_messages)
+                ],
+                files_changed=[_sanitize_for_log(s) for s in self._extract_file_paths(clean)],
+            )
+        except (KeyboardInterrupt, SystemExit):
+            # Control flow MUST propagate.
+            raise
+        except Exception as e:
+            logger.warning(
+                "kimi_extract_session_context_failed reason=%s",
+                _sanitize_for_log(str(e))[:200],
+            )
+            return {}
 
     def cleanup(self) -> None:
         """Clean up Kimi CLI provider resources.

@@ -20,8 +20,9 @@ Each provider must implement pattern matching for its specific CLI's prompt
 and output format to reliably detect status changes.
 """
 
+import re
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 
@@ -213,6 +214,73 @@ class BaseProvider(ABC):
         Providers can override this to adjust status detection behavior.
         """
         pass
+
+    @staticmethod
+    def _extract_questions(user_messages: List[str]) -> List[str]:
+        """Extract lines containing '?' from user messages."""
+        questions: List[str] = []
+        for msg in user_messages:
+            for line in msg.splitlines():
+                stripped = line.strip()
+                if "?" in stripped and len(stripped) > 5:
+                    questions.append(stripped)
+        return questions[-5:]  # last 5
+
+    @staticmethod
+    def _extract_decisions(assistant_text: str) -> List[str]:
+        """Extract decision-like sentences from assistant output."""
+        decision_indicators = re.compile(
+            r"(?:I(?:'ll| will| have| decided| chose| went with|'m going to)|"
+            r"(?:The |My |Our )?(?:approach|decision|plan|solution|strategy) (?:is|was|will be)|"
+            r"(?:We should|Let's|Going to|Decided to|Chose to))",
+            re.IGNORECASE,
+        )
+        decisions: List[str] = []
+        for line in assistant_text.splitlines():
+            stripped = line.strip()
+            if decision_indicators.search(stripped) and len(stripped) > 10:
+                # Trim to first sentence if very long
+                if len(stripped) > 200:
+                    stripped = stripped[:200] + "..."
+                decisions.append(stripped)
+        return decisions[-10:]  # last 10
+
+    @staticmethod
+    def _extract_file_paths(text: str) -> List[str]:
+        """Extract file paths mentioned in terminal output.
+
+        Looks for common patterns: paths with extensions, tool-use file references.
+        """
+        # Match paths like src/foo/bar.py, ./test.js, /abs/path.ts
+        path_pattern = re.compile(
+            r"(?:^|[\s\"'`(])(" r"(?:\.{0,2}/)?(?:[\w.-]+/)+[\w.-]+\.\w{1,10}" r")"
+        )
+        seen: set[str] = set()
+        paths: List[str] = []
+        for match in path_pattern.finditer(text):
+            p = match.group(1)
+            if p not in seen and not p.startswith("http"):
+                seen.add(p)
+                paths.append(p)
+        return paths[-20:]  # last 20
+
+    def _build_context_dict(
+        self,
+        provider_name: str,
+        last_task: str,
+        key_decisions: List[str],
+        open_questions: List[str],
+        files_changed: List[str],
+    ) -> Dict[str, Any]:
+        """Build the standard session context dict."""
+        return {
+            "provider": provider_name,
+            "terminal_id": self.terminal_id,
+            "last_task": last_task,
+            "key_decisions": key_decisions,
+            "open_questions": open_questions,
+            "files_changed": files_changed,
+        }
 
     def _apply_skill_prompt(self, system_prompt: str) -> str:
         """Append skill catalog text to a system prompt if available.
