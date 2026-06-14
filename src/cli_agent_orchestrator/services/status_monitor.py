@@ -79,6 +79,13 @@ class StatusMonitor:
         self._bursting: Dict[str, bool] = {}
         # Pending quiescence-detect timer handle per terminal (loop.call_later).
         self._quiesce_handle: Dict[str, asyncio.TimerHandle] = {}
+        # The event loop that owns the quiescence timers. Captured when the
+        # first timer is scheduled (on the loop thread). clear_terminal /
+        # reset_buffer can run OFF that thread (cleanup_old_data is dispatched
+        # via asyncio.to_thread), and TimerHandle.cancel() is not thread-safe,
+        # so the cancel is marshaled back onto this loop. See
+        # _cancel_quiesce_handle.
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     async def run(self) -> None:
         """Subscribe to output events and detect status changes."""
@@ -236,13 +243,15 @@ class StatusMonitor:
             # on the current screen — deterministic, no timing.
             self._apply_detection(terminal_id, self._detect_screen(terminal_id, provider))
             return
+        # Remember the timer-owning loop so an off-thread clear/reset can marshal
+        # the cancel back onto it (this runs on the loop thread).
+        self._loop = loop
 
         with self._lock:
             was_bursting = self._bursting.get(terminal_id, False)
             self._bursting[terminal_id] = True
             handle = self._quiesce_handle.pop(terminal_id, None)
-        if handle is not None:
-            handle.cancel()
+        self._cancel_quiesce_handle(handle)
 
         if not was_bursting:
             self._apply_detection(terminal_id, self._detect_screen(terminal_id, provider))
@@ -266,6 +275,34 @@ class StatusMonitor:
             return asyncio.get_running_loop()
         except RuntimeError:
             return None
+
+    def _cancel_quiesce_handle(self, handle: Optional[asyncio.TimerHandle]) -> None:
+        """Cancel a quiescence timer safely from any thread.
+
+        The timer is an asyncio.TimerHandle owned by ``self._loop``.
+        TimerHandle.cancel() mutates loop-internal scheduling state and is NOT
+        thread-safe, yet clear_terminal/reset_buffer can run off the loop thread
+        (cleanup_old_data is dispatched via asyncio.to_thread). Marshal the
+        cancel onto the owning loop with call_soon_threadsafe unless we are
+        already on it.
+        """
+        if handle is None:
+            return
+        loop = self._loop
+        if loop is None:
+            handle.cancel()  # no loop ever captured (unit/offline path) — safe
+            return
+        try:
+            on_loop = asyncio.get_running_loop() is loop
+        except RuntimeError:
+            on_loop = False
+        if on_loop:
+            handle.cancel()
+        else:
+            try:
+                loop.call_soon_threadsafe(handle.cancel)
+            except RuntimeError:
+                pass  # loop already closed during shutdown — the timer is moot
 
     def notify_input_sent(self, terminal_id: str) -> None:
         """Arm the next PROCESSING transition.
@@ -299,8 +336,7 @@ class StatusMonitor:
             self._screens.pop(terminal_id, None)
             self._bursting.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
-        if handle is not None:
-            handle.cancel()
+        self._cancel_quiesce_handle(handle)
 
     def reset_buffer(self, terminal_id: str) -> None:
         """Clear the rolling buffer + last-known status WITHOUT forgetting the
@@ -320,8 +356,7 @@ class StatusMonitor:
             self._screens.pop(terminal_id, None)
             self._bursting.pop(terminal_id, None)
             handle = self._quiesce_handle.pop(terminal_id, None)
-        if handle is not None:
-            handle.cancel()
+        self._cancel_quiesce_handle(handle)
 
     def get_status(self, terminal_id: str) -> TerminalStatus:
         """Get current terminal status — the single source of truth for both backends.

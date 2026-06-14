@@ -6,6 +6,7 @@ backends (tmux) it returns the pushed pipeline status; for event-inbox backends
 provider's native status. These tests pin both paths.
 """
 
+import threading
 from unittest.mock import MagicMock, patch
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -270,3 +271,56 @@ class TestStickyLatching:
         m.feed(TerminalStatus.UNKNOWN)
         assert m.status() == TerminalStatus.UNKNOWN
         assert m.published == ["unknown"]
+
+
+class TestQuiescenceTimerCancel:
+    """The pyte quiescence timer is an asyncio.TimerHandle owned by the
+    StatusMonitor's loop. clear_terminal/reset_buffer can run off that loop
+    thread (cleanup_old_data is dispatched via asyncio.to_thread), and
+    TimerHandle.cancel() is not thread-safe, so the cancel must be marshaled
+    onto the owning loop, never called directly cross-thread."""
+
+    def test_cancel_marshaled_when_off_loop_thread(self):
+        sm = StatusMonitor()
+        loop = MagicMock()
+        sm._loop = loop
+        handle = MagicMock()
+        sm._quiesce_handle["t1"] = handle
+
+        # clear_terminal from a worker thread (which has no running loop).
+        t = threading.Thread(target=sm.clear_terminal, args=("t1",))
+        t.start()
+        t.join()
+
+        handle.cancel.assert_not_called()
+        loop.call_soon_threadsafe.assert_called_once_with(handle.cancel)
+
+    def test_reset_buffer_cancel_marshaled_when_off_loop_thread(self):
+        sm = StatusMonitor()
+        loop = MagicMock()
+        sm._loop = loop
+        handle = MagicMock()
+        sm._quiesce_handle["t1"] = handle
+
+        t = threading.Thread(target=sm.reset_buffer, args=("t1",))
+        t.start()
+        t.join()
+
+        handle.cancel.assert_not_called()
+        loop.call_soon_threadsafe.assert_called_once_with(handle.cancel)
+
+    def test_cancel_direct_when_no_loop_captured(self):
+        """Offline/unit path (no loop ever scheduled a timer): a direct cancel
+        is correct because there is no foreign loop to race."""
+        sm = StatusMonitor()
+        handle = MagicMock()
+        sm._quiesce_handle["t1"] = handle
+        sm.clear_terminal("t1")  # sm._loop is None
+        handle.cancel.assert_called_once()
+
+    def test_no_handle_is_a_noop(self):
+        sm = StatusMonitor()
+        sm._loop = MagicMock()
+        # No timer scheduled for this terminal — must not blow up.
+        sm.clear_terminal("missing")
+        sm._loop.call_soon_threadsafe.assert_not_called()
