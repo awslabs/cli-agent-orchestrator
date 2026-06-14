@@ -639,10 +639,17 @@ class ClaudeCodeProvider(BaseProvider):
 
         # Live spinner: "✻ <gerund>… (…)" — the boxed-prompt spinner or a bare
         # spinner line. Visible in a composited frame ⇒ genuinely working.
-        if any(
-            NEW_TUI_BOX_SPINNER_PATTERN.search(ln) or re.search(NEW_TUI_SPINNER_PATTERN, ln)
-            for ln in bottom
-        ):
+        #
+        # Use ONLY the gerund-first NEW_TUI_BOX_SPINNER_PATTERN, not the looser
+        # NEW_TUI_SPINNER_PATTERN. The loose pattern ([glyph][^\n]*ing…) is
+        # documented (see its definition) as too permissive precisely because
+        # its glyph class includes the markdown bullets "·"/"*", so a settled
+        # response bullet ending in a gerund + ellipsis ("* …after deploying…")
+        # in the bottom region reads as a live spinner — a false PROCESSING that
+        # then latches and starves InboxService (delivers only on IDLE/COMPLETED).
+        # The raw get_status() path already switched to the tight pattern for the
+        # same reason; the screen path must match.
+        if any(NEW_TUI_BOX_SPINNER_PATTERN.search(ln) for ln in bottom):
             return TerminalStatus.PROCESSING
 
         bottom_joined = "\n".join(bottom)

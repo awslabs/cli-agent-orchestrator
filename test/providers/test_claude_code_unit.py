@@ -1557,6 +1557,22 @@ class TestClaudeCodeScreenDetection:
         ]
         assert self._p().get_status_from_screen(screen) == TerminalStatus.COMPLETED
 
+    def test_response_bullet_with_gerund_is_not_false_spinner(self):
+        """A settled COMPLETED turn whose "*"/"·" response bullet ends in a
+        gerund + ellipsis must NOT read as a live spinner. The loose
+        NEW_TUI_SPINNER_PATTERN (glyph class includes "·"/"*") matches such a
+        bullet; the gerund-first NEW_TUI_BOX_SPINNER_PATTERN the detector now
+        uses does not. Without the fix this screen latches a false PROCESSING
+        that starves InboxService."""
+        screen = [
+            "● Done — see notes.",
+            "* Remember to restart the service after deploying…",
+            "─" * 60,
+            "❯ ",
+            "─" * 60,
+        ]
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.COMPLETED
+
     def test_selection_widget_is_waiting_user_answer(self):
         screen = [
             "Do you want to proceed?",
