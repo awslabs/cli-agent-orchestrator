@@ -1558,7 +1558,14 @@ class MemoryService:
                 scan_all=scan_all,
             )
             return self._apply_sort_and_increment(
-                bm25_only, scope, sort_by, limit, include_related=include_related
+                bm25_only,
+                scope,
+                sort_by,
+                limit,
+                include_related=include_related,
+                query=query,
+                terminal_context=terminal_context,
+                scan_all=scan_all,
             )
 
         metadata_results = await self._metadata_recall(
@@ -1572,7 +1579,14 @@ class MemoryService:
 
         if search_mode == "metadata" or not query:
             return self._apply_sort_and_increment(
-                metadata_results, scope, sort_by, limit, include_related=include_related
+                metadata_results,
+                scope,
+                sort_by,
+                limit,
+                include_related=include_related,
+                query=query,
+                terminal_context=terminal_context,
+                scan_all=scan_all,
             )
 
         # hybrid: top up with BM25 hits not already in metadata results
@@ -1580,7 +1594,14 @@ class MemoryService:
         remaining = max(0, limit - len(metadata_results))
         if remaining == 0:
             return self._apply_sort_and_increment(
-                metadata_results, scope, sort_by, limit, include_related=include_related
+                metadata_results,
+                scope,
+                sort_by,
+                limit,
+                include_related=include_related,
+                query=query,
+                terminal_context=terminal_context,
+                scan_all=scan_all,
             )
 
         scope_id = (
@@ -1599,7 +1620,14 @@ class MemoryService:
             scan_all=scan_all,
         )
         return self._apply_sort_and_increment(
-            metadata_results + bm25_results, scope, sort_by, limit, include_related=include_related
+            metadata_results + bm25_results,
+            scope,
+            sort_by,
+            limit,
+            include_related=include_related,
+            query=query,
+            terminal_context=terminal_context,
+            scan_all=scan_all,
         )
 
     def _apply_sort_and_increment(
@@ -1609,6 +1637,9 @@ class MemoryService:
         sort_by: str,
         limit: int,
         include_related: bool = False,
+        query: Optional[str] = None,
+        terminal_context: Optional[dict] = None,
+        scan_all: bool = False,
     ) -> list:
         """Apply sort mode, slice, then best-effort access bump.
 
@@ -1622,6 +1653,7 @@ class MemoryService:
         """
         from cli_agent_orchestrator.services.memory_scoring import (
             SCOPE_PRECEDENCE,
+            normalise_bm25_scores,
             score_memory,
         )
 
@@ -1637,9 +1669,17 @@ class MemoryService:
                     )
                 )
             else:  # "score"
+                # Genuine 3-factor: score the WHOLE candidate set against the
+                # query in one corpus, normalise per-batch, and feed that into
+                # the lexical factor. Keyed by full identity so two same-slug
+                # rows in different scopes never collide. No query / no
+                # rank_bm25 → empty map → degrades to recency+usage.
+                norm_bm25 = normalise_bm25_scores(
+                    self._bm25_relevance(query, results, terminal_context, scope, scan_all)
+                )
                 composite = {
-                    m.key: score_memory(
-                        0.0,
+                    self._identity(m): score_memory(
+                        norm_bm25.get(self._identity(m), 0.0),
                         m.updated_at,
                         int(getattr(m, "access_count", 0) or 0),
                         now=now_utc,
@@ -1648,7 +1688,7 @@ class MemoryService:
                 }
                 results.sort(
                     key=lambda m: (
-                        -composite[m.key],
+                        -composite[self._identity(m)],
                         -m.updated_at.timestamp(),
                         -int(getattr(m, "access_count", 0) or 0),
                         m.key,
@@ -1682,6 +1722,20 @@ class MemoryService:
 
         return sliced
 
+    def _identity(self, m) -> tuple:
+        """Full memory identity ``(key, scope, scope_id)`` matching SQLite.
+
+        Matches the metadata table's uniqueness constraint. Used to key
+        usage enrich/increment and the composite-score dict so same-slug
+        memories in different scopes never collide.
+
+        Uses ``_effective_scope_id`` (not raw ``m.scope_id``) so PROJECT rows
+        — whose parsed Memory carries ``scope_id=None`` but whose SQLite row
+        stores the project hash — match correctly. Mirrors the recovery the
+        related-key expansion already performs.
+        """
+        return (m.key, m.scope, self._effective_scope_id(m))
+
     def _enrich_access_counts(self, memories: list) -> None:
         """Populate ``access_count`` on Memory objects from SQLite.
 
@@ -1698,11 +1752,12 @@ class MemoryService:
             keys = list({m.key for m in memories})
             with self._get_db_session() as db:
                 rows = db.query(MemoryMetadataModel).filter(MemoryMetadataModel.key.in_(keys)).all()
-                # Prefer an exact (key, scope) match; fall back to key-only.
-                by_key_scope = {(r.key, r.scope): int(r.access_count or 0) for r in rows}
-                by_key = {r.key: int(r.access_count or 0) for r in rows}
+                # Key the lookup by FULL identity (key, scope, scope_id) — the
+                # table's uniqueness constraint. A bare-key or (key, scope)
+                # match would read a same-slug row from another scope/project.
+                by_identity = {(r.key, r.scope, r.scope_id): int(r.access_count or 0) for r in rows}
             for m in memories:
-                m.access_count = by_key_scope.get((m.key, m.scope), by_key.get(m.key, 0))
+                m.access_count = by_identity.get(self._identity(m), 0)
         except Exception as e:  # noqa: BLE001 — best-effort enrichment
             logger.debug(f"access_count enrichment skipped: {e}")
 
@@ -1719,15 +1774,35 @@ class MemoryService:
         """
         if not memories:
             return
-        from sqlalchemy import func, or_, update
+        from sqlalchemy import and_, func, or_, update
 
         from cli_agent_orchestrator.clients.database import MemoryMetadataModel
 
-        keys = list({m.key for m in memories})
+        # Match on FULL identity (key, scope, scope_id), not bare key — the
+        # table's uniqueness constraint. A key-only UPDATE would bump every
+        # same-slug row across scopes/projects (cross-scope contamination).
+        # OR-of-ANDs is used over tuple_().in_() because SQLite tuple-IN
+        # compares scope_id with ``=``, which never matches the NULL that
+        # global rows carry; ``.is_(None)`` is required for those.
+        identities = {self._identity(m) for m in memories}
+        identity_clause = or_(
+            *[
+                and_(
+                    MemoryMetadataModel.key == k,
+                    MemoryMetadataModel.scope == s,
+                    (
+                        MemoryMetadataModel.scope_id == sid
+                        if sid is not None
+                        else MemoryMetadataModel.scope_id.is_(None)
+                    ),
+                )
+                for (k, s, sid) in identities
+            ]
+        )
         with self._get_db_session() as db:
             stmt = (
                 update(MemoryMetadataModel)
-                .where(MemoryMetadataModel.key.in_(keys))
+                .where(identity_clause)
                 .where(
                     or_(
                         MemoryMetadataModel.last_accessed_at.is_(None),
@@ -1835,6 +1910,100 @@ class MemoryService:
     def _bm25_tokenize(text: str) -> list[str]:
         """Lowercase, split on non-alphanumeric, drop empties."""
         return [t for t in re.split(r"[^a-zA-Z0-9]+", text.lower()) if t]
+
+    def _bm25_relevance(
+        self,
+        query: Optional[str],
+        memories: list,
+        terminal_context: Optional[dict],
+        scope: Optional[str],
+        scan_all: bool,
+    ) -> dict:
+        """Raw BM25 score per memory identity for the score-mode lexical factor.
+
+        Scores against ``query`` over the FULL wiki corpus in the search dirs
+        (the same corpus ``_bm25_search`` builds), not just the candidate
+        ``memories``. The full corpus is essential for correct IDF: a candidate-
+        only corpus collapses when every candidate contains the query term
+        (df == N → negative IDF → all-zero). Scores are returned only for the
+        identities present in ``memories``, keyed by ``(key, scope, scope_id)``,
+        so the relevance magnitude is comparable across rows regardless of
+        whether each arrived via metadata substring match or BM25 top-up.
+
+        Returns ``{}`` when not applicable (no query/candidates, ``rank_bm25``
+        absent, no corpus); callers treat a missing key as ``0.0`` so score
+        degrades to recency+usage. A document only scores when at least one
+        query token actually appears in it — BM25 IDF can go negative on tiny
+        corpora, so we cannot gate on score > 0 alone.
+        """
+        if not query or not memories:
+            return {}
+        try:
+            from rank_bm25 import BM25Okapi  # type: ignore[import-untyped]
+        except ImportError:
+            logger.debug("rank_bm25 not installed; score-mode BM25 factor disabled")
+            return {}
+
+        query_tokens = self._bm25_tokenize(query)
+        if not query_tokens:
+            return {}
+        query_token_set = set(query_tokens)
+
+        # Build the corpus over every wiki file in the search dirs so IDF is
+        # computed against the real document population, not just the matches.
+        # A candidate-only corpus collapses when every candidate contains the
+        # query term (df == N → negative IDF → all-zero).
+        search_dirs = self._get_search_dirs(scope, terminal_context, scan_all=scan_all)
+        wanted = {self._identity(m) for m in memories}
+        identities: list[Optional[tuple]] = []  # parallel to corpus_tokens
+        corpus_tokens: list[list[str]] = []
+        seen: set[Path] = set()
+        for project_dir in search_dirs:
+            wiki_root = project_dir / "wiki"
+            if not wiki_root.exists():
+                continue
+            for wiki_file in wiki_root.rglob("*.md"):
+                if wiki_file.name == "index.md" or wiki_file in seen:
+                    continue
+                seen.add(wiki_file)
+                rel_parts = wiki_file.relative_to(wiki_root).parts
+                if not rel_parts:
+                    continue
+                try:
+                    tokens = self._bm25_tokenize(wiki_file.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                file_scope = rel_parts[0]
+                file_scope_id: Optional[str] = None
+                if (
+                    file_scope in (MemoryScope.SESSION.value, MemoryScope.AGENT.value)
+                    and len(rel_parts) >= 3
+                ):
+                    file_scope_id = rel_parts[1]
+                elif file_scope == MemoryScope.PROJECT.value:
+                    # Project rows store the project-hash container as scope_id.
+                    file_scope_id = project_dir.name if project_dir.name != "global" else None
+                corpus_tokens.append(tokens)
+                # Only track identities we'll report; others stay in the corpus
+                # (for IDF) but map to None so they're skipped on readback.
+                identity = (wiki_file.stem, file_scope, file_scope_id)
+                identities.append(identity if identity in wanted else None)
+
+        if not corpus_tokens:
+            return {}
+
+        try:
+            scores = BM25Okapi(corpus_tokens).get_scores(query_tokens)
+        except Exception as e:  # noqa: BLE001 — best-effort lexical factor
+            logger.debug(f"score-mode BM25 scoring skipped: {e}")
+            return {}
+
+        out: dict = {}
+        for i, ident in enumerate(identities):
+            # Report a wanted row only when it is a real lexical match.
+            if ident is not None and query_token_set & set(corpus_tokens[i]):
+                out[ident] = float(scores[i])
+        return out
 
     def _bm25_search(
         self,

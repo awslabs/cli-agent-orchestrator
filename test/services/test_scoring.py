@@ -936,6 +936,213 @@ class TestNormaliseBm25Scores:
 
 
 # ===========================================================================
+# Identity correctness — usage metadata keyed by (key, scope, scope_id)
+# (regression for review finding: same-slug rows across scopes collided)
+# ===========================================================================
+
+
+def _row_opt(db_engine, key: str, scope: str) -> Optional[MemoryMetadataModel]:
+    Session = sessionmaker(bind=db_engine)
+    with Session() as db:
+        row = db.query(MemoryMetadataModel).filter_by(key=key, scope=scope).first()
+        if row is not None:
+            _ = row.access_count, row.last_accessed_at
+        return row
+
+
+class TestUsageIdentityIsolation:
+    """Recalling one memory must not mutate a same-slug memory in another
+    scope. The metadata identity is ``(key, scope, scope_id)``, not bare key.
+    """
+
+    def test_project_recall_does_not_increment_global_same_slug(self, svc, db_engine):
+        """The original repro: a global and a project row share the slug.
+        Recalling the project row must leave the global row's count at 0.
+        """
+        op = _ctx(caller_scope="global")
+        for scope in ("global", "project"):
+            _run(
+                svc.store(
+                    content=f"shared slug body in {scope}",
+                    scope=scope,
+                    memory_type="reference",
+                    key="shared-slug",
+                    tags="t",
+                    terminal_context=op,
+                )
+            )
+        assert int(_row(db_engine, "shared-slug", "global").access_count or 0) == 0
+        assert int(_row(db_engine, "shared-slug", "project").access_count or 0) == 0
+
+        # Recall ONLY the project scope.
+        results = _run(svc.recall(query="body", scope="project", terminal_context=op))
+        assert any(m.key == "shared-slug" and m.scope == "project" for m in results)
+
+        # Project row incremented; global row untouched.
+        assert int(_row(db_engine, "shared-slug", "project").access_count or 0) == 1
+        assert int(_row(db_engine, "shared-slug", "global").access_count or 0) == 0
+
+    def test_enrich_reads_per_scope_count_not_cross_scope(self, svc, db_engine):
+        """``_enrich_access_counts`` must populate each Memory with ITS OWN
+        scope's count, never a same-slug row's count from another scope.
+        """
+        op = _ctx(caller_scope="global")
+        for scope in ("global", "project"):
+            _run(
+                svc.store(
+                    content=f"enrich body {scope}",
+                    scope=scope,
+                    memory_type="reference",
+                    key="enrich-slug",
+                    tags="t",
+                    terminal_context=op,
+                )
+            )
+        # Distinct counts per scope, set directly in SQLite.
+        Session = sessionmaker(bind=db_engine)
+        with Session() as db:
+            g = db.query(MemoryMetadataModel).filter_by(key="enrich-slug", scope="global").first()
+            p = db.query(MemoryMetadataModel).filter_by(key="enrich-slug", scope="project").first()
+            g.access_count = 7
+            p.access_count = 99
+            db.commit()
+
+        # Recall without scope so both rows are candidates; enrich runs under
+        # any non-recency sort.
+        results = _run(svc.recall(query="body", terminal_context=op, sort_by="usage"))
+        by_scope = {m.scope: m for m in results if m.key == "enrich-slug"}
+        assert int(by_scope["global"].access_count) == 7
+        assert int(by_scope["project"].access_count) == 99
+
+    def test_global_null_scope_id_still_increments(self, svc, db_engine):
+        """The OR-of-ANDs identity predicate must match a global row whose
+        ``scope_id IS NULL`` (the tuple-IN/NULL edge). Recall increments it.
+        """
+        op = _ctx(caller_scope="global")
+        _run(
+            svc.store(
+                content="null scope id body",
+                scope="global",
+                memory_type="reference",
+                key="null-scope",
+                tags="t",
+                terminal_context=op,
+            )
+        )
+        row = _row(db_engine, "null-scope", "global")
+        assert row.scope_id is None
+        assert int(row.access_count or 0) == 0
+
+        _run(svc.recall(query="body", scope="global", terminal_context=op))
+        assert int(_row(db_engine, "null-scope", "global").access_count or 0) == 1
+
+
+# ===========================================================================
+# sort_by="score" feeds genuine BM25 relevance (not a hard-coded 0.0)
+# (regression for review finding: score mode was really recency + usage)
+# ===========================================================================
+
+
+class TestScoreUsesBm25:
+    def test_strong_bm25_outranks_recency_under_score(self, svc, db_engine):
+        """Haofei's repro, inverted: an OLDER article with strong query-term
+        density and a NEWER weak match. Under sort_by="score" the strong-BM25
+        doc must be able to outrank pure-recency ordering — proving BM25 is
+        now part of the composite (it was hard-coded to 0.0 before).
+        """
+        pytest.importorskip("rank_bm25")
+        op = _ctx(caller_scope="global")
+        # Strong match: query term repeated many times.
+        _run(
+            svc.store(
+                content="kafka kafka kafka kafka kafka streaming kafka kafka",
+                scope="global",
+                memory_type="reference",
+                key="strong-bm25",
+                tags="t",
+                terminal_context=op,
+            )
+        )
+        # Weak match: query term appears once, lots of filler.
+        _run(
+            svc.store(
+                content="kafka mentioned once among much unrelated filler prose here",
+                scope="global",
+                memory_type="reference",
+                key="weak-bm25",
+                tags="t",
+                terminal_context=op,
+            )
+        )
+        # Filler docs WITHOUT the query term, so "kafka" appears in a minority
+        # of the corpus and its IDF stays positive (df < N/2). Without these,
+        # a 2-doc corpus gives "kafka" df=N → negative IDF → BM25 collapses to
+        # zero and the test could not distinguish score from recency.
+        for i in range(4):
+            _run(
+                svc.store(
+                    content=f"unrelated filler document number {i} about gardening",
+                    scope="global",
+                    memory_type="reference",
+                    key=f"filler-{i}",
+                    tags="t",
+                    terminal_context=op,
+                )
+            )
+        base = datetime(2026, 5, 15, 12, 0, 0, tzinfo=timezone.utc)
+        # Make the STRONG match OLDER and the WEAK match NEWER, so pure
+        # recency would rank weak-bm25 first.
+        _stamp_updated_at(db_engine, "strong-bm25", "global", base - timedelta(days=20))
+        _stamp_updated_at(db_engine, "weak-bm25", "global", base - timedelta(days=1))
+
+        recency = [
+            m.key
+            for m in _run(
+                svc.recall(query="kafka", scope="global", terminal_context=op, sort_by="recency")
+            )
+            if m.key in ("strong-bm25", "weak-bm25")
+        ]
+        score = [
+            m.key
+            for m in _run(
+                svc.recall(query="kafka", scope="global", terminal_context=op, sort_by="score")
+            )
+            if m.key in ("strong-bm25", "weak-bm25")
+        ]
+        # Pure recency favours the newer weak match...
+        assert recency[0] == "weak-bm25"
+        # ...but score now incorporates BM25, lifting the strong match to top.
+        assert score[0] == "strong-bm25"
+
+    def test_score_without_query_equals_recency_usage(self, svc, db_engine):
+        """No query → no BM25 candidates → bm25_raw stays 0.0 for all, so
+        score mode is exactly recency+usage (no behavioural change there).
+        """
+        op = _ctx(caller_scope="global")
+        for k in ("no-q-a", "no-q-b"):
+            _run(
+                svc.store(
+                    content=f"body {k}",
+                    scope="global",
+                    memory_type="reference",
+                    key=k,
+                    tags="t",
+                    terminal_context=op,
+                )
+            )
+        base = datetime(2026, 5, 15, 12, 0, 0, tzinfo=timezone.utc)
+        _stamp_updated_at(db_engine, "no-q-a", "global", base - timedelta(days=1))
+        _stamp_updated_at(db_engine, "no-q-b", "global", base - timedelta(days=10))
+        score = [
+            m.key
+            for m in _run(svc.recall(scope="global", terminal_context=op, sort_by="score"))
+            if m.key in ("no-q-a", "no-q-b")
+        ]
+        # Newer first; usage equal; BM25 absent → recency decides.
+        assert score == ["no-q-a", "no-q-b"]
+
+
+# ===========================================================================
 # Perf budget — score_memory < 50µs per call
 # ===========================================================================
 
