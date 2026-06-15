@@ -1,6 +1,7 @@
 """Unit tests for the Cursor CLI provider."""
 
 import re
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -386,10 +387,7 @@ class TestGetStatusV2026Tui:
             "Add a follow-up\x1b[0m"
             "                                                    "
             "    \x1b[2mctrl+c to stop\x1b[0m"
-            " \x1b[49m\n"
-            + padding
-            + "\n" * 50
-            + "  \x1b[2mComposer 2.5 Fast\x1b[0m"
+            " \x1b[49m\n" + padding + "\n" * 50 + "  \x1b[2mComposer 2.5 Fast\x1b[0m"
             "                                             \x1b[35mRun Everything\x1b[39m\n"
         )
         # Sanity: the indicator is in the head, not in the tail.
@@ -449,9 +447,7 @@ class TestGetStatusV2026Tui:
         # Pattern sanity check: TUI_PROCESSING_INDICATOR_PATTERN
         # matches the v2026+ TUI hint, and does not spuriously
         # match idle / completed buffers.
-        assert re.search(
-            TUI_PROCESSING_INDICATOR_PATTERN, "ctrl+c to stop", re.IGNORECASE
-        )
+        assert re.search(TUI_PROCESSING_INDICATOR_PATTERN, "ctrl+c to stop", re.IGNORECASE)
         assert re.search(
             TUI_PROCESSING_INDICATOR_PATTERN,
             "  ctrl+c to stop  ",
@@ -459,9 +455,7 @@ class TestGetStatusV2026Tui:
         )
         # Negative: the indicator must NOT match an idle input
         # box (the v2026 placeholder alone, no "ctrl+c to stop").
-        assert not re.search(
-            TUI_PROCESSING_INDICATOR_PATTERN, "Add a follow-up", re.IGNORECASE
-        )
+        assert not re.search(TUI_PROCESSING_INDICATOR_PATTERN, "Add a follow-up", re.IGNORECASE)
         assert not re.search(
             TUI_PROCESSING_INDICATOR_PATTERN, "Plan, search, build anything", re.IGNORECASE
         )
@@ -472,9 +466,7 @@ class TestGetStatusV2026Tui:
         # TUI_STATUS_BAR_PATTERN must match the status bar
         # fragments we use as a "TUI is fully rendered" guard.
         assert re.search(TUI_PLACEHOLDER_PATTERN, "Plan, search, build anything")
-        assert re.search(
-            TUI_PLACEHOLDER_PATTERN, "  plan, search, build anything  ", re.IGNORECASE
-        )
+        assert re.search(TUI_PLACEHOLDER_PATTERN, "  plan, search, build anything  ", re.IGNORECASE)
         # v2026 swaps the placeholder to "Add a follow-up" after
         # the first turn — the detection must classify that as
         # idle too.
@@ -645,10 +637,11 @@ class TestBuildCommand:
         cmd = provider._build_cursor_command()
         # v2026+ rejects --trust in interactive REPL mode (it is only
         # valid with --print/headless). v2026 also dropped the
-        # --agent flag, so the launch command is now "agent --force"
-        # when no profile / model / system-prompt is configured.
-        # See issues #299 and #300.
-        assert cmd == "agent --force"
+        # --agent flag, so the launch command is now "cursor-agent --force"
+        # (or "agent --force" when only the primary name is on PATH;
+        # we prefer the unambiguous cursor-agent alias first — see
+        # issues #299 and #300).
+        assert cmd == "cursor-agent --force"
 
     @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
     def test_constructor_model_forwarded(self, mock_load):
@@ -699,6 +692,7 @@ class TestBuildCommand:
         from cli_agent_orchestrator.providers.cursor_cli import (
             CursorCliProvider,
         )
+
         profile = MagicMock()
         profile.model = None
         profile.system_prompt = "hi"
@@ -718,6 +712,7 @@ class TestBuildCommand:
         # map carries CAO_TERMINAL_ID.
         import json
         from pathlib import Path
+
         profile = MagicMock()
         profile.model = None
         profile.system_prompt = None
@@ -745,6 +740,7 @@ class TestBuildCommand:
         # explicit preset (matches the prior --mcp behaviour).
         import json
         from pathlib import Path
+
         profile = MagicMock()
         profile.model = None
         profile.system_prompt = None
@@ -762,10 +758,7 @@ class TestBuildCommand:
         assert m is not None
         plugin_dir = Path(m.group(1))
         manifest = json.loads((plugin_dir / "plugin.json").read_text(encoding="utf-8"))
-        assert (
-            manifest["mcpServers"]["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"]
-            == "preset"
-        )
+        assert manifest["mcpServers"]["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"] == "preset"
 
     @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
     def test_tool_restrictions_skip_system_prompt(self, mock_load):
@@ -824,21 +817,145 @@ class TestBuildCommandBinaryResolution:
     """Copilot review #3411781886: ``_build_cursor_command`` must
     fall back to the legacy ``cursor-agent`` binary when the
     primary ``agent`` binary is missing on the host.
+
+    The provider prefers the unambiguous ``cursor-agent`` alias
+    first because ``agent`` is a common binary name shared with
+    unrelated tools (Linux ``gpg-agent``, the OS X
+    ``com.apple.security.agent``-style launch daemons, various
+    language server entry points, etc.). When the primary
+    ``agent`` name is selected the provider also probes
+    ``agent --version`` to confirm the resolved binary is the
+    Cursor CLI before launching (see
+    :meth:`TestBuildCommandBinaryResolution.test_agent_validation`
+    and the related tests).
     """
 
-    def test_prefers_agent_when_both_available(self):
-        # The autouse fixture already returns '/usr/bin/agent' for
-        # shutil.which. Confirm the resulting command starts with
-        # the primary name.
-        with patch("cli_agent_orchestrator.providers.cursor_cli.shutil.which") as mock_which:
-            mock_which.side_effect = lambda name: ("/usr/bin/agent" if name == "agent" else None)
+    def test_prefers_cursor_agent_when_both_available(self):
+        # ``cursor-agent`` is unambiguous (only the Cursor CLI
+        # ships it) so the provider picks it even when ``agent``
+        # is also on PATH.
+        def fake_which(name):
+            return {
+                "agent": "/usr/bin/agent",
+                "cursor-agent": "/usr/local/bin/cursor-agent",
+            }.get(name)
+
+        with patch(
+            "cli_agent_orchestrator.providers.cursor_cli.shutil.which",
+            side_effect=fake_which,
+        ):
             with patch(
                 "cli_agent_orchestrator.providers.cursor_cli.load_agent_profile",
                 side_effect=FileNotFoundError("no profile"),
             ):
                 provider = make_provider()
                 cmd = provider._build_cursor_command()
+        assert cmd.startswith("cursor-agent ")
+
+    def test_agent_validation_passes_for_cursor_binary(self):
+        # When only ``agent`` is on PATH, the provider probes
+        # ``agent --version`` and accepts a banner that matches
+        # ``agent <4-digit year>.<...>`` (Cursor's semver
+        # convention). The version probe runs via subprocess so
+        # we mock it; the test asserts the launch proceeds.
+        probe_result = MagicMock()
+        probe_result.stdout = "agent 2026.06.15-03-48-54-da23e37\n"
+        probe_result.stderr = ""
+
+        def fake_which(name):
+            return "/usr/bin/agent" if name == "agent" else None
+
+        with patch(
+            "cli_agent_orchestrator.providers.cursor_cli.shutil.which",
+            side_effect=fake_which,
+        ):
+            with patch(
+                "cli_agent_orchestrator.providers.cursor_cli.subprocess.run",
+                return_value=probe_result,
+            ) as mock_run:
+                with patch(
+                    "cli_agent_orchestrator.providers.cursor_cli.load_agent_profile",
+                    side_effect=FileNotFoundError("no profile"),
+                ):
+                    provider = make_provider()
+                    cmd = provider._build_cursor_command()
         assert cmd.startswith("agent ")
+        # The probe must have been called.
+        assert mock_run.call_count == 1
+        assert mock_run.call_args.args[0] == ["agent", "--version"]
+
+    def test_agent_validation_rejects_non_cursor_binary(self):
+        # The probe returns a banner that does not match the
+        # Cursor semver convention (e.g. the resolved ``agent``
+        # is some other tool). The provider must raise
+        # ProviderError rather than launching a non-Cursor
+        # binary with Cursor-only flags and producing a 500.
+        probe_result = MagicMock()
+        probe_result.stdout = "agent (gpg-agent) 2.4.0\n"
+        probe_result.stderr = ""
+
+        def fake_which(name):
+            return "/usr/bin/agent" if name == "agent" else None
+
+        with patch(
+            "cli_agent_orchestrator.providers.cursor_cli.shutil.which",
+            side_effect=fake_which,
+        ):
+            with patch(
+                "cli_agent_orchestrator.providers.cursor_cli.subprocess.run",
+                return_value=probe_result,
+            ):
+                with patch(
+                    "cli_agent_orchestrator.providers.cursor_cli.load_agent_profile",
+                    side_effect=FileNotFoundError("no profile"),
+                ):
+                    provider = make_provider()
+                    with pytest.raises(ProviderError, match="does not identify as Cursor CLI"):
+                        provider._build_cursor_command()
+
+    def test_agent_validation_handles_probe_timeout(self):
+        # If the resolved ``agent`` binary hangs the probe
+        # (subprocess.TimeoutExpired), the provider must surface
+        # a clear error rather than blocking ``_build_cursor_command``
+        # for the operator.
+        def fake_which(name):
+            return "/usr/bin/agent" if name == "agent" else None
+
+        with patch(
+            "cli_agent_orchestrator.providers.cursor_cli.shutil.which",
+            side_effect=fake_which,
+        ):
+            with patch(
+                "cli_agent_orchestrator.providers.cursor_cli.subprocess.run",
+                side_effect=subprocess.TimeoutExpired(cmd=["agent", "--version"], timeout=3.0),
+            ):
+                with patch(
+                    "cli_agent_orchestrator.providers.cursor_cli.load_agent_profile",
+                    side_effect=FileNotFoundError("no profile"),
+                ):
+                    provider = make_provider()
+                    with pytest.raises(ProviderError, match="Could not probe"):
+                        provider._build_cursor_command()
+
+    def test_cursor_agent_skips_validation(self):
+        # ``cursor-agent`` is unambiguous; no version probe is
+        # needed. The provider should pick it without ever
+        # touching subprocess.
+        with patch(
+            "cli_agent_orchestrator.providers.cursor_cli.shutil.which",
+            return_value="/usr/local/bin/cursor-agent",
+        ):
+            with patch(
+                "cli_agent_orchestrator.providers.cursor_cli.subprocess.run",
+            ) as mock_run:
+                with patch(
+                    "cli_agent_orchestrator.providers.cursor_cli.load_agent_profile",
+                    side_effect=FileNotFoundError("no profile"),
+                ):
+                    provider = make_provider()
+                    cmd = provider._build_cursor_command()
+        assert cmd.startswith("cursor-agent ")
+        mock_run.assert_not_called()
 
     def test_falls_back_to_cursor_agent_when_agent_missing(self):
         # When only the legacy alias is on PATH, the command must
@@ -894,11 +1011,11 @@ class TestInitialize:
         assert provider._initialized is True
         mock_backend.return_value.send_keys.assert_called_once()
         sent = mock_backend.return_value.send_keys.call_args.args[2]
-        assert sent.startswith("agent ")
-        assert "--force" in sent
         # v2026+ rejects --trust in interactive REPL mode. See
-        # issue #299. The launch command is "agent --force" when
-        # no profile / model / system-prompt is configured.
+        # issue #299. The launch command starts with the resolved
+        # binary (cursor-agent preferred, agent fallback).
+        assert sent.startswith("cursor-agent ") or sent.startswith("agent ")
+        assert "--force" in sent
         assert "--trust" not in sent
 
     @pytest.mark.asyncio
@@ -926,7 +1043,9 @@ class TestInitialize:
     @patch("cli_agent_orchestrator.providers.cursor_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.cursor_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.cursor_cli.get_backend")
-    async def test_initialize_does_not_send_system_prompt_flag(self, mock_backend, mock_shell, mock_wait):
+    async def test_initialize_does_not_send_system_prompt_flag(
+        self, mock_backend, mock_shell, mock_wait
+    ):
         # v2026.06.15 has a confirmed bug where any request that
         # carries --system-prompt is rejected by the backend, so
         # the provider deliberately omits the flag.
@@ -1009,6 +1128,34 @@ class TestMiscInterface:
         provider._initialized = True
         provider.cleanup()
         assert provider._initialized is False
+
+    def test_cleanup_removes_tracked_tmp_paths(self, tmp_path, monkeypatch):
+        # Copilot review #3412413702 (P1): cleanup() must delete
+        # the per-session temp files the provider wrote (system
+        # prompt + plugin dir). We stub _cao_tmp_dir to redirect
+        # to a temp dir and assert the files are removed on
+        # cleanup().
+        monkeypatch.setenv("CAO_TMP_DIR", str(tmp_path))
+        provider = make_provider()
+        # Materialise a fake system-prompt file and a fake plugin
+        # dir as if a launch had run.
+        prompt_path = tmp_path / f"{provider.terminal_id}-system-prompt.md"
+        prompt_path.write_text("dummy")
+        plugin_dir = tmp_path / f"{provider.terminal_id}-cursor-plugins"
+        plugin_dir.mkdir()
+        (plugin_dir / "plugin.json").write_text("{}")
+        provider._tmp_paths = [prompt_path, plugin_dir]
+        # Sanity: the files are there before cleanup.
+        assert prompt_path.exists()
+        assert plugin_dir.is_dir()
+        provider.cleanup()
+        # And gone after.
+        assert not prompt_path.exists()
+        assert not plugin_dir.exists()
+        # The registry is also drained so a second cleanup is a
+        # no-op (idempotent).
+        assert provider._tmp_paths == []
+        provider.cleanup()  # should not raise
 
     def test_paste_enter_count_is_one(self):
         assert make_provider().paste_enter_count == 1

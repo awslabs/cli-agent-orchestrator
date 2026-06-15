@@ -50,6 +50,7 @@ from cli_agent_orchestrator.constants import (
     SERVER_HOST,
     SERVER_PORT,
     SERVER_VERSION,
+    TRUSTED_FORWARDER_IPS,
     WS_ALLOWED_CLIENTS,
     add_local_cors_origins,
 )
@@ -1580,12 +1581,25 @@ def main():
     # already-installed CORSMiddleware reads the list by reference, so
     # mutating it before uvicorn starts is sufficient. See issue #151.
     add_local_cors_origins(host, port)
-    # --proxy-headers: trust X-Forwarded-Proto / X-Forwarded-For from an
-    # upstream reverse proxy (Codespaces / devcontainers / nginx in
+    # --proxy-headers: trust X-Forwarded-Proto / X-Forwarded-For from
+    # an upstream reverse proxy (Codespaces / devcontainers / nginx in
     # front of cao-server). Required for the WebSocket terminal viewer
     # over an HTTPS tunnel — without it uvicorn sees the raw HTTP
     # request and the browser's WSS upgrade fails. See issue #149.
-    uvicorn.run(app, host=host, port=port, proxy_headers=True, forwarded_allow_ips="*")
+    #
+    # The forwarded-allow-ips list defaults to loopback (see
+    # constants.TRUSTED_FORWARDER_IPS); operators behind a reverse
+    # proxy opt into a wider range with CAO_FORWARDED_ALLOW_IPS. A
+    # literal ``*`` is honoured and disables the check (matches the
+    # existing CAO_WS_ALLOWED_CLIENTS="*" semantics).
+    forwarded_ips = "*" if "*" in TRUSTED_FORWARDER_IPS else ",".join(TRUSTED_FORWARDER_IPS)
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        proxy_headers=True,
+        forwarded_allow_ips=forwarded_ips,
+    )
 
 
 if __name__ == "__main__":

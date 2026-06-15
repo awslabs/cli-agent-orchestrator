@@ -2,23 +2,58 @@
 
 This module provides the CursorCliProvider class for integrating with the
 Cursor CLI (https://cursor.com/cli), Anysphere's terminal-native AI coding
-assistant. The CLI is invoked via the ``agent`` binary (Cursor's primary
-command per https://cursor.com/docs/cli/overview; ``cursor-agent`` is the
-historical/backward-compatible alias still shipped on most installations)
-and exposes an interactive REPL with the following features exercised by
-this provider:
+assistant. The CLI is invoked via the ``cursor-agent`` binary (preferred;
+unambiguous name shared only with the Cursor CLI) and falls back to the
+primary ``agent`` name (Cursor's documented top-level command per
+https://cursor.com/docs/cli/overview) when the legacy alias is missing.
+When the primary ``agent`` name is selected the provider runs a
+``agent --version`` probe to confirm the resolved binary is the Cursor
+CLI (a number of unrelated tools also install an ``agent`` binary).
 
-- System prompt injection via a ``--system-prompt`` flag (newlines escaped
-  for safe tmux transport, matching the Claude Code pattern).
-- Agent profile selection via ``--agent <name>`` when the CAO agent
-  profile maps to a Cursor agent.
-- Model override via ``--model <id>`` (e.g. ``gpt-5``, ``sonnet-4``).
-- Hard tool approval bypass via ``--force`` (a.k.a. ``--yolo``) for
-  headless launches.
-- MCP server configuration via ``--mcp <json>`` (Cursor 2025+ format).
-- Trust prompt bypass via ``--trust``.
-- Skill catalog injection appended to the system prompt via the shared
-  ``_apply_skill_prompt`` helper from :class:`BaseProvider`.
+Cursor CLI v2026.06.15 (the version ``curl https://cursor.com/install | bash``
+ships today) has dropped or moved several flags the provider previously
+relied on. The v2026 launch command the provider builds:
+
+- ``--force`` auto-approves tool calls so the agent does not block on
+  per-tool approval prompts during orchestration.
+- ``--model`` selects a specific model (e.g. ``gpt-5``, ``sonnet-4``,
+  ``composer-2.5``).
+- ``--plugin-dir <path>`` injects MCP server configuration. v2026
+  removed the ``--mcp <json>`` flag in favour of ``--plugin-dir``
+  pointing at a directory holding Cursor plugin manifests. The
+  provider synthesises that directory from the agent profile's
+  ``mcpServers`` map at launch time.
+- ``--approve-mcps`` pre-approves MCP servers declared via
+  ``--plugin-dir`` so the REPL does not block on a per-server
+  approval dialog.
+
+Flags deliberately omitted for v2026.06.15:
+
+- ``--system-prompt <file>`` is omitted because v2026.06.15's backend
+  rejects every request that carries a ``--system-prompt <file>``
+  payload with ``[invalid_argument] unknown option '--system-prompt'``
+  regardless of the file's contents (a 3-character file reproduces
+  the bug). Multi-turn inbox still works because the CAO role context
+  reaches the agent via the ``cao-mcp-server`` MCP tool's handoff /
+  assign payloads. The preserved ``_write_system_prompt_file`` helper
+  is ready to re-enable this path when Cursor ships a fixed client.
+- ``--agent <name>`` is omitted because v2026 removed the flag
+  (issue #300).
+- ``--trust`` is omitted because v2026 rejects it in interactive
+  REPL mode ("only works with --print/headless mode").
+- ``--mcp <json>`` is replaced by ``--plugin-dir`` as noted above.
+
+Skill catalog injection: the provider forwards the skill catalog via
+the shared ``_apply_skill_prompt`` helper from :class:`BaseProvider`
+to the (currently disabled) system prompt path. When ``--system-prompt``
+is re-enabled, the catalog will be appended at launch.
+
+Status detection is pattern-based. v2026+ uses a full Ink/TUI; the
+provider detects the "ctrl+c to stop" hint Cursor renders on the
+input-box line every frame the agent is working on a turn. Older
+text-mode builds are still classified by the legacy ``❯`` prompt
+and ``─────`` separator regex suite (mirrors the Claude Code
+provider's structural fix for the stale-spinner bug).
 
 Status detection is pattern-based. Cursor CLI uses an Ink-style interactive
 prompt (``❯``) for IDLE / COMPLETED, spinner text with ellipsis for
@@ -31,6 +66,7 @@ import logging
 import re
 import shlex
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -190,6 +226,14 @@ class CursorCliProvider(BaseProvider):
         self._initialized = False
         self._agent_profile = agent_profile
         self._model = model
+        # Temp paths the provider has created under the CAO tmp dir.
+        # ``cleanup()`` deletes every entry in this list so the
+        # per-session files (system prompt + plugin dir) do not
+        # accumulate on disk. Initialised lazily on the first
+        # ``_build_cursor_command`` so providers that never get
+        # launched (e.g. because the binary is missing) leave the
+        # tmp dir untouched.
+        self._tmp_paths: list[Path] = []
 
     @property
     def paste_enter_count(self) -> int:
@@ -244,21 +288,76 @@ class CursorCliProvider(BaseProvider):
             except Exception as exc:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {exc}")
 
-        # Resolve the binary: prefer Cursor's documented primary
-        # command ``agent``; fall back to the legacy ``cursor-agent``
-        # alias when only that one is installed (e.g. older macOS
-        # installs pinned to the historical name). The e2e skip
-        # fixture in test/e2e/conftest.py::require_cursor accepts
-        # either name, so the launch should behave consistently.
-        if shutil.which("agent"):
-            binary = "agent"
-        elif shutil.which("cursor-agent"):
-            binary = "cursor-agent"
+        # Resolve the binary. ``agent`` is a common name and a
+        # number of unrelated tools (e.g. the Linux ``gpg-agent``)
+        # install an ``agent`` binary on $PATH; we cannot tell
+        # whether a given ``agent`` is Cursor without inspecting it.
+        # We prefer the unambiguous ``cursor-agent`` first (which
+        # only the Cursor CLI ships) and fall back to the documented
+        # primary ``agent`` name when only that is installed. When
+        # we do pick the ``agent`` path, we run a quick
+        # ``agent --version`` probe to confirm the resolved binary
+        # identifies as Cursor — if it does not, we raise
+        # ``ProviderError`` so the operator can either uninstall
+        # the conflicting tool or symlink the Cursor binary to
+        # ``cursor-agent``. The e2e skip fixture in
+        # ``test/e2e/conftest.py::require_cursor`` accepts either
+        # name, so the launch behaves consistently when the probe
+        # passes.
+        cursor_agent = shutil.which("cursor-agent")
+        generic_agent = shutil.which("agent")
+        binary, path = None, None
+        if cursor_agent:
+            binary, path = "cursor-agent", cursor_agent
+        elif generic_agent:
+            binary, path = "agent", generic_agent
         else:
             raise ProviderError(
                 "Cursor CLI not found: neither 'agent' nor 'cursor-agent' is on $PATH. "
                 "Install from https://cursor.com/cli"
             )
+
+        # The ``agent`` binary name is shared with a number of
+        # unrelated tools. Validate it really is the Cursor CLI
+        # before launching — saves the operator a confusing 500
+        # from the spawned tmux pane when the wrong tool rejects
+        # the Cursor-only flags. We do the probe via
+        # ``subprocess.run`` with a short timeout so a slow or
+        # hung binary does not block ``_build_cursor_command``.
+        if binary == "agent":
+            try:
+                probe = subprocess.run(  # noqa: S603 — binary is on $PATH
+                    [binary, "--version"],
+                    capture_output=True,
+                    text=True,
+                    timeout=3.0,
+                )
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+                raise ProviderError(
+                    f"Could not probe '{binary}' at {path}: {exc}. "
+                    "If this is a non-Cursor tool installed under the same name, "
+                    "either uninstall it or symlink the Cursor binary to 'cursor-agent'."
+                ) from exc
+            # Cursor's ``agent --version`` prints
+            # ``agent <semver>`` (e.g. ``agent 2026.06.15-...``).
+            # The version string is the only reliable signal that
+            # we can match without hard-coding the binary's
+            # internal name; we accept the version line as
+            # evidence the resolved binary really is the Cursor
+            # CLI. The probe is intentionally lenient: any line
+            # that contains the word ``agent`` and a 4-digit year
+            # (the semver convention Cursor ships) is treated as a
+            # match. If the binary returns a different banner the
+            # operator sees a clear error rather than a 500 from
+            # the launched agent.
+            banner = (probe.stdout or probe.stderr or "").strip()
+            if not re.search(r"agent\s+\d{4}\.\d+\.\d+", banner):
+                raise ProviderError(
+                    f"'{binary}' at {path} does not identify as Cursor CLI "
+                    f"(version probe returned: {banner!r}). "
+                    "If this is a non-Cursor tool installed under the same name, "
+                    "either uninstall it or symlink the Cursor binary to 'cursor-agent'."
+                )
 
         command_parts = [binary]
 
@@ -281,44 +380,30 @@ class CursorCliProvider(BaseProvider):
         if model:
             command_parts.extend(["--model", model])
 
-        # System prompt injection. v2026 takes a *file path*, not
-        # inline text — but the v2026.06.15 client has a confirmed
-        # bug where the resulting API request is rejected by the
-        # backend with ``[invalid_argument] unknown option
-        # '--system-prompt'`` regardless of the file's contents (a
-        # 3-character file reproduces it). The bug is reproducible
-        # via both ``--print`` and the interactive TUI; the full
-        # Cursor log shows the request to
-        # ``https://agentn.global.api5.cursor.sh`` failing on
-        # every retry with the same error code, with the server
-        # returning ``ConnectError: InvalidArgument`` mid-stream.
+        # System prompt injection is intentionally omitted for
+        # Cursor CLI v2026.06.15 — the backend (https://agentn.global.api5.cursor.sh)
+        # rejects every request that carries a ``--system-prompt <file>``
+        # payload with ``[invalid_argument] unknown option
+        # '--system-prompt'`` regardless of the file's contents. The bug
+        # is reproducible via both ``--print`` and the interactive
+        # TUI; the full Cursor log at /tmp/cursor-agent-logs/session-*.log
+        # shows the request failing on every retry. See
+        # https://github.com/awslabs/cli-agent-orchestrator/issues/299
+        # for the upstream investigation.
         #
-        # CAO's stance for v2026.06.15: drop ``--system-prompt``
-        # entirely. Multi-turn inbox still works because the CAO
-        # role context reaches the agent via the
-        # ``cao-mcp-server`` MCP tool, not the system prompt —
-        # handoff / assign payloads include the role + system
-        # prompt on the wire. The agent profile body is therefore
-        # not pre-loaded, but the agent still has the right
-        # capabilities and the right inbox tools.
+        # CAO's stance: drop --system-prompt entirely. Multi-turn
+        # inbox still works because the CAO role context reaches the
+        # agent via the ``cao-mcp-server`` MCP tool's handoff /
+        # assign payloads (on the wire, not via Cursor's launch
+        # arguments). The agent still has the right capabilities and
+        # the right inbox tools; only the role body is not pre-loaded
+        # as a system prompt.
         #
-        # When Cursor ships a fixed v2026.x client the launch
-        # command should add ``--system-prompt <file>`` back; the
-        # file-writing helper is preserved below for that path.
-        if False and profile is not None:  # pragma: no cover — disabled for v2026.06.15
-            system_prompt = profile.system_prompt or ""
-            system_prompt = self._apply_skill_prompt(system_prompt)
-
-            if self._allowed_tools and "*" not in self._allowed_tools:
-                from cli_agent_orchestrator.constants import SECURITY_PROMPT
-
-                tools_list = ", ".join(self._allowed_tools)
-                tool_constraint = f"\nYou only have access to these tools: {tools_list}\n"
-                system_prompt = SECURITY_PROMPT + tool_constraint + system_prompt
-
-            if system_prompt:
-                prompt_path = self._write_system_prompt_file(system_prompt)
-                command_parts.extend(["--system-prompt", prompt_path])
+        # When Cursor ships a fixed v2026.x client, re-introduce the
+        # system-prompt injection here using the preserved
+        # ``_write_system_prompt_file`` helper and update the
+        # ``extract_last_message_from_script`` docstring to point at
+        # the new behaviour.
 
         # MCP server injection via --plugin-dir. v2026 removed
         # ``--mcp <json>``; the replacement is ``--plugin-dir
@@ -349,11 +434,11 @@ class CursorCliProvider(BaseProvider):
         file: <prompt text>``.
 
         We write the prompt to a file under the CAO tmp dir keyed by
-        the terminal id, return the absolute path, and let the
-        ``cleanup`` path delete the file when the session is torn
-        down. The file is created lazily on the first launch and
-        overwritten on subsequent launches (e.g. after a
-        ``reset_buffer`` for a fallback mode).
+        the terminal id, return the absolute path, and register the
+        file in ``self._tmp_paths`` so ``cleanup()`` deletes it when
+        the session is torn down. The file is created lazily on the
+        first launch and overwritten on subsequent launches (e.g.
+        after a ``reset_buffer`` for a fallback mode).
 
         Args:
             system_prompt: The fully-resolved system prompt text
@@ -364,14 +449,10 @@ class CursorCliProvider(BaseProvider):
             ``--system-prompt <path>``.
         """
         import os
-        import tempfile
 
-        cao_tmp = Path(
-            os.environ.get("CAO_TMP_DIR", str(Path.home() / ".aws" / "cli-agent-orchestrator" / "tmp"))
-        )
-        cao_tmp.mkdir(parents=True, exist_ok=True)
-        prompt_path = cao_tmp / f"{self.terminal_id}-system-prompt.md"
+        prompt_path = self._cao_tmp_dir() / f"{self.terminal_id}-system-prompt.md"
         prompt_path.write_text(system_prompt, encoding="utf-8")
+        self._register_tmp_path(prompt_path)
         return str(prompt_path)
 
     def _write_plugin_dir(self, mcp_servers) -> str:
@@ -385,8 +466,9 @@ class CursorCliProvider(BaseProvider):
         etc.) start transparently under the new flag.
 
         The synthesised directory lives under the CAO tmp dir keyed
-        by the terminal id and is reused across launches of the
-        same session; ``cleanup`` deletes it when the session ends.
+        by the terminal id and is registered in ``self._tmp_paths``
+        so ``cleanup()`` deletes it (and the per-session manifest
+        inside it) when the session ends.
 
         Args:
             mcp_servers: The agent profile's ``mcpServers`` map. Keys
@@ -397,13 +479,7 @@ class CursorCliProvider(BaseProvider):
             Absolute path to the plugin directory. Pass this to
             ``--plugin-dir <path>``.
         """
-        import os
-
-        cao_tmp = Path(
-            os.environ.get("CAO_TMP_DIR", str(Path.home() / ".aws" / "cli-agent-orchestrator" / "tmp"))
-        )
-        cao_tmp.mkdir(parents=True, exist_ok=True)
-        plugin_dir = cao_tmp / f"{self.terminal_id}-cursor-plugins"
+        plugin_dir = self._cao_tmp_dir() / f"{self.terminal_id}-cursor-plugins"
         plugin_dir.mkdir(parents=True, exist_ok=True)
 
         # CAO_TERMINAL_ID is forwarded into every server's env so
@@ -432,10 +508,40 @@ class CursorCliProvider(BaseProvider):
         # this layout can be tweaked without touching the rest of
         # the provider.
         manifest = {"mcpServers": servers}
-        (plugin_dir / "plugin.json").write_text(
-            json.dumps(manifest, indent=2), encoding="utf-8"
-        )
+        (plugin_dir / "plugin.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        self._register_tmp_path(plugin_dir)
         return str(plugin_dir)
+
+    def _cao_tmp_dir(self) -> Path:
+        """Resolve the CAO tmp directory and create it on demand.
+
+        Honours the ``CAO_TMP_DIR`` env var so tests can redirect
+        temp output to ``/tmp/cao_test`` instead of polluting the
+        user's ``~/.aws/cli-agent-orchestrator/tmp``. Defaults to
+        ``~/.aws/cli-agent-orchestrator/tmp`` for production.
+        """
+        import os
+
+        cao_tmp = Path(
+            os.environ.get(
+                "CAO_TMP_DIR", str(Path.home() / ".aws" / "cli-agent-orchestrator" / "tmp")
+            )
+        )
+        cao_tmp.mkdir(parents=True, exist_ok=True)
+        return cao_tmp
+
+    def _register_tmp_path(self, path: Path) -> None:
+        """Track a per-session temp path so ``cleanup()`` can remove it.
+
+        A single path can be a file (the system prompt) or a
+        directory (the plugin dir). If the path is already in the
+        registry we skip the add; if a previous run wrote a stale
+        file at the same path we let the new write overwrite it but
+        keep the registry entry for the new one.
+        """
+        if path in self._tmp_paths:
+            return
+        self._tmp_paths.append(path)
 
     async def initialize(self) -> bool:
         """Initialize the Cursor CLI provider by starting ``agent``.
@@ -552,12 +658,9 @@ class CursorCliProvider(BaseProvider):
         TUI_TAIL_WINDOW = 1024
         tail = clean[-TUI_TAIL_WINDOW:]
         processing_indicator_in_tail = (
-            re.search(TUI_PROCESSING_INDICATOR_PATTERN, tail, re.IGNORECASE)
-            is not None
+            re.search(TUI_PROCESSING_INDICATOR_PATTERN, tail, re.IGNORECASE) is not None
         )
-        placeholder_in_tail = (
-            re.search(TUI_PLACEHOLDER_PATTERN, tail, re.IGNORECASE) is not None
-        )
+        placeholder_in_tail = re.search(TUI_PLACEHOLDER_PATTERN, tail, re.IGNORECASE) is not None
 
         if processing_indicator_in_tail:
             # Primary v2026+ PROCESSING signal: the "ctrl+c to stop"
@@ -657,166 +760,6 @@ class CursorCliProvider(BaseProvider):
         # processing. We require the status bar to be present
         # too so a half-initialised TUI does not false-positive.
         if not processing_indicator_in_tail and re.search(TUI_STATUS_BAR_PATTERN, clean):
-            return TerminalStatus.COMPLETED
-
-        return TerminalStatus.UNKNOWN
-
-        # Strip the RAW pipe-pane escapes (cursor positioning, in-place
-        # redraws), not just SGR colour codes — otherwise cursor
-        # sequences survive and the structural checks below misfire on
-        # the raw stream.
-        clean = strip_terminal_escapes(output)
-
-        # =================================================================
-        # v2026+ TUI detection.
-        # =================================================================
-        # Cursor CLI v2026.x runs a full Ink/TUI in interactive mode.
-        # The `❯` prompt and the `─────` separator that older builds
-        # emitted as plain text are now rendered as TUI widgets and
-        # never reach the pipe-pane buffer (issue #299). The only
-        # stable, plain-text signal the v2026 TUI emits is the
-        # input-box placeholder — "Plan, search, build anything" on
-        # a fresh launch, "Add a follow-up" after the first turn —
-        # which Cursor REPLACES with the user's text on submit and
-        # only redraws once the response is fully delivered. We use
-        # the *absence* of the placeholder in the tail of the buffer
-        # as a positive PROCESSING signal — the user has submitted
-        # and the agent is working (or has worked and the response
-        # is rendering). Its *presence* means the input box is empty
-        # and the agent is ready for the next turn.
-        #
-        # We only consult the tail of the buffer (last ~1KB) so a
-        # long response that scrolls the placeholder out of the
-        # rolling 8KB window does not flip us back to IDLE during
-        # processing. The 1KB window is well below the 8KB buffer
-        # cap, so the placeholder is still present in the tail
-        # whenever the input box is actually empty.
-        #
-        # This check runs BEFORE the regex-based fallback so the
-        # placeholder signal wins on v2026+ builds. Older text-mode
-        # builds never emit the placeholder string, so the regex
-        # fallback below is what classifies them — and the
-        # fixture-recorded unit tests keep working.
-        TUI_TAIL_WINDOW = 1024
-        tail = clean[-TUI_TAIL_WINDOW:]
-        placeholder_in_tail = re.search(TUI_PLACEHOLDER_PATTERN, tail, re.IGNORECASE) is not None
-        if not placeholder_in_tail:
-            # Placeholder is not visible in the input box. Either
-            # the user has typed something and not submitted, or
-            # the agent is processing, or a response is being
-            # rendered. We can't distinguish "user typed but
-            # hasn't pressed Enter" from "agent working" purely
-            # from the buffer in v2026 — but for CAO's purposes
-            # both should block inbox delivery and count as
-            # "not idle". StatusMonitor's stickiness gate will
-            # keep us in PROCESSING until the placeholder
-            # reappears (i.e. the agent has finished a turn and
-            # the input box is empty again).
-            #
-            # We still let the WAITING_USER_ANSWER / trust /
-            # permission checks below run first — those are
-            # interactive prompts that take precedence over a
-            # plain processing state.
-            tui_active = True
-        else:
-            tui_active = False
-
-        # PRIMARY PROCESSING check: walk backwards from the *last*
-        # separator. If a spinner line appears before another
-        # separator, the agent is actively processing. If we hit
-        # another separator first, the spinner is from a completed
-        # task and should be ignored. Mirrors the Claude Code
-        # provider's structural fix for the stale-spinner bug.
-        # The separator regex tolerates any CSI sequence interleaved
-        # *between* the box-drawing characters — Cursor re-renders
-        # the separator with new colour escapes on every prompt, and
-        # we must not miss it. Intermediate bytes are restricted to
-        # the ECMA-48 param range (0x30-0x3F) so a stray ``ESC [``
-        # is not consumed. The pattern is anchored to a full line
-        # (``^...$``) so a stray dash sequence inside response
-        # content is not matched.
-        # The separator regex is anchored to a full line (``^…$``);
-        # the ``MULTILINE`` flag is required so ``^`` and ``$``
-        # match at every line start/end, not just the buffer
-        # start/end.
-        _sep_re = re.compile(SEPARATOR_PATTERN, re.MULTILINE)
-        _sep_positions = [m.start() for m in _sep_re.finditer(clean)]
-        if _sep_positions:
-            pre_sep_lines = clean[: _sep_positions[-1]].rstrip("\n").split("\n")
-            for line in reversed(pre_sep_lines):
-                if re.search(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✶✢✽✻✳·][^\n]*\u2026", line):
-                    return TerminalStatus.PROCESSING
-                if _sep_re.search(line):
-                    break
-
-        # Find the LAST occurrence of each marker for fallback
-        # position checks. ``IDLE_PROMPT_PATTERN`` is line-anchored
-        # (see its definition) so re.findall across the full buffer
-        # only matches true prompt lines, never the leading
-        # ``❯ <text>`` of an echoed user input line.
-        last_processing = None
-        for m in re.finditer(PROCESSING_PATTERN, clean):
-            last_processing = m
-
-        last_idle = None
-        for m in re.finditer(IDLE_PROMPT_PATTERN, clean, re.MULTILINE):
-            last_idle = m
-
-        # FALLBACK PROCESSING: spinner visible AND no separator follows
-        # it yet (early in execution before the separator appears).
-        if last_processing and not _sep_re.search(clean):
-            if last_idle is None or last_processing.start() > last_idle.start():
-                return TerminalStatus.PROCESSING
-
-        # Check for active TUI selection widgets (mode picker, model
-        # picker, etc.) which show a ↑/↓ navigation footer. Exclude
-        # the trust/permission dialogs, which are separate states.
-        if (
-            re.search(WAITING_USER_ANSWER_PATTERN, clean)
-            and not re.search(TRUST_PROMPT_PATTERN, clean, re.IGNORECASE)
-            and not re.search(PERMISSION_PROMPT_PATTERN, clean, re.IGNORECASE)
-        ):
-            return TerminalStatus.WAITING_USER_ANSWER
-
-        # Trust / permission dialogs are an interactive prompt that
-        # blocks the agent until the operator accepts. Treat them as
-        # WAITING_USER_ANSWER.
-        if re.search(TRUST_PROMPT_PATTERN, clean, re.IGNORECASE) or re.search(
-            PERMISSION_PROMPT_PATTERN, clean, re.IGNORECASE
-        ):
-            return TerminalStatus.WAITING_USER_ANSWER
-
-        # v2026+ TUI: placeholder absent in the input box = the user
-        # has submitted and the agent is working (or has worked and
-        # the response is rendering). This is the positive
-        # PROCESSING signal that fixes issue #299. We do NOT fire it
-        # on older text-mode builds — those never emit the
-        # placeholder string, so ``placeholder_in_tail`` is False
-        # from the start and the regex-based idle check below
-        # (which requires ``last_idle`` to match a `❯` line) is
-        # what classifies them.
-        if not placeholder_in_tail and tui_active and re.search(TUI_STATUS_BAR_PATTERN, clean):
-            return TerminalStatus.PROCESSING
-
-        # IDLE / COMPLETED: an idle prompt at the bottom of the buffer
-        # indicates the agent has finished its turn (or is freshly
-        # initialized and waiting for input). We do not differentiate
-        # IDLE vs COMPLETED on the position of an idle prompt alone —
-        # message extraction is the source of truth for the response
-        # payload; CAO's status machine only needs to know the agent
-        # is no longer working. We report COMPLETED to match the
-        # other providers' convention (the supervisor inbox accepts
-        # COMPLETED as a "ready" signal).
-        if last_idle:
-            return TerminalStatus.COMPLETED
-
-        # v2026+ TUI IDLE: placeholder visible AND no TUI signal of
-        # an active turn. This is the post-response state — the
-        # agent has finished and the input box is back to the
-        # placeholder. We require the status bar to be present too
-        # so we don't false-positive on a brand-new TUI that hasn't
-        # rendered any state yet.
-        if placeholder_in_tail and re.search(TUI_STATUS_BAR_PATTERN, clean):
             return TerminalStatus.COMPLETED
 
         return TerminalStatus.UNKNOWN
@@ -955,5 +898,42 @@ class CursorCliProvider(BaseProvider):
         return "/exit"
 
     def cleanup(self) -> None:
-        """Clean up Cursor CLI provider state."""
+        """Clean up Cursor CLI provider state.
+
+        Resets the initialised flag and removes every per-session
+        temp file the provider has created under the CAO tmp dir
+        (system prompt file, plugin directory). Removing the
+        plugin directory also drops the per-session ``plugin.json``
+        manifest that forwards ``CAO_TERMINAL_ID`` into the MCP
+        server env.
+
+        Errors during cleanup are logged and swallowed — the
+        session is already going away at this point and we do not
+        want to mask the original error path with a transient
+        ``OSError`` from a stale file. The registry is cleared
+        either way so a future reuse of the same provider instance
+        (rare; providers are typically one-shot) does not try to
+        re-delete paths that no longer exist.
+        """
+        import logging
+        import shutil
+
+        logger = logging.getLogger(__name__)
         self._initialized = False
+        for path in self._tmp_paths:
+            try:
+                if path.is_dir() and not path.is_symlink():
+                    shutil.rmtree(path)
+                elif path.exists() or path.is_symlink():
+                    path.unlink()
+            except FileNotFoundError:
+                # Already removed by something else (e.g. operator
+                # manually cleaned the tmp dir). Not an error.
+                pass
+            except OSError as exc:
+                logger.warning(
+                    "CursorCliProvider cleanup: failed to remove %s: %s",
+                    path,
+                    exc,
+                )
+        self._tmp_paths = []

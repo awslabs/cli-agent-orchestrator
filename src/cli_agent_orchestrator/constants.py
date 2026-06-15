@@ -243,6 +243,31 @@ WS_ALLOWED_CLIENTS = [
     "localhost",
 ] + _split_env_list("CAO_WS_ALLOWED_CLIENTS")
 
+# Trusted upstream IP allowlist for uvicorn's ``proxy_headers`` and
+# ``forwarded_allow_ips`` settings. When cao-server is bound to a
+# non-loopback address (Codespaces, devcontainer, reverse proxy), uvicorn
+# must trust ``X-Forwarded-*`` headers from the proxy so the WebSocket
+# terminal viewer's WSS upgrade survives the HTTPS tunnel. Trusting those
+# headers from arbitrary peers lets an attacker spoof client IPs in
+# logs / middleware, so the default is loopback-only — safe for a
+# bare ``cao-server --host 127.0.0.1``.
+#
+# Operators behind a reverse proxy should set
+# ``CAO_FORWARDED_ALLOW_IPS`` to a comma-separated list of the proxy's
+# own IPs (or CIDR ranges uvicorn accepts), e.g.
+# ``CAO_FORWARDED_ALLOW_IPS="10.0.0.5"``. Codespaces users can use
+# ``CAO_FORWARDED_ALLOW_IPS="*"`` because the Codespaces tunnel
+# terminates TLS in a separate network namespace the proxy address is
+# not enumerable for, but that is an opt-in only — the default is the
+# safe loopback list.
+#
+# A literal ``*`` is honoured and disables the check (matches the
+# existing semantics of ``CAO_WS_ALLOWED_CLIENTS="*"``).
+TRUSTED_FORWARDER_IPS = [
+    "127.0.0.1",
+    "::1",
+] + _split_env_list("CAO_FORWARDED_ALLOW_IPS")
+
 # =============================================================================
 # Memory System Configuration
 # =============================================================================

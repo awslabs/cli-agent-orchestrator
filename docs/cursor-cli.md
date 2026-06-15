@@ -42,16 +42,20 @@ curl -X POST "http://localhost:9889/sessions?provider=cursor_cli&agent_profile=d
 
 ### Status Detection
 
-The Cursor CLI provider detects terminal states by analyzing output patterns:
+The Cursor CLI provider detects terminal states by analyzing output patterns. Cursor CLI v2026.06.15 runs a full Ink/TUI in interactive mode, so the detection targets both the legacy text-mode REPL and the modern TUI:
 
-- **IDLE / COMPLETED**: Terminal shows a `❯` (or `>`) REPL prompt, ready for input.
-- **PROCESSING**: Spinner characters (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✶✢✽✻✳·`) with ellipsis on a line immediately before the `──────────────────────` separator.
+- **IDLE / COMPLETED (v2026+ TUI)**: Status bar (`Composer …` / `Run Everything`) is visible, and the `ctrl+c to stop` hint is absent from the input-box line. The input box is back to the placeholder (`Plan, search, build anything` on a fresh launch, `Add a follow-up` after the first turn).
+- **PROCESSING (v2026+ TUI)**: Status bar visible AND the `ctrl+c to stop` hint is present on the input-box line. Cursor renders this every frame the agent is working on a turn; it disappears once the response is fully delivered.
+- **IDLE / COMPLETED (older text-mode)**: Terminal shows a `❯` (or `>`) REPL prompt on its own line, ready for input.
+- **PROCESSING (older text-mode)**: Spinner characters (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✶✢✽✻✳·`) with ellipsis on a line immediately before the `──────────────────────` separator.
 - **WAITING_USER_ANSWER**: TUI selection widget (mode picker, model picker) showing the `↑/↓ to navigate` footer, or an active workspace-trust / tool-permission dialog.
 - **UNKNOWN**: No recognizable state.
 
 Status detection checks patterns in priority order: PROCESSING → WAITING_USER_ANSWER → COMPLETED → UNKNOWN.
 
-The PROCESSING check is **structural** — it walks backwards from the last separator looking for a spinner line, so stale spinner text from a previously completed turn does not trigger a false positive (the same approach used by the Claude Code provider).
+The PROCESSING check is **structural** — for older text-mode builds it walks backwards from the last separator looking for a spinner line, so stale spinner text from a previously completed turn does not trigger a false positive (the same approach used by the Claude Code provider).
+
+For v2026+ TUI detection, the tail of the rolling 8KB buffer (last ~1KB) is consulted. The `ctrl+c to stop` indicator is always rendered in the last few hundred bytes of the input-box line on every Cursor TUI frame, so the 1KB window is well below the 8KB cap and the indicator is present whenever the agent is actively working.
 
 ### Message Extraction
 
@@ -59,19 +63,22 @@ Cursor CLI does not emit a single canonical response marker (unlike Claude Code'
 
 1. Find the last `──────────────────────` separator that precedes a trailing `❯` idle prompt.
 2. Find the separator before that one (or the start of the buffer).
-3. Extract the content between them and strip ANSI codes.
+3. Extract the content between them and strip full ECMA-48 escape sequences (CSI, OSC, 2-byte ESC).
 
 If no boundary is detected, extraction raises `ValueError("No Cursor CLI response found - no separator / idle prompt boundary detected")`.
+
+> **Note:** the v2026+ TUI does not emit `─────` separator or `❯` prompt in the pipe-pane buffer (they are TUI widgets), so message extraction on the live TUI stream returns `ValueError`. Use the `get_output` API on a rendered `capture-pane` snapshot (which renders the TUI back into a text-mode stream) when extracting v2026 responses.
 
 ### Permission Bypass
 
 By default, CAO launches Cursor CLI with the following flags to skip the interactive dialogs that would otherwise block headless orchestration:
 
 - `--force` — auto-approves every tool call (Bash, file writes, etc.).
-- `--trust` — accepts the per-directory workspace trust dialog on first run.
-- `--approve-mcps` — pre-approves MCP servers declared on the command line.
+- `--approve-mcps` — pre-approves MCP servers declared via `--plugin-dir`.
 
-These are safe to set because CAO already confirms workspace trust during `cao launch` ("Do you trust all the actions in this folder?") or via `--yolo`. Without them, every worker agent spawned via handoff/assign would block on a trust/permission dialog with no way to accept it interactively.
+`--trust` is **not** passed because Cursor CLI v2026+ rejects it in interactive REPL mode with `Error: --trust can only be used with --print/headless mode`. The CAO launch flow already confirms workspace trust, and the interactive REPL has no per-directory trust dialog for `--trust` to skip.
+
+These are safe to set because CAO already confirms workspace trust during `cao launch` ("Do you trust all the actions in this folder?") or via `--yolo`. Without them, every worker agent spawned via handoff/assign would block on a permission dialog with no way to accept it interactively.
 
 ## Configuration
 
@@ -80,18 +87,16 @@ These are safe to set because CAO already confirms workspace trust during `cao l
 When launched with an agent profile (e.g., `--agents code_supervisor`), CAO:
 
 1. Loads the profile from the agent store (`~/.aws/cli-agent-orchestrator/agent-store`).
-2. Extracts the system prompt from the Markdown content.
-3. Passes it via `--system-prompt` (newlines escaped to `\n` for tmux compatibility).
-4. Injects MCP servers via `--mcp <json>` if the profile defines `mcpServers`.
-5. Forwards the `CAO_TERMINAL_ID` env var to each MCP server so they can identify the current terminal for handoff/assign operations.
-6. Honors the profile's `model` field by passing `--model <id>` at launch (overridable via the constructor).
+2. Honors the profile's `model` field by passing `--model <id>` at launch (overridable via the constructor).
+3. For MCP servers: writes a synthetic Cursor plugin manifest under `~/.aws/cli-agent-orchestrator/tmp/<tid>-cursor-plugins/plugin.json` and passes the directory via `--plugin-dir`. The manifest's `mcpServers` map carries the `CAO_TERMINAL_ID` env var so MCP tools can identify the current terminal for handoff/assign operations. `--approve-mcps` is added so the REPL does not block on a per-server approval dialog.
+4. **Does not** pass the profile body via `--system-prompt` in v2026.06.15: the backend rejects every request that carries a `--system-prompt <file>` payload with `[invalid_argument] unknown option '--system-prompt'` regardless of the file's contents (the bug is reproducible with a 3-character file). The CAO role context still reaches the agent via the `cao-mcp-server` MCP tool's handoff/assign payloads, so the agent has the right capabilities and the right inbox tools; only the role body is not pre-loaded as a system prompt. The preserved `_write_system_prompt_file` helper is ready to re-enable this path when Cursor ships a fixed client.
 
 ### Launch Command
 
-The provider builds the command via `_build_cursor_command()`:
+The provider builds the command via `_build_cursor_command()`. The provider prefers the unambiguous `cursor-agent` alias (which only the Cursor CLI ships) and falls back to the documented primary `agent` name when only that is installed. When `agent` is selected the provider runs an `agent --version` probe to confirm the resolved binary is the Cursor CLI (a number of unrelated tools also install an `agent` binary on `$PATH`).
 
 ```
-agent --force --trust [--model <id>] [--agent <name>] [--system-prompt "..."] [--mcp "{...}" --approve-mcps]
+cursor-agent --force [--model <id>] [--plugin-dir <path> --approve-mcps]
 ```
 
 The `--print` flag is intentionally **not** passed: CAO drives the interactive REPL so the inbox service can stream follow-up prompts via MCP handoff. Print mode is a one-shot CLI flag that exits after the first response and is therefore incompatible with multi-turn CAO sessions.
@@ -106,12 +111,13 @@ The provider forwards a model selection in the following order of precedence:
 
 ## Tool Restrictions
 
-Cursor CLI does not yet expose a `--disallowedTools` (or equivalent) flag for hard tool enforcement, so this provider falls back to **soft enforcement via the system prompt** (see `docs/tool-restrictions.md`):
+Cursor CLI v2026 does not expose a `--disallowedTools` (or equivalent) flag for hard tool enforcement, and the soft-enforcement path the provider used in earlier builds (prepending `SECURITY_PROMPT` + an allowlist to the system prompt) is **not available in v2026** because the provider no longer passes `--system-prompt` (see "Agent Profile Integration" above). The recommended path for restricted tool access on Cursor v2026 is to choose a provider that supports a native enforcement mechanism:
 
-- When the operator sets an explicit non-wildcard allowlist (`--allowed-tools fs_read,fs_list` or a restricted `role`), the provider prepends the shared `SECURITY_PROMPT` plus a tool list to the agent's system prompt. This is **advisory only** — Cursor may still call any tool. See `skills/cao-provider/references/lessons-learnt.md` #13 for the three enforcement approaches.
-- When the operator uses `--yolo` (`allowed_tools=["*"]`) or omits restrictions entirely, no security prompt is added.
+- **Hard enforcement**: prefer Claude Code, Copilot CLI, or Gemini CLI which all support `--disallowedTools`.
+- **OpenCode**: the OpenCode CLI frontmatter mechanism lets the supervisor restrict per-agent capabilities.
+- **Advisory only on Cursor v2026**: if you must use `cursor_cli` with restricted tools, configure a dedicated free-tier account + workspace and use Cursor's own permission UI to scope what the agent can do. The CAO `allowed_tools` argument is currently ignored on `cursor_cli` for v2026 and is documented as such.
 
-If you need strict hard enforcement, prefer a provider that supports `--disallowedTools` (Claude Code, Copilot CLI, Gemini CLI) or the OpenCode CLI frontmatter mechanism.
+See `docs/tool-restrictions.md` and `skills/cao-provider/references/lessons-learnt.md` #13 for the three enforcement approaches.
 
 ## End-to-End Testing
 
@@ -192,12 +198,12 @@ If the supervisor completes the analysis work itself, the per-directory lock or 
 ### Common Issues
 
 1. **Trust Dialog Blocking**
-   - The provider launches Cursor CLI with `--trust` automatically.
-   - If the dialog still appears, verify the `agent` version supports `--trust` (`agent --help`).
+   - The provider does **not** launch with `--trust` in v2026+ (Cursor rejects the flag in interactive REPL mode). The CAO launch flow's workspace-trust confirmation is sufficient.
+   - If the dialog still appears, verify the `agent` (or `cursor-agent`) version supports `--force` (`agent --help`).
 
 2. **MCP Approval Dialog Blocking**
-   - The provider launches with `--approve-mcps` when the profile declares `mcpServers`.
-   - If MCP servers still prompt, check the `--mcp` JSON syntax in the launch command.
+   - The provider launches with `--approve-mcps` when the profile declares `mcpServers`, and the MCP servers are written into a `--plugin-dir` manifest.
+   - If MCP servers still prompt, check the synthesised `plugin.json` under `~/.aws/cli-agent-orchestrator/tmp/<tid>-cursor-plugins/`.
 
 3. **Authentication Issues**
    ```bash
@@ -207,13 +213,18 @@ If the supervisor completes the analysis work itself, the per-directory lock or 
 
 4. **Status Stuck on UNKNOWN**
    - Attach to the tmux session (`tmux attach -t <session-name>`) and check terminal output.
-   - Verify Cursor CLI starts correctly in a regular terminal first: `agent "hello"`.
+   - Verify Cursor CLI starts correctly in a regular terminal first: `agent --print "hello"`.
+   - For v2026+ the detector expects the TUI to be rendered (you should see the `→ Add a follow-up` placeholder and a status bar with `Composer 2.5 Fast`). Older text-mode builds classify via `❯` prompt + `─────` separator.
 
 5. **`agent` Not Found on `$PATH`**
    - The provider does not prefix the command with an absolute path — install the binary where your shell can find it.
+   - The provider prefers `cursor-agent` when both names are installed; `agent` is only used when the legacy alias is missing, and even then the version banner is probed to confirm the resolved binary is the Cursor CLI.
    - On Linux, the recommended install method is `curl https://cursor.com/install -fsS | bash`.
 
-6. **E2E tests skip with "Cursor CLI (agent / cursor-agent) not installed"**
+6. **`[invalid_argument] unknown option '--system-prompt'` from the Cursor backend**
+   - This is a confirmed v2026.06.15 backend bug. The provider deliberately omits `--system-prompt` to avoid it. If you see this error, the agent was likely launched by another tool (e.g. `agent --print` directly). See issue #299 for the investigation.
+
+7. **E2E tests skip with "Cursor CLI (agent / cursor-agent) not installed"**
    - Install Cursor CLI and ensure the `agent` (or legacy `cursor-agent`) binary is on `$PATH`.
    - The `require_cursor` fixture auto-skips when the binary is absent; no failure, just no coverage.
 
