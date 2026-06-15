@@ -159,6 +159,62 @@ class TestTerminalCreationWithWorkingDirectory:
             call_kwargs = mock_svc.create_terminal.call_args.kwargs
             assert call_kwargs.get("working_directory") == str(tmp_path)
 
+    def test_create_terminal_passes_caller_id(self, client):
+        """caller_id query param threads through to the service (issue #284)."""
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            mock_svc.create_terminal = AsyncMock(
+                return_value=Terminal(
+                    id="abcd5678",
+                    name="test-window",
+                    session_name="test-session",
+                    provider="q_cli",
+                    agent_profile="analyst",
+                    caller_id="dcba8765",
+                )
+            )
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "provider": "q_cli",
+                    "agent_profile": "analyst",
+                    "caller_id": "dcba8765",
+                },
+            )
+
+            assert response.status_code == 201
+            call_kwargs = mock_svc.create_terminal.call_args.kwargs
+            assert call_kwargs.get("caller_id") == "dcba8765"
+            assert response.json()["caller_id"] == "dcba8765"
+
+    def test_create_terminal_rejects_malformed_caller_id(self, client):
+        """caller_id is validated against the TerminalId pattern — IDs arrive
+        from agent input and must not be persisted unvalidated."""
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "provider": "q_cli",
+                    "agent_profile": "analyst",
+                    "caller_id": "not-a-terminal-id!",
+                },
+            )
+
+            assert response.status_code == 422
+            mock_svc.create_terminal.assert_not_called()
+
     def test_create_terminal_in_session_with_working_directory(self, client):
         """Test POST /sessions/{session}/terminals with working_directory."""
         with (

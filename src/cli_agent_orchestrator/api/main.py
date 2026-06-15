@@ -683,6 +683,7 @@ async def create_terminal_in_session(
     provider: Optional[str] = None,
     working_directory: Optional[str] = None,
     allowed_tools: Optional[str] = None,
+    caller_id: Optional[TerminalId] = None,
 ) -> Terminal:
     """Create additional terminal in existing session."""
     try:
@@ -706,6 +707,7 @@ async def create_terminal_in_session(
             working_directory=working_directory,
             allowed_tools=allowed_tools_list,
             registry=get_plugin_registry(request),
+            caller_id=caller_id,
         )
         return result
     except ValueError as e:

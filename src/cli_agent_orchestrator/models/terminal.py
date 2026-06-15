@@ -31,6 +31,9 @@ class Terminal(BaseModel):
     provider: ProviderType = Field(..., description="CLI tool provider")
     session_name: str = Field(..., description="Session name")
     agent_profile: Optional[str] = Field(None, description="Agent profile")
+    caller_id: Optional[str] = Field(
+        None, description="Terminal that created this one via handoff/assign (callback target)"
+    )
     allowed_tools: Optional[List[str]] = Field(None, description="Allowed CAO tools")
     shell_command: Optional[str] = Field(
         None, description="Shell process name captured before kiro launch"

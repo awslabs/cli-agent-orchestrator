@@ -49,6 +49,7 @@ class TestCreateTerminalProviderResolution:
             params={
                 "provider": "claude_code",
                 "agent_profile": "reviewer",
+                "caller_id": "supervisor-1",
                 "working_directory": "/repo",
             },
             timeout=MCP_REQUEST_TIMEOUT,
@@ -91,6 +92,7 @@ class TestCreateTerminalProviderResolution:
             params={
                 "provider": "kiro_cli",
                 "agent_profile": "reviewer",
+                "caller_id": "supervisor-1",
                 "working_directory": "/repo",
             },
             timeout=MCP_REQUEST_TIMEOUT,
@@ -146,19 +148,44 @@ class TestAssignSenderIdInjection:
     @patch("cli_agent_orchestrator.mcp_server.server._send_direct_input")
     @patch("cli_agent_orchestrator.mcp_server.server.wait_until_terminal_status", return_value=True)
     @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
-    def test_assign_sender_id_fallback_unknown(self, mock_create, mock_wait, mock_send):
-        """When CAO_TERMINAL_ID is not set, suffix should use 'unknown'."""
+    def test_assign_missing_terminal_id_errors_before_creating_terminal(
+        self, mock_create, mock_wait, mock_send
+    ):
+        """When CAO_TERMINAL_ID is not set, assign must fail fast (issue #284) —
+        never tell a worker to reply to terminal 'unknown', and never leave an
+        orphan worker terminal behind."""
         from cli_agent_orchestrator.mcp_server.server import _assign_impl
-
-        mock_create.return_value = ("worker-3", "codex")
-        mock_send.return_value = None
 
         with patch.dict(os.environ, {}, clear=True):
             result = _assign_impl("developer", "Build feature X")
 
-        sent_message = mock_send.call_args[0][1]
-        assert mock_send.call_args[0][2] == "assign"
-        assert "[Assigned by terminal unknown" in sent_message
+        assert result["success"] is False
+        assert result["terminal_id"] is None
+        assert "CAO_TERMINAL_ID not set" in result["message"]
+        mock_create.assert_not_called()
+        mock_send.assert_not_called()
+
+    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
+    @patch("cli_agent_orchestrator.mcp_server.server._send_direct_input")
+    @patch("cli_agent_orchestrator.mcp_server.server.wait_until_terminal_status", return_value=True)
+    @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
+    def test_assign_surfaces_terminal_id_when_send_fails_after_creation(
+        self, mock_create, mock_wait, mock_send
+    ):
+        """If the task send fails after the worker terminal was created, the
+        orphaned terminal's ID must be surfaced so the supervisor can inspect
+        or delete it — matching the ready-timeout path."""
+        from cli_agent_orchestrator.mcp_server.server import _assign_impl
+
+        mock_create.return_value = ("worker-orphan", "claude_code")
+        mock_send.side_effect = Exception("connection refused")
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "supervisor-abc123"}):
+            result = _assign_impl("developer", "Analyze the logs")
+
+        assert result["success"] is False
+        assert result["terminal_id"] == "worker-orphan"
+        assert "Assignment failed" in result["message"]
 
     @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
     @patch("cli_agent_orchestrator.mcp_server.server._send_direct_input")
