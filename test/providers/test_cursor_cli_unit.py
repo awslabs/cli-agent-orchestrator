@@ -212,13 +212,29 @@ class TestGetStatus:
     def test_idle_fixture_returns_completed(self):
         output = load_fixture("cursor_cli_idle_output.txt")
         provider = make_provider()
+        # Fresh spawn, no input received yet -> IDLE, not COMPLETED.
+        # We mark a turn to simulate the post-first-turn state so
+        # the same fixture exercises the COMPLETED branch as well.
+        provider.mark_input_received()
         # Provider reports COMPLETED on idle prompt to match other
         # providers' "ready" signal convention.
         assert provider.get_status(output) == TerminalStatus.COMPLETED
 
+    def test_idle_fixture_without_input_returns_idle(self):
+        # Fresh spawn (no user input ever delivered): the TUI
+        # looks the same as the post-turn idle state but the
+        # turn counter is zero, so the detector must report IDLE
+        # (not COMPLETED) — distinguishes "just spawned, waiting
+        # for first prompt" from "last turn delivered, ready
+        # for next".
+        output = load_fixture("cursor_cli_idle_output.txt")
+        provider = make_provider()
+        assert provider.get_status(output) == TerminalStatus.IDLE
+
     def test_completed_fixture_returns_completed(self):
         output = load_fixture("cursor_cli_completed_output.txt")
         provider = make_provider()
+        provider.mark_input_received()
         assert provider.get_status(output) == TerminalStatus.COMPLETED
 
     def test_processing_spinner_before_separator_returns_processing(self):
@@ -241,6 +257,7 @@ class TestGetStatus:
             + "\n\u276f "
         )
         provider = make_provider()
+        provider.mark_input_received()
         assert provider.get_status(stale_output) == TerminalStatus.COMPLETED
 
     def test_processing_no_separator_yet_returns_processing(self):
@@ -281,6 +298,7 @@ class TestGetStatus:
         sep = "\u2500" * 30
         output = sep + "\n\u276f What is 2+2?\n" + sep + "\nThe answer is 4.\n" + sep + "\n\u276f "
         provider = make_provider()
+        provider.mark_input_received()
         assert provider.get_status(output) == TerminalStatus.COMPLETED
 
 
@@ -303,7 +321,15 @@ class TestGetStatusV2026Tui:
     def test_v2026_idle_fixture_returns_completed(self):
         output = load_fixture("cursor_cli_v2026_idle_output.txt")
         provider = make_provider()
+        provider.mark_input_received()
         assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+    def test_v2026_idle_fixture_fresh_spawn_returns_idle(self):
+        # Without a turn, the same TUI buffer is IDLE (not
+        # COMPLETED). The turn counter is the split.
+        output = load_fixture("cursor_cli_v2026_idle_output.txt")
+        provider = make_provider()
+        assert provider.get_status(output) == TerminalStatus.IDLE
 
     def test_v2026_post_turn_idle_fixture_returns_completed(self):
         # v2026 swaps the input-box placeholder from "Plan,
@@ -314,6 +340,7 @@ class TestGetStatusV2026Tui:
         # up the response on the next turn.
         output = load_fixture("cursor_cli_v2026_post_turn_idle_output.txt")
         provider = make_provider()
+        provider.mark_input_received()
         assert provider.get_status(output) == TerminalStatus.COMPLETED
 
     def test_v2026_processing_fixture_returns_processing(self):
@@ -344,6 +371,7 @@ class TestGetStatusV2026Tui:
             "                                             \x1b[35mRun Everything\x1b[39m\n"
         )
         provider = make_provider()
+        provider.mark_input_received()
         assert provider.get_status(output) == TerminalStatus.COMPLETED
 
     def test_synthetic_v2026_processing_placeholder_replaced(self):
@@ -394,6 +422,7 @@ class TestGetStatusV2026Tui:
         assert "ctrl+c to stop" in output
         assert "ctrl+c to stop" not in output[-1024:]
         provider = make_provider()
+        provider.mark_input_received()
         # The tail has the status bar and the placeholder but no
         # "ctrl+c to stop" — this is the post-turn idle state.
         assert provider.get_status(output) == TerminalStatus.COMPLETED
@@ -418,6 +447,7 @@ class TestGetStatusV2026Tui:
             "                                             \x1b[35mRun Everything\x1b[39m\n"
         )
         provider = make_provider()
+        provider.mark_input_received()
         assert provider.get_status(output) == TerminalStatus.COMPLETED
 
     def test_processing_indicator_in_tail_returns_processing(self):
@@ -545,6 +575,7 @@ class TestExtractLastMessage:
         # extraction both work.
         sep_with_color = "\x1b[38;5;245m" + ("\u2500" * 30) + "\x1b[0m"
         provider = make_provider()
+        provider.mark_input_received()
         output = (
             sep_with_color
             + "\n\u276f question\n"

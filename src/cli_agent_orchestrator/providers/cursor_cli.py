@@ -234,6 +234,15 @@ class CursorCliProvider(BaseProvider):
         # launched (e.g. because the binary is missing) leave the
         # tmp dir untouched.
         self._tmp_paths: list[Path] = []
+        # Turn counter. ``get_status`` returns ``IDLE`` while
+        # ``_turns == 0`` (fresh spawn, no user input yet) and
+        # ``COMPLETED`` once at least one turn has been delivered
+        # and the agent is back in a non-processing state. This
+        # lets the UI badge distinguish "just spawned, waiting for
+        # first prompt" from "last turn delivered, ready for next".
+        # Incremented from :meth:`mark_input_received`, which the
+        # terminal service calls after every ``send_input``.
+        self._turns: int = 0
 
     @property
     def paste_enter_count(self) -> int:
@@ -740,17 +749,19 @@ class CursorCliProvider(BaseProvider):
         if tui_processing and re.search(TUI_STATUS_BAR_PATTERN, clean):
             return TerminalStatus.PROCESSING
 
-        # IDLE / COMPLETED: an idle prompt at the bottom of the buffer
-        # indicates the agent has finished its turn (or is freshly
-        # initialized and waiting for input). We do not differentiate
-        # IDLE vs COMPLETED on the position of an idle prompt alone —
-        # message extraction is the source of truth for the response
-        # payload; CAO's status machine only needs to know the agent
-        # is no longer working. We report COMPLETED to match the
-        # other providers' convention (the supervisor inbox accepts
-        # COMPLETED as a "ready" signal).
+        # IDLE / COMPLETED: an idle prompt at the bottom of the
+        # buffer indicates the agent has finished its turn (or is
+        # freshly initialized and waiting for input). We
+        # differentiate IDLE vs COMPLETED on the turn counter: a
+        # fresh spawn (no user input ever delivered) is IDLE
+        # regardless of what the TUI looks like, and a turn
+        # that has finished is COMPLETED. The TUI's status bar +
+        # absence of "ctrl+c to stop" is the same in both states
+        # (no good way to tell them apart from the buffer alone
+        # in v2026), so the turn counter is the authoritative
+        # source for that split.
         if last_idle:
-            return TerminalStatus.COMPLETED
+            return TerminalStatus.COMPLETED if self._turns > 0 else TerminalStatus.IDLE
 
         # v2026+ TUI IDLE: no "ctrl+c to stop" indicator on the
         # input-box line AND the status bar is visible. The
@@ -758,9 +769,11 @@ class CursorCliProvider(BaseProvider):
         # state, so it is the *absence* of the processing
         # indicator that distinguishes idle / completed from
         # processing. We require the status bar to be present
-        # too so a half-initialised TUI does not false-positive.
+        # too so we don't false-positive on a half-initialised
+        # TUI. Same IDLE-vs-COMPLETED split via the turn counter
+        # as above.
         if not processing_indicator_in_tail and re.search(TUI_STATUS_BAR_PATTERN, clean):
-            return TerminalStatus.COMPLETED
+            return TerminalStatus.COMPLETED if self._turns > 0 else TerminalStatus.IDLE
 
         return TerminalStatus.UNKNOWN
 
@@ -937,3 +950,23 @@ class CursorCliProvider(BaseProvider):
                     exc,
                 )
         self._tmp_paths = []
+
+    def mark_input_received(self) -> None:
+        """Record that a turn has been delivered to the agent.
+
+        Called by the terminal service after every ``send_input``.
+        Bumps the internal turn counter so :meth:`get_status` can
+        distinguish a fresh spawn (``IDLE``) from a finished
+        turn (``COMPLETED``) — the v2026 TUI looks the same in
+        both states (status bar visible, no ``ctrl+c to stop``
+        hint), so the counter is the only authoritative signal.
+
+        Called on the *delivery* path, not on the response path:
+        we increment the moment the input is sent to tmux, not
+        when the agent finishes processing it. That means the
+        status will be ``COMPLETED`` after the next
+        ``get_status`` call once the agent has finished the
+        turn, not before — which is what the StatusMonitor's
+        stickiness gate expects.
+        """
+        self._turns += 1
