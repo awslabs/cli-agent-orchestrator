@@ -7,10 +7,12 @@ from typing import Any, Dict, List, Optional, cast
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
     Integer,
     String,
+    Text,
     UniqueConstraint,
     create_engine,
 )
@@ -80,8 +82,31 @@ class MemoryMetadataModel(Base):
     token_estimate = Column(Integer, nullable=True)
     created_at = Column(DateTime(timezone=True), default=_utcnow)
     updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
+    # 3-factor scoring. ``access_count`` feeds the usage factor;
+    # ``last_accessed_at`` backs a server-side rate-limit on increments. NOT
+    # NULL DEFAULT 0 so existing rows read as "never recalled" without a
+    # backfill. Migrated onto existing DBs by ``_migrate_add_access_count``.
+    access_count = Column(Integer, nullable=False, default=0, server_default="0")
+    last_accessed_at = Column(DateTime(timezone=True), nullable=True, default=None)
+    # LLM wiki compilation. NULL = never LLM-compiled (pre-existing rows, or
+    # every compile attempt fell back to append). Non-NULL = UTC timestamp of
+    # the last successful compile.
+    last_compiled_at = Column(DateTime(timezone=True), nullable=True, default=None)
+    # Comma-separated sanitised keys of cross-referenced articles. NULL =
+    # never computed (pre-existing rows or LLM error). ``""`` = computed, no
+    # related found (success — distinct from NULL to avoid endless retries).
+    # Practical max ≤ 256 bytes (3 keys × 60 chars + 2 commas). The CHECK
+    # constraint applies on FRESH databases only — existing DBs rely on the
+    # parse-side cap in ``_parse_related_keys``.
+    related_keys = Column(Text, nullable=True, default=None)
 
-    __table_args__ = (UniqueConstraint("key", "scope", "scope_id", name="uq_memory_key_scope"),)
+    __table_args__ = (
+        UniqueConstraint("key", "scope", "scope_id", name="uq_memory_key_scope"),
+        CheckConstraint(
+            "related_keys IS NULL OR length(related_keys) < 1024",
+            name="ck_related_keys_length",
+        ),
+    )
 
 
 class ProjectAliasModel(Base):
@@ -132,6 +157,9 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _migrate_terminals_schema()
     _migrate_memory_indexes()
+    _migrate_add_access_count()
+    _migrate_add_last_compiled_at()
+    _migrate_add_related_keys()
 
 
 def _migrate_project_aliases_schema() -> None:
@@ -188,6 +216,80 @@ def _migrate_memory_indexes() -> None:
             )
     except Exception as e:
         logger.debug(f"Memory index migration skipped: {e}")
+
+
+def _migrate_add_access_count() -> None:
+    """Add access_count and last_accessed_at columns to memory_metadata if missing.
+
+    Idempotent: PRAGMA table_info gate, ALTER TABLE ADD COLUMN only
+    when missing. Fresh DBs already have the columns from
+    ``Base.metadata.create_all``. Existing rows get ``0`` / ``NULL`` — the
+    correct values for "never recalled".
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            cursor = conn.execute("PRAGMA table_info(memory_metadata)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if "access_count" not in columns:
+                conn.execute(
+                    "ALTER TABLE memory_metadata ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0"
+                )
+                logger.info("Migration: added access_count column to memory_metadata")
+            if "last_accessed_at" not in columns:
+                conn.execute("ALTER TABLE memory_metadata ADD COLUMN last_accessed_at DATETIME")
+                logger.info("Migration: added last_accessed_at column to memory_metadata")
+    except Exception as e:
+        logger.debug(f"Migration check for access_count failed: {e}")
+
+
+def _migrate_add_last_compiled_at() -> None:
+    """Add last_compiled_at column to memory_metadata if missing.
+
+    Idempotent: skipped on fresh DBs (the column ships in the model) and on
+    repeated runs. Existing Phase 1/2 rows get NULL — correct, since they were
+    never LLM-compiled.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            cursor = conn.execute("PRAGMA table_info(memory_metadata)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if "last_compiled_at" not in columns:
+                conn.execute("ALTER TABLE memory_metadata ADD COLUMN last_compiled_at DATETIME")
+                logger.info("Migration: added last_compiled_at column to memory_metadata")
+    except Exception as e:
+        logger.debug(f"Migration check for last_compiled_at failed: {e}")
+
+
+def _migrate_add_related_keys() -> None:
+    """Add related_keys column to memory_metadata if missing.
+
+    Reuses the idempotent ALTER pattern: PRAGMA table_info gate, ALTER TABLE
+    ADD COLUMN only when missing. The CHECK(length < 1024) constraint applies
+    to FRESH DBs only — adding a CHECK to an existing SQLite table requires a
+    full table rebuild we deliberately avoid. Existing DBs rely on the
+    parse-side 1024-byte cap in ``_parse_related_keys``.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            cursor = conn.execute("PRAGMA table_info(memory_metadata)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if "related_keys" not in columns:
+                conn.execute("ALTER TABLE memory_metadata ADD COLUMN related_keys TEXT")
+                logger.info("Migration: added related_keys column to memory_metadata")
+    except Exception as e:
+        logger.debug(f"Migration check for related_keys failed: {e}")
 
 
 def _migrate_terminals_schema() -> None:

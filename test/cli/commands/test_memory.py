@@ -8,7 +8,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from click.testing import CliRunner
 
-from cli_agent_orchestrator.cli.commands.memory import clear, delete, list_memories, show
+from cli_agent_orchestrator.cli.commands.memory import (
+    clear,
+    delete,
+    lint_cmd,
+    list_memories,
+    show,
+)
 from cli_agent_orchestrator.models.memory import Memory
 
 # ---------------------------------------------------------------------------
@@ -308,3 +314,89 @@ class TestMemoryClearRequiresScope:
 
         assert result.exit_code == 0
         assert "No session-scoped memories to clear" in result.output
+
+
+class TestMemoryLint:
+    """cao memory lint — JSON output must be a clean, parseable stream."""
+
+    @patch("cli_agent_orchestrator.services.wiki_lint.run_lint", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.cli.commands.memory._get_memory_service")
+    def test_lint_json_stdout_is_pure_json(self, mock_get_svc, mock_run_lint):
+        """The completion line must not pollute stdout under --format json."""
+        import json
+
+        mock_svc = MagicMock()
+        mock_svc.resolve_scope_id = MagicMock(return_value="proj-abc")
+        mock_get_svc.return_value = mock_svc
+        mock_run_lint.return_value = []  # no issues
+
+        runner = CliRunner()
+        result = runner.invoke(lint_cmd, ["--format", "json"])
+
+        assert result.exit_code == 0
+        # stdout parses cleanly; the "lint_run_completed" line went to stderr.
+        assert json.loads(result.stdout) == []
+        assert "lint_run_completed" not in result.stdout
+        assert "lint_run_completed" in result.stderr
+
+    @patch("cli_agent_orchestrator.services.wiki_lint.run_lint", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.cli.commands.memory._get_memory_service")
+    def test_completion_summary_only_run_reports_no_issues(self, mock_get_svc, mock_run_lint):
+        """A run whose only row is the completion summary must hit the
+        'No lint issues found.' branch, not render the summary as a finding.
+        """
+        from cli_agent_orchestrator.services.wiki_lint import LintIssue
+
+        mock_svc = MagicMock()
+        mock_svc.resolve_scope_id = MagicMock(return_value="proj-abc")
+        mock_get_svc.return_value = mock_svc
+        mock_run_lint.return_value = [
+            LintIssue(
+                issue_type="lint_error",
+                key="run_lint",
+                description="lint_run_completed: 5/5",
+                severity="warning",
+            )
+        ]
+
+        runner = CliRunner()
+        result = runner.invoke(lint_cmd, [])
+
+        assert result.exit_code == 0
+        assert "No lint issues found." in result.stdout
+        # The summary is echoed once (top line) but not duplicated as a row.
+        assert result.stdout.count("lint_run_completed") <= 1
+
+    @patch("cli_agent_orchestrator.services.wiki_lint.run_lint", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.cli.commands.memory._get_memory_service")
+    def test_completion_summary_excluded_from_json_payload(self, mock_get_svc, mock_run_lint):
+        """Under --format json the completion summary is not a payload row."""
+        import json
+
+        from cli_agent_orchestrator.services.wiki_lint import LintIssue
+
+        mock_svc = MagicMock()
+        mock_svc.resolve_scope_id = MagicMock(return_value="proj-abc")
+        mock_get_svc.return_value = mock_svc
+        mock_run_lint.return_value = [
+            LintIssue(
+                issue_type="orphan_page",
+                key="lonely",
+                description="orphan",
+                severity="warning",
+            ),
+            LintIssue(
+                issue_type="lint_error",
+                key="run_lint",
+                description="lint_run_completed: 5/5",
+                severity="warning",
+            ),
+        ]
+
+        runner = CliRunner()
+        result = runner.invoke(lint_cmd, ["--format", "json"])
+
+        payload = json.loads(result.stdout)
+        assert len(payload) == 1
+        assert payload[0]["key"] == "lonely"
+        assert not any("lint_run_completed" in p["description"] for p in payload)

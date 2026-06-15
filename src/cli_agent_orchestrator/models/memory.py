@@ -81,6 +81,27 @@ class Memory(BaseModel):
     )
     created_at: datetime = Field(..., description="Creation timestamp")
     updated_at: datetime = Field(..., description="Last update timestamp")
+    access_count: int = Field(
+        default=0, description="Recall hit count; feeds the usage scoring factor"
+    )
+    last_compiled_at: Optional[datetime] = Field(
+        default=None,
+        description="UTC time of last successful LLM compile; None if never",
+    )
+    related_keys: Optional[str] = Field(
+        default=None,
+        description=(
+            "Comma-separated cross-reference keys. " "None=never computed; ''=computed empty."
+        ),
+    )
+    is_related: bool = Field(
+        default=False,
+        exclude=True,
+        description=(
+            "Internal render-only label: True iff this Memory was loaded via "
+            "one-level cross-reference traversal. Never persisted or serialised."
+        ),
+    )
     content: str = Field(default="", description="Memory content loaded from wiki file")
     action: Optional[str] = Field(
         default=None,
