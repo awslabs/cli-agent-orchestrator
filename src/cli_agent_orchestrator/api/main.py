@@ -1014,8 +1014,15 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     # Defaults to loopback; operators running cao-server inside a container can
     # extend the allowlist with the ``CAO_WS_ALLOWED_CLIENTS`` env var so the
     # host browser (reaching the container via a bridge IP) can attach.
+    # A literal ``*`` in the allowlist disables the IP check (Codespaces /
+    # devcontainers / remote setups where the WS client originates from an
+    # IP the operator cannot enumerate ahead of time).
     client_host = websocket.client.host if websocket.client else None
-    if client_host is not None and client_host not in WS_ALLOWED_CLIENTS:
+    if (
+        "*" not in WS_ALLOWED_CLIENTS
+        and client_host is not None
+        and client_host not in WS_ALLOWED_CLIENTS
+    ):
         await websocket.close(code=4003, reason="WebSocket access is restricted to allowed clients")
         return
 
