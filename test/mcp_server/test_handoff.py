@@ -117,8 +117,9 @@ class TestHandoffMessageContext:
     @patch("cli_agent_orchestrator.mcp_server.server._send_direct_input")
     @patch("cli_agent_orchestrator.mcp_server.server.wait_until_terminal_status")
     @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
-    def test_codex_handoff_context_fallback_when_no_env(self, mock_create, mock_wait, mock_send):
-        """When CAO_TERMINAL_ID is not set, supervisor ID should be 'unknown'."""
+    def test_codex_handoff_errors_when_no_env(self, mock_create, mock_wait, mock_send):
+        """When CAO_TERMINAL_ID is not set, codex handoff must fail visibly
+        (issue #284) — never tell a worker its supervisor is terminal 'unknown'."""
         mock_create.return_value = ("dev-terminal-5", "codex")
         mock_wait.side_effect = [True, True]
         mock_send.return_value = None
@@ -131,13 +132,30 @@ class TestHandoffMessageContext:
                 mock_requests.get.return_value = mock_response
                 mock_requests.post.return_value = mock_response
 
-                asyncio.run(_handoff_impl("developer", "Do task"))
+                result = asyncio.run(_handoff_impl("developer", "Do task"))
 
-        sent_message = mock_send.call_args[0][1]
-        assert mock_send.call_args[0][2] == "handoff"
-        assert "unknown" in sent_message
-        assert "[CAO Handoff]" in sent_message
-        assert "Do task" in sent_message
+        assert result.success is False
+        assert "CAO_TERMINAL_ID not set" in result.message
+        # The created (now orphaned) terminal must be surfaced so it can be
+        # inspected or cleaned up, matching the timeout failure paths.
+        assert result.terminal_id == "dev-terminal-5"
+        # Fail-fast: the (up to 120s) ready wait must not even start.
+        mock_wait.assert_not_called()
+        mock_send.assert_not_called()
+
+    @patch("cli_agent_orchestrator.mcp_server.server._send_direct_input")
+    @patch("cli_agent_orchestrator.mcp_server.server.wait_until_terminal_status")
+    @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
+    def test_handoff_terminal_id_none_when_creation_fails(self, mock_create, mock_wait, mock_send):
+        """When terminal creation itself fails, no terminal exists to report."""
+        mock_create.side_effect = Exception("session not found")
+
+        result = asyncio.run(_handoff_impl("developer", "Do task"))
+
+        assert result.success is False
+        assert "Handoff failed" in result.message
+        assert result.terminal_id is None
+        mock_send.assert_not_called()
 
     @patch("cli_agent_orchestrator.mcp_server.server._send_direct_input")
     @patch("cli_agent_orchestrator.mcp_server.server.wait_until_terminal_status")

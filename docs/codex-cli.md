@@ -94,6 +94,31 @@ For example, the `code_supervisor` profile includes the `cao-mcp-server` which p
 
 CAO also sets `tool_timeout_sec=600.0` (10 minutes) for each MCP server to allow long-running operations like handoff. **Important**: The value must be a TOML float (`600.0`, not `600`) because Codex deserializes this field via `Option<f64>`. A TOML integer is silently rejected, falling back to the 60-second default.
 
+### Memory Injection
+
+When CAO's memory system is enabled, the built-in `codex_memory` plugin auto-injects
+relevant memories into the project on terminal creation. On `post_create_terminal` for a
+`codex` terminal, it writes a delimited block into `<cwd>/AGENTS.md` — the file Codex CLI
+reads from the working directory as project instructions:
+
+```markdown
+<!-- cao-memory:begin -->
+<cao-memory>
+## Context from CAO Memory
+- [project] testing-framework: Always use pytest for this project
+...
+</cao-memory>
+<!-- cao-memory:end -->
+```
+
+Because `AGENTS.md` is a user-authored, repo-root file, the plugin owns **only** the
+delimited block and replaces it in place on each run — any hand-written content around it
+is preserved (the same approach as the Claude Code `CLAUDE.md` plugin, not Kiro's
+whole-file ownership). The plugin is observer-only: it runs after the terminal is created,
+logs-and-skips on any error, and never crashes `cao-server`. It writes nothing when memory
+is disabled or there are no relevant memories. See [memory.md](memory.md) for the full
+memory system.
+
 ### Launch Flags
 
 The Codex provider automatically adds these flags for tmux compatibility:

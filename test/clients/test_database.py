@@ -691,6 +691,116 @@ class TestInitDb:
         mock_base.metadata.create_all.assert_called_once()
 
 
+class TestTerminalsSchemaMigration:
+    """Tests for the terminals-table column-add migration (caller_id, issue #284)."""
+
+    def test_caller_id_column_added_to_legacy_table(self, tmp_path, monkeypatch):
+        """A pre-#284 terminals table gains the caller_id column."""
+        import sqlite3
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        db_file = tmp_path / "legacy.db"
+        with sqlite3.connect(str(db_file)) as conn:
+            conn.execute(
+                "CREATE TABLE terminals ("
+                "id TEXT PRIMARY KEY, tmux_session TEXT NOT NULL, "
+                "tmux_window TEXT NOT NULL, provider TEXT NOT NULL, "
+                "agent_profile TEXT, allowed_tools TEXT, shell_command TEXT, "
+                "last_active TIMESTAMP)"
+            )
+            conn.execute(
+                "INSERT INTO terminals (id, tmux_session, tmux_window, provider) "
+                "VALUES ('abc12345', 'cao-s', 'w-0', 'kiro_cli')"
+            )
+            conn.commit()
+
+        # _migrate_terminals_schema reads DATABASE_FILE from constants at call time
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.constants.DATABASE_FILE", db_file, raising=False
+        )
+
+        db_mod._migrate_terminals_schema()
+
+        with sqlite3.connect(str(db_file)) as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(terminals)")}
+            rows = conn.execute("SELECT id, caller_id FROM terminals").fetchall()
+        assert "caller_id" in columns
+        assert rows == [("abc12345", None)], "existing rows must get NULL caller_id"
+
+    def test_migration_is_idempotent(self, tmp_path, monkeypatch):
+        """Running the migration twice must not fail or duplicate columns."""
+        import sqlite3
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        db_file = tmp_path / "current.db"
+        with sqlite3.connect(str(db_file)) as conn:
+            conn.execute(
+                "CREATE TABLE terminals ("
+                "id TEXT PRIMARY KEY, tmux_session TEXT NOT NULL, "
+                "tmux_window TEXT NOT NULL, provider TEXT NOT NULL)"
+            )
+            conn.commit()
+
+        # _migrate_terminals_schema reads DATABASE_FILE from constants at call time
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.constants.DATABASE_FILE", db_file, raising=False
+        )
+
+        db_mod._migrate_terminals_schema()
+        db_mod._migrate_terminals_schema()
+
+        with sqlite3.connect(str(db_file)) as conn:
+            columns = [row[1] for row in conn.execute("PRAGMA table_info(terminals)")]
+        assert columns.count("caller_id") == 1
+        assert columns.count("allowed_tools") == 1
+
+
+class TestCallerIdRoundTrip:
+    """caller_id must round-trip create→read (issue #284): a write path that
+    persists it and a read path that drops it would silently break callback
+    routing for every worker."""
+
+    def test_caller_id_round_trips_through_real_db(self, tmp_path, monkeypatch):
+        """create_terminal persists caller_id; get_terminal_metadata returns it."""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        engine = create_engine(f"sqlite:///{tmp_path / 'rt.db'}")
+        Base.metadata.create_all(bind=engine)
+        monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=engine))
+
+        created = create_terminal(
+            "abc12345", "cao-s", "w-0", "kiro_cli", "developer", caller_id="def67890"
+        )
+        assert created["caller_id"] == "def67890"
+
+        fetched = get_terminal_metadata("abc12345")
+        assert fetched is not None
+        assert fetched["caller_id"] == "def67890"
+
+    def test_caller_id_defaults_to_none(self, tmp_path, monkeypatch):
+        """Operator-launched terminals (no caller) round-trip NULL."""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        engine = create_engine(f"sqlite:///{tmp_path / 'rt2.db'}")
+        Base.metadata.create_all(bind=engine)
+        monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=engine))
+
+        created = create_terminal("abc12345", "cao-s", "w-0", "kiro_cli")
+        assert created["caller_id"] is None
+
+        fetched = get_terminal_metadata("abc12345")
+        assert fetched is not None
+        assert fetched["caller_id"] is None
+
+
 class TestProjectAliasMigration:
     """Tests for the project_aliases alias-only primary-key migration."""
 

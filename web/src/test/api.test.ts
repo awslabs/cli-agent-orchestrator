@@ -176,4 +176,82 @@ describe('API wrapper', () => {
     await api.deleteTerminal('t1')
     expect(mockFetch).toHaveBeenCalledWith('/terminals/t1', expect.objectContaining({ method: 'DELETE' }))
   })
+
+  it('getMemoryStatus fetches /settings/memory', async () => {
+    mockResponse({ enabled: true })
+    const result = await api.getMemoryStatus()
+    expect(result).toEqual({ enabled: true })
+    expect(mockFetch).toHaveBeenCalledWith('/settings/memory', expect.objectContaining({ signal: expect.any(AbortSignal) }))
+  })
+
+  it('listMemories fetches /memory without filters', async () => {
+    mockResponse([])
+    await api.listMemories()
+    expect(mockFetch).toHaveBeenCalledWith('/memory', expect.any(Object))
+  })
+
+  it('listMemories includes filters as query params', async () => {
+    mockResponse([])
+    await api.listMemories({ scope: 'project', type: 'reference', scopeId: 'my-proj', limit: 25 })
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/memory?scope=project&type=reference&scope_id=my-proj&limit=25',
+      expect.any(Object)
+    )
+  })
+
+  it('getMemory fetches /memory/{key} with scope and scope_id', async () => {
+    mockResponse({ key: 'my-key', scope: 'session', scope_id: 's1', memory_type: 'user', tags: '', created_at: '', updated_at: '', content: 'hello' })
+    const result = await api.getMemory('my-key', 'session', 's1')
+    expect(result.content).toBe('hello')
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/memory/my-key?scope=session&scope_id=s1',
+      expect.any(Object)
+    )
+  })
+
+  it('getMemory encodes user strings in URL', async () => {
+    mockResponse({})
+    await api.getMemory('a b', 'project', 'p/1')
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/memory/a%20b?scope=project&scope_id=p%2F1',
+      expect.any(Object)
+    )
+  })
+
+  it('deleteMemory sends DELETE with scope and scope_id', async () => {
+    mockResponse({ success: true })
+    await api.deleteMemory('my-key', 'project', 'my-proj')
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/memory/my-key?scope=project&scope_id=my-proj',
+      expect.objectContaining({ method: 'DELETE' })
+    )
+  })
+
+  it('deleteMemory omits scope_id for global scope', async () => {
+    mockResponse({ success: true })
+    await api.deleteMemory('my-key', 'global')
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/memory/my-key?scope=global',
+      expect.objectContaining({ method: 'DELETE' })
+    )
+  })
+
+  it('clearMemories sends DELETE with scope and scope_id', async () => {
+    mockResponse({ success: true, deleted_count: 3 })
+    const result = await api.clearMemories('session', 's 1')
+    expect(result.deleted_count).toBe(3)
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/memory?scope=session&scope_id=s%201',
+      expect.objectContaining({ method: 'DELETE' })
+    )
+  })
+
+  it('clearMemories omits scope_id for global scope', async () => {
+    mockResponse({ success: true, deleted_count: 0 })
+    await api.clearMemories('global')
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/memory?scope=global',
+      expect.objectContaining({ method: 'DELETE' })
+    )
+  })
 })
