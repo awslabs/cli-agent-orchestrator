@@ -1,6 +1,7 @@
 """Unit tests for the Cursor CLI provider."""
 
 import re
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -13,6 +14,7 @@ from cli_agent_orchestrator.providers.cursor_cli import (
     IDLE_PROMPT_PATTERN_LOG,
     PERMISSION_PROMPT_PATTERN,
     PROCESSING_PATTERN,
+    SEPARATOR_PATTERN,
     TRUST_PROMPT_PATTERN,
     WAITING_USER_ANSWER_PATTERN,
     CursorCliProvider,
@@ -25,6 +27,22 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 def load_fixture(name: str) -> str:
     """Load a plain-text fixture file."""
     return (FIXTURES_DIR / name).read_text(encoding="utf-8")
+
+
+@pytest.fixture(autouse=True)
+def _stub_cursor_binary():
+    """Make ``shutil.which('agent')`` succeed for the duration of every
+    test in this module so the build_command / initialize paths don't
+    raise ``ProviderError('Cursor CLI not found')``.
+
+    Tests that need to exercise the legacy-alias fallback override
+    this via ``mock_which``.
+    """
+    with patch(
+        "cli_agent_orchestrator.providers.cursor_cli.shutil.which",
+        return_value="/usr/bin/agent",
+    ):
+        yield
 
 
 def make_provider(
@@ -89,6 +107,89 @@ class TestRegexPatterns:
     def test_ansi_strips_truecolor(self):
         text = "\x1b[38;2;255;100;50mHello\x1b[0m"
         assert re.sub(ANSI_CODE_PATTERN, "", text) == "Hello"
+
+    def test_idle_prompt_is_start_of_line_anchored(self):
+        # Copilot review #3411781807: IDLE_PROMPT_PATTERN must be
+        # anchored to start-of-line so it does NOT match the
+        # leading "❯ " on echoed user input lines (e.g.
+        # "❯ Summarize…") or any "> " inside response content.
+        # The pattern is also what the regex module anchors; we
+        # verify by passing multi-line input and inspecting the
+        # match positions.
+        ip = re.compile(IDLE_PROMPT_PATTERN, re.MULTILINE)
+        # A line-anchored prompt: only one match at offset 0.
+        text = "\u276f Summarize this file"
+        matches = list(ip.finditer(text))
+        assert len(matches) == 1
+        assert matches[0].start() == 0
+
+    def test_idle_prompt_rejects_arrow_in_response_content(self):
+        # A ">" or "❯" character in the middle of a response
+        # body (e.g. "use > to redirect" or "return > 0") must
+        # NOT be matched as an idle prompt.
+        ip = re.compile(IDLE_PROMPT_PATTERN, re.MULTILINE)
+        # "use > to redirect" — the ">" is preceded by " " (a
+        # space), so the pattern's `^\s*` anchor fails to match
+        # at that position; MULTILINE `^` only matches at line
+        # start.
+        text = "use > to redirect output"
+        assert list(ip.finditer(text)) == []
+        # Same for an in-line "❯" surrounded by text.
+        text2 = "the answer is \u276f 42"
+        assert list(ip.finditer(text2)) == []
+
+    def test_idle_prompt_log_is_start_of_line_anchored(self):
+        # Copilot review #3411781846: IDLE_PROMPT_PATTERN_LOG has
+        # the same over-broad matching problem as IDLE_PROMPT_PATTERN.
+        ip = re.compile(IDLE_PROMPT_PATTERN_LOG, re.MULTILINE)
+        text = "use > to redirect"
+        assert list(ip.finditer(text)) == []
+
+
+# ---------------------------------------------------------------------------
+# SEPARATOR_PATTERN
+# ---------------------------------------------------------------------------
+
+
+class TestSeparatorPattern:
+    def test_matches_plain_separator(self):
+        # Baseline: a plain ──…── line.
+        sep = "\u2500" * 22
+        assert re.search(SEPARATOR_PATTERN, sep, re.MULTILINE)
+
+    def test_matches_csi_before_dash_run(self):
+        # The original case: a single CSI before the entire dash run.
+        sep = "\x1b[38;5;245m" + ("\u2500" * 22) + "\x1b[0m"
+        assert re.search(SEPARATOR_PATTERN, sep, re.MULTILINE)
+
+    def test_matches_csi_between_dashes(self):
+        # Copilot review #3411781900 / #3411781914: the separator
+        # regex must tolerate CSI sequences *between* the ─
+        # characters, not just before the entire run. Cursor
+        # re-renders the separator in place with new colour escapes
+        # on every prompt, so the byte stream looks like
+        # `\x1b[38;5;245m──\x1b[0m──\x1b[38;5;245m──` (CSIs
+        # interleaved between dashes). Build a 22-dash line with
+        # CSIs after every two dashes; the regex must still
+        # consume the full line.
+        dash_run = "\u2500" * 22
+        # Insert a CSI every 2 dashes
+        interleaved = ""
+        for i, ch in enumerate(dash_run):
+            interleaved += ch
+            if (i + 1) % 2 == 0 and i < len(dash_run) - 1:
+                interleaved += "\x1b[0m"
+        # Wrap with leading SGR to mimic a TUI re-render
+        sep = "\x1b[38;5;245m" + interleaved
+        assert re.search(SEPARATOR_PATTERN, sep, re.MULTILINE)
+
+    def test_does_not_match_dash_sequence_inside_content(self):
+        # Copilot review: the regex must not match a stray dash
+        # sequence inside response content. The pattern is anchored
+        # to a full line so a 20+-dash substring embedded in a
+        # longer line is not matched.
+        bad = "Here is some code: " + ("\u2500" * 22) + " done"
+        assert not re.search(SEPARATOR_PATTERN, bad, re.MULTILINE)
 
 
 # ---------------------------------------------------------------------------
@@ -474,6 +575,67 @@ class TestBuildCommand:
 
 
 # ---------------------------------------------------------------------------
+# _build_cursor_command() — binary resolution
+# ---------------------------------------------------------------------------
+
+
+class TestBuildCommandBinaryResolution:
+    """Copilot review #3411781886: ``_build_cursor_command`` must
+    fall back to the legacy ``cursor-agent`` binary when the
+    primary ``agent`` binary is missing on the host.
+    """
+
+    def test_prefers_agent_when_both_available(self):
+        # The autouse fixture already returns '/usr/bin/agent' for
+        # shutil.which. Confirm the resulting command starts with
+        # the primary name.
+        with patch("cli_agent_orchestrator.providers.cursor_cli.shutil.which") as mock_which:
+            mock_which.side_effect = lambda name: ("/usr/bin/agent" if name == "agent" else None)
+            with patch(
+                "cli_agent_orchestrator.providers.cursor_cli.load_agent_profile",
+                side_effect=FileNotFoundError("no profile"),
+            ):
+                provider = make_provider()
+                cmd = provider._build_cursor_command()
+        assert cmd.startswith("agent ")
+
+    def test_falls_back_to_cursor_agent_when_agent_missing(self):
+        # When only the legacy alias is on PATH, the command must
+        # invoke it so the launch does not hard-fail on older
+        # installations pinned to the historical name.
+        def fake_which(name):
+            if name == "agent":
+                return None
+            if name == "cursor-agent":
+                return "/usr/local/bin/cursor-agent"
+            return None
+
+        with patch(
+            "cli_agent_orchestrator.providers.cursor_cli.shutil.which",
+            side_effect=fake_which,
+        ):
+            with patch(
+                "cli_agent_orchestrator.providers.cursor_cli.load_agent_profile",
+                side_effect=FileNotFoundError("no profile"),
+            ):
+                provider = make_provider()
+                cmd = provider._build_cursor_command()
+        assert cmd.startswith("cursor-agent ")
+        assert "--force" in cmd
+
+    def test_raises_when_neither_binary_installed(self):
+        # Both binaries missing: a clear ProviderError with an
+        # install-from message.
+        with patch(
+            "cli_agent_orchestrator.providers.cursor_cli.shutil.which",
+            return_value=None,
+        ):
+            provider = make_provider()
+            with pytest.raises(ProviderError, match="Cursor CLI not found"):
+                provider._build_cursor_command()
+
+
+# ---------------------------------------------------------------------------
 # initialize() — async with new get_backend pattern
 # ---------------------------------------------------------------------------
 
@@ -539,6 +701,47 @@ class TestInitialize:
         await provider.initialize()
         sent = mock_backend.return_value.send_keys.call_args.args[2]
         assert "--model gpt-5" in sent
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.cursor_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.cursor_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.cursor_cli.get_backend")
+    async def test_initialize_arms_stickiness_gate(self, mock_backend, mock_shell, mock_wait):
+        # Copilot review #3411781865: initialize() must call
+        # status_monitor.notify_input_sent() before send_keys so
+        # the launching command can drive a fresh PROCESSING
+        # transition past any stale ready latch. Without this,
+        # a previously-latched IDLE/COMPLETED would suppress the
+        # genuine PROCESSING transition that follows.
+        #
+        # The status_monitor module is imported lazily inside
+        # initialize() to break a circular import
+        # (status_monitor imports provider_manager which imports
+        # cursor_cli), so we install a sentinel module into
+        # sys.modules with a status_monitor attribute. The lazy
+        # ``from cli_agent_orchestrator.services.status_monitor
+        # import status_monitor`` inside initialize() resolves
+        # through sys.modules and binds the sentinel
+        # ``status_monitor`` name in the cursor_cli module's
+        # namespace.
+        sentinel_status_monitor = MagicMock()
+        sentinel_module = type(sys)("fake_status_monitor")
+        sentinel_module.status_monitor = sentinel_status_monitor
+
+        mock_shell.return_value = True
+        mock_wait.return_value = True
+        provider = make_provider()
+
+        with patch.dict(
+            "sys.modules",
+            {"cli_agent_orchestrator.services.status_monitor": sentinel_module},
+            clear=False,
+        ):
+            await provider.initialize()
+
+        sentinel_status_monitor.notify_input_sent.assert_called_once_with(provider.terminal_id)
+        # And send_keys must have been called.
+        assert mock_backend.return_value.send_keys.call_count == 1
 
 
 # ---------------------------------------------------------------------------

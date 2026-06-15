@@ -30,6 +30,7 @@ import json
 import logging
 import re
 import shlex
+import shutil
 from typing import Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
@@ -62,7 +63,15 @@ PROCESSING_PATTERN = r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✶✢✽✻✳·][^\n]*\u
 
 # Cursor CLI's REPL prompt is a "❯" character (right arrow) with optional
 # space / non-breaking space, identical in shape to Claude Code's prompt.
-IDLE_PROMPT_PATTERN = r"[❯>][\s\xa0]"
+# The pattern is anchored to the start of a line (with optional SGR colour
+# codes before the prompt) so it does NOT match the leading "❯ " on echoed
+# user input lines (e.g. "❯ Summarize…") or any "> " inside response
+# content. This matches the claude_code provider's _SOL_IDLE_RE pattern.
+IDLE_PROMPT_PATTERN = r"^\s*(?:\x1b\[[0-9;]*m)*[❯>](?:\x1b\[[0-9;]*m)*[\s\xa0]"
+
+# Same pattern for log files (no ANSI involved). Still start-of-line
+# anchored so the log pre-check is consistent with live status detection.
+IDLE_PROMPT_PATTERN_LOG = r"^\s*[❯>][\s\xa0]"
 
 # Footer shown while a TUI selection widget is active (mode picker, model
 # picker, file completion overlay).
@@ -78,8 +87,20 @@ PERMISSION_PROMPT_PATTERN = (
     r"(?:do you want to (?:allow|run)|approve this action|\[\s*y\s*/\s*n\s*\])"
 )
 
-# Same pattern for log files (no ANSI involved).
-IDLE_PROMPT_PATTERN_LOG = r"[❯>][\s\xa0]"
+# Separator regex. Matches a contiguous run of at least 20 box-drawing
+# horizontal characters (U+2500), with an optional CSI escape between any
+# two consecutive dashes. This is the correct "CSI interleaved with the
+# separator" pattern: Cursor's TUI re-renders the separator in place
+# with new colour escapes on every prompt, so the byte stream looks
+# like:
+#   ─\x1b[0m──\x1b[38;5;245m──\x1b[0m──…
+# The pattern is anchored to a full line (``^…$``) so we don't match
+# a stray dash sequence inside response content.
+# Intermediate bytes are restricted to the ECMA-48 param range
+# (0x30-0x3F) so a stray ``ESC [`` introducer is not consumed.
+SEPARATOR_PATTERN = (
+    r"^(?:\x1b\[[\x30-\x3F]*[\x40-\x7E])?(?:\u2500(?:\x1b\[[\x30-\x3F]*[\x40-\x7E])?){20,}$"
+)
 
 
 class CursorCliProvider(BaseProvider):
@@ -171,7 +192,23 @@ class CursorCliProvider(BaseProvider):
             except Exception as exc:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {exc}")
 
-        command_parts = ["agent"]
+        # Resolve the binary: prefer Cursor's documented primary
+        # command ``agent``; fall back to the legacy ``cursor-agent``
+        # alias when only that one is installed (e.g. older macOS
+        # installs pinned to the historical name). The e2e skip
+        # fixture in test/e2e/conftest.py::require_cursor accepts
+        # either name, so the launch should behave consistently.
+        if shutil.which("agent"):
+            binary = "agent"
+        elif shutil.which("cursor-agent"):
+            binary = "cursor-agent"
+        else:
+            raise ProviderError(
+                "Cursor CLI not found: neither 'agent' nor 'cursor-agent' is on $PATH. "
+                "Install from https://cursor.com/cli"
+            )
+
+        command_parts = [binary]
 
         # Approval + trust flags. We always pass --force when running
         # under CAO so per-tool approval prompts do not block handoff /
@@ -262,6 +299,17 @@ class CursorCliProvider(BaseProvider):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
         command = self._build_cursor_command()
+        # Arm the StatusMonitor stickiness gate so the launching
+        # command can drive a fresh PROCESSING transition past any
+        # stale ready latch. Without this, a previously-latched
+        # IDLE/COMPLETED would suppress the genuine PROCESSING
+        # transition that follows once Cursor starts loading.
+        # Imported lazily to avoid a circular import: the
+        # status_monitor module imports provider_manager, which
+        # imports this module.
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        status_monitor.notify_input_sent(self.terminal_id)
         get_backend().send_keys(self.session_name, self.window_name, command)
 
         # Wait for Cursor CLI to fully initialize. Accept both IDLE
@@ -314,13 +362,19 @@ class CursorCliProvider(BaseProvider):
         # another separator first, the spinner is from a completed
         # task and should be ignored. Mirrors the Claude Code
         # provider's structural fix for the stale-spinner bug.
-        # The separator regex tolerates any CSI sequence (not just
-        # SGR) between the box-drawing characters — Cursor
-        # re-renders the separator with new colour escapes on
-        # every prompt, and we must not miss it. The intermediate
-        # byte range is restricted to the ECMA-48 param bytes
-        # (0x30-0x3F) so a stray ``ESC [`` is not consumed.
-        _sep_re = re.compile(r"(?:\x1b\[[\x30-\x3F]*[\x40-\x7E])*\u2500{20,}")
+        # The separator regex tolerates any CSI sequence interleaved
+        # *between* the box-drawing characters — Cursor re-renders
+        # the separator with new colour escapes on every prompt, and
+        # we must not miss it. Intermediate bytes are restricted to
+        # the ECMA-48 param range (0x30-0x3F) so a stray ``ESC [``
+        # is not consumed. The pattern is anchored to a full line
+        # (``^...$``) so a stray dash sequence inside response
+        # content is not matched.
+        # The separator regex is anchored to a full line (``^…$``);
+        # the ``MULTILINE`` flag is required so ``^`` and ``$``
+        # match at every line start/end, not just the buffer
+        # start/end.
+        _sep_re = re.compile(SEPARATOR_PATTERN, re.MULTILINE)
         _sep_positions = [m.start() for m in _sep_re.finditer(clean)]
         if _sep_positions:
             pre_sep_lines = clean[: _sep_positions[-1]].rstrip("\n").split("\n")
@@ -331,18 +385,21 @@ class CursorCliProvider(BaseProvider):
                     break
 
         # Find the LAST occurrence of each marker for fallback
-        # position checks.
+        # position checks. ``IDLE_PROMPT_PATTERN`` is line-anchored
+        # (see its definition) so re.findall across the full buffer
+        # only matches true prompt lines, never the leading
+        # ``❯ <text>`` of an echoed user input line.
         last_processing = None
         for m in re.finditer(PROCESSING_PATTERN, clean):
             last_processing = m
 
         last_idle = None
-        for m in re.finditer(IDLE_PROMPT_PATTERN, clean):
+        for m in re.finditer(IDLE_PROMPT_PATTERN, clean, re.MULTILINE):
             last_idle = m
 
         # FALLBACK PROCESSING: spinner visible AND no separator follows
         # it yet (early in execution before the separator appears).
-        if last_processing and not re.search(r"\u2500{20,}", clean):
+        if last_processing and not _sep_re.search(clean):
             if last_idle is None or last_processing.start() > last_idle.start():
                 return TerminalStatus.PROCESSING
 
@@ -417,16 +474,24 @@ class CursorCliProvider(BaseProvider):
         Raises:
             ValueError: When no response boundary is detected.
         """
-        # Match a separator line, allowing ANY CSI sequence (not just
-        # SGR) to appear between the box-drawing characters. Cursor
-        # re-renders the separator with new colour escapes on every
-        # prompt, so ``\x1b[38;5;245m──\x1b[0m──\x1b[38;5;245m──``
-        # (multiple SGR segments inside the line) must still match.
-        # Intermediate bytes are restricted to the ECMA-48 param
-        # range (0x30-0x3F) so a stray ``ESC [`` is not consumed.
-        _sep_re = re.compile(r"(?:\x1b\[[\x30-\x3F]*[\x40-\x7E])*\u2500{20,}")
+        # Match a separator line, with ANY CSI sequence (not just
+        # SGR) interleaved between the box-drawing characters.
+        # Cursor re-renders the separator with new colour escapes
+        # on every prompt, so the byte stream looks like
+        # ``\x1b[38;5;245m──\x1b[0m──\x1b[38;5;245m──`` — the
+        # pattern must accept CSI inside the dash run, not just
+        # before it. Intermediate bytes are restricted to the
+        # ECMA-48 param range (0x30-0x3F) so a stray ``ESC [`` is
+        # not consumed. The pattern is anchored to a full line
+        # (``^...$``) so a stray dash sequence inside response
+        # content is not matched.
+        # The separator regex is anchored to a full line (``^…$``);
+        # the ``MULTILINE`` flag is required so ``^`` and ``$``
+        # match at every line start/end, not just the buffer
+        # start/end.
+        _sep_re = re.compile(SEPARATOR_PATTERN, re.MULTILINE)
         separators = list(_sep_re.finditer(script_output))
-        idle_matches = list(re.finditer(IDLE_PROMPT_PATTERN, script_output))
+        idle_matches = list(re.finditer(IDLE_PROMPT_PATTERN, script_output, re.MULTILINE))
 
         if not separators or not idle_matches:
             raise ValueError(
