@@ -78,6 +78,17 @@ IDLE_PROMPT_PATTERN_LOG = r"^\s*[❯>][\s\xa0]"
 # picker, file completion overlay).
 WAITING_USER_ANSWER_PATTERN = r"↑/↓ to navigate"
 
+# v2026+ TUI processing indicator. When the agent is actively working
+# on a turn, Cursor renders the input-box line with the placeholder
+# text followed by "ctrl+c to stop" on the same line — this is the
+# "you can interrupt me with Ctrl+C" hint. The indicator is absent
+# on every other state (idle, completed, freshly launched, brand-new
+# TUI). The placeholder itself ("Add a follow-up" / "Plan, search,
+# build anything") is ALWAYS present in v2026 regardless of state,
+# so it cannot distinguish idle from processing on its own — the
+# presence / absence of "ctrl+c to stop" is the reliable signal.
+TUI_PROCESSING_INDICATOR_PATTERN = r"ctrl\+c to stop"
+
 # Workspace trust dialog (Cursor asks once per directory the first time the
 # agent is launched there).
 TRUST_PROMPT_PATTERN = r"do you trust (?:the )?files? in this folder|confirm folder trust"
@@ -107,18 +118,24 @@ SEPARATOR_PATTERN = (
 # `❯` prompt and the `─────` separator are no longer emitted as text in
 # the pipe-pane buffer — they are rendered as TUI widgets. The only
 # stable, plain-text signal the TUI emits into the scrollback is the
-# input-box placeholder ("Plan, search, build anything") plus the status
-# bar ("Composer 2.5 Fast" / "Run Everything"). Cursor REPLACES the
-# placeholder with the user's text on submit and only redraws it once
-# the agent has finished a turn, so the presence/absence of this
-# placeholder is a reliable idle/processing signal even though the
-# placeholder itself is no longer "an idle prompt" in the text-mode
-# sense.
+# input-box placeholder plus the status bar ("Composer 2.5 Fast" /
+# "Run Everything"). Cursor REPLACES the placeholder with the user's
+# text on submit and only redraws it once the agent has finished a
+# turn, so the presence/absence of this placeholder is a reliable
+# idle/processing signal even though the placeholder itself is no
+# longer "an idle prompt" in the text-mode sense.
 #
-# Match is intentionally case-insensitive: the rendered text has
-# application-level i18n hooks and a few builds render the leading
-# "Plan" as "plan" depending on the locale.
-TUI_PLACEHOLDER_PATTERN = r"Plan, search, build anything"
+# The exact placeholder text varies by conversation state:
+#
+#   * fresh launch, no prior turns:    ``Plan, search, build anything``
+#   * after the first user turn:       ``Add a follow-up``
+#
+# Both are emitted as a single string in the input-box line; either
+# indicates the input box is empty and the agent is ready for the
+# next turn. We match either of them. The pattern is intentionally
+# case-insensitive: a few builds render "plan" lower-case depending
+# on the locale.
+TUI_PLACEHOLDER_PATTERN = r"(?:Plan, search, build anything|Add a follow-up)"
 TUI_STATUS_BAR_PATTERN = r"Run Everything|Composer \d"
 
 
@@ -473,15 +490,19 @@ class CursorCliProvider(BaseProvider):
         patterns in priority order:
 
         1. Empty / None output → UNKNOWN
-        2. PROCESSING — Cursor CLI v2026+ TUI placeholder-absent signal
+        2. PROCESSING — Cursor CLI v2026+ TUI: ``ctrl+c to stop``
+           indicator on the input-box line. Cursor renders this
+           every frame the agent is working on a turn; it disappears
+           once the response is fully delivered and the input box
+           is back to the placeholder alone.
         3. PROCESSING — structural spinner-before-separator check
-           (older text-mode Cursor builds)
-        4. PROCESSING — fallback spinner visible with no separator
+           (older text-mode Cursor builds).
+        4. PROCESSING — fallback spinner visible with no separator.
         5. WAITING_USER_ANSWER — TUI selection footer or trust /
-           permission prompt
+           permission prompt.
         6. IDLE / COMPLETED — TUI placeholder present (v2026+) OR
-           idle prompt present (older text-mode builds)
-        7. UNKNOWN — fallback when no marker matches
+           idle prompt present (older text-mode builds).
+        7. UNKNOWN — fallback when no marker matches.
 
         Args:
             output: Raw terminal output (rolling buffer, up to ~8KB).
@@ -499,6 +520,154 @@ class CursorCliProvider(BaseProvider):
         clean = strip_terminal_escapes(output)
 
         # =================================================================
+        # v2026+ TUI detection — primary signal: "ctrl+c to stop".
+        # =================================================================
+        # Cursor CLI v2026.x runs a full Ink/TUI in interactive mode.
+        # The `❯` prompt and the `─────` separator that older builds
+        # emitted as plain text are now rendered as TUI widgets and
+        # never reach the pipe-pane buffer (issue #299).
+        #
+        # The TUI *does* still emit two plain-text signals into the
+        # pipe-pane stream:
+        #
+        #   * the input-box placeholder — "Plan, search, build
+        #     anything" on a fresh launch, "Add a follow-up" after
+        #     the first turn. Always present in v2026 regardless of
+        #     agent state, so it cannot distinguish idle from
+        #     processing on its own.
+        #   * the "ctrl+c to stop" hint, which Cursor renders on the
+        #     same line as the placeholder while the agent is
+        #     actively working on a turn. Absent on every other
+        #     state (idle, completed, freshly launched, brand-new
+        #     TUI). This is the reliable processing signal.
+        #
+        # We check the *tail* of the buffer (last ~1KB) so a long
+        # response that scrolls older processing markers out of the
+        # rolling 8KB window does not flip us back to IDLE during
+        # processing. The 1KB window is well below the 8KB buffer
+        # cap, and the input-box line is rendered in the last few
+        # hundred bytes on every Cursor TUI frame, so the indicator
+        # is always present in the tail whenever the agent is
+        # working.
+        TUI_TAIL_WINDOW = 1024
+        tail = clean[-TUI_TAIL_WINDOW:]
+        processing_indicator_in_tail = (
+            re.search(TUI_PROCESSING_INDICATOR_PATTERN, tail, re.IGNORECASE)
+            is not None
+        )
+        placeholder_in_tail = (
+            re.search(TUI_PLACEHOLDER_PATTERN, tail, re.IGNORECASE) is not None
+        )
+
+        if processing_indicator_in_tail:
+            # Primary v2026+ PROCESSING signal: the "ctrl+c to stop"
+            # hint is on the input-box line. Cursor renders this
+            # every frame the agent is working on a turn.
+            #
+            # We still let the WAITING_USER_ANSWER / trust /
+            # permission checks below run first — those are
+            # interactive prompts that take precedence over a
+            # plain processing state.
+            tui_processing = True
+        else:
+            tui_processing = False
+
+        # PRIMARY PROCESSING check (older text-mode Cursor builds):
+        # walk backwards from the *last* separator. If a spinner
+        # line appears before another separator, the agent is
+        # actively processing. If we hit another separator first,
+        # the spinner is from a completed task and should be
+        # ignored. Mirrors the Claude Code provider's structural
+        # fix for the stale-spinner bug.
+        # The separator regex is anchored to a full line (``^…$``);
+        # the ``MULTILINE`` flag is required so ``^`` and ``$``
+        # match at every line start/end, not just the buffer
+        # start/end.
+        _sep_re = re.compile(SEPARATOR_PATTERN, re.MULTILINE)
+        _sep_positions = [m.start() for m in _sep_re.finditer(clean)]
+        if _sep_positions:
+            pre_sep_lines = clean[: _sep_positions[-1]].rstrip("\n").split("\n")
+            for line in reversed(pre_sep_lines):
+                if re.search(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✶✢✽✻✳·][^\n]*\u2026", line):
+                    return TerminalStatus.PROCESSING
+                if _sep_re.search(line):
+                    break
+
+        # Find the LAST occurrence of each marker for fallback
+        # position checks. ``IDLE_PROMPT_PATTERN`` is line-anchored
+        # (see its definition) so re.findall across the full buffer
+        # only matches true prompt lines, never the leading
+        # ``❯ <text>`` of an echoed user input line.
+        last_processing = None
+        for m in re.finditer(PROCESSING_PATTERN, clean):
+            last_processing = m
+
+        last_idle = None
+        for m in re.finditer(IDLE_PROMPT_PATTERN, clean, re.MULTILINE):
+            last_idle = m
+
+        # FALLBACK PROCESSING: spinner visible AND no separator follows
+        # it yet (early in execution before the separator appears).
+        if last_processing and not _sep_re.search(clean):
+            if last_idle is None or last_processing.start() > last_idle.start():
+                return TerminalStatus.PROCESSING
+
+        # Check for active TUI selection widgets (mode picker, model
+        # picker, etc.) which show a ↑/↓ navigation footer. Exclude
+        # the trust/permission dialogs, which are separate states.
+        if (
+            re.search(WAITING_USER_ANSWER_PATTERN, clean)
+            and not re.search(TRUST_PROMPT_PATTERN, clean, re.IGNORECASE)
+            and not re.search(PERMISSION_PROMPT_PATTERN, clean, re.IGNORECASE)
+        ):
+            return TerminalStatus.WAITING_USER_ANSWER
+
+        # Trust / permission dialogs are an interactive prompt that
+        # blocks the agent until the operator accepts. Treat them as
+        # WAITING_USER_ANSWER.
+        if re.search(TRUST_PROMPT_PATTERN, clean, re.IGNORECASE) or re.search(
+            PERMISSION_PROMPT_PATTERN, clean, re.IGNORECASE
+        ):
+            return TerminalStatus.WAITING_USER_ANSWER
+
+        # v2026+ TUI: "ctrl+c to stop" is on the input-box line.
+        # This is the primary PROCESSING signal. We also require
+        # the status bar to be present so a half-initialised TUI
+        # does not false-positive.
+        if tui_processing and re.search(TUI_STATUS_BAR_PATTERN, clean):
+            return TerminalStatus.PROCESSING
+
+        # IDLE / COMPLETED: an idle prompt at the bottom of the buffer
+        # indicates the agent has finished its turn (or is freshly
+        # initialized and waiting for input). We do not differentiate
+        # IDLE vs COMPLETED on the position of an idle prompt alone —
+        # message extraction is the source of truth for the response
+        # payload; CAO's status machine only needs to know the agent
+        # is no longer working. We report COMPLETED to match the
+        # other providers' convention (the supervisor inbox accepts
+        # COMPLETED as a "ready" signal).
+        if last_idle:
+            return TerminalStatus.COMPLETED
+
+        # v2026+ TUI IDLE: no "ctrl+c to stop" indicator on the
+        # input-box line AND the status bar is visible. The
+        # placeholder is always present in v2026 regardless of
+        # state, so it is the *absence* of the processing
+        # indicator that distinguishes idle / completed from
+        # processing. We require the status bar to be present
+        # too so a half-initialised TUI does not false-positive.
+        if not processing_indicator_in_tail and re.search(TUI_STATUS_BAR_PATTERN, clean):
+            return TerminalStatus.COMPLETED
+
+        return TerminalStatus.UNKNOWN
+
+        # Strip the RAW pipe-pane escapes (cursor positioning, in-place
+        # redraws), not just SGR colour codes — otherwise cursor
+        # sequences survive and the structural checks below misfire on
+        # the raw stream.
+        clean = strip_terminal_escapes(output)
+
+        # =================================================================
         # v2026+ TUI detection.
         # =================================================================
         # Cursor CLI v2026.x runs a full Ink/TUI in interactive mode.
@@ -506,14 +675,15 @@ class CursorCliProvider(BaseProvider):
         # emitted as plain text are now rendered as TUI widgets and
         # never reach the pipe-pane buffer (issue #299). The only
         # stable, plain-text signal the v2026 TUI emits is the
-        # input-box placeholder "Plan, search, build anything",
+        # input-box placeholder — "Plan, search, build anything" on
+        # a fresh launch, "Add a follow-up" after the first turn —
         # which Cursor REPLACES with the user's text on submit and
         # only redraws once the response is fully delivered. We use
         # the *absence* of the placeholder in the tail of the buffer
         # as a positive PROCESSING signal — the user has submitted
         # and the agent is working (or has worked and the response
-        # is rendering). Its *presence* in the tail means the input
-        # box is empty and the agent is ready for the next turn.
+        # is rendering). Its *presence* means the input box is empty
+        # and the agent is ready for the next turn.
         #
         # We only consult the tail of the buffer (last ~1KB) so a
         # long response that scrolls the placeholder out of the

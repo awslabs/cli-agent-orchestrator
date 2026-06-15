@@ -16,6 +16,7 @@ from cli_agent_orchestrator.providers.cursor_cli import (
     PROCESSING_PATTERN,
     SEPARATOR_PATTERN,
     TUI_PLACEHOLDER_PATTERN,
+    TUI_PROCESSING_INDICATOR_PATTERN,
     TUI_STATUS_BAR_PATTERN,
     TRUST_PROMPT_PATTERN,
     WAITING_USER_ANSWER_PATTERN,
@@ -303,6 +304,17 @@ class TestGetStatusV2026Tui:
         provider = make_provider()
         assert provider.get_status(output) == TerminalStatus.COMPLETED
 
+    def test_v2026_post_turn_idle_fixture_returns_completed(self):
+        # v2026 swaps the input-box placeholder from "Plan,
+        # search, build anything" (fresh launch) to "Add a
+        # follow-up" after the first user turn. The status
+        # detector must still classify this post-turn idle
+        # state as COMPLETED so the supervisor inbox can pick
+        # up the response on the next turn.
+        output = load_fixture("cursor_cli_v2026_post_turn_idle_output.txt")
+        provider = make_provider()
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
     def test_v2026_processing_fixture_returns_processing(self):
         # The processing fixture has the placeholder replaced by
         # user-typed text ("say hello in 3 words"). No `❯`, no
@@ -334,16 +346,23 @@ class TestGetStatusV2026Tui:
         assert provider.get_status(output) == TerminalStatus.COMPLETED
 
     def test_synthetic_v2026_processing_placeholder_replaced(self):
-        # Same buffer as the idle case, but the placeholder has
-        # been replaced by the user's submitted text. The status
-        # bar is still visible so the buffer looks fully rendered,
-        # not half-initialised.
+        # The v2026 TUI marks active processing with "ctrl+c to
+        # stop" on the input-box line, not by removing the
+        # placeholder. The placeholder is ALWAYS present in v2026
+        # regardless of agent state, so the previous test (which
+        # stripped the placeholder to fake "processing") was
+        # modelling the wrong v2026 behaviour. The correct v2026
+        # processing state keeps the placeholder AND adds
+        # "ctrl+c to stop" on the same line.
         output = (
             "  Cursor Agent\n"
             "  v2026.06.15-03-48-54-da23e37\n"
             "\n"
-            "  \x1b[48;5;233m \x1b[2m→ \x1b[0;7msay hello in 3 words\x1b[0m"
-            "\x1b[48;5;233m                                                  \x1b[49m\n"
+            "  \x1b[48;5;233m \x1b[2m→ \x1b[0;7m"
+            "Add a follow-up\x1b[0m"
+            "                                                    "
+            "    \x1b[2mctrl+c to stop\x1b[0m"
+            " \x1b[49m\n"
             "  \x1b[48;5;233m                                                                       \x1b[49m\n"
             "\n"
             "  \x1b[2mComposer 2.5 Fast\x1b[0m"
@@ -353,31 +372,33 @@ class TestGetStatusV2026Tui:
         assert provider.get_status(output) == TerminalStatus.PROCESSING
 
     def test_processing_window_only_checks_tail_of_buffer(self):
-        # A 4KB buffer that contains the placeholder in the first
-        # 3KB but NOT in the last 1KB must classify as PROCESSING
-        # — long responses evict the placeholder from the visible
-        # tail even though it is still in the scrollback. The
-        # status bar is also absent from the tail so the
-        # processing-positive branch (which requires the status
-        # bar) does not fire; the absence of the placeholder in
-        # the tail combined with no `❯` separator matches means
-        # the status is UNKNOWN. We assert the specific contract:
-        # the TUI TAIL WINDOW matters, not the full buffer.
+        # A 4KB buffer where the input-box line was rendered with
+        # the "ctrl+c to stop" indicator early in the buffer (so it
+        # has scrolled out of the 1KB TUI TAIL WINDOW) but the
+        # agent is no longer working. The tail of the buffer
+        # therefore has the status bar and the placeholder but no
+        # processing indicator, and we must classify the state as
+        # COMPLETED (post-turn idle). This is the inverse of the
+        # long-response-in-head test below.
         padding = "x" * 3500
         output = (
-            "Plan, search, build anything\n"  # placeholder in head
+            "  \x1b[48;5;233m \x1b[2m→ \x1b[0;7m"
+            "Add a follow-up\x1b[0m"
+            "                                                    "
+            "    \x1b[2mctrl+c to stop\x1b[0m"
+            " \x1b[49m\n"
             + padding
             + "\n" * 50
             + "  \x1b[2mComposer 2.5 Fast\x1b[0m"
             "                                             \x1b[35mRun Everything\x1b[39m\n"
         )
-        # Sanity: the placeholder is in the head, not in the tail.
-        assert "Plan, search, build anything" in output
-        assert "Plan, search, build anything" not in output[-1024:]
+        # Sanity: the indicator is in the head, not in the tail.
+        assert "ctrl+c to stop" in output
+        assert "ctrl+c to stop" not in output[-1024:]
         provider = make_provider()
-        # The tail has the status bar but no placeholder, so the
-        # processing-positive branch fires.
-        assert provider.get_status(output) == TerminalStatus.PROCESSING
+        # The tail has the status bar and the placeholder but no
+        # "ctrl+c to stop" — this is the post-turn idle state.
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
 
     def test_idle_placeholder_with_long_response_in_head(self):
         # Inverse of the previous test: a long response was
@@ -401,13 +422,63 @@ class TestGetStatusV2026Tui:
         provider = make_provider()
         assert provider.get_status(output) == TerminalStatus.COMPLETED
 
+    def test_processing_indicator_in_tail_returns_processing(self):
+        # The new v2026+ TUI signal: "ctrl+c to stop" on the
+        # input-box line. The placeholder is still present in
+        # v2026 regardless of state, so it is the presence /
+        # absence of this indicator that distinguishes
+        # processing from idle.
+        output = (
+            "  Cursor Agent\n"
+            "  v2026.06.15-03-48-54-da23e37\n"
+            "\n"
+            "  ⠠⠛ Composing  23 tokens\n"
+            "\n"
+            "  \x1b[48;5;233m \x1b[2m→ \x1b[0;7m"
+            "Add a follow-up\x1b[0m"
+            "                                                    "
+            "    \x1b[2mctrl+c to stop\x1b[0m"
+            " \x1b[49m\n"
+            "  \x1b[2mComposer 2.5 Fast\x1b[0m"
+            "                                             \x1b[35mRun Everything\x1b[39m\n"
+        )
+        provider = make_provider()
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    def test_processing_indicator_pattern_documented(self):
+        # Pattern sanity check: TUI_PROCESSING_INDICATOR_PATTERN
+        # matches the v2026+ TUI hint, and does not spuriously
+        # match idle / completed buffers.
+        assert re.search(
+            TUI_PROCESSING_INDICATOR_PATTERN, "ctrl+c to stop", re.IGNORECASE
+        )
+        assert re.search(
+            TUI_PROCESSING_INDICATOR_PATTERN,
+            "  ctrl+c to stop  ",
+            re.IGNORECASE,
+        )
+        # Negative: the indicator must NOT match an idle input
+        # box (the v2026 placeholder alone, no "ctrl+c to stop").
+        assert not re.search(
+            TUI_PROCESSING_INDICATOR_PATTERN, "Add a follow-up", re.IGNORECASE
+        )
+        assert not re.search(
+            TUI_PROCESSING_INDICATOR_PATTERN, "Plan, search, build anything", re.IGNORECASE
+        )
+
     def test_v2026_placeholder_pattern_documented(self):
         # Pattern sanity check: TUI_PLACEHOLDER_PATTERN must match
-        # the literal placeholder text Cursor renders, and
+        # both placeholder strings Cursor v2026 uses, and
         # TUI_STATUS_BAR_PATTERN must match the status bar
         # fragments we use as a "TUI is fully rendered" guard.
         assert re.search(TUI_PLACEHOLDER_PATTERN, "Plan, search, build anything")
-        assert re.search(TUI_PLACEHOLDER_PATTERN, "  plan, search, build anything  ", re.IGNORECASE)
+        assert re.search(
+            TUI_PLACEHOLDER_PATTERN, "  plan, search, build anything  ", re.IGNORECASE
+        )
+        # v2026 swaps the placeholder to "Add a follow-up" after
+        # the first turn — the detection must classify that as
+        # idle too.
+        assert re.search(TUI_PLACEHOLDER_PATTERN, "Add a follow-up")
         assert re.search(TUI_STATUS_BAR_PATTERN, "Run Everything")
         assert re.search(TUI_STATUS_BAR_PATTERN, "Composer 2.5 Fast")
         # Negative: these patterns must NOT spuriously match a
