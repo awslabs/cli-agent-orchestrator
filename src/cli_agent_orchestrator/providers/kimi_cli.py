@@ -34,7 +34,7 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -608,7 +608,7 @@ class KimiCliProvider(BaseProvider):
     # Opt in to pyte rendered-screen detection (gated by CAO_PYTE_STATUS).
     supports_screen_detection = True
 
-    def get_status_from_screen(self, screen_lines: list) -> TerminalStatus:
+    def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
         """Detect status from a pyte-composited viewport (escape-free rows).
 
         The composited screen removes the need for the raw-stream hacks the

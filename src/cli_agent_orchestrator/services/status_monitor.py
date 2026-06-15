@@ -223,8 +223,10 @@ class StatusMonitor:
             return TerminalStatus.UNKNOWN
         try:
             return provider.get_status_from_screen(lines)
-        except Exception as e:
-            logger.error(f"Error detecting screen status for {terminal_id}: {e}")
+        except Exception:
+            # Full traceback: screen detectors are new and can trip on
+            # unexpected TUI frames; the stack makes such regressions debuggable.
+            logger.exception(f"Error detecting screen status for {terminal_id}")
             return TerminalStatus.UNKNOWN
 
     def _schedule_screen_detection(self, terminal_id: str, provider) -> None:
