@@ -88,6 +88,7 @@ class TmuxBackend(TerminalBackend):
         keys: str,
         enter_count: int = 1,
         force_bracketed_paste: bool = False,
+        submit_delay: float = 0.3,
     ) -> None:
         self._client.send_keys(
             session_name,
@@ -95,6 +96,7 @@ class TmuxBackend(TerminalBackend):
             keys,
             enter_count=enter_count,
             force_bracketed_paste=force_bracketed_paste,
+            submit_delay=submit_delay,
         )
 
     def send_special_key(self, session_name: str, window_name: str, key: str) -> None:

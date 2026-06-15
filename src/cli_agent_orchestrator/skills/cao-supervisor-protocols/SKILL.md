@@ -15,10 +15,10 @@ From `cao-mcp-server`, supervisors orchestrate work with:
 
 - `assign(agent_profile, message)` for asynchronous work that returns immediately
 - `handoff(agent_profile, message)` for synchronous work that blocks until the worker finishes
-- `send_message(receiver_id, message)` for direct messages to an existing terminal
+- `send_message(message, receiver_id=None)` for direct messages — `receiver_id` defaults to the terminal that created yours via handoff/assign
 - `answer_user_prompt(terminal_id, answer)` for answering a Hermes worker that reports `waiting_user_answer`
 
-Your own terminal ID is available in the `CAO_TERMINAL_ID` environment variable. Use it when you need workers to send results back to you.
+Your own terminal ID is available in the `CAO_TERMINAL_ID` environment variable. CAO appends it to assigned task messages and records it on worker terminals automatically, so you rarely need to handle it yourself.
 
 ## Choosing Between Assign and Handoff
 
@@ -47,15 +47,15 @@ If you need multiple worker results, dispatch them all first, then end the turn.
 
 ## Callback Pattern
 
-When you use `assign`, include the callback terminal ID in the task message. Tell the worker exactly which terminal should receive the result and instruct the worker to use `send_message`.
+By default, CAO appends your terminal ID and callback instructions to every assigned message automatically, and records your terminal as the worker's caller — workers can reply with `send_message` without a `receiver_id`. You do not need to hand-write callback instructions.
 
-Example pattern:
+You may still include an explicit callback ID in the task message for emphasis:
 
 ```text
 Analyze dataset A. Send results back to terminal abc123 using send_message.
 ```
 
-Some CAO deployments also append an automatic callback suffix to assigned messages. Treat that appended context as helpful reinforcement, but still write task messages that are explicit and self-contained.
+If your deployment disables the automatic suffix (`CAO_ENABLE_SENDER_ID_INJECTION=false`), the explicit pattern above is required: the structural caller record still works, but the worker gets no in-message reminder.
 
 ## Direct Supervisor Communication
 
@@ -77,11 +77,10 @@ Other providers may still emit prompts in their terminal output without reportin
 
 ## Practical Workflow
 
-1. Read or determine your terminal ID.
-2. Dispatch asynchronous workers with `assign` and include callback instructions.
-3. Use `handoff` only for steps that must finish before you can continue.
-4. End the turn so asynchronous worker messages can be delivered.
-5. When messages arrive, synthesize the results and continue the workflow.
+1. Dispatch asynchronous workers with `assign` — callback routing is automatic (your terminal ID is appended to the message and recorded as the worker's caller).
+2. Use `handoff` only for steps that must finish before you can continue.
+3. End the turn so asynchronous worker messages can be delivered.
+4. When messages arrive, synthesize the results and continue the workflow.
 
 ## Reliability Guidelines
 

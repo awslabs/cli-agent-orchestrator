@@ -1,5 +1,6 @@
 """Codex CLI provider implementation."""
 
+import asyncio
 import logging
 import re
 import shlex
@@ -11,6 +12,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
+from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +30,6 @@ IDLE_PROMPT_TAIL_LINES = 5
 # is active.  This is intentionally permissive — _has_idle_pattern() is a
 # lightweight pre-check; the real status decision is made by get_status()
 # which uses capture-pane (rendered screen).
-IDLE_PROMPT_PATTERN_LOG = r"\? for shortcuts"
 # Match assistant response start: "assistant:/codex:/agent:" (label style from synthetic
 # test fixtures) or "•" bullet point (real Codex interactive output format).
 # [^\S\n]* matches horizontal whitespace only (not newlines) so the match anchors
@@ -256,7 +257,7 @@ class CodexProvider(BaseProvider):
 
         return shlex.join(command_parts)
 
-    def _handle_trust_prompt(self, timeout: float = 20.0) -> None:
+    async def _handle_trust_prompt(self, timeout: float = 20.0) -> None:
         """Auto-accept the workspace trust prompt if it appears.
 
         Codex shows a folder approval dialog when opening a new directory.
@@ -268,14 +269,17 @@ class CodexProvider(BaseProvider):
         while time.time() - start_time < timeout:
             output = get_backend().get_history(self.session_name, self.window_name)
             if not output:
-                time.sleep(1.0)
+                await asyncio.sleep(1.0)
                 continue
 
             # Clean ANSI codes for reliable text matching
             clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
 
             if re.search(TRUST_PROMPT_PATTERN, clean_output):
+                from cli_agent_orchestrator.services.status_monitor import status_monitor
+
                 logger.info("Codex workspace trust prompt detected, auto-accepting")
+                status_monitor.notify_input_sent(self.terminal_id)
                 get_backend().send_special_key(self.session_name, self.window_name, "Enter")
                 return
 
@@ -284,19 +288,25 @@ class CodexProvider(BaseProvider):
                 logger.info("Codex started without trust prompt")
                 return
 
-            time.sleep(1.0)
+            await asyncio.sleep(1.0)
         logger.warning("Codex trust prompt handler timed out")
 
-    def initialize(self) -> bool:
+    async def initialize(self) -> bool:
         """Initialize Codex provider by starting codex command."""
-        if not wait_for_shell(get_backend(), self.session_name, self.window_name, timeout=10.0):
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        if not await wait_for_shell(self.terminal_id, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
         # Send a warm-up command before launching codex.
         # Codex exits immediately in freshly-created tmux sessions where the shell
         # has not yet processed a full interactive command cycle.
+        # Arm the StatusMonitor stickiness gate: each send_keys here represents
+        # external input that must be allowed to drive PROCESSING transitions
+        # past any previously-latched ready state.
+        status_monitor.notify_input_sent(self.terminal_id)
         get_backend().send_keys(self.session_name, self.window_name, "echo ready")
-        time.sleep(2.0)
+        await asyncio.sleep(2.0)
 
         # Build command with flags and agent profile (developer_instructions).
         # --no-alt-screen: run in inline mode so output stays in normal scrollback,
@@ -304,13 +314,14 @@ class CodexProvider(BaseProvider):
         # --disable shell_snapshot: avoid TTY input conflicts (SIGTTIN) in tmux
         #   caused by the shell_snapshot subprocess inheriting stdin.
         command = self._build_codex_command()
+        status_monitor.notify_input_sent(self.terminal_id)
         get_backend().send_keys(self.session_name, self.window_name, command)
 
         # Handle workspace trust prompt if it appears (new/untrusted directories)
-        self._handle_trust_prompt(timeout=20.0)
+        await self._handle_trust_prompt(timeout=20.0)
 
-        if not wait_until_status(
-            self,
+        if not await wait_until_status(
+            self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
             timeout=60.0,
             polling_interval=1.0,
@@ -320,16 +331,14 @@ class CodexProvider(BaseProvider):
         self._initialized = True
         return True
 
-    def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
-        """Get Codex status by analyzing terminal output."""
-        output = get_backend().get_history(
-            self.session_name, self.window_name, tail_lines=tail_lines
-        )
-
+    def get_status(self, output: str) -> TerminalStatus:
         if not output:
-            return TerminalStatus.ERROR
+            return TerminalStatus.UNKNOWN
 
-        clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
+        # Strip the RAW pipe-pane escapes (cursor positioning, in-place redraws),
+        # not just SGR colour codes — otherwise cursor sequences survive and the
+        # idle ``›`` prompt / structural checks below misfire on the raw stream.
+        clean_output = strip_terminal_escapes(output)
         tail_output = "\n".join(clean_output.splitlines()[-25:])
 
         # Search for user messages, excluding the Codex TUI footer when present.
@@ -413,15 +422,22 @@ class CodexProvider(BaseProvider):
 
                 return TerminalStatus.IDLE
 
+            # No user-message marker in the cleaned buffer. Two cases:
+            # - Fresh init: no assistant content either → IDLE.
+            # - Long-running response: the › user marker has been evicted from
+            #   the 8KB rolling buffer by the time the response settles, but an
+            #   assistant bullet is still visible. Without this branch we'd
+            #   return IDLE forever and ``wait_for_status(completed)`` in the
+            #   e2e tests would time out.
+            # Search above the TUI footer cutoff so the › suggestion-hint and
+            # status-bar lines aren't confused with a model reply.
+            if _find_assistant_marker(clean_output[:cutoff_pos]) is not None:
+                return TerminalStatus.COMPLETED
             return TerminalStatus.IDLE
 
         # If we're not at an idle prompt and we don't see explicit errors/permission prompts,
         # assume the CLI is still producing output.
         return TerminalStatus.PROCESSING
-
-    def get_idle_pattern_for_log(self) -> str:
-        """Return Codex IDLE prompt pattern for log files."""
-        return IDLE_PROMPT_PATTERN_LOG
 
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract Codex's final response from terminal output.

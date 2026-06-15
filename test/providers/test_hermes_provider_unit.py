@@ -270,36 +270,41 @@ class TestHermesInitialization:
         mock_profile.mcpServers = None
         return mock_profile
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.hermes.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.hermes.wait_until_status")
     @patch("cli_agent_orchestrator.providers.hermes.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.hermes.tmux_client")
-    def test_initialize_success(self, mock_tmux, mock_wait_shell, mock_wait_status, mock_load):
+    async def test_initialize_success(
+        self, mock_tmux, mock_wait_shell, mock_wait_status, mock_load
+    ):
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
         mock_load.return_value = self._profile()
 
         provider = HermesProvider("tid", "sess", "win", "developer")
-        result = provider.initialize()
+        result = await provider.initialize()
 
         assert result is True
         mock_tmux.send_keys.assert_called_once_with(
             "sess", "win", "test-worker chat --yolo --accept-hooks --source cao"
         )
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.hermes.wait_for_shell")
-    def test_initialize_shell_timeout(self, mock_wait_shell):
+    async def test_initialize_shell_timeout(self, mock_wait_shell):
         mock_wait_shell.return_value = False
         provider = HermesProvider("tid", "sess", "win", "developer")
 
         with pytest.raises(TimeoutError, match="Shell initialization timed out"):
-            provider.initialize()
+            await provider.initialize()
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.hermes.load_agent_profile")
     @patch("cli_agent_orchestrator.providers.hermes.wait_until_status")
     @patch("cli_agent_orchestrator.providers.hermes.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.hermes.tmux_client")
-    def test_initialize_hermes_timeout(
+    async def test_initialize_hermes_timeout(
         self, mock_tmux, mock_wait_shell, mock_wait_status, mock_load
     ):
         mock_wait_shell.return_value = True
@@ -309,143 +314,123 @@ class TestHermesInitialization:
         provider = HermesProvider("tid", "sess", "win", "developer")
 
         with pytest.raises(TimeoutError, match="Hermes initialization timed out"):
-            provider.initialize()
+            await provider.initialize()
 
 
 class TestHermesStatusDetection:
-    @patch("cli_agent_orchestrator.providers.hermes.tmux_client")
-    def test_get_status_idle_with_custom_prompt_prefix(self, mock_tmux):
-        mock_tmux.get_history.return_value = HERMES_IDLE_OUTPUT
-
+    def test_get_status_idle_with_custom_prompt_prefix(self):
         provider = HermesProvider("tid", "sess", "win", None)
-        assert provider.get_status() == TerminalStatus.IDLE
+        assert provider.get_status(HERMES_IDLE_OUTPUT) == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.hermes.tmux_client")
-    def test_get_status_idle_with_custom_prompt_symbol(self, mock_tmux):
-        mock_tmux.get_history.return_value = HERMES_IDLE_CUSTOM_SYMBOL_OUTPUT
-
+    def test_get_status_idle_with_custom_prompt_symbol(self):
         provider = HermesProvider("tid", "sess", "win", None)
-        assert provider.get_status() == TerminalStatus.IDLE
+        assert provider.get_status(HERMES_IDLE_CUSTOM_SYMBOL_OUTPUT) == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.hermes.tmux_client")
-    def test_get_status_idle_with_stable_timer_and_unknown_prompt_symbol(self, mock_tmux):
-        mock_tmux.get_history.return_value = HERMES_IDLE_UNKNOWN_SYMBOL_OUTPUT
-
+    def test_get_status_idle_with_stable_timer_and_unknown_prompt_symbol(self):
         provider = HermesProvider("tid", "sess", "win", None)
-        assert provider.get_status() == TerminalStatus.PROCESSING
-        assert provider.get_status() == TerminalStatus.IDLE
+        assert provider.get_status(HERMES_IDLE_UNKNOWN_SYMBOL_OUTPUT) == TerminalStatus.PROCESSING
+        assert provider.get_status(HERMES_IDLE_UNKNOWN_SYMBOL_OUTPUT) == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.hermes.tmux_client")
-    def test_get_status_frozen_idle_timer_does_not_pin_idle_forever(self, mock_tmux):
-        mock_tmux.get_history.return_value = HERMES_IDLE_UNKNOWN_SYMBOL_OUTPUT
-
+    def test_get_status_frozen_idle_timer_does_not_pin_idle_forever(self):
         provider = HermesProvider("tid", "sess", "win", None)
-        statuses = [provider.get_status() for _ in range(10)]
+        statuses = [provider.get_status(HERMES_IDLE_UNKNOWN_SYMBOL_OUTPUT) for _ in range(10)]
 
         assert TerminalStatus.IDLE in statuses
         assert statuses[-1] == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.hermes.tmux_client")
-    def test_get_status_processing_excludes_interrupt_prompt(self, mock_tmux):
-        mock_tmux.get_history.return_value = HERMES_PROCESSING_OUTPUT
-
+    def test_get_status_processing_excludes_interrupt_prompt(self):
         provider = HermesProvider("tid", "sess", "win", None)
-        assert provider.get_status() == TerminalStatus.PROCESSING
+        assert provider.get_status(HERMES_PROCESSING_OUTPUT) == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.hermes.tmux_client")
-    def test_get_status_processing_placeholder_overrides_stable_timer(self, mock_tmux):
-        mock_tmux.get_history.return_value = HERMES_PROCESSING_WITH_STALE_IDLE_TIMER_OUTPUT
-
+    def test_get_status_processing_placeholder_overrides_stable_timer(self):
         provider = HermesProvider("tid", "sess", "win", None)
-        assert provider.get_status() == TerminalStatus.PROCESSING
-        assert provider.get_status() == TerminalStatus.PROCESSING
+        assert (
+            provider.get_status(HERMES_PROCESSING_WITH_STALE_IDLE_TIMER_OUTPUT)
+            == TerminalStatus.PROCESSING
+        )
+        assert (
+            provider.get_status(HERMES_PROCESSING_WITH_STALE_IDLE_TIMER_OUTPUT)
+            == TerminalStatus.PROCESSING
+        )
 
-    @patch("cli_agent_orchestrator.providers.hermes.tmux_client")
-    def test_get_status_waiting_user_answer_for_hermes_approval_menu(self, mock_tmux):
-        mock_tmux.get_history.return_value = HERMES_WAITING_APPROVAL_OUTPUT
-
+    def test_get_status_waiting_user_answer_for_hermes_approval_menu(self):
         provider = HermesProvider("tid", "sess", "win", None)
-        assert provider.get_status() == TerminalStatus.WAITING_USER_ANSWER
+        assert (
+            provider.get_status(HERMES_WAITING_APPROVAL_OUTPUT)
+            == TerminalStatus.WAITING_USER_ANSWER
+        )
 
-    @patch("cli_agent_orchestrator.providers.hermes.tmux_client")
-    def test_get_status_waiting_prompt_wins_over_interrupt_marker(self, mock_tmux):
-        mock_tmux.get_history.return_value = HERMES_WAITING_APPROVAL_WITH_INTERRUPT_OUTPUT
-
+    def test_get_status_waiting_prompt_wins_over_interrupt_marker(self):
         provider = HermesProvider("tid", "sess", "win", None)
-        assert provider.get_status() == TerminalStatus.WAITING_USER_ANSWER
+        assert (
+            provider.get_status(HERMES_WAITING_APPROVAL_WITH_INTERRUPT_OUTPUT)
+            == TerminalStatus.WAITING_USER_ANSWER
+        )
 
-    @patch("cli_agent_orchestrator.providers.hermes.tmux_client")
-    def test_get_status_waiting_user_answer_for_localized_approval_menu(self, mock_tmux):
-        mock_tmux.get_history.return_value = HERMES_WAITING_APPROVAL_ZH_OUTPUT
-
+    def test_get_status_waiting_user_answer_for_localized_approval_menu(self):
         provider = HermesProvider("tid", "sess", "win", None)
-        assert provider.get_status() == TerminalStatus.WAITING_USER_ANSWER
+        assert (
+            provider.get_status(HERMES_WAITING_APPROVAL_ZH_OUTPUT)
+            == TerminalStatus.WAITING_USER_ANSWER
+        )
 
-    @patch("cli_agent_orchestrator.providers.hermes.tmux_client")
-    def test_get_status_waiting_user_answer_for_button_style_approval(self, mock_tmux):
-        mock_tmux.get_history.return_value = HERMES_WAITING_BUTTON_STYLE_OUTPUT
-
+    def test_get_status_waiting_user_answer_for_button_style_approval(self):
         provider = HermesProvider("tid", "sess", "win", None)
-        assert provider.get_status() == TerminalStatus.WAITING_USER_ANSWER
+        assert (
+            provider.get_status(HERMES_WAITING_BUTTON_STYLE_OUTPUT)
+            == TerminalStatus.WAITING_USER_ANSWER
+        )
 
-    @patch("cli_agent_orchestrator.providers.hermes.tmux_client")
-    def test_get_status_waiting_user_answer_for_clarify_picker(self, mock_tmux):
-        mock_tmux.get_history.return_value = HERMES_WAITING_CLARIFY_OUTPUT
-
+    def test_get_status_waiting_user_answer_for_clarify_picker(self):
         provider = HermesProvider("tid", "sess", "win", None)
-        assert provider.get_status() == TerminalStatus.WAITING_USER_ANSWER
+        assert (
+            provider.get_status(HERMES_WAITING_CLARIFY_OUTPUT) == TerminalStatus.WAITING_USER_ANSWER
+        )
 
-    @patch("cli_agent_orchestrator.providers.hermes.tmux_client")
-    def test_get_status_does_not_treat_stale_approval_as_waiting(self, mock_tmux):
-        mock_tmux.get_history.return_value = HERMES_STALE_APPROVAL_COMPLETED_OUTPUT
-
+    def test_get_status_does_not_treat_stale_approval_as_waiting(self):
         provider = HermesProvider("tid", "sess", "win", None)
-        assert provider.get_status() == TerminalStatus.PROCESSING
-        assert provider.get_status() == TerminalStatus.COMPLETED
+        assert (
+            provider.get_status(HERMES_STALE_APPROVAL_COMPLETED_OUTPUT) == TerminalStatus.PROCESSING
+        )
+        assert (
+            provider.get_status(HERMES_STALE_APPROVAL_COMPLETED_OUTPUT) == TerminalStatus.COMPLETED
+        )
 
-    @patch("cli_agent_orchestrator.providers.hermes.tmux_client")
-    def test_get_status_does_not_treat_stale_clarify_picker_as_waiting(self, mock_tmux):
-        mock_tmux.get_history.return_value = HERMES_STALE_CLARIFY_COMPLETED_OUTPUT
-
+    def test_get_status_does_not_treat_stale_clarify_picker_as_waiting(self):
         provider = HermesProvider("tid", "sess", "win", None)
-        assert provider.get_status() == TerminalStatus.PROCESSING
-        assert provider.get_status() == TerminalStatus.COMPLETED
+        assert (
+            provider.get_status(HERMES_STALE_CLARIFY_COMPLETED_OUTPUT) == TerminalStatus.PROCESSING
+        )
+        assert (
+            provider.get_status(HERMES_STALE_CLARIFY_COMPLETED_OUTPUT) == TerminalStatus.COMPLETED
+        )
 
-    @patch("cli_agent_orchestrator.providers.hermes.tmux_client")
-    def test_get_status_completed(self, mock_tmux):
-        mock_tmux.get_history.return_value = HERMES_COMPLETED_OUTPUT
-
+    def test_get_status_completed(self):
         provider = HermesProvider("tid", "sess", "win", None)
-        assert provider.get_status() == TerminalStatus.COMPLETED
+        assert provider.get_status(HERMES_COMPLETED_OUTPUT) == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.hermes.tmux_client")
-    def test_get_status_completed_without_default_header(self, mock_tmux):
-        mock_tmux.get_history.return_value = HERMES_COMPLETED_CUSTOM_OUTPUT
-
+    def test_get_status_completed_without_default_header(self):
         provider = HermesProvider("tid", "sess", "win", None)
-        assert provider.get_status() == TerminalStatus.COMPLETED
+        assert provider.get_status(HERMES_COMPLETED_CUSTOM_OUTPUT) == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.hermes.tmux_client")
-    def test_get_status_completed_ignores_stale_initializing_text(self, mock_tmux):
-        mock_tmux.get_history.return_value = HERMES_COMPLETED_WITH_STALE_INITIALIZING_OUTPUT
-
+    def test_get_status_completed_ignores_stale_initializing_text(self):
         provider = HermesProvider("tid", "sess", "win", None)
-        assert provider.get_status() == TerminalStatus.PROCESSING
-        assert provider.get_status() == TerminalStatus.COMPLETED
+        assert (
+            provider.get_status(HERMES_COMPLETED_WITH_STALE_INITIALIZING_OUTPUT)
+            == TerminalStatus.PROCESSING
+        )
+        assert (
+            provider.get_status(HERMES_COMPLETED_WITH_STALE_INITIALIZING_OUTPUT)
+            == TerminalStatus.COMPLETED
+        )
 
-    @patch("cli_agent_orchestrator.providers.hermes.tmux_client")
-    def test_get_status_error(self, mock_tmux):
-        mock_tmux.get_history.return_value = "Error: failed\n"
-
+    def test_get_status_error(self):
         provider = HermesProvider("tid", "sess", "win", None)
-        assert provider.get_status() == TerminalStatus.ERROR
+        assert provider.get_status("Error: failed\n") == TerminalStatus.ERROR
 
-    @patch("cli_agent_orchestrator.providers.hermes.tmux_client")
-    def test_get_status_empty_output(self, mock_tmux):
-        mock_tmux.get_history.return_value = ""
-
+    def test_get_status_empty_output(self):
         provider = HermesProvider("tid", "sess", "win", None)
-        assert provider.get_status() == TerminalStatus.ERROR
+        assert provider.get_status("") == TerminalStatus.ERROR
 
 
 class TestHermesExtraction:

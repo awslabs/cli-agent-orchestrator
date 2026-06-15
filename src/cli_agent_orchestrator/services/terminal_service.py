@@ -32,7 +32,7 @@ from cli_agent_orchestrator.clients.database import (
     update_last_active,
     update_terminal_shell_command,
 )
-from cli_agent_orchestrator.constants import SESSION_PREFIX, TERMINAL_LOG_DIR
+from cli_agent_orchestrator.constants import FIFO_DIR, SESSION_PREFIX, TERMINAL_LOG_DIR
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
@@ -43,6 +43,7 @@ from cli_agent_orchestrator.plugins import (
     PostSendMessageEvent,
 )
 from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
 from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
@@ -51,6 +52,7 @@ from cli_agent_orchestrator.services.session_env import (
     get_session_env,
     set_session_env,
 )
+from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
 from cli_agent_orchestrator.utils.terminal import (
@@ -119,7 +121,7 @@ RUNTIME_SKILL_PROMPT_PROVIDERS = {
 }
 
 
-def create_terminal(
+async def create_terminal(
     provider: str,
     agent_profile: str,
     session_name: Optional[str] = None,
@@ -128,6 +130,7 @@ def create_terminal(
     allowed_tools: Optional[list[str]] = None,
     registry: PluginRegistry | None = None,
     env_vars: Optional[dict[str, str]] = None,
+    caller_id: Optional[str] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -150,6 +153,10 @@ def create_terminal(
             ``new_session=False``, the persisted session vars are merged in
             automatically; the explicit ``env_vars`` argument is ignored to
             keep the per-session view consistent. See issue #248.
+        caller_id: Terminal ID of the supervisor that created this terminal
+            via handoff/assign. Recorded so send_message can route callbacks
+            structurally instead of parsing IDs out of message text (issue #284).
+            None for operator-launched terminals.
 
     Returns:
         Terminal object with all metadata populated
@@ -236,9 +243,32 @@ def create_terminal(
             provider,
             agent_profile,
             allowed_tools,
+            caller_id=caller_id,
         )
 
-        # Step 4: Create and initialize the CLI provider
+        # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
+        # backends (tmux). Event-inbox backends (herdr) deliver via their own
+        # socket events and their pipe_pane is a no-op, so skip the FIFO there and
+        # rely on the herdr inbox registration below.
+        if not get_backend().supports_event_inbox():
+            # Reader must exist BEFORE pipe-pane starts so it captures from the start.
+            fifo_manager.create_reader(terminal_id)
+
+            # Configure pipe-pane to stream output to the FIFO. This enables
+            # real-time event-driven processing via StatusMonitor and LogWriter
+            # (LogWriter writes TERMINAL_LOG_DIR/{id}.log from the FIFO). A pane
+            # has a single pipe-pane target, so we pipe ONLY to the FIFO.
+            fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
+            get_backend().pipe_pane(session_name, window_name, str(fifo_path))
+
+            # Nudge the shell so it re-renders its prompt AFTER pipe-pane attaches.
+            # pipe-pane only captures output produced after it starts; on a fast
+            # shell the initial prompt is drawn before the pipe attaches, leaving
+            # the StatusMonitor buffer empty so wait_for_shell() times out. A bare
+            # Enter produces a fresh prompt line that flows through the pipe.
+            get_backend().send_special_key(session_name, window_name, "Enter")
+
+        # Step 6: Create and initialize the CLI provider
         # This starts the agent (e.g., runs "kiro-cli chat --agent developer").
         # Only runtime-prompt providers (Claude Code, Codex, Gemini, Kimi) receive
         # the skill catalog here; Kiro (skill:// resources) and OpenCode
@@ -254,7 +284,7 @@ def create_terminal(
             skill_prompt=skill_prompt,
             model=profile.model if profile else None,
         )
-        provider_instance.initialize()
+        await provider_instance.initialize()
 
         # Persist shell_command baseline if the provider captured one
         shell_command = provider_instance.shell_baseline
@@ -263,12 +293,6 @@ def create_terminal(
         if shell_command:
             update_terminal_shell_command(terminal_id, shell_command)
 
-        # Step 5: Set up terminal logging via tmux pipe-pane
-        # This captures all terminal output to a log file for inbox monitoring
-        log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
-        log_path.touch()  # Ensure file exists before watching
-        get_backend().pipe_pane(session_name, window_name, str(log_path))
-
         # Build and return the Terminal object
         terminal = Terminal(
             id=terminal_id,
@@ -276,6 +300,7 @@ def create_terminal(
             provider=ProviderType(provider),
             session_name=session_name,
             agent_profile=agent_profile,
+            caller_id=caller_id,
             allowed_tools=allowed_tools,
             shell_command=shell_command,
             status=TerminalStatus.IDLE,
@@ -308,8 +333,16 @@ def create_terminal(
         return terminal
 
     except Exception as e:
-        # Cleanup on failure: clean up provider resources and kill session
+        # Cleanup on failure: clean up FIFO reader, status monitor, provider, and session
         logger.error(f"Failed to create terminal: {e}")
+        try:
+            fifo_manager.stop_reader(terminal_id)
+        except Exception:
+            pass  # Ignore cleanup errors
+        try:
+            status_monitor.clear_terminal(terminal_id)
+        except Exception:
+            pass  # Ignore cleanup errors
         try:
             provider_manager.cleanup_provider(terminal_id)
         except Exception:
@@ -333,11 +366,7 @@ def get_terminal(terminal_id: str) -> Dict:
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
-        # Get status from provider
-        provider = provider_manager.get_provider(terminal_id)
-        if provider is None:
-            raise ValueError(f"Provider not found for terminal {terminal_id}")
-        status = provider.get_status().value
+        status = status_monitor.get_status(terminal_id).value
 
         return {
             "id": metadata["id"],
@@ -345,6 +374,7 @@ def get_terminal(terminal_id: str) -> Dict:
             "provider": metadata["provider"],
             "session_name": metadata["tmux_session"],
             "agent_profile": metadata["agent_profile"],
+            "caller_id": metadata.get("caller_id"),
             "allowed_tools": metadata.get("allowed_tools"),
             "status": status,
             "last_active": metadata["last_active"],
@@ -413,7 +443,7 @@ def send_input(
             and provider.blocks_orchestrated_input_while_waiting_user_answer is True
             and orchestration_value
             in {OrchestrationType.ASSIGN.value, OrchestrationType.HANDOFF.value}
-            and provider.get_status() == TerminalStatus.WAITING_USER_ANSWER
+            and status_monitor.get_status(terminal_id) == TerminalStatus.WAITING_USER_ANSWER
         ):
             raise TerminalInputBlockedError(
                 f"Terminal {terminal_id} is waiting for a user answer. "
@@ -435,12 +465,20 @@ def send_input(
         # Check how many Enter keys the provider needs after paste
         enter_count = provider.paste_enter_count if provider else 1
 
+        # Arm the StatusMonitor stickiness gate so that the next provider-
+        # detected PROCESSING transition is honored (overriding the latched
+        # IDLE/COMPLETED). Without this, sticky ready-status would block
+        # the genuine PROCESSING signal that arrives once the agent starts
+        # working on the new message.
+        status_monitor.notify_input_sent(terminal_id)
+
         get_backend().send_keys(
             metadata["tmux_session"],
             metadata["tmux_window"],
             message,
             enter_count=enter_count,
             force_bracketed_paste=True,
+            submit_delay=provider.paste_submit_delay if provider else 0.3,
         )
 
         # Notify the provider that external input was received.
@@ -492,6 +530,11 @@ def send_special_key(terminal_id: str, key: str) -> bool:
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
+        # Arm StatusMonitor stickiness: special keys (Enter on a permission
+        # prompt, C-c interrupting work, C-d sending EOF) all initiate a new
+        # processing cycle that must be allowed to push past any latched
+        # ready status.
+        status_monitor.notify_input_sent(terminal_id)
         get_backend().send_special_key(metadata["tmux_session"], metadata["tmux_window"], key)
 
         update_last_active(terminal_id)
@@ -505,6 +548,15 @@ def send_special_key(terminal_id: str, key: str) -> bool:
 
 def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
     """Get terminal output.
+
+    ``FULL`` mode returns the StatusMonitor rolling buffer (the streamed output
+    accumulated from the FIFO pipeline), which is bounded to the most recent
+    ``STATE_BUFFER_MAX`` bytes (8KB); it falls back to a tmux history capture
+    only when that buffer is empty. This is a deliberate trade-off in the
+    event-driven architecture (instant, no tmux call) — it is *not* unbounded
+    scrollback, so very long sessions are truncated to the tail. Use the
+    on-disk ``{id}.log`` (LogWriter) or the delete-time ``{id}.scrollback``
+    snapshot when complete history is required.
 
     For ``LAST`` mode, if the provider declares ``extraction_retries > 0``,
     retries extraction with 10 s delays between attempts.  This handles
@@ -529,8 +581,16 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
+        # Get output from StatusMonitor buffer (instant, no tmux call)
+        full_output = status_monitor.get_buffer(terminal_id)
+        if not full_output:
+            # Fallback to backend history only if buffer not available (edge case)
+            full_output = get_backend().get_history(
+                metadata["tmux_session"], metadata["tmux_window"]
+            )
+
         if mode == OutputMode.FULL:
-            return get_backend().get_history(metadata["tmux_session"], metadata["tmux_window"])
+            return full_output
         elif mode == OutputMode.LAST:
             provider = provider_manager.get_provider(terminal_id)
             if provider is None:
@@ -665,6 +725,7 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
                         metadata["tmux_session"], metadata["tmux_window"]
                     ),
                     "allowed_tools": metadata.get("allowed_tools"),
+                    "caller_id": metadata.get("caller_id"),
                 }
                 snapshot_path = TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json"
                 snapshot_path.write_text(_json.dumps(snapshot, indent=2), encoding="utf-8")
@@ -676,6 +737,20 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
                 get_backend().stop_pipe_pane(metadata["tmux_session"], metadata["tmux_window"])
             except Exception as e:
                 logger.warning(f"Failed to stop pipe-pane for {terminal_id}: {e}")
+
+            # Stop FIFO reader and cleanup FIFO file. Must run BEFORE kill_window
+            # so the reader thread (which reopens the FIFO on EOF) unblocks and
+            # joins before the pane disappears.
+            try:
+                fifo_manager.stop_reader(terminal_id)
+            except Exception as e:
+                logger.warning(f"Failed to stop FIFO reader for {terminal_id}: {e}")
+
+            # Clear state detector buffers for this terminal
+            try:
+                status_monitor.clear_terminal(terminal_id)
+            except Exception as e:
+                logger.warning(f"Failed to clear state detector for {terminal_id}: {e}")
 
             # Kill the tmux window (this terminates the agent process)
             try:

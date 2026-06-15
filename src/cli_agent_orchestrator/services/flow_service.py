@@ -31,6 +31,8 @@ from cli_agent_orchestrator.constants import DEFAULT_PROVIDER, PROVIDERS
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.services.fifo_reader import fifo_manager
+from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.terminal_service import create_terminal, send_input
 from cli_agent_orchestrator.utils.template import render_template
 
@@ -167,13 +169,12 @@ def enable_flow(name: str) -> bool:
 
 def _is_terminal_busy(terminal_id: str) -> bool:
     try:
-        provider = provider_manager.get_provider(terminal_id)
-        return provider is not None and provider.get_status() == TerminalStatus.PROCESSING
+        return status_monitor.get_status(terminal_id) == TerminalStatus.PROCESSING
     except Exception:
         return False
 
 
-def execute_flow(name: str) -> bool:
+async def execute_flow(name: str) -> bool:
     """Execute flow: run script, render prompt, launch session."""
     try:
         logger.info(f"Executing flow: {name}")
@@ -244,9 +245,21 @@ def execute_flow(name: str) -> bool:
                 return False
             for t in terminals:
                 provider_manager.cleanup_provider(t["id"])
+                # Tear down the event-driven pipeline for each recycled terminal:
+                # stop the FIFO reader thread (and unlink its *.fifo file) and clear
+                # the StatusMonitor buffers. Without this, repeated flow runs leak
+                # background reader threads and stale FIFO files / status entries.
+                try:
+                    fifo_manager.stop_reader(t["id"])
+                except Exception as e:
+                    logger.warning(f"Failed to stop FIFO reader for {t['id']}: {e}")
+                try:
+                    status_monitor.clear_terminal(t["id"])
+                except Exception as e:
+                    logger.warning(f"Failed to clear status buffers for {t['id']}: {e}")
             get_backend().kill_session(session_name)
             delete_terminals_by_session(session_name)
-        terminal = create_terminal(
+        terminal = await create_terminal(
             session_name=session_name,
             provider=flow.provider,
             agent_profile=flow.agent_profile,

@@ -1,5 +1,6 @@
 """Flow commands for CLI Agent Orchestrator."""
 
+import asyncio
 from datetime import datetime
 
 import click
@@ -88,12 +89,40 @@ def enable(name):
         raise click.ClickException(str(e))
 
 
+async def _run_flow_with_pipeline(name):
+    """Run a flow with the in-process event pipeline bootstrapped.
+
+    ``execute_flow`` -> ``create_terminal`` -> ``provider.initialize`` relies on
+    the StatusMonitor buffer being populated by the FIFO reader -> EventBus ->
+    StatusMonitor pipeline. Outside the server that pipeline isn't running, so
+    the event loop must be registered with the bus and the StatusMonitor/LogWriter
+    consumers started here; otherwise ``wait_for_shell``/``wait_until_status``
+    never see output and initialization hangs until timeout.
+    """
+    from cli_agent_orchestrator.services.event_bus import bus
+    from cli_agent_orchestrator.services.log_writer import log_writer
+    from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+    bus.set_loop(asyncio.get_running_loop())
+    status_task = asyncio.create_task(status_monitor.run())
+    log_task = asyncio.create_task(log_writer.run())
+    try:
+        return await flow_service.execute_flow(name)
+    finally:
+        status_task.cancel()
+        log_task.cancel()
+        await asyncio.gather(status_task, log_task, return_exceptions=True)
+
+
 @flow.command()
 @click.argument("name")
 def run(name):
     """Manually run a flow."""
     try:
-        executed = flow_service.execute_flow(name)
+        # execute_flow is async in the event-driven architecture (it awaits the
+        # async create_terminal); drive it to completion from this sync command
+        # with the event pipeline bootstrapped (see _run_flow_with_pipeline).
+        executed = asyncio.run(_run_flow_with_pipeline(name))
         if executed:
             click.echo(f"Flow '{name}' executed successfully")
         else:

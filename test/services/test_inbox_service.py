@@ -1,580 +1,581 @@
-"""Tests for the inbox service."""
+"""Tests for the event-driven InboxService."""
 
-from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+import asyncio
+from datetime import datetime
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.constants import INBOX_RECONCILE_GRACE_SECONDS
-from cli_agent_orchestrator.models.inbox import MessageStatus
+from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.services.inbox_service import (
-    LogFileHandler,
-    _get_log_tail,
-    _has_idle_pattern,
-    check_and_send_pending_messages,
-    poll_opencode_pending_messages,
-    reconcile_orphaned_messages,
-)
+from cli_agent_orchestrator.services.inbox_service import InboxService
 
 
-class TestGetLogTail:
-    """Tests for _get_log_tail function."""
-
-    @patch("cli_agent_orchestrator.services.inbox_service.subprocess.run")
-    @patch("cli_agent_orchestrator.services.inbox_service.TERMINAL_LOG_DIR")
-    def test_get_log_tail_success(self, mock_log_dir, mock_run):
-        """Test getting log tail successfully."""
-        mock_log_dir.__truediv__ = lambda self, x: Path("/tmp") / x
-        mock_run.return_value = MagicMock(stdout="last line\n")
-
-        result = _get_log_tail("test-terminal", lines=5)
-
-        assert result == "last line\n"
-        mock_run.assert_called_once()
-
-    @patch("cli_agent_orchestrator.services.inbox_service.subprocess.run")
-    @patch("cli_agent_orchestrator.services.inbox_service.TERMINAL_LOG_DIR")
-    def test_get_log_tail_exception(self, mock_log_dir, mock_run):
-        """Test getting log tail with exception."""
-        mock_log_dir.__truediv__ = lambda self, x: Path("/tmp") / x
-        mock_run.side_effect = Exception("Subprocess error")
-
-        result = _get_log_tail("test-terminal")
-
-        assert result == ""
+def _make_message(id=1, receiver_id="term-1", message="hello", status=MessageStatus.PENDING):
+    return InboxMessage(
+        id=id,
+        sender_id="sender-1",
+        receiver_id=receiver_id,
+        message=message,
+        status=status,
+        created_at=datetime.now(),
+    )
 
 
-class TestHasIdlePattern:
-    """Tests for _has_idle_pattern function."""
-
-    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.inbox_service._get_log_tail")
-    def test_has_idle_pattern_true(self, mock_tail, mock_provider_manager):
-        """Test idle pattern detection returns True."""
-        mock_tail.return_value = "[developer]> "
-        mock_provider = MagicMock()
-        mock_provider.get_idle_pattern_for_log.return_value = r"\[developer\]>"
-        mock_provider_manager.get_provider.return_value = mock_provider
-
-        result = _has_idle_pattern("test-terminal")
-
-        assert result is True
-
-    @patch("cli_agent_orchestrator.services.inbox_service._get_log_tail")
-    def test_has_idle_pattern_empty_tail(self, mock_tail):
-        """Test idle pattern detection with empty tail."""
-        mock_tail.return_value = ""
-
-        result = _has_idle_pattern("test-terminal")
-
-        assert result is False
-
-    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.inbox_service._get_log_tail")
-    def test_has_idle_pattern_no_provider(self, mock_tail, mock_provider_manager):
-        """Test idle pattern detection with no provider."""
-        mock_tail.return_value = "some content"
-        mock_provider_manager.get_provider.return_value = None
-
-        result = _has_idle_pattern("test-terminal")
-
-        assert result is False
-
-    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.inbox_service._get_log_tail")
-    def test_has_idle_pattern_exception(self, mock_tail, mock_provider_manager):
-        """Test idle pattern detection with exception."""
-        mock_tail.return_value = "some content"
-        mock_provider_manager.get_provider.side_effect = Exception("Error")
-
-        result = _has_idle_pattern("test-terminal")
-
-        assert result is False
-
-
-class TestCheckAndSendPendingMessages:
-    """Tests for check_and_send_pending_messages function."""
-
-    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
-    def test_no_pending_messages(self, mock_get_messages):
-        """Test when no pending messages exist."""
-        mock_get_messages.return_value = []
-
-        result = check_and_send_pending_messages("test-terminal")
-
-        assert result is False
-
-    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
-    def test_provider_not_found(self, mock_get_messages, mock_provider_manager):
-        """Test when provider not found."""
-        mock_message = MagicMock()
-        mock_message.id = 1
-        mock_message.message = "test message"
-        mock_get_messages.return_value = [mock_message]
-        mock_provider_manager.get_provider.return_value = None
-
-        with pytest.raises(ValueError, match="Provider not found"):
-            check_and_send_pending_messages("test-terminal")
-
-    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
-    def test_terminal_not_ready(self, mock_get_messages, mock_provider_manager):
-        """Test when terminal not ready (PROCESSING, eager disabled -> skip)."""
-        mock_message = MagicMock()
-        mock_get_messages.return_value = [mock_message]
-        mock_provider = MagicMock()
-        mock_provider.get_status.return_value = TerminalStatus.PROCESSING
-        mock_provider.accepts_input_while_processing = False
-        mock_provider_manager.get_provider.return_value = mock_provider
-
-        # Pin the env-driven flag so the test is hermetic regardless of
-        # CAO_EAGER_INBOX_DELIVERY in the runner's environment.
-        with patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", False):
-            result = check_and_send_pending_messages("test-terminal")
-
-        assert result is False
+class TestDeliverPending:
+    """Tests for InboxService.deliver_pending()."""
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
-    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
-    def test_message_sent_successfully(
-        self, mock_get_messages, mock_provider_manager, mock_terminal_service, mock_update_status
-    ):
-        """Test successful message delivery."""
-        mock_message = MagicMock()
-        mock_message.id = 1
-        mock_message.message = "test message"
-        mock_get_messages.return_value = [mock_message]
-        mock_provider = MagicMock()
-        mock_provider.get_status.return_value = TerminalStatus.IDLE
-        mock_provider_manager.get_provider.return_value = mock_provider
+    def test_delivers_message_when_idle(self, mock_get, mock_monitor, mock_term_svc, mock_update):
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
 
-        result = check_and_send_pending_messages("test-terminal")
+        svc = InboxService()
+        svc.deliver_pending("term-1")
 
-        assert result is True
-        mock_terminal_service.send_input.assert_called_once_with("test-terminal", "test message")
-        mock_update_status.assert_called_once_with(1, MessageStatus.DELIVERED)
+        mock_term_svc.send_input.assert_called_once_with("term-1", "hello")
+        mock_update.assert_called_once_with(1, MessageStatus.DELIVERED)
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
-    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
-    def test_message_send_failure(
-        self, mock_get_messages, mock_provider_manager, mock_terminal_service, mock_update_status
+    def test_delivers_message_when_completed(
+        self, mock_get, mock_monitor, mock_term_svc, mock_update
     ):
-        """Test message delivery failure."""
-        mock_message = MagicMock()
-        mock_message.id = 1
-        mock_message.message = "test message"
-        mock_get_messages.return_value = [mock_message]
-        mock_provider = MagicMock()
-        mock_provider.get_status.return_value = TerminalStatus.IDLE
-        mock_provider_manager.get_provider.return_value = mock_provider
-        mock_terminal_service.send_input.side_effect = Exception("Send failed")
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.COMPLETED
 
-        with pytest.raises(Exception, match="Send failed"):
-            check_and_send_pending_messages("test-terminal")
+        svc = InboxService()
+        svc.deliver_pending("term-1")
 
-        # Status is optimistically set to DELIVERED before send_input, then
-        # reset to FAILED when the send raises.
-        mock_update_status.assert_has_calls(
+        mock_term_svc.send_input.assert_called_once_with("term-1", "hello")
+        mock_update.assert_called_once_with(1, MessageStatus.DELIVERED)
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_skips_when_no_pending_messages(
+        self, mock_get, mock_monitor, mock_term_svc, mock_update
+    ):
+        mock_get.return_value = []
+
+        svc = InboxService()
+        svc.deliver_pending("term-1")
+
+        mock_term_svc.send_input.assert_not_called()
+        mock_update.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_skips_when_processing(self, mock_get, mock_monitor, mock_term_svc, mock_update):
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.PROCESSING
+
+        svc = InboxService()
+        svc.deliver_pending("term-1")
+
+        mock_term_svc.send_input.assert_not_called()
+        mock_update.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_skips_when_unknown(self, mock_get, mock_monitor, mock_term_svc, mock_update):
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.UNKNOWN
+
+        svc = InboxService()
+        svc.deliver_pending("term-1")
+
+        mock_term_svc.send_input.assert_not_called()
+        mock_update.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_delivers_multiple_messages_concatenated(
+        self, mock_get, mock_monitor, mock_term_svc, mock_update
+    ):
+        msgs = [_make_message(id=1, message="hello"), _make_message(id=2, message="world")]
+        mock_get.return_value = msgs
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+
+        svc = InboxService()
+        svc.deliver_pending("term-1", num_messages=2)
+
+        mock_get.assert_called_once_with("term-1", limit=2)
+        mock_term_svc.send_input.assert_called_once_with("term-1", "hello\nworld")
+        assert mock_update.call_count == 2
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_delivers_all_when_num_messages_zero(
+        self, mock_get, mock_monitor, mock_term_svc, mock_update
+    ):
+        msgs = [_make_message(id=i, message=f"msg{i}") for i in range(3)]
+        mock_get.return_value = msgs
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+
+        svc = InboxService()
+        svc.deliver_pending("term-1", num_messages=0)
+
+        mock_get.assert_called_once_with("term-1", limit=100)
+        mock_term_svc.send_input.assert_called_once_with("term-1", "msg0\nmsg1\nmsg2")
+        assert mock_update.call_count == 3
+
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
+    def test_marks_failed_on_send_error(self, mock_get, mock_monitor, mock_term_svc, mock_update):
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_term_svc.send_input.side_effect = RuntimeError("tmux error")
+
+        svc = InboxService()
+        svc.deliver_pending("term-1")
+
+        # Status is set to DELIVERED before send_input (#164), then reset to
+        # FAILED when the send raises.
+        mock_update.assert_has_calls(
             [
                 call(1, MessageStatus.DELIVERED),
                 call(1, MessageStatus.FAILED),
             ]
         )
-        assert mock_update_status.call_count == 2
+        assert mock_update.call_count == 2
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
-    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_marks_delivered_before_send_input(
-        self, mock_get_messages, mock_provider_manager, mock_terminal_service, mock_update_status
+        self, mock_get, mock_monitor, mock_term_svc, mock_update
     ):
-        """Regression test for the double-delivery race (GH #164).
+        """Regression for the double-delivery race (#164).
 
-        send_input() writes to the terminal log, which re-triggers the
-        watchdog. The message must already be marked DELIVERED by then, so the
-        status update has to happen before send_input is called.
+        send_input()'s output flows back through the FIFO/StatusMonitor pipeline
+        and can re-emit a status event that re-enters deliver_pending. The
+        message must already be DELIVERED by then, so the status update has to
+        happen before send_input is called.
         """
-        mock_message = MagicMock()
-        mock_message.id = 1
-        mock_message.message = "test message"
-        mock_get_messages.return_value = [mock_message]
-        mock_provider = MagicMock()
-        mock_provider.get_status.return_value = TerminalStatus.IDLE
-        mock_provider_manager.get_provider.return_value = mock_provider
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
 
         order = []
-        mock_update_status.side_effect = lambda *args, **kwargs: order.append(("update", args))
-        mock_terminal_service.send_input.side_effect = lambda *args, **kwargs: order.append(
-            ("send", args)
-        )
+        mock_update.side_effect = lambda *args, **kwargs: order.append(("update", args))
+        mock_term_svc.send_input.side_effect = lambda *args, **kwargs: order.append(("send", args))
 
-        check_and_send_pending_messages("test-terminal")
+        svc = InboxService()
+        svc.deliver_pending("term-1")
 
         assert order[0] == ("update", (1, MessageStatus.DELIVERED))
         assert order[1][0] == "send"
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
-    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_resolution_failure_leaves_message_pending(
-        self, mock_get_messages, mock_provider_manager, mock_terminal_service, mock_update_status
+        self, mock_get, mock_monitor, mock_term_svc, mock_update
     ):
         """A TerminalNotFoundError during send leaves the message PENDING, not FAILED.
 
         Pane resolution can transiently fail (e.g. herdr pane not yet resolvable).
-        Status is optimistically set DELIVERED before send (to close the watchdog
+        Status is optimistically set DELIVERED before send (to close the
         re-entrancy race), so on a resolution failure it must be reset to PENDING
         for a later retry — never left DELIVERED or marked FAILED.
         """
-        mock_message = MagicMock()
-        mock_message.id = 1
-        mock_message.message = "test message"
-        mock_get_messages.return_value = [mock_message]
-        mock_provider = MagicMock()
-        mock_provider.get_status.return_value = TerminalStatus.IDLE
-        mock_provider_manager.get_provider.return_value = mock_provider
-        mock_terminal_service.send_input.side_effect = TerminalNotFoundError("s:w")
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
+        mock_term_svc.send_input.side_effect = TerminalNotFoundError("s:w")
 
-        result = check_and_send_pending_messages("test-terminal")
+        svc = InboxService()
+        svc.deliver_pending("term-1")
 
-        assert result is False
         # Final status is PENDING (reset after the optimistic DELIVERED), never FAILED.
-        assert mock_update_status.call_args_list[-1] == call(1, MessageStatus.PENDING)
-        assert call(1, MessageStatus.FAILED) not in mock_update_status.call_args_list
+        assert mock_update.call_args_list[-1] == call(1, MessageStatus.PENDING)
+        assert call(1, MessageStatus.FAILED) not in mock_update.call_args_list
 
 
 class TestEagerInboxDelivery:
     """Tests for eager inbox delivery (CAO_EAGER_INBOX_DELIVERY).
 
-    Covers the relaxed status gate in check_and_send_pending_messages() that
-    allows PROCESSING delivery when the env var is
-    enabled and the provider declares accepts_input_while_processing=True.
+    Covers the relaxed status gate in deliver_pending() that allows PROCESSING
+    and WAITING_USER_ANSWER delivery when the env var is enabled and the
+    provider declares accepts_input_while_processing=True.
     """
 
-    def _make_message(self):
-        msg = MagicMock()
-        msg.id = 42
-        msg.message = "eager test"
-        msg.sender_id = "sender-1"
-        return msg
-
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_delivery_idle_status_always_works(
-        self, mock_get_messages, mock_pm, mock_ts, mock_update
+        self, mock_get, mock_monitor, mock_pm, mock_term_svc, mock_update
     ):
         """IDLE delivers regardless of env var or provider capability."""
-        mock_get_messages.return_value = [self._make_message()]
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
         provider = MagicMock()
-        provider.get_status.return_value = TerminalStatus.IDLE
         provider.accepts_input_while_processing = False
         mock_pm.get_provider.return_value = provider
 
         with patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", False):
-            result = check_and_send_pending_messages("t1")
+            svc = InboxService()
+            svc.deliver_pending("t1")
 
-        assert result is True
-        mock_ts.send_input.assert_called_once()
+        mock_term_svc.send_input.assert_called_once()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_delivery_completed_status_always_works(
-        self, mock_get_messages, mock_pm, mock_ts, mock_update
+        self, mock_get, mock_monitor, mock_pm, mock_term_svc, mock_update
     ):
         """COMPLETED delivers regardless of env var or provider capability."""
-        mock_get_messages.return_value = [self._make_message()]
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.COMPLETED
         provider = MagicMock()
-        provider.get_status.return_value = TerminalStatus.COMPLETED
         provider.accepts_input_while_processing = False
         mock_pm.get_provider.return_value = provider
 
         with patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", False):
-            result = check_and_send_pending_messages("t1")
+            svc = InboxService()
+            svc.deliver_pending("t1")
 
-        assert result is True
+        mock_term_svc.send_input.assert_called_once()
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_delivery_processing_with_eager_enabled_and_capable_provider(
-        self, mock_get_messages, mock_pm, mock_ts, mock_update
+        self, mock_get, mock_monitor, mock_pm, mock_term_svc, mock_update
     ):
         """PROCESSING + eager ON + capable provider -> delivers."""
-        mock_get_messages.return_value = [self._make_message()]
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.PROCESSING
         provider = MagicMock()
-        provider.get_status.return_value = TerminalStatus.PROCESSING
         provider.accepts_input_while_processing = True
         mock_pm.get_provider.return_value = provider
 
         with patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", True):
-            result = check_and_send_pending_messages("t1")
+            svc = InboxService()
+            svc.deliver_pending("t1")
 
-        assert result is True
-        mock_ts.send_input.assert_called_once()
+        mock_term_svc.send_input.assert_called_once()
 
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_delivery_processing_with_eager_enabled_and_non_capable_provider(
-        self, mock_get_messages, mock_pm
+        self, mock_get, mock_monitor, mock_pm, mock_term_svc, mock_update
     ):
         """PROCESSING + eager ON + non-capable provider -> skips."""
-        mock_get_messages.return_value = [self._make_message()]
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.PROCESSING
         provider = MagicMock()
-        provider.get_status.return_value = TerminalStatus.PROCESSING
         provider.accepts_input_while_processing = False
         mock_pm.get_provider.return_value = provider
 
         with patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", True):
-            result = check_and_send_pending_messages("t1")
+            svc = InboxService()
+            svc.deliver_pending("t1")
 
-        assert result is False
+        mock_term_svc.send_input.assert_not_called()
 
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
-    def test_delivery_processing_with_eager_disabled(self, mock_get_messages, mock_pm):
+    def test_delivery_processing_with_eager_disabled(
+        self, mock_get, mock_monitor, mock_pm, mock_term_svc, mock_update
+    ):
         """PROCESSING + eager OFF -> skips even for capable provider."""
-        mock_get_messages.return_value = [self._make_message()]
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.PROCESSING
         provider = MagicMock()
-        provider.get_status.return_value = TerminalStatus.PROCESSING
         provider.accepts_input_while_processing = True
         mock_pm.get_provider.return_value = provider
 
         with patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", False):
-            result = check_and_send_pending_messages("t1")
+            svc = InboxService()
+            svc.deliver_pending("t1")
 
-        assert result is False
+        mock_term_svc.send_input.assert_not_called()
 
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
     def test_delivery_waiting_user_answer_with_eager_enabled_and_capable_provider(
-        self, mock_get_messages, mock_pm, mock_ts
+        self, mock_get, mock_monitor, mock_pm, mock_term_svc, mock_update
     ):
-        """WAITING_USER_ANSWER -> stays pending, not eagerly delivered.
-
-        Even under the most delivery-favorable conditions (eager ON + capable
-        provider), WAITING_USER_ANSWER must not deliver: the agent is blocked on
-        a prompt and typing into it would answer the wrong question.
-        """
-        mock_get_messages.return_value = [self._make_message()]
+        """WAITING_USER_ANSWER + eager ON + capable provider -> delivers."""
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
         provider = MagicMock()
-        provider.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
         provider.accepts_input_while_processing = True
         mock_pm.get_provider.return_value = provider
 
         with patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", True):
-            result = check_and_send_pending_messages("t1")
+            svc = InboxService()
+            svc.deliver_pending("t1")
 
-        assert result is False
-        mock_ts.send_input.assert_not_called()
+        mock_term_svc.send_input.assert_called_once()
 
+    @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
+    @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
     @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.inbox_service.status_monitor")
     @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
-    def test_delivery_error_status_never_delivers(self, mock_get_messages, mock_pm):
+    def test_delivery_error_status_never_delivers(
+        self, mock_get, mock_monitor, mock_pm, mock_term_svc, mock_update
+    ):
         """ERROR -> never delivers regardless of flags."""
-        mock_get_messages.return_value = [self._make_message()]
-        provider = MagicMock()
-        provider.get_status.return_value = TerminalStatus.ERROR
-        provider.accepts_input_while_processing = True
-        mock_pm.get_provider.return_value = provider
-
-        with patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", True):
-            result = check_and_send_pending_messages("t1")
-
-        assert result is False
-
-
-class TestEagerInboxDeliveryWatchdog:
-    """Tests for eager delivery in the watchdog path (LogFileHandler)."""
-
-    @patch("cli_agent_orchestrator.services.inbox_service.check_and_send_pending_messages")
-    @patch("cli_agent_orchestrator.services.inbox_service._has_idle_pattern")
-    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
-    def test_watchdog_skips_idle_check_for_eager_capable_provider(
-        self, mock_get_messages, mock_pm, mock_has_idle, mock_check_send
-    ):
-        """Watchdog proceeds past idle check when eager + capable provider."""
-        mock_get_messages.return_value = [MagicMock()]
+        mock_get.return_value = [_make_message()]
+        mock_monitor.get_status.return_value = TerminalStatus.ERROR
         provider = MagicMock()
         provider.accepts_input_while_processing = True
         mock_pm.get_provider.return_value = provider
 
-        handler = LogFileHandler()
         with patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", True):
-            handler._handle_log_change("t1")
+            svc = InboxService()
+            svc.deliver_pending("t1")
 
-        # _has_idle_pattern should NOT be called (skipped)
-        mock_has_idle.assert_not_called()
-        mock_check_send.assert_called_once_with("t1", registry=None)
-
-    @patch("cli_agent_orchestrator.services.inbox_service.check_and_send_pending_messages")
-    @patch("cli_agent_orchestrator.services.inbox_service._has_idle_pattern")
-    @patch("cli_agent_orchestrator.services.inbox_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
-    def test_watchdog_requires_idle_check_for_non_capable_provider(
-        self, mock_get_messages, mock_pm, mock_has_idle, mock_check_send
-    ):
-        """Watchdog still requires idle check for non-capable provider even with eager ON."""
-        mock_get_messages.return_value = [MagicMock()]
-        provider = MagicMock()
-        provider.accepts_input_while_processing = False
-        mock_pm.get_provider.return_value = provider
-        mock_has_idle.return_value = False  # Not idle
-
-        handler = LogFileHandler()
-        with patch("cli_agent_orchestrator.services.inbox_service.EAGER_INBOX_DELIVERY", True):
-            handler._handle_log_change("t1")
-
-        mock_has_idle.assert_called_once_with("t1")
-        mock_check_send.assert_not_called()
+        mock_term_svc.send_input.assert_not_called()
 
 
 class TestPollOpenCodePendingMessages:
-    """Tests for the temporary OpenCode inbox poller."""
+    """Tests for the OpenCode inbox poller."""
 
-    @patch("cli_agent_orchestrator.services.inbox_service.check_and_send_pending_messages")
     @patch("cli_agent_orchestrator.services.inbox_service.list_pending_receiver_ids_by_provider")
-    def test_polls_pending_opencode_receivers(self, mock_list_receivers, mock_check_send):
+    def test_polls_pending_opencode_receivers(self, mock_list_receivers):
         """Test poller attempts delivery for each pending OpenCode receiver."""
         mock_list_receivers.return_value = ["receiver-1", "receiver-2"]
 
-        poll_opencode_pending_messages()
+        svc = InboxService()
+        svc.deliver_pending = MagicMock()
+        svc.poll_opencode_pending_messages()
 
         mock_list_receivers.assert_called_once_with("opencode_cli")
-        assert mock_check_send.call_args_list == [
+        assert svc.deliver_pending.call_args_list == [
             call("receiver-1", registry=None),
             call("receiver-2", registry=None),
         ]
 
-    @patch("cli_agent_orchestrator.services.inbox_service.check_and_send_pending_messages")
     @patch("cli_agent_orchestrator.services.inbox_service.list_pending_receiver_ids_by_provider")
-    def test_survives_per_receiver_failure(self, mock_list_receivers, mock_check_send):
+    def test_survives_per_receiver_failure(self, mock_list_receivers):
         """Test one failed receiver does not stop the poll loop."""
         mock_list_receivers.return_value = ["receiver-1", "receiver-2"]
-        mock_check_send.side_effect = [Exception("tmux busy"), False]
 
-        poll_opencode_pending_messages()
+        svc = InboxService()
+        svc.deliver_pending = MagicMock(side_effect=[Exception("tmux busy"), None])
+        svc.poll_opencode_pending_messages()
 
-        assert mock_check_send.call_count == 2
+        assert svc.deliver_pending.call_count == 2
 
 
 class TestReconcileOrphanedMessages:
     """Tests for the provider-agnostic inbox reconciliation sweep (issue #131)."""
 
-    @patch("cli_agent_orchestrator.services.inbox_service.check_and_send_pending_messages")
     @patch("cli_agent_orchestrator.services.inbox_service.list_pending_receiver_ids_older_than")
-    def test_reconciles_stale_receivers(self, mock_list_receivers, mock_check_send):
+    def test_reconciles_stale_receivers(self, mock_list_receivers):
         """Sweep attempts delivery for each receiver with an orphaned message."""
         mock_list_receivers.return_value = ["receiver-1", "receiver-2"]
 
-        reconcile_orphaned_messages()
+        svc = InboxService()
+        svc.deliver_pending = MagicMock()
+        svc.reconcile_orphaned_messages()
 
         mock_list_receivers.assert_called_once_with(INBOX_RECONCILE_GRACE_SECONDS)
-        assert mock_check_send.call_args_list == [
+        assert svc.deliver_pending.call_args_list == [
             call("receiver-1", registry=None),
             call("receiver-2", registry=None),
         ]
 
-    @patch("cli_agent_orchestrator.services.inbox_service.check_and_send_pending_messages")
     @patch("cli_agent_orchestrator.services.inbox_service.list_pending_receiver_ids_older_than")
-    def test_survives_per_receiver_failure(self, mock_list_receivers, mock_check_send):
+    def test_survives_per_receiver_failure(self, mock_list_receivers):
         """One failed receiver does not stop the sweep."""
         mock_list_receivers.return_value = ["receiver-1", "receiver-2"]
-        mock_check_send.side_effect = [Exception("tmux busy"), False]
 
-        reconcile_orphaned_messages()
+        svc = InboxService()
+        svc.deliver_pending = MagicMock(side_effect=[Exception("tmux busy"), None])
+        svc.reconcile_orphaned_messages()
 
-        assert mock_check_send.call_count == 2
+        assert svc.deliver_pending.call_count == 2
 
 
-class TestLogFileHandler:
-    """Tests for LogFileHandler class."""
+class TestRun:
+    """Tests for InboxService.run() event loop."""
 
-    @patch("cli_agent_orchestrator.services.inbox_service.check_and_send_pending_messages")
-    @patch("cli_agent_orchestrator.services.inbox_service._has_idle_pattern")
-    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
-    def test_on_modified_triggers_delivery(self, mock_get_messages, mock_has_idle, mock_check_send):
-        """Test on_modified triggers message delivery."""
-        from watchdog.events import FileModifiedEvent
+    @pytest.mark.asyncio
+    async def test_processes_idle_status_event(self):
+        svc = InboxService()
+        svc.deliver_pending = MagicMock()
 
-        mock_get_messages.return_value = [MagicMock()]
-        mock_has_idle.return_value = True
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "topic": "terminal.abc123.status",
+                "data": {"status": TerminalStatus.IDLE.value},
+            }
+        )
 
-        handler = LogFileHandler()
-        event = FileModifiedEvent("/path/to/test-terminal.log")
+        with patch("cli_agent_orchestrator.services.inbox_service.bus") as mock_bus:
+            mock_bus.subscribe.return_value = queue
 
-        handler.on_modified(event)
+            # Run one iteration then cancel
+            async def run_one():
+                task = asyncio.create_task(svc.run())
+                await asyncio.sleep(0.05)
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
-        mock_check_send.assert_called_once_with("test-terminal", registry=None)
+            await run_one()
 
-    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
-    def test_handle_log_change_no_pending_messages(self, mock_get_messages):
-        """Test _handle_log_change with no pending messages (covers lines 105-107)."""
-        mock_get_messages.return_value = []
+        svc.deliver_pending.assert_called_once_with("abc123", registry=None)
 
-        handler = LogFileHandler()
+    @pytest.mark.asyncio
+    async def test_processes_completed_status_event(self):
+        svc = InboxService()
+        svc.deliver_pending = MagicMock()
 
-        # Should return early - covers lines 105-107
-        handler._handle_log_change("test-terminal")
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "topic": "terminal.xyz789.status",
+                "data": {"status": TerminalStatus.COMPLETED.value},
+            }
+        )
 
-        mock_get_messages.assert_called_once_with("test-terminal", limit=1)
+        with patch("cli_agent_orchestrator.services.inbox_service.bus") as mock_bus:
+            mock_bus.subscribe.return_value = queue
 
-    @patch("cli_agent_orchestrator.services.inbox_service._has_idle_pattern")
-    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
-    def test_handle_log_change_not_idle(self, mock_get_messages, mock_has_idle):
-        """Test _handle_log_change when terminal not idle (covers lines 110-114)."""
-        mock_get_messages.return_value = [MagicMock()]
-        mock_has_idle.return_value = False
+            task = asyncio.create_task(svc.run())
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
-        handler = LogFileHandler()
+        svc.deliver_pending.assert_called_once_with("xyz789", registry=None)
 
-        # Should return early - covers lines 110-114
-        handler._handle_log_change("test-terminal")
+    @pytest.mark.asyncio
+    async def test_ignores_processing_status_event(self):
+        svc = InboxService()
+        svc.deliver_pending = MagicMock()
 
-        mock_has_idle.assert_called_once_with("test-terminal")
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "topic": "terminal.abc123.status",
+                "data": {"status": TerminalStatus.PROCESSING.value},
+            }
+        )
 
-    def test_on_modified_non_log_file(self):
-        """Test on_modified ignores non-log files."""
-        from watchdog.events import FileModifiedEvent
+        with patch("cli_agent_orchestrator.services.inbox_service.bus") as mock_bus:
+            mock_bus.subscribe.return_value = queue
 
-        handler = LogFileHandler()
-        # Create a non-.log file event
-        event = MagicMock(spec=FileModifiedEvent)
-        event.src_path = "/path/to/test-terminal.txt"
+            task = asyncio.create_task(svc.run())
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
-        # Should not process non-log files
-        handler.on_modified(event)
+        svc.deliver_pending.assert_not_called()
 
-    def test_on_modified_not_file_modified_event(self):
-        """Test on_modified ignores non-FileModifiedEvent."""
-        handler = LogFileHandler()
-        event = MagicMock()  # Not a FileModifiedEvent
-        event.src_path = "/path/to/test-terminal.log"
+    @pytest.mark.asyncio
+    async def test_threads_registry_to_delivery(self):
+        """run(registry) threads the plugin registry to deliver_pending so
+        status-driven deliveries fire PostSendMessageEvent hooks with the same
+        attribution as the immediate and OpenCode-poller paths (PR #273 review).
+        """
+        svc = InboxService()
+        svc.deliver_pending = MagicMock()
+        registry = MagicMock()
 
-        # Should not process non-FileModifiedEvent
-        handler.on_modified(event)
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "topic": "terminal.abc123.status",
+                "data": {"status": TerminalStatus.IDLE.value},
+            }
+        )
 
-    @patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages")
-    def test_handle_log_change_exception(self, mock_get_messages):
-        """Test _handle_log_change handles exceptions (covers line 119-120)."""
-        mock_get_messages.side_effect = Exception("Database error")
+        with patch("cli_agent_orchestrator.services.inbox_service.bus") as mock_bus:
+            mock_bus.subscribe.return_value = queue
 
-        handler = LogFileHandler()
+            task = asyncio.create_task(svc.run(registry))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
-        # Should not raise exception - handles it gracefully
-        handler._handle_log_change("test-terminal")
+        svc.deliver_pending.assert_called_once_with("abc123", registry=registry)
+
+    @pytest.mark.asyncio
+    async def test_offloads_delivery_to_thread(self):
+        """Delivery is offloaded via asyncio.to_thread so the consumer loop keeps
+        yielding to the event loop and never blocks StatusMonitor/LogWriter on
+        deliver_pending's synchronous DB + tmux I/O (PR #273 review; see the
+        threading discipline note in docs/event-driven-architecture.md).
+        """
+        svc = InboxService()
+        svc.deliver_pending = MagicMock()
+
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "topic": "terminal.abc123.status",
+                "data": {"status": TerminalStatus.IDLE.value},
+            }
+        )
+
+        with (
+            patch("cli_agent_orchestrator.services.inbox_service.bus") as mock_bus,
+            patch(
+                "cli_agent_orchestrator.services.inbox_service.asyncio.to_thread",
+                new_callable=AsyncMock,
+            ) as mock_to_thread,
+        ):
+            mock_bus.subscribe.return_value = queue
+
+            task = asyncio.create_task(svc.run())
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        mock_to_thread.assert_awaited_once_with(svc.deliver_pending, "abc123", registry=None)

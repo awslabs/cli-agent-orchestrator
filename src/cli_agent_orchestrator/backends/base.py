@@ -146,6 +146,7 @@ class TerminalBackend(ABC):
         keys: str,
         enter_count: int = 1,
         force_bracketed_paste: bool = False,
+        submit_delay: float = 0.3,
     ) -> None:
         """Send text input to a window.
 
@@ -155,6 +156,9 @@ class TerminalBackend(ABC):
             keys: Text to send
             enter_count: Number of Enter keys to send after the text
             force_bracketed_paste: If True, wrap in bracketed paste sequences
+            submit_delay: Seconds to wait after pasting before sending Enter, so
+                a TUI (e.g. Claude Code's Ink renderer) finishes processing the
+                paste before submission. Backends without a paste step may ignore.
         """
         ...
 

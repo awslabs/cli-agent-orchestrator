@@ -295,6 +295,7 @@ class TmuxClient:
         keys: str,
         enter_count: int = 1,
         force_bracketed_paste: bool = False,
+        submit_delay: float = 0.3,
     ) -> None:
         """Send keys to window using tmux paste-buffer for instant delivery.
 
@@ -348,10 +349,12 @@ class TmuxClient:
                 ["tmux", "paste-buffer", paste_flag, "-b", buf_name, "-t", target],
                 check=True,
             )
-            # Brief delay to let the TUI process the bracketed paste end sequence
-            # before sending Enter. Without this, some TUIs (e.g., Claude Code 2.x)
-            # swallow the Enter that immediately follows paste-buffer -p.
-            time.sleep(0.3)
+            # Delay to let the TUI process the bracketed paste end sequence before
+            # sending Enter. Without enough delay, some TUIs (e.g. the newest
+            # Claude Code Ink renderer) swallow the Enter that immediately follows
+            # paste-buffer, leaving the message unsubmitted. The duration is
+            # provider-tunable via ``submit_delay`` (BaseProvider.paste_submit_delay).
+            time.sleep(submit_delay)
             for i in range(enter_count):
                 if i > 0:
                     # Delay between Enter presses for TUIs that need time to

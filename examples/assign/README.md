@@ -104,17 +104,18 @@ This blocks until report_generator completes and returns the template.
 ```
 Use assign for parallel tasks:
 
-1. Get your terminal ID: my_id = CAO_TERMINAL_ID
-
-2. Assign with callback instructions:
+1. Assign the task:
    assign(
      agent_profile="data_analyst",
-     message="Analyze dataset [values]. 
-              Send results to terminal {my_id} using send_message."
+     message="Analyze dataset [values]."
    )
 
-3. Continue immediately (non-blocking)
-4. Repeat for other datasets
+   Your terminal ID and callback instructions are appended to the
+   message automatically, and your terminal is recorded as the
+   worker's caller. (Disable with CAO_ENABLE_SENDER_ID_INJECTION=false.)
+
+2. Continue immediately (non-blocking)
+3. Repeat for other datasets
 ```
 
 ### 3. `send_message` - Async Communication
@@ -130,11 +131,12 @@ Use assign for parallel tasks:
 Use send_message to return results:
 
 send_message(
-  receiver_id="abc12345",
   message="Dataset A analysis: mean=3.0, median=3.0, std=1.414"
 )
 
-Message will be delivered to terminal abc12345's inbox.
+Without receiver_id, the message routes to the terminal that
+assigned the task (the recorded caller). Pass receiver_id only
+to reach a different terminal.
 ```
 
 ## Agent Profile Details
@@ -343,8 +345,8 @@ See `test/e2e/test_assign.py` for the test implementation.
 
 ## Tips
 
-- Always get your terminal ID before assigning
-- Include callback terminal ID in all assign messages
+- Callback routing is automatic: your terminal ID is appended to assign messages and recorded as the worker's caller
+- Workers reply with `send_message` without `receiver_id` — it routes to the assigning terminal
 - Assign all parallel tasks quickly (don't wait between assigns)
 - Use handoff for work that must complete before final assembly
 - Check inbox for incoming results from assigned workers

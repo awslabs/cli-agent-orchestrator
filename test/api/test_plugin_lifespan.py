@@ -1,19 +1,45 @@
 """Integration tests for plugin registry FastAPI lifespan wiring."""
 
 import logging
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi import Request
 
 from cli_agent_orchestrator.api.main import app, get_plugin_registry, lifespan
-from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
 from cli_agent_orchestrator.plugins import CaoPlugin, PluginRegistry, hook
 from cli_agent_orchestrator.plugins.events import PostSendMessageEvent
 
 
 async def fake_flow_daemon() -> None:
     """Minimal async flow daemon stub for lifespan tests."""
+
+
+async def fake_opencode_daemon(registry) -> None:
+    """Minimal async OpenCode inbox poller stub for lifespan tests."""
+    del registry
+
+
+def _consumer_patches():
+    """Patch the event-bus consumer coroutines and the OpenCode poller.
+
+    The merged lifespan starts ``status_monitor.run()``, ``log_writer.run()``
+    and ``inbox_service.run()`` as background tasks (each an endless event-bus
+    consumer loop) and the OpenCode inbox delivery daemon. These must be
+    stubbed so the lifespan enters and exits cleanly without spinning real
+    consumer loops or leaving un-awaited coroutines. ``run`` is an async
+    method on each singleton, so an ``AsyncMock`` yields an awaitable that
+    ``asyncio.create_task`` can schedule and complete immediately.
+    """
+    return (
+        patch("cli_agent_orchestrator.api.main.status_monitor.run", new_callable=AsyncMock),
+        patch("cli_agent_orchestrator.api.main.log_writer.run", new_callable=AsyncMock),
+        patch("cli_agent_orchestrator.api.main.inbox_service.run", new_callable=AsyncMock),
+        patch(
+            "cli_agent_orchestrator.api.main.opencode_inbox_delivery_daemon",
+            fake_opencode_daemon,
+        ),
+    )
 
 
 class TestPluginRegistryLifespan:
@@ -23,30 +49,28 @@ class TestPluginRegistryLifespan:
     async def test_lifespan_stores_registry_and_tears_it_down(self) -> None:
         """The lifespan should create, store, expose, and tear down the registry."""
 
-        mock_observer = MagicMock()
         ordering: list[str] = []
         mock_load = AsyncMock()
         mock_teardown = AsyncMock()
         mock_load.side_effect = lambda: ordering.append("registry_load")
-        mock_observer.schedule.side_effect = lambda *args, **kwargs: ordering.append(
-            "observer_schedule"
-        )
 
         request_scope = {"type": "http", "app": app, "headers": []}
+
+        status_run, log_run, inbox_run, opencode_daemon = _consumer_patches()
 
         with (
             patch("cli_agent_orchestrator.api.main.setup_logging"),
             patch("cli_agent_orchestrator.api.main.init_db"),
             patch("cli_agent_orchestrator.api.main.cleanup_old_data"),
             patch(
-                "cli_agent_orchestrator.api.main.get_backend",
-                return_value=MagicMock(spec=TmuxBackend),
-            ),
-            patch(
-                "cli_agent_orchestrator.api.main.PollingObserver",
-                return_value=mock_observer,
+                "cli_agent_orchestrator.api.main.cleanup_expired_memories", new_callable=AsyncMock
             ),
             patch("cli_agent_orchestrator.api.main.flow_daemon", fake_flow_daemon),
+            patch("cli_agent_orchestrator.api.main.bus.set_loop"),
+            status_run,
+            log_run,
+            inbox_run,
+            opencode_daemon,
             patch.object(PluginRegistry, "load", mock_load),
             patch.object(PluginRegistry, "teardown", mock_teardown),
         ):
@@ -57,13 +81,10 @@ class TestPluginRegistryLifespan:
                 assert get_plugin_registry(Request(request_scope)) is registry
                 assert get_plugin_registry(Request(dict(request_scope))) is registry
                 mock_load.assert_awaited_once()
-                mock_observer.schedule.assert_called_once()
-                mock_observer.start.assert_called_once()
-                assert ordering == ["registry_load", "observer_schedule"]
+                # Registry load is the first startup step.
+                assert ordering == ["registry_load"]
 
             mock_teardown.assert_awaited_once()
-            mock_observer.stop.assert_called_once()
-            mock_observer.join.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_lifespan_logs_no_plugins_registered_when_entry_points_are_empty(
@@ -71,17 +92,21 @@ class TestPluginRegistryLifespan:
     ) -> None:
         """The lifespan should surface the empty-plugin INFO log from the registry."""
 
-        mock_observer = MagicMock()
+        status_run, log_run, inbox_run, opencode_daemon = _consumer_patches()
 
         with (
             patch("cli_agent_orchestrator.api.main.setup_logging"),
             patch("cli_agent_orchestrator.api.main.init_db"),
             patch("cli_agent_orchestrator.api.main.cleanup_old_data"),
             patch(
-                "cli_agent_orchestrator.api.main.PollingObserver",
-                return_value=mock_observer,
+                "cli_agent_orchestrator.api.main.cleanup_expired_memories", new_callable=AsyncMock
             ),
             patch("cli_agent_orchestrator.api.main.flow_daemon", fake_flow_daemon),
+            patch("cli_agent_orchestrator.api.main.bus.set_loop"),
+            status_run,
+            log_run,
+            inbox_run,
+            opencode_daemon,
             patch("importlib.metadata.entry_points", return_value=[]),
         ):
             with caplog.at_level(logging.INFO, logger="cli_agent_orchestrator.plugins.registry"):
@@ -94,8 +119,6 @@ class TestPluginRegistryLifespan:
     async def test_lifespan_tolerates_plugin_setup_failure(self) -> None:
         """The lifespan should still start when one plugin fails during setup."""
 
-        mock_observer = MagicMock()
-
         class FailingPlugin(CaoPlugin):
             async def setup(self) -> None:
                 raise RuntimeError("setup failed")
@@ -105,15 +128,21 @@ class TestPluginRegistryLifespan:
             async def on_message(self, event: PostSendMessageEvent) -> None:
                 del event
 
+        status_run, log_run, inbox_run, opencode_daemon = _consumer_patches()
+
         with (
             patch("cli_agent_orchestrator.api.main.setup_logging"),
             patch("cli_agent_orchestrator.api.main.init_db"),
             patch("cli_agent_orchestrator.api.main.cleanup_old_data"),
             patch(
-                "cli_agent_orchestrator.api.main.PollingObserver",
-                return_value=mock_observer,
+                "cli_agent_orchestrator.api.main.cleanup_expired_memories", new_callable=AsyncMock
             ),
             patch("cli_agent_orchestrator.api.main.flow_daemon", fake_flow_daemon),
+            patch("cli_agent_orchestrator.api.main.bus.set_loop"),
+            status_run,
+            log_run,
+            inbox_run,
+            opencode_daemon,
             patch(
                 "importlib.metadata.entry_points",
                 return_value=[

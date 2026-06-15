@@ -17,7 +17,7 @@ so the keyword arguments below follow the implementation, not the (stale) task b
 
 import contextlib
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -84,6 +84,13 @@ def create_mocks():
         backend.session_exists.return_value = True
         backend.create_window.return_value = WINDOW_NAME
         backend.get_pane_id.return_value = PANE_ID
+        # Herdr-style backend: event-inbox based, so the FIFO/pipe-pane setup is
+        # skipped and inbox delivery goes through the herdr registration below.
+        backend.supports_event_inbox.return_value = True
+
+        # create_terminal awaits provider.initialize(); make it a coroutine.
+        provider_instance = m.provider_manager.create_provider.return_value
+        provider_instance.initialize = AsyncMock(return_value=True)
 
         service = MagicMock()
         m.get_herdr_inbox_service.return_value = service
@@ -96,13 +103,14 @@ def create_mocks():
 class TestCreateTerminalHerdrRegistration:
     """create_terminal -> herdr inbox registration wiring."""
 
-    def test_create_terminal_registers_with_herdr_inbox(self, create_mocks):
+    @pytest.mark.asyncio
+    async def test_create_terminal_registers_with_herdr_inbox(self, create_mocks):
         """When a herdr inbox service exists, the new terminal is registered with it."""
         # Arrange
         m = create_mocks
 
         # Act
-        terminal = create_terminal(
+        terminal = await create_terminal(
             provider="claude_code",
             agent_profile="developer",
             session_name=SESSION_NAME,
@@ -114,14 +122,15 @@ class TestCreateTerminalHerdrRegistration:
         assert isinstance(terminal, Terminal)
         assert terminal.id == TERMINAL_ID
 
-    def test_create_terminal_no_registration_when_service_none(self, create_mocks):
+    @pytest.mark.asyncio
+    async def test_create_terminal_no_registration_when_service_none(self, create_mocks):
         """On the tmux path (service is None) no registration is attempted."""
         # Arrange
         m = create_mocks
         m.get_herdr_inbox_service.return_value = None
 
         # Act
-        terminal = create_terminal(
+        terminal = await create_terminal(
             provider="claude_code",
             agent_profile="developer",
             session_name=SESSION_NAME,
@@ -133,7 +142,8 @@ class TestCreateTerminalHerdrRegistration:
         assert isinstance(terminal, Terminal)
         assert terminal.id == TERMINAL_ID
 
-    def test_create_terminal_registration_failure_does_not_kill_terminal(self, create_mocks):
+    @pytest.mark.asyncio
+    async def test_create_terminal_registration_failure_does_not_kill_terminal(self, create_mocks):
         """A registration failure is swallowed; the terminal is still created and returned."""
         # Arrange: pane id lookup blows up (e.g. TerminalNotFoundError) inside the
         # registration block. The inner try/except must contain it.
@@ -141,7 +151,7 @@ class TestCreateTerminalHerdrRegistration:
         m.backend.get_pane_id.side_effect = RuntimeError("pane not found")
 
         # Act
-        terminal = create_terminal(
+        terminal = await create_terminal(
             provider="claude_code",
             agent_profile="developer",
             session_name=SESSION_NAME,
@@ -156,13 +166,14 @@ class TestCreateTerminalHerdrRegistration:
         m.backend.kill_session.assert_not_called()
         m.provider_manager.cleanup_provider.assert_not_called()
 
-    def test_create_terminal_kiro_provider_sets_is_kiro_true(self, create_mocks):
+    @pytest.mark.asyncio
+    async def test_create_terminal_kiro_provider_sets_is_kiro_true(self, create_mocks):
         """A kiro_cli provider registers with is_kiro=True."""
         # Arrange
         m = create_mocks
 
         # Act
-        create_terminal(
+        await create_terminal(
             provider=ProviderType.KIRO_CLI.value,
             agent_profile="developer",
             session_name=SESSION_NAME,

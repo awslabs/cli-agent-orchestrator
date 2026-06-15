@@ -27,6 +27,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
+from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
 
@@ -34,12 +35,17 @@ logger = logging.getLogger(__name__)
 # Regex Patterns for Kiro CLI Output Analysis
 # =============================================================================
 
-# Green arrow pattern indicates the start of an agent response (ANSI-stripped)
+# Green arrow pattern indicates the start of an agent response (escape-stripped)
 # Example: "> Here is the code you requested..."
 GREEN_ARROW_PATTERN = r"^>\s*"
 
-# ANSI escape code pattern for stripping terminal colors
-# Matches sequences like \x1b[32m (green), \x1b[0m (reset), etc.
+# SGR (colour) escape codes only. Used by get_status, which strips colour but
+# MUST preserve carriage returns and cursor-movement sequences: the permission
+# detection counts idle prompts per newline-delimited line, and Kiro renders
+# active prompts with \r in-place redraws (same line, no \n). strip_terminal_
+# escapes would normalise \r -> \n and split those redraws onto separate lines,
+# making an active permission prompt look idle (inbox would then deliver during
+# a permission prompt — see test_permission_prompt_detection).
 ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
 
 # Additional escape sequences that may appear in terminal output
@@ -48,8 +54,7 @@ ESCAPE_SEQUENCE_PATTERN = r"\[[?0-9;]*[a-zA-Z]"
 # Control characters to strip from final output
 CONTROL_CHAR_PATTERN = r"[\x00-\x1f\x7f-\x9f]"
 
-# Bell character (audible alert)
-BELL_CHAR = "\x07"
+# Legacy-UI IDLE prompt pattern for log files (with ANSI codes)
 IDLE_PROMPT_PATTERN_LOG = r"\x1b\[38;5;\d+m\[.+?\].*\x1b\[38;5;\d+m>\s*\x1b\[\d*m"
 
 # =============================================================================
@@ -192,7 +197,7 @@ class KiroCliProvider(BaseProvider):
             return None
         return profile.model or None
 
-    def initialize(self) -> bool:
+    async def initialize(self) -> bool:
         """Initialize Kiro CLI provider by starting kiro-cli chat command.
 
         This method:
@@ -206,9 +211,11 @@ class KiroCliProvider(BaseProvider):
         Raises:
             TimeoutError: If shell or Kiro CLI initialization times out
         """
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
         # Step 1: Wait for shell prompt to appear in the tmux window
         # This ensures the terminal is ready before we send commands
-        if not wait_for_shell(get_backend(), self.session_name, self.window_name, timeout=10.0):
+        if not await wait_for_shell(self.terminal_id, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
         # Capture the shell process name before launching kiro — used later to detect kiro exit
@@ -245,13 +252,16 @@ class KiroCliProvider(BaseProvider):
             base_args.extend(["--model", model])
         base_args.extend(["--agent", self._agent_profile])
         command = shlex.join(base_args)
+        # Arm the StatusMonitor stickiness gate before launching the CLI so
+        # the IDLE → PROCESSING → IDLE/COMPLETED transition is honored.
+        status_monitor.notify_input_sent(self.terminal_id)
         get_backend().send_keys(self.session_name, self.window_name, command)
 
         # Step 3: Wait for Kiro CLI to fully initialize and show the agent prompt.
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
         # message that get_status() interprets as a completed response.
-        if not wait_until_status(
-            self, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=30.0
+        if not await wait_until_status(
+            self.terminal_id, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=30.0
         ):
             if yolo:
                 # Yolo already launched with --legacy-ui; no further fallback.
@@ -259,69 +269,82 @@ class KiroCliProvider(BaseProvider):
             # Non-yolo TUI mode failed — fall back to --legacy-ui
             logger.warning("Kiro CLI TUI initialization timed out, retrying with --legacy-ui")
             # Exit the current session and start fresh with --legacy-ui
+            status_monitor.notify_input_sent(self.terminal_id)
             get_backend().send_keys(self.session_name, self.window_name, "/exit")
-            if not wait_for_shell(get_backend(), self.session_name, self.window_name, timeout=10.0):
+            if not await wait_for_shell(self.terminal_id, timeout=10.0):
                 raise TimeoutError("Shell recovery timed out after --legacy-ui fallback")
+            # Clear the StatusMonitor buffer so the --legacy-ui attempt is detected
+            # against a clean buffer, not one still full of stale TUI marker bytes
+            # from the failed first attempt (which would otherwise time out too).
+            status_monitor.reset_buffer(self.terminal_id)
             legacy_args = ["kiro-cli", "chat", "--legacy-ui"]
             if model:
                 legacy_args.extend(["--model", model])
             legacy_args.extend(["--agent", self._agent_profile])
             legacy_command = shlex.join(legacy_args)
+            status_monitor.notify_input_sent(self.terminal_id)
             get_backend().send_keys(self.session_name, self.window_name, legacy_command)
-            if not wait_until_status(
-                self, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=30.0
+            if not await wait_until_status(
+                self.terminal_id, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=30.0
             ):
                 raise TimeoutError("Kiro CLI initialization timed out with TUI and `--legacy-ui`")
 
         self._initialized = True
         return True
 
-    def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
+    def get_status(self, output: str) -> TerminalStatus:
         """Get Kiro CLI status by analyzing terminal output.
 
         Status detection logic (in priority order):
-        1. No output → ERROR
+        1. No output → UNKNOWN
         2. No IDLE prompt visible → PROCESSING (agent is generating response)
         3. Error indicators present → ERROR
         4. Permission prompt visible → WAITING_USER_ANSWER
         5. Green arrow + prompt visible → COMPLETED (response ready)
         6. Only prompt visible → IDLE (waiting for input)
-
-        Args:
-            tail_lines: Number of lines to capture from terminal history.
-                        If None, uses default from get_backend().
-
-        Returns:
-            Current TerminalStatus enum value
         """
-        logger.debug(f"get_status: tail_lines={tail_lines}")
-        output = get_backend().get_history(
-            self.session_name, self.window_name, tail_lines=tail_lines
-        )
-
-        # No output indicates a terminal error
         if not output:
-            return TerminalStatus.ERROR
+            return TerminalStatus.UNKNOWN
 
-        # Strip ANSI codes once for all pattern matching
-        # This simplifies regex patterns and improves reliability
+        # Strip ONLY SGR colour codes for pattern matching. Carriage returns and
+        # cursor-movement sequences are intentionally preserved: the permission
+        # check below counts idle prompts per "\n"-delimited line and relies on
+        # \r in-place redraws staying on the same logical line (see
+        # ANSI_CODE_PATTERN). Do not switch this to strip_terminal_escapes.
         clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
 
-        # Check 0: TUI startup — the new TUI renders the idle-prompt
-        # placeholder ("Ask a question or describe a task") before the
-        # "● Initializing..." phase completes, so a naive idle match would
-        # declare IDLE ~1s into launch and the first user message would be
-        # dropped. "Initializing..." is always cleared once init finishes, so
-        # its presence unconditionally means PROCESSING.
-        if re.search(TUI_INITIALIZING_PATTERN, clean_output):
-            return TerminalStatus.PROCESSING
-
-        # Check 1: Detect idle prompts early — required for the position-aware
-        # processing check below.
+        # Check 0a: Detect idle prompts early — required for the position-aware
+        # processing checks below.
         old_idle_matches = list(re.finditer(self._idle_prompt_pattern, clean_output))
         new_tui_idle_matches = list(re.finditer(NEW_TUI_IDLE_PATTERN, clean_output))
         has_idle_prompt = old_idle_matches[0] if old_idle_matches else None
         has_new_tui_idle = bool(new_tui_idle_matches)
+
+        # Check 0b: TUI startup — Kiro emits "● Initializing..." or
+        # "0 of N mcp servers initialized. ctrl-c to start chatting now"
+        # before the prompt is interactive; pastes during this window are
+        # silently absorbed by the boot screen.
+        #
+        # The new TUI renders an idle-prompt PLACEHOLDER ("Ask a question
+        # or describe a task") even during boot, so NEW_TUI_IDLE_PATTERN
+        # matching after the init line does NOT mean init has finished —
+        # we must still report PROCESSING.
+        #
+        # In --legacy-ui (and once the new TUI is interactive), the actual
+        # "[agent] N% > " idle prompt only appears AFTER init has completed.
+        # The "0 of N mcp servers initialized..." line is drawn once at
+        # boot and redrawn over by the TUI; under the event-driven FIFO
+        # pipeline that line still sits in the rolling byte stream forever
+        # (issue surfaced by yolo --legacy-ui timing out 11/11 e2e tests).
+        # Treat the init line as PROCESSING only when no real ``[agent] >``
+        # idle prompt appears AFTER the last init match — mirrors the
+        # TUI_PROCESSING_PATTERN ghost-text guard below.
+        init_matches = list(re.finditer(TUI_INITIALIZING_PATTERN, clean_output))
+        if init_matches:
+            last_init_pos = init_matches[-1].end()
+            real_idle_after_init = any(m.start() > last_init_pos for m in old_idle_matches)
+            if not real_idle_after_init:
+                return TerminalStatus.PROCESSING
 
         # Check 2: Look for TUI "Kiro is working" ghost text.
         # Kiro TUI redraws the screen in-place, so the buffer can retain a stale
@@ -458,7 +481,7 @@ class KiroCliProvider(BaseProvider):
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract agent's final response message using green arrow indicator."""
         # Strip ANSI codes for pattern matching
-        clean_output = re.sub(ANSI_CODE_PATTERN, "", script_output)
+        clean_output = strip_terminal_escapes(script_output)
 
         # Find patterns in clean output
         green_arrows = list(re.finditer(GREEN_ARROW_PATTERN, clean_output, re.MULTILINE))
@@ -521,10 +544,6 @@ class KiroCliProvider(BaseProvider):
         if not final_answer:
             raise ValueError("Empty Kiro CLI response - no content found")
 
-        # Clean up the message
-        final_answer = re.sub(ANSI_CODE_PATTERN, "", final_answer)
-        final_answer = re.sub(ESCAPE_SEQUENCE_PATTERN, "", final_answer)
-        final_answer = re.sub(CONTROL_CHAR_PATTERN, "", final_answer)
         return final_answer.strip()
 
     def _extract_tui_message(self, clean_output: str) -> str:

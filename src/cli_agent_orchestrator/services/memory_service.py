@@ -2512,6 +2512,7 @@ class MemoryService:
 
             from cli_agent_orchestrator.models.terminal import TerminalStatus
             from cli_agent_orchestrator.providers.manager import provider_manager
+            from cli_agent_orchestrator.services.status_monitor import status_monitor
 
             provider = provider_manager.get_provider(cm["id"])
             if provider is None:
@@ -2524,7 +2525,7 @@ class MemoryService:
             if not lock.acquire(blocking=False):
                 return self.get_memory_context_for_terminal(terminal_id)
             try:
-                if provider.get_status() != TerminalStatus.IDLE:
+                if status_monitor.get_status(cm["id"]) != TerminalStatus.IDLE:
                     return self.get_memory_context_for_terminal(terminal_id)
 
                 from cli_agent_orchestrator.services.terminal_service import (
@@ -2538,7 +2539,7 @@ class MemoryService:
                 # the sleep this loop spins in microseconds and we always read
                 # stale output.
                 for _ in range(30):
-                    if provider.get_status() in (
+                    if status_monitor.get_status(cm["id"]) in (
                         TerminalStatus.COMPLETED,
                         TerminalStatus.IDLE,
                     ):

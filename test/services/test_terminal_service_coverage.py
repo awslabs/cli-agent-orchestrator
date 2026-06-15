@@ -4,7 +4,7 @@ Covers: create_terminal error cleanup, delete_terminal internals,
 and the SESSION_PREFIX branch.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -14,6 +14,9 @@ from cli_agent_orchestrator.models.agent_profile import AgentProfile
 class TestCreateTerminalCleanup:
     """Test error cleanup paths in create_terminal."""
 
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
@@ -26,7 +29,7 @@ class TestCreateTerminalCleanup:
         return_value="tid1",
     )
     @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
-    def test_cleanup_on_provider_init_failure(
+    async def test_cleanup_on_provider_init_failure(
         self,
         mock_load_profile,
         mock_tid,
@@ -35,6 +38,8 @@ class TestCreateTerminalCleanup:
         mock_pm,
         mock_tmux,
         mock_log_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
     ):
         """When provider.initialize() fails, cleanup should kill session and cleanup provider."""
         from cli_agent_orchestrator.services.terminal_service import create_terminal
@@ -44,11 +49,12 @@ class TestCreateTerminalCleanup:
         mock_load_profile.return_value = AgentProfile(name="dev", description="Dev")
 
         mock_provider = MagicMock()
-        mock_provider.initialize.side_effect = Exception("Provider init failed")
+        # initialize is awaited inside create_terminal, so it must be an AsyncMock
+        mock_provider.initialize = AsyncMock(side_effect=Exception("Provider init failed"))
         mock_pm.create_provider.return_value = mock_provider
 
         with pytest.raises(Exception, match="Provider init failed"):
-            create_terminal(
+            await create_terminal(
                 provider="kiro_cli",
                 agent_profile="dev",
                 session_name="test-ses",
@@ -59,6 +65,9 @@ class TestCreateTerminalCleanup:
         mock_pm.cleanup_provider.assert_called_once_with("tid1")
         mock_tmux.kill_session.assert_called_once()
 
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
@@ -71,7 +80,7 @@ class TestCreateTerminalCleanup:
         return_value="tid1",
     )
     @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
-    def test_cleanup_on_failure_does_not_kill_session_if_not_new(
+    async def test_cleanup_on_failure_does_not_kill_session_if_not_new(
         self,
         mock_load_profile,
         mock_tid,
@@ -80,6 +89,8 @@ class TestCreateTerminalCleanup:
         mock_pm,
         mock_tmux,
         mock_log_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
     ):
         """When new_session=False, cleanup should NOT kill the session."""
         from cli_agent_orchestrator.services.terminal_service import create_terminal
@@ -89,11 +100,12 @@ class TestCreateTerminalCleanup:
         mock_load_profile.return_value = AgentProfile(name="dev", description="Dev")
 
         mock_provider = MagicMock()
-        mock_provider.initialize.side_effect = Exception("fail")
+        # initialize is awaited inside create_terminal, so it must be an AsyncMock
+        mock_provider.initialize = AsyncMock(side_effect=Exception("fail"))
         mock_pm.create_provider.return_value = mock_provider
 
         with pytest.raises(Exception):
-            create_terminal(
+            await create_terminal(
                 provider="kiro_cli",
                 agent_profile="dev",
                 session_name="cao-existing",
@@ -104,6 +116,9 @@ class TestCreateTerminalCleanup:
         mock_pm.cleanup_provider.assert_called_once()
         mock_tmux.kill_session.assert_not_called()
 
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
@@ -116,7 +131,7 @@ class TestCreateTerminalCleanup:
         return_value="tid1",
     )
     @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
-    def test_cleanup_ignores_cleanup_errors(
+    async def test_cleanup_ignores_cleanup_errors(
         self,
         mock_load_profile,
         mock_tid,
@@ -125,6 +140,8 @@ class TestCreateTerminalCleanup:
         mock_pm,
         mock_tmux,
         mock_log_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
     ):
         """Cleanup errors should be swallowed, original error re-raised."""
         from cli_agent_orchestrator.services.terminal_service import create_terminal
@@ -134,13 +151,14 @@ class TestCreateTerminalCleanup:
         mock_load_profile.return_value = AgentProfile(name="dev", description="Dev")
 
         mock_provider = MagicMock()
-        mock_provider.initialize.side_effect = Exception("original error")
+        # initialize is awaited inside create_terminal, so it must be an AsyncMock
+        mock_provider.initialize = AsyncMock(side_effect=Exception("original error"))
         mock_pm.create_provider.return_value = mock_provider
         mock_pm.cleanup_provider.side_effect = Exception("cleanup error")
         mock_tmux.kill_session.side_effect = Exception("kill error")
 
         with pytest.raises(Exception, match="original error"):
-            create_terminal(
+            await create_terminal(
                 provider="kiro_cli",
                 agent_profile="dev",
                 session_name="test-ses",
@@ -148,6 +166,9 @@ class TestCreateTerminalCleanup:
                 allowed_tools=["*"],
             )
 
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
@@ -160,7 +181,7 @@ class TestCreateTerminalCleanup:
         return_value="tid1",
     )
     @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
-    def test_session_prefix_added_for_new_session(
+    async def test_session_prefix_added_for_new_session(
         self,
         mock_load_profile,
         mock_tid,
@@ -169,6 +190,8 @@ class TestCreateTerminalCleanup:
         mock_pm,
         mock_tmux,
         mock_log_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
     ):
         """New sessions without the prefix get it added automatically."""
         from cli_agent_orchestrator.services.terminal_service import create_terminal
@@ -177,10 +200,12 @@ class TestCreateTerminalCleanup:
         mock_tmux.create_session.return_value = "w1"
         mock_load_profile.return_value = AgentProfile(name="dev", description="Dev")
         mock_provider = MagicMock()
+        # initialize is awaited on the success path; AsyncMock returns cleanly
+        mock_provider.initialize = AsyncMock(return_value=True)
         mock_pm.create_provider.return_value = mock_provider
         mock_log_dir.__truediv__ = MagicMock(return_value=MagicMock())
 
-        result = create_terminal(
+        result = await create_terminal(
             provider="kiro_cli",
             agent_profile="dev",
             session_name="myses",
@@ -200,6 +225,9 @@ class TestCreateTerminalSessionCleanupGuard:
     preventing destruction of pre-existing sessions on error.
     """
 
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
@@ -212,7 +240,7 @@ class TestCreateTerminalSessionCleanupGuard:
         return_value="tid1",
     )
     @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
-    def test_no_kill_session_when_session_already_exists(
+    async def test_no_kill_session_when_session_already_exists(
         self,
         mock_load_profile,
         mock_tid,
@@ -221,6 +249,8 @@ class TestCreateTerminalSessionCleanupGuard:
         mock_pm,
         mock_tmux,
         mock_log_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
     ):
         """When session already exists, cleanup must NOT kill the pre-existing session."""
         from cli_agent_orchestrator.services.terminal_service import create_terminal
@@ -228,7 +258,7 @@ class TestCreateTerminalSessionCleanupGuard:
         mock_tmux.session_exists.return_value = True  # session already exists
 
         with pytest.raises(ValueError, match="already exists"):
-            create_terminal(
+            await create_terminal(
                 provider="kiro_cli",
                 agent_profile="dev",
                 session_name="cao-foo",
@@ -238,6 +268,9 @@ class TestCreateTerminalSessionCleanupGuard:
 
         mock_tmux.kill_session.assert_not_called()
 
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
@@ -250,7 +283,7 @@ class TestCreateTerminalSessionCleanupGuard:
         return_value="tid1",
     )
     @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
-    def test_kill_session_when_we_created_it_and_later_step_fails(
+    async def test_kill_session_when_we_created_it_and_later_step_fails(
         self,
         mock_load_profile,
         mock_tid,
@@ -259,6 +292,8 @@ class TestCreateTerminalSessionCleanupGuard:
         mock_pm,
         mock_tmux,
         mock_log_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
     ):
         """When we successfully created the session but a later step fails, cleanup SHOULD kill it."""
         from cli_agent_orchestrator.services.terminal_service import create_terminal
@@ -268,11 +303,12 @@ class TestCreateTerminalSessionCleanupGuard:
         mock_load_profile.return_value = AgentProfile(name="dev", description="Dev")
 
         mock_provider = MagicMock()
-        mock_provider.initialize.side_effect = Exception("provider init failed")
+        # initialize is awaited inside create_terminal, so it must be an AsyncMock
+        mock_provider.initialize = AsyncMock(side_effect=Exception("provider init failed"))
         mock_pm.create_provider.return_value = mock_provider
 
         with pytest.raises(Exception, match="provider init failed"):
-            create_terminal(
+            await create_terminal(
                 provider="kiro_cli",
                 agent_profile="dev",
                 session_name="test-ses",

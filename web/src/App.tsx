@@ -1,19 +1,23 @@
 import { useEffect, useState, Suspense } from 'react'
+import { api } from './api'
 import { useStore } from './store'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { DashboardHome } from './components/DashboardHome'
 import { AgentPanel } from './components/AgentPanel'
 import { FlowsPanel } from './components/FlowsPanel'
+import { MemoryPanel } from './components/MemoryPanel'
 import { SettingsPanel } from './components/SettingsPanel'
-import { Bot, Home, Clock, Settings, CheckCircle, XCircle, Info, Wifi, WifiOff } from 'lucide-react'
+import { Bot, Home, Clock, Settings, Brain, CheckCircle, XCircle, Info, Wifi, WifiOff } from 'lucide-react'
 
-type TabKey = 'home' | 'agents' | 'flows' | 'settings'
+type TabKey = 'home' | 'agents' | 'flows' | 'settings' | 'memory'
 
+// Memory appended last so Alt+N numbering of existing tabs never shifts
 const TABS: { key: TabKey; label: string; icon: React.ReactNode }[] = [
   { key: 'home', label: 'Home', icon: <Home size={16} /> },
   { key: 'agents', label: 'Agents', icon: <Bot size={16} /> },
   { key: 'flows', label: 'Flows', icon: <Clock size={16} /> },
   { key: 'settings', label: 'Settings', icon: <Settings size={16} /> },
+  { key: 'memory', label: 'Memory', icon: <Brain size={16} /> },
 ]
 
 function Snackbar() {
@@ -49,25 +53,32 @@ function Snackbar() {
 
 export default function App() {
   const [tab, setTab] = useState<TabKey>('home')
+  // Default false (fail-closed): a dead backend hides the tab rather than showing a broken panel
+  const [memoryEnabled, setMemoryEnabled] = useState(false)
   const { sessions, connected, fetchSessions } = useStore()
+
+  const visibleTabs = TABS.filter(t => t.key !== 'memory' || memoryEnabled)
 
   useEffect(() => {
     fetchSessions()
+    api.getMemoryStatus()
+      .then(s => setMemoryEnabled(s.enabled))
+      .catch(() => {})
     const interval = setInterval(fetchSessions, 10000)
     return () => clearInterval(interval)
   }, [])
 
-  // Keyboard shortcuts: Alt+1-4
+  // Keyboard shortcuts: Alt+1-N over the visible tabs
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (e.altKey && e.key >= '1' && e.key <= String(TABS.length)) {
+      if (e.altKey && e.key >= '1' && e.key <= String(visibleTabs.length)) {
         e.preventDefault()
-        setTab(TABS[parseInt(e.key) - 1].key)
+        setTab(visibleTabs[parseInt(e.key) - 1].key)
       }
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [])
+  }, [memoryEnabled])
 
   return (
     <div className="min-h-screen bg-[#0f0f14] text-gray-200">
@@ -100,7 +111,7 @@ export default function App() {
       <div className="border-b border-gray-800">
         <div className="max-w-7xl mx-auto px-6">
           <nav className="flex gap-1 py-2" role="tablist">
-            {TABS.map((t, i) => (
+            {visibleTabs.map((t, i) => (
               <button
                 key={t.key}
                 role="tab"
@@ -134,6 +145,7 @@ export default function App() {
             {tab === 'agents' && <AgentPanel />}
             {tab === 'flows' && <FlowsPanel />}
             {tab === 'settings' && <SettingsPanel />}
+            {tab === 'memory' && <MemoryPanel />}
           </Suspense>
         </ErrorBoundary>
       </main>

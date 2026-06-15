@@ -12,6 +12,7 @@ import struct
 import subprocess
 import termios
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Dict, List, Optional, cast
 
@@ -29,7 +30,6 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field, field_validator
-from watchdog.observers.polling import PollingObserver
 
 from cli_agent_orchestrator.backends import TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
@@ -50,18 +50,22 @@ from cli_agent_orchestrator.constants import (
     SERVER_HOST,
     SERVER_PORT,
     SERVER_VERSION,
-    TERMINAL_LOG_DIR,
     WS_ALLOWED_CLIENTS,
     add_local_cors_origins,
 )
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
+from cli_agent_orchestrator.models.memory import (
+    MemoryKey,
+    MemoryScope,
+    MemoryScopeId,
+    MemoryType,
+)
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalId
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services import (
     flow_service,
-    inbox_service,
     session_service,
     terminal_service,
 )
@@ -69,13 +73,13 @@ from cli_agent_orchestrator.services.cleanup_service import (
     cleanup_expired_memories,
     cleanup_old_data,
 )
+from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.herdr_inbox_registry import set_herdr_inbox_service
 from cli_agent_orchestrator.services.herdr_inbox_service import HerdrInboxService
-from cli_agent_orchestrator.services.inbox_service import (
-    LogFileHandler,
-    check_and_send_pending_messages,
-)
+from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.services.install_service import InstallResult, install_agent
+from cli_agent_orchestrator.services.log_writer import log_writer
+from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.terminal_service import OutputMode, TerminalInputBlockedError
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.logging import setup_logging
@@ -84,7 +88,7 @@ from cli_agent_orchestrator.utils.skills import (
     load_skill_content,
     validate_skill_name,
 )
-from cli_agent_orchestrator.utils.terminal import generate_session_name, validate_tmux_name
+from cli_agent_orchestrator.utils.terminal import validate_tmux_name
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +105,7 @@ async def flow_daemon():
             flows = flow_service.get_flows_to_run()
             for flow in flows:
                 try:
-                    executed = flow_service.execute_flow(flow.name)
+                    executed = await flow_service.execute_flow(flow.name)
                     if executed:
                         logger.info(f"Flow '{flow.name}' executed successfully")
                     else:
@@ -128,11 +132,11 @@ async def opencode_inbox_delivery_daemon(registry: PluginRegistry) -> None:
 async def inbox_reconciliation_daemon(registry: PluginRegistry) -> None:
     """Background task that recovers inbox messages the fast paths missed.
 
-    Safety net for issue #131: the immediate (on POST) and watchdog (on log
-    change) delivery paths can both miss a message when the receiver is already
-    idle, leaving it PENDING forever. This sweep runs on a slower interval than
-    the watchdog and re-attempts delivery for anything left pending past the
-    grace window.
+    Safety net for issue #131: the immediate (on POST) delivery path and the
+    event-driven StatusMonitor pipeline can both miss a message when the receiver
+    is already idle, leaving it PENDING forever. This sweep runs on a slower
+    interval and re-attempts delivery for anything left pending past the grace
+    window.
     """
     logger.info("Inbox reconciliation daemon started")
     while True:
@@ -176,6 +180,26 @@ class InstallAgentProfileRequest(BaseModel):
     env_vars: Optional[Dict[str, str]] = None
 
 
+class MemorySummary(BaseModel):
+    """Memory list entry. Excludes file_path (absolute server filesystem path)."""
+
+    key: str
+    scope: str
+    scope_id: Optional[str] = Field(
+        description="Native for session/agent, derived from storage path for project, None for global"
+    )
+    memory_type: str
+    tags: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class MemoryDetail(MemorySummary):
+    """Full memory view — adds the latest wiki section content."""
+
+    content: str
+
+
 class CreateFlowRequest(BaseModel):
     """Request model for creating a flow."""
 
@@ -211,23 +235,34 @@ async def lifespan(app: FastAPI):
     # Start flow daemon as background task
     daemon_task = asyncio.create_task(flow_daemon())
 
+    # Register event loop with event bus for thread-safe publishing
+    loop = asyncio.get_running_loop()
+    bus.set_loop(loop)
+
+    # Start event bus consumers as background tasks
+    status_monitor_task = asyncio.create_task(status_monitor.run())
+    log_writer_task = asyncio.create_task(log_writer.run())
+    inbox_service_task = asyncio.create_task(inbox_service.run(registry))
+    logger.info("Event bus consumers started (StatusMonitor, LogWriter, InboxService)")
+
     # Start temporary OpenCode inbox poller. GH #115 tracks replacing this
     # provider-specific wakeup path with a unified delivery engine.
     opencode_inbox_task = asyncio.create_task(opencode_inbox_delivery_daemon(registry))
 
-    # Start provider-agnostic reconciliation sweep for orphaned PENDING
-    # messages the immediate and watchdog paths missed (issue #131).
+    # Start provider-agnostic reconciliation sweep for orphaned PENDING messages
+    # the immediate and event-driven status paths missed (issue #131).
     inbox_reconcile_task = asyncio.create_task(inbox_reconciliation_daemon(registry))
 
-    # Start inbox watcher — herdr uses socket events, tmux uses file polling
+    # Herdr delivers inbox via its own socket events; the tmux backend uses the
+    # FIFO -> EventBus pipeline (StatusMonitor / LogWriter / InboxService) started
+    # above. Start the herdr inbox service only when the herdr backend is active
+    # (additive; no-op for tmux). See #271.
     herdr_inbox_task: Optional[asyncio.Task] = None
-    inbox_observer: Optional[PollingObserver] = None
-
     backend = get_backend()
     if isinstance(backend, HerdrBackend):
 
         def deliver_inbox(terminal_id: str) -> None:
-            check_and_send_pending_messages(terminal_id, registry=registry)
+            inbox_service.deliver_pending(terminal_id, registry=registry)
 
         svc = HerdrInboxService(
             herdr_session=backend.herdr_session,
@@ -236,15 +271,10 @@ async def lifespan(app: FastAPI):
         set_herdr_inbox_service(svc)
         herdr_inbox_task = asyncio.create_task(svc.start())
         logger.info("Herdr inbox service started")
-    else:
-        inbox_observer = PollingObserver(timeout=INBOX_POLLING_INTERVAL)
-        inbox_observer.schedule(LogFileHandler(registry), str(TERMINAL_LOG_DIR), recursive=False)
-        inbox_observer.start()
-        logger.info("Inbox watcher started (PollingObserver)")
 
     yield
 
-    # Stop inbox watcher
+    # Stop herdr inbox service on shutdown
     if herdr_inbox_task is not None:
         herdr_inbox_task.cancel()
         try:
@@ -253,15 +283,22 @@ async def lifespan(app: FastAPI):
             pass
         set_herdr_inbox_service(None)
         logger.info("Herdr inbox service stopped")
-    elif inbox_observer is not None:
-        inbox_observer.stop()
-        inbox_observer.join()
-        logger.info("Inbox watcher stopped")
 
+    # Cancel consumer tasks on shutdown
+    status_monitor_task.cancel()
+    log_writer_task.cancel()
+    inbox_service_task.cancel()
     # Cancel daemon on shutdown
     daemon_task.cancel()
+
     try:
-        await daemon_task
+        await asyncio.gather(
+            status_monitor_task,
+            log_writer_task,
+            inbox_service_task,
+            daemon_task,
+            return_exceptions=True,
+        )
     except asyncio.CancelledError:
         pass
 
@@ -442,6 +479,14 @@ class AgentDirsUpdate(BaseModel):
     extra_dirs: Optional[List[str]] = None
 
 
+@app.get("/settings/memory")
+async def get_memory_settings_endpoint() -> Dict:
+    """Return whether the memory subsystem is enabled (for UI feature discovery)."""
+    from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+    return {"enabled": is_memory_enabled()}
+
+
 @app.post("/settings/agent-dirs")
 async def set_agent_dirs_endpoint(body: AgentDirsUpdate) -> Dict:
     """Update agent directories per provider."""
@@ -536,7 +581,7 @@ async def create_session(
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
-        result = session_service.create_session(
+        result = await session_service.create_session(
             provider=provider,
             agent_profile=agent_profile,
             session_name=session_name,
@@ -551,11 +596,11 @@ async def create_session(
             sidecar_provider = provider or DEFAULT_PROVIDER
             sidecar_session = result.session_name
 
-            def _spawn_sidecar() -> None:
+            async def _spawn_sidecar() -> None:
                 try:
                     from cli_agent_orchestrator.services import terminal_service
 
-                    terminal_service.create_terminal(
+                    await terminal_service.create_terminal(
                         provider=sidecar_provider,
                         agent_profile="memory_manager",
                         session_name=sidecar_session,
@@ -638,6 +683,7 @@ async def create_terminal_in_session(
     provider: Optional[str] = None,
     working_directory: Optional[str] = None,
     allowed_tools: Optional[str] = None,
+    caller_id: Optional[TerminalId] = None,
 ) -> Terminal:
     """Create additional terminal in existing session."""
     try:
@@ -653,7 +699,7 @@ async def create_terminal_in_session(
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
-        result = terminal_service.create_terminal(
+        result = await terminal_service.create_terminal(
             provider=resolved_provider,
             agent_profile=agent_profile,
             session_name=session_name,
@@ -661,6 +707,7 @@ async def create_terminal_in_session(
             working_directory=working_directory,
             allowed_tools=allowed_tools_list,
             registry=get_plugin_registry(request),
+            caller_id=caller_id,
         )
         return result
     except ValueError as e:
@@ -877,14 +924,10 @@ async def create_inbox_message_endpoint(
             detail=f"Failed to create inbox message: {str(e)}",
         )
 
-    # Best-effort immediate delivery. If the receiver terminal is idle, the
-    # message is delivered now; otherwise the watchdog will deliver it when
-    # the terminal becomes idle. Delivery failures must not cause the API
-    # to report an error — the message was already persisted above.
+    # Attempt immediate delivery if terminal is already IDLE.
+    # If not, InboxService will deliver on next IDLE status event.
     try:
-        inbox_service.check_and_send_pending_messages(
-            receiver_id, registry=get_plugin_registry(request)
-        )
+        inbox_service.deliver_pending(receiver_id, registry=get_plugin_registry(request))
     except Exception as e:
         logger.warning(f"Immediate delivery attempt failed for {receiver_id}: {e}")
 
@@ -1231,7 +1274,7 @@ async def disable_flow(name: str) -> Dict:
 async def run_flow(name: str) -> Dict:
     """Manually execute a flow."""
     try:
-        executed = flow_service.execute_flow(name)
+        executed = await flow_service.execute_flow(name)
         return {"executed": executed}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -1240,6 +1283,233 @@ async def run_flow(name: str) -> Dict:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to execute flow: {str(e)}",
         )
+
+
+# ── Memory endpoints ─────────────────────────────────────────────────
+# REST mirror of `cao memory list/show/delete/clear` (issue #286). The server
+# has no meaningful cwd, so project scope is addressed by an explicit scope_id
+# query param instead of terminal_context — passing a client cwd would be
+# routed through resolve_project_id(), whose CAO_PROJECT_ID override applies
+# unconditionally and could silently target the wrong project.
+
+
+def _get_memory_service():
+    """Build a MemoryService (lazy import mirrors the circular-import guard
+    in memory_service._is_memory_enabled; module-level factory so tests can
+    patch it like the CLI's _get_memory_service)."""
+    from cli_agent_orchestrator.services.memory_service import MemoryService
+
+    return MemoryService()
+
+
+def _require_memory_enabled() -> None:
+    """Raise 404 when the memory subsystem is disabled.
+
+    recall() silently returns [] when disabled, so the gate must be explicit
+    rather than inferred from empty results.
+    """
+    from cli_agent_orchestrator.services.settings_service import is_memory_enabled
+
+    if not is_memory_enabled():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Memory system is disabled"
+        )
+
+
+def _memory_scope_id(mem, base_dir: Path) -> Optional[str]:
+    """Resolve the response scope_id for a recalled memory.
+
+    session/agent results carry scope_id natively; project membership is only
+    recoverable from the storage path (base_dir/<project_id>/wiki/project/...);
+    global has none.
+    """
+    if mem.scope_id:
+        return str(mem.scope_id)
+    if mem.scope != MemoryScope.PROJECT.value:
+        return None
+    try:
+        relative = Path(mem.file_path).resolve().relative_to(base_dir.resolve())
+        return relative.parts[0]
+    except (ValueError, IndexError):
+        return None
+
+
+def _memory_matches_scope_id(mem, scope_id: str, base_dir: Path) -> bool:
+    """True when a recalled memory belongs to the given scope_id.
+
+    Global memories have no scope_id (resolved as None), so they never match —
+    scope_id strictly narrows to one project/session/agent.
+    """
+    return _memory_scope_id(mem, base_dir) == scope_id
+
+
+def _to_memory_summary(mem, base_dir: Path) -> MemorySummary:
+    return MemorySummary(
+        key=mem.key,
+        scope=mem.scope,
+        scope_id=_memory_scope_id(mem, base_dir),
+        memory_type=mem.memory_type,
+        tags=mem.tags,
+        created_at=mem.created_at,
+        updated_at=mem.updated_at,
+    )
+
+
+@app.get("/memory", response_model=List[MemorySummary])
+async def list_memories_endpoint(
+    scope: Optional[MemoryScope] = None,
+    memory_type: Optional[MemoryType] = Query(default=None, alias="type"),
+    scope_id: Optional[MemoryScopeId] = None,
+    limit: int = Query(default=50, ge=1, le=100),
+) -> List[MemorySummary]:
+    """List stored memories across all projects (mirrors `cao memory list --all`)."""
+    _require_memory_enabled()
+    svc = _get_memory_service()
+    try:
+        # Internal limit 1000: recall truncates BEFORE the scope_id filter
+        # below, so filtering a small page could return an under-filled result.
+        # metadata mode: no query to rank, and it avoids the BM25 path.
+        memories = await svc.recall(
+            scope=scope.value if scope else None,
+            memory_type=memory_type.value if memory_type else None,
+            limit=1000,
+            scan_all=True,
+            search_mode="metadata",
+        )
+        if scope_id is not None:
+            memories = [m for m in memories if _memory_matches_scope_id(m, scope_id, svc.base_dir)]
+        return [_to_memory_summary(m, svc.base_dir) for m in memories[:limit]]
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to list memories: {str(e)}",
+        )
+
+
+@app.get("/memory/{key}", response_model=MemoryDetail)
+async def get_memory_endpoint(
+    key: MemoryKey,
+    scope: Optional[MemoryScope] = None,
+    scope_id: Optional[MemoryScopeId] = None,
+) -> MemoryDetail:
+    """Show a memory by key (mirrors `cao memory show`; first match wins)."""
+    _require_memory_enabled()
+    svc = _get_memory_service()
+    try:
+        memories = await svc.recall(
+            query=key,
+            scope=scope.value if scope else None,
+            limit=1000,
+            scan_all=True,
+            search_mode="metadata",
+        )
+        for mem in memories:
+            if mem.key != key:
+                continue
+            if scope_id is not None and not _memory_matches_scope_id(mem, scope_id, svc.base_dir):
+                continue
+            return MemoryDetail(
+                content=mem.content,
+                **_to_memory_summary(mem, svc.base_dir).model_dump(),
+            )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"Memory '{key}' not found"
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get memory: {str(e)}",
+        )
+
+
+@app.delete("/memory/{key}")
+async def delete_memory_endpoint(
+    key: MemoryKey,
+    scope: MemoryScope = MemoryScope.PROJECT,
+    scope_id: Optional[MemoryScopeId] = None,
+) -> Dict:
+    """Delete a memory by key (mirrors `cao memory delete`).
+
+    Unlike the MCP memory_forget tool (which resolves context from
+    CAO_TERMINAL_ID), non-global scopes require an explicit scope_id.
+    """
+    from cli_agent_orchestrator.services.memory_service import MemoryDisabledError
+
+    _require_memory_enabled()
+    if scope != MemoryScope.GLOBAL and scope_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"scope '{scope.value}' requires scope_id",
+        )
+    svc = _get_memory_service()
+    try:
+        deleted = await svc.forget(key=key, scope=scope.value, scope_id=scope_id)
+    except MemoryDisabledError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Memory system is disabled"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete memory: {str(e)}",
+        )
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Memory '{key}' not found in scope '{scope.value}'",
+        )
+    return {"success": True}
+
+
+@app.delete("/memory")
+async def clear_memories_endpoint(
+    scope: MemoryScope,
+    scope_id: Optional[MemoryScopeId] = None,
+) -> Dict:
+    """Clear all memories in a scope (mirrors `cao memory clear`).
+
+    Best-effort per-item loop (warn-and-continue), reporting deleted_count —
+    deliberately not all-or-nothing.
+    """
+    from cli_agent_orchestrator.services.memory_service import MemoryDisabledError
+
+    _require_memory_enabled()
+    if scope != MemoryScope.GLOBAL and scope_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"scope '{scope.value}' requires scope_id",
+        )
+    svc = _get_memory_service()
+    try:
+        memories = await svc.recall(
+            scope=scope.value, limit=1000, scan_all=True, search_mode="metadata"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to clear memories: {str(e)}",
+        )
+    if scope_id is not None:
+        memories = [m for m in memories if _memory_matches_scope_id(m, scope_id, svc.base_dir)]
+
+    deleted_count = 0
+    for mem in memories:
+        try:
+            # session/agent results carry scope_id natively; project results
+            # need the query param (their recalled scope_id is None).
+            if await svc.forget(key=mem.key, scope=scope.value, scope_id=mem.scope_id or scope_id):
+                deleted_count += 1
+        except MemoryDisabledError:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Memory system is disabled"
+            )
+        except Exception as e:
+            logger.warning("Failed to delete memory %r during clear: %s", mem.key, e)
+    return {"success": True, "deleted_count": deleted_count}
 
 
 # Static file serving for built web UI.

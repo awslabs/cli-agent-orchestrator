@@ -26,8 +26,10 @@ logger = logging.getLogger(__name__)
 # Environment variable to enable/disable working_directory parameter
 ENABLE_WORKING_DIRECTORY = os.getenv("CAO_ENABLE_WORKING_DIRECTORY", "false").lower() == "true"
 
-# Environment variable to enable/disable automatic sender terminal ID injection
-ENABLE_SENDER_ID_INJECTION = os.getenv("CAO_ENABLE_SENDER_ID_INJECTION", "false").lower() == "true"
+# Environment variable to enable/disable automatic sender terminal ID injection.
+# Defaults to enabled (issue #284): callback routing must not depend on the
+# supervisor LLM remembering to hand-write its terminal ID into the message.
+ENABLE_SENDER_ID_INJECTION = os.getenv("CAO_ENABLE_SENDER_ID_INJECTION", "true").lower() == "true"
 
 # Terminal count threshold for cleanup nudge
 TERMINAL_CLEANUP_NUDGE_THRESHOLD = 10
@@ -196,6 +198,9 @@ def _create_terminal(
 
         # Create new terminal in existing session - always pass working_directory
         params = {"provider": provider, "agent_profile": agent_profile}
+        # Record the creating terminal so send_message can route callbacks
+        # structurally instead of parsing IDs out of message text (issue #284).
+        params["caller_id"] = current_terminal_id
         if working_directory:
             params["working_directory"] = working_directory
         if child_allowed_tools:
@@ -246,6 +251,9 @@ def _send_direct_input(
         f"{API_BASE_URL}/terminals/{terminal_id}/input",
         params={
             "message": message,
+            # "supervisor" fallback is safe here: sender_id is a display label
+            # for plugin event emission, never a routable callback address
+            # (unlike the hard-error paths added for issue #284).
             "sender_id": os.environ.get("CAO_TERMINAL_ID", "supervisor"),
             "orchestration_type": orchestration_type,
         },
@@ -394,7 +402,14 @@ def _send_direct_input_handoff(terminal_id: str, provider: str, message: str) ->
     # this is a blocking handoff and should simply output results rather than
     # attempting to call send_message back to the supervisor.
     if provider == "codex":
-        supervisor_id = os.environ.get("CAO_TERMINAL_ID", "unknown")
+        # Never tell a worker its supervisor is terminal 'unknown' (issue #284):
+        # a missing ID is a configuration error, not a routable address.
+        supervisor_id = os.environ.get("CAO_TERMINAL_ID")
+        if not supervisor_id:
+            raise ValueError(
+                "CAO_TERMINAL_ID not set - cannot identify the supervisor terminal "
+                "for the handoff context. Run handoff from inside a CAO terminal."
+            )
         handoff_message = (
             f"[CAO Handoff] Supervisor terminal ID: {supervisor_id}. "
             "This is a blocking handoff — the orchestrator will automatically "
@@ -413,7 +428,14 @@ def _send_direct_input_assign(terminal_id: str, message: str) -> None:
     """Send assign payload to a worker agent, appending callback instructions."""
     # Auto-inject sender terminal ID suffix when enabled
     if ENABLE_SENDER_ID_INJECTION:
-        sender_id = os.environ.get("CAO_TERMINAL_ID", "unknown")
+        # Never tell a worker to reply to terminal 'unknown' (issue #284):
+        # a missing ID is a configuration error, not a routable address.
+        sender_id = os.environ.get("CAO_TERMINAL_ID")
+        if not sender_id:
+            raise ValueError(
+                "CAO_TERMINAL_ID not set - cannot inject callback instructions "
+                "for the worker. Run assign from inside a CAO terminal."
+            )
         message += (
             f"\n\n[Assigned by terminal {sender_id}. "
             f"When done, send results back to terminal {sender_id} using send_message]"
@@ -491,10 +513,26 @@ async def _handoff_impl(
 ) -> HandoffResult:
     """Implementation of handoff logic."""
     start_time = time.time()
+    terminal_id: Optional[str] = None
 
     try:
         # Create terminal
         terminal_id, provider = _create_terminal(agent_profile, working_directory)
+
+        # Fail fast for codex before the (up to 120s) ready wait: its handoff
+        # context requires CAO_TERMINAL_ID, and _send_direct_input_handoff
+        # would only raise after the wait completes (issue #284).
+        if provider == "codex" and not os.environ.get("CAO_TERMINAL_ID"):
+            return HandoffResult(
+                success=False,
+                message=(
+                    "Handoff failed: CAO_TERMINAL_ID not set - cannot identify the "
+                    "supervisor terminal for the handoff context. Run handoff from "
+                    "inside a CAO terminal."
+                ),
+                output=None,
+                terminal_id=terminal_id,
+            )
 
         # Wait for terminal to be ready (IDLE or COMPLETED) before sending
         # the handoff message. Accept COMPLETED in addition to IDLE because
@@ -571,8 +609,12 @@ async def _handoff_impl(
         )
 
     except Exception as e:
+        # Surface the terminal_id when creation succeeded before the failure
+        # (e.g. the codex missing-CAO_TERMINAL_ID guard) so the orphaned
+        # terminal can be inspected or cleaned up — matching the timeout
+        # failure paths above, which also return the live terminal_id.
         return HandoffResult(
-            success=False, message=f"Handoff failed: {str(e)}", output=None, terminal_id=None
+            success=False, message=f"Handoff failed: {str(e)}", output=None, terminal_id=terminal_id
         )
 
 
@@ -686,7 +728,21 @@ def _assign_impl(
     agent_profile: str, message: str, working_directory: Optional[str] = None
 ) -> Dict[str, Any]:
     """Implementation of assign logic."""
+    terminal_id: Optional[str] = None
     try:
+        # Fail fast before creating the worker terminal: with injection on,
+        # a missing CAO_TERMINAL_ID would otherwise surface only after the
+        # terminal exists, leaving an orphan window behind (issue #284).
+        if ENABLE_SENDER_ID_INJECTION and not os.environ.get("CAO_TERMINAL_ID"):
+            return {
+                "success": False,
+                "terminal_id": None,
+                "message": (
+                    "Assignment failed: CAO_TERMINAL_ID not set - cannot inject callback "
+                    "instructions for the worker. Run assign from inside a CAO terminal."
+                ),
+            }
+
         # Create terminal
         terminal_id, _ = _create_terminal(agent_profile, working_directory)
 
@@ -720,7 +776,14 @@ def _assign_impl(
         }
 
     except Exception as e:
-        return {"success": False, "terminal_id": None, "message": f"Assignment failed: {str(e)}"}
+        # Surface the terminal_id when creation succeeded before the failure
+        # (e.g. the send POST failed) so the orphaned terminal can be
+        # inspected or deleted — matching the ready-timeout path above.
+        return {
+            "success": False,
+            "terminal_id": terminal_id,
+            "message": f"Assignment failed: {str(e)}",
+        }
 
 
 def _build_assign_description(enable_sender_id: bool, enable_workdir: bool) -> str:
@@ -730,11 +793,13 @@ def _build_assign_description(enable_sender_id: bool, enable_workdir: bool) -> s
         desc = """\
 Assigns a task to another agent without blocking.
 
-The sender's terminal ID and callback instructions will automatically be appended to the message."""
+The sender's terminal ID and callback instructions will automatically be appended to the message.
+The worker can also reply by calling send_message without receiver_id — it routes to this terminal."""
     else:
         desc = """\
 Assigns a task to another agent without blocking.
 
+The worker can send results back by calling send_message without receiver_id — it routes to this terminal automatically.
 In the message to the worker agent include instruction to send results back via send_message tool.
 **IMPORTANT**: The terminal id of each agent is available in environment variable CAO_TERMINAL_ID.
 When assigning, first find out your own CAO_TERMINAL_ID value, then include the terminal_id value in the message to the worker agent to allow callback.
@@ -808,52 +873,114 @@ else:
 
 
 # Implementation function for send_message
-def _send_message_impl(receiver_id: str, message: str) -> Dict[str, Any]:
+def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, Any]:
     """Implementation of send_message logic."""
     try:
+        own_terminal_id = os.environ.get("CAO_TERMINAL_ID")
+
+        # Default the receiver to the recorded caller (issue #284): handoff/
+        # assign persist the creating terminal's ID on the worker's row, so a
+        # worker can reply without parsing an ID out of the task message text.
+        if not receiver_id:
+            if not own_terminal_id:
+                return {
+                    "success": False,
+                    "error": (
+                        "receiver_id not provided and CAO_TERMINAL_ID not set - cannot "
+                        "look up the recorded caller. Pass receiver_id explicitly."
+                    ),
+                }
+            response = requests.get(
+                f"{API_BASE_URL}/terminals/{own_terminal_id}", timeout=MCP_REQUEST_TIMEOUT
+            )
+            try:
+                response.raise_for_status()
+            except requests.HTTPError as exc:
+                detail = _extract_error_detail(response, str(exc))
+                return {
+                    "success": False,
+                    "error": (
+                        f"receiver_id not provided and the caller lookup for this "
+                        f"terminal ({own_terminal_id}) failed: {detail}. Pass "
+                        "receiver_id explicitly."
+                    ),
+                }
+            receiver_id = response.json().get("caller_id")
+            if not receiver_id:
+                return {
+                    "success": False,
+                    "error": (
+                        "receiver_id not provided and this terminal has no recorded "
+                        "caller (it was not created via handoff/assign). Pass "
+                        "receiver_id explicitly."
+                    ),
+                }
+
         # Guard against the worker sending a message to itself (issue #24).
         # Worker agents sometimes confuse their own CAO_TERMINAL_ID with the
         # supervisor's and end up queueing a message into their own inbox,
         # which never reaches the supervisor. Reject that here so the worker
         # gets a clear error and can pick the correct receiver_id instead.
-        own_terminal_id = os.environ.get("CAO_TERMINAL_ID")
         if own_terminal_id and receiver_id == own_terminal_id:
             return {
                 "success": False,
                 "error": (
                     f"receiver_id ({receiver_id}) is this terminal's own CAO_TERMINAL_ID. "
-                    "send_message cannot deliver to the sender. The callback terminal ID of "
-                    "the supervisor that assigned this task is in the task message — use "
-                    "that as receiver_id instead."
+                    "send_message cannot deliver to the sender. Omit receiver_id to reply "
+                    "to the terminal that assigned this task (the recorded caller), or "
+                    "use the supervisor's terminal ID from the task message."
                 ),
             }
 
-        # Auto-inject sender terminal ID suffix when enabled
-        if ENABLE_SENDER_ID_INJECTION:
-            sender_id = os.environ.get("CAO_TERMINAL_ID", "unknown")
+        # Auto-inject sender terminal ID suffix when enabled. Skipped when
+        # CAO_TERMINAL_ID is unset — never inject 'unknown' as a routable
+        # address (issue #284); _send_to_inbox raises a clear error for that
+        # case anyway.
+        if ENABLE_SENDER_ID_INJECTION and own_terminal_id:
             message += (
-                f"\n\n[Message from terminal {sender_id}. "
+                f"\n\n[Message from terminal {own_terminal_id}. "
                 "Use send_message MCP tool for any follow-up work.]"
             )
 
         return _send_to_inbox(receiver_id, message)
+    except requests.HTTPError as exc:
+        # e.g. the receiver terminal (a recorded caller included) was deleted
+        # before this reply — surface the API detail instead of a raw
+        # requests error string so the agent knows the address is gone.
+        detail = str(exc)
+        if exc.response is not None:
+            detail = _extract_error_detail(exc.response, detail)
+        return {
+            "success": False,
+            "error": f"Failed to deliver to terminal {receiver_id}: {detail}",
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
 @mcp.tool()
 async def send_message(
-    receiver_id: str = Field(description="Target terminal ID to send message to"),
     message: str = Field(description="Message content to send"),
+    receiver_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Target terminal ID. Omit to reply to the terminal that created "
+            "this one via handoff/assign (the recorded caller)."
+        ),
+    ),
 ) -> Dict[str, Any]:
     """Send a message to another terminal's inbox.
 
     The message will be delivered when the destination terminal is IDLE.
     Messages are delivered in order (oldest first).
 
+    When receiver_id is omitted, the message goes to the recorded caller —
+    the terminal that created this one via handoff/assign. This is the
+    reliable way to send results back to your supervisor.
+
     Args:
-        receiver_id: Terminal ID of the receiver
         message: Message content to send
+        receiver_id: Terminal ID of the receiver (optional, defaults to the recorded caller)
 
     Returns:
         Dict with success status and message details

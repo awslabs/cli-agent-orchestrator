@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -264,11 +265,11 @@ class CopilotCliProvider(BaseProvider):
             self.window_name,
         )
 
-    def initialize(self) -> bool:
+    async def initialize(self) -> bool:
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
         try:
-            shell_ready = wait_for_shell(
-                get_backend(), self.session_name, self.window_name, timeout=30.0
-            )
+            shell_ready = await wait_for_shell(self.terminal_id, timeout=30.0)
         except Exception as exc:
             logger.warning(
                 "wait_for_shell failed for %s:%s, retrying with provider history: %s",
@@ -286,10 +287,10 @@ class CopilotCliProvider(BaseProvider):
         deadline = time.time() + 60.0
         self._accept_trust_prompts(timeout=10.0)
         while time.time() < deadline:
-            status = self.get_status()
+            status = status_monitor.get_status(self.terminal_id)
             if status == TerminalStatus.WAITING_USER_ANSWER:
                 self._accept_trust_prompts(timeout=5.0)
-                time.sleep(1.0)
+                await asyncio.sleep(1.0)
                 continue
             if status in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
                 # Return on the first ready state like the other providers.
@@ -298,7 +299,7 @@ class CopilotCliProvider(BaseProvider):
                 # handling before the terminal is actually usable.
                 self._initialized = True
                 return True
-            time.sleep(1.0)
+            await asyncio.sleep(1.0)
 
         raise TimeoutError("Copilot initialization timed out after 60 seconds")
 
@@ -415,11 +416,13 @@ class CopilotCliProvider(BaseProvider):
             break
         return trimmed
 
-    def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
-        effective_tail_lines = tail_lines if tail_lines is not None else 220
-        output = self._history(tail_lines=effective_tail_lines)
+    def get_status(self, output: str) -> TerminalStatus:
+        if not output or not output.strip():
+            return TerminalStatus.UNKNOWN
+
+        output = self._clean(output)
         if not output.strip():
-            return TerminalStatus.PROCESSING
+            return TerminalStatus.UNKNOWN
 
         lines = output.splitlines()
         has_idle_prompt_at_end = self._has_idle_prompt_near_end(lines)

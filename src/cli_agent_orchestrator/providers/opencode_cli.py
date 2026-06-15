@@ -14,7 +14,7 @@ The provider detects the following terminal states:
 - PROCESSING: Agent working (``esc interrupt`` footer)
 - COMPLETED: Agent finished turn (``▣ <agent> · <model> · Ns`` marker + idle footer)
 - WAITING_USER_ANSWER: Permission dialog active (``△ Permission required`` visible)
-- ERROR: Fallback when no state marker matches
+- UNKNOWN: Fallback when no state marker matches (or empty buffer)
 """
 
 import logging
@@ -122,7 +122,7 @@ class OpenCodeCliProvider(BaseProvider):
         """
         return 2000
 
-    def initialize(self) -> bool:
+    async def initialize(self) -> bool:
         """Start the OpenCode TUI and wait for the idle splash frame.
 
         Steps:
@@ -137,15 +137,15 @@ class OpenCodeCliProvider(BaseProvider):
         Raises:
             TimeoutError: If shell or OpenCode doesn't reach IDLE/COMPLETED in time.
         """
-        if not wait_for_shell(get_backend(), self.session_name, self.window_name, timeout=10.0):
+        if not await wait_for_shell(self.terminal_id, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
         command = self._build_launch_command()
         get_backend().send_keys(self.session_name, self.window_name, command)
 
         # 120s covers first-run npm install (5–30s) and concurrent multi-agent launches.
-        if not wait_until_status(
-            self,
+        if not await wait_until_status(
+            self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
             timeout=120.0,
         ):
@@ -173,8 +173,8 @@ class OpenCodeCliProvider(BaseProvider):
         # env vars are shell words; join cmd parts with shlex for proper quoting
         return " ".join(env_pairs) + " " + shlex.join(cmd_parts)
 
-    def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
-        """Detect current TUI state from the tmux capture buffer.
+    def get_status(self, output: str) -> TerminalStatus:
+        """Detect current TUI state from the StatusMonitor buffer string.
 
         Priority order:
         1. WAITING_USER_ANSWER — permission dialog heading present, no idle footer after it
@@ -183,19 +183,16 @@ class OpenCodeCliProvider(BaseProvider):
         3. COMPLETED — last full ``▣…·…·…Ns`` marker present, idle footer after it,
            no later ``▣`` token (would indicate a new incomplete turn)
         4. IDLE — idle footer present, no ``esc interrupt`` anywhere
-        5. ERROR — fallback
+        5. UNKNOWN — fallback
 
         Args:
-            tail_lines: Lines to capture; None uses the backend default.
+            output: StatusMonitor buffer string for this terminal.
 
         Returns:
             Current TerminalStatus.
         """
-        output = get_backend().get_history(
-            self.session_name, self.window_name, tail_lines=tail_lines
-        )
         if not output:
-            return TerminalStatus.ERROR
+            return TerminalStatus.UNKNOWN
 
         clean = re.sub(ANSI_CODE_PATTERN, "", output)
 
@@ -249,8 +246,8 @@ class OpenCodeCliProvider(BaseProvider):
         ):
             return TerminalStatus.IDLE
 
-        # ── 5. ERROR (fallback) ───────────────────────────────────────────────
-        return TerminalStatus.ERROR
+        # ── 5. UNKNOWN (fallback) ─────────────────────────────────────────────
+        return TerminalStatus.UNKNOWN
 
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract the agent's response from the TUI scrollback.

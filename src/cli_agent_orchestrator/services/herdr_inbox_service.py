@@ -386,7 +386,7 @@ class HerdrInboxService:
 
             # Get session name before deleting
             meta = get_terminal_metadata(terminal_id)
-            session_name = meta["tmux_session"] if meta else None
+            term_session = meta["tmux_session"] if meta else None
 
             # Remove from all maps
             self._terminal_to_pane.pop(terminal_id, None)
@@ -399,8 +399,8 @@ class HerdrInboxService:
             except Exception as e:
                 logger.warning(f"Reconcile: failed to delete terminal {terminal_id}: {e}")
 
-            if session_name:
-                affected_sessions.setdefault(session_name, 0)
+            if term_session:
+                affected_sessions.setdefault(term_session, 0)
 
         # Count remaining terminals per affected session
         for tid, _ in self._terminal_to_pane.items():

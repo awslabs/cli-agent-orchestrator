@@ -173,16 +173,16 @@ class HermesProvider(BaseProvider):
 
         return shlex.join(command_parts)
 
-    def initialize(self) -> bool:
+    async def initialize(self) -> bool:
         """Initialize Hermes by starting the configured profile chat REPL."""
-        if not wait_for_shell(tmux_client, self.session_name, self.window_name, timeout=10.0):
+        if not await wait_for_shell(self.terminal_id, timeout=10.0):
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
         command = self._build_hermes_command()
         tmux_client.send_keys(self.session_name, self.window_name, command)
 
-        if not wait_until_status(
-            self,
+        if not await wait_until_status(
+            self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
             timeout=120.0,
             polling_interval=1.0,
@@ -192,9 +192,13 @@ class HermesProvider(BaseProvider):
         self._initialized = True
         return True
 
-    def get_status(self, tail_lines: Optional[int] = None) -> TerminalStatus:
-        """Get Hermes status by analyzing the tmux capture buffer."""
-        output = tmux_client.get_history(self.session_name, self.window_name, tail_lines=tail_lines)
+    def get_status(self, output: str) -> TerminalStatus:
+        """Get Hermes status by analyzing the terminal output buffer.
+
+        Args:
+            output: Terminal output buffer (up to ~8KB rolling buffer) supplied
+                by the StatusMonitor via the FIFO reader pipeline.
+        """
         if not output:
             return TerminalStatus.ERROR
 

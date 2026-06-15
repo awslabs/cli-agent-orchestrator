@@ -2,9 +2,49 @@
 
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import Annotated, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    Field,
+    StringConstraints,
+    field_validator,
+)
+
+
+def _reject_control_chars(value: str) -> str:
+    """Reject control characters to prevent newline/NULL bypasses of `$`-anchored regexes."""
+    if any(ch in value for ch in ("\n", "\r", "\x00")):
+        raise ValueError("must not contain control characters")
+    return value
+
+
+# Mirrors the CLI validation rule (cli/commands/memory.py) — reject-first, so
+# malformed keys 422 at the API layer instead of being silently sanitized.
+MemoryKey = Annotated[
+    str,
+    StringConstraints(pattern=r"^[a-z0-9-]{1,60}$"),
+    AfterValidator(_reject_control_chars),
+]
+
+
+def _reject_all_dots(value: str) -> str:
+    """Reject '.', '..', '...' so traversal tokens 422 at the boundary instead
+    of relying on the get_wiki_path guard deeper down."""
+    _reject_control_chars(value)
+    if set(value) == {"."}:
+        raise ValueError("scope_id must not consist solely of dots")
+    return value
+
+
+# Same charset as _PROJECT_ID_OVERRIDE_PATTERN in memory_service.py; also valid
+# for session/agent scope_ids (which pass _sanitize_scope_id).
+MemoryScopeId = Annotated[
+    str,
+    StringConstraints(pattern=r"^[a-zA-Z0-9._-]{1,128}$"),
+    AfterValidator(_reject_all_dots),
+]
 
 
 class MemoryScope(str, Enum):

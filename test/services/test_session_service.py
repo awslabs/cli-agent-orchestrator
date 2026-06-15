@@ -1,6 +1,6 @@
 """Tests for the session service."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -15,10 +15,11 @@ from cli_agent_orchestrator.services.session_service import (
 class TestCreateSession:
     """Tests for create_session function."""
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.session_service.dispatch_plugin_event")
     @patch("cli_agent_orchestrator.services.session_service.create_terminal")
     @patch("cli_agent_orchestrator.services.session_service.resolve_provider")
-    def test_create_session_resolves_provider_when_omitted(
+    async def test_create_session_resolves_provider_when_omitted(
         self, mock_resolve, mock_create_terminal, mock_dispatch
     ):
         """When provider is None, resolve_provider is called and its result forwarded."""
@@ -27,15 +28,16 @@ class TestCreateSession:
         mock_terminal.session_name = "cao-test"
         mock_create_terminal.return_value = mock_terminal
 
-        create_session(provider=None, agent_profile="my_agent")
+        await create_session(provider=None, agent_profile="my_agent")
 
         mock_resolve.assert_called_once_with("my_agent", fallback_provider="kiro_cli")
         assert mock_create_terminal.call_args.kwargs["provider"] == "claude_code"
 
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.session_service.dispatch_plugin_event")
     @patch("cli_agent_orchestrator.services.session_service.create_terminal")
     @patch("cli_agent_orchestrator.services.session_service.resolve_provider")
-    def test_create_session_uses_explicit_provider(
+    async def test_create_session_uses_explicit_provider(
         self, mock_resolve, mock_create_terminal, mock_dispatch
     ):
         """When provider is explicitly passed, resolve_provider is NOT called."""
@@ -43,7 +45,7 @@ class TestCreateSession:
         mock_terminal.session_name = "cao-test"
         mock_create_terminal.return_value = mock_terminal
 
-        create_session(provider="kiro_cli", agent_profile="my_agent")
+        await create_session(provider="kiro_cli", agent_profile="my_agent")
 
         mock_resolve.assert_not_called()
         assert mock_create_terminal.call_args.kwargs["provider"] == "kiro_cli"
@@ -145,14 +147,21 @@ class TestGetSession:
 class TestDeleteSession:
     """Tests for delete_session function."""
 
-    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_session")
-    @patch("cli_agent_orchestrator.services.session_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_success(
-        self, mock_get_backend, mock_list_terminals, mock_provider_manager, mock_delete_terminals
+        self,
+        mock_get_backend,
+        mock_list_terminals,
+        mock_delete_terminal,
     ):
-        """Test deleting session successfully."""
+        """Test deleting session successfully.
+
+        delete_session delegates per-terminal teardown (FIFO reader, status
+        buffer, provider, DB) to terminal_service.delete_terminal, then kills
+        the backend session and returns the Dict result shape.
+        """
         mock_get_backend.return_value.session_exists.return_value = True
         mock_list_terminals.return_value = [
             {"id": "terminal1"},
@@ -163,18 +172,19 @@ class TestDeleteSession:
 
         assert result == {"deleted": ["cao-test"], "errors": []}
         mock_get_backend.return_value.kill_session.assert_called_once_with("cao-test")
-        mock_delete_terminals.assert_called_once_with("cao-test")
-        assert mock_provider_manager.cleanup_provider.call_count == 2
+        # Each terminal is torn down via the event-driven delete_terminal path.
+        assert mock_delete_terminal.call_count == 2
+        mock_delete_terminal.assert_any_call("terminal1", registry=ANY)
+        mock_delete_terminal.assert_any_call("terminal2", registry=ANY)
 
-    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_session")
-    @patch("cli_agent_orchestrator.services.session_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_when_backend_session_already_gone(
-        self, mock_get_backend, mock_list_terminals, mock_provider_manager, mock_delete_terminals
+        self, mock_get_backend, mock_list_terminals, mock_delete_terminal
     ):
-        """Backend session already gone — delete_session should not raise, not call kill_session,
-        but still call delete_terminals_by_session."""
+        """Backend session already gone — delete_session should not raise and not
+        call kill_session, but still tear down each terminal via delete_terminal."""
         mock_get_backend.return_value.session_exists.return_value = False
         mock_list_terminals.return_value = [{"id": "terminal1"}]
 
@@ -182,14 +192,13 @@ class TestDeleteSession:
 
         assert result == {"deleted": ["cao-test"], "errors": []}
         mock_get_backend.return_value.kill_session.assert_not_called()
-        mock_delete_terminals.assert_called_once_with("cao-test")
+        mock_delete_terminal.assert_called_once_with("terminal1", registry=ANY)
 
-    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_session")
-    @patch("cli_agent_orchestrator.services.session_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_no_terminals(
-        self, mock_get_backend, mock_list_terminals, mock_provider_manager, mock_delete_terminals
+        self, mock_get_backend, mock_list_terminals, mock_delete_terminal
     ):
         """Test deleting session with no terminals."""
         mock_get_backend.return_value.session_exists.return_value = True
@@ -198,7 +207,8 @@ class TestDeleteSession:
         result = delete_session("cao-test")
 
         assert result == {"deleted": ["cao-test"], "errors": []}
-        mock_provider_manager.cleanup_provider.assert_not_called()
+        mock_get_backend.return_value.kill_session.assert_called_once_with("cao-test")
+        mock_delete_terminal.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
@@ -210,14 +220,13 @@ class TestDeleteSession:
         with pytest.raises(Exception, match="Database error"):
             delete_session("cao-test")
 
-    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_session")
-    @patch("cli_agent_orchestrator.services.session_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
-    def test_delete_session_continues_when_provider_cleanup_fails(
-        self, mock_get_backend, mock_list_terminals, mock_provider_manager, mock_delete_terminals
+    def test_delete_session_continues_when_terminal_cleanup_fails(
+        self, mock_get_backend, mock_list_terminals, mock_delete_terminal
     ):
-        """Test that delete_session continues even when provider cleanup fails for some terminals."""
+        """Test that delete_session continues even when terminal teardown fails for some terminals."""
         mock_get_backend.return_value.session_exists.return_value = True
         mock_list_terminals.return_value = [
             {"id": "terminal1"},
@@ -225,30 +234,28 @@ class TestDeleteSession:
             {"id": "terminal3"},
         ]
 
-        # First terminal cleanup fails, others succeed
-        mock_provider_manager.cleanup_provider.side_effect = [
-            Exception("Provider cleanup error for terminal1"),
+        # First terminal teardown fails, others succeed
+        mock_delete_terminal.side_effect = [
+            Exception("Terminal teardown error for terminal1"),
             None,  # terminal2 succeeds
             None,  # terminal3 succeeds
         ]
 
         result = delete_session("cao-test")
 
-        # Session should still be deleted despite provider cleanup failure
+        # Session should still be deleted despite per-terminal teardown failure
         assert result == {"deleted": ["cao-test"], "errors": []}
         mock_get_backend.return_value.kill_session.assert_called_once_with("cao-test")
-        mock_delete_terminals.assert_called_once_with("cao-test")
-        # All three provider cleanups were attempted
-        assert mock_provider_manager.cleanup_provider.call_count == 3
+        # All three terminal teardowns were attempted
+        assert mock_delete_terminal.call_count == 3
 
-    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_session")
-    @patch("cli_agent_orchestrator.services.session_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
-    def test_delete_session_cleans_up_provider_for_each_terminal(
-        self, mock_get_backend, mock_list_terminals, mock_provider_manager, mock_delete_terminals
+    def test_delete_session_cleans_up_each_terminal(
+        self, mock_get_backend, mock_list_terminals, mock_delete_terminal
     ):
-        """Test that delete_session calls cleanup_provider for every terminal in the session."""
+        """Test that delete_session tears down every terminal in the session via delete_terminal."""
         mock_get_backend.return_value.session_exists.return_value = True
         mock_list_terminals.return_value = [
             {"id": "term-aaa"},
@@ -260,15 +267,9 @@ class TestDeleteSession:
         result = delete_session("cao-multi-terminal")
 
         assert result == {"deleted": ["cao-multi-terminal"], "errors": []}
-        # Verify cleanup_provider was called for each terminal with the correct ID
-        expected_calls = [
-            (("term-aaa",),),
-            (("term-bbb",),),
-            (("term-ccc",),),
-            (("term-ddd",),),
-        ]
-        assert mock_provider_manager.cleanup_provider.call_count == 4
-        mock_provider_manager.cleanup_provider.assert_any_call("term-aaa")
-        mock_provider_manager.cleanup_provider.assert_any_call("term-bbb")
-        mock_provider_manager.cleanup_provider.assert_any_call("term-ccc")
-        mock_provider_manager.cleanup_provider.assert_any_call("term-ddd")
+        # Verify delete_terminal was called for each terminal with the correct ID
+        assert mock_delete_terminal.call_count == 4
+        mock_delete_terminal.assert_any_call("term-aaa", registry=ANY)
+        mock_delete_terminal.assert_any_call("term-bbb", registry=ANY)
+        mock_delete_terminal.assert_any_call("term-ccc", registry=ANY)
+        mock_delete_terminal.assert_any_call("term-ddd", registry=ANY)

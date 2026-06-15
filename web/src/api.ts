@@ -89,6 +89,24 @@ export interface ProviderInfo {
   installed: boolean
 }
 
+export interface MemoryStatus {
+  enabled: boolean
+}
+
+export interface MemorySummary {
+  key: string
+  scope: string
+  scope_id: string | null
+  memory_type: string
+  tags: string
+  created_at: string
+  updated_at: string
+}
+
+export interface MemoryDetail extends MemorySummary {
+  content: string
+}
+
 export const api = {
   // Agent Profiles & Providers
   listProfiles: () => fetchJSON<AgentProfileInfo[]>('/agents/profiles'),
@@ -144,4 +162,27 @@ export const api = {
   enableFlow: (name: string) => fetchJSON<{ success: boolean }>(`/flows/${name}/enable`, { method: 'POST' }),
   disableFlow: (name: string) => fetchJSON<{ success: boolean }>(`/flows/${name}/disable`, { method: 'POST' }),
   runFlow: (name: string) => fetchJSON<{ executed: boolean }>(`/flows/${name}/run`, { method: 'POST', timeoutMs: 90000 }),
+
+  // Memory
+  getMemoryStatus: () => fetchJSON<MemoryStatus>('/settings/memory'),
+  listMemories: (filters?: { scope?: string; type?: string; scopeId?: string; limit?: number }) => {
+    const params = [
+      filters?.scope ? `scope=${encodeURIComponent(filters.scope)}` : '',
+      filters?.type ? `type=${encodeURIComponent(filters.type)}` : '',
+      filters?.scopeId ? `scope_id=${encodeURIComponent(filters.scopeId)}` : '',
+      filters?.limit ? `limit=${filters.limit}` : '',
+    ].filter(Boolean).join('&')
+    return fetchJSON<MemorySummary[]>(`/memory${params ? `?${params}` : ''}`)
+  },
+  getMemory: (key: string, scope?: string, scopeId?: string) => {
+    const params = [
+      scope ? `scope=${encodeURIComponent(scope)}` : '',
+      scopeId ? `scope_id=${encodeURIComponent(scopeId)}` : '',
+    ].filter(Boolean).join('&')
+    return fetchJSON<MemoryDetail>(`/memory/${encodeURIComponent(key)}${params ? `?${params}` : ''}`)
+  },
+  deleteMemory: (key: string, scope: string, scopeId?: string) =>
+    fetchJSON<{ success: boolean }>(`/memory/${encodeURIComponent(key)}?scope=${encodeURIComponent(scope)}${scopeId ? `&scope_id=${encodeURIComponent(scopeId)}` : ''}`, { method: 'DELETE' }),
+  clearMemories: (scope: string, scopeId?: string) =>
+    fetchJSON<{ success: boolean; deleted_count: number }>(`/memory?scope=${encodeURIComponent(scope)}${scopeId ? `&scope_id=${encodeURIComponent(scopeId)}` : ''}`, { method: 'DELETE' }),
 }

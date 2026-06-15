@@ -1,5 +1,6 @@
 """Tests for terminal utilities."""
 
+import asyncio
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -128,80 +129,154 @@ class TestValidateTmuxName:
 class TestWaitForShell:
     """Tests for wait_for_shell function."""
 
-    def test_wait_for_shell_success(self):
-        """Test successful shell wait."""
-        mock_tmux = MagicMock()
-        # Return same output twice to indicate shell is ready
-        mock_tmux.get_history.side_effect = ["prompt $", "prompt $"]
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    async def test_wait_for_shell_success(self, mock_monitor):
+        """Test successful shell wait - buffer is non-empty and stable."""
+        mock_monitor.get_buffer.return_value = "prompt $"
 
-        result = wait_for_shell(
-            mock_tmux, "test-session", "window-0", timeout=2.0, polling_interval=0.1
+        result = await wait_for_shell(
+            "test-terminal", timeout=2.0, stable_duration=0.3, polling_interval=0.1
         )
 
         assert result is True
 
-    def test_wait_for_shell_timeout(self):
-        """Test shell wait timeout."""
-        mock_tmux = MagicMock()
-        # Return different outputs each time
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    async def test_wait_for_shell_timeout(self, mock_monitor):
+        """Test shell wait timeout - buffer keeps changing."""
         call_count = [0]
 
-        def get_history_side_effect(*args, **kwargs):
+        def get_buffer_side_effect(terminal_id):
             call_count[0] += 1
             return f"output {call_count[0]}"
 
-        mock_tmux.get_history.side_effect = get_history_side_effect
+        mock_monitor.get_buffer.side_effect = get_buffer_side_effect
 
-        result = wait_for_shell(
-            mock_tmux, "test-session", "window-0", timeout=0.5, polling_interval=0.1
+        result = await wait_for_shell(
+            "test-terminal", timeout=0.5, stable_duration=0.3, polling_interval=0.1
         )
 
         assert result is False
 
-    def test_wait_for_shell_empty_output(self):
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    async def test_wait_for_shell_empty_output(self, mock_monitor):
         """Test shell wait with empty output."""
-        mock_tmux = MagicMock()
-        mock_tmux.get_history.return_value = ""
+        mock_monitor.get_buffer.return_value = ""
 
-        result = wait_for_shell(
-            mock_tmux, "test-session", "window-0", timeout=0.5, polling_interval=0.1
+        result = await wait_for_shell(
+            "test-terminal", timeout=0.5, stable_duration=0.3, polling_interval=0.1
         )
 
         assert result is False
+
+
+class TestWaitForShellEventInbox:
+    """wait_for_shell on event-inbox backends (herdr) must read backend history,
+    not the (always-empty) StatusMonitor buffer."""
+
+    def _backend(self, *, history, event_inbox=True):
+        backend = MagicMock()
+        backend.supports_event_inbox.return_value = event_inbox
+        backend.get_history.return_value = history
+        return backend
+
+    def _provider(self):
+        provider = MagicMock()
+        provider.session_name = "sess"
+        provider.window_name = "win"
+        return provider
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.manager.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    async def test_reads_backend_history_when_event_inbox(
+        self, mock_monitor, mock_get_backend, mock_pm
+    ):
+        # StatusMonitor buffer is empty (herdr never feeds it); readiness must
+        # still be detected from the backend's pane history.
+        mock_monitor.get_buffer.return_value = ""
+        backend = self._backend(history="user@host:~$ ")
+        mock_get_backend.return_value = backend
+        mock_pm.get_provider.return_value = self._provider()
+
+        result = await wait_for_shell("t1", timeout=2.0, stable_duration=0.3, polling_interval=0.1)
+
+        assert result is True
+        backend.get_history.assert_called_with("sess", "win", strip_escapes=True)
+        mock_monitor.get_buffer.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.manager.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    async def test_times_out_when_backend_history_empty(
+        self, mock_monitor, mock_get_backend, mock_pm
+    ):
+        mock_get_backend.return_value = self._backend(history="")
+        mock_pm.get_provider.return_value = self._provider()
+
+        result = await wait_for_shell("t1", timeout=0.4, stable_duration=0.2, polling_interval=0.1)
+
+        assert result is False
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.manager.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    async def test_tmux_backend_still_uses_status_monitor(
+        self, mock_monitor, mock_get_backend, mock_pm
+    ):
+        # Pipe-pane backend: behavior unchanged — read the StatusMonitor buffer,
+        # never touch backend.get_history.
+        mock_monitor.get_buffer.return_value = "prompt $"
+        backend = self._backend(history="ignored", event_inbox=False)
+        mock_get_backend.return_value = backend
+
+        result = await wait_for_shell("t1", timeout=2.0, stable_duration=0.3, polling_interval=0.1)
+
+        assert result is True
+        backend.get_history.assert_not_called()
+        mock_pm.get_provider.assert_not_called()
 
 
 class TestWaitUntilStatus:
     """Tests for wait_until_status function."""
 
-    def test_wait_until_status_success(self):
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    async def test_wait_until_status_success(self, mock_monitor):
         """Test successful status wait."""
-        mock_provider = MagicMock()
-        mock_provider.get_status.return_value = TerminalStatus.IDLE
+        mock_monitor.get_status.return_value = TerminalStatus.IDLE
 
-        result = wait_until_status(
-            mock_provider, TerminalStatus.IDLE, timeout=1.0, polling_interval=0.1
+        result = await wait_until_status(
+            "test-terminal", TerminalStatus.IDLE, timeout=1.0, polling_interval=0.1
         )
 
         assert result is True
 
-    def test_wait_until_status_timeout(self):
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    async def test_wait_until_status_timeout(self, mock_monitor):
         """Test status wait timeout."""
-        mock_provider = MagicMock()
-        mock_provider.get_status.return_value = TerminalStatus.PROCESSING
+        mock_monitor.get_status.return_value = TerminalStatus.PROCESSING
 
-        result = wait_until_status(
-            mock_provider, TerminalStatus.IDLE, timeout=0.5, polling_interval=0.1
+        result = await wait_until_status(
+            "test-terminal", TerminalStatus.IDLE, timeout=0.5, polling_interval=0.1
         )
 
         assert result is False
 
-    def test_wait_until_status_with_set(self):
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    async def test_wait_until_status_with_set(self, mock_monitor):
         """Test status wait accepts a set of target statuses."""
-        mock_provider = MagicMock()
-        mock_provider.get_status.return_value = TerminalStatus.COMPLETED
+        mock_monitor.get_status.return_value = TerminalStatus.COMPLETED
 
-        result = wait_until_status(
-            mock_provider,
+        result = await wait_until_status(
+            "test-terminal",
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
             timeout=1.0,
             polling_interval=0.1,
@@ -209,18 +284,18 @@ class TestWaitUntilStatus:
 
         assert result is True
 
-    def test_wait_until_status_eventually_succeeds(self):
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    async def test_wait_until_status_eventually_succeeds(self, mock_monitor):
         """Test status wait that eventually succeeds."""
-        mock_provider = MagicMock()
-        # First few calls return PROCESSING, then IDLE
-        mock_provider.get_status.side_effect = [
+        mock_monitor.get_status.side_effect = [
             TerminalStatus.PROCESSING,
             TerminalStatus.PROCESSING,
             TerminalStatus.IDLE,
         ]
 
-        result = wait_until_status(
-            mock_provider, TerminalStatus.IDLE, timeout=2.0, polling_interval=0.1
+        result = await wait_until_status(
+            "test-terminal", TerminalStatus.IDLE, timeout=2.0, polling_interval=0.1
         )
 
         assert result is True
@@ -229,7 +304,7 @@ class TestWaitUntilStatus:
 class TestWaitUntilTerminalStatus:
     """Tests for wait_until_terminal_status function."""
 
-    @patch("cli_agent_orchestrator.utils.terminal.httpx.get")
+    @patch("cli_agent_orchestrator.utils.terminal.requests.get")
     def test_wait_until_terminal_status_success(self, mock_get):
         """Test successful terminal status wait."""
         mock_response = MagicMock()
@@ -243,7 +318,7 @@ class TestWaitUntilTerminalStatus:
 
         assert result is True
 
-    @patch("cli_agent_orchestrator.utils.terminal.httpx.get")
+    @patch("cli_agent_orchestrator.utils.terminal.requests.get")
     def test_wait_until_terminal_status_timeout(self, mock_get):
         """Test terminal status wait timeout."""
         mock_response = MagicMock()
@@ -257,7 +332,7 @@ class TestWaitUntilTerminalStatus:
 
         assert result is False
 
-    @patch("cli_agent_orchestrator.utils.terminal.httpx.get")
+    @patch("cli_agent_orchestrator.utils.terminal.requests.get")
     def test_wait_until_terminal_status_api_error(self, mock_get):
         """Test terminal status wait with API error."""
         mock_get.side_effect = Exception("Connection error")
@@ -268,7 +343,7 @@ class TestWaitUntilTerminalStatus:
 
         assert result is False
 
-    @patch("cli_agent_orchestrator.utils.terminal.httpx.get")
+    @patch("cli_agent_orchestrator.utils.terminal.requests.get")
     def test_wait_until_terminal_status_non_200(self, mock_get):
         """Test terminal status wait with non-200 response."""
         mock_response = MagicMock()
@@ -281,7 +356,7 @@ class TestWaitUntilTerminalStatus:
 
         assert result is False
 
-    @patch("cli_agent_orchestrator.utils.terminal.httpx.get")
+    @patch("cli_agent_orchestrator.utils.terminal.requests.get")
     def test_wait_until_terminal_status_multi_status_set(self, mock_get):
         """Test waiting for multiple target statuses (set)."""
         mock_response = MagicMock()
@@ -298,7 +373,7 @@ class TestWaitUntilTerminalStatus:
 
         assert result is True
 
-    @patch("cli_agent_orchestrator.utils.terminal.httpx.get")
+    @patch("cli_agent_orchestrator.utils.terminal.requests.get")
     def test_wait_until_terminal_status_multi_status_no_match(self, mock_get):
         """Test multi-status wait times out when status doesn't match any target."""
         mock_response = MagicMock()

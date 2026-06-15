@@ -1,14 +1,17 @@
-"""Tests for the inbox-watcher branch of the FastAPI lifespan.
+"""Tests for the herdr inbox-watcher branch of the FastAPI lifespan.
 
-The lifespan (api/main.py) starts one of two inbox watchers depending on the
-active terminal backend:
+After the event-driven refactor (#273), the tmux backend delivers inbox messages
+through the in-process FIFO -> EventBus pipeline (StatusMonitor / LogWriter /
+InboxService consumers started unconditionally in the lifespan), so there is no
+longer a tmux ``PollingObserver`` watchdog branch. The lifespan starts an extra
+watcher ONLY for the herdr backend:
 
-- HerdrBackend  -> HerdrInboxService (socket events), scheduled as an asyncio task
-- anything else -> PollingObserver (tmux log-file watchdog)
+- HerdrBackend -> HerdrInboxService (socket events), scheduled as an asyncio task
+- anything else -> nothing extra (the EventBus consumers above handle it)
 
-These tests pin both the startup wiring and the matching shutdown teardown for
-each path. Everything external is mocked, so no herdr socket, watchdog thread,
-database, or real background task is created.
+These tests pin the herdr startup wiring and its matching shutdown teardown.
+Everything external is mocked, so no herdr socket, database, or real background
+task is created.
 
 Mocking notes:
 - ``asyncio.create_task`` is replaced with a fake that returns a ``_FakeTask``.
@@ -28,7 +31,6 @@ import pytest
 
 from cli_agent_orchestrator.api.main import app, lifespan
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
-from cli_agent_orchestrator.constants import INBOX_POLLING_INTERVAL, TERMINAL_LOG_DIR
 from cli_agent_orchestrator.plugins import PluginRegistry
 
 # --- Test doubles -------------------------------------------------------
@@ -111,8 +113,6 @@ def _patched_lifespan(backend: object, tasks: list):
             get_backend=patch_main("get_backend", return_value=backend),
             herdr_cls=patch_main("HerdrInboxService"),
             set_svc=patch_main("set_herdr_inbox_service"),
-            observer_cls=patch_main("PollingObserver"),
-            log_handler_cls=patch_main("LogFileHandler"),
             load=stack.enter_context(patch.object(PluginRegistry, "load", new_callable=AsyncMock)),
             teardown=stack.enter_context(
                 patch.object(PluginRegistry, "teardown", new_callable=AsyncMock)
@@ -122,7 +122,7 @@ def _patched_lifespan(backend: object, tasks: list):
 
 
 class TestLifespanInboxWiring:
-    """Startup + shutdown wiring for both inbox-watcher backends."""
+    """Startup + shutdown wiring for the herdr inbox watcher."""
 
     @pytest.mark.asyncio
     async def test_herdr_backend_starts_service_and_sets_registry(self) -> None:
@@ -151,12 +151,13 @@ class TestLifespanInboxWiring:
                 svc.start.assert_called_once()
                 assert _find_task(tasks, svc.start.return_value) is not None
 
-                # The tmux watcher path must not run.
-                mocks.observer_cls.assert_not_called()
-
     @pytest.mark.asyncio
-    async def test_tmux_backend_starts_polling_observer(self) -> None:
-        """Non-herdr backend builds, schedules, and starts the PollingObserver."""
+    async def test_tmux_backend_skips_herdr_service(self) -> None:
+        """Non-herdr backend starts no extra herdr watcher.
+
+        The tmux path relies on the EventBus consumers started unconditionally
+        earlier in the lifespan; no HerdrInboxService is constructed.
+        """
         # Arrange
         tasks: list = []
         backend = MagicMock()  # not a HerdrBackend instance
@@ -164,27 +165,13 @@ class TestLifespanInboxWiring:
         # Act
         with _patched_lifespan(backend, tasks) as mocks:
             async with lifespan(app):
-                # Assert (startup)
-                mocks.observer_cls.assert_called_once_with(timeout=INBOX_POLLING_INTERVAL)
-                observer = mocks.observer_cls.return_value
-
-                # LogFileHandler is built with the registry stored on app.state...
-                mocks.log_handler_cls.assert_called_once_with(app.state.plugin_registry)
-                # ...and that handler is scheduled on the terminal log dir.
-                observer.schedule.assert_called_once_with(
-                    mocks.log_handler_cls.return_value,
-                    str(TERMINAL_LOG_DIR),
-                    recursive=False,
-                )
-                observer.start.assert_called_once()
-
-                # The herdr path must not run.
+                # Assert (startup): the herdr path must not run.
                 mocks.herdr_cls.assert_not_called()
                 mocks.set_svc.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_herdr_shutdown_cancels_task_and_skips_observer(self) -> None:
-        """On exit the herdr path cancels its task; observer teardown never runs."""
+    async def test_herdr_shutdown_cancels_task_and_clears_registry(self) -> None:
+        """On exit the herdr path cancels its task and clears the registry."""
         # Arrange
         tasks: list = []
         backend = MagicMock(spec=HerdrBackend)
@@ -198,13 +185,12 @@ class TestLifespanInboxWiring:
             herdr_task = _find_task(tasks, svc.start.return_value)
             assert herdr_task is not None
             herdr_task.cancel.assert_called_once()
-
-            # Observer was never constructed, so stop()/join() cannot run.
-            mocks.observer_cls.assert_not_called()
+            # Registry is cleared back to None on shutdown.
+            mocks.set_svc.assert_any_call(None)
 
     @pytest.mark.asyncio
-    async def test_tmux_shutdown_stops_observer_and_skips_herdr_task(self) -> None:
-        """On exit the tmux path stops+joins the observer; no herdr task exists."""
+    async def test_tmux_shutdown_has_no_herdr_task(self) -> None:
+        """On exit the tmux path has no herdr task to cancel."""
         # Arrange
         tasks: list = []
         backend = MagicMock()  # not a HerdrBackend instance
@@ -212,11 +198,7 @@ class TestLifespanInboxWiring:
         # Act
         with _patched_lifespan(backend, tasks) as mocks:
             async with lifespan(app):
-                observer = mocks.observer_cls.return_value
-            # Assert (shutdown — after context exit)
-            observer.stop.assert_called_once()
-            observer.join.assert_called_once()
-
-            # No herdr inbox service or task was ever created to cancel.
+                pass
+            # Assert (shutdown — after context exit): no herdr task was created.
             mocks.herdr_cls.assert_not_called()
             assert _find_task(tasks, mocks.herdr_cls.return_value.start.return_value) is None

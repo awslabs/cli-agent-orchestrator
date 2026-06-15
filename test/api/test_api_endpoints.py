@@ -18,7 +18,7 @@ from cli_agent_orchestrator.api.main import (
     opencode_inbox_delivery_daemon,
 )
 from cli_agent_orchestrator.models.terminal import Terminal
-from cli_agent_orchestrator.services import inbox_service
+from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.utils.skills import SkillNameError
 
 # ── Health endpoint ──────────────────────────────────────────────────
@@ -251,7 +251,9 @@ class TestCreateSession:
             agent_profile="developer",
         )
         with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
-            mock_svc.create_session.return_value = mock_terminal
+            # The endpoint awaits session_service.create_session, so the patched
+            # attribute must be an AsyncMock to return an awaitable.
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
 
             response = client.post(
                 "/sessions",
@@ -286,7 +288,9 @@ class TestCreateSession:
             agent_profile="developer",
         )
         with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
-            mock_svc.create_session.return_value = mock_terminal
+            # The endpoint awaits session_service.create_session, so the patched
+            # attribute must be an AsyncMock to return an awaitable.
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
 
             response = client.post(
                 "/sessions",
@@ -390,12 +394,16 @@ class TestCreateSession:
         from cli_agent_orchestrator.models.terminal import Terminal as TerminalModel
 
         with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
-            mock_svc.create_session.return_value = TerminalModel(
-                id="abcd1234",
-                name="w",
-                session_name=prefixed,
-                provider="kiro_cli",
-                agent_profile="developer",
+            # The endpoint awaits session_service.create_session, so the patched
+            # attribute must be an AsyncMock to return an awaitable.
+            mock_svc.create_session = AsyncMock(
+                return_value=TerminalModel(
+                    id="abcd1234",
+                    name="w",
+                    session_name=prefixed,
+                    provider="kiro_cli",
+                    agent_profile="developer",
+                )
             )
             response = client.post(
                 "/sessions",
@@ -588,7 +596,9 @@ class TestCreateTerminalInSession:
             agent_profile="reviewer",
         )
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.create_terminal.return_value = mock_terminal
+            # The endpoint awaits terminal_service.create_terminal, so the
+            # patched attribute must be an AsyncMock to return an awaitable.
+            mock_svc.create_terminal = AsyncMock(return_value=mock_terminal)
 
             response = client.post(
                 "/sessions/test-session/terminals",
@@ -1094,7 +1104,9 @@ class TestInboxReconciliationDaemon:
 
         mock_to_thread.assert_awaited_once()
         # The sweep, not some other sync function, must be the dispatched work.
-        assert mock_to_thread.await_args.args[0] is inbox_service.reconcile_orphaned_messages
+        # reconcile_orphaned_messages is a bound method on the singleton now, so a
+        # fresh attribute access is a distinct object — compare by value, not id.
+        assert mock_to_thread.await_args.args[0] == inbox_service.reconcile_orphaned_messages
         assert mock_to_thread.await_args.args[1] is registry
 
 
@@ -1106,50 +1118,93 @@ class TestLifespan:
 
     @pytest.mark.asyncio
     async def test_lifespan_startup_and_shutdown(self):
-        """lifespan starts background tasks on entry, cleans up on exit."""
-        from cli_agent_orchestrator.api.main import lifespan
-        from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
+        """lifespan starts the event-bus consumers on entry, cleans up on exit.
 
-        mock_observer = MagicMock()
+        The watchdog PollingObserver inbox watcher was replaced by event-bus
+        consumers: startup registers the running loop with the event bus
+        (``bus.set_loop``) and spins up StatusMonitor/LogWriter/InboxService as
+        background tasks (plus the flow daemon and OpenCode inbox poller). On
+        exit the plugin registry is torn down.
+        """
+        from cli_agent_orchestrator.api import main as main_module
+        from cli_agent_orchestrator.api.main import lifespan
 
         async def fake_daemon():
             await asyncio.sleep(3600)
+
+        async def fake_registry_daemon(_registry):
+            await asyncio.sleep(3600)
+
+        async def quick_return():
+            return None
+
+        async def never_returns():
+            await asyncio.sleep(3600)
+
+        mock_load = AsyncMock()
+        mock_teardown = AsyncMock()
 
         with (
             patch("cli_agent_orchestrator.api.main.setup_logging"),
             patch("cli_agent_orchestrator.api.main.init_db"),
             patch("cli_agent_orchestrator.api.main.cleanup_old_data"),
-            patch(
-                "cli_agent_orchestrator.api.main.get_backend",
-                return_value=MagicMock(spec=TmuxBackend),
-            ),
-            patch(
-                "cli_agent_orchestrator.api.main.PollingObserver",
-                return_value=mock_observer,
-            ),
+            patch("cli_agent_orchestrator.api.main.cleanup_expired_memories", quick_return),
             patch("cli_agent_orchestrator.api.main.flow_daemon", fake_daemon),
+            patch(
+                "cli_agent_orchestrator.api.main.opencode_inbox_delivery_daemon",
+                fake_registry_daemon,
+            ),
+            patch("cli_agent_orchestrator.api.main.bus") as mock_bus,
+            patch.object(
+                main_module.status_monitor, "run", new=AsyncMock(side_effect=never_returns)
+            ),
+            patch.object(main_module.log_writer, "run", new=AsyncMock(side_effect=never_returns)),
+            patch.object(
+                main_module.inbox_service, "run", new=AsyncMock(side_effect=never_returns)
+            ),
+            patch("cli_agent_orchestrator.plugins.PluginRegistry.load", mock_load),
+            patch("cli_agent_orchestrator.plugins.PluginRegistry.teardown", mock_teardown),
         ):
             async with lifespan(app):
-                # Inside the lifespan — startup completed
-                mock_observer.schedule.assert_called_once()
-                mock_observer.start.assert_called_once()
+                # Inside the lifespan — startup completed.
+                # The registry was loaded and stored on app state.
+                mock_load.assert_awaited_once()
+                assert app.state.plugin_registry is not None
+                # The event loop was registered with the event bus so the
+                # thread-safe publishers can reach the asyncio consumers.
+                mock_bus.set_loop.assert_called_once()
+                loop_arg = mock_bus.set_loop.call_args.args[0]
+                assert loop_arg is asyncio.get_running_loop()
 
-            # After exit — shutdown cleanup
-            mock_observer.stop.assert_called_once()
-            mock_observer.join.assert_called_once()
+            # After exit — shutdown tears down the plugin registry.
+            mock_teardown.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_lifespan_cancels_inbox_reconciliation_on_shutdown(self):
-        """The reconciliation sweep task is cancelled when the server stops (issue #131)."""
+        """The reconciliation sweep task is cancelled when the server stops (issue #131).
+
+        The watchdog PollingObserver is gone in the event-driven model, so the
+        event-bus consumers are stubbed (as in the startup/shutdown test) and the
+        reconciliation daemon is replaced with one that records its cancellation.
+        """
+        from cli_agent_orchestrator.api import main as main_module
         from cli_agent_orchestrator.api.main import lifespan
 
-        mock_observer = MagicMock()
         reconcile_cancelled = {"value": False}
 
-        async def fake_flow_daemon():
+        async def fake_daemon():
             await asyncio.sleep(3600)
 
-        async def fake_reconcile(registry):
+        async def fake_registry_daemon(_registry):
+            await asyncio.sleep(3600)
+
+        async def never_returns():
+            await asyncio.sleep(3600)
+
+        async def quick_return():
+            return None
+
+        async def fake_reconcile(_registry):
             try:
                 await asyncio.sleep(3600)
             except asyncio.CancelledError:
@@ -1160,15 +1215,26 @@ class TestLifespan:
             patch("cli_agent_orchestrator.api.main.setup_logging"),
             patch("cli_agent_orchestrator.api.main.init_db"),
             patch("cli_agent_orchestrator.api.main.cleanup_old_data"),
+            patch("cli_agent_orchestrator.api.main.cleanup_expired_memories", quick_return),
+            patch("cli_agent_orchestrator.api.main.flow_daemon", fake_daemon),
             patch(
-                "cli_agent_orchestrator.api.main.PollingObserver",
-                return_value=mock_observer,
+                "cli_agent_orchestrator.api.main.opencode_inbox_delivery_daemon",
+                fake_registry_daemon,
             ),
-            patch("cli_agent_orchestrator.api.main.flow_daemon", fake_flow_daemon),
             patch(
                 "cli_agent_orchestrator.api.main.inbox_reconciliation_daemon",
                 fake_reconcile,
             ),
+            patch("cli_agent_orchestrator.api.main.bus"),
+            patch.object(
+                main_module.status_monitor, "run", new=AsyncMock(side_effect=never_returns)
+            ),
+            patch.object(main_module.log_writer, "run", new=AsyncMock(side_effect=never_returns)),
+            patch.object(
+                main_module.inbox_service, "run", new=AsyncMock(side_effect=never_returns)
+            ),
+            patch("cli_agent_orchestrator.plugins.PluginRegistry.load", new=AsyncMock()),
+            patch("cli_agent_orchestrator.plugins.PluginRegistry.teardown", new=AsyncMock()),
         ):
             async with lifespan(app):
                 pass

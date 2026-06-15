@@ -53,12 +53,19 @@ LOG_DIR = CAO_HOME_DIR / "logs"
 TERMINAL_LOG_DIR = LOG_DIR / "terminal"  # Per-terminal log files for pipe-pane output
 TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
+# FIFO directory for event-driven terminal output streaming
+FIFO_DIR = CAO_HOME_DIR / "fifos"  # Named pipes for tmux pipe-pane streaming
+FIFO_DIR.mkdir(parents=True, exist_ok=True)
+
 # =============================================================================
-# Inbox Service Configuration
+# Event-Driven State Detection Configuration
 # =============================================================================
-# Polling interval for detecting log file changes (seconds)
-# Lower values = faster response, higher CPU usage
-INBOX_POLLING_INTERVAL = 5
+# Rolling buffer size for state detection (8KB)
+# Keeps trailing 8KB of terminal output for pattern matching
+STATE_BUFFER_MAX = 8192
+
+# Max events buffered per subscriber queue before dropping
+EVENT_BUS_MAX_QUEUE_SIZE = 1024
 
 # Eager inbox delivery: when enabled, deliver queued messages to terminals in
 # PROCESSING state for providers that declare
@@ -66,23 +73,33 @@ INBOX_POLLING_INTERVAL = 5
 # for capable providers (e.g., Claude Code).
 EAGER_INBOX_DELIVERY = os.environ.get("CAO_EAGER_INBOX_DELIVERY", "false").lower() == "true"
 
+# Poll interval (seconds) for the OpenCode inbox poller. OpenCode buffers input
+# and its pipe-pane output can stop changing once the TUI settles, so the
+# FIFO/StatusMonitor pipeline may never emit an IDLE/COMPLETED status event to
+# trigger delivery for an already-idle OpenCode terminal. A slow, provider-
+# agnostic poll (see api.main.opencode_inbox_delivery_daemon) is the safety net
+# for those terminals; the event bus remains the primary delivery path for all
+# other providers.
+INBOX_POLLING_INTERVAL = 5
+
 # Reconciliation sweep for orphaned inbox messages.
-# The immediate (on POST) and watchdog (on log-file change) delivery paths can
-# both miss a message when the receiving terminal is already idle: the single
-# immediate attempt may observe a stale status, and the watchdog only fires on
-# log output that an idle agent never produces. Those messages would otherwise
-# stay PENDING forever. A slow background sweep re-attempts delivery for any
-# message left pending past the grace window below, acting as a catch-all
-# fallback under the two fast paths (issue #131).
+# The fast delivery paths — the immediate attempt on POST and the event-driven
+# StatusMonitor pipeline — can both miss a message when the receiving terminal
+# is already idle: the immediate attempt may observe a stale status, and an idle
+# terminal produces no new output, so no IDLE/COMPLETED status event fires to
+# wake delivery. Those messages would otherwise stay PENDING forever. A slow,
+# provider-agnostic background sweep re-attempts delivery for any message left
+# pending past the grace window below, a catch-all fallback under the fast paths
+# and the OpenCode poller (issue #131).
 #
 # The interval is deliberately much larger than INBOX_POLLING_INTERVAL: this is
 # a safety net, not a primary delivery path, so it trades latency for low load.
 INBOX_RECONCILE_INTERVAL = 30  # seconds between reconciliation sweeps
 
-# Only reconcile messages older than this. Keeping the grace window >=
-# INBOX_POLLING_INTERVAL (the watchdog poll cadence) ensures the sweep never
-# competes with the immediate and watchdog paths for freshly queued messages —
-# it only adopts ones those paths have already had their chance at and missed.
+# Only reconcile messages older than this. The grace window keeps the sweep from
+# competing with the immediate and event-driven paths for freshly queued
+# messages — it only adopts ones those paths have already had their chance at
+# and missed.
 INBOX_RECONCILE_GRACE_SECONDS = 30
 
 # =============================================================================

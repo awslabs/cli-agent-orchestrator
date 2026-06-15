@@ -31,11 +31,9 @@ dependencies = [
     "uvicorn[standard]>=0.24.0",
     "websockets>=12.0",
     "libtmux>=0.51.0",
-    "aiofiles>=24.1.0",
     "click>=8.0.0",
     "python-dotenv>=1.2.2",
     "python-frontmatter>=1.1.0",
-    "watchdog==6.0.0",
     "requests>=2.32.0",
     "rank-bm25>=0.2.2",
 ]
@@ -45,6 +43,11 @@ dependencies = [
 "cao-server" = "cli_agent_orchestrator.api.main:main"
 "cao-mcp-server" = "cli_agent_orchestrator.mcp_server.server:main"
 "cao-ops-mcp-server" = "cli_agent_orchestrator.ops_mcp_server.server:main"
+
+[project.entry-points."cao.plugins"]
+claude_code_memory = "cli_agent_orchestrator.plugins.builtin.claude_code_memory:ClaudeCodeMemoryPlugin"
+kiro_cli_memory = "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory:KiroCliMemoryPlugin"
+codex_memory = "cli_agent_orchestrator.plugins.builtin.codex_memory:CodexMemoryPlugin"
 
 [project.urls]
 Homepage = "https://github.com/awslabs/cli-agent-orchestrator"

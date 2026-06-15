@@ -23,10 +23,7 @@ import logging
 from typing import Dict, List
 
 from cli_agent_orchestrator.backends.registry import get_backend
-from cli_agent_orchestrator.clients.database import (
-    delete_terminals_by_session,
-    list_terminals_by_session,
-)
+from cli_agent_orchestrator.clients.database import list_terminals_by_session
 from cli_agent_orchestrator.constants import SESSION_PREFIX
 from cli_agent_orchestrator.models.terminal import Terminal
 from cli_agent_orchestrator.plugins import (
@@ -34,7 +31,6 @@ from cli_agent_orchestrator.plugins import (
     PostCreateSessionEvent,
     PostKillSessionEvent,
 )
-from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
 from cli_agent_orchestrator.services.session_env import clear_session_env
 from cli_agent_orchestrator.services.terminal_service import create_terminal
@@ -43,7 +39,7 @@ from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 logger = logging.getLogger(__name__)
 
 
-def create_session(
+async def create_session(
     provider: str | None,
     agent_profile: str,
     session_name: str | None = None,
@@ -63,7 +59,7 @@ def create_session(
     else:
         resolved_provider = provider
 
-    terminal = create_terminal(
+    terminal = await create_terminal(
         provider=resolved_provider,
         agent_profile=agent_profile,
         session_name=session_name,
@@ -124,21 +120,21 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
     try:
         session_alive = get_backend().session_exists(session_name)
 
+        from cli_agent_orchestrator.services import terminal_service
+
         terminals = list_terminals_by_session(session_name)
 
-        # Cleanup providers (non-blocking — don't let failures stop deletion)
+        # Clean up each terminal (snapshot, kill window, FIFO reader,
+        # status buffer, provider, DB) via the event-driven teardown path.
         for terminal in terminals:
             try:
-                provider_manager.cleanup_provider(terminal["id"])
+                terminal_service.delete_terminal(terminal["id"], registry=registry)
             except Exception as e:
-                logger.warning(f"Provider cleanup failed for {terminal['id']}: {e}")
+                logger.warning(f"Failed to cleanup terminal {terminal['id']}: {e}")
 
         # Kill backend session only if it still exists
         if session_alive:
             get_backend().kill_session(session_name)
-
-        # Delete terminal metadata
-        delete_terminals_by_session(session_name)
 
         # Drop the per-session forwarded-env mapping (issue #248). Safe
         # even when no vars were forwarded — the helper is a no-op then.

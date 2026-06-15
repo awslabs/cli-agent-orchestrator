@@ -17,7 +17,6 @@ from cli_agent_orchestrator.providers.kimi_cli import (
     ANSI_CODE_PATTERN,
     ERROR_PATTERN,
     IDLE_PROMPT_PATTERN,
-    IDLE_PROMPT_PATTERN_LOG,
     IDLE_PROMPT_TAIL_LINES,
     RESPONSE_BULLET_PATTERN,
     STATUS_BAR_PATTERN,
@@ -45,13 +44,17 @@ def _read_fixture(name: str) -> str:
 class TestKimiCliProviderInitialization:
     """Tests for KimiCliProvider initialization flow."""
 
-    @patch("cli_agent_orchestrator.providers.kimi_cli.wait_until_status", return_value=True)
-    @patch("cli_agent_orchestrator.providers.kimi_cli.wait_for_shell", return_value=True)
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.kimi_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kimi_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
-    def test_initialize_success(self, mock_tmux, mock_wait_shell, mock_wait_status):
+    async def test_initialize_success(self, mock_tmux, mock_wait_shell, mock_wait_status):
         """Test successful initialization sends kimi command and reaches IDLE."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+
         provider = KimiCliProvider("term-1", "session-1", "window-1")
-        result = provider.initialize()
+        result = await provider.initialize()
 
         assert result is True
         assert provider._initialized is True
@@ -59,31 +62,41 @@ class TestKimiCliProviderInitialization:
         mock_wait_shell.assert_called_once()
         mock_wait_status.assert_called_once()
 
-    @patch("cli_agent_orchestrator.providers.kimi_cli.wait_for_shell", return_value=False)
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.kimi_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
-    def test_initialize_shell_timeout(self, mock_tmux, mock_wait_shell):
+    async def test_initialize_shell_timeout(self, mock_tmux, mock_wait_shell):
         """Test shell init timeout raises TimeoutError."""
+        mock_wait_shell.return_value = False
+
         provider = KimiCliProvider("term-1", "session-1", "window-1")
         with pytest.raises(TimeoutError, match="Shell initialization"):
-            provider.initialize()
+            await provider.initialize()
 
-    @patch("cli_agent_orchestrator.providers.kimi_cli.wait_until_status", return_value=False)
-    @patch("cli_agent_orchestrator.providers.kimi_cli.wait_for_shell", return_value=True)
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.kimi_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kimi_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
-    def test_initialize_kimi_timeout(self, mock_tmux, mock_wait_shell, mock_wait_status):
+    async def test_initialize_kimi_timeout(self, mock_tmux, mock_wait_shell, mock_wait_status):
         """Test Kimi CLI init timeout raises TimeoutError."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = False
+
         provider = KimiCliProvider("term-1", "session-1", "window-1")
         with pytest.raises(TimeoutError, match="Kimi CLI initialization"):
-            provider.initialize()
+            await provider.initialize()
 
-    @patch("cli_agent_orchestrator.providers.kimi_cli.wait_until_status", return_value=True)
-    @patch("cli_agent_orchestrator.providers.kimi_cli.wait_for_shell", return_value=True)
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.kimi_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kimi_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
-    def test_initialize_with_agent_profile(
+    async def test_initialize_with_agent_profile(
         self, mock_load, mock_tmux, mock_wait_shell, mock_wait_status
     ):
         """Test initialization with agent profile creates temp files."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.system_prompt = "You are a helpful assistant"
@@ -91,7 +104,7 @@ class TestKimiCliProviderInitialization:
         mock_load.return_value = mock_profile
 
         provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="developer")
-        result = provider.initialize()
+        result = await provider.initialize()
         assert result is True
 
         # Verify kimi command includes --agent-file
@@ -112,14 +125,17 @@ class TestKimiCliProviderInitialization:
         with pytest.raises(ProviderError, match="Failed to load agent profile"):
             provider._build_kimi_command()
 
-    @patch("cli_agent_orchestrator.providers.kimi_cli.wait_until_status", return_value=True)
-    @patch("cli_agent_orchestrator.providers.kimi_cli.wait_for_shell", return_value=True)
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.kimi_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kimi_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
-    def test_initialize_with_mcp_servers(
+    async def test_initialize_with_mcp_servers(
         self, mock_load, mock_tmux, mock_wait_shell, mock_wait_status
     ):
         """Test initialization with MCP servers in profile adds --mcp-config and modifies config.toml."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.system_prompt = None
@@ -137,7 +153,7 @@ class TestKimiCliProviderInitialization:
             "cli_agent_orchestrator.providers.kimi_cli.Path.home",
             return_value=Path(tempfile.mkdtemp()),
         ):
-            result = provider.initialize()
+            result = await provider.initialize()
         assert result is True
 
         call_args = mock_tmux.return_value.send_keys.call_args
@@ -146,13 +162,19 @@ class TestKimiCliProviderInitialization:
         # No --config flag in command (breaks OAuth authentication)
         assert "--config" not in command
 
-    @patch("cli_agent_orchestrator.providers.kimi_cli.wait_until_status", return_value=True)
-    @patch("cli_agent_orchestrator.providers.kimi_cli.wait_for_shell", return_value=True)
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.kimi_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kimi_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
-    def test_initialize_sends_kimi_command(self, mock_tmux, mock_wait_shell, mock_wait_status):
+    async def test_initialize_sends_kimi_command(
+        self, mock_tmux, mock_wait_shell, mock_wait_status
+    ):
         """Test that initialize sends the kimi --yolo command with cd and TERM override."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+
         provider = KimiCliProvider("term-1", "session-1", "window-1")
-        provider.initialize()
+        await provider.initialize()
 
         call_args = mock_tmux.return_value.send_keys.call_args
         command = call_args[0][2]
@@ -170,15 +192,12 @@ class TestKimiCliProviderInitialization:
 class TestKimiCliProviderStatusDetection:
     """Tests for KimiCliProvider.get_status()."""
 
-    @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
-    def test_get_status_idle(self, mock_tmux):
+    def test_get_status_idle(self):
         """Test IDLE detection from fresh startup output."""
-        mock_tmux.return_value.get_history.return_value = _read_fixture("kimi_cli_idle_output.txt")
         provider = KimiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status() == TerminalStatus.IDLE
+        assert provider.get_status(_read_fixture("kimi_cli_idle_output.txt")) == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
-    def test_get_status_idle_no_thinking(self, mock_tmux):
+    def test_get_status_idle_no_thinking(self):
         """Test IDLE detection with ✨ prompt (no-thinking mode)."""
         output = (
             "Welcome to Kimi Code CLI!\n"
@@ -186,60 +205,51 @@ class TestKimiCliProviderStatusDetection:
             "\n\n"
             "23:14  yolo  agent (kimi-for-coding)  ctrl-x: toggle mode  context: 0.0%"
         )
-        mock_tmux.return_value.get_history.return_value = output
         provider = KimiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status() == TerminalStatus.IDLE
+        assert provider.get_status(output) == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
-    def test_get_status_completed(self, mock_tmux):
+    def test_get_status_completed(self):
         """Test COMPLETED detection when response is present with prompt."""
-        mock_tmux.return_value.get_history.return_value = _read_fixture(
-            "kimi_cli_completed_output.txt"
-        )
         provider = KimiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status() == TerminalStatus.COMPLETED
+        assert (
+            provider.get_status(_read_fixture("kimi_cli_completed_output.txt"))
+            == TerminalStatus.COMPLETED
+        )
 
-    @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
-    def test_get_status_completed_complex(self, mock_tmux):
+    def test_get_status_completed_complex(self):
         """Test COMPLETED detection with multi-line code response."""
-        mock_tmux.return_value.get_history.return_value = _read_fixture(
-            "kimi_cli_complex_response.txt"
-        )
         provider = KimiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status() == TerminalStatus.COMPLETED
+        assert (
+            provider.get_status(_read_fixture("kimi_cli_complex_response.txt"))
+            == TerminalStatus.COMPLETED
+        )
 
-    @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
-    def test_get_status_processing(self, mock_tmux):
+    def test_get_status_processing(self):
         """Test PROCESSING detection when no prompt at bottom."""
-        mock_tmux.return_value.get_history.return_value = _read_fixture(
-            "kimi_cli_processing_output.txt"
+        provider = KimiCliProvider("term-1", "session-1", "window-1")
+        assert (
+            provider.get_status(_read_fixture("kimi_cli_processing_output.txt"))
+            == TerminalStatus.PROCESSING
         )
-        provider = KimiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status() == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
-    def test_get_status_error_empty(self, mock_tmux):
-        """Test ERROR on empty output."""
-        mock_tmux.return_value.get_history.return_value = ""
+    def test_get_status_unknown_empty(self):
+        """Test UNKNOWN on empty output."""
         provider = KimiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status() == TerminalStatus.ERROR
+        assert provider.get_status("") == TerminalStatus.UNKNOWN
 
-    @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
-    def test_get_status_error_none(self, mock_tmux):
-        """Test ERROR on None output."""
-        mock_tmux.return_value.get_history.return_value = None
+    def test_get_status_unknown_none(self):
+        """Test UNKNOWN on None output."""
         provider = KimiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status() == TerminalStatus.ERROR
+        assert provider.get_status(None) == TerminalStatus.UNKNOWN
 
-    @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
-    def test_get_status_error_pattern(self, mock_tmux):
+    def test_get_status_error_pattern(self):
         """Test ERROR detection from error output fixture."""
-        mock_tmux.return_value.get_history.return_value = _read_fixture("kimi_cli_error_output.txt")
         provider = KimiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status() == TerminalStatus.ERROR
+        assert (
+            provider.get_status(_read_fixture("kimi_cli_error_output.txt")) == TerminalStatus.ERROR
+        )
 
-    @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
-    def test_get_status_idle_with_ansi_codes(self, mock_tmux):
+    def test_get_status_idle_with_ansi_codes(self):
         """Test IDLE detection with ANSI escape codes in output."""
         # Simulate raw ANSI output: bold prompt with color codes
         output = (
@@ -248,22 +258,10 @@ class TestKimiCliProviderStatusDetection:
             "\n\n"
             "23:14  yolo  agent (kimi-for-coding, thinking)  ctrl-x: toggle mode  context: 0.0%"
         )
-        mock_tmux.return_value.get_history.return_value = output
         provider = KimiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status() == TerminalStatus.IDLE
+        assert provider.get_status(output) == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
-    def test_get_status_with_tail_lines(self, mock_tmux):
-        """Test status detection with tail_lines parameter passed through."""
-        mock_tmux.return_value.get_history.return_value = _read_fixture("kimi_cli_idle_output.txt")
-        provider = KimiCliProvider("term-1", "session-1", "window-1")
-        provider.get_status(tail_lines=20)
-        mock_tmux.return_value.get_history.assert_called_once_with(
-            "session-1", "window-1", tail_lines=20
-        )
-
-    @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
-    def test_get_status_idle_tall_terminal(self, mock_tmux):
+    def test_get_status_idle_tall_terminal(self):
         """Test IDLE detection in tall terminals (46+ rows) where prompt is far from bottom.
 
         In a 46-row terminal, the welcome banner takes ~12 lines, the prompt is at
@@ -280,12 +278,10 @@ class TestKimiCliProviderStatusDetection:
             + "\n" * 32  # 32 empty padding lines (typical for 46-row terminal)
             + "00:05  yolo  agent (kimi-for-coding, thinking)  ctrl-x: toggle mode  context: 0.0%\n"
         )
-        mock_tmux.return_value.get_history.return_value = output
         provider = KimiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status() == TerminalStatus.IDLE
+        assert provider.get_status(output) == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
-    def test_get_status_processing_streaming(self, mock_tmux):
+    def test_get_status_processing_streaming(self):
         """Test PROCESSING when response is mid-stream (no prompt, no error)."""
         output = (
             "╭──────────────────╮\n"
@@ -296,12 +292,10 @@ class TestKimiCliProviderStatusDetection:
             "def foo():\n"
             "    pass\n"
         )
-        mock_tmux.return_value.get_history.return_value = output
         provider = KimiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status() == TerminalStatus.PROCESSING
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
-    def test_get_status_completed_long_response_no_bullets(self, mock_tmux):
+    def test_get_status_completed_long_response_no_bullets(self):
         """Test COMPLETED for long structured responses without • bullet markers.
 
         Kimi doesn't always use • bullets — report templates, tables, numbered lists
@@ -319,8 +313,7 @@ class TestKimiCliProviderStatusDetection:
             "  ━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "  1. Summary section...\n"
         )
-        mock_tmux.return_value.get_history.return_value = processing_output
-        assert provider.get_status() == TerminalStatus.PROCESSING
+        assert provider.get_status(processing_output) == TerminalStatus.PROCESSING
         # Flag should now be latched
         assert provider._has_received_input is True
 
@@ -334,11 +327,9 @@ class TestKimiCliProviderStatusDetection:
             "\n\n"
             "19:12  yolo  agent (kimi-for-coding, thinking)  ctrl-x: toggle mode  context: 2.9%"
         )
-        mock_tmux.return_value.get_history.return_value = completed_output
-        assert provider.get_status() == TerminalStatus.COMPLETED
+        assert provider.get_status(completed_output) == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
-    def test_get_status_latching_persists_after_scrollout(self, mock_tmux):
+    def test_get_status_latching_persists_after_scrollout(self):
         """Test that _has_received_input flag persists after user input box scrolls out."""
         provider = KimiCliProvider("term-1", "session-1", "window-1")
 
@@ -352,11 +343,9 @@ class TestKimiCliProviderStatusDetection:
             "\n\n"
             "23:14  yolo  agent (kimi-for-coding, thinking)  ctrl-x: toggle mode  context: 1.0%"
         )
-        mock_tmux.return_value.get_history.return_value = output
-        assert provider.get_status() == TerminalStatus.COMPLETED
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
-    def test_get_status_idle_before_any_input(self, mock_tmux):
+    def test_get_status_idle_before_any_input(self):
         """Test IDLE when no user input has been received yet (fresh startup)."""
         provider = KimiCliProvider("term-1", "session-1", "window-1")
         assert provider._has_received_input is False
@@ -367,12 +356,10 @@ class TestKimiCliProviderStatusDetection:
             "\n\n"
             "23:14  yolo  agent (kimi-for-coding, thinking)  ctrl-x: toggle mode  context: 0.0%"
         )
-        mock_tmux.return_value.get_history.return_value = output
-        assert provider.get_status() == TerminalStatus.IDLE
+        assert provider.get_status(output) == TerminalStatus.IDLE
         assert provider._has_received_input is False
 
-    @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
-    def test_get_status_processing_latches_flag(self, mock_tmux):
+    def test_get_status_processing_latches_flag(self):
         """Test that user input box detected during PROCESSING latches the flag."""
         provider = KimiCliProvider("term-1", "session-1", "window-1")
         assert provider._has_received_input is False
@@ -384,8 +371,7 @@ class TestKimiCliProviderStatusDetection:
             "╰──────────────────╯\n"
             "Response content streaming...\n"
         )
-        mock_tmux.return_value.get_history.return_value = output
-        status = provider.get_status()
+        status = provider.get_status(output)
         assert status == TerminalStatus.PROCESSING
         assert provider._has_received_input is True
 
@@ -934,15 +920,6 @@ class TestKimiCliProviderMisc:
         provider = KimiCliProvider("term-1", "session-1", "window-1")
         assert provider.exit_cli() == "/exit"
 
-    def test_get_idle_pattern_for_log(self):
-        """Test idle pattern for log monitoring matches both emoji markers."""
-        provider = KimiCliProvider("term-1", "session-1", "window-1")
-        pattern = provider.get_idle_pattern_for_log()
-        assert pattern == IDLE_PROMPT_PATTERN_LOG
-        # Should match both emoji markers
-        assert re.search(pattern, "user@app✨")
-        assert re.search(pattern, "user@app💫")
-
     def test_cleanup(self):
         """Test cleanup resets initialized state and latching flag."""
         provider = KimiCliProvider("term-1", "session-1", "window-1")
@@ -1091,3 +1068,165 @@ class TestKimiCliProviderPatterns:
         """Test tail lines constant is reasonable for Kimi's TUI layout."""
         assert IDLE_PROMPT_TAIL_LINES >= 40  # Must cover tall terminals (46+ rows)
         assert IDLE_PROMPT_TAIL_LINES <= 100  # Not unreasonably large
+
+
+# ---------------------------------------------------------------------------
+# Newest "Kimi Code" TUI status detection (regression for the redesigned CLI)
+#
+# These fixtures are REAL pipe-pane captures (last ~8KB rolling-buffer window)
+# of the redesigned Kimi Code TUI, which has no ✨/💫 prompt — readiness is the
+# "agent (<model> ●)" status bar / "context: N%" footer with an empty
+# "── input ──" box, and a turn-in-flight is a braille spinner ("⠧ Thinking…
+# Ns · N tokens"). The legacy emoji-prompt detector timed out at init on this
+# build; get_status() must classify these raw buffers correctly.
+# ---------------------------------------------------------------------------
+_KIMI_FIXTURES = Path(__file__).parent / "fixtures"
+
+
+class TestKimiCodeNewTuiStatus:
+    """get_status() against real captured raw buffers of the new Kimi Code TUI."""
+
+    def _provider(self):
+        return KimiCliProvider("term-x", "session-x", "window-x", agent_profile="developer")
+
+    def test_new_tui_idle_raw_capture(self):
+        """A freshly-initialized terminal (no task yet) reads IDLE — this is the
+        init readiness signal the legacy emoji detector missed."""
+        buf = (_KIMI_FIXTURES / "kimi_code_tui_idle_raw.txt").read_text(encoding="utf-8")
+        assert self._provider().get_status(buf) == TerminalStatus.IDLE
+
+    def test_new_tui_processing_raw_capture(self):
+        """A turn in flight (braille spinner is the freshest output) reads PROCESSING."""
+        buf = (_KIMI_FIXTURES / "kimi_code_tui_processing_raw.txt").read_text(encoding="utf-8")
+        assert self._provider().get_status(buf) == TerminalStatus.PROCESSING
+
+    def test_new_tui_completed_raw_capture(self):
+        """A finished turn (response present, spinner cleared, prompt visible)
+        reads COMPLETED even though stale spinner frames linger in the buffer."""
+        buf = (_KIMI_FIXTURES / "kimi_code_tui_completed_raw.txt").read_text(encoding="utf-8")
+        assert self._provider().get_status(buf) == TerminalStatus.COMPLETED
+
+    def test_new_tui_stale_spinner_does_not_block_completed(self):
+        """Position-based detection: a stale braille frame earlier in the buffer
+        must not be mistaken for a live turn once the prompt has redrawn."""
+        buf = (_KIMI_FIXTURES / "kimi_code_tui_completed_raw.txt").read_text(encoding="utf-8")
+        # Sanity: the completed fixture really does contain stale braille frames.
+        assert any("⠀" <= ch <= "⣿" for ch in buf)
+        assert self._provider().get_status(buf) != TerminalStatus.PROCESSING
+
+
+class TestKimiCodeNewTuiExtraction:
+    """Extraction for the newest "Kimi Code" TUI (✨ prompt, • bullets).
+
+    Ground truth from a live Kimi Code session: user messages render as
+    ✨-prefixed lines (no ╭─ input box), responses as • bullets, and the
+    footer is a "── input ──" rule + status bar. Decorative ╰─ boxes from
+    boot banners (Kimi welcome box, FastMCP server banner) appear ABOVE the
+    conversation — anchoring on the last box-end used to slice the
+    "response" out of the boot screen and run it to end-of-capture.
+    """
+
+    NEW_TUI_CAPTURE = (
+        "╭──────────────────────────────╮\n"
+        "│  ▐█▛█▛█▌  Welcome to Kimi Code CLI!  │\n"
+        "│  Directory: /tmp/cao_kimi_x  │\n"
+        "╰──────────────────────────────╯\n"
+        "╭──────────────────────────────╮\n"
+        "│  🖥  Server: cao-mcp-server, 3.4.2  │\n"
+        "╰──────────────────────────────╯\n"
+        "✨ What is 17*23? Reply with just the number and one short sentence.\n"
+        "\n"
+        "• The user is asking for a simple multiplication: 17 * 23.\n"
+        "\n"
+        "• 391. The product of 17 and 23 is 391.\n"
+        "\n"
+        "── input ─────────────────────────────────\n"
+        "\n"
+        "\n"
+        "──────────────────────────────────────────\n"
+        "yolo  agent (Kimi-k2.6 ●)  /tmp/cao_kimi_x  ctrl-o: editor\n"
+        "context: 4.0% (10.4k/262.1k)\n"
+    )
+
+    def test_extracts_response_after_sparkle_prompt(self):
+        provider = KimiCliProvider("test123", "test-session", "window-0")
+        result = provider.extract_last_message_from_script(self.NEW_TUI_CAPTURE)
+        assert "391" in result
+
+    def test_extraction_excludes_footer_chrome_and_boot_banners(self):
+        provider = KimiCliProvider("test123", "test-session", "window-0")
+        result = provider.extract_last_message_from_script(self.NEW_TUI_CAPTURE)
+        assert "input ─" not in result
+        assert "context:" not in result
+        assert "Welcome to Kimi Code CLI" not in result
+        assert "cao-mcp-server, 3.4.2" not in result
+
+
+class TestKimiCodeDispatchGrace:
+    """Newest-TUI: a fresh dispatch must read PROCESSING even when the ready
+    chrome (status bar) is the freshest content in the buffer.
+
+    Real failure (supervisor-assign e2e): the paste repaints the status bar
+    before the turn's first spinner frame, so the spinner-vs-ready position
+    compare read COMPLETED ~130ms after send_input(); the StatusMonitor
+    ready-latch then pinned the false COMPLETED for the entire turn and the
+    test extracted mid-flight output.
+    """
+
+    NEW_TUI_READY_CHROME = (
+        "✨ Analyze the datasets and report back.\n"
+        "\n"
+        "• Dispatching analysts now.\n"
+        "── input ─────────────────────────────────\n"
+        "\n"
+        "──────────────────────────────────────────\n"
+        "yolo  agent (Kimi-k2.6 ●)  /tmp/cao_kimi_x  ctrl-o: editor\n"
+        "context: 4.0% (10.4k/262.1k)\n"
+    )
+
+    def test_fresh_dispatch_reads_processing(self):
+        provider = KimiCliProvider("test123", "test-session", "window-0")
+        provider.mark_input_received()
+        assert provider.get_status(self.NEW_TUI_READY_CHROME) == TerminalStatus.PROCESSING
+
+    def test_grace_expires_to_completed_when_pane_clear(self):
+        import time as _time
+
+        provider = KimiCliProvider("test123", "test-session", "window-0")
+        provider.mark_input_received()
+        provider._last_dispatch_time = _time.time() - 6.0
+        with patch("cli_agent_orchestrator.providers.kimi_cli.get_backend") as mock_backend:
+            # Rendered pane shows the same ready chrome — no live spinner.
+            mock_backend.return_value.get_history.return_value = self.NEW_TUI_READY_CHROME
+            assert provider.get_status(self.NEW_TUI_READY_CHROME) == TerminalStatus.COMPLETED
+
+    def test_ready_stream_with_live_pane_spinner_is_processing(self):
+        """A ready-looking chunk boundary mid-turn: the stream shows the ready
+        chrome, but the RENDERED pane still shows a live spinner — must stay
+        PROCESSING (this is the frame the StatusMonitor latch would otherwise
+        pin as a false COMPLETED)."""
+        import time as _time
+
+        provider = KimiCliProvider("test123", "test-session", "window-0")
+        provider.mark_input_received()
+        provider._last_dispatch_time = _time.time() - 6.0
+        pane = self.NEW_TUI_READY_CHROME.replace("── input ─", "⠹ Using handoff({...})\n── input ─")
+        with patch("cli_agent_orchestrator.providers.kimi_cli.get_backend") as mock_backend:
+            mock_backend.return_value.get_history.return_value = pane
+            assert provider.get_status(self.NEW_TUI_READY_CHROME) == TerminalStatus.PROCESSING
+
+    def test_pane_read_failure_falls_back_to_stream(self):
+        import time as _time
+
+        provider = KimiCliProvider("test123", "test-session", "window-0")
+        provider.mark_input_received()
+        provider._last_dispatch_time = _time.time() - 6.0
+        with patch("cli_agent_orchestrator.providers.kimi_cli.get_backend") as mock_backend:
+            mock_backend.return_value.get_history.side_effect = RuntimeError("pane gone")
+            assert provider.get_status(self.NEW_TUI_READY_CHROME) == TerminalStatus.COMPLETED
+
+    def test_no_dispatch_unaffected(self):
+        provider = KimiCliProvider("test123", "test-session", "window-0")
+        # bullet in buffer latches _has_received_input → COMPLETED, as before;
+        # no dispatch yet → pane confirmation is skipped entirely.
+        assert provider.get_status(self.NEW_TUI_READY_CHROME) == TerminalStatus.COMPLETED

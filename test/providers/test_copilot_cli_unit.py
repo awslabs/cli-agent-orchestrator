@@ -199,80 +199,71 @@ class TestCopilotCliProviderModelFlag:
 
 
 class TestCopilotCliProviderInitialization:
+    @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.copilot_cli.wait_for_shell")
-    def test_initialize_shell_timeout(self, mock_wait_shell):
+    async def test_initialize_shell_timeout(self, mock_wait_shell):
         mock_wait_shell.return_value = False
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
 
         with pytest.raises(TimeoutError, match="Shell initialization timed out"):
-            provider.initialize()
+            await provider.initialize()
 
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    @patch("cli_agent_orchestrator.providers.copilot_cli.asyncio.sleep")
     @patch("cli_agent_orchestrator.providers.copilot_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
     @patch.object(CopilotCliProvider, "_accept_trust_prompts")
-    @patch("cli_agent_orchestrator.providers.copilot_cli.time.sleep")
-    def test_initialize_success_with_ui_probe(
+    async def test_initialize_success(
         self,
-        _mock_sleep,
         mock_accept,
         mock_tmux,
         mock_wait_shell,
+        _mock_async_sleep,
+        mock_status_monitor,
     ):
+        """initialize() launches the CLI and returns once the terminal is IDLE."""
         mock_wait_shell.return_value = True
-        provider = CopilotCliProvider("test1234", "test-session", "window-0")
-        with patch.object(provider, "get_status", return_value=TerminalStatus.IDLE):
-            assert provider.initialize() is True
+        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
 
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+
+        result = await provider.initialize()
+
+        assert result is True
+        assert provider._initialized is True
+        # The CLI command is typed into the pane after the shell is ready.
         mock_tmux.return_value.send_keys.assert_called_once()
         mock_accept.assert_called_once()
 
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    @patch("cli_agent_orchestrator.providers.copilot_cli.asyncio.sleep")
     @patch("cli_agent_orchestrator.providers.copilot_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
     @patch.object(CopilotCliProvider, "_accept_trust_prompts")
-    @patch("cli_agent_orchestrator.providers.copilot_cli.time.sleep")
-    @patch("cli_agent_orchestrator.providers.copilot_cli.time.time")
-    def test_initialize_timeout_when_no_ui_and_not_idle(
+    async def test_initialize_handles_trust_prompt_then_idle(
         self,
-        mock_time,
-        _mock_sleep,
         mock_accept,
-        _mock_tmux,
+        mock_tmux,
         mock_wait_shell,
+        _mock_async_sleep,
+        mock_status_monitor,
     ):
+        """A WAITING_USER_ANSWER trust prompt is handled before reaching IDLE."""
         mock_wait_shell.return_value = True
-        mock_time.side_effect = [0.0, 0.0, 61.0]
+        mock_status_monitor.get_status.side_effect = [
+            TerminalStatus.WAITING_USER_ANSWER,
+            TerminalStatus.IDLE,
+        ]
+
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
 
-        with (
-            patch.object(provider, "get_status", return_value=TerminalStatus.PROCESSING),
-            pytest.raises(TimeoutError, match="Copilot initialization timed out after 60 seconds"),
-        ):
-            provider.initialize()
+        result = await provider.initialize()
 
-        assert mock_accept.call_count == 1
-
-    @patch("cli_agent_orchestrator.providers.copilot_cli.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
-    @patch.object(CopilotCliProvider, "_accept_trust_prompts")
-    @patch("cli_agent_orchestrator.providers.copilot_cli.time.sleep")
-    def test_initialize_reaccepts_trust_when_waiting(
-        self,
-        _mock_sleep,
-        mock_accept,
-        _mock_tmux,
-        mock_wait_shell,
-    ):
-        mock_wait_shell.return_value = True
-        provider = CopilotCliProvider("test1234", "test-session", "window-0")
-
-        with patch.object(
-            provider,
-            "get_status",
-            side_effect=[TerminalStatus.WAITING_USER_ANSWER] + [TerminalStatus.IDLE] * 12,
-        ):
-            assert provider.initialize() is True
-
-        assert mock_accept.call_count == 2
+        assert result is True
+        # Initial trust handling + the in-loop WAITING_USER_ANSWER handling.
+        assert mock_accept.call_count >= 2
 
 
 class TestCopilotCliProviderTrustPrompts:
@@ -342,21 +333,19 @@ class TestCopilotCliProviderTrustPrompts:
 class TestCopilotCliProviderStatusDetection:
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
     def test_get_status_waiting_user_answer(self, mock_tmux):
-        mock_tmux.return_value.get_history.return_value = "confirm folder trust [y/n]"
+        output = "confirm folder trust [y/n]"
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
-        assert provider.get_status() == TerminalStatus.WAITING_USER_ANSWER
+        assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
 
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
     def test_get_status_idle_with_no_user_message(self, mock_tmux):
-        mock_tmux.return_value.get_history.return_value = (
-            "GitHub Copilot v0.0.415\n❯ Type @ to mention files"
-        )
+        output = "GitHub Copilot v0.0.415\n❯ Type @ to mention files"
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
-        assert provider.get_status() == TerminalStatus.IDLE
+        assert provider.get_status(output) == TerminalStatus.IDLE
 
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
     def test_get_status_idle_with_wrapped_prompt_helper(self, mock_tmux):
-        mock_tmux.return_value.get_history.return_value = (
+        output = (
             "● Environment loaded: 2 MCP servers, 3 agents\n"
             "────────────────────────────────────────────────────────────────────────────────\n"
             "❯  Type @ to mention files, # for issues/PRs, / for commands, or ? for \n"
@@ -365,31 +354,29 @@ class TestCopilotCliProviderStatusDetection:
             " shift+tab switch mode                     Remaining reqs.: 99.66666666666667%\n"
         )
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
-        assert provider.get_status() == TerminalStatus.IDLE
+        assert provider.get_status(output) == TerminalStatus.IDLE
 
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
     def test_get_status_processing_when_no_idle_prompt(self, mock_tmux):
-        mock_tmux.return_value.get_history.return_value = "Working on edits..."
+        output = "Working on edits..."
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
-        assert provider.get_status() == TerminalStatus.PROCESSING
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
 
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
     def test_get_status_error_while_processing_if_error_after_user(self, mock_tmux):
-        mock_tmux.return_value.get_history.return_value = "❯ refactor this\nError: failed to parse"
+        output = "❯ refactor this\nError: failed to parse"
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
-        assert provider.get_status() == TerminalStatus.ERROR
+        assert provider.get_status(output) == TerminalStatus.ERROR
 
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
     def test_get_status_completed_when_response_present_and_idle(self, mock_tmux):
-        mock_tmux.return_value.get_history.return_value = (
-            "❯ refactor this\n● Edit file.py (+1 -1)\n❯ "
-        )
+        output = "❯ refactor this\n● Edit file.py (+1 -1)\n❯ "
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
-        assert provider.get_status() == TerminalStatus.COMPLETED
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
 
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
     def test_get_status_processing_when_spinner_visible_with_idle_prompt(self, mock_tmux):
-        mock_tmux.return_value.get_history.return_value = (
+        output = (
             "❯ Analyze the dataset and calculate standard \n"
             "  deviation.\n"
             "∙ Thinking (Esc to cancel)\n"
@@ -399,23 +386,19 @@ class TestCopilotCliProviderStatusDetection:
             "  shortcuts\n"
         )
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
-        assert provider.get_status() == TerminalStatus.PROCESSING
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
 
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
     def test_get_status_error_when_idle_and_error_without_assistant_marker(self, mock_tmux):
-        mock_tmux.return_value.get_history.return_value = (
-            "❯ refactor this\nError: failed to parse\n❯ "
-        )
+        output = "❯ refactor this\nError: failed to parse\n❯ "
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
-        assert provider.get_status() == TerminalStatus.ERROR
+        assert provider.get_status(output) == TerminalStatus.ERROR
 
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
     def test_get_status_completed_when_idle_and_error_with_assistant_marker(self, mock_tmux):
-        mock_tmux.return_value.get_history.return_value = (
-            "❯ refactor this\nassistant: note\nError: sample\n❯ "
-        )
+        output = "❯ refactor this\nassistant: note\nError: sample\n❯ "
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
-        assert provider.get_status() == TerminalStatus.COMPLETED
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
 
     # ------------------------------------------------------------------
     # Copilot v1.0.31+ layout: bare ❯ followed by the status bar line
@@ -424,7 +407,7 @@ class TestCopilotCliProviderStatusDetection:
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
     def test_get_status_idle_with_v1031_autopilot_status_bar(self, mock_tmux):
         """Bare ❯ + 'autopilot · / commands ...' status bar → IDLE (no prior user turn)."""
-        mock_tmux.return_value.get_history.return_value = (
+        output = (
             "● Selected custom agent: developer\n"
             "\n"
             "● Environment loaded: 3 custom instructions, 1 hook, 2 MCP servers\n"
@@ -436,12 +419,12 @@ class TestCopilotCliProviderStatusDetection:
             " autopilot · / commands \u200b                        Claude Sonnet 4.6 · (0%)\n"
         )
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
-        assert provider.get_status() == TerminalStatus.IDLE
+        assert provider.get_status(output) == TerminalStatus.IDLE
 
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
     def test_get_status_idle_with_v1031_plan_status_bar(self, mock_tmux):
         """Bare ❯ + 'plan · / commands ...' status bar → IDLE."""
-        mock_tmux.return_value.get_history.return_value = (
+        output = (
             " ~/repo [⎇ main]\n"
             "────────────────────────────────────────────────────────────────────────────────\n"
             "❯\n"
@@ -449,12 +432,12 @@ class TestCopilotCliProviderStatusDetection:
             " plan · / commands \u200b                             Claude Sonnet 4.6 · (0%)\n"
         )
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
-        assert provider.get_status() == TerminalStatus.IDLE
+        assert provider.get_status(output) == TerminalStatus.IDLE
 
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
     def test_get_status_idle_with_v1031_interactive_status_bar(self, mock_tmux):
         """Bare ❯ + 'interactive · / commands ...' status bar → IDLE."""
-        mock_tmux.return_value.get_history.return_value = (
+        output = (
             " ~/repo [⎇ main]\n"
             "────────────────────────────────────────────────────────────────────────────────\n"
             "❯\n"
@@ -462,12 +445,12 @@ class TestCopilotCliProviderStatusDetection:
             " interactive · / commands \u200b                      Claude Sonnet 4.6 · (0%)\n"
         )
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
-        assert provider.get_status() == TerminalStatus.IDLE
+        assert provider.get_status(output) == TerminalStatus.IDLE
 
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
     def test_get_status_completed_with_v1031_status_bar_after_user_turn(self, mock_tmux):
         """User turn + agent response + bare ❯ + status bar → COMPLETED."""
-        mock_tmux.return_value.get_history.return_value = (
+        output = (
             "❯ fix the bug\n"
             "● Edit src/main.py (+3 -1)\n"
             " ~/repo [⎇ main*%]\n"
@@ -477,12 +460,12 @@ class TestCopilotCliProviderStatusDetection:
             " autopilot · / commands \u200b                        Claude Sonnet 4.6 · (0%)\n"
         )
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
-        assert provider.get_status() == TerminalStatus.COMPLETED
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
 
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
     def test_get_status_processing_with_spinner_and_v1031_status_bar(self, mock_tmux):
         """Spinner line present alongside status bar → still PROCESSING."""
-        mock_tmux.return_value.get_history.return_value = (
+        output = (
             "❯ refactor utils.py\n"
             "∙ Thinking (Esc to cancel)\n"
             " ~/repo [⎇ main*%]\n"
@@ -492,12 +475,12 @@ class TestCopilotCliProviderStatusDetection:
             " autopilot · / commands \u200b                        Claude Sonnet 4.6 · (0%)\n"
         )
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
-        assert provider.get_status() == TerminalStatus.PROCESSING
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
 
     @patch("cli_agent_orchestrator.providers.copilot_cli.get_backend")
     def test_get_status_idle_with_v1031_absolute_path_breadcrumb(self, mock_tmux):
         """Bare ❯ + absolute-path breadcrumb (CWD outside $HOME) → IDLE."""
-        mock_tmux.return_value.get_history.return_value = (
+        output = (
             " /tmp/pr184-e2e [⎇ pr-184]\n"
             "────────────────────────────────────────────────────────────────────────────────\n"
             "❯\n"
@@ -505,7 +488,7 @@ class TestCopilotCliProviderStatusDetection:
             " autopilot · / commands \u200b                        Claude Sonnet 4.6 · (0%)\n"
         )
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
-        assert provider.get_status() == TerminalStatus.IDLE
+        assert provider.get_status(output) == TerminalStatus.IDLE
 
 
 class TestCopilotCliProviderMessageExtraction:

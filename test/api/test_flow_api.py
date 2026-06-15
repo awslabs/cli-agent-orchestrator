@@ -1,7 +1,7 @@
 """Tests for flow management API endpoints."""
 
 from datetime import datetime
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -357,7 +357,8 @@ class TestRunFlow:
     def test_run_flow_success(self, client):
         """POST /flows/{name}/run executes a flow and returns result."""
         with patch("cli_agent_orchestrator.api.main.flow_service") as mock_svc:
-            mock_svc.execute_flow.return_value = True
+            # Endpoint awaits flow_service.execute_flow, so it must be an AsyncMock.
+            mock_svc.execute_flow = AsyncMock(return_value=True)
 
             response = client.post("/flows/test-flow/run")
 
@@ -368,7 +369,8 @@ class TestRunFlow:
     def test_run_flow_skipped(self, client):
         """POST /flows/{name}/run returns executed=false when script says no."""
         with patch("cli_agent_orchestrator.api.main.flow_service") as mock_svc:
-            mock_svc.execute_flow.return_value = False
+            # Endpoint awaits flow_service.execute_flow, so it must be an AsyncMock.
+            mock_svc.execute_flow = AsyncMock(return_value=False)
 
             response = client.post("/flows/test-flow/run")
 
