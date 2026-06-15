@@ -1,0 +1,621 @@
+"""Unit tests for the Cursor CLI provider."""
+
+import re
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.providers.cursor_cli import (
+    ANSI_CODE_PATTERN,
+    IDLE_PROMPT_PATTERN,
+    IDLE_PROMPT_PATTERN_LOG,
+    PERMISSION_PROMPT_PATTERN,
+    PROCESSING_PATTERN,
+    TRUST_PROMPT_PATTERN,
+    WAITING_USER_ANSWER_PATTERN,
+    CursorCliProvider,
+    ProviderError,
+)
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+
+def load_fixture(name: str) -> str:
+    """Load a plain-text fixture file."""
+    return (FIXTURES_DIR / name).read_text(encoding="utf-8")
+
+
+def make_provider(
+    agent_profile: str | None = None,
+    allowed_tools: list | None = None,
+    model: str | None = None,
+    skill_prompt: str | None = None,
+) -> CursorCliProvider:
+    """Build a CursorCliProvider with the given configuration."""
+    return CursorCliProvider(
+        terminal_id="test-tid",
+        session_name="test-session",
+        window_name="window-0",
+        agent_profile=agent_profile,
+        allowed_tools=allowed_tools,
+        model=model,
+        skill_prompt=skill_prompt,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Regex patterns
+# ---------------------------------------------------------------------------
+
+
+class TestRegexPatterns:
+    def test_idle_prompt_matches_unicode_arrow(self):
+        assert re.search(IDLE_PROMPT_PATTERN, "\u276f ")
+
+    def test_idle_prompt_matches_ascii_arrow(self):
+        assert re.search(IDLE_PROMPT_PATTERN, "> ")
+
+    def test_idle_prompt_matches_non_breaking_space(self):
+        assert re.search(IDLE_PROMPT_PATTERN, "\u276f\xa0")
+
+    def test_idle_prompt_rejects_other_text(self):
+        assert not re.search(IDLE_PROMPT_PATTERN, "hello world")
+
+    def test_processing_pattern_matches_braille_spinner(self):
+        assert re.search(PROCESSING_PATTERN, "\u2807 Thinking\u2026")
+
+    def test_processing_pattern_matches_unicode_spinner(self):
+        assert re.search(PROCESSING_PATTERN, "\u2736 Reasoning\u2026")
+
+    def test_processing_pattern_matches_claude_spinner(self):
+        assert re.search(PROCESSING_PATTERN, "\u2733 Cooking\u2026 (esc to interrupt)")
+
+    def test_processing_pattern_rejects_plain_text(self):
+        assert not re.search(PROCESSING_PATTERN, "just some plain text")
+
+    def test_waiting_user_answer_pattern_matches_navigation_footer(self):
+        assert re.search(WAITING_USER_ANSWER_PATTERN, "\u2191/\u2193 to navigate")
+
+    def test_trust_prompt_pattern_matches(self):
+        assert re.search(
+            TRUST_PROMPT_PATTERN, "Do you trust the files in this folder?", re.IGNORECASE
+        )
+
+    def test_permission_prompt_pattern_matches(self):
+        assert re.search(PERMISSION_PROMPT_PATTERN, "Do you want to allow this?", re.IGNORECASE)
+
+    def test_ansi_strips_truecolor(self):
+        text = "\x1b[38;2;255;100;50mHello\x1b[0m"
+        assert re.sub(ANSI_CODE_PATTERN, "", text) == "Hello"
+
+
+# ---------------------------------------------------------------------------
+# get_status()
+# ---------------------------------------------------------------------------
+
+
+class TestGetStatus:
+    """Verify get_status() returns the correct enum for each fixture.
+
+    New event-driven contract: get_status(output) receives the buffer
+    string directly from the StatusMonitor; the provider no longer
+    reads tmux internally.
+    """
+
+    def test_idle_fixture_returns_completed(self):
+        output = load_fixture("cursor_cli_idle_output.txt")
+        provider = make_provider()
+        # Provider reports COMPLETED on idle prompt to match other
+        # providers' "ready" signal convention.
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+    def test_completed_fixture_returns_completed(self):
+        output = load_fixture("cursor_cli_completed_output.txt")
+        provider = make_provider()
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+    def test_processing_spinner_before_separator_returns_processing(self):
+        output = load_fixture("cursor_cli_processing_output.txt")
+        provider = make_provider()
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    def test_stale_spinner_ignored_returns_completed(self):
+        # A spinner from a previous turn followed by another separator
+        # is a completed task, not active processing.
+        sep = "\u2500" * 30
+        stale_output = (
+            sep
+            + "\nFirst task done\n"
+            + sep
+            + "\nOld spinner text\u2026 lingering\n"
+            + sep
+            + "\nLatest response done\n"
+            + sep
+            + "\n\u276f "
+        )
+        provider = make_provider()
+        assert provider.get_status(stale_output) == TerminalStatus.COMPLETED
+
+    def test_processing_no_separator_yet_returns_processing(self):
+        output = "Welcome to Cursor Agent\n\u2807 Thinking\u2026\n"
+        provider = make_provider()
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    def test_trust_prompt_returns_waiting_user_answer(self):
+        output = load_fixture("cursor_cli_permission_output.txt")
+        provider = make_provider()
+        assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_tui_widget_footer_returns_waiting_user_answer(self):
+        sep = "\u2500" * 30
+        output = (
+            sep
+            + "\nPick a model:\n"
+            + "gpt-5\nsonnet-4\n"
+            + "\u2191/\u2193 to navigate, enter to select\n"
+        )
+        provider = make_provider()
+        assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_empty_output_returns_unknown(self):
+        provider = make_provider()
+        assert provider.get_status("") == TerminalStatus.UNKNOWN
+
+    def test_none_output_returns_unknown(self):
+        provider = make_provider()
+        assert provider.get_status(None) == TerminalStatus.UNKNOWN
+
+    def test_unrecognizable_output_returns_unknown(self):
+        provider = make_provider()
+        assert provider.get_status("random text without any markers") == TerminalStatus.UNKNOWN
+
+    def test_idle_after_input_received_returns_completed(self):
+        # Long response with multiple separators, ending at the idle prompt.
+        sep = "\u2500" * 30
+        output = sep + "\n\u276f What is 2+2?\n" + sep + "\nThe answer is 4.\n" + sep + "\n\u276f "
+        provider = make_provider()
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+
+# ---------------------------------------------------------------------------
+# extract_last_message_from_script()
+# ---------------------------------------------------------------------------
+
+
+class TestExtractLastMessage:
+    def test_extracts_response_from_completed_fixture(self):
+        provider = make_provider()
+        output = load_fixture("cursor_cli_completed_output.txt")
+        result = provider.extract_last_message_from_script(output)
+        assert "comprehensive response" in result
+        assert "multiple paragraphs" in result
+
+    def test_extracts_response_strips_ansi(self):
+        sep = "\u2500" * 30
+        provider = make_provider()
+        output = (
+            sep
+            + "\n\u276f say hello\n"
+            + sep
+            + "\n\x1b[32mHello world\x1b[0m\n"
+            + sep
+            + "\n\u276f "
+        )
+        result = provider.extract_last_message_from_script(output)
+        assert "Hello world" in result
+        assert "\x1b[" not in result
+
+    def test_raises_when_no_separator(self):
+        provider = make_provider()
+        with pytest.raises(ValueError, match="No Cursor CLI response found"):
+            provider.extract_last_message_from_script("\u276f hello")
+
+    def test_raises_when_no_idle_prompt(self):
+        provider = make_provider()
+        output = ("\u2500" * 30) + "\nSome response without trailing prompt"
+        with pytest.raises(ValueError, match="No Cursor CLI response found"):
+            provider.extract_last_message_from_script(output)
+
+    def test_raises_when_response_is_empty(self):
+        sep = "\u2500" * 30
+        provider = make_provider()
+        # Two separators back to back, then idle prompt. No content between.
+        output = sep + "\n\u276f user\n" + sep + "\n   \n" + sep + "\n\u276f "
+        with pytest.raises(ValueError, match="Empty Cursor CLI response"):
+            provider.extract_last_message_from_script(output)
+
+    def test_extracts_with_only_one_separator(self):
+        # Single-separator buffers occur when the response start
+        # separator has scrolled out of the 8KB rolling buffer but
+        # the end separator is still present. In that case the
+        # start_sep is None and we fall back to the buffer start.
+        sep = "\u2500" * 30
+        provider = make_provider()
+        output = sep + "\nThe answer is 42.\n" + sep + "\n\u276f "
+        result = provider.extract_last_message_from_script(output)
+        assert "The answer is 42." in result
+
+    def test_separator_matching_tolerates_interleaved_csi_escapes(self):
+        # Cursor re-renders the separator with new colour escapes
+        # on every prompt: the box-drawing line may contain
+        # multiple SGR segments interleaved between the ─ chars.
+        # The regex must still match so status detection and
+        # extraction both work.
+        sep_with_color = "\x1b[38;5;245m" + ("\u2500" * 30) + "\x1b[0m"
+        provider = make_provider()
+        output = (
+            sep_with_color
+            + "\n\u276f question\n"
+            + sep_with_color
+            + "\nHello world\n"
+            + sep_with_color
+            + "\n\u276f "
+        )
+        # Status detection also uses the separator regex.
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+        # Extraction must find the response between the second
+        # and third separators.
+        result = provider.extract_last_message_from_script(output)
+        assert "Hello world" in result
+
+    def test_extraction_strips_cursor_positioning_sequences(self):
+        # Long generations cause Cursor to emit cursor-positioning
+        # sequences inside the response area (e.g. \x1b[2K erase
+        # line, \x1b[H cursor home). The extracted text must not
+        # contain these.
+        sep = "\u2500" * 30
+        provider = make_provider()
+        output = (
+            sep
+            + "\n\u276f say hello\n"
+            + sep
+            + "\nHello \x1b[2Kworld\x1b[H with cursor moves\n"
+            + sep
+            + "\n\u276f "
+        )
+        result = provider.extract_last_message_from_script(output)
+        assert "Hello world with cursor moves" in result
+        assert "\x1b[" not in result
+
+    def test_extraction_strips_osc_title_sequences(self):
+        # OSC sequences (e.g. terminal title updates) can leak into
+        # the captured text. The extraction must strip them.
+        sep = "\u2500" * 30
+        provider = make_provider()
+        osc = "\x1b]0;Cursor Agent\x07"  # set window title
+        output = (
+            sep
+            + "\n\u276f say hello\n"
+            + sep
+            + "\n"
+            + osc
+            + "Response text after title update\n"
+            + sep
+            + "\n\u276f "
+        )
+        result = provider.extract_last_message_from_script(output)
+        assert "Response text after title update" in result
+        assert "\x1b]" not in result
+
+    def test_uses_last_response_when_multiple(self):
+        sep = "\u2500" * 30
+        provider = make_provider()
+        output = (
+            sep
+            + "\n\u276f First question\n"
+            + sep
+            + "\nFirst response\n"
+            + sep
+            + "\n\u276f Second question\n"
+            + sep
+            + "\nSecond response\n"
+            + sep
+            + "\n\u276f Third question\n"
+            + sep
+            + "\nThird (latest) response\n"
+            + sep
+            + "\n\u276f "
+        )
+        result = provider.extract_last_message_from_script(output)
+        assert "Third" in result
+        assert "Second" not in result
+        assert "First" not in result
+
+
+# ---------------------------------------------------------------------------
+# _build_cursor_command()
+# ---------------------------------------------------------------------------
+
+
+class TestBuildCommand:
+    @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
+    def test_no_profile_bare_command(self, mock_load):
+        mock_load.side_effect = FileNotFoundError("no profile")
+        provider = make_provider()
+        cmd = provider._build_cursor_command()
+        assert cmd == "agent --force --trust"
+
+    @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
+    def test_constructor_model_forwarded(self, mock_load):
+        mock_load.side_effect = FileNotFoundError("no profile")
+        provider = make_provider(model="gpt-5")
+        cmd = provider._build_cursor_command()
+        assert "--model gpt-5" in cmd
+
+    @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
+    def test_profile_model_overrides_constructor(self, mock_load):
+        profile = MagicMock()
+        profile.model = "sonnet-4"
+        profile.system_prompt = None
+        profile.mcpServers = None
+        mock_load.return_value = profile
+        provider = make_provider(agent_profile="developer", model="gpt-5")
+        cmd = provider._build_cursor_command()
+        assert "--model sonnet-4" in cmd
+        assert "gpt-5" not in cmd
+
+    @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
+    def test_agent_profile_forwarded(self, mock_load):
+        profile = MagicMock()
+        profile.model = None
+        profile.system_prompt = None
+        profile.mcpServers = None
+        mock_load.return_value = profile
+        provider = make_provider(agent_profile="developer")
+        cmd = provider._build_cursor_command()
+        assert "--agent developer" in cmd
+
+    @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
+    def test_system_prompt_escaped(self, mock_load):
+        profile = MagicMock()
+        profile.model = None
+        profile.system_prompt = "Line 1\nLine 2"
+        profile.mcpServers = None
+        mock_load.return_value = profile
+        provider = make_provider(agent_profile="developer")
+        cmd = provider._build_cursor_command()
+        assert "Line 1\\nLine 2" in cmd
+
+    @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
+    def test_skill_prompt_appended(self, mock_load):
+        profile = MagicMock()
+        profile.model = None
+        profile.system_prompt = "Base prompt."
+        profile.mcpServers = None
+        mock_load.return_value = profile
+        provider = make_provider(
+            agent_profile="developer",
+            skill_prompt="<skills>...</skills>",
+        )
+        cmd = provider._build_cursor_command()
+        assert "Base prompt.\\n\\n<skills>...</skills>" in cmd
+
+    @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
+    def test_mcp_servers_forwarded_with_cao_terminal_id(self, mock_load):
+        profile = MagicMock()
+        profile.model = None
+        profile.system_prompt = None
+        profile.mcpServers = {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}}
+        mock_load.return_value = profile
+        provider = make_provider(agent_profile="developer")
+        cmd = provider._build_cursor_command()
+        assert "--mcp" in cmd
+        assert "--approve-mcps" in cmd
+        # The MCP JSON is the argument after --mcp. shlex.join wraps
+        # it in single quotes when it contains spaces.
+        mcp_match = re.search(r"--mcp\s+'?(\{.*?\})'\s+--approve-mcps", cmd)
+        assert mcp_match is not None, f"--mcp JSON not found in: {cmd}"
+        mcp_value = mcp_match.group(1)
+        assert "CAO_TERMINAL_ID" in mcp_value
+        assert "test-tid" in mcp_value
+
+    @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
+    def test_mcp_preserves_existing_cao_terminal_id(self, mock_load):
+        profile = MagicMock()
+        profile.model = None
+        profile.system_prompt = None
+        profile.mcpServers = {
+            "cao-mcp-server": {
+                "command": "cao-mcp-server",
+                "args": [],
+                "env": {"CAO_TERMINAL_ID": "preset"},
+            }
+        }
+        mock_load.return_value = profile
+        provider = make_provider(agent_profile="developer")
+        cmd = provider._build_cursor_command()
+        mcp_match = re.search(r"--mcp\s+'?(\{.*?\})'\s+--approve-mcps", cmd)
+        assert mcp_match is not None
+        mcp_value = mcp_match.group(1)
+        assert "preset" in mcp_value
+        # The constructor's terminal_id must NOT override the preset.
+        assert '"CAO_TERMINAL_ID": "test-tid"' not in mcp_value
+
+    @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
+    def test_tool_restrictions_prepend_security_prompt(self, mock_load):
+        profile = MagicMock()
+        profile.model = None
+        profile.system_prompt = "Base prompt."
+        profile.mcpServers = None
+        mock_load.return_value = profile
+        provider = make_provider(
+            agent_profile="developer",
+            allowed_tools=["fs_read", "fs_list"],
+        )
+        cmd = provider._build_cursor_command()
+        # SECURITY_PROMPT is the "## SECURITY CONSTRAINTS" block.
+        assert "SECURITY CONSTRAINTS" in cmd
+        assert "fs_read" in cmd
+        assert "fs_list" in cmd
+
+    @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
+    def test_wildcard_allowed_tools_skips_security_prompt(self, mock_load):
+        # Unrestricted yolo mode: SECURITY_PROMPT is not prepended.
+        profile = MagicMock()
+        profile.model = None
+        profile.system_prompt = "Base prompt."
+        profile.mcpServers = None
+        mock_load.return_value = profile
+        provider = make_provider(
+            agent_profile="developer",
+            allowed_tools=["*"],
+        )
+        cmd = provider._build_cursor_command()
+        assert "SECURITY CONSTRAINTS" not in cmd
+
+    @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
+    def test_missing_profile_raises_provider_error(self, mock_load):
+        mock_load.side_effect = FileNotFoundError("missing")
+        provider = make_provider(agent_profile="developer")
+        with pytest.raises(ProviderError, match="Failed to load agent profile"):
+            provider._build_cursor_command()
+
+
+# ---------------------------------------------------------------------------
+# initialize() — async with new get_backend pattern
+# ---------------------------------------------------------------------------
+
+
+class TestInitialize:
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.cursor_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.cursor_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.cursor_cli.get_backend")
+    async def test_initialize_success(self, mock_backend, mock_shell, mock_wait):
+        mock_shell.return_value = True
+        mock_wait.return_value = True
+        provider = make_provider()
+        assert await provider.initialize() is True
+        assert provider._initialized is True
+        mock_backend.return_value.send_keys.assert_called_once()
+        sent = mock_backend.return_value.send_keys.call_args.args[2]
+        assert sent.startswith("agent ")
+        assert "--force" in sent
+        assert "--trust" in sent
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.cursor_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.cursor_cli.get_backend")
+    async def test_initialize_shell_timeout(self, mock_backend, mock_shell):
+        mock_shell.return_value = False
+        provider = make_provider()
+        with pytest.raises(TimeoutError, match="Shell initialization timed out"):
+            await provider.initialize()
+        mock_backend.return_value.send_keys.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.cursor_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.cursor_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.cursor_cli.get_backend")
+    async def test_initialize_cursor_timeout(self, mock_backend, mock_shell, mock_wait):
+        mock_shell.return_value = True
+        mock_wait.return_value = False
+        provider = make_provider()
+        with pytest.raises(TimeoutError, match="Cursor CLI initialization timed out"):
+            await provider.initialize()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.cursor_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.cursor_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.cursor_cli.get_backend")
+    async def test_initialize_sends_agent_flag(self, mock_backend, mock_shell, mock_wait):
+        mock_shell.return_value = True
+        mock_wait.return_value = True
+        provider = make_provider(agent_profile="developer")
+        await provider.initialize()
+        sent = mock_backend.return_value.send_keys.call_args.args[2]
+        assert "--agent developer" in sent
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.cursor_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.cursor_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.cursor_cli.get_backend")
+    async def test_initialize_sends_model_flag(self, mock_backend, mock_shell, mock_wait):
+        mock_shell.return_value = True
+        mock_wait.return_value = True
+        provider = make_provider(model="gpt-5")
+        await provider.initialize()
+        sent = mock_backend.return_value.send_keys.call_args.args[2]
+        assert "--model gpt-5" in sent
+
+
+# ---------------------------------------------------------------------------
+# Misc interface methods
+# ---------------------------------------------------------------------------
+
+
+class TestMiscInterface:
+    def test_exit_cli_returns_slash_exit(self):
+        assert make_provider().exit_cli() == "/exit"
+
+    def test_get_idle_pattern_for_log(self):
+        assert make_provider().get_idle_pattern_for_log() == IDLE_PROMPT_PATTERN_LOG
+
+    def test_cleanup_resets_initialized(self):
+        provider = make_provider()
+        provider._initialized = True
+        provider.cleanup()
+        assert provider._initialized is False
+
+    def test_paste_enter_count_is_one(self):
+        assert make_provider().paste_enter_count == 1
+
+    def test_terminal_attributes_stored(self):
+        provider = make_provider(
+            agent_profile="developer", allowed_tools=["fs_read"], model="gpt-5"
+        )
+        assert provider.terminal_id == "test-tid"
+        assert provider.session_name == "test-session"
+        assert provider.window_name == "window-0"
+        assert provider._agent_profile == "developer"
+        assert provider._model == "gpt-5"
+
+
+# ---------------------------------------------------------------------------
+# ProviderManager registration
+# ---------------------------------------------------------------------------
+
+
+class TestProviderManagerRegistration:
+    def test_create_provider_cursor_cli_stores_mapping(self):
+        from cli_agent_orchestrator.providers.manager import ProviderManager
+
+        manager = ProviderManager()
+        provider = manager.create_provider(
+            provider_type="cursor_cli",
+            terminal_id="tid",
+            tmux_session="s",
+            tmux_window="w",
+            agent_profile="developer",
+        )
+        assert isinstance(provider, CursorCliProvider)
+        assert manager.get_provider("tid") is provider
+        assert manager.list_providers()["tid"] == "CursorCliProvider"
+
+    def test_create_provider_unknown_type_raises(self):
+        from cli_agent_orchestrator.providers.manager import ProviderManager
+
+        manager = ProviderManager()
+        with pytest.raises(ValueError, match="Unknown provider type"):
+            manager.create_provider(
+                provider_type="nonexistent",
+                terminal_id="tid",
+                tmux_session="s",
+                tmux_window="w",
+            )
+
+
+# ---------------------------------------------------------------------------
+# launch.py PROVIDERS_REQUIRING_WORKSPACE_ACCESS
+# ---------------------------------------------------------------------------
+
+
+class TestWorkspaceAccess:
+    def test_cursor_cli_in_workspace_access_set(self):
+        from cli_agent_orchestrator.cli.commands.launch import (
+            PROVIDERS_REQUIRING_WORKSPACE_ACCESS,
+        )
+
+        assert "cursor_cli" in PROVIDERS_REQUIRING_WORKSPACE_ACCESS

@@ -134,6 +134,14 @@ def require_hermes():
         pytest.skip("Hermes CLI not installed")
 
 
+@pytest.fixture()
+def require_cursor():
+    """Skip test if Cursor CLI (agent or cursor-agent) is not available."""
+    if _cli_available("agent") or _cli_available("cursor-agent"):
+        return
+    pytest.skip("Cursor CLI (agent / cursor-agent) not installed")
+
+
 def create_terminal(
     provider: str,
     agent_profile: str,
