@@ -15,6 +15,8 @@ from cli_agent_orchestrator.providers.cursor_cli import (
     PERMISSION_PROMPT_PATTERN,
     PROCESSING_PATTERN,
     SEPARATOR_PATTERN,
+    TUI_PLACEHOLDER_PATTERN,
+    TUI_STATUS_BAR_PATTERN,
     TRUST_PROMPT_PATTERN,
     WAITING_USER_ANSWER_PATTERN,
     CursorCliProvider,
@@ -281,6 +283,140 @@ class TestGetStatus:
 
 
 # ---------------------------------------------------------------------------
+# get_status() — Cursor CLI v2026+ TUI detection (issue #299)
+# ---------------------------------------------------------------------------
+
+
+class TestGetStatusV2026Tui:
+    """Status detection for the Ink/TUI Cursor CLI ships in v2026+.
+
+    The pre-v2026 regex suite (looking for `❯` and `─────`) no longer
+    matches the v2026 output because those markers are TUI widgets and
+    never reach the pipe-pane buffer (issue #299). The provider now
+    relies on the input-box placeholder "Plan, search, build anything":
+    present in the tail of the buffer = idle / completed, absent =
+    the user has submitted and the agent is working.
+    """
+
+    def test_v2026_idle_fixture_returns_completed(self):
+        output = load_fixture("cursor_cli_v2026_idle_output.txt")
+        provider = make_provider()
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+    def test_v2026_processing_fixture_returns_processing(self):
+        # The processing fixture has the placeholder replaced by
+        # user-typed text ("say hello in 3 words"). No `❯`, no
+        # `─────`, no spinner — the TUI-marker fallback is the
+        # only thing that can classify this as PROCESSING.
+        output = load_fixture("cursor_cli_v2026_processing_output.txt")
+        provider = make_provider()
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    def test_synthetic_v2026_idle_with_tui_markers(self):
+        # Minimal hand-crafted buffer: header + status bar +
+        # placeholder. No `❯`, no `─────`. Pre-fix this would
+        # have returned UNKNOWN because every regex was looking
+        # for an older-Build marker.
+        output = (
+            "  Cursor Agent\n"
+            "  v2026.06.15-03-48-54-da23e37\n"
+            "  \x1b[2mUse /config to customize.\x1b[0m\n"
+            "\n"
+            "  \x1b[48;5;233m \x1b[2m→ \x1b[0;7mP\x1b[0;2m"
+            "lan, search, build anything\x1b[0m"
+            "\x1b[48;5;233m                                              \x1b[49m\n"
+            "  \x1b[48;5;233m                                                                              \x1b[49m\n"
+            "\n"
+            "  \x1b[2mComposer 2.5 Fast\x1b[0m"
+            "                                             \x1b[35mRun Everything\x1b[39m\n"
+        )
+        provider = make_provider()
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+    def test_synthetic_v2026_processing_placeholder_replaced(self):
+        # Same buffer as the idle case, but the placeholder has
+        # been replaced by the user's submitted text. The status
+        # bar is still visible so the buffer looks fully rendered,
+        # not half-initialised.
+        output = (
+            "  Cursor Agent\n"
+            "  v2026.06.15-03-48-54-da23e37\n"
+            "\n"
+            "  \x1b[48;5;233m \x1b[2m→ \x1b[0;7msay hello in 3 words\x1b[0m"
+            "\x1b[48;5;233m                                                  \x1b[49m\n"
+            "  \x1b[48;5;233m                                                                       \x1b[49m\n"
+            "\n"
+            "  \x1b[2mComposer 2.5 Fast\x1b[0m"
+            "                                             \x1b[35mRun Everything\x1b[39m\n"
+        )
+        provider = make_provider()
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    def test_processing_window_only_checks_tail_of_buffer(self):
+        # A 4KB buffer that contains the placeholder in the first
+        # 3KB but NOT in the last 1KB must classify as PROCESSING
+        # — long responses evict the placeholder from the visible
+        # tail even though it is still in the scrollback. The
+        # status bar is also absent from the tail so the
+        # processing-positive branch (which requires the status
+        # bar) does not fire; the absence of the placeholder in
+        # the tail combined with no `❯` separator matches means
+        # the status is UNKNOWN. We assert the specific contract:
+        # the TUI TAIL WINDOW matters, not the full buffer.
+        padding = "x" * 3500
+        output = (
+            "Plan, search, build anything\n"  # placeholder in head
+            + padding
+            + "\n" * 50
+            + "  \x1b[2mComposer 2.5 Fast\x1b[0m"
+            "                                             \x1b[35mRun Everything\x1b[39m\n"
+        )
+        # Sanity: the placeholder is in the head, not in the tail.
+        assert "Plan, search, build anything" in output
+        assert "Plan, search, build anything" not in output[-1024:]
+        provider = make_provider()
+        # The tail has the status bar but no placeholder, so the
+        # processing-positive branch fires.
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    def test_idle_placeholder_with_long_response_in_head(self):
+        # Inverse of the previous test: a long response was
+        # processed (no placeholder in head) but the agent has
+        # finished and redrawn the placeholder, which is now
+        # present in the tail. Must classify as COMPLETED.
+        padding = "y" * 3500
+        # Place the placeholder at the end of the buffer (the
+        # natural TUI redraw position) so it lands inside the
+        # 1024-byte TUI TAIL WINDOW.
+        output = (
+            "  \x1b[2mComposer 2.5 Fast\x1b[0m\n"
+            + padding
+            + "\n"
+            + "  \x1b[48;5;233m \x1b[2m→ \x1b[0;7mP\x1b[0;2m"
+            "lan, search, build anything\x1b[0m"
+            "\x1b[48;5;233m                                              \x1b[49m\n"
+            "  \x1b[2mComposer 2.5 Fast\x1b[0m"
+            "                                             \x1b[35mRun Everything\x1b[39m\n"
+        )
+        provider = make_provider()
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+    def test_v2026_placeholder_pattern_documented(self):
+        # Pattern sanity check: TUI_PLACEHOLDER_PATTERN must match
+        # the literal placeholder text Cursor renders, and
+        # TUI_STATUS_BAR_PATTERN must match the status bar
+        # fragments we use as a "TUI is fully rendered" guard.
+        assert re.search(TUI_PLACEHOLDER_PATTERN, "Plan, search, build anything")
+        assert re.search(TUI_PLACEHOLDER_PATTERN, "  plan, search, build anything  ", re.IGNORECASE)
+        assert re.search(TUI_STATUS_BAR_PATTERN, "Run Everything")
+        assert re.search(TUI_STATUS_BAR_PATTERN, "Composer 2.5 Fast")
+        # Negative: these patterns must NOT spuriously match a
+        # "no markers" buffer that we want to classify as UNKNOWN.
+        assert not re.search(TUI_PLACEHOLDER_PATTERN, "say hello world")
+        assert not re.search(TUI_STATUS_BAR_PATTERN, "random text")
+
+
+# ---------------------------------------------------------------------------
 # extract_last_message_from_script()
 # ---------------------------------------------------------------------------
 
@@ -436,7 +572,11 @@ class TestBuildCommand:
         mock_load.side_effect = FileNotFoundError("no profile")
         provider = make_provider()
         cmd = provider._build_cursor_command()
-        assert cmd == "agent --force --trust"
+        # v2026+ rejects --trust in interactive REPL mode (it is only
+        # valid with --print/headless). The CAO launch flow already
+        # confirms workspace trust, so the interactive REPL does not
+        # need the flag. See issue #299.
+        assert cmd == "agent --force"
 
     @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
     def test_constructor_model_forwarded(self, mock_load):
@@ -655,7 +795,10 @@ class TestInitialize:
         sent = mock_backend.return_value.send_keys.call_args.args[2]
         assert sent.startswith("agent ")
         assert "--force" in sent
-        assert "--trust" in sent
+        # v2026+ rejects --trust in interactive REPL mode. See
+        # issue #299. The launch command is "agent --force" when
+        # no profile / model / system-prompt is configured.
+        assert "--trust" not in sent
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.cursor_cli.wait_for_shell")
