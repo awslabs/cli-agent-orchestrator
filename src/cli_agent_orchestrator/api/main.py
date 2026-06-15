@@ -1580,7 +1580,12 @@ def main():
     # already-installed CORSMiddleware reads the list by reference, so
     # mutating it before uvicorn starts is sufficient. See issue #151.
     add_local_cors_origins(host, port)
-    uvicorn.run(app, host=host, port=port)
+    # --proxy-headers: trust X-Forwarded-Proto / X-Forwarded-For from an
+    # upstream reverse proxy (Codespaces / devcontainers / nginx in
+    # front of cao-server). Required for the WebSocket terminal viewer
+    # over an HTTPS tunnel — without it uvicorn sees the raw HTTP
+    # request and the browser's WSS upgrade fails. See issue #149.
+    uvicorn.run(app, host=host, port=port, proxy_headers=True, forwarded_allow_ips="*")
 
 
 if __name__ == "__main__":
