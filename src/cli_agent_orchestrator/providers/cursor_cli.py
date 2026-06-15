@@ -31,6 +31,7 @@ import logging
 import re
 import shlex
 import shutil
+from pathlib import Path
 from typing import Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
@@ -187,17 +188,31 @@ class CursorCliProvider(BaseProvider):
         the primary name so newly-installed machines work out of the
         box.
 
-        Flags used:
+        Flags used (v2026.06.15+):
         - ``--force`` auto-approves tool calls so the agent does not
           block on per-tool approval prompts during orchestration.
-        - ``--trust`` accepts the workspace-trust dialog on first run.
-        - ``--approve-mcps`` pre-approves MCP servers declared on the
-          command line (Cursor prompts for each MCP server otherwise).
-        - ``--system-prompt`` injects the agent's CAO system prompt
-          (with the skill catalog appended).
-        - ``--agent`` selects a Cursor-side agent (when configured).
         - ``--model`` selects a specific model (when configured).
-        - ``--mcp`` injects MCP server configuration.
+        - ``--system-prompt <path>`` injects the agent's CAO system
+          prompt. **v2026 changed this from inline text to a file
+          path** (issue #300), so we write the prompt to a per-session
+          temp file and pass the path. The skill catalog is appended
+          to the prompt before it is written.
+        - ``--plugin-dir`` injects MCP server configuration. v2026
+          removed the ``--mcp <json>`` flag in favour of
+          ``--plugin-dir <path>`` pointing at a directory that holds
+          Cursor plugin / MCP server manifests. We synthesise the
+          directory from the agent profile's ``mcpServers`` map at
+          launch time and keep it under the CAO tmp dir.
+        - ``--approve-mcps`` pre-approves MCP servers declared via
+          ``--plugin-dir`` so the REPL does not block on a per-server
+          approval dialog.
+
+        The CAO agent profile is no longer passed as ``--agent <name>``
+        — that flag was removed in v2026. The profile's identity is
+        preserved via the system-prompt content (the profile markdown
+        body) and the synthesised plugin-dir layout. Multi-agent
+        orchestration (handoff / assign) continues to work because the
+        inbox / MCP tools are the same across all profiles.
 
         Returns a properly escaped shell command string suitable for
         :func:`tmux_client.send_keys`. Uses :func:`shlex.join` to handle
@@ -228,15 +243,18 @@ class CursorCliProvider(BaseProvider):
 
         command_parts = [binary]
 
-        # Approval + trust flags. We always pass --force when running
-        # under CAO so per-tool approval prompts do not block handoff /
-        # assign flows. --trust prevents the first-run trust dialog
-        # from blocking the REPL.
+        # Approval flag. We always pass --force when running under
+        # CAO so per-tool approval prompts do not block handoff /
+        # assign flows. --trust was removed because v2026 rejects it
+        # in interactive REPL mode ("only works with --print/headless
+        # mode"); the CAO launch flow already confirms workspace
+        # trust, and the interactive REPL has no per-directory trust
+        # dialog that --trust would skip.
         command_parts.append("--force")
 
-        # Model override (--model, when explicitly set or supplied by
-        # the agent profile's `model` field). Profile.model takes
-        # precedence when set, then the constructor-provided
+        # Model override (--model, when explicitly set or supplied
+        # by the agent profile's ``model`` field). Profile.model
+        # takes precedence when set, then the constructor-provided
         # ``self._model``.
         model = self._model
         if profile is not None and profile.model:
@@ -244,23 +262,24 @@ class CursorCliProvider(BaseProvider):
         if model:
             command_parts.extend(["--model", model])
 
-        # Agent selection (Cursor-side agent).
-        if self._agent_profile:
-            command_parts.extend(["--agent", self._agent_profile])
-
-        # System prompt injection. Escape newlines so tmux send_keys
-        # chunking cannot break the command. Prepend SECURITY_PROMPT
-        # when tool restrictions are active (Cursor does not yet expose
-        # a --disallowedTools equivalent).
+        # System prompt injection. v2026 takes a file path, not
+        # inline text. We write the prompt (with the skill catalog
+        # and the optional SECURITY_PROMPT for soft tool-restriction
+        # enforcement) to a per-session temp file under the CAO tmp
+        # dir, then point ``--system-prompt`` at the file. Escape
+        # backslashes and newlines only matter if we were passing
+        # inline text; on a file path the shell sees a literal
+        # string and tmux send_keys does not need special handling.
         if profile is not None:
             system_prompt = profile.system_prompt or ""
             system_prompt = self._apply_skill_prompt(system_prompt)
 
-            # Soft tool-restriction enforcement: when the operator has
-            # set an explicit (non-wildcard) allowlist, prepend the
-            # shared SECURITY_PROMPT plus a tool list to the system
-            # prompt. See skills/cao-provider/references/lessons-learnt.md
-            # #13 for the three enforcement approaches.
+            # Soft tool-restriction enforcement: when the operator
+            # has set an explicit (non-wildcard) allowlist, prepend
+            # the shared SECURITY_PROMPT plus a tool list to the
+            # system prompt. See skills/cao-provider/references/
+            # lessons-learnt.md #13 for the three enforcement
+            # approaches.
             if self._allowed_tools and "*" not in self._allowed_tools:
                 from cli_agent_orchestrator.constants import SECURITY_PROMPT
 
@@ -269,33 +288,125 @@ class CursorCliProvider(BaseProvider):
                 system_prompt = SECURITY_PROMPT + tool_constraint + system_prompt
 
             if system_prompt:
-                escaped_prompt = system_prompt.replace("\\", "\\\\").replace("\n", "\\n")
-                command_parts.extend(["--system-prompt", escaped_prompt])
+                prompt_path = self._write_system_prompt_file(system_prompt)
+                command_parts.extend(["--system-prompt", prompt_path])
 
-        # MCP server injection. Forward CAO_TERMINAL_ID so MCP servers
-        # (e.g. cao-mcp-server) can identify the current terminal for
-        # handoff / assign operations. Cursor's --mcp flag accepts a
-        # JSON object of {name: config}.
+        # MCP server injection via --plugin-dir. v2026 removed
+        # ``--mcp <json>``; the replacement is ``--plugin-dir
+        # <path>`` pointing at a directory containing plugin / MCP
+        # server manifests. We synthesise the directory from the
+        # agent profile's ``mcpServers`` map at launch time, inject
+        # CAO_TERMINAL_ID into each server's env so MCP tools can
+        # identify the current terminal for handoff / assign
+        # operations, and keep the layout under the CAO tmp dir so
+        # it is removed with the session.
         if profile is not None and profile.mcpServers:
-            mcp_config: dict = {}
-            for server_name, server_config in profile.mcpServers.items():
-                if isinstance(server_config, dict):
-                    mcp_config[server_name] = dict(server_config)
-                else:
-                    mcp_config[server_name] = server_config.model_dump(exclude_none=True)
-
-                env = mcp_config[server_name].get("env", {})
-                if "CAO_TERMINAL_ID" not in env:
-                    env["CAO_TERMINAL_ID"] = self.terminal_id
-                    mcp_config[server_name]["env"] = env
-
-            mcp_json = json.dumps({"mcpServers": mcp_config})
-            command_parts.extend(["--mcp", mcp_json])
+            plugin_dir = self._write_plugin_dir(profile.mcpServers)
+            command_parts.extend(["--plugin-dir", plugin_dir])
             # --approve-mcps is required to skip per-server approval
             # dialogs on first run; otherwise the REPL blocks.
             command_parts.append("--approve-mcps")
 
         return shlex.join(command_parts)
+
+    def _write_system_prompt_file(self, system_prompt: str) -> str:
+        """Write the system prompt to a per-session temp file.
+
+        Cursor CLI v2026.06.15 takes a *file path* for
+        ``--system-prompt`` rather than the inline text that older
+        builds accepted. The provider used to escape newlines into
+        ``\\n`` and pass the prompt as a single shell argument; that
+        form now triggers ``error: failed to read --system-prompt
+        file: <prompt text>``.
+
+        We write the prompt to a file under the CAO tmp dir keyed by
+        the terminal id, return the absolute path, and let the
+        ``cleanup`` path delete the file when the session is torn
+        down. The file is created lazily on the first launch and
+        overwritten on subsequent launches (e.g. after a
+        ``reset_buffer`` for a fallback mode).
+
+        Args:
+            system_prompt: The fully-resolved system prompt text
+                (profile body + skill catalog + optional SECURITY_PROMPT).
+
+        Returns:
+            Absolute path to the file. Pass this to
+            ``--system-prompt <path>``.
+        """
+        import os
+        import tempfile
+
+        cao_tmp = Path(
+            os.environ.get("CAO_TMP_DIR", str(Path.home() / ".aws" / "cli-agent-orchestrator" / "tmp"))
+        )
+        cao_tmp.mkdir(parents=True, exist_ok=True)
+        prompt_path = cao_tmp / f"{self.terminal_id}-system-prompt.md"
+        prompt_path.write_text(system_prompt, encoding="utf-8")
+        return str(prompt_path)
+
+    def _write_plugin_dir(self, mcp_servers) -> str:
+        """Materialise a Cursor plugin directory for the session's MCP servers.
+
+        Cursor CLI v2026.06.15 dropped the ``--mcp <json>`` flag in
+        favour of ``--plugin-dir <path>``: a directory that holds
+        Cursor plugin manifests. We translate the CAO agent
+        profile's ``mcpServers`` map into a minimal manifest layout
+        so the same MCP servers (cao-mcp-server, ops-mcp-server,
+        etc.) start transparently under the new flag.
+
+        The synthesised directory lives under the CAO tmp dir keyed
+        by the terminal id and is reused across launches of the
+        same session; ``cleanup`` deletes it when the session ends.
+
+        Args:
+            mcp_servers: The agent profile's ``mcpServers`` map. Keys
+                are server names; values are either plain dicts (from
+                YAML) or Pydantic models (from programmatic install).
+
+        Returns:
+            Absolute path to the plugin directory. Pass this to
+            ``--plugin-dir <path>``.
+        """
+        import os
+
+        cao_tmp = Path(
+            os.environ.get("CAO_TMP_DIR", str(Path.home() / ".aws" / "cli-agent-orchestrator" / "tmp"))
+        )
+        cao_tmp.mkdir(parents=True, exist_ok=True)
+        plugin_dir = cao_tmp / f"{self.terminal_id}-cursor-plugins"
+        plugin_dir.mkdir(parents=True, exist_ok=True)
+
+        # CAO_TERMINAL_ID is forwarded into every server's env so
+        # MCP tools (cao-mcp-server, ops-mcp-server) can resolve
+        # the current terminal for handoff / assign operations. We
+        # do not override an explicit preset — the same rule the
+        # --mcp <json> path used to follow (issue #300 is the v2026
+        # equivalent).
+        servers: dict = {}
+        for server_name, server_config in mcp_servers.items():
+            if isinstance(server_config, dict):
+                servers[server_name] = dict(server_config)
+            else:
+                servers[server_name] = server_config.model_dump(exclude_none=True)
+            env = servers[server_name].get("env", {})
+            if "CAO_TERMINAL_ID" not in env:
+                env["CAO_TERMINAL_ID"] = self.terminal_id
+                servers[server_name]["env"] = env
+
+        # Cursor v2026 plugin manifests are JSON files inside the
+        # plugin dir. The exact schema is undocumented in the help
+        # text we captured; the minimum that the CLI accepts is a
+        # ``mcpServers`` object matching the well-known MCP config
+        # layout, written as ``plugin.json`` at the root. If the
+        # schema proves more strict in a later v2026 point release
+        # this layout can be tweaked without touching the rest of
+        # the provider.
+        manifest = {"mcpServers": servers}
+        (plugin_dir / "plugin.json").write_text(
+            json.dumps(manifest, indent=2), encoding="utf-8"
+        )
+        return str(plugin_dir)
 
     async def initialize(self) -> bool:
         """Initialize the Cursor CLI provider by starting ``agent``.

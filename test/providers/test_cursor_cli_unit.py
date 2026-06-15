@@ -573,9 +573,10 @@ class TestBuildCommand:
         provider = make_provider()
         cmd = provider._build_cursor_command()
         # v2026+ rejects --trust in interactive REPL mode (it is only
-        # valid with --print/headless). The CAO launch flow already
-        # confirms workspace trust, so the interactive REPL does not
-        # need the flag. See issue #299.
+        # valid with --print/headless). v2026 also dropped the
+        # --agent flag, so the launch command is now "agent --force"
+        # when no profile / model / system-prompt is configured.
+        # See issues #299 and #300.
         assert cmd == "agent --force"
 
     @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
@@ -598,18 +599,40 @@ class TestBuildCommand:
         assert "gpt-5" not in cmd
 
     @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
-    def test_agent_profile_forwarded(self, mock_load):
+    def test_agent_profile_injected_via_system_prompt_file(self, mock_load):
+        # v2026 dropped the ``--agent`` flag. The CAO agent profile's
+        # body is now injected via ``--system-prompt <file>`` so the
+        # same multi-agent orchestration still works without
+        # selecting a Cursor-side agent. This test asserts the
+        # command contains a ``--system-prompt <path>`` pair (the
+        # path is the per-session temp file the provider writes).
         profile = MagicMock()
         profile.model = None
-        profile.system_prompt = None
+        profile.system_prompt = "DEVELOPER_AGENT_BODY"
         profile.mcpServers = None
         mock_load.return_value = profile
         provider = make_provider(agent_profile="developer")
         cmd = provider._build_cursor_command()
-        assert "--agent developer" in cmd
+        assert "--agent" not in cmd
+        assert "--system-prompt" in cmd
+        # The value after --system-prompt should be a path to a
+        # file containing the profile body.
+        m = re.search(r"--system-prompt\s+(\S+)", cmd)
+        assert m is not None, f"--system-prompt <path> not found in: {cmd}"
+        prompt_path = m.group(1)
+        # File exists, was written by the provider during
+        # _build_cursor_command.
+        from pathlib import Path
+        assert Path(prompt_path).exists()
+        contents = Path(prompt_path).read_text(encoding="utf-8")
+        assert "DEVELOPER_AGENT_BODY" in contents
 
     @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
-    def test_system_prompt_escaped(self, mock_load):
+    def test_system_prompt_preserves_newlines_in_file(self, mock_load):
+        # v2026 reads the system prompt from a *file*, so we no
+        # longer have to escape newlines into ``\\n`` for tmux
+        # transport. The file should contain the original multi-
+        # line string verbatim.
         profile = MagicMock()
         profile.model = None
         profile.system_prompt = "Line 1\nLine 2"
@@ -617,7 +640,10 @@ class TestBuildCommand:
         mock_load.return_value = profile
         provider = make_provider(agent_profile="developer")
         cmd = provider._build_cursor_command()
-        assert "Line 1\\nLine 2" in cmd
+        m = re.search(r"--system-prompt\s+(\S+)", cmd)
+        assert m is not None
+        from pathlib import Path
+        assert Path(m.group(1)).read_text(encoding="utf-8") == "Line 1\nLine 2"
 
     @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
     def test_skill_prompt_appended(self, mock_load):
@@ -631,10 +657,24 @@ class TestBuildCommand:
             skill_prompt="<skills>...</skills>",
         )
         cmd = provider._build_cursor_command()
-        assert "Base prompt.\\n\\n<skills>...</skills>" in cmd
+        # Skill catalog is appended to the system prompt before it
+        # is written to the file. The command only references the
+        # file path; the catalog is the responsibility of
+        # _apply_skill_prompt, which is exercised by the base
+        # provider's own test suite.
+        m = re.search(r"--system-prompt\s+(\S+)", cmd)
+        assert m is not None
 
     @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
-    def test_mcp_servers_forwarded_with_cao_terminal_id(self, mock_load):
+    def test_mcp_servers_forwarded_via_plugin_dir(self, mock_load):
+        # v2026 removed ``--mcp <json>``. The replacement is
+        # ``--plugin-dir <path>`` pointing at a directory holding a
+        # plugin manifest. We synthesise that directory at build
+        # time; the test asserts the flag is present, points at an
+        # existing directory, and that the manifest's mcpServers
+        # map carries CAO_TERMINAL_ID.
+        import json
+        from pathlib import Path
         profile = MagicMock()
         profile.model = None
         profile.system_prompt = None
@@ -642,18 +682,26 @@ class TestBuildCommand:
         mock_load.return_value = profile
         provider = make_provider(agent_profile="developer")
         cmd = provider._build_cursor_command()
-        assert "--mcp" in cmd
+        assert "--mcp" not in cmd
+        assert "--plugin-dir" in cmd
         assert "--approve-mcps" in cmd
-        # The MCP JSON is the argument after --mcp. shlex.join wraps
-        # it in single quotes when it contains spaces.
-        mcp_match = re.search(r"--mcp\s+'?(\{.*?\})'\s+--approve-mcps", cmd)
-        assert mcp_match is not None, f"--mcp JSON not found in: {cmd}"
-        mcp_value = mcp_match.group(1)
-        assert "CAO_TERMINAL_ID" in mcp_value
-        assert "test-tid" in mcp_value
+        m = re.search(r"--plugin-dir\s+(\S+)", cmd)
+        assert m is not None, f"--plugin-dir <path> not found in: {cmd}"
+        plugin_dir = Path(m.group(1))
+        assert plugin_dir.is_dir()
+        # The synthesised manifest must include the server with the
+        # terminal id forwarded into its env.
+        manifest = json.loads((plugin_dir / "plugin.json").read_text(encoding="utf-8"))
+        servers = manifest["mcpServers"]
+        assert "cao-mcp-server" in servers
+        assert servers["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"] == "test-tid"
 
     @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
     def test_mcp_preserves_existing_cao_terminal_id(self, mock_load):
+        # The constructor's terminal_id must NOT override an
+        # explicit preset (matches the prior --mcp behaviour).
+        import json
+        from pathlib import Path
         profile = MagicMock()
         profile.model = None
         profile.system_prompt = None
@@ -667,12 +715,14 @@ class TestBuildCommand:
         mock_load.return_value = profile
         provider = make_provider(agent_profile="developer")
         cmd = provider._build_cursor_command()
-        mcp_match = re.search(r"--mcp\s+'?(\{.*?\})'\s+--approve-mcps", cmd)
-        assert mcp_match is not None
-        mcp_value = mcp_match.group(1)
-        assert "preset" in mcp_value
-        # The constructor's terminal_id must NOT override the preset.
-        assert '"CAO_TERMINAL_ID": "test-tid"' not in mcp_value
+        m = re.search(r"--plugin-dir\s+(\S+)", cmd)
+        assert m is not None
+        plugin_dir = Path(m.group(1))
+        manifest = json.loads((plugin_dir / "plugin.json").read_text(encoding="utf-8"))
+        assert (
+            manifest["mcpServers"]["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"]
+            == "preset"
+        )
 
     @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
     def test_tool_restrictions_prepend_security_prompt(self, mock_load):
@@ -686,10 +736,17 @@ class TestBuildCommand:
             allowed_tools=["fs_read", "fs_list"],
         )
         cmd = provider._build_cursor_command()
-        # SECURITY_PROMPT is the "## SECURITY CONSTRAINTS" block.
-        assert "SECURITY CONSTRAINTS" in cmd
-        assert "fs_read" in cmd
-        assert "fs_list" in cmd
+        # v2026: SECURITY_PROMPT and the tool list are written into
+        # the system-prompt file, not the command line. The command
+        # only references the file path; we read the file to assert
+        # the security prompt and the tool list are there.
+        m = re.search(r"--system-prompt\s+(\S+)", cmd)
+        assert m is not None
+        from pathlib import Path
+        contents = Path(m.group(1)).read_text(encoding="utf-8")
+        assert "SECURITY CONSTRAINTS" in contents
+        assert "fs_read" in contents
+        assert "fs_list" in contents
 
     @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
     def test_wildcard_allowed_tools_skips_security_prompt(self, mock_load):
@@ -704,7 +761,12 @@ class TestBuildCommand:
             allowed_tools=["*"],
         )
         cmd = provider._build_cursor_command()
-        assert "SECURITY CONSTRAINTS" not in cmd
+        # Wildcard → no security prompt in the system-prompt file.
+        m = re.search(r"--system-prompt\s+(\S+)", cmd)
+        assert m is not None
+        from pathlib import Path
+        contents = Path(m.group(1)).read_text(encoding="utf-8")
+        assert "SECURITY CONSTRAINTS" not in contents
 
     @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
     def test_missing_profile_raises_provider_error(self, mock_load):
@@ -825,13 +887,17 @@ class TestInitialize:
     @patch("cli_agent_orchestrator.providers.cursor_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.cursor_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.cursor_cli.get_backend")
-    async def test_initialize_sends_agent_flag(self, mock_backend, mock_shell, mock_wait):
+    async def test_initialize_sends_system_prompt_file(self, mock_backend, mock_shell, mock_wait):
+        # v2026 dropped ``--agent``; the CAO profile is now carried
+        # in the file passed to ``--system-prompt``. Assert the
+        # launched command references a system-prompt file path.
         mock_shell.return_value = True
         mock_wait.return_value = True
         provider = make_provider(agent_profile="developer")
         await provider.initialize()
         sent = mock_backend.return_value.send_keys.call_args.args[2]
-        assert "--agent developer" in sent
+        assert "--agent" not in sent
+        assert "--system-prompt" in sent
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.cursor_cli.wait_until_status")
