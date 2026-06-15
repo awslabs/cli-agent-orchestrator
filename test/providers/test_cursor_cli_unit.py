@@ -237,16 +237,67 @@ class TestExtractLastMessage:
         result = provider.extract_last_message_from_script(output)
         assert "The answer is 42." in result
 
-    def test_extracts_with_only_one_separator(self):
-        # Single-separator buffers occur when the response start
-        # separator has scrolled out of the 8KB rolling buffer but
-        # the end separator is still present. In that case the
-        # start_sep is None and we fall back to the buffer start.
+    def test_separator_matching_tolerates_interleaved_csi_escapes(self):
+        # Cursor re-renders the separator with new colour escapes
+        # on every prompt: the box-drawing line may contain
+        # multiple SGR segments interleaved between the ─ chars.
+        # The regex must still match so status detection and
+        # extraction both work.
+        sep_with_color = "\x1b[38;5;245m" + ("\u2500" * 30) + "\x1b[0m"
+        provider = make_provider()
+        output = (
+            sep_with_color
+            + "\n\u276f question\n"
+            + sep_with_color
+            + "\nHello world\n"
+            + sep_with_color
+            + "\n\u276f "
+        )
+        # Status detection also uses the separator regex.
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+        # Extraction must find the response between the second
+        # and third separators.
+        result = provider.extract_last_message_from_script(output)
+        assert "Hello world" in result
+
+    def test_extraction_strips_cursor_positioning_sequences(self):
+        # Long generations cause Cursor to emit cursor-positioning
+        # sequences inside the response area (e.g. \x1b[2K erase
+        # line, \x1b[H cursor home). The extracted text must not
+        # contain these.
         sep = "\u2500" * 30
         provider = make_provider()
-        output = sep + "\nThe answer is 42.\n" + sep + "\n\u276f "
+        output = (
+            sep
+            + "\n\u276f say hello\n"
+            + sep
+            + "\nHello \x1b[2Kworld\x1b[H with cursor moves\n"
+            + sep
+            + "\n\u276f "
+        )
         result = provider.extract_last_message_from_script(output)
-        assert "The answer is 42." in result
+        assert "Hello world with cursor moves" in result
+        assert "\x1b[" not in result
+
+    def test_extraction_strips_osc_title_sequences(self):
+        # OSC sequences (e.g. terminal title updates) can leak into
+        # the captured text. The extraction must strip them.
+        sep = "\u2500" * 30
+        provider = make_provider()
+        osc = "\x1b]0;Cursor Agent\x07"  # set window title
+        output = (
+            sep
+            + "\n\u276f say hello\n"
+            + sep
+            + "\n"
+            + osc
+            + "Response text after title update\n"
+            + sep
+            + "\n\u276f "
+        )
+        result = provider.extract_last_message_from_script(output)
+        assert "Response text after title update" in result
+        assert "\x1b]" not in result
 
     def test_uses_last_response_when_multiple(self):
         sep = "\u2500" * 30

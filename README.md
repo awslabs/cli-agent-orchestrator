@@ -164,7 +164,7 @@ cao launch --agents code_supervisor
 
 # Or specify a provider
 cao launch --agents code_supervisor --provider claude_code
-# Valid: kiro_cli | claude_code | codex | gemini_cli | hermes | kimi_cli | copilot_cli | opencode_cli | cursor_cli
+# Valid: kiro_cli | claude_code | codex | q_cli | gemini_cli | hermes | kimi_cli | copilot_cli | opencode_cli | cursor_cli
 
 # Unrestricted access, skip confirmation (DANGEROUS)
 cao launch --agents code_supervisor --yolo
@@ -253,7 +253,7 @@ provider: claude_code
 ---
 ```
 
-Valid values: `kiro_cli`, `claude_code`, `codex`, `q_cli`, `gemini_cli`, `hermes`, `kimi_cli`, `copilot_cli`, `cursor_cli`. The `cao launch --provider` flag always takes precedence for the initial session. See [`examples/cross-provider/`](examples/cross-provider/).
+Valid values: `kiro_cli`, `claude_code`, `codex`, `q_cli`, `gemini_cli`, `hermes`, `kimi_cli`, `copilot_cli`, `opencode_cli`, `cursor_cli`. The `cao launch --provider` flag always takes precedence for the initial session. See [`examples/cross-provider/`](examples/cross-provider/).
 
 ### Tool Restrictions
 

@@ -314,7 +314,13 @@ class CursorCliProvider(BaseProvider):
         # another separator first, the spinner is from a completed
         # task and should be ignored. Mirrors the Claude Code
         # provider's structural fix for the stale-spinner bug.
-        _sep_re = re.compile(r"(?:\x1b\[[0-9;]*m)*\u2500{20,}")
+        # The separator regex tolerates any CSI sequence (not just
+        # SGR) between the box-drawing characters — Cursor
+        # re-renders the separator with new colour escapes on
+        # every prompt, and we must not miss it. The intermediate
+        # byte range is restricted to the ECMA-48 param bytes
+        # (0x30-0x3F) so a stray ``ESC [`` is not consumed.
+        _sep_re = re.compile(r"(?:\x1b\[[\x30-\x3F]*[\x40-\x7E])*\u2500{20,}")
         _sep_positions = [m.start() for m in _sep_re.finditer(clean)]
         if _sep_positions:
             pre_sep_lines = clean[: _sep_positions[-1]].rstrip("\n").split("\n")
@@ -395,10 +401,30 @@ class CursorCliProvider(BaseProvider):
         *third* separators (or equivalently, between the user's
         ``❯ <text>`` question and the next ``❯`` idle prompt).
 
+        The separator regex tolerates SGR colour codes interleaved
+        between the ``─`` characters (Cursor's TUI redraws the
+        separator in place with new colour escapes on every prompt).
+        All remaining terminal escapes (cursor positioning, OSC, \r
+        redraws) are stripped from the response region before
+        returning so the extracted text is the rendered output, not
+        the raw byte stream. We do NOT use
+        :func:`cli_agent_orchestrator.utils.text.strip_terminal_escapes`
+        because that function normalises ``\\r`` to ``\\n`` and would
+        split single-line spinner frames into multiple lines — see
+        its docstring. Extraction operates on rendered (capture-pane)
+        output, not the raw FIFO stream.
+
         Raises:
             ValueError: When no response boundary is detected.
         """
-        _sep_re = re.compile(r"(?:\x1b\[[0-9;]*m)*\u2500{20,}")
+        # Match a separator line, allowing ANY CSI sequence (not just
+        # SGR) to appear between the box-drawing characters. Cursor
+        # re-renders the separator with new colour escapes on every
+        # prompt, so ``\x1b[38;5;245m──\x1b[0m──\x1b[38;5;245m──``
+        # (multiple SGR segments inside the line) must still match.
+        # Intermediate bytes are restricted to the ECMA-48 param
+        # range (0x30-0x3F) so a stray ``ESC [`` is not consumed.
+        _sep_re = re.compile(r"(?:\x1b\[[\x30-\x3F]*[\x40-\x7E])*\u2500{20,}")
         separators = list(_sep_re.finditer(script_output))
         idle_matches = list(re.finditer(IDLE_PROMPT_PATTERN, script_output))
 
@@ -440,8 +466,28 @@ class CursorCliProvider(BaseProvider):
         start = start_sep.end() if start_sep is not None else 0
         response = script_output[start : end_sep.start()]
 
-        # Strip ANSI codes from the extracted region.
-        response = re.sub(ANSI_CODE_PATTERN, "", response).strip()
+        # Strip ALL terminal escape sequences from the extracted
+        # region (not just SGR colours). Cursor CLI re-renders
+        # cursor-positioning sequences inside the response area
+        # during long generations, and OSC title updates can leak
+        # into the captured text. We deliberately do not use
+        # ``strip_terminal_escapes`` here because that function
+        # normalises ``\r`` → ``\n`` (suitable for status detection
+        # but destructive for response extraction).
+        #
+        # The regex follows the ECMA-48 escape grammar:
+        #   CSI:  ESC [  <param-bytes 0x30-0x3F>*  <final-byte 0x40-0x7E>
+        #   OSC:  ESC ]  <payload>        BEL  |  ESC \
+        #   2-byte ESC: ESC <0x20-0x2F>+  <0x30-0x7E>
+        # Intermediate bytes are restricted to 0x20-0x3F so that
+        # plain ``ESC [`` (e.g. CSI introducer with no params) is
+        # only consumed when followed by a real final byte.
+        _full_esc_re = re.compile(
+            r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"
+            r"|\x1b\[[\x30-\x3F]*[\x40-\x7E]"
+            r"|\x1b[\x20-\x2F]+[\x30-\x7E]"
+        )
+        response = _full_esc_re.sub("", response).strip()
 
         if not response:
             raise ValueError("Empty Cursor CLI response - no content found between separators")
