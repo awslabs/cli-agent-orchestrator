@@ -410,24 +410,28 @@ class CursorCliProvider(BaseProvider):
         # Anchor on the trailing idle prompt (the last ❯ in the
         # buffer). The response ends at this prompt. Walk back to
         # find the separator that immediately precedes the response.
+        # The earlier check guarantees that ``separators`` and
+        # ``idle_matches`` are both non-empty, so at least one
+        # separator is guaranteed to be before the trailing
+        # prompt (an idle prompt at position 0 would be paired
+        # with no separators, which the earlier check rejects).
         final_prompt = idle_matches[-1]
 
         # Find the last separator that comes BEFORE the trailing
         # prompt. That separator marks the end of the response.
-        end_sep = None
+        end_sep: Optional[re.Match[str]] = None
         for sep in reversed(separators):
             if sep.start() < final_prompt.start():
                 end_sep = sep
                 break
 
-        if not end_sep:
-            raise ValueError("Incomplete Cursor CLI response - no separator before idle prompt")
+        assert end_sep is not None  # see comment above
 
         # The response starts at the separator before end_sep (which
         # marks the start of the response region) — or at the start
         # of the buffer if there is no such separator. This avoids
         # leaking the user's question into the extracted response.
-        start_sep = None
+        start_sep: Optional[re.Match[str]] = None
         for sep in reversed(separators):
             if sep.start() < end_sep.start():
                 start_sep = sep

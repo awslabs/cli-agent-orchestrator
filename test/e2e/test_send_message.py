@@ -283,3 +283,21 @@ class TestCopilotCliSendMessage:
     def test_send_message_to_inbox(self, require_copilot):
         """Send a message to another Copilot CLI terminal's inbox and verify delivery."""
         _run_send_message_test(provider="copilot_cli", agent_profile="developer")
+
+
+# ---------------------------------------------------------------------------
+# Cursor CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestCursorCliSendMessage:
+    """E2E send_message tests for the Cursor CLI provider.
+
+    Requires the ``agent`` (or legacy ``cursor-agent``) binary on PATH.
+    Skip otherwise via the ``require_cursor`` fixture.
+    """
+
+    def test_send_message_to_inbox(self, require_cursor):
+        """Send a message to another Cursor CLI terminal's inbox and verify delivery."""
+        _run_send_message_test(provider="cursor_cli", agent_profile="developer")

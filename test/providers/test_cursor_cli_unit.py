@@ -226,6 +226,28 @@ class TestExtractLastMessage:
         with pytest.raises(ValueError, match="Empty Cursor CLI response"):
             provider.extract_last_message_from_script(output)
 
+    def test_extracts_with_only_one_separator(self):
+        # Single-separator buffers occur when the response start
+        # separator has scrolled out of the 8KB rolling buffer but
+        # the end separator is still present. In that case the
+        # start_sep is None and we fall back to the buffer start.
+        sep = "\u2500" * 30
+        provider = make_provider()
+        output = sep + "\nThe answer is 42.\n" + sep + "\n\u276f "
+        result = provider.extract_last_message_from_script(output)
+        assert "The answer is 42." in result
+
+    def test_extracts_with_only_one_separator(self):
+        # Single-separator buffers occur when the response start
+        # separator has scrolled out of the 8KB rolling buffer but
+        # the end separator is still present. In that case the
+        # start_sep is None and we fall back to the buffer start.
+        sep = "\u2500" * 30
+        provider = make_provider()
+        output = sep + "\nThe answer is 42.\n" + sep + "\n\u276f "
+        result = provider.extract_last_message_from_script(output)
+        assert "The answer is 42." in result
+
     def test_uses_last_response_when_multiple(self):
         sep = "\u2500" * 30
         provider = make_provider()

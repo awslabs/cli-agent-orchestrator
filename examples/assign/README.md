@@ -180,6 +180,7 @@ cao launch --agents analysis_supervisor
 cao launch --agents analysis_supervisor --provider claude_code
 cao launch --agents analysis_supervisor --provider codex
 cao launch --agents analysis_supervisor --provider copilot_cli
+cao launch --agents analysis_supervisor --provider cursor_cli
 cao launch --agents analysis_supervisor --provider gemini_cli
 cao launch --agents analysis_supervisor --provider kimi_cli
 ```
