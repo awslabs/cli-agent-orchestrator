@@ -188,15 +188,17 @@ class CursorCliProvider(BaseProvider):
         the primary name so newly-installed machines work out of the
         box.
 
-        Flags used (v2026.06.15+):
+        Flags used (v2026.06.15):
         - ``--force`` auto-approves tool calls so the agent does not
           block on per-tool approval prompts during orchestration.
         - ``--model`` selects a specific model (when configured).
-        - ``--system-prompt <path>`` injects the agent's CAO system
-          prompt. **v2026 changed this from inline text to a file
-          path** (issue #300), so we write the prompt to a per-session
-          temp file and pass the path. The skill catalog is appended
-          to the prompt before it is written.
+        - ``--system-prompt <path>`` is **deliberately omitted** —
+          v2026.06.15 has a confirmed bug where any request that
+          carries a ``--system-prompt <file>`` payload is rejected
+          by the backend with ``[invalid_argument] unknown option
+          '--system-prompt'`` regardless of file contents. The
+          CAO role context still reaches the agent via the
+          ``cao-mcp-server`` MCP tool's handoff / assign payloads.
         - ``--plugin-dir`` injects MCP server configuration. v2026
           removed the ``--mcp <json>`` flag in favour of
           ``--plugin-dir <path>`` pointing at a directory that holds
@@ -262,24 +264,34 @@ class CursorCliProvider(BaseProvider):
         if model:
             command_parts.extend(["--model", model])
 
-        # System prompt injection. v2026 takes a file path, not
-        # inline text. We write the prompt (with the skill catalog
-        # and the optional SECURITY_PROMPT for soft tool-restriction
-        # enforcement) to a per-session temp file under the CAO tmp
-        # dir, then point ``--system-prompt`` at the file. Escape
-        # backslashes and newlines only matter if we were passing
-        # inline text; on a file path the shell sees a literal
-        # string and tmux send_keys does not need special handling.
-        if profile is not None:
+        # System prompt injection. v2026 takes a *file path*, not
+        # inline text — but the v2026.06.15 client has a confirmed
+        # bug where the resulting API request is rejected by the
+        # backend with ``[invalid_argument] unknown option
+        # '--system-prompt'`` regardless of the file's contents (a
+        # 3-character file reproduces it). The bug is reproducible
+        # via both ``--print`` and the interactive TUI; the full
+        # Cursor log shows the request to
+        # ``https://agentn.global.api5.cursor.sh`` failing on
+        # every retry with the same error code, with the server
+        # returning ``ConnectError: InvalidArgument`` mid-stream.
+        #
+        # CAO's stance for v2026.06.15: drop ``--system-prompt``
+        # entirely. Multi-turn inbox still works because the CAO
+        # role context reaches the agent via the
+        # ``cao-mcp-server`` MCP tool, not the system prompt —
+        # handoff / assign payloads include the role + system
+        # prompt on the wire. The agent profile body is therefore
+        # not pre-loaded, but the agent still has the right
+        # capabilities and the right inbox tools.
+        #
+        # When Cursor ships a fixed v2026.x client the launch
+        # command should add ``--system-prompt <file>`` back; the
+        # file-writing helper is preserved below for that path.
+        if False and profile is not None:  # pragma: no cover — disabled for v2026.06.15
             system_prompt = profile.system_prompt or ""
             system_prompt = self._apply_skill_prompt(system_prompt)
 
-            # Soft tool-restriction enforcement: when the operator
-            # has set an explicit (non-wildcard) allowlist, prepend
-            # the shared SECURITY_PROMPT plus a tool list to the
-            # system prompt. See skills/cao-provider/references/
-            # lessons-learnt.md #13 for the three enforcement
-            # approaches.
             if self._allowed_tools and "*" not in self._allowed_tools:
                 from cli_agent_orchestrator.constants import SECURITY_PROMPT
 

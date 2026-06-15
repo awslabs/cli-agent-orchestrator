@@ -599,13 +599,16 @@ class TestBuildCommand:
         assert "gpt-5" not in cmd
 
     @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
-    def test_agent_profile_injected_via_system_prompt_file(self, mock_load):
-        # v2026 dropped the ``--agent`` flag. The CAO agent profile's
-        # body is now injected via ``--system-prompt <file>`` so the
-        # same multi-agent orchestration still works without
-        # selecting a Cursor-side agent. This test asserts the
-        # command contains a ``--system-prompt <path>`` pair (the
-        # path is the per-session temp file the provider writes).
+    def test_agent_profile_loaded_but_not_passed_as_flag(self, mock_load):
+        # v2026.06.15 has a confirmed bug where the backend rejects
+        # any ``--system-prompt <file>`` request with
+        # ``[invalid_argument] unknown option '--system-prompt'``,
+        # so the provider deliberately does not pass that flag
+        # even when a profile has a system prompt. The CAO role
+        # context still reaches the agent via the cao-mcp-server
+        # inbox (handoff / assign payloads include role + prompt
+        # on the wire), so dropping the flag is the right
+        # operational choice.
         profile = MagicMock()
         profile.model = None
         profile.system_prompt = "DEVELOPER_AGENT_BODY"
@@ -614,56 +617,25 @@ class TestBuildCommand:
         provider = make_provider(agent_profile="developer")
         cmd = provider._build_cursor_command()
         assert "--agent" not in cmd
-        assert "--system-prompt" in cmd
-        # The value after --system-prompt should be a path to a
-        # file containing the profile body.
-        m = re.search(r"--system-prompt\s+(\S+)", cmd)
-        assert m is not None, f"--system-prompt <path> not found in: {cmd}"
-        prompt_path = m.group(1)
-        # File exists, was written by the provider during
-        # _build_cursor_command.
-        from pathlib import Path
-        assert Path(prompt_path).exists()
-        contents = Path(prompt_path).read_text(encoding="utf-8")
-        assert "DEVELOPER_AGENT_BODY" in contents
+        assert "--system-prompt" not in cmd
 
     @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
-    def test_system_prompt_preserves_newlines_in_file(self, mock_load):
-        # v2026 reads the system prompt from a *file*, so we no
-        # longer have to escape newlines into ``\\n`` for tmux
-        # transport. The file should contain the original multi-
-        # line string verbatim.
+    def test_no_system_prompt_flag_even_with_prompt_content(self, mock_load):
+        # Sanity: even a 3-character system prompt does not get
+        # written to a file. The provider's _write_system_prompt_file
+        # helper is preserved (for the day Cursor ships a fixed
+        # v2026.x) but no longer wired into the launch command.
+        from cli_agent_orchestrator.providers.cursor_cli import (
+            CursorCliProvider,
+        )
         profile = MagicMock()
         profile.model = None
-        profile.system_prompt = "Line 1\nLine 2"
+        profile.system_prompt = "hi"
         profile.mcpServers = None
         mock_load.return_value = profile
         provider = make_provider(agent_profile="developer")
         cmd = provider._build_cursor_command()
-        m = re.search(r"--system-prompt\s+(\S+)", cmd)
-        assert m is not None
-        from pathlib import Path
-        assert Path(m.group(1)).read_text(encoding="utf-8") == "Line 1\nLine 2"
-
-    @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
-    def test_skill_prompt_appended(self, mock_load):
-        profile = MagicMock()
-        profile.model = None
-        profile.system_prompt = "Base prompt."
-        profile.mcpServers = None
-        mock_load.return_value = profile
-        provider = make_provider(
-            agent_profile="developer",
-            skill_prompt="<skills>...</skills>",
-        )
-        cmd = provider._build_cursor_command()
-        # Skill catalog is appended to the system prompt before it
-        # is written to the file. The command only references the
-        # file path; the catalog is the responsibility of
-        # _apply_skill_prompt, which is exercised by the base
-        # provider's own test suite.
-        m = re.search(r"--system-prompt\s+(\S+)", cmd)
-        assert m is not None
+        assert "--system-prompt" not in cmd
 
     @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
     def test_mcp_servers_forwarded_via_plugin_dir(self, mock_load):
@@ -725,7 +697,14 @@ class TestBuildCommand:
         )
 
     @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
-    def test_tool_restrictions_prepend_security_prompt(self, mock_load):
+    def test_tool_restrictions_skip_system_prompt(self, mock_load):
+        # Soft tool-restriction enforcement used to prepend
+        # SECURITY_PROMPT and the tool list to the system prompt.
+        # v2026.06.15 forces us to drop --system-prompt entirely,
+        # so this enforcement path is not available. The test
+        # asserts the command does NOT carry the security prompt
+        # (it is no longer injected) and does NOT carry the
+        # --system-prompt flag.
         profile = MagicMock()
         profile.model = None
         profile.system_prompt = "Base prompt."
@@ -736,21 +715,15 @@ class TestBuildCommand:
             allowed_tools=["fs_read", "fs_list"],
         )
         cmd = provider._build_cursor_command()
-        # v2026: SECURITY_PROMPT and the tool list are written into
-        # the system-prompt file, not the command line. The command
-        # only references the file path; we read the file to assert
-        # the security prompt and the tool list are there.
-        m = re.search(r"--system-prompt\s+(\S+)", cmd)
-        assert m is not None
-        from pathlib import Path
-        contents = Path(m.group(1)).read_text(encoding="utf-8")
-        assert "SECURITY CONSTRAINTS" in contents
-        assert "fs_read" in contents
-        assert "fs_list" in contents
+        assert "--system-prompt" not in cmd
+        assert "SECURITY CONSTRAINTS" not in cmd
+        assert "fs_read" not in cmd
+        assert "fs_list" not in cmd
 
     @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
-    def test_wildcard_allowed_tools_skips_security_prompt(self, mock_load):
-        # Unrestricted yolo mode: SECURITY_PROMPT is not prepended.
+    def test_wildcard_allowed_tools_no_system_prompt(self, mock_load):
+        # Unrestricted yolo mode: nothing special happens — there
+        # is no system-prompt injection at all in v2026.06.15.
         profile = MagicMock()
         profile.model = None
         profile.system_prompt = "Base prompt."
@@ -761,12 +734,7 @@ class TestBuildCommand:
             allowed_tools=["*"],
         )
         cmd = provider._build_cursor_command()
-        # Wildcard → no security prompt in the system-prompt file.
-        m = re.search(r"--system-prompt\s+(\S+)", cmd)
-        assert m is not None
-        from pathlib import Path
-        contents = Path(m.group(1)).read_text(encoding="utf-8")
-        assert "SECURITY CONSTRAINTS" not in contents
+        assert "--system-prompt" not in cmd
 
     @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
     def test_missing_profile_raises_provider_error(self, mock_load):
@@ -887,17 +855,17 @@ class TestInitialize:
     @patch("cli_agent_orchestrator.providers.cursor_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.cursor_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.cursor_cli.get_backend")
-    async def test_initialize_sends_system_prompt_file(self, mock_backend, mock_shell, mock_wait):
-        # v2026 dropped ``--agent``; the CAO profile is now carried
-        # in the file passed to ``--system-prompt``. Assert the
-        # launched command references a system-prompt file path.
+    async def test_initialize_does_not_send_system_prompt_flag(self, mock_backend, mock_shell, mock_wait):
+        # v2026.06.15 has a confirmed bug where any request that
+        # carries --system-prompt is rejected by the backend, so
+        # the provider deliberately omits the flag.
         mock_shell.return_value = True
         mock_wait.return_value = True
         provider = make_provider(agent_profile="developer")
         await provider.initialize()
         sent = mock_backend.return_value.send_keys.call_args.args[2]
         assert "--agent" not in sent
-        assert "--system-prompt" in sent
+        assert "--system-prompt" not in sent
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.cursor_cli.wait_until_status")
