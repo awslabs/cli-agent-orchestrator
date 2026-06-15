@@ -218,3 +218,144 @@ def clear(scope, yes):
             click.echo(f"Warning: Failed to delete '{mem.key}'.", err=True)
 
     click.echo(f"Cleared {deleted_count} {scope}-scoped memory(ies).")
+
+
+@memory.command(name="lint")
+@click.option(
+    "--scope",
+    type=click.Choice([s.value for s in MemoryScope], case_sensitive=False),
+    default=None,
+    help="Restrict lint to one scope (default: all four).",
+)
+@click.option(
+    "--format",
+    "out_format",
+    type=click.Choice(["table", "json"], case_sensitive=False),
+    default="table",
+    show_default=True,
+    help="Output format. JSON includes ISO-8601 detected_at per row.",
+)
+def lint_cmd(scope, out_format):
+    """Run wiki lint detectors and print findings.
+
+    Exit codes:
+      0  no error-severity issues found
+      1  one or more error-severity issues found
+      2  CLI / project resolution failure (handled by Click)
+    """
+    import json as _json
+
+    from cli_agent_orchestrator.services.wiki_lint import (
+        compute_exit_code,
+        run_lint,
+    )
+
+    svc = _get_memory_service()
+    ctx = _cwd_context()
+    try:
+        # Resolve project_hash via the same chain `cao memory list` uses.
+        project_hash = svc.resolve_scope_id("project", ctx) or "unknown"
+    except Exception as e:
+        raise click.ClickException(f"failed to resolve project identity: {e}")
+
+    try:
+        issues = _run_async(run_lint(project_hash, scope=scope))
+    except Exception as e:
+        raise click.ClickException(f"lint run failed: {e}")
+
+    is_json = out_format.lower() == "json"
+
+    # Emit a top-line completion summary for visibility even when the result
+    # list is empty. Routed to stderr under --format json so stdout stays a
+    # clean, parseable JSON stream.
+    completion = next(
+        (
+            i.description
+            for i in issues
+            if i.issue_type == "lint_error" and i.description.startswith("lint_run_completed:")
+        ),
+        "lint_run_completed: 0/5",
+    )
+    click.echo(completion, err=is_json)
+
+    # The completion summary is echoed above; drop it from the rendered
+    # payload/table and the exit-code computation so it isn't duplicated and
+    # the "No lint issues found." branch can still fire on a clean run.
+    issues = [
+        i
+        for i in issues
+        if not (i.issue_type == "lint_error" and i.description.startswith("lint_run_completed:"))
+    ]
+
+    if is_json:
+        payload = [
+            {
+                "issue_type": i.issue_type,
+                "key": i.key,
+                "related_key": i.related_key,
+                "description": i.description,
+                "severity": i.severity,
+                "detected_at": i.detected_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            for i in issues
+        ]
+        click.echo(_json.dumps(payload, indent=2))
+    else:
+        if not issues:
+            click.echo("No lint issues found.")
+            raise click.exceptions.Exit(compute_exit_code(issues))
+        header = f"{'SEVERITY':<8} {'TYPE':<18} {'KEY':<30} {'DETECTED':<22} DESCRIPTION"
+        click.echo(header)
+        click.echo("-" * len(header))
+        for i in issues:
+            ts = i.detected_at.strftime("%Y-%m-%d %H:%M:%SZ")
+            click.echo(f"{i.severity:<8} {i.issue_type:<18} {i.key:<30} {ts:<22} {i.description}")
+
+    raise click.exceptions.Exit(compute_exit_code(issues))
+
+
+@memory.command(name="compact")
+@click.option(
+    "--scope",
+    type=click.Choice([s.value for s in MemoryScope], case_sensitive=False),
+    default="global",
+    show_default=True,
+    help="Scope to compact.",
+)
+@click.option(
+    "--key",
+    default=None,
+    help="Compact a single topic unconditionally (default: all stale topics).",
+)
+def compact_cmd(scope, key):
+    """Compact wiki topics with the LLM compiler (repair sweep).
+
+    Compiles every topic whose article changed since its last compile —
+    the catch-all for background compiles that were dropped, timed out, or
+    lost a concurrency race. Drives the locally installed coding-agent CLI
+    (claude / codex / kiro-cli); requires no API key. Compiles run one at a
+    time and can take a minute or two each.
+    """
+    if key is not None:
+        key = _validate_key(key)
+
+    svc = _get_memory_service()
+    ctx = _cwd_context()
+    scope_id = None
+    if scope != MemoryScope.GLOBAL.value:
+        scope_id = svc.resolve_scope_id(scope, ctx)
+        if scope_id is None:
+            raise click.ClickException(f"could not resolve scope_id for scope '{scope}'")
+
+    try:
+        results = _run_async(svc.compact(scope=scope, scope_id=scope_id, key=key))
+    except Exception as e:
+        raise click.ClickException(f"compact failed: {e}")
+
+    summary = results.pop("_summary", {})
+    if not results:
+        click.echo("Nothing to compact — all topics are up to date.")
+        return
+    for topic_key, status in sorted(results.items()):
+        click.echo(f"{status:<22} {topic_key}")
+    click.echo(f"\nSummary: {summary}")
