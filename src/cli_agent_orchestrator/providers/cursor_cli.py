@@ -215,7 +215,6 @@ class CursorCliProvider(BaseProvider):
         # assign flows. --trust prevents the first-run trust dialog
         # from blocking the REPL.
         command_parts.append("--force")
-        command_parts.append("--trust")
 
         # Model override (--model, when explicitly set or supplied by
         # the agent profile's `model` field). Profile.model takes
