@@ -115,18 +115,77 @@ If you need strict hard enforcement, prefer a provider that supports `--disallow
 
 ## End-to-End Testing
 
-The E2E test suite validates handoff, assign, and send_message flows for every supported provider. To run the Cursor CLI E2E tests:
+The E2E test suite validates the full orchestration matrix (handoff, assign, send_message, allowedTools, supervisor orchestration) for every supported provider. The 11 core e2e tests for Cursor CLI are added under the `TestCursorCli*` test classes in `test/e2e/` and follow the same `_run_*_test()` helpers used by the other providers.
+
+### Prerequisites
+
+1. **Cursor CLI** (`agent` or `cursor-agent`) installed and authenticated.
+2. **CAO server** running (`uv run cao-server`).
+3. **Agent profiles** installed for the cursor_cli provider (the profiles shipped in `examples/assign/` are provider-agnostic; you can pin them to `cursor_cli` either at install time or via frontmatter `provider: cursor_cli`):
+
+   ```bash
+   cao install examples/assign/data_analyst.md --provider cursor_cli
+   cao install examples/assign/report_generator.md --provider cursor_cli
+   cao install developer --provider cursor_cli  # for handoff / send_message tests
+   ```
+
+4. **tmux** available on `$PATH`.
+
+### Running Cursor CLI E2E Tests
+
+The default pytest `addopts` excludes the `e2e` marker, so the `-o "addopts="` override is required to enable them:
 
 ```bash
 # Start CAO server
 uv run cao-server
 
-# Run all E2E tests filtered to the cursor_cli provider
+# All Cursor CLI e2e tests
 uv run pytest -m e2e test/e2e/ -v -k cursor_cli -o "addopts="
 
-# Run a specific flow
+# Individual flow files
 uv run pytest -m e2e test/e2e/test_handoff.py -v -k cursor_cli -o "addopts="
+uv run pytest -m e2e test/e2e/test_assign.py -v -k cursor_cli -o "addopts="
+uv run pytest -m e2e test/e2e/test_send_message.py -v -k cursor_cli -o "addopts="
+uv run pytest -m e2e test/e2e/test_allowed_tools.py -v -k cursor_cli -o "addopts="
+uv run pytest -m e2e test/e2e/test_supervisor_orchestration.py -v -k cursor_cli -o "addopts="
 ```
+
+### The 11 Core E2E Tests
+
+| # | Test class | What it validates |
+|---|------------|-------------------|
+| 1 | `TestCursorCliHandoff::test_handoff_simple_function` | Worker creates a Python function, returns extractable output |
+| 2 | `TestCursorCliHandoff::test_handoff_second_task` | Same terminal handles a second task with no state leakage |
+| 3 | `TestCursorCliAssign::test_assign_data_analyst` | `data_analyst` profile produces statistical analysis on a dataset |
+| 4 | `TestCursorCliAssign::test_assign_report_generator` | `report_generator` profile creates a structured report template |
+| 5 | `TestCursorCliAssign::test_assign_with_callback` | Worker completes → inbox callback → supervisor receives result |
+| 6 | `TestCursorCliSendMessage::test_send_message_to_inbox` | One terminal sends a message to another's inbox; delivery verified |
+| 7 | `TestCursorCliAllowedTools::test_restricted_supervisor_cannot_bash` | **Marked `xfail`** — Cursor CLI lacks a native `--disallowedTools` flag; soft enforcement via `SECURITY_PROMPT` is advisory only. Tracked under "Tool Restrictions" above. |
+| 8 | `TestCursorCliAllowedTools::test_unrestricted_developer_can_bash` | Developer with `--yolo` (allowedTools=`["*"]`) can execute bash |
+| 9 | `TestCursorCliAllowedTools::test_allowed_tools_stored_in_metadata` | `allowedTools` is persisted and returned by `GET /terminals/{id}` |
+| 10 | `TestCursorCliSupervisorOrchestration::test_supervisor_handoff` | Supervisor agent autonomously calls the `handoff()` MCP tool to delegate to `report_generator` |
+| 11 | `TestCursorCliSupervisorOrchestration::test_supervisor_assign_three_analysts` | **The canonical `examples/assign/` smoke test.** Supervisor parallel-assigns 3x data analysts, sequential-handoffs the report generator, receives all 3 inbox callbacks, and finalizes the report without doing the analysis work itself. The supervisor must NOT complete the jobs itself — the test asserts the final output references delegated results. |
+
+### Manual `examples/assign/` Smoke Test
+
+For a quick interactive validation outside the pytest harness:
+
+```bash
+cao install examples/assign/analysis_supervisor.md --provider cursor_cli
+cao install examples/assign/data_analyst.md --provider cursor_cli
+cao install examples/assign/report_generator.md --provider cursor_cli
+
+cao launch --agents analysis_supervisor --provider cursor_cli
+```
+
+Then in the supervisor terminal, paste the example task from `examples/assign/README.md` (3 datasets, calculate mean/median/stdev, generate a report). The supervisor should:
+
+1. Use `assign()` to dispatch 3x data analysts in parallel
+2. Use `handoff()` to get a report template from the report generator
+3. Finish its turn (no sleep/echo loops — they block inbox delivery)
+4. Receive all 3 inbox callbacks and combine template + results into the final report
+
+If the supervisor completes the analysis work itself, the per-directory lock or status detection is broken — see `skills/cao-provider/references/lessons-learnt.md` #19 (per-directory locks) and #16 (alt-screen detection).
 
 ## Troubleshooting
 
@@ -153,6 +212,10 @@ uv run pytest -m e2e test/e2e/test_handoff.py -v -k cursor_cli -o "addopts="
 5. **`agent` Not Found on `$PATH`**
    - The provider does not prefix the command with an absolute path — install the binary where your shell can find it.
    - On Linux, the recommended install method is `curl https://cursor.com/install -fsS | bash`.
+
+6. **E2E tests skip with "Cursor CLI (agent / cursor-agent) not installed"**
+   - Install Cursor CLI and ensure the `agent` (or legacy `cursor-agent`) binary is on `$PATH`.
+   - The `require_cursor` fixture auto-skips when the binary is absent; no failure, just no coverage.
 
 ## References
 
