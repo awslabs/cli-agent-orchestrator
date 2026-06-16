@@ -31,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- mcp: bundled agent profiles now launch the installed `cao-mcp-server` console script instead of re-fetching the whole package from GitHub via `uvx --from git+…@main` on every agent launch — the cold fetch (~20s) exceeded some providers' MCP startup timeout (Codex: 10s), so agents came up without their orchestration tools (`handoff`/`assign`/`send_message`) and silently could not delegate; a shared resolver (`utils/mcp_resolution.py`) rewrites the bare command to a PATH-independent invocation (interpreter-sibling → PATH → `python -m`), used by all providers, and a regression test keeps new profiles from reintroducing the network fetch (#403)
+
 - claude_code: a backgrounded task ("✻ Waiting for N dynamic workflow(s) to finish") no longer reads as COMPLETED — the wait line has no spinner ellipsis (invisible to every PROCESSING check) while the printed response + idle ❯ box look like a finished turn, and it even matched the lenient completion pattern; both the raw-buffer and pyte screen paths now report PROCESSING until a newer response/completion summary appears, so dashboards and wait_until_terminal_status no longer see a mid-run terminal as done (#392)
 
 - fifo: non-blocking FIFO reader loop and event-loop-safe session teardown — reader threads can no longer be stranded in a blocking FIFO `open()` by a stop/reopen race, and `DELETE /sessions` runs teardown in a worker thread, so repeated create/delete cycles can no longer wedge cao-server (#382)

@@ -600,6 +600,31 @@ class TestKimiCliProviderBuildCommand:
         assert "--config" not in command
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
+    def test_build_command_resolves_bundled_mcp_command(self, mock_load, tmp_path):
+        """The bare cao-mcp-server command is resolved to a PATH-independent
+        invocation in the emitted --mcp-config JSON (wiring guard: a refactor
+        that drops the resolve_mcp_server_config call must fail this test)."""
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = {
+            "cao-mcp-server": {"type": "stdio", "command": "cao-mcp-server", "args": []}
+        }
+        mock_load.return_value = mock_profile
+
+        provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
+        MOD = "cli_agent_orchestrator.utils.mcp_resolution"
+        with (
+            patch("cli_agent_orchestrator.providers.kimi_cli.Path.home", return_value=tmp_path),
+            patch(f"{MOD}._sibling_script", return_value="/venv/bin/cao-mcp-server"),
+            patch(f"{MOD}.shutil.which", return_value=None),
+        ):
+            command = provider._build_kimi_command()
+
+        assert "/venv/bin/cao-mcp-server" in command
+        provider.cleanup()
+
+    @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
     def test_build_command_creates_agent_yaml(self, mock_load):
         """Test that agent YAML and system prompt files are created correctly."""
         mock_profile = MagicMock()

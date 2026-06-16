@@ -547,6 +547,19 @@ class TestCopilotCliProviderMisc:
         assert "cao-mcp-server" in runtime_cfg["mcpServers"]
         assert runtime_cfg["mcpServers"]["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"] == "abc12345"
 
+    def test_build_runtime_mcp_config_resolves_bundled_command(self):
+        """The bundled cao-mcp-server is resolved to a PATH-independent
+        invocation (wiring guard: a refactor that drops the
+        resolve_cao_mcp_command call must fail this test)."""
+        provider = CopilotCliProvider("abc12345", "test-session", "window-0")
+        MOD = "cli_agent_orchestrator.utils.mcp_resolution"
+        with (
+            patch(f"{MOD}._sibling_script", return_value="/venv/bin/cao-mcp-server"),
+            patch(f"{MOD}.shutil.which", return_value=None),
+        ):
+            runtime_cfg = json.loads(provider._build_runtime_mcp_config())
+        assert runtime_cfg["mcpServers"]["cao-mcp-server"]["command"] == "/venv/bin/cao-mcp-server"
+
     def test_cleanup_resets_initialized_state(self):
         provider = CopilotCliProvider("test1234", "test-session", "window-0")
         provider._initialized = True

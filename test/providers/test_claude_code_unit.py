@@ -1145,6 +1145,31 @@ class TestClaudeCodeProviderMisc:
         assert server_env["CAO_TERMINAL_ID"] == "term-42"
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_build_command_resolves_bundled_mcp_command(self, mock_load):
+        """The bare cao-mcp-server command is resolved to a PATH-independent
+        invocation in the written MCP config (wiring guard: a refactor that
+        drops the resolve_mcp_server_config call must fail this test)."""
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = {
+            "cao-mcp-server": {"type": "stdio", "command": "cao-mcp-server", "args": []}
+        }
+        mock_profile.permissionMode = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("term-43", "test-session", "window-0", "test-agent")
+        MOD = "cli_agent_orchestrator.utils.mcp_resolution"
+        with (
+            patch(f"{MOD}._sibling_script", return_value="/venv/bin/cao-mcp-server"),
+            patch(f"{MOD}.shutil.which", return_value=None),
+        ):
+            command = provider._build_claude_command()
+
+        mcp_data = _extract_mcp_config(command)
+        assert mcp_data["mcpServers"]["cao-mcp-server"]["command"] == "/venv/bin/cao-mcp-server"
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     def test_build_command_mcp_preserves_existing_env(self, mock_load):
         """Test that existing env vars in MCP config are preserved when injecting CAO_TERMINAL_ID."""
         mock_profile = MagicMock()

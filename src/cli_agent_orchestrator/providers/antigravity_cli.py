@@ -54,6 +54,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.mcp_resolution import resolve_cao_mcp_command
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
@@ -337,9 +338,16 @@ class AntigravityCliProvider(BaseProvider):
                 cfg = dict(server_config)
             else:
                 cfg = server_config.model_dump(exclude_none=True)
-            entry = {
-                "command": cfg.get("command", ""),
-                "args": cfg.get("args", []),
+            # Resolve the bundled cao-mcp-server console script to a
+            # PATH-independent invocation. persisted=True: this command is
+            # written to mcp_config.json and read by agy at later launches,
+            # so prefer the stable PATH launcher over the versioned venv path.
+            command, args = resolve_cao_mcp_command(
+                cfg.get("command", ""), cfg.get("args", []) or [], persisted=True
+            )
+            entry: dict = {
+                "command": command,
+                "args": args,
             }
             env = dict(cfg.get("env", {}))
             env["CAO_TERMINAL_ID"] = self.terminal_id
@@ -444,8 +452,8 @@ class AntigravityCliProvider(BaseProvider):
         # untrusted cwd). Unanswered it blocks init — the picker never reads IDLE.
         self._handle_startup_dialog()
 
-        # agy startup + first MCP connection (cao-mcp-server is fetched via uvx
-        # from git on first use) + the -i acknowledgment can take a while.
+        # agy startup + first MCP connection + the -i acknowledgment can take
+        # a while.
         if not await wait_until_status(
             self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},

@@ -766,6 +766,38 @@ class TestBuildCommand:
         assert servers["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"] == "test-tid"
 
     @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
+    def test_mcp_resolves_bundled_command_in_manifest(self, mock_load):
+        # Wiring guard: the bare cao-mcp-server command must be rewritten to
+        # a PATH-independent invocation in the written plugin manifest. A
+        # refactor that drops the resolve_mcp_server_config call fails this.
+        import json
+        from pathlib import Path
+
+        profile = MagicMock()
+        profile.model = None
+        profile.system_prompt = None
+        profile.mcpServers = {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}}
+        mock_load.return_value = profile
+        provider = make_provider(agent_profile="developer")
+        MOD = "cli_agent_orchestrator.utils.mcp_resolution"
+        # NOTE: mcp_resolution and cursor_cli import the SAME shutil module
+        # object, so a blanket which->None would break the provider's own
+        # cursor-binary lookup (stubbed by the autouse fixture). Only the
+        # cao-mcp-server lookup may miss.
+        which_cursor_keeps_working = lambda name: (
+            None if name == "cao-mcp-server" else "/usr/local/bin/cursor-agent"
+        )
+        with (
+            patch(f"{MOD}._sibling_script", return_value="/venv/bin/cao-mcp-server"),
+            patch(f"{MOD}.shutil.which", side_effect=which_cursor_keeps_working),
+        ):
+            cmd = provider._build_cursor_command()
+        m = re.search(r"--plugin-dir\s+(\S+)", cmd)
+        assert m is not None
+        manifest = json.loads((Path(m.group(1)) / "plugin.json").read_text(encoding="utf-8"))
+        assert manifest["mcpServers"]["cao-mcp-server"]["command"] == "/venv/bin/cao-mcp-server"
+
+    @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
     def test_mcp_preserves_existing_cao_terminal_id(self, mock_load):
         # The constructor's terminal_id must NOT override an
         # explicit preset (matches the prior --mcp behaviour).

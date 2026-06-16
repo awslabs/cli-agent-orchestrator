@@ -41,6 +41,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
@@ -337,6 +338,10 @@ class KimiCliProvider(BaseProvider):
                             mcp_config[server_name] = dict(server_config)
                         else:
                             mcp_config[server_name] = server_config.model_dump(exclude_none=True)
+
+                        # Resolve the bundled cao-mcp-server console script to a
+                        # PATH-independent invocation.
+                        mcp_config[server_name] = resolve_mcp_server_config(mcp_config[server_name])
 
                         # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
                         # can identify the current terminal for handoff/assign operations.

@@ -12,6 +12,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
@@ -277,9 +278,12 @@ class CodexProvider(BaseProvider):
                 for server_name, server_config in profile.mcpServers.items():
                     prefix = f"mcp_servers.{server_name}"
                     if isinstance(server_config, dict):
-                        cfg = server_config
+                        cfg = dict(server_config)
                     else:
                         cfg = server_config.model_dump(exclude_none=True)
+                    # Resolve the bundled cao-mcp-server console script to a
+                    # PATH-independent invocation.
+                    cfg = resolve_mcp_server_config(cfg)
                     if "command" in cfg:
                         command_parts.extend(["-c", f'{prefix}.command="{cfg["command"]}"'])
                     if "args" in cfg:

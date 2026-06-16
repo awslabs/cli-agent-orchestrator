@@ -178,6 +178,33 @@ class TestCodexBuildCommand:
         # Tool timeout must be a TOML float (600.0) for Codex's f64 deserializer
         assert "mcp_servers.cao-mcp-server.tool_timeout_sec=600.0" in command
 
+    @patch("cli_agent_orchestrator.providers.codex.resolve_mcp_server_config")
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_bundled_mcp_command_is_resolved(self, mock_load_profile, mock_resolve):
+        """The bundled bare cao-mcp-server command is run through the resolver
+        before being emitted as a -c override."""
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = "You are a supervisor."
+        mock_profile.mcpServers = {
+            "cao-mcp-server": {"type": "stdio", "command": "cao-mcp-server", "args": []}
+        }
+        mock_profile.codexProfile = None
+        mock_load_profile.return_value = mock_profile
+        # Simulate the resolver returning a PATH-independent absolute path.
+        mock_resolve.side_effect = lambda cfg: {
+            **cfg,
+            "command": "/home/u/.local/bin/cao-mcp-server",
+            "args": [],
+        }
+
+        provider = CodexProvider("test1234", "test-session", "window-0", "code_supervisor")
+        command = provider._build_codex_command()
+
+        # The resolver was invoked and its resolved command appears in the override.
+        assert mock_resolve.called
+        assert 'mcp_servers.cao-mcp-server.command="/home/u/.local/bin/cao-mcp-server"' in command
+
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_build_command_with_mcp_servers_env(self, mock_load_profile):
         mock_profile = MagicMock()
