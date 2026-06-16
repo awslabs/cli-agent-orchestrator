@@ -41,6 +41,10 @@ uv run cao --help
 uv run pytest test/providers/test_kiro_cli_unit.py -v -k "test_initialization"
 ```
 
+## Developing in GitHub Codespaces
+
+If you prefer a pre-configured cloud environment, the project runs end-to-end inside a GitHub Codespace. See [docs/codespaces.md](docs/codespaces.md) for the server start command, port forwarding, and troubleshooting tips.
+
 ## Web UI Development
 
 The web UI is a React + Vite + Tailwind app in `web/`.

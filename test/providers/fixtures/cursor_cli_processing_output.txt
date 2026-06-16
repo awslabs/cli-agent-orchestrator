@@ -1,0 +1,6 @@
+Welcome to Cursor Agent
+──────────────────────
+❯ Summarize this file
+──────────────────────
+⠋ Thinking… (esc to interrupt)
+──────────────────────

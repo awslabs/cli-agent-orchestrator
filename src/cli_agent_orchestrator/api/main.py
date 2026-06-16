@@ -50,6 +50,7 @@ from cli_agent_orchestrator.constants import (
     SERVER_HOST,
     SERVER_PORT,
     SERVER_VERSION,
+    TRUSTED_FORWARDER_IPS,
     WS_ALLOWED_CLIENTS,
     add_local_cors_origins,
 )
@@ -455,6 +456,7 @@ async def list_providers_endpoint() -> List[Dict]:
         "kimi_cli": "kimi",
         "copilot_cli": "copilot",
         "opencode_cli": "opencode",
+        "cursor_cli": "agent",
     }
     result = []
     for provider, binary in provider_binaries.items():
@@ -1013,8 +1015,15 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     # Defaults to loopback; operators running cao-server inside a container can
     # extend the allowlist with the ``CAO_WS_ALLOWED_CLIENTS`` env var so the
     # host browser (reaching the container via a bridge IP) can attach.
+    # A literal ``*`` in the allowlist disables the IP check (Codespaces /
+    # devcontainers / remote setups where the WS client originates from an
+    # IP the operator cannot enumerate ahead of time).
     client_host = websocket.client.host if websocket.client else None
-    if client_host is not None and client_host not in WS_ALLOWED_CLIENTS:
+    if (
+        "*" not in WS_ALLOWED_CLIENTS
+        and client_host is not None
+        and client_host not in WS_ALLOWED_CLIENTS
+    ):
         await websocket.close(code=4003, reason="WebSocket access is restricted to allowed clients")
         return
 
@@ -1572,7 +1581,25 @@ def main():
     # already-installed CORSMiddleware reads the list by reference, so
     # mutating it before uvicorn starts is sufficient. See issue #151.
     add_local_cors_origins(host, port)
-    uvicorn.run(app, host=host, port=port)
+    # --proxy-headers: trust X-Forwarded-Proto / X-Forwarded-For from
+    # an upstream reverse proxy (Codespaces / devcontainers / nginx in
+    # front of cao-server). Required for the WebSocket terminal viewer
+    # over an HTTPS tunnel — without it uvicorn sees the raw HTTP
+    # request and the browser's WSS upgrade fails. See issue #149.
+    #
+    # The forwarded-allow-ips list defaults to loopback (see
+    # constants.TRUSTED_FORWARDER_IPS); operators behind a reverse
+    # proxy opt into a wider range with CAO_FORWARDED_ALLOW_IPS. A
+    # literal ``*`` is honoured and disables the check (matches the
+    # existing CAO_WS_ALLOWED_CLIENTS="*" semantics).
+    forwarded_ips = "*" if "*" in TRUSTED_FORWARDER_IPS else ",".join(TRUSTED_FORWARDER_IPS)
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        proxy_headers=True,
+        forwarded_allow_ips=forwarded_ips,
+    )
 
 
 if __name__ == "__main__":

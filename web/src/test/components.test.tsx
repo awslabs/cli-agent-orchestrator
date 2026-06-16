@@ -148,7 +148,7 @@ describe('FALLBACK_PROVIDERS', () => {
   })
 
   it('includes all known providers', () => {
-    const expected = ['kiro_cli', 'claude_code', 'q_cli', 'codex', 'gemini_cli', 'hermes', 'kimi_cli', 'copilot_cli', 'opencode_cli']
+    const expected = ['kiro_cli', 'claude_code', 'q_cli', 'codex', 'gemini_cli', 'hermes', 'kimi_cli', 'copilot_cli', 'opencode_cli', 'cursor_cli']
     for (const p of expected) {
       expect(FALLBACK_PROVIDERS).toContain(p)
     }

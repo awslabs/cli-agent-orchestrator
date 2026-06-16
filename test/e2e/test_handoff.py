@@ -322,3 +322,41 @@ class TestCopilotCliHandoff:
             ),
             content_keywords=["multiply", "product", "return", "def"],
         )
+
+
+# ---------------------------------------------------------------------------
+# Cursor CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestCursorCliHandoff:
+    """E2E handoff tests for the Cursor CLI provider.
+
+    Requires the ``agent`` (or legacy ``cursor-agent``) binary on PATH.
+    Skip otherwise via the ``require_cursor`` fixture.
+    """
+
+    def test_handoff_simple_function(self, require_cursor):
+        """Cursor CLI developer creates a simple Python function and returns output."""
+        _run_handoff_test(
+            provider="cursor_cli",
+            agent_profile="developer",
+            task_message=(
+                "Create a Python function called 'greet' that takes a name parameter "
+                "and returns 'Hello, {name}!'. Output only the function code."
+            ),
+            content_keywords=["greet", "hello", "def"],
+        )
+
+    def test_handoff_second_task(self, require_cursor):
+        """Cursor CLI developer handles a second independent task."""
+        _run_handoff_test(
+            provider="cursor_cli",
+            agent_profile="developer",
+            task_message=(
+                "Create a Python function called 'multiply' that takes two parameters "
+                "a and b and returns their product. Output only the function code."
+            ),
+            content_keywords=["multiply", "product", "return", "def"],
+        )

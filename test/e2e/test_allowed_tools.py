@@ -590,3 +590,58 @@ class TestGeminiCliAllowedTools:
             agent_profile="developer",
             allowed_tools="@builtin,fs_read,@cao-mcp-server",
         )
+
+
+# ---------------------------------------------------------------------------
+# Cursor CLI provider — soft enforcement via SECURITY_PROMPT
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestCursorCliAllowedTools:
+    """E2E allowedTools tests for the Cursor CLI provider.
+
+    Cursor CLI does not expose a native ``--disallowedTools`` flag, so this
+    provider relies on the shared ``SECURITY_PROMPT`` prepended to the
+    agent's system prompt — a soft-enforcement approach. The restricted
+    bash test is marked ``xfail`` because soft enforcement is advisory,
+    not a security boundary (see ``skills/cao-provider/references/lessons-learnt.md``
+    lesson #13).
+    """
+
+    @pytest.mark.xfail(
+        reason=(
+            "Cursor CLI provider uses soft enforcement via SECURITY_PROMPT "
+            "(no native --disallowedTools equivalent); restricted supervisor "
+            "may still execute bash. Tracked as a known limitation in "
+            "docs/cursor-cli.md#tool-restrictions."
+        ),
+        strict=False,
+    )
+    def test_restricted_supervisor_cannot_bash(self, require_cursor):
+        """Supervisor with only @cao-mcp-server should not execute bash.
+
+        Enforcement: SECURITY_PROMPT prepended to the system prompt
+        (soft enforcement — the agent may still attempt bash).
+        Marked xfail because soft enforcement is not a security boundary.
+        """
+        _run_restricted_tool_test(
+            provider="cursor_cli",
+            agent_profile="code_supervisor",
+            allowed_tools="@cao-mcp-server",
+        )
+
+    def test_unrestricted_developer_can_bash(self, require_cursor):
+        """Developer with wildcard allowedTools can execute bash."""
+        _run_unrestricted_tool_test(
+            provider="cursor_cli",
+            agent_profile="developer",
+        )
+
+    def test_allowed_tools_stored_in_metadata(self, require_cursor):
+        """allowed_tools is persisted and returned by GET /terminals."""
+        _run_allowed_tools_stored_test(
+            provider="cursor_cli",
+            agent_profile="developer",
+            allowed_tools="@builtin,fs_read,@cao-mcp-server",
+        )
