@@ -364,10 +364,13 @@ def compact_cmd(scope, key):
 @memory.command(name="heal")
 @click.option(
     "--scope",
-    type=click.Choice([s.value for s in MemoryScope], case_sensitive=False),
+    # Only global/project are resolvable from cwd context here; session/agent
+    # need a session_name/agent_profile that this CLI path cannot derive, so
+    # offering them would only ever raise "could not resolve scope_id".
+    type=click.Choice([MemoryScope.GLOBAL.value, MemoryScope.PROJECT.value], case_sensitive=False),
     default="project",
     show_default=True,
-    help="Scope to heal.",
+    help="Scope to heal (global or project).",
 )
 @click.option(
     "--apply",

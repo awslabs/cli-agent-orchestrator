@@ -101,6 +101,12 @@ class HealAction:
     description: str = ""  # human summary of what was done / would be done
     status: str = "applied"  # "applied"|"skipped"|"error"|"planned"
     pre_strip_paragraph: Optional[str] = None  # only for stale_claim; size-capped
+    # Buffered audit payload (event_type, summary, fields). Populated by the
+    # healers instead of emitting inline; the batch loop flushes it only AFTER
+    # the group's db.commit() succeeds, so a rolled-back mutation never leaves a
+    # false audit record (invariant #7, fixed). None when there is nothing to
+    # audit (e.g. a skipped no-op that produced no side effect).
+    audit: Optional[tuple] = None  # (event_type: str, summary: str, fields: dict)
 
 
 @dataclass(frozen=True)
@@ -284,25 +290,36 @@ async def _heal_orphan(
         )
 
     if not wiki_path.exists():
-        # Already gone — still drop any stale index/metadata, emit audit.
+        # Already gone — still drop any stale index/metadata. Track whether the
+        # best-effort index removal succeeded so the description does not claim
+        # cleanup that did not happen.
+        index_removed = True
         try:
             svc._update_index(scope, scope_id, key, "", "", "", _now_ts(), "remove")
         except Exception as e:
+            index_removed = False
             logger.warning("orphan_pruned index remove failed key=%s: %s", key, type(e).__name__)
         _delete_row(db, key, scope, scope_id)
-        await write_audit(
-            "orphan_pruned",
-            f"deleted orphan wiki file: {key}",
-            key=key,
-            scope=scope,
-            scope_id=scope_id or "",
-            file_path=str(wiki_path),
+        desc = (
+            "file already absent; index/metadata cleaned"
+            if index_removed
+            else "file already absent; metadata row removed (index removal failed, see logs)"
         )
         return HealAction(
             "orphan_pruned",
             key,
             status="applied",
-            description="file already absent; index/metadata cleaned",
+            description=desc,
+            audit=(
+                "orphan_pruned",
+                f"deleted orphan wiki file: {key}",
+                {
+                    "key": key,
+                    "scope": scope,
+                    "scope_id": scope_id or "",
+                    "file_path": str(wiki_path),
+                },
+            ),
         )
 
     try:
@@ -315,19 +332,21 @@ async def _heal_orphan(
             "orphan_pruned", key, status="error", description=f"delete failed: {type(e).__name__}"
         )
 
-    await write_audit(
-        "orphan_pruned",
-        f"deleted orphan wiki file: {key}",
-        key=key,
-        scope=scope,
-        scope_id=scope_id or "",
-        file_path=str(wiki_path),
-    )
     return HealAction(
         "orphan_pruned",
         key,
         status="applied",
         description=f"deleted {wiki_path.name}, index line, metadata row",
+        audit=(
+            "orphan_pruned",
+            f"deleted orphan wiki file: {key}",
+            {
+                "key": key,
+                "scope": scope,
+                "scope_id": scope_id or "",
+                "file_path": str(wiki_path),
+            },
+        ),
     )
 
 
@@ -423,22 +442,24 @@ async def _heal_contradiction(
             description=f"forget failed: {type(e).__name__}",
         )
 
-    await write_audit(
-        "contradiction_resolved",
-        f"kept {winner_key}, forgot {loser_key}",
-        winner_key=winner_key,
-        loser_key=loser_key,
-        scope=scope,
-        scope_id=scope_id or "",
-        winner_updated_at=winner_ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        loser_updated_at=loser_ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
-    )
     return HealAction(
         "contradiction_resolved",
         winner_key,
         related_key=loser_key,
         status="applied",
         description=f"kept {winner_key}, forgot {loser_key}",
+        audit=(
+            "contradiction_resolved",
+            f"kept {winner_key}, forgot {loser_key}",
+            {
+                "winner_key": winner_key,
+                "loser_key": loser_key,
+                "scope": scope,
+                "scope_id": scope_id or "",
+                "winner_updated_at": winner_ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "loser_updated_at": loser_ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+        ),
     )
 
 
@@ -491,22 +512,26 @@ async def _heal_stale_claim(
     capped_pre_strip = _cap_pre_strip(pre_strip) if pre_strip is not None else None
 
     if pre_strip is None:
-        # No paragraph matched — leave content unchanged, audit + skipped.
-        await write_audit(
-            "stale_claim_pruned",
-            f"no paragraph found for {stale_id} in {key}",
-            key=key,
-            scope=scope,
-            scope_id=scope_id or "",
-            stale_identifier=stale_id,
-            pre_strip_paragraph="",
-        )
+        # No paragraph matched — leave content unchanged, audit + skipped. This
+        # records a read-only outcome (nothing mutated), so it is safe to emit
+        # regardless of the batch commit; buffer it for uniformity.
         return HealAction(
             "stale_claim_pruned",
             key,
             status="skipped",
             description=f"stale id {stale_id} not found in article",
             pre_strip_paragraph=None,
+            audit=(
+                "stale_claim_pruned",
+                f"no paragraph found for {stale_id} in {key}",
+                {
+                    "key": key,
+                    "scope": scope,
+                    "scope_id": scope_id or "",
+                    "stale_identifier": stale_id,
+                    "pre_strip_paragraph": "",
+                },
+            ),
         )
 
     tmp_path = wiki_path.parent / f".{wiki_path.stem}.strip.tmp"
@@ -543,22 +568,24 @@ async def _heal_stale_claim(
     except Exception as e:
         logger.debug("stale_claim metadata stamp failed key=%s: %s", key, type(e).__name__)
 
-    await write_audit(
-        "stale_claim_pruned",
-        f"stripped stale reference to {stale_id} in article {key}",
-        key=key,
-        scope=scope,
-        scope_id=scope_id or "",
-        stale_identifier=stale_id,
-        # Already byte-capped by _cap_pre_strip(); audit_log re-caps defensively.
-        pre_strip_paragraph=capped_pre_strip or "",
-    )
     return HealAction(
         "stale_claim_pruned",
         key,
         status="applied",
         description=f"stripped paragraph naming {stale_id}",
         pre_strip_paragraph=capped_pre_strip,
+        audit=(
+            "stale_claim_pruned",
+            f"stripped stale reference to {stale_id} in article {key}",
+            {
+                "key": key,
+                "scope": scope,
+                "scope_id": scope_id or "",
+                "stale_identifier": stale_id,
+                # Already byte-capped by _cap_pre_strip(); audit_log re-caps defensively.
+                "pre_strip_paragraph": capped_pre_strip or "",
+            },
+        ),
     )
 
 
@@ -607,19 +634,21 @@ async def _heal_poison(
             description=f"zero failed: {type(e).__name__}",
         )
 
-    await write_audit(
-        "poison_access_zeroed",
-        f"reset access_count from {old_count} to 0",
-        key=key,
-        scope=scope,
-        scope_id=scope_id or "",
-        access_count_was=str(old_count),
-    )
     return HealAction(
         "poison_access_zeroed",
         key,
         status="applied",
         description=f"reset access_count {old_count} → 0",
+        audit=(
+            "poison_access_zeroed",
+            f"reset access_count from {old_count} to 0",
+            {
+                "key": key,
+                "scope": scope,
+                "scope_id": scope_id or "",
+                "access_count_was": str(old_count),
+            },
+        ),
     )
 
 
@@ -709,7 +738,12 @@ async def heal(
                     truncated_run_level += 1
                     continue
                 if cap is not None and (
-                    sum(1 for a in actions if _action_src_type(a.issue_type) == t) >= cap
+                    sum(
+                        1
+                        for a in actions
+                        if a.status != "skipped" and _action_src_type(a.issue_type) == t
+                    )
+                    >= cap
                 ):
                     truncated_by_type[t] = truncated_by_type.get(t, 0) + 1
                     continue
@@ -787,12 +821,18 @@ async def heal(
                         continue
                     action = await healer(svc, issue, scope, scope_id, db)
                     actions.append(action)
-                    n_this_type += 1
-                    actions_applied += 1
+                    # Only actionable work consumes the blast-radius budget; a
+                    # skipped no-op (unparseable description, missing row, …)
+                    # mutated nothing and must not crowd out a real fix.
+                    if action.status != "skipped":
+                        n_this_type += 1
+                        actions_applied += 1
                 db.commit()
             except Exception as e:
                 # Roll the whole group back; surface as errored actions so the
-                # report is truthful (no silent partial-commit).
+                # report is truthful (no silent partial-commit). Buffered audit
+                # payloads for this group are DROPPED — nothing committed, so no
+                # mutation may be recorded (invariant #7).
                 logger.warning("heal batch group rolled back type=%s: %s", t, type(e).__name__)
                 try:
                     db.rollback()
@@ -811,11 +851,19 @@ async def heal(
                             pre_strip_paragraph=a.pre_strip_paragraph,
                         )
                     )
+                continue
             finally:
                 try:
                     db.close()
                 except Exception:
                     pass
+            # Commit succeeded — NOW flush the group's buffered audit events.
+            # Emitting only post-commit guarantees the audit log never records a
+            # mutation that was rolled back.
+            for a in actions[group_start:]:
+                if a.audit is not None:
+                    event_type, summary, fields = a.audit
+                    await write_audit(event_type, summary, **fields)
     finally:
         _release_lock(lock_fd)
 

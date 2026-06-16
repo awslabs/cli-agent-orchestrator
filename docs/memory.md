@@ -26,7 +26,7 @@ hardening, auto-injection into provider config files, LLM wiki compaction, cross
 
 **In progress:** Phase 4 U1 wiki self-healing adds `cao memory heal`, which consumes the
 Phase 3 lint findings and applies a fix per issue type (dry-run by default, `--apply` to
-mutate, full audit trail). It lives on `feat/wiki-self-healing` and is not yet PR'd.
+mutate, full audit trail). It is up for review on `feat/wiki-self-healing` (PR #306).
 
 ## How It Works
 

@@ -401,6 +401,108 @@ class TestPoisonGate:
 
 
 # ===========================================================================
+# Audit emitted only AFTER a successful commit (rollback drops the audit)
+# ===========================================================================
+
+
+class TestAuditAfterCommit:
+    def _force_commit_failure(self, svc, monkeypatch):
+        """Wrap _get_db_session so the returned session's commit() raises."""
+        real_get = svc._get_db_session
+
+        def _patched():
+            db = real_get()
+            monkeypatch.setattr(db, "commit", _raise_commit)
+            return db
+
+        def _raise_commit():
+            raise RuntimeError("simulated commit failure")
+
+        monkeypatch.setattr(svc, "_get_db_session", _patched)
+
+    def test_poison_rollback_emits_no_audit_and_keeps_count(self, svc, audit_base, monkeypatch):
+        # poison_frequency's ONLY side effect is the in-session DB write. A
+        # commit failure must roll it back AND leave no false audit record.
+        _store(svc, "poisoned")
+        with svc._get_db_session() as db:
+            db.query(MemoryMetadataModel).filter_by(key="poisoned").first().access_count = 999
+            db.commit()
+
+        self._force_commit_failure(svc, monkeypatch)
+        issues = [_make_issue(issue_type="poison_frequency", key="poisoned")]
+        report = _run(
+            heal(issues, scope="global", scope_id=None, apply=True, aggressive=True, svc=svc)
+        )
+
+        assert report.actions[0].status == "error"
+        # Row reverted by rollback — count never zeroed.
+        assert int(_row(svc, "poisoned").access_count) == 999
+        # And crucially: NO mutation audit recorded for the rolled-back write.
+        log = _read_audit(audit_base)
+        assert "[poison_access_zeroed]" not in log
+
+    def test_orphan_rollback_emits_no_mutation_audit(self, svc, audit_base, monkeypatch):
+        _store(svc, "orphan-rb")
+        self._force_commit_failure(svc, monkeypatch)
+        issues = [_make_issue(issue_type="orphan_page", key="orphan-rb")]
+        report = _run(heal(issues, scope="global", scope_id=None, apply=True, svc=svc))
+
+        assert report.actions[0].status == "error"
+        assert "[orphan_pruned]" not in _read_audit(audit_base)
+
+    def test_successful_commit_still_emits_audit(self, svc, audit_base):
+        # Control: the happy path still emits the mutation audit (post-commit).
+        _store(svc, "orphan-ok")
+        issues = [_make_issue(issue_type="orphan_page", key="orphan-ok")]
+        report = _run(heal(issues, scope="global", scope_id=None, apply=True, svc=svc))
+        assert report.actions[0].status == "applied"
+        assert "[orphan_pruned]" in _read_audit(audit_base)
+
+
+# ===========================================================================
+# Skipped no-ops must not consume the cap budget
+# ===========================================================================
+
+
+class TestSkippedDoesNotConsumeCap:
+    def test_skipped_stale_claim_does_not_eat_cap(self, svc, audit_base, monkeypatch):
+        # Cap stale_claim at 1. An unparseable (skipped) issue ordered first must
+        # NOT consume that single slot — the real fix after it should still apply.
+        monkeypatch.setitem(wiki_healer.ISSUE_CAPS, "stale_claim", 1)
+        _store(svc, "real-article", content="intro\n\nrefers to src/gone.py here\n\noutro\n")
+        issues = [
+            _make_issue(issue_type="stale_claim", key="bogus", description="weird format"),
+            _make_issue(
+                issue_type="stale_claim",
+                key="real-article",
+                description="file not found: src/gone.py",
+            ),
+        ]
+        report = _run(heal(issues, scope="global", scope_id=None, apply=True, svc=svc))
+        statuses = {a.key: a.status for a in report.actions}
+        assert statuses["bogus"] == "skipped"
+        assert statuses["real-article"] == "applied"  # not crowded out by the skip
+        assert report.truncated_by_type.get("stale_claim", 0) == 0
+
+    def test_dry_run_skipped_does_not_eat_cap(self, svc, audit_base, monkeypatch):
+        monkeypatch.setitem(wiki_healer.ISSUE_CAPS, "stale_claim", 1)
+        _store(svc, "real-article", content="intro\n\nrefers to src/gone.py here\n\noutro\n")
+        issues = [
+            _make_issue(issue_type="stale_claim", key="bogus", description="weird format"),
+            _make_issue(
+                issue_type="stale_claim",
+                key="real-article",
+                description="file not found: src/gone.py",
+            ),
+        ]
+        report = _run(heal(issues, scope="global", scope_id=None, apply=False, svc=svc))
+        statuses = {a.key: a.status for a in report.actions}
+        assert statuses["bogus"] == "skipped"
+        assert statuses["real-article"] == "planned"
+        assert report.truncated_by_type.get("stale_claim", 0) == 0
+
+
+# ===========================================================================
 # graph_density flag-only + lint_error ignored
 # ===========================================================================
 
