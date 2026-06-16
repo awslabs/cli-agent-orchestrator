@@ -59,6 +59,13 @@ LOG_FILENAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 SYNC_AUDIT_EVENTS: frozenset = frozenset(
     {
         "lint_run_completed",
+        # Phase 4 U1 — wiki self-healing. Each applied mutation emits an
+        # AWAITED audit event; ``heal_run_completed`` summarises the run.
+        "orphan_pruned",
+        "contradiction_resolved",
+        "stale_claim_pruned",
+        "poison_access_zeroed",
+        "heal_run_completed",
     }
 )
 NOWAIT_AUDIT_EVENTS: frozenset = frozenset(

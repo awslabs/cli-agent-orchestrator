@@ -11,6 +11,7 @@ from click.testing import CliRunner
 from cli_agent_orchestrator.cli.commands.memory import (
     clear,
     delete,
+    heal_cmd,
     lint_cmd,
     list_memories,
     show,
@@ -400,3 +401,167 @@ class TestMemoryLint:
         assert len(payload) == 1
         assert payload[0]["key"] == "lonely"
         assert not any("lint_run_completed" in p["description"] for p in payload)
+
+
+class TestMemoryHeal:
+    """cao memory heal — dry-run default, --apply gate, poison dual-gate."""
+
+    @patch("cli_agent_orchestrator.services.wiki_healer.heal", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.services.wiki_lint.run_lint", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.cli.commands.memory._get_memory_service")
+    def test_dry_run_default(self, mock_get_svc, mock_run_lint, mock_heal):
+        from cli_agent_orchestrator.services.wiki_healer import HealAction, HealReport
+
+        mock_svc = MagicMock()
+        mock_svc.resolve_scope_id = MagicMock(return_value="proj-abc")
+        mock_get_svc.return_value = mock_svc
+        mock_run_lint.return_value = []
+        mock_heal.return_value = HealReport(
+            scope="project",
+            scope_id="proj-abc",
+            apply=False,
+            aggressive=False,
+            actions=[
+                HealAction(
+                    "orphan_pruned", "lonely", description="Would delete orphan", status="planned"
+                )
+            ],
+            dry_run_summary="Would apply 1 of 1 actionable findings (0 suppressed by caps).",
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(heal_cmd, ["--scope", "project"])
+
+        assert result.exit_code == 0
+        # heal() was called with apply=False by default.
+        _, kwargs = mock_heal.call_args
+        assert kwargs["apply"] is False
+        assert kwargs["aggressive"] is False
+        assert "Would apply 1" in result.stdout
+        assert "planned" in result.stdout
+
+    @patch("cli_agent_orchestrator.services.wiki_healer.heal", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.services.wiki_lint.run_lint", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.cli.commands.memory._get_memory_service")
+    def test_apply_flag_passed_through(self, mock_get_svc, mock_run_lint, mock_heal):
+        from cli_agent_orchestrator.services.wiki_healer import HealAction, HealReport
+
+        mock_svc = MagicMock()
+        mock_svc.resolve_scope_id = MagicMock(return_value="proj-abc")
+        mock_get_svc.return_value = mock_svc
+        mock_run_lint.return_value = []
+        mock_heal.return_value = HealReport(
+            scope="project",
+            scope_id="proj-abc",
+            apply=True,
+            aggressive=False,
+            actions=[
+                HealAction("orphan_pruned", "lonely", description="deleted", status="applied")
+            ],
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(heal_cmd, ["--scope", "project", "--apply"])
+
+        assert result.exit_code == 0
+        _, kwargs = mock_heal.call_args
+        assert kwargs["apply"] is True
+        assert "applied" in result.stdout
+
+    @patch("cli_agent_orchestrator.services.wiki_healer.heal", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.services.wiki_lint.run_lint", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.cli.commands.memory._get_memory_service")
+    def test_aggressive_flag_passed_through(self, mock_get_svc, mock_run_lint, mock_heal):
+        from cli_agent_orchestrator.services.wiki_healer import HealReport
+
+        mock_svc = MagicMock()
+        mock_svc.resolve_scope_id = MagicMock(return_value="proj-abc")
+        mock_get_svc.return_value = mock_svc
+        mock_run_lint.return_value = []
+        mock_heal.return_value = HealReport(
+            scope="project", scope_id="proj-abc", apply=True, aggressive=True, actions=[]
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(heal_cmd, ["--scope", "project", "--apply", "--aggressive"])
+
+        assert result.exit_code == 0
+        _, kwargs = mock_heal.call_args
+        assert kwargs["apply"] is True
+        assert kwargs["aggressive"] is True
+        assert "Nothing to heal." in result.stdout
+
+    @patch("cli_agent_orchestrator.services.wiki_healer.heal", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.services.wiki_lint.run_lint", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.cli.commands.memory._get_memory_service")
+    def test_issue_type_filter(self, mock_get_svc, mock_run_lint, mock_heal):
+        from cli_agent_orchestrator.services.wiki_healer import HealReport
+        from cli_agent_orchestrator.services.wiki_lint import LintIssue
+
+        mock_svc = MagicMock()
+        mock_svc.resolve_scope_id = MagicMock(return_value="proj-abc")
+        mock_get_svc.return_value = mock_svc
+        mock_run_lint.return_value = [
+            LintIssue(issue_type="orphan_page", key="a"),
+            LintIssue(issue_type="stale_claim", key="b", description="file not found: x.py"),
+        ]
+        mock_heal.return_value = HealReport(
+            scope="project", scope_id="proj-abc", apply=False, aggressive=False, actions=[]
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(heal_cmd, ["--scope", "project", "--issue-type", "orphan_page"])
+
+        assert result.exit_code == 0
+        passed_issues = mock_heal.call_args.args[0]
+        assert all(i.issue_type == "orphan_page" for i in passed_issues)
+        assert len(passed_issues) == 1
+
+    @patch("cli_agent_orchestrator.services.wiki_healer.heal", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.services.wiki_lint.run_lint", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.cli.commands.memory._get_memory_service")
+    def test_json_output(self, mock_get_svc, mock_run_lint, mock_heal):
+        import json
+
+        from cli_agent_orchestrator.services.wiki_healer import HealAction, HealReport
+
+        mock_svc = MagicMock()
+        mock_svc.resolve_scope_id = MagicMock(return_value="proj-abc")
+        mock_get_svc.return_value = mock_svc
+        mock_run_lint.return_value = []
+        mock_heal.return_value = HealReport(
+            scope="project",
+            scope_id="proj-abc",
+            apply=True,
+            aggressive=False,
+            actions=[
+                HealAction("orphan_pruned", "lonely", description="deleted", status="applied")
+            ],
+            total_suppressed=0,
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(heal_cmd, ["--scope", "project", "--apply", "--format", "json"])
+
+        assert result.exit_code == 0
+        payload = json.loads(result.stdout)
+        assert payload["apply"] is True
+        assert payload["actions"][0]["key"] == "lonely"
+
+    @patch("cli_agent_orchestrator.services.wiki_healer.heal", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.services.wiki_lint.run_lint", new_callable=AsyncMock)
+    @patch("cli_agent_orchestrator.cli.commands.memory._get_memory_service")
+    def test_lock_conflict_surfaces_clean_error(self, mock_get_svc, mock_run_lint, mock_heal):
+        from cli_agent_orchestrator.services.wiki_healer import HealConflictError
+
+        mock_svc = MagicMock()
+        mock_svc.resolve_scope_id = MagicMock(return_value="proj-abc")
+        mock_get_svc.return_value = mock_svc
+        mock_run_lint.return_value = []
+        mock_heal.side_effect = HealConflictError("another heal is running")
+
+        runner = CliRunner()
+        result = runner.invoke(heal_cmd, ["--scope", "project", "--apply"])
+
+        assert result.exit_code != 0
+        assert "another heal is running" in result.output

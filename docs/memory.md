@@ -2,6 +2,32 @@
 
 CAO's memory system gives agents persistent, cross-session storage. Agents store facts, decisions, and preferences during a session; CAO injects relevant memories back as context when the agent starts its next session.
 
+> For how it works under the hood — the three storage layers, the SQLite schema, and the read/write paths — see [`memory-internals.md`](memory-internals.md).
+
+## Delivery Status
+
+The memory system ships as a stack of PRs. Status as of 2026-06-16:
+
+| PR | Scope | Status |
+|---|---|---|
+| #245 | **Phase 1 — foundation**: scopes, store/recall/forget, markdown wiki storage, CLI commands, MCP tools (no auto-save) | ✅ Merged to `main` |
+| #254 | **Phase 2 — SQLite + BM25**: metadata index, keyword search, context-manager agent | ✅ Merged to `main` |
+| #262 | **Phase 2.5 — hardening**: per-scope caps, ISO-8601 timestamps, fork/marker safety, path-traversal guards | ✅ Merged to `main` |
+| #269 | **Auto-inject plugins**: built-in Claude Code + Kiro + Codex plugins that write memory into each provider's config file on terminal creation | ✅ Merged to `main` (2026-06-13) |
+| #285 | **Phase 3 — LLM wiki compile, cross-references, lint, audit log, 3-factor scoring**, Kimi session context | ✅ Merged to `main` (2026-06-15) |
+| #290 | **Web UI** for the memory system | ✅ Merged to `main` (2026-06-13) |
+| — | **Phase 4 U1 — wiki self-healing** (`cao memory heal`): turn lint findings into fixes, dry-run by default | 🟡 In progress — branch `feat/wiki-self-healing` |
+| — | **Phase 4 — import/export, federation** | ⏳ Pending — not yet split into a PR |
+
+**What works on `main` today:** store, recall, forget, four scopes, SQLite-indexed BM25
+search, 3-factor recall scoring, CLI inspection, MCP tools, retention/cleanup, all Phase 2.5
+hardening, auto-injection into provider config files, LLM wiki compaction, cross-references,
+`cao memory lint` detectors, the daily audit log, and the memory Web UI.
+
+**In progress:** Phase 4 U1 wiki self-healing adds `cao memory heal`, which consumes the
+Phase 3 lint findings and applies a fix per issue type (dry-run by default, `--apply` to
+mutate, full audit trail). It lives on `feat/wiki-self-healing` and is not yet PR'd.
+
 ## How It Works
 
 1. **Agent stores a memory** via `memory_store` MCP tool during a session
