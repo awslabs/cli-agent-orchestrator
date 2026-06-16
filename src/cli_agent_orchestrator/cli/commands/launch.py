@@ -16,7 +16,11 @@ from cli_agent_orchestrator.constants import (
     SERVER_PORT,
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.utils.terminal import poll_until_done, wait_until_terminal_status
+from cli_agent_orchestrator.utils.terminal import (
+    poll_until_done,
+    sync_backend_from_server,
+    wait_until_terminal_status,
+)
 
 # Providers that require workspace folder access
 PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
@@ -302,6 +306,10 @@ def launch(
         # if it times out we still attach so the user can inspect the
         # half-initialized session rather than orphan it in tmux.
         if not headless:
+            # Align the CLI's backend singleton with the running server.
+            # Without this, ``cao-server --terminal herdr`` + no config.json
+            # entry causes the CLI to default to tmux. See issue #308.
+            sync_backend_from_server()
             ready = wait_until_terminal_status(
                 terminal["id"],
                 {TerminalStatus.IDLE, TerminalStatus.COMPLETED},

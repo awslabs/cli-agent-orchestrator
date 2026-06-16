@@ -8,6 +8,69 @@ from click.testing import CliRunner
 
 from cli_agent_orchestrator.cli.commands.launch import _parse_env_pairs, launch
 
+# ── Backend auto-detection (issue #308) ──────────────────────────────
+
+
+def test_launch_syncs_backend_from_server_before_attach():
+    """Non-headless launch calls sync_backend_from_server() before get_backend().
+
+    Regression guard for #308: when ``cao-server --terminal herdr`` is used
+    without config.json, the CLI must auto-detect the server's backend via
+    /health rather than defaulting to tmux.
+    """
+    runner = CliRunner()
+    call_order = []
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend") as mock_get_backend,
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+        patch("cli_agent_orchestrator.cli.commands.launch.sync_backend_from_server") as mock_sync,
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
+
+        def record_sync():
+            call_order.append("sync")
+
+        def record_attach(*a, **kw):
+            call_order.append("attach")
+
+        mock_sync.side_effect = record_sync
+        mock_get_backend.return_value.attach_session.side_effect = record_attach
+
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
+
+        assert result.exit_code == 0
+        mock_sync.assert_called_once()
+        assert call_order == ["sync", "attach"]
+
+
+def test_launch_headless_does_not_sync_backend():
+    """Headless launch skips sync_backend_from_server (no attach needed)."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.sync_backend_from_server") as mock_sync,
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+
+        result = runner.invoke(launch, ["--agents", "test-agent", "--headless", "--yolo"])
+
+        assert result.exit_code == 0
+        mock_sync.assert_not_called()
+
 
 def test_launch_passes_cwd_by_default():
     """Test that launch command sends current working directory when not explicitly provided."""

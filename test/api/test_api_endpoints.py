@@ -39,6 +39,24 @@ class TestHealthCheck:
         assert components["herdr"] in ("ok", "unavailable")
         assert components["claude"] in ("ok", "unavailable")
 
+    def test_health_reports_terminal_backend_tmux(self, client):
+        """GET /health reports terminal_backend matching the active backend (tmux)."""
+        with patch("cli_agent_orchestrator.api.main.get_backend") as mock_backend:
+            mock_backend.return_value = MagicMock(spec=[])  # not HerdrBackend
+            response = client.get("/health")
+        data = response.json()
+        assert data["terminal_backend"] == "tmux"
+
+    def test_health_reports_terminal_backend_herdr(self, client):
+        """GET /health reports terminal_backend='herdr' when server uses HerdrBackend."""
+        from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+        mock_herdr = MagicMock(spec=HerdrBackend)
+        with patch("cli_agent_orchestrator.api.main.get_backend", return_value=mock_herdr):
+            response = client.get("/health")
+        data = response.json()
+        assert data["terminal_backend"] == "herdr"
+
 
 # ── Agent profiles endpoint ──────────────────────────────────────────
 

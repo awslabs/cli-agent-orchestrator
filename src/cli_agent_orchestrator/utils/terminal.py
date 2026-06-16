@@ -188,6 +188,32 @@ async def wait_until_status(
     return False
 
 
+def sync_backend_from_server() -> None:
+    """Query the running cao-server's /health endpoint and align the local backend singleton.
+
+    When ``cao-server --terminal herdr`` is used without setting ``terminal_backend``
+    in config.json, CLI processes that call ``get_backend()`` default to tmux.
+    This function bridges the gap by reading the server's active backend and
+    calling ``set_backend()`` so subsequent ``get_backend()`` calls return the
+    correct backend type.
+
+    Failures (server unreachable, unexpected response) are logged and silently
+    ignored — the CLI falls back to its normal config-based resolution.
+    """
+    from cli_agent_orchestrator.backends.factory import BackendFactory
+    from cli_agent_orchestrator.backends.registry import set_backend
+
+    try:
+        resp = requests.get(f"{API_BASE_URL}/health", timeout=2.0)
+        resp.raise_for_status()
+        data = resp.json()
+        backend_name = data.get("terminal_backend")
+        if backend_name:
+            set_backend(BackendFactory.create(backend_override=backend_name))
+    except Exception as e:
+        logger.debug(f"sync_backend_from_server: could not reach server: {e}")
+
+
 def poll_until_done(terminal_id: str, timeout: float, polling_interval: float = 1.0) -> None:
     """Poll terminal status until completed/error or timeout.
 

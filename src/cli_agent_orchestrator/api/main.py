@@ -378,12 +378,18 @@ app.add_middleware(
 async def health_check():
     import shutil
 
+    from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
     def _probe(binary: str) -> str:
         return "ok" if shutil.which(binary) else "unavailable"
+
+    backend = get_backend()
+    backend_name = "herdr" if isinstance(backend, HerdrBackend) else "tmux"
 
     return {
         "status": "ok",
         "service": "cli-agent-orchestrator",
+        "terminal_backend": backend_name,
         "components": {
             "cao": "ok",
             "herdr": _probe("herdr"),
