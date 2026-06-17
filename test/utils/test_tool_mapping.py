@@ -33,6 +33,7 @@ class TestResolveAllowedTools:
         result = resolve_allowed_tools(None, "developer")
         assert "execute_bash" in result
         assert "fs_*" in result
+        assert "web_fetch" in result
 
     def test_developer_default_when_no_role_no_tools(self):
         """No role + no allowedTools = developer defaults (secure default)."""
@@ -81,9 +82,9 @@ class TestGetDisallowedTools:
         assert "Write" in result
 
     def test_claude_code_developer_allows_all(self):
-        """Developer with fs_* and execute_bash should not block anything."""
+        """Developer (fs_*, execute_bash, web_fetch) should not block anything."""
         result = get_disallowed_tools(
-            "claude_code", ["@builtin", "fs_*", "execute_bash", "@cao-mcp-server"]
+            "claude_code", ["@builtin", "fs_*", "execute_bash", "web_fetch", "@cao-mcp-server"]
         )
         assert result == []
 
@@ -116,6 +117,63 @@ class TestGetDisallowedTools:
         result = get_disallowed_tools("claude_code", ["@cao-mcp-server", "@custom"])
         # Should block all native tools since no CAO tool categories are allowed
         assert len(result) > 0
+
+
+class TestClaudeCodeWebFetch:
+    """The web_fetch category gates Claude Code's network tools.
+
+    Before this category existed, WebFetch/WebSearch were unmapped and therefore
+    never blocked — a read-only reviewer or orchestration-only supervisor could
+    still reach the network (an exfiltration/SSRF surface). web_fetch makes that
+    governable: only profiles that grant it keep network access.
+    """
+
+    def test_web_fetch_allows_network_tools(self):
+        """A profile granting web_fetch does not block WebFetch/WebSearch."""
+        disallowed = get_disallowed_tools("claude_code", ["web_fetch"])
+        assert "WebFetch" not in disallowed
+        assert "WebSearch" not in disallowed
+
+    def test_supervisor_blocks_network_tools(self):
+        """Supervisor (no web_fetch) blocks both network tools."""
+        disallowed = get_disallowed_tools("claude_code", ["@cao-mcp-server", "fs_read", "fs_list"])
+        assert "WebFetch" in disallowed
+        assert "WebSearch" in disallowed
+
+    def test_reviewer_blocks_network_tools(self):
+        """Reviewer (no web_fetch) blocks both network tools."""
+        disallowed = get_disallowed_tools(
+            "claude_code", ["@builtin", "fs_read", "fs_list", "@cao-mcp-server"]
+        )
+        assert "WebFetch" in disallowed
+        assert "WebSearch" in disallowed
+
+    def test_execute_bash_does_not_grant_network(self):
+        """Network access is its own category — execute_bash alone blocks it.
+
+        Guards against folding the network tools into execute_bash: an agent
+        allowed only shell should not silently gain web access.
+        """
+        disallowed = get_disallowed_tools("claude_code", ["execute_bash"])
+        assert "WebFetch" in disallowed
+        assert "WebSearch" in disallowed
+
+    def test_gemini_web_fetch_mapping(self):
+        """Gemini has the equivalent network category (web_fetch, google_web_search)."""
+        disallowed = get_disallowed_tools("gemini_cli", ["fs_read"])
+        assert "web_fetch" in disallowed
+        assert "google_web_search" in disallowed
+        # Granting it unblocks both.
+        granted = get_disallowed_tools("gemini_cli", ["fs_read", "web_fetch"])
+        assert "web_fetch" not in granted
+        assert "google_web_search" not in granted
+
+    def test_web_fetch_noop_for_unmapped_provider(self):
+        """For a provider with no network entry (copilot), web_fetch is a
+        harmless no-op — it maps to nothing and blocks nothing extra."""
+        assert get_disallowed_tools("copilot_cli", ["web_fetch", "fs_read"]) == sorted(
+            {"shell", "write", "list", "grep"}
+        )
 
 
 class TestFormatToolSummary:
@@ -158,7 +216,7 @@ class TestClaudeCodeSubagentEscape:
 
     def test_developer_with_bash_keeps_task(self):
         disallowed = get_disallowed_tools(
-            "claude_code", ["@builtin", "fs_*", "execute_bash", "@cao-mcp-server"]
+            "claude_code", ["@builtin", "fs_*", "execute_bash", "web_fetch", "@cao-mcp-server"]
         )
         assert "Task" not in disallowed
         assert disallowed == []

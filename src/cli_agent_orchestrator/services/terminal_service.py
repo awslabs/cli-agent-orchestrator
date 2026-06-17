@@ -120,6 +120,13 @@ RUNTIME_SKILL_PROMPT_PROVIDERS = {
     ProviderType.KIMI_CLI.value,
 }
 
+# Providers whose tool restrictions are prompt-level text only (no native
+# blocking mechanism) — a restricted policy on these is advisory, not enforced.
+SOFT_ENFORCEMENT_PROVIDERS = {
+    ProviderType.KIMI_CLI.value,
+    ProviderType.CODEX.value,
+}
+
 
 async def create_terminal(
     provider: str,
@@ -232,6 +239,20 @@ async def create_terminal(
             mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
             allowed_tools = resolve_allowed_tools(
                 profile.allowedTools, profile.role, mcp_server_names
+            )
+
+        # Soft-enforcement guard: kimi_cli/codex have NO native tool-blocking
+        # mechanism (kimi runs --yolo; restrictions are prompt-level text
+        # only), so a restricted policy on them is advisory, not enforced.
+        # Surface that loudly at launch so operators route restricted or
+        # write-capable roles to hard-enforcement providers instead.
+        if provider in SOFT_ENFORCEMENT_PROVIDERS and allowed_tools and "*" not in allowed_tools:
+            logger.warning(
+                f"Terminal {terminal_id}: provider '{provider}' cannot enforce tool "
+                f"restrictions (soft/prompt-level only) but profile '{agent_profile}' "
+                f"requests {allowed_tools}. Treat this worker as unrestricted; for "
+                f"enforced restrictions use claude_code, kiro_cli, gemini_cli, or "
+                f"copilot_cli."
             )
 
         # Step 3c: Persist terminal metadata to database after restrictions

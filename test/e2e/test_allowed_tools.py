@@ -441,7 +441,7 @@ class TestClaudeCodeAllowedTools:
         _run_allowed_tools_stored_test(
             provider="claude_code",
             agent_profile="developer",
-            allowed_tools="@builtin,fs_*,execute_bash,@cao-mcp-server",
+            allowed_tools="@builtin,fs_*,execute_bash,web_fetch,@cao-mcp-server",
         )
 
 

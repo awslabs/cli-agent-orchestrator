@@ -1,7 +1,7 @@
 """Tool mapping from CAO vocabulary to provider-native tool names.
 
 CAO defines a universal tool vocabulary (execute_bash, fs_read, fs_write, fs_list, fs_*,
-@builtin, @cao-mcp-server) that is translated to each provider's native tool names.
+web_fetch, @builtin, @cao-mcp-server) that is translated to each provider's native tool names.
 This module provides the mapping and a function to compute which native tools to BLOCK
 given a set of allowed CAO tools.
 """
@@ -32,6 +32,14 @@ TOOL_MAPPING: Dict[str, Dict[str, List[str]]] = {
         "fs_write": ["Edit", "Write", "NotebookEdit"],
         "fs_list": ["Glob", "Grep"],
         "fs_*": ["Read", "Edit", "Write", "NotebookEdit", "Glob", "Grep"],
+        # Network access. WebSearch gates here too: both reach the network and
+        # are the agent's exfiltration/SSRF surface, so a profile without
+        # web_fetch loses both. Note: the subagent tool (Task) is deliberately
+        # NOT a separate category — it folds into execute_bash above, because a
+        # Task subagent spawns with its own full toolset and can run shell;
+        # exposing it standalone would let a profile grant subagent without
+        # execute_bash and re-open that escape.
+        "web_fetch": ["WebFetch", "WebSearch"],
     },
     "copilot_cli": {
         "execute_bash": ["shell"],
@@ -53,6 +61,7 @@ TOOL_MAPPING: Dict[str, Dict[str, List[str]]] = {
             "search_file_content",
             "glob",
         ],
+        "web_fetch": ["web_fetch", "google_web_search"],
     },
 }
 
