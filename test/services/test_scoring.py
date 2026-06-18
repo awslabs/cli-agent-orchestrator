@@ -324,6 +324,25 @@ class TestT1CrossScopeStoreGuard:
         for s in ("session", "project", "agent", "global"):
             assert scope_write_allowed(s, s) is True
 
+    def test_scope_write_allowed_federated_table(self):
+        """Federated is write-rank 0 but writable by every caller except
+        session: any caller with rank > 0 (project/agent/global) may write it,
+        federated may write itself, but session (rank 0, names differ) cannot,
+        and federated cannot write the higher-ranked global tier.
+        """
+        assert scope_write_allowed("global", "federated") is True
+        assert scope_write_allowed("project", "federated") is True
+        assert scope_write_allowed("agent", "federated") is True
+        assert scope_write_allowed("session", "federated") is False
+        assert scope_write_allowed("federated", "federated") is True
+        assert scope_write_allowed("federated", "global") is False
+
+    def test_sort_by_recency_invariant_still_present(self):
+        """Confirm the load-bearing byte-identical recency test still exists
+        (do NOT modify it).
+        """
+        assert hasattr(TestU73PlanCases, "test_sort_by_recency_reproduces_phase1_order")
+
 
 # ===========================================================================
 # T2 — Mass-recall score gaming / increment rate-limit

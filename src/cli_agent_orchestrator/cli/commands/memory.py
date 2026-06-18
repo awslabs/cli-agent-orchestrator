@@ -53,7 +53,7 @@ def memory():
     "--scope",
     type=click.Choice([s.value for s in MemoryScope], case_sensitive=False),
     default=None,
-    help="Filter by scope (global, project, session, agent).",
+    help="Filter by scope (global, project, session, agent, federated).",
 )
 @click.option(
     "--type",
@@ -179,7 +179,7 @@ def delete(key, scope, yes):
     "--scope",
     type=click.Choice([s.value for s in MemoryScope], case_sensitive=False),
     required=True,
-    help="Scope to clear (required). One of: global, project, session, agent.",
+    help="Scope to clear (required). One of: global, project, session, agent, federated.",
 )
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt.")
 def clear(scope, yes):

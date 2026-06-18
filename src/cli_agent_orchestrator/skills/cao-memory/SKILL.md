@@ -24,6 +24,7 @@ Every memory has a **scope** (where it applies) and a **type** (what kind of fac
 |-------|-----------|---------|
 | `project` (default) | This repo / working directory | Conventions, architecture, build rules |
 | `global` | Every project | User identity, durable cross-project preferences |
+| `federated` | Every project on this machine | Reusable, repo-independent lessons worth sharing across all your work (rejects credentials) |
 | `session` | This run only | Short-lived task context |
 | `agent` | This agent role | Role-specific working notes |
 
@@ -39,7 +40,7 @@ already told you, search memory first.
 memory_recall(query="database widgets endpoint testing")
 ```
 
-Omit `scope` to search all scopes (results follow precedence session → project → global → agent).
+Omit `scope` to search all scopes (results follow precedence session → project → global → agent → federated).
 Filter with `scope=` or `memory_type=` when you know where to look. Recall is for searching
 *beyond* what was auto-injected (see below) — don't re-recall what's already in front of you.
 
@@ -65,6 +66,29 @@ memory_store(
 ```
 
 Same `key` + `scope` upserts (updates in place) rather than duplicating.
+
+### Share across all your projects — `scope="federated"`
+
+When a lesson is durable **and not specific to this repo** — a reusable library gotcha, a
+debugging trick, a tooling preference that holds everywhere — store it with
+`scope="federated"` so it follows you into every project on this machine, not just this one.
+
+```
+memory_store(
+    content="tmux paste-buffer needs `-p` or multi-line input loses bracketed-paste framing.",
+    scope="federated",
+    memory_type="reference",
+)
+```
+
+Federated memories sit at the **lowest recall precedence** — a project-local fact with the
+same key always wins — so federating is safe: it only adds a fallback, never overrides what's
+true here. To un-share, `memory_forget(key=..., scope="federated")`.
+
+- **Never federate secrets.** Tokens, keys, and passwords are **rejected automatically** on a
+  federated write — and they'd be exposed to every project anyway. Keep credentials out of
+  memory entirely.
+- **When in doubt, use `project`.** Federate only what you're confident is reusable everywhere.
 
 ## Forget — remove what's wrong or superseded
 

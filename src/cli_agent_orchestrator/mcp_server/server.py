@@ -1093,7 +1093,10 @@ async def memory_store(
     content: str = Field(description="Memory content to store (markdown supported)"),
     scope: str = Field(
         default="project",
-        description='Memory scope: "global", "project", "session", or "agent"',
+        description=(
+            'Memory scope: "global", "project", "session", "agent", or '
+            '"federated" (machine-wide shared tier; rejects credentials)'
+        ),
     ),
     memory_type: str = Field(
         default="project",
@@ -1153,7 +1156,10 @@ async def memory_recall(
     ),
     scope: Optional[str] = Field(
         default=None,
-        description='Filter by scope: "global", "project", "session", "agent". Omit to search all.',
+        description=(
+            'Filter by scope: "global", "project", "session", "agent", '
+            '"federated". Omit to search all.'
+        ),
     ),
     memory_type: Optional[str] = Field(
         default=None,
@@ -1237,7 +1243,10 @@ async def memory_forget(
     key: str = Field(description="Key of the memory to remove (e.g. 'prefer-pytest')"),
     scope: str = Field(
         default="project",
-        description='Scope of the memory to remove: "global", "project", "session", or "agent"',
+        description=(
+            'Scope of the memory to remove: "global", "project", "session", '
+            '"agent", or "federated"'
+        ),
     ),
 ) -> Dict[str, Any]:
     """Remove a memory by key and scope.
