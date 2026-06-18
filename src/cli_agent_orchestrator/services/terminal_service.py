@@ -677,7 +677,7 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
             # response marker was likely produced but pushed past the scrollback
             # limit (overflow).  If the buffer is mostly empty, the agent never
             # produced a text response (e.g. only tool calls, crash, or timeout).
-            actual_lines = len(full_output.splitlines())
+            actual_lines = full_output.count("\n") + 1
             overflow_threshold = int(_ESCALATION_STEPS[-1] * 0.9)
             if actual_lines >= overflow_threshold:
                 logger.warning(
