@@ -829,11 +829,10 @@ async def heal(
                         actions_applied += 1
                 db.commit()
             except Exception as e:
-                # Roll the whole group back; surface as errored actions so the
-                # report is truthful (no silent partial-commit). Buffered audit
-                # payloads for this group are DROPPED — nothing committed, so no
-                # mutation may be recorded (invariant #7).
-                logger.warning("heal batch group rolled back type=%s: %s", t, type(e).__name__)
+                # Roll the whole group back at the DB level; filesystem side effects (if any)
+                # may already have occurred, so surface as errored actions and avoid emitting
+                # mutation audits for this group.
+                logger.warning("heal batch group commit failed type=%s: %s", t, type(e).__name__)
                 try:
                     db.rollback()
                 except Exception:
@@ -846,7 +845,10 @@ async def heal(
                             a.issue_type,
                             a.key,
                             related_key=a.related_key,
-                            description=f"rolled back ({type(e).__name__}): {a.description}",
+                            description=(
+                                f"commit failed ({type(e).__name__}); DB rolled back; "
+                                f"filesystem changes may be partial: {a.description}"
+                            ),
                             status="error",
                             pre_strip_paragraph=a.pre_strip_paragraph,
                         )
