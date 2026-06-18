@@ -4,29 +4,21 @@ CAO's memory system gives agents persistent, cross-session storage. Agents store
 
 > For how it works under the hood — the three storage layers, the SQLite schema, and the read/write paths — see [`memory-internals.md`](memory-internals.md).
 
-## Delivery Status
+## Capabilities
 
-The memory system ships as a stack of PRs. Status as of 2026-06-16:
-
-| PR | Scope | Status |
-|---|---|---|
-| #245 | **Phase 1 — foundation**: scopes, store/recall/forget, markdown wiki storage, CLI commands, MCP tools (no auto-save) | ✅ Merged to `main` |
-| #254 | **Phase 2 — SQLite + BM25**: metadata index, keyword search, context-manager agent | ✅ Merged to `main` |
-| #262 | **Phase 2.5 — hardening**: per-scope caps, ISO-8601 timestamps, fork/marker safety, path-traversal guards | ✅ Merged to `main` |
-| #269 | **Auto-inject plugins**: built-in Claude Code + Kiro + Codex plugins that write memory into each provider's config file on terminal creation | ✅ Merged to `main` (2026-06-13) |
-| #285 | **Phase 3 — LLM wiki compile, cross-references, lint, audit log, 3-factor scoring**, Kimi session context | ✅ Merged to `main` (2026-06-15) |
-| #290 | **Web UI** for the memory system | ✅ Merged to `main` (2026-06-13) |
-| — | **Phase 4 U1 — wiki self-healing** (`cao memory heal`): turn lint findings into fixes, dry-run by default | 🟡 In progress — branch `feat/wiki-self-healing` |
-| — | **Phase 4 — import/export, federation** | ⏳ Pending — not yet split into a PR |
-
-**What works on `main` today:** store, recall, forget, four scopes, SQLite-indexed BM25
-search, 3-factor recall scoring, CLI inspection, MCP tools, retention/cleanup, all Phase 2.5
-hardening, auto-injection into provider config files, LLM wiki compaction, cross-references,
-`cao memory lint` detectors, the daily audit log, and the memory Web UI.
-
-**In progress:** Phase 4 U1 wiki self-healing adds `cao memory heal`, which consumes the
-Phase 3 lint findings and applies a fix per issue type (dry-run by default, `--apply` to
-mutate, full audit trail). It is up for review on `feat/wiki-self-healing` (PR #306).
+- **Four scopes** (`global`, `project`, `session`, `agent`) and four type labels.
+- **Store / recall / forget** via MCP tools and `cao memory` CLI commands.
+- **Markdown wiki storage** with a SQLite metadata index.
+- **Search**: keyword (BM25), recency, or hybrid; results ranked by recency, a
+  composite 3-factor score (BM25 + recency + usage), or usage.
+- **Cross-references** between related memories, expandable on recall.
+- **Auto-injection** into each provider's config file on terminal creation, plus a
+  `<cao-memory>` block prepended to the agent's first message.
+- **LLM wiki compaction** (`cao memory compact`) that rewrites topic articles.
+- **Linting** (`cao memory lint`) for orphans, contradictions, stale claims, and more.
+- **Self-healing** (`cao memory heal`) that turns lint findings into fixes — dry-run
+  by default, `--apply` to mutate, with a full audit trail.
+- **Tiered retention / cleanup**, a daily audit log, and a memory Web UI.
 
 ## How It Works
 
@@ -46,7 +38,10 @@ Scope controls where a memory is stored and who can read it back.
 | `session` | `memory/global/wiki/session/` | Ephemeral: notes for current session only |
 | `agent` | `memory/global/wiki/agent/` | Role-specific: patterns the agent role always applies |
 
-`project` is the default scope. The project hash is `sha256(realpath(cwd))[:12]`.
+`project` is the default scope. Project identity resolves via a precedence chain — a
+`CAO_PROJECT_ID` / `memory.project_id` override, then the normalized git remote URL, then
+`sha256(realpath(cwd))[:12]` as a fallback — so a project stays recallable across renames
+and moves.
 
 > **Note:** `session` and `agent` scopes are stored under the global container, not in their own top-level directories. Only `project` scope gets a dedicated directory keyed by project hash.
 
@@ -85,14 +80,19 @@ Search memories by keyword query and optional filters.
 
 ```
 memory_recall(
-  query="testing",     # optional, searches content
-  scope="project",     # optional, filter by scope
-  memory_type=None,    # optional, filter by type
-  limit=10             # optional, default 10, max 100
+  query="testing",         # optional, searches content
+  scope="project",         # optional, filter by scope
+  memory_type=None,        # optional, filter by type
+  limit=10,                # optional, default 10, max 100
+  search_mode="hybrid",    # optional: "hybrid" (default), "bm25", "metadata"
+  sort_by="recency",       # optional: "recency" (default), "score", "usage"
+  include_related=False    # optional, expand cross-referenced memories
 )
 ```
 
-Results are returned sorted by recency, with scope precedence: `session` > `project` > `global`.
+`sort_by` controls ranking: `recency` (newest first), `score` (composite 3-factor —
+BM25 relevance + recency + usage), or `usage` (most accessed). When no `scope` is
+given, results follow scope precedence: `session` > `project` > `global`.
 
 ### `memory_forget`
 
@@ -124,11 +124,39 @@ cao memory delete <key> --scope project --yes
 
 # Clear all memories for a scope
 cao memory clear --scope session --yes
+
+# Lint the wiki for orphans, contradictions, stale claims, etc.
+cao memory lint
+cao memory lint --scope project --format json
+
+# Compact wiki topics with the LLM compiler (repair sweep)
+cao memory compact --scope global
+cao memory compact --key testing-framework
+
+# Repair lint findings — dry-run by default, --apply to mutate
+cao memory heal --scope project              # dry-run plan
+cao memory heal --scope project --apply
+cao memory heal --scope project --apply --aggressive   # also heal poison_frequency
 ```
+
+`cao memory heal` consumes the findings from `cao memory lint` and applies one fix per
+issue type: it deletes orphan pages, resolves contradictions (keeping the newer article),
+strips stale claims, and — only under `--aggressive` — zeroes poisoned access counts. It
+is dry-run by default; pass `--apply` to mutate. Every applied mutation is written to the
+daily audit log.
 
 ## Context Injection
 
-When an agent receives its first message in a session, CAO prepends a `<cao-memory>` block containing relevant memories (up to 3000 characters). The block format:
+CAO injects relevant memories into a new session two ways:
+
+1. **First-message block** — when an agent receives its first message in a session,
+   CAO prepends a `<cao-memory>` block containing relevant memories.
+2. **Provider config file** — built-in plugins for Claude Code, Codex, and Kiro CLI
+   write the same block into each provider's per-project config file (e.g.
+   `.claude/CLAUDE.md`) on terminal creation, delimited by `cao-memory` markers so
+   repeated runs overwrite the same section.
+
+The block format:
 
 ```
 <cao-memory>
@@ -141,11 +169,16 @@ When an agent receives its first message in a session, CAO prepends a `<cao-memo
 <original user message>
 ```
 
-Memories are selected in scope precedence order: `session` > `project` > `global`.
+Memories are selected in scope precedence order: `session` > `project` > `global`. Each
+scope is independently capped — at most `MEMORY_MAX_PER_SCOPE` (10) entries and
+`MEMORY_SCOPE_BUDGET_CHARS` (1000) characters per scope — so one scope cannot monopolize
+the injection budget.
 
-## Auto-Save
+## Saving Memories
 
-In Phase 1 there is no automatic save hook. Agents must call `memory_store` explicitly via MCP when they want to persist a fact. Agent profiles include guidance on when to store. Hook-driven auto-save is shipped via per-provider plugins in a subsequent PR.
+Agents call `memory_store` explicitly via MCP when they want to persist a fact; agent
+profiles include guidance on when to store (see below). Hook- and plugin-driven injection
+surfaces stored memories back into later sessions automatically.
 
 ## Storage Layout
 
