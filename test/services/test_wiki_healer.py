@@ -78,11 +78,16 @@ def _store(svc, key, content="body content here", *, scope="global", tags="t"):
 
 def _row(svc, key, scope="global", scope_id=None):
     with svc._get_db_session() as db:
-        return (
-            db.query(MemoryMetadataModel)
-            .filter(MemoryMetadataModel.key == key, MemoryMetadataModel.scope == scope)
-            .first()
+        q = db.query(MemoryMetadataModel).filter(
+            MemoryMetadataModel.key == key,
+            MemoryMetadataModel.scope == scope,
+            (
+                MemoryMetadataModel.scope_id == scope_id
+                if scope_id is not None
+                else MemoryMetadataModel.scope_id.is_(None)
+            ),
         )
+        return q.first()
 
 
 # ===========================================================================
