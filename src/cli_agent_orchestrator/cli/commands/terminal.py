@@ -2,6 +2,8 @@
 
 import json
 import os
+import re
+import shlex
 
 import click
 import requests
@@ -24,6 +26,11 @@ def restore(terminal_id: str):
     working directory and loads the saved scrollback history into the pane.
     The session must still exist.
     """
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", terminal_id):
+        raise click.ClickException(
+            f"Invalid terminal_id '{terminal_id}'. Only alphanumeric, underscore, and hyphen characters are allowed."
+        )
+
     snapshot_path = TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json"
     scrollback_path = TERMINAL_LOG_DIR / f"{terminal_id}.scrollback"
 
@@ -57,9 +64,9 @@ def restore(terminal_id: str):
     login_shell = os.environ.get("SHELL", "bash")
 
     if scrollback_path.exists():
-        window_shell = f"cat '{scrollback_path}'; exec {login_shell} -l"
+        window_shell = f"cat {shlex.quote(str(scrollback_path))}; exec {shlex.quote(login_shell)} -l"
     else:
-        window_shell = f"exec {login_shell} -l"
+        window_shell = f"exec {shlex.quote(login_shell)} -l"
 
     try:
         get_backend().create_window(
