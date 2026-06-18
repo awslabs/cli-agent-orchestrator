@@ -616,9 +616,8 @@ class MemoryService:
 
             hit = scan_for_secrets(content)
             if hit:
-                # Log the pattern NAME only — never the raw key (which is
-                # caller-supplied and unsanitized here) nor content bytes.
-                logger.warning("federated_secret_rejected pattern=%s", hit)
+                # Do not log detector output; emit only a constant event marker.
+                logger.warning("federated_secret_rejected")
                 raise ValueError(f"federated write rejected: matched credential pattern {hit!r}")
 
         # Store-time cross-scope write guard. A caller may
