@@ -90,6 +90,17 @@ def _row(svc, key, scope="global", scope_id=None):
         return q.first()
 
 
+def _make_orphan(svc, key, content="orphan body", *, scope="global", scope_id=None):
+    """Create a TRUE orphan: a wiki file on disk with NO SQLite row and NO
+    index entry. This is the only input the orphan healer should ever delete —
+    a key that still has a row/index line in this scope is a live memory and is
+    refused by the defensive re-check (cross-project collision safety)."""
+    wiki_path = svc.get_wiki_path(scope, scope_id, key)
+    wiki_path.parent.mkdir(parents=True, exist_ok=True)
+    wiki_path.write_text(content, encoding="utf-8")
+    return wiki_path
+
+
 # ===========================================================================
 # Strip algorithm unit tests
 # ===========================================================================
@@ -179,10 +190,9 @@ class TestDryRun:
 
 class TestOrphanFix:
     def test_orphan_applied_deletes_everything(self, svc, audit_base):
-        _store(svc, "stale-orphan")
-        wiki_path = svc.get_wiki_path("global", None, "stale-orphan")
+        wiki_path = _make_orphan(svc, "stale-orphan")
         assert wiki_path.exists()
-        assert _row(svc, "stale-orphan") is not None
+        assert _row(svc, "stale-orphan") is None  # true orphan — no SQLite row
 
         issues = [_make_issue(issue_type="orphan_page", key="stale-orphan")]
         report = _run(heal(issues, scope="global", scope_id=None, apply=True, svc=svc))
@@ -197,6 +207,27 @@ class TestOrphanFix:
         log = _read_audit(audit_base)
         assert "[orphan_pruned]" in log
         assert "key=stale-orphan" in log
+
+    def test_orphan_with_live_row_is_refused(self, svc, audit_base):
+        # Cross-project collision safety: run_lint(scope="project") returns
+        # orphans across ALL containers, but LintIssue carries no scope_id, so
+        # the healer reconstructs the path in the CURRENT container. A key that
+        # is a LIVE memory here (SQLite row present) must NOT be deleted even
+        # though some other project flagged the same key as an orphan.
+        _store(svc, "shared-key")
+        wiki_path = svc.get_wiki_path("global", None, "shared-key")
+        assert wiki_path.exists()
+        assert _row(svc, "shared-key") is not None
+
+        issues = [_make_issue(issue_type="orphan_page", key="shared-key")]
+        report = _run(heal(issues, scope="global", scope_id=None, apply=True, svc=svc))
+
+        assert report.actions[0].status == "skipped"
+        assert "not orphaned" in report.actions[0].description
+        # Live memory untouched.
+        assert wiki_path.exists()
+        assert _row(svc, "shared-key") is not None
+        assert "[orphan_pruned]" not in _read_audit(audit_base)
 
     def test_orphan_missing_file_still_cleans(self, svc, audit_base):
         # No file at all — healer should not crash, should emit audit.
@@ -447,7 +478,7 @@ class TestAuditAfterCommit:
         assert "[poison_access_zeroed]" not in log
 
     def test_orphan_rollback_emits_no_mutation_audit(self, svc, audit_base, monkeypatch):
-        _store(svc, "orphan-rb")
+        _make_orphan(svc, "orphan-rb")
         self._force_commit_failure(svc, monkeypatch)
         issues = [_make_issue(issue_type="orphan_page", key="orphan-rb")]
         report = _run(heal(issues, scope="global", scope_id=None, apply=True, svc=svc))
@@ -457,7 +488,7 @@ class TestAuditAfterCommit:
 
     def test_successful_commit_still_emits_audit(self, svc, audit_base):
         # Control: the happy path still emits the mutation audit (post-commit).
-        _store(svc, "orphan-ok")
+        _make_orphan(svc, "orphan-ok")
         issues = [_make_issue(issue_type="orphan_page", key="orphan-ok")]
         report = _run(heal(issues, scope="global", scope_id=None, apply=True, svc=svc))
         assert report.actions[0].status == "applied"
@@ -543,7 +574,7 @@ class TestCaps:
         # Shrink the orphan cap so we can exercise truncation cheaply.
         monkeypatch.setitem(wiki_healer.ISSUE_CAPS, "orphan_page", 2)
         for i in range(5):
-            _store(svc, f"orphan-{i}")
+            _make_orphan(svc, f"orphan-{i}")
         issues = [_make_issue(issue_type="orphan_page", key=f"orphan-{i}") for i in range(5)]
         report = _run(heal(issues, scope="global", scope_id=None, apply=True, svc=svc))
         assert len([a for a in report.actions if a.status == "applied"]) == 2
@@ -555,7 +586,7 @@ class TestCaps:
     def test_run_level_cap_reported(self, svc, audit_base, monkeypatch):
         monkeypatch.setattr(wiki_healer, "MAX_HEAL_ACTIONS", 2)
         for i in range(4):
-            _store(svc, f"orphan-{i}")
+            _make_orphan(svc, f"orphan-{i}")
         issues = [_make_issue(issue_type="orphan_page", key=f"orphan-{i}") for i in range(4)]
         report = _run(heal(issues, scope="global", scope_id=None, apply=True, svc=svc))
         assert len(report.actions) == 2

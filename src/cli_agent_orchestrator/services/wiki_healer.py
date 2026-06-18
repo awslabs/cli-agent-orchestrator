@@ -244,6 +244,49 @@ def _now_ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _row_exists(db: Any, key: str, scope: str, scope_id: Optional[str]) -> bool:
+    """True iff a metadata row exists for (key, scope, scope_id) on ``db``."""
+    from cli_agent_orchestrator.clients.database import MemoryMetadataModel
+
+    return (
+        db.query(MemoryMetadataModel)
+        .filter(
+            MemoryMetadataModel.key == key,
+            MemoryMetadataModel.scope == scope,
+            (
+                MemoryMetadataModel.scope_id == scope_id
+                if scope_id is not None
+                else MemoryMetadataModel.scope_id.is_(None)
+            ),
+        )
+        .first()
+    ) is not None
+
+
+# Mirror the index-entry shape parsed by wiki_lint._detect_orphan_pages.
+_INDEX_KEY_RE = re.compile(r"\[([a-z0-9-]{1,60})\]")
+
+
+def _index_has_key(svc: MemoryService, scope: str, scope_id: Optional[str], key: str) -> bool:
+    """True iff ``key`` appears as an index entry for this (scope, scope_id).
+
+    Best-effort read of the container's ``index.md``. On any read error we
+    return ``True`` (treat as present) so a transient failure never green-lights
+    a deletion — the orphan guard must fail safe.
+    """
+    try:
+        index_path = svc.get_index_path(scope, scope_id)
+        if not index_path.exists():
+            return False
+        for line in index_path.read_text(encoding="utf-8").splitlines():
+            m = _INDEX_KEY_RE.search(line)
+            if m and m.group(1) == key:
+                return True
+        return False
+    except OSError:
+        return True
+
+
 def _delete_row(db: Any, key: str, scope: str, scope_id: Optional[str]) -> int:
     """Delete the metadata row for (key, scope, scope_id) on the SHARED session.
 
@@ -287,6 +330,22 @@ async def _heal_orphan(
     except ValueError:
         return HealAction(
             "orphan_pruned", key, status="skipped", description="path traversal guard rejected key"
+        )
+
+    # Defensive orphan re-check (cross-project safety). The LintIssue carries no
+    # scope_id, and run_lint(scope="project") returns orphans across ALL project
+    # containers; the healer reconstructs wiki_path using the CURRENT (scope,
+    # scope_id). A key collision (project B has an orphan key that is a LIVE
+    # memory in project A) would otherwise delete a valid file. An orphan is, by
+    # definition, absent from BOTH the index and SQLite for its own container —
+    # so if either is present for THIS (scope, scope_id) the file is not
+    # orphaned here and we refuse to unlink it.
+    if _row_exists(db, key, scope, scope_id) or _index_has_key(svc, scope, scope_id, key):
+        return HealAction(
+            "orphan_pruned",
+            key,
+            status="skipped",
+            description="not orphaned in this scope (SQLite row or index entry present); refusing delete",
         )
 
     if not wiki_path.exists():
