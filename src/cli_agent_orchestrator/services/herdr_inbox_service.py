@@ -408,7 +408,13 @@ class HerdrInboxService:
             # do we fall through to the delete path.
             if term_window and self._label_still_live(term_window):
                 try:
-                    new_pane_id = get_backend().get_pane_id(
+                    # Invalidate pane cache so get_pane_id does a fresh label-based
+                    # lookup instead of returning the stale pane_id we just proved
+                    # is no longer live. See PR #309 review comment.
+                    backend = get_backend()
+                    if hasattr(backend, "_pane_cache"):
+                        backend._pane_cache.pop(terminal_id, None)
+                    new_pane_id = backend.get_pane_id(
                         terminal_id, term_session or "", term_window
                     )
                 except Exception as e:
