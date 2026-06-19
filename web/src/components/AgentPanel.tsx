@@ -25,6 +25,10 @@ export function AgentPanel() {
   const [provider, setProvider] = useState('kiro_cli')
   const [profile, setProfile] = useState('')
   const [creating, setCreating] = useState(false)
+  // Synchronous in-flight lock: prevents a second submit (rapid double-click or
+  // Enter in the form inputs, which bypass the button's disabled state) from
+  // firing before the `creating` state re-renders and creating a duplicate session.
+  const creatingRef = useRef(false)
   const [liveTerminal, setLiveTerminal] = useState<{ id: string; provider?: string; agentProfile?: string | null } | null>(null)
   const [profiles, setProfiles] = useState<AgentProfileInfo[]>([])
   const [loadingProfiles, setLoadingProfiles] = useState(true)
@@ -137,14 +141,19 @@ export function AgentPanel() {
   }, [activeSessionDetail?.terminals.map(t => t.id).join(',')])
 
   const handleCreate = async () => {
-    if (!profile.trim()) return
+    if (creatingRef.current || !profile.trim()) return
+    creatingRef.current = true
     setCreating(true)
-    await createSession(provider, profile.trim(), workingDirectory.trim() || undefined, sessionName.trim() || undefined)
-    setCreating(false)
-    setShowSpawnModal(false)
-    setProfile('')
-    setWorkingDirectory('')
-    setSessionName('')
+    try {
+      await createSession(provider, profile.trim(), workingDirectory.trim() || undefined, sessionName.trim() || undefined)
+      setShowSpawnModal(false)
+      setProfile('')
+      setWorkingDirectory('')
+      setSessionName('')
+    } finally {
+      setCreating(false)
+      creatingRef.current = false
+    }
   }
 
   const openTerminal = (terminalId: string, provider?: string, agentProfile?: string | null) => {
