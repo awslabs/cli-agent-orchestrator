@@ -414,9 +414,7 @@ class HerdrInboxService:
                     backend = get_backend()
                     if hasattr(backend, "_pane_cache"):
                         backend._pane_cache.pop(terminal_id, None)
-                    new_pane_id = backend.get_pane_id(
-                        terminal_id, term_session or "", term_window
-                    )
+                    new_pane_id = backend.get_pane_id(terminal_id, term_session or "", term_window)
                 except Exception as e:
                     logger.warning(
                         "Reconcile: tab %s live but pane re-resolve failed for %s (%s); "
