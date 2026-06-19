@@ -85,47 +85,47 @@ def _skill_search_dirs() -> List[Path]:
     return dirs
 
 
-def _resolve_skill_path(skill_name: str) -> Path:
-    """Locate a skill folder across the global store and extra directories.
+def _resolve_skill(skill_name: str) -> Tuple[SkillMetadata, str]:
+    """Load a skill by name from the global store or extra directories.
 
-    Returns the first ``<dir>/<skill_name>`` that loads as a *valid* skill, so
-    resolution stays consistent with :func:`list_skills` ("first valid match
-    wins"): an earlier folder that contains a ``SKILL.md`` but fails to load no
-    longer shadows a later valid folder of the same name. Without this, the
-    injected catalog could advertise a skill (from a later dir) that the
-    subsequent ``load_skill`` call then fails to resolve.
+    Scans the search dirs in resolution order and returns the first
+    ``<dir>/<skill_name>`` that loads as a *valid* skill ("first valid match
+    wins"), so resolution stays consistent with :func:`list_skills`: an earlier
+    folder that contains a ``SKILL.md`` but fails to load no longer shadows a
+    later valid folder of the same name. Without this, the injected catalog
+    could advertise a skill (from a later dir) that the subsequent ``load_skill``
+    call then fails to resolve.
 
-    When no candidate loads cleanly, falls back to the first folder that does
-    contain a ``SKILL.md`` so the caller re-raises the underlying validation
-    error, or ultimately to ``SKILLS_DIR / skill_name`` so the error references
-    the canonical global path.
+    The matched folder is parsed exactly once. When no candidate loads cleanly,
+    the error from the first folder that contains a ``SKILL.md`` is re-raised so
+    the underlying validation failure is surfaced; if no folder contains a
+    ``SKILL.md`` at all, a ``FileNotFoundError`` referencing the canonical global
+    path is raised instead.
     """
-    first_with_skill_md: Optional[Path] = None
+    first_error: Optional[Exception] = None
     for directory in _skill_search_dirs():
         candidate = directory / skill_name
         if not (candidate / "SKILL.md").is_file():
             continue
-        if first_with_skill_md is None:
-            first_with_skill_md = candidate
         try:
-            _load_skill_folder(candidate)
-        except Exception:
-            continue
-        return candidate
-    return first_with_skill_md if first_with_skill_md is not None else SKILLS_DIR / skill_name
+            return _load_skill_folder(candidate)
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
+    if first_error is not None:
+        raise first_error
+    return _load_skill_folder(SKILLS_DIR / skill_name)
 
 
 def load_skill_metadata(name: str) -> SkillMetadata:
     """Load validated metadata for a single installed skill."""
-    skill_name = validate_skill_name(name)
-    metadata, _ = _load_skill_folder(_resolve_skill_path(skill_name))
+    metadata, _ = _resolve_skill(validate_skill_name(name))
     return metadata
 
 
 def load_skill_content(name: str) -> str:
     """Load the Markdown body content for a single installed skill."""
-    skill_name = validate_skill_name(name)
-    _, content = _load_skill_folder(_resolve_skill_path(skill_name))
+    _, content = _resolve_skill(validate_skill_name(name))
     return content
 
 
@@ -136,7 +136,7 @@ def list_skills() -> List[SkillMetadata]:
     ``extra_skill_dirs``); the first *valid* occurrence of a skill name wins, so
     a skill in the global store is not shadowed by one in a later extra
     directory. Invalid skill folders are skipped without reserving the name,
-    which matches :func:`_resolve_skill_path` ("first valid match wins"). The
+    which matches :func:`_resolve_skill` ("first valid match wins"). The
     result is sorted by name.
     """
     skills_by_name: Dict[str, SkillMetadata] = {}
