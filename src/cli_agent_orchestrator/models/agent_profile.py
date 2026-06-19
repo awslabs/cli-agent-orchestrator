@@ -49,7 +49,7 @@ class AgentProfile(BaseModel):
 
     # Codex-only. Inline Codex config overrides passed as `-c key=value` at
     # launch (e.g. {"model_reasoning_effort": "xhigh", "service_tier": "fast",
-    # "features.fast_mode": true}). Keys may be dotted paths into Codex's
+    # "features.fast_mode": True}). Keys may be dotted paths into Codex's
     # config.toml schema; values are serialized to TOML scalars (strings are
     # quoted, bools/numbers emitted bare). Applied in both the default --yolo
     # path and the --profile <codexProfile> path, so per-agent knobs like

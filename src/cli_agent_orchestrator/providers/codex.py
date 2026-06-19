@@ -146,6 +146,29 @@ def _toml_scalar(value: Any) -> str:
     return f'"{escaped}"'
 
 
+_CODEX_CONFIG_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _toml_override(key: str, value: Any) -> str:
+    """Build one ``key=<toml-scalar>`` Codex ``-c`` override, validating the key.
+
+    Keys must be non-empty dotted config paths over ``[A-Za-z0-9_.-]`` (e.g.
+    ``features.fast_mode``); spaces, ``=``, quotes, or control characters are
+    rejected so a misconfigured profile fails fast instead of silently emitting
+    a malformed ``-c`` override. Value-serialization failures from
+    :func:`_toml_scalar` are re-raised with the offending key for context.
+    """
+    if not isinstance(key, str) or not _CODEX_CONFIG_KEY_PATTERN.match(key):
+        raise ValueError(
+            f"Invalid codexConfig key {key!r}: must be a dotted config path over "
+            "[A-Za-z0-9_.-] (e.g. 'features.fast_mode')"
+        )
+    try:
+        return f"{key}={_toml_scalar(value)}"
+    except TypeError as exc:
+        raise TypeError(f"codexConfig key '{key}': {exc}") from exc
+
+
 def _find_assistant_marker(text: str) -> Optional[re.Match[str]]:
     """Find the first ASSISTANT_PREFIX_PATTERN match in ``text`` whose line
     is not an MCP tool-call marker.
@@ -291,7 +314,7 @@ class CodexProvider(BaseProvider):
             # overrides and the profile/config defaults on key conflicts.
             if profile.codexConfig:
                 for key, value in profile.codexConfig.items():
-                    command_parts.extend(["-c", f"{key}={_toml_scalar(value)}"])
+                    command_parts.extend(["-c", _toml_override(key, value)])
 
         return shlex.join(command_parts)
 

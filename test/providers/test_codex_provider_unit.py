@@ -6,7 +6,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.providers.codex import CodexProvider, ProviderError, _toml_scalar
+from cli_agent_orchestrator.providers.codex import (
+    CodexProvider,
+    ProviderError,
+    _toml_override,
+    _toml_scalar,
+)
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -462,7 +467,6 @@ class TestTomlScalar:
         assert "\n" not in _toml_scalar("line1\nline2")
         assert _toml_scalar("line1\nline2") == '"line1\\nline2"'
 
-
     def test_string_escapes_tabs_and_carriage_returns(self):
         assert _toml_scalar("a\tb\rc") == '"a\\tb\\rc"'
 
@@ -470,6 +474,25 @@ class TestTomlScalar:
     def test_rejects_non_scalar(self, value):
         with pytest.raises(TypeError):
             _toml_scalar(value)
+
+
+class TestTomlOverride:
+    """Tests for ``_toml_override`` key validation."""
+
+    def test_builds_override_for_valid_dotted_key(self):
+        assert _toml_override("features.fast_mode", True) == "features.fast_mode=true"
+        assert _toml_override("model_reasoning_effort", "xhigh") == 'model_reasoning_effort="xhigh"'
+
+    @pytest.mark.parametrize("key", ["bad key", "a=b", 'k"x', "key\ninjected", "", "a/b"])
+    def test_rejects_unsafe_key(self, key):
+        # Unsafe keys would produce a malformed -c override or split the tmux
+        # command across lines; fail fast instead.
+        with pytest.raises(ValueError, match="Invalid codexConfig key"):
+            _toml_override(key, "v")
+
+    def test_non_scalar_value_error_names_offending_key(self):
+        with pytest.raises(TypeError, match="codexConfig key 'features.x'"):
+            _toml_override("features.x", {"nested": 1})
 
 
 class TestCodexProviderCodexConfig:
