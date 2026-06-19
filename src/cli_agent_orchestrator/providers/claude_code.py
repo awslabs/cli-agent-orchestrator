@@ -320,12 +320,21 @@ class ClaudeCodeProvider(BaseProvider):
                 get_backend().send_special_key(self.session_name, self.window_name, "Enter")
                 return
 
-            # 3) Claude Code fully started — no prompts needed
+            # 3) Claude Code fully started — no prompts needed.
+            #    The version banner is the ONLY reliable "ready" signal here: it
+            #    renders only once the REPL is up and cannot appear in the echoed
+            #    launch command. The old bare IDLE_PROMPT_PATTERN ("> "/"❯ ") check
+            #    was removed: the injected --append-system-prompt text contains
+            #    "> `memory_store`" (start of a line), which the echoed command
+            #    surfaces in the capture buffer within ~300ms and false-matches as
+            #    "idle". The handler then returned BEFORE the workspace-trust dialog
+            #    rendered, leaving it unaccepted; initialize() then blocked on
+            #    {IDLE, COMPLETED} for 30s and the session was killed. Trust/bypass
+            #    dialogs are handled explicitly above; if no banner ever appears the
+            #    loop just waits out its timeout and the downstream
+            #    wait_until_status() remains the real readiness gate.
             if re.search(r"Welcome to|Claude Code v\d+", clean_output):
                 logger.info("Claude Code started without prompts")
-                return
-            if re.search(IDLE_PROMPT_PATTERN, clean_output):
-                logger.info("Claude Code idle prompt detected, no prompts needed")
                 return
 
             time.sleep(1.0)
