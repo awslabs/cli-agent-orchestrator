@@ -2,7 +2,7 @@
 
 import logging
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import frontmatter
 from pydantic import ValidationError
@@ -88,15 +88,31 @@ def _skill_search_dirs() -> List[Path]:
 def _resolve_skill_path(skill_name: str) -> Path:
     """Locate a skill folder across the global store and extra directories.
 
-    Returns the first ``<dir>/<skill_name>`` that contains a ``SKILL.md``. When
-    nothing matches, falls back to ``SKILLS_DIR / skill_name`` so callers raise a
-    ``FileNotFoundError`` that references the canonical global path.
+    Returns the first ``<dir>/<skill_name>`` that loads as a *valid* skill, so
+    resolution stays consistent with :func:`list_skills` ("first valid match
+    wins"): an earlier folder that contains a ``SKILL.md`` but fails to load no
+    longer shadows a later valid folder of the same name. Without this, the
+    injected catalog could advertise a skill (from a later dir) that the
+    subsequent ``load_skill`` call then fails to resolve.
+
+    When no candidate loads cleanly, falls back to the first folder that does
+    contain a ``SKILL.md`` so the caller re-raises the underlying validation
+    error, or ultimately to ``SKILLS_DIR / skill_name`` so the error references
+    the canonical global path.
     """
+    first_with_skill_md: Optional[Path] = None
     for directory in _skill_search_dirs():
         candidate = directory / skill_name
-        if (candidate / "SKILL.md").is_file():
-            return candidate
-    return SKILLS_DIR / skill_name
+        if not (candidate / "SKILL.md").is_file():
+            continue
+        if first_with_skill_md is None:
+            first_with_skill_md = candidate
+        try:
+            _load_skill_folder(candidate)
+        except Exception:
+            continue
+        return candidate
+    return first_with_skill_md if first_with_skill_md is not None else SKILLS_DIR / skill_name
 
 
 def load_skill_metadata(name: str) -> SkillMetadata:
@@ -117,9 +133,11 @@ def list_skills() -> List[SkillMetadata]:
     """Return all valid skills from the global store and extra directories.
 
     Directories are scanned in resolution order (global store first, then
-    ``extra_skill_dirs``); the first occurrence of a skill name wins, so a skill
-    in the global store is not shadowed by one in a later extra directory.
-    Invalid skill folders are skipped. The result is sorted by name.
+    ``extra_skill_dirs``); the first *valid* occurrence of a skill name wins, so
+    a skill in the global store is not shadowed by one in a later extra
+    directory. Invalid skill folders are skipped without reserving the name,
+    which matches :func:`_resolve_skill_path` ("first valid match wins"). The
+    result is sorted by name.
     """
     skills_by_name: Dict[str, SkillMetadata] = {}
     for directory in _skill_search_dirs():

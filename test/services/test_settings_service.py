@@ -219,6 +219,17 @@ class TestGetExtraSkillDirs:
         result = get_extra_skill_dirs()
         assert result == ["/a", "/b"]
 
+    def test_filters_non_string_and_empty_entries(self, settings_file):
+        """Malformed persisted entries (null/numbers/blank) are dropped, not returned.
+
+        Otherwise Path(extra) in _skill_search_dirs() would raise TypeError and
+        break skill listing/loading.
+        """
+        settings_file.write_text(
+            json.dumps({"extra_skill_dirs": ["/valid", None, 123, "", "  ", "/also-valid"]})
+        )
+        assert get_extra_skill_dirs() == ["/valid", "/also-valid"]
+
 
 class TestSetExtraSkillDirs:
     """Tests for set_extra_skill_dirs function."""
@@ -231,6 +242,11 @@ class TestSetExtraSkillDirs:
     def test_strips_empty_strings(self, settings_file):
         """set_extra_skill_dirs removes empty or whitespace-only strings."""
         result = set_extra_skill_dirs(["/valid", "", "  ", "/also-valid"])
+        assert result == ["/valid", "/also-valid"]
+
+    def test_ignores_non_string_entries(self, settings_file):
+        """Non-string entries are dropped rather than crashing on .strip()."""
+        result = set_extra_skill_dirs(["/valid", None, 123, "/also-valid"])
         assert result == ["/valid", "/also-valid"]
 
     def test_persists_to_disk(self, settings_file):

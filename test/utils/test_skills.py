@@ -288,6 +288,44 @@ class TestExtraSkillDirs:
         with pytest.raises(FileNotFoundError, match="Skill folder does not exist"):
             load_skill_metadata("nope")
 
+    def test_invalid_earlier_skill_does_not_shadow_valid_extra(self, tmp_path, monkeypatch):
+        """A broken same-named folder in an earlier dir must not hide a valid later one.
+
+        ``list_skills`` already skips the invalid folder and advertises the
+        valid extra-dir skill; ``_resolve_skill_path`` must agree so ``load_skill``
+        succeeds for the same name ("first valid match wins").
+        """
+        global_dir = tmp_path / "global"
+        # Invalid: folder name does not match the declared skill name.
+        broken = global_dir / "task"
+        broken.mkdir(parents=True)
+        (broken / "SKILL.md").write_text("---\nname: other\ndescription: Broken\n---\n\nBody\n")
+        extra = tmp_path / "project"
+        _write_skill(extra / "task", "task", "Project task", body="# Task\n\nSteps.")
+        _use_skill_dirs(monkeypatch, global_dir, [extra])
+
+        # list and load must agree: both resolve to the valid extra-dir skill.
+        assert "task" in [skill.name for skill in list_skills()]
+        assert load_skill_metadata("task").description == "Project task"
+        assert load_skill_content("task") == "# Task\n\nSteps."
+
+    def test_invalid_only_skill_surfaces_validation_error(self, tmp_path, monkeypatch):
+        """When the only same-named folder is invalid, the real validation error is raised.
+
+        The fallback preserves the meaningful error instead of degrading to a
+        generic "Skill folder does not exist".
+        """
+        global_dir = tmp_path / "global"
+        broken = global_dir / "task"
+        broken.mkdir(parents=True)
+        (broken / "SKILL.md").write_text("---\nname: other\ndescription: Broken\n---\n\nBody\n")
+        extra = tmp_path / "project"
+        extra.mkdir()
+        _use_skill_dirs(monkeypatch, global_dir, [extra])
+
+        with pytest.raises(ValueError, match="does not match skill name"):
+            load_skill_metadata("task")
+
 
 class TestValidateSkillFolder:
     """Tests for validate_skill_folder."""

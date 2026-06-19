@@ -140,16 +140,23 @@ def set_extra_agent_dirs(dirs: List[str]) -> List[str]:
 
 
 def get_extra_skill_dirs() -> List[str]:
-    """Get extra skill scan directories (user-added custom paths)."""
+    """Get extra skill scan directories (user-added custom paths).
+
+    Filters to non-empty strings so malformed persisted data (e.g. a manually
+    edited ``settings.json`` storing ``null`` or numbers) cannot later raise a
+    ``TypeError`` from ``Path(extra)`` and break skill listing/loading.
+    """
     settings = _load()
     dirs = settings.get("extra_skill_dirs", [])
-    return dirs if isinstance(dirs, list) else []
+    if not isinstance(dirs, list):
+        return []
+    return [d.strip() for d in dirs if isinstance(d, str) and d.strip()]
 
 
 def set_extra_skill_dirs(dirs: List[str]) -> List[str]:
     """Set extra skill scan directories."""
     settings = _load()
-    extra_skill_dirs = [d for d in dirs if d.strip()]
+    extra_skill_dirs = [d.strip() for d in dirs if isinstance(d, str) and d.strip()]
     settings["extra_skill_dirs"] = extra_skill_dirs
     _save(settings)
     return extra_skill_dirs
