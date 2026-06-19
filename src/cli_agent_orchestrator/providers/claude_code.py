@@ -9,8 +9,10 @@ from pathlib import Path
 from typing import List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
@@ -190,8 +192,15 @@ class ClaudeCodeProvider(BaseProvider):
             system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
             system_prompt = self._apply_skill_prompt(system_prompt)
             if system_prompt:
-                escaped_prompt = system_prompt.replace("\\", "\\\\").replace("\n", "\\n")
-                command_parts.extend(["--append-system-prompt", escaped_prompt])
+                tmp_dir = CAO_HOME_DIR / "tmp"
+                tmp_dir.mkdir(parents=True, exist_ok=True)
+                prompt_file = tmp_dir / f"{self.terminal_id}.prompt"
+                prompt_file.write_text(system_prompt, encoding="utf-8")
+                try:
+                    prompt_file.chmod(0o600)
+                except OSError:
+                    pass
+                command_parts.extend(["--append-system-prompt-file", str(prompt_file)])
 
             # Add MCP config if present.
             # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
@@ -211,8 +220,15 @@ class ClaudeCodeProvider(BaseProvider):
                         env["CAO_TERMINAL_ID"] = self.terminal_id
                         mcp_config[server_name]["env"] = env
 
-                mcp_json = json.dumps({"mcpServers": mcp_config})
-                command_parts.extend(["--mcp-config", mcp_json])
+                tmp_dir = CAO_HOME_DIR / "tmp"
+                tmp_dir.mkdir(parents=True, exist_ok=True)
+                mcp_file = tmp_dir / f"{self.terminal_id}.mcp.json"
+                mcp_file.write_text(json.dumps({"mcpServers": mcp_config}), encoding="utf-8")
+                try:
+                    mcp_file.chmod(0o600)
+                except OSError:
+                    pass
+                command_parts.extend(["--mcp-config", str(mcp_file)])
 
         # Apply tool restrictions via --disallowedTools flags.
         # --dangerously-skip-permissions bypasses prompts but --disallowedTools
@@ -271,7 +287,7 @@ class ClaudeCodeProvider(BaseProvider):
             json.dump(settings, f, indent=2)
         logger.info("Set skipDangerousModePermissionPrompt in ~/.claude/settings.json")
 
-    def _handle_startup_prompts(self, timeout: float = 20.0) -> None:
+    def _handle_startup_prompts(self, timeout: Optional[float] = None) -> None:
         """Auto-accept startup prompts that may appear before the REPL is ready.
 
         Claude Code may show up to two prompts during startup:
@@ -283,6 +299,8 @@ class ClaudeCodeProvider(BaseProvider):
         2. **Workspace trust dialog** – shows "Yes, I trust this folder";
            requires ``Enter``.
         """
+        if timeout is None:
+            timeout = get_server_settings()["startup_prompt_handler_timeout"]
         start_time = time.time()
         bypass_accepted = False
         while time.time() - start_time < timeout:
@@ -336,8 +354,9 @@ class ClaudeCodeProvider(BaseProvider):
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
         # Wait for shell prompt to appear in the tmux window
-        if not await wait_for_shell(self.terminal_id, timeout=10.0):
-            raise TimeoutError("Shell initialization timed out after 10 seconds")
+        init_timeout = get_server_settings()["provider_init_timeout"]
+        if not await wait_for_shell(self.terminal_id, timeout=init_timeout):
+            raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
 
         # Prevent bypass permissions dialog from appearing (settings-based fix).
         self._ensure_skip_bypass_prompt_setting()
@@ -352,7 +371,7 @@ class ClaudeCodeProvider(BaseProvider):
         get_backend().send_keys(self.session_name, self.window_name, command)
 
         # Handle startup prompts (bypass permissions + workspace trust)
-        self._handle_startup_prompts(timeout=20.0)
+        self._handle_startup_prompts()
 
         # Wait for Claude Code prompt to be ready.
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
@@ -361,13 +380,14 @@ class ClaudeCodeProvider(BaseProvider):
         # drives wait_until_status; it only fires once the provider's own
         # get_status returns IDLE/COMPLETED on Claude-rendered content, so the
         # old stale-zsh-prompt false-IDLE guard is no longer needed.
+        init_timeout = get_server_settings()["provider_init_timeout"]
         if not await wait_until_status(
             self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-            timeout=30.0,
+            timeout=init_timeout,
             polling_interval=1.0,
         ):
-            raise TimeoutError("Claude Code initialization timed out after 30 seconds")
+            raise TimeoutError(f"Claude Code initialization timed out after {init_timeout}s")
 
         self._initialized = True
         return True
@@ -784,3 +804,11 @@ class ClaudeCodeProvider(BaseProvider):
     def cleanup(self) -> None:
         """Clean up Claude Code provider."""
         self._initialized = False
+        # Remove temp files created during initialization
+        tmp_dir = CAO_HOME_DIR / "tmp"
+        for suffix in (".prompt", ".mcp.json"):
+            tmp_file = tmp_dir / f"{self.terminal_id}{suffix}"
+            try:
+                tmp_file.unlink(missing_ok=True)
+            except OSError:
+                pass
