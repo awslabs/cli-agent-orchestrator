@@ -45,8 +45,9 @@ SCOPE_PRECEDENCE: dict = {
 }
 
 # Cross-scope write authorisation table. Caller may write a target
-# scope iff ``SCOPE_RANK[caller] >= SCOPE_RANK[target]``. ``agent`` and
-# ``project`` share rank 1 — siblings; cross-sibling writes are rejected.
+# scope iff ``caller == target`` OR ``SCOPE_RANK[caller] > SCOPE_RANK[target]``
+# (strict). ``agent`` and ``project`` share rank 1 — siblings; cross-sibling
+# writes are rejected.
 #
 # ``federated`` is intentionally asymmetric: it has the LOWEST recall
 # precedence (4 in SCOPE_PRECEDENCE — last on recall) yet write-rank 0,
