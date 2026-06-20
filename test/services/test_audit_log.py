@@ -393,6 +393,11 @@ class TestT9SyncVsNowait:
         assert SYNC_AUDIT_EVENTS == frozenset(
             {
                 "lint_run_completed",
+                # Memory import/export run-completed gates (Phase 4 U2).
+                "export_completed",
+                "import_completed",
+                # Marker strong-mode lenient rewrite (Phase 4 U2 T14).
+                "marker_strong_mode_rewrite",
             }
         )
 
@@ -409,6 +414,14 @@ class TestT9SyncVsNowait:
                 "compile_stale_dropped",
                 "compile_error",
                 "find_related_completed",
+                # Memory import/export deferred outcomes (Phase 4 U2).
+                "export_started",
+                "export_failed",
+                "import_started",
+                "import_failed",
+                "memory_imported_row",
+                "import_rejection",
+                "import_tmp_dir_swept",
             }
         )
 

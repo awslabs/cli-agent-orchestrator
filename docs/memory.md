@@ -100,6 +100,47 @@ cao memory delete <key> --scope project --yes
 cao memory clear --scope session --yes
 ```
 
+## Import / Export
+
+Memories can be moved between machines or checkouts as a single self-describing
+`.tar.gz` bundle. The bundle carries both the wiki files and their SQLite metadata
+(token estimates, access counts, `related_keys`, timestamps, provenance) and is
+content-hashed so import-side tampering is detectable.
+
+```bash
+# Export a scope to a deterministic bundle (.tar.gz or .tgz)
+cao memory export --scope project --out project.tar.gz
+cao memory export --scope global  --out global.tar.gz
+cao memory export --scope project --scope-id <project_id> --out other.tar.gz
+
+# Import a bundle — DRY-RUN by default (prints the plan, writes nothing)
+cao memory import project.tar.gz
+cao memory import project.tar.gz --apply                       # actually write
+cao memory import project.tar.gz --on-conflict merge --apply   # skip|replace|merge
+cao memory import project.tar.gz --target-project-id <id> --apply
+```
+
+`--scope` accepts `session`, `project`, `global`, or `federated` — `agent`-scope
+memories are never exported or imported. Import is **dry-run by default**: without
+`--apply` it prints `N new, M conflicts, K rejected` and touches nothing. `--on-conflict`
+controls existing-key collisions (`skip` is the default; `replace` overwrites; `merge`
+tie-breaks on updated-time, then access count, then key).
+
+**Project identity is re-derived, never trusted.** A `project` bundle does not carry a
+portable directory — its destination project_id is resolved on the *importing* machine
+(from the current working directory, or pinned with `--target-project-id`), so the
+memories land under the importer's own project, not the exporter's path. When a bundle's
+identity came from a `cwd_hash` fallback (a local-only project with no git remote), import
+**refuses to guess**: run it from inside the destination project, or pass
+`--target-project-id <project_id>` explicitly. See the worked example in
+[`docs/issues/memory-import-export.md`](issues/memory-import-export.md#worked-example--no-remote-project---target-project-id).
+
+**Secret gate on import.** A bundle is untrusted input from another machine, so every
+imported memory is screened with the same credential deny-list (`scan_for_secrets`) that
+gates `federated` writes — for *all* target scopes, not just `federated`. A hit rejects
+that row (reported by pattern name only, never the content) and rolls the whole import
+back. Both commands raise `MemoryDisabledError` when memory is disabled.
+
 ## Context Injection
 
 When an agent receives its first message in a session, CAO prepends a `<cao-memory>` block containing relevant memories (up to 3000 characters). The block format:

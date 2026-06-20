@@ -7,7 +7,7 @@ Publisher: terminal.{id}.status
 import asyncio
 import logging
 import threading
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from cli_agent_orchestrator.constants import (
     CAO_PYTE_STATUS,
@@ -75,7 +75,9 @@ class StatusMonitor:
         # on two edges only — rising (output resumed) and quiescence (output
         # stopped for PYTE_QUIESCENCE_DELAY_S) — never mid-burst, which is what
         # keeps status flap-free.
-        self._screens: Dict[str, Tuple[object, object]] = {}
+        # pyte ``Screen`` + ``Stream`` — typed ``Any`` because pyte ships no
+        # type stubs and is imported lazily on the screen-detection path.
+        self._screens: Dict[str, Tuple[Any, Any]] = {}
         self._bursting: Dict[str, bool] = {}
         # Pending quiescence-detect timer handle per terminal (loop.call_later).
         self._quiesce_handle: Dict[str, asyncio.TimerHandle] = {}
@@ -222,7 +224,8 @@ class StatusMonitor:
         if not lines or provider is None:
             return TerminalStatus.UNKNOWN
         try:
-            return provider.get_status_from_screen(lines)
+            status: TerminalStatus = provider.get_status_from_screen(lines)
+            return status
         except Exception:
             # Full traceback: screen detectors are new and can trip on
             # unexpected TUI frames; the stack makes such regressions debuggable.

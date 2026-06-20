@@ -59,13 +59,25 @@ def mock_db():
     """
     terminals = {}
 
-    def _create(terminal_id, session_name, window_name, provider, agent_profile):
+    def _create(
+        terminal_id,
+        session_name,
+        window_name,
+        provider,
+        agent_profile=None,
+        allowed_tools=None,
+        shell_command=None,
+        caller_id=None,
+    ):
         terminals[terminal_id] = {
             "id": terminal_id,
             "tmux_session": session_name,
             "tmux_window": window_name,
             "provider": provider,
             "agent_profile": agent_profile,
+            "allowed_tools": allowed_tools,
+            "shell_command": shell_command,
+            "caller_id": caller_id,
             "last_active": datetime.now(),
         }
         return terminals[terminal_id]

@@ -59,6 +59,14 @@ LOG_FILENAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 SYNC_AUDIT_EVENTS: frozenset = frozenset(
     {
         "lint_run_completed",
+        # Memory import/export run-completed gates. SYNC: import/export
+        # await these before returning the report to the caller.
+        "export_completed",
+        "import_completed",
+        # Marker strong-mode lenient rewrite (T14). SYNC: emitted on the
+        # import-critical path before rows are applied, and import callers
+        # rely on its presence to audit the project_id rewrite decision.
+        "marker_strong_mode_rewrite",
     }
 )
 NOWAIT_AUDIT_EVENTS: frozenset = frozenset(
@@ -75,6 +83,16 @@ NOWAIT_AUDIT_EVENTS: frozenset = frozenset(
         "compile_stale_dropped",
         "compile_error",
         "find_related_completed",
+        # Memory import/export — deferred/background outcomes. NOWAIT:
+        # progress markers, per-row applies, rejections, and the orphan
+        # tmp-dir cleanup sweep, none of which gate the run-completed return.
+        "export_started",
+        "export_failed",
+        "import_started",
+        "import_failed",
+        "memory_imported_row",
+        "import_rejection",
+        "import_tmp_dir_swept",
     }
 )
 AUDIT_EVENT_WHITELIST: frozenset = SYNC_AUDIT_EVENTS | NOWAIT_AUDIT_EVENTS

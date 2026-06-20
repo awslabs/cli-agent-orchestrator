@@ -99,6 +99,12 @@ class MemoryMetadataModel(Base):
     # constraint applies on FRESH databases only — existing DBs rely on the
     # parse-side cap in ``_parse_related_keys``.
     related_keys = Column(Text, nullable=True, default=None)
+    # Phase 4 U2 — import provenance. NULL = never imported (locally authored
+    # rows). Non-NULL = importer-set JSON ``{archive_sha256, imported_at,
+    # actor}`` (devsecops T8). Any archive-claimed value is stripped before
+    # apply; only the importer writes this column. Migrated onto existing DBs
+    # by ``_migrate_add_imported_from``.
+    imported_from = Column(Text, nullable=True, default=None)
 
     __table_args__ = (
         UniqueConstraint("key", "scope", "scope_id", name="uq_memory_key_scope"),
@@ -160,6 +166,7 @@ def init_db() -> None:
     _migrate_add_access_count()
     _migrate_add_last_compiled_at()
     _migrate_add_related_keys()
+    _migrate_add_imported_from()
 
 
 def _migrate_project_aliases_schema() -> None:
@@ -290,6 +297,29 @@ def _migrate_add_related_keys() -> None:
                 logger.info("Migration: added related_keys column to memory_metadata")
     except Exception as e:
         logger.debug(f"Migration check for related_keys failed: {e}")
+
+
+def _migrate_add_imported_from() -> None:
+    """Add imported_from column to memory_metadata if missing (Phase 4 U2).
+
+    Reuses the idempotent ALTER pattern: PRAGMA table_info gate, ALTER TABLE
+    ADD COLUMN only when missing. Fresh DBs already have the column from
+    ``Base.metadata.create_all``. Existing rows get NULL — correct, since they
+    were authored locally and never imported.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            cursor = conn.execute("PRAGMA table_info(memory_metadata)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if "imported_from" not in columns:
+                conn.execute("ALTER TABLE memory_metadata ADD COLUMN imported_from TEXT")
+                logger.info("Migration: added imported_from column to memory_metadata")
+    except Exception as e:
+        logger.debug(f"Migration check for imported_from failed: {e}")
 
 
 def _migrate_terminals_schema() -> None:

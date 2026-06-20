@@ -314,6 +314,249 @@ def lint_cmd(scope, out_format):
     raise click.exceptions.Exit(compute_exit_code(issues))
 
 
+# Scopes that participate in import/export. Mirrors
+# _archive_format.IMPORTABLE_SCOPES: ``agent`` is banned (devsecops T11) and
+# ``federated`` (PR #314) is a first-class scope value, so we cannot reuse the
+# MemoryScope enum (which lacks ``federated`` and still lists ``agent``).
+_IMPORTABLE_SCOPE_CHOICES = ["session", "project", "global", "federated"]
+
+
+@memory.command(name="export")
+@click.option(
+    "--scope",
+    type=click.Choice(_IMPORTABLE_SCOPE_CHOICES, case_sensitive=False),
+    required=True,
+    help="Scope to export. One of: session, project, global, federated.",
+)
+@click.option(
+    "--scope-id",
+    default=None,
+    help="Explicit scope_id. Resolved from cwd when omitted (ignored for global).",
+)
+@click.option(
+    "--out",
+    "out_path",
+    type=click.Path(dir_okay=False),
+    required=True,
+    help="Output bundle path (must end in .tar.gz or .tgz).",
+)
+@click.option(
+    "--format",
+    "out_format",
+    type=click.Choice(["table", "json"], case_sensitive=False),
+    default="table",
+    show_default=True,
+    help="Output format for the export report.",
+)
+def export_cmd(scope, scope_id, out_path, out_format):
+    """Export a project's memories to a deterministic .tar.gz bundle.
+
+    Resolves scope_id the same way ``cao memory heal``/``compact`` do: global
+    carries no scope_id; other scopes resolve from the current working
+    directory unless ``--scope-id`` is supplied. The bundle is content-hashed
+    so import-side tampering is detectable.
+    """
+    import json as _json
+    from pathlib import Path
+
+    from cli_agent_orchestrator.services import memory_export
+
+    scope = scope.lower()
+    svc = _get_memory_service()
+    ctx = _cwd_context()
+
+    if scope == MemoryScope.GLOBAL.value:
+        resolved_scope_id = None
+    elif scope_id is not None:
+        resolved_scope_id = scope_id
+    else:
+        resolved_scope_id = svc.resolve_scope_id(scope, ctx)
+        if resolved_scope_id is None:
+            raise click.ClickException(f"could not resolve scope_id for scope '{scope}'")
+
+    try:
+        report = _run_async(
+            memory_export.export(
+                scope,
+                resolved_scope_id,
+                output_path=Path(out_path),
+            )
+        )
+    except Exception as e:
+        raise click.ClickException(f"export failed: {e}")
+
+    # The service honors a non-blocking promise: failures land in
+    # report.errors rather than raising. Surface them as a CLI error.
+    if report.errors:
+        raise click.ClickException("export failed: " + "; ".join(str(x) for x in report.errors))
+
+    if out_format.lower() == "json":
+        click.echo(
+            _json.dumps(
+                {
+                    "archive_path": str(report.archive_path),
+                    "project_id": report.project_id,
+                    "id_kind": report.id_kind,
+                    "format_version": report.format_version,
+                    "n_wiki_files": report.n_wiki_files,
+                    "n_metadata_rows": report.n_metadata_rows,
+                    "bytes_written": report.bytes_written,
+                    "content_hash": report.content_hash,
+                },
+                indent=2,
+            )
+        )
+    else:
+        click.echo(f"Wrote {report.archive_path}")
+        click.echo(f"  project_id:   {report.project_id} ({report.id_kind})")
+        click.echo(f"  wiki files:   {report.n_wiki_files}")
+        click.echo(f"  metadata rows: {report.n_metadata_rows}")
+        click.echo(f"  bytes:        {report.bytes_written}")
+        click.echo(f"  content_hash: {report.content_hash}")
+
+
+@memory.command(name="import")
+@click.argument("bundle", type=click.Path(exists=True, dir_okay=False))
+@click.option(
+    "--target-project-id",
+    "target_project_id",
+    default=None,
+    help=(
+        "Pin the project_id that project-scoped rows import into. "
+        "Resolved from the current working directory when omitted. "
+        "(global/federated rows always import with a NULL scope_id.)"
+    ),
+)
+@click.option(
+    "--on-conflict",
+    "conflict_policy",
+    type=click.Choice(["skip", "replace", "merge"], case_sensitive=False),
+    default="skip",
+    show_default=True,
+    help="How to handle keys that already exist.",
+)
+@click.option(
+    "--apply",
+    "apply_changes",
+    is_flag=True,
+    default=False,
+    help="Apply the import. Without this flag the import is a dry-run plan.",
+)
+@click.option(
+    "--format",
+    "out_format",
+    type=click.Choice(["table", "json"], case_sensitive=False),
+    default="table",
+    show_default=True,
+    help="Output format for the import report.",
+)
+def import_cmd(bundle, target_project_id, conflict_policy, apply_changes, out_format):
+    """Import memories from a bundle. Dry-run by default; pass --apply to write.
+
+    Without ``--apply`` the command prints the plan (N new, M conflicts, K
+    rejected) without touching any memory. Project-scoped rows import into the
+    project_id resolved from the current working directory unless
+    ``--target-project-id`` pins one explicitly.
+    """
+    import json as _json
+    from pathlib import Path
+
+    try:
+        from cli_agent_orchestrator.services import memory_import
+    except ImportError:
+        raise click.ClickException(
+            "memory import is not available in this build (import service not installed)."
+        )
+
+    conflict_policy = conflict_policy.lower()
+
+    try:
+        report = _run_async(
+            memory_import.import_archive(
+                Path(bundle),
+                conflict_policy=conflict_policy,
+                dry_run=not apply_changes,
+                target_project_id=target_project_id,
+            )
+        )
+    except click.ClickException:
+        raise
+    except Exception as e:
+        # The cwd_hash-no-target refusal (issue #316) and other conflict /
+        # refusal errors surface here. Give the operator the resolution.
+        msg = str(e)
+        if "cwd_hash" in msg or "target" in msg.lower():
+            raise click.ClickException(
+                f"import refused: {msg}. " "Re-run with --target-project-id to pin a destination."
+            )
+        raise click.ClickException(f"import failed: {msg}")
+
+    actions = list(report.actions)
+    rejections = list(report.rejections)
+    _CONFLICT_DECISIONS = {
+        "skip_existing",
+        "replace_existing",
+        "merge_winner_existing",
+        "merge_winner_imported",
+    }
+    n_new = sum(1 for a in actions if a.decision == "insert")
+    n_conflict = sum(1 for a in actions if a.decision in _CONFLICT_DECISIONS)
+    n_rejected = len(rejections)
+
+    if out_format.lower() == "json":
+        click.echo(
+            _json.dumps(
+                {
+                    "archive_path": str(report.archive_path),
+                    "project_id_in_archive": report.project_id_in_archive,
+                    "project_id_applied": report.project_id_applied,
+                    "format_version": report.format_version,
+                    "dry_run": report.dry_run,
+                    "summary": {
+                        "new": n_new,
+                        "conflicts": n_conflict,
+                        "rejected": n_rejected,
+                    },
+                    "actions": [
+                        {
+                            "key": a.key,
+                            "scope": a.scope,
+                            "scope_id": a.scope_id,
+                            "decision": a.decision,
+                            "reason": a.reason,
+                        }
+                        for a in actions
+                    ],
+                    "rejections": [
+                        {"member": r.member, "reason": r.reason, "detail": r.detail}
+                        for r in rejections
+                    ],
+                },
+                indent=2,
+            )
+        )
+    else:
+        mode = "DRY-RUN (no changes written)" if report.dry_run else "APPLIED"
+        click.echo(f"Import {mode}")
+        click.echo(f"  archive project_id: {report.project_id_in_archive}")
+        click.echo(f"  applied project_id: {report.project_id_applied}")
+        click.echo(f"  plan: {n_new} new, {n_conflict} conflicts, {n_rejected} rejected")
+        if actions:
+            click.echo()
+            header = f"{'DECISION':<10} {'SCOPE':<10} {'KEY':<30} REASON"
+            click.echo(header)
+            click.echo("-" * len(header))
+            for a in actions:
+                click.echo(f"{a.decision:<10} {a.scope:<10} {a.key:<30} {a.reason or ''}")
+        if rejections:
+            click.echo()
+            click.echo("Rejections:")
+            for r in rejections:
+                click.echo(f"  {r.reason:<28} {r.member}  {r.detail or ''}")
+        if report.dry_run and (actions or rejections):
+            click.echo("\nRe-run with --apply to perform the import.")
+
+
 @memory.command(name="compact")
 @click.option(
     "--scope",
