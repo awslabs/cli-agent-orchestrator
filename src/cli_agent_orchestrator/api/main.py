@@ -50,6 +50,7 @@ from cli_agent_orchestrator.constants import (
     SERVER_HOST,
     SERVER_PORT,
     SERVER_VERSION,
+    TERMINALS_RUN_STEP_ROUTE,
     TRUSTED_FORWARDER_IPS,
     WS_ALLOWED_CLIENTS,
     add_local_cors_origins,
@@ -70,6 +71,7 @@ from cli_agent_orchestrator.services import (
     session_service,
     terminal_service,
 )
+from cli_agent_orchestrator.services.agent_step import StepExecutionError, run_agent_step
 from cli_agent_orchestrator.services.cleanup_service import (
     cleanup_expired_memories,
     cleanup_old_data,
@@ -152,6 +154,37 @@ async def inbox_reconciliation_daemon(registry: PluginRegistry) -> None:
 class TerminalOutputResponse(BaseModel):
     output: str
     mode: str
+
+
+class RunStepRequest(BaseModel):
+    """Request body for the combined step-execution endpoint (N0, #312)."""
+
+    provider: str = Field(description="Provider type (e.g. 'kiro_cli', 'claude_code')")
+    agent: str = Field(description="Agent profile name")
+    prompt: str = Field(description="Prompt to send (caller applies any prompt shaping first)")
+    session_name: Optional[str] = Field(
+        default=None,
+        description="Existing session to create the terminal in; auto-generated if None",
+    )
+    reuse_terminal_id: Optional[str] = Field(
+        default=None, description="Reuse an existing terminal (skips create + teardown)"
+    )
+    teardown: bool = Field(
+        default=True,
+        description="Delete the created terminal after the step (ignored when reusing)",
+    )
+    timeout: float = Field(default=600.0, description="Max seconds to wait for completion", gt=0)
+    working_directory: Optional[str] = Field(
+        default=None, description="Working directory for a freshly created terminal"
+    )
+
+
+class RunStepResponse(BaseModel):
+    """Response wrapping an ``AgentStepResult`` from ``run_agent_step``."""
+
+    terminal_id: str
+    last_message: str
+    status: str
 
 
 class SkillContentResponse(BaseModel):
@@ -921,6 +954,51 @@ async def exit_terminal(terminal_id: TerminalId) -> Dict:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to exit terminal: {str(e)}",
+        )
+
+
+@app.post(TERMINALS_RUN_STEP_ROUTE, response_model=RunStepResponse)
+async def run_step(body: RunStepRequest) -> RunStepResponse:
+    """Run a single agent step through the shared substrate (N0, #312).
+
+    This is the combined server-side endpoint both step callers converge on:
+    the handoff MCP client reaches it over HTTP (one call replacing its former
+    six granular round-trips); the run engine (N5) calls ``run_agent_step``
+    directly in-process and never round-trips here (single-seam rule, ADR-3).
+
+    The handler body is ``await run_agent_step(...)``. Domain failures from the
+    substrate are mapped to ``HTTPException`` at this boundary (project Mandated
+    boundary-map rule): a step that times out / errors -> 504, a bad terminal
+    reference -> 404, any other failure -> 500.
+    """
+    try:
+        result = await run_agent_step(
+            provider=body.provider,
+            agent=body.agent,
+            prompt=body.prompt,
+            session_name=body.session_name,
+            reuse_terminal_id=body.reuse_terminal_id,
+            teardown=body.teardown,
+            timeout=body.timeout,
+            working_directory=body.working_directory,
+        )
+        return RunStepResponse(
+            terminal_id=result.terminal_id,
+            last_message=result.last_message,
+            status=(result.status.value if hasattr(result.status, "value") else str(result.status)),
+        )
+    except StepExecutionError as e:
+        # Timeout / ERROR end-state — the step did not complete successfully.
+        raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail=str(e))
+    except TimeoutError as e:
+        raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail=str(e))
+    except ValueError as e:
+        # Unknown terminal / bad input surfaced by the terminal layer.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to run step: {str(e)}",
         )
 
 

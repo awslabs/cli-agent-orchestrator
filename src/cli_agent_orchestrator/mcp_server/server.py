@@ -1,8 +1,8 @@
 """CLI Agent Orchestrator MCP Server implementation."""
 
-import asyncio
 import logging
 import os
+import re
 import time
 from typing import Any, Dict, Optional, Tuple, Union
 
@@ -396,32 +396,78 @@ def _send_terminal_input(terminal_id: str, message: str) -> None:
     response.raise_for_status()
 
 
-def _send_direct_input_handoff(terminal_id: str, provider: str, message: str) -> None:
-    """Send handoff payload to an agent, prepending orchestrator instructions if needed."""
-    # For Codex provider: prepend handoff context so the worker agent knows
-    # this is a blocking handoff and should simply output results rather than
-    # attempting to call send_message back to the supervisor.
-    if provider == "codex":
-        # Never tell a worker its supervisor is terminal 'unknown' (issue #284):
-        # a missing ID is a configuration error, not a routable address.
-        supervisor_id = os.environ.get("CAO_TERMINAL_ID")
-        if not supervisor_id:
-            raise ValueError(
-                "CAO_TERMINAL_ID not set - cannot identify the supervisor terminal "
-                "for the handoff context. Run handoff from inside a CAO terminal."
-            )
-        handoff_message = (
-            f"[CAO Handoff] Supervisor terminal ID: {supervisor_id}. "
-            "This is a blocking handoff — the orchestrator will automatically "
-            "capture your response when you finish. Complete the task and output "
-            "your results directly. Do NOT use send_message to notify the supervisor "
-            "unless explicitly needed — just do the work and present your deliverables.\n\n"
-            f"{message}"
-        )
-    else:
-        handoff_message = message
+def _shape_handoff_message(provider: str, message: str) -> str:
+    """Return the handoff prompt, prepending the codex [CAO Handoff] banner.
 
+    Codex needs to be told this is a blocking handoff so it outputs results
+    directly rather than calling send_message back to the supervisor. The
+    banner embeds this MCP process's CAO_TERMINAL_ID — which is why prompt
+    shaping stays caller-side in the single-seam refactor (the server process
+    does not have it). Other providers get the message unchanged.
+
+    Raises:
+        ValueError: codex provider with no CAO_TERMINAL_ID — never tell a worker
+            its supervisor is terminal 'unknown' (issue #284).
+    """
+    if provider != "codex":
+        return message
+
+    supervisor_id = os.environ.get("CAO_TERMINAL_ID")
+    if not supervisor_id:
+        raise ValueError(
+            "CAO_TERMINAL_ID not set - cannot identify the supervisor terminal "
+            "for the handoff context. Run handoff from inside a CAO terminal."
+        )
+    return (
+        f"[CAO Handoff] Supervisor terminal ID: {supervisor_id}. "
+        "This is a blocking handoff — the orchestrator will automatically "
+        "capture your response when you finish. Complete the task and output "
+        "your results directly. Do NOT use send_message to notify the supervisor "
+        "unless explicitly needed — just do the work and present your deliverables.\n\n"
+        f"{message}"
+    )
+
+
+def _send_direct_input_handoff(terminal_id: str, provider: str, message: str) -> None:
+    """Send handoff payload to an agent, prepending orchestrator instructions if needed.
+
+    Retained for the assign path and any direct callers; the codex banner logic
+    lives in ``_shape_handoff_message`` so the single-seam handoff path and this
+    direct path produce byte-identical shaped prompts.
+    """
+    handoff_message = _shape_handoff_message(provider, message)
     _send_direct_input(terminal_id, handoff_message, OrchestrationType.HANDOFF)
+
+
+def _resolve_handoff_provider(agent_profile: str) -> str:
+    """Resolve the provider for a handoff WITHOUT creating a terminal.
+
+    Mirrors the provider-resolution branch of ``_create_terminal``: a worker
+    inherits the supervisor's provider as a FALLBACK (not an override) when run
+    inside a CAO terminal, else uses the default. This lets the codex fast-fail
+    and codex prompt-shaping run caller-side before the single combined call.
+    """
+    current_terminal_id = os.environ.get("CAO_TERMINAL_ID")
+    if not current_terminal_id:
+        return resolve_provider(agent_profile, fallback_provider=DEFAULT_PROVIDER)
+
+    response = requests.get(
+        f"{API_BASE_URL}/terminals/{current_terminal_id}", timeout=MCP_REQUEST_TIMEOUT
+    )
+    response.raise_for_status()
+    terminal_metadata = response.json()
+    return resolve_provider(agent_profile, fallback_provider=terminal_metadata["provider"])
+
+
+def _terminal_id_from_detail(detail: str) -> Optional[str]:
+    """Best-effort extraction of an 8-hex terminal id from an error detail.
+
+    The run-step endpoint surfaces the live terminal in its error message
+    (e.g. "terminal a1b2c3d4 did not reach a ready status ..."). Pull it back
+    out so a failed handoff can still report the orphaned terminal for cleanup.
+    """
+    match = re.search(r"terminal ([a-f0-9]{8})\b", detail)
+    return match.group(1) if match else None
 
 
 def _send_direct_input_assign(terminal_id: str, message: str) -> None:
@@ -511,17 +557,36 @@ def _load_skill_impl(name: str) -> Union[str, Dict[str, Any]]:
 async def _handoff_impl(
     agent_profile: str, message: str, timeout: int = 600, working_directory: Optional[str] = None
 ) -> HandoffResult:
-    """Implementation of handoff logic."""
+    """Implementation of handoff logic.
+
+    Single-seam refactor (issue #312, N0). This MCP-process function is an HTTP
+    client; it MUST NOT import services/clients. Its former six granular
+    round-trips (create -> poll-ready -> input -> poll-complete -> output ->
+    exit/delete) are collapsed into ONE call to the combined server-side
+    ``POST /terminals/run-step`` endpoint, whose handler runs the shared
+    ``run_agent_step`` substrate. Observable behavior is preserved (BR-8): same
+    HandoffResult shape + success/failure semantics, same codex CAO_TERMINAL_ID
+    fast-fail, same timeout contract, terminal auto-torn-down on success.
+
+    Codex prompt-shaping (the [CAO Handoff] banner) stays CALLER-SIDE here: it
+    depends on this MCP process's ``CAO_TERMINAL_ID`` env var, which the server
+    process does not have. We shape the prompt before the single call and pass
+    the already-shaped text to the substrate, which sends it verbatim. This is
+    the one behavior-equivalence risk flagged in the plan; keeping the shaping
+    caller-side is the choice that preserves the exact existing codex banner.
+    """
     start_time = time.time()
     terminal_id: Optional[str] = None
 
     try:
-        # Create terminal
-        terminal_id, provider = _create_terminal(agent_profile, working_directory)
+        # Resolve the provider WITHOUT creating a terminal, so the codex
+        # fast-fail (which needs CAO_TERMINAL_ID) and the codex prompt-shaping
+        # can both run caller-side before the single combined call. The server
+        # endpoint then creates + drives + tears down the terminal.
+        provider = _resolve_handoff_provider(agent_profile)
 
-        # Fail fast for codex before the (up to 120s) ready wait: its handoff
-        # context requires CAO_TERMINAL_ID, and _send_direct_input_handoff
-        # would only raise after the wait completes (issue #284).
+        # Fail fast for codex: its handoff banner requires CAO_TERMINAL_ID. We
+        # check before any terminal is created (no terminal_id to surface yet).
         if provider == "codex" and not os.environ.get("CAO_TERMINAL_ID"):
             return HandoffResult(
                 success=False,
@@ -531,75 +596,59 @@ async def _handoff_impl(
                     "inside a CAO terminal."
                 ),
                 output=None,
-                terminal_id=terminal_id,
+                terminal_id=None,
             )
 
-        # Wait for terminal to be ready (IDLE or COMPLETED) before sending
-        # the handoff message. Accept COMPLETED in addition to IDLE because
-        # providers that use an initial prompt flag process the system prompt
-        # as the first user message and produce a response, reaching COMPLETED
-        # without ever showing a bare IDLE state.
-        # Both states indicate the provider is ready to accept input.
-        #
-        # Use a generous timeout (120s) because provider initialization can be
-        # slow: shell warm-up (~5s), CLI startup with MCP server registration
-        # (~10-30s), and API authentication (~5-10s). If the provider's own
-        # initialize() timed out (60-90s), this acts as a fallback to catch
-        # cases where the CLI starts slightly after the provider timeout.
-        # Provider initialization can be slow (~15-45s depending on provider).
-        if not wait_until_terminal_status(
-            terminal_id,
-            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-            timeout=120.0,
-        ):
-            return HandoffResult(
-                success=False,
-                message=f"Terminal {terminal_id} did not reach ready status within 120 seconds",
-                output=None,
-                terminal_id=terminal_id,
+        # Shape the prompt caller-side (prepends the codex [CAO Handoff] banner
+        # when provider == codex; otherwise returns the message unchanged).
+        shaped_message = _shape_handoff_message(provider, message)
+
+        # Single combined call: create -> ready-wait -> input -> complete-wait ->
+        # extract -> teardown, all server-side via run_agent_step.
+        payload: Dict[str, Any] = {
+            "provider": provider,
+            "agent": agent_profile,
+            "prompt": shaped_message,
+            "teardown": True,
+            "timeout": float(timeout),
+        }
+        if working_directory:
+            payload["working_directory"] = working_directory
+
+        # Allow the full step time plus the server-side ready-wait (up to 120s)
+        # plus headroom; the server enforces the per-step timeout internally.
+        client_timeout = float(timeout) + 180.0
+        try:
+            response = requests.post(
+                f"{API_BASE_URL}/terminals/run-step",
+                json=payload,
+                timeout=client_timeout,
             )
-
-        await asyncio.sleep(2)  # wait another 2s
-
-        # Send message to terminal (injects handoff instructions for codex if needed)
-        _send_direct_input_handoff(terminal_id, provider, message)
-
-        # Monitor until completion with timeout
-        if not wait_until_terminal_status(
-            terminal_id, TerminalStatus.COMPLETED, timeout=timeout, polling_interval=1.0
-        ):
+        except requests.Timeout:
             return HandoffResult(
                 success=False,
                 message=f"Handoff timed out after {timeout} seconds",
                 output=None,
-                terminal_id=terminal_id,
+                terminal_id=None,
             )
 
-        # Get the response
-        response = requests.get(
-            f"{API_BASE_URL}/terminals/{terminal_id}/output",
-            params={"mode": "last"},
-            timeout=MCP_REQUEST_TIMEOUT,
-        )
-        response.raise_for_status()
-        output_data = response.json()
-        output = output_data["output"]
+        if response.status_code != 200:
+            # Map the boundary's HTTPException back into a HandoffResult. The
+            # server surfaces the live terminal_id inside the detail message.
+            detail = _extract_error_detail(response, f"status {response.status_code}")
+            tid = _terminal_id_from_detail(detail)
+            # A 504 from the endpoint is the timeout/ERROR end-state.
+            if response.status_code == 504:
+                msg = f"Handoff timed out after {timeout} seconds"
+            else:
+                msg = f"Handoff failed: {detail}"
+            return HandoffResult(success=False, message=msg, output=None, terminal_id=tid)
 
-        # Send provider-specific exit command to cleanup terminal
-        response = requests.post(
-            f"{API_BASE_URL}/terminals/{terminal_id}/exit", timeout=MCP_REQUEST_TIMEOUT
-        )
-        response.raise_for_status()
-
-        # Auto-delete the worker terminal after successful handoff
-        try:
-            requests.delete(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=MCP_REQUEST_TIMEOUT)
-            logger.info(f"Auto-deleted handoff terminal {terminal_id}")
-        except Exception as e:
-            logger.warning(f"Failed to auto-delete handoff terminal {terminal_id}: {e}")
+        data = response.json()
+        terminal_id = data.get("terminal_id")
+        output = data.get("last_message")
 
         execution_time = time.time() - start_time
-
         return HandoffResult(
             success=True,
             message=f"Successfully handed off to {agent_profile} ({provider}) in {execution_time:.2f}s"
@@ -609,10 +658,9 @@ async def _handoff_impl(
         )
 
     except Exception as e:
-        # Surface the terminal_id when creation succeeded before the failure
-        # (e.g. the codex missing-CAO_TERMINAL_ID guard) so the orphaned
-        # terminal can be inspected or cleaned up — matching the timeout
-        # failure paths above, which also return the live terminal_id.
+        # Surface terminal_id when known. With the single-call design the server
+        # owns the terminal lifecycle, so on a client-side failure (e.g. the
+        # provider resolution) there is usually no terminal to surface.
         return HandoffResult(
             success=False, message=f"Handoff failed: {str(e)}", output=None, terminal_id=terminal_id
         )
