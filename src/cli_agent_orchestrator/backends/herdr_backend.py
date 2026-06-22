@@ -109,7 +109,7 @@ def _sanitize_herdr_args(args: List[str]) -> List[str]:
 
 
 # Cache TTL for pane_id resolution (seconds).
-# Used by _resolve_pane_id() (inbox service path, herdr-native terminal_ids) and
+# Used by get_pane_id() (fast-path, reads the cache populated at create time) and
 # _resolve_workspace_id(). _resolve_pane_id_from_window() never caches pane_ids —
 # herdr renumbers panes on deletion, so it resolves the pane fresh every call.
 _PANE_CACHE_TTL = 5.0
@@ -201,42 +201,6 @@ class HerdrBackend(TerminalBackend):
         if isinstance(data, dict) and "result" in data:
             return cast(dict, data["result"])
         return cast(dict, data)
-
-    def _resolve_pane_id(self, terminal_id: str) -> str:
-        """Resolve terminal_id to current compact pane_id.
-
-        Uses a cache with 5s TTL to reduce redundant herdr pane list calls.
-
-        Args:
-            terminal_id: Stable terminal identifier
-
-        Returns:
-            Current compact pane_id
-
-        Raises:
-            TerminalNotFoundError: If terminal_id not found in pane list
-        """
-        # Check cache
-        if terminal_id in self._pane_cache:
-            pane_id, cached_at = self._pane_cache[terminal_id]
-            if time.time() - cached_at < _PANE_CACHE_TTL:
-                return pane_id
-
-        # Resolve via herdr pane list
-        result = self._run_herdr(["pane", "list"])
-        try:
-            data = self._parse_herdr_json(result.stdout)
-            panes = data.get("panes", []) if isinstance(data, dict) else data
-        except json.JSONDecodeError as e:
-            raise TerminalBackendError(f"Failed to parse herdr pane list output: {e}") from e
-
-        for pane in panes:
-            if pane.get("terminal_id") == terminal_id:
-                pane_id = str(pane["pane_id"])
-                self._pane_cache[terminal_id] = (pane_id, time.time())
-                return pane_id
-
-        raise TerminalNotFoundError(terminal_id)
 
     def _resolve_workspace_id(self, session_name: str) -> str:
         """Resolve session_name (workspace label) to workspace ID.
@@ -887,11 +851,3 @@ class HerdrBackend(TerminalBackend):
                 return str(pane["pane_id"])
 
         raise TerminalNotFoundError(f"{session_name}:{window_name}")
-
-    def invalidate_cache(self) -> None:
-        """Invalidate all cached pane_id mappings.
-
-        Called after herdr reconnection when pane_ids may have compacted.
-        """
-        self._pane_cache.clear()
-        self._workspace_cache.clear()

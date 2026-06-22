@@ -8,6 +8,7 @@ import requests
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import API_BASE_URL, TERMINAL_LOG_DIR
+from cli_agent_orchestrator.utils.terminal import sync_backend_from_server
 
 
 @click.group()
@@ -62,6 +63,7 @@ def restore(terminal_id: str):
         window_shell = f"exec {login_shell} -l"
 
     try:
+        sync_backend_from_server()
         get_backend().create_window(
             session_name,
             window_name,

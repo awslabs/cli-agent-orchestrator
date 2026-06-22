@@ -22,7 +22,7 @@ CAO controls what tools an agent can use through a two-layer system:
 
 ## Default Behavior
 
-**If you don't set `role` or `allowedTools`, the agent defaults to `developer` role permissions** (`@builtin`, `fs_*`, `execute_bash`, `@cao-mcp-server`). This gives full coding access while still going through the restriction system. The launch confirmation prompt will remind you to add `role` or `allowedTools` to your profile.
+**If you don't set `role` or `allowedTools`, the agent defaults to `developer` role permissions** (`@builtin`, `fs_*`, `execute_bash`, `web_fetch`, `@cao-mcp-server`). This gives full coding access while still going through the restriction system. The launch confirmation prompt will remind you to add `role` or `allowedTools` to your profile.
 
 ## The Three Controls
 
@@ -43,8 +43,8 @@ role: supervisor
 | Role | Default `allowedTools` | What the agent can do |
 |------|----------------------|----------------------|
 | `supervisor` | `@cao-mcp-server`, `fs_read`, `fs_list` | Orchestrate workers + read files for context |
-| `developer` | `@builtin`, `fs_*`, `execute_bash`, `@cao-mcp-server` | Full access: read, write, execute, orchestrate |
-| `reviewer` | `@builtin`, `fs_read`, `fs_list`, `@cao-mcp-server` | Read-only: review code, no writes or execution |
+| `developer` | `@builtin`, `fs_*`, `execute_bash`, `web_fetch`, `@cao-mcp-server` | Full access: read, write, execute, fetch, orchestrate |
+| `reviewer` | `@builtin`, `fs_read`, `fs_list`, `@cao-mcp-server` | Read-only: review code, no writes, execution, or network |
 
 #### Custom Roles
 
@@ -106,6 +106,7 @@ No `role` is needed — `allowedTools` is the full specification of what tools t
 | `fs_write` | Write/edit files | `Edit`, `Write` | `write_file`, `replace` |
 | `fs_list` | Search/list files | `Glob`, `Grep` | `list_directory`, `glob` |
 | `fs_*` | All filesystem ops | All of the above | All of the above |
+| `web_fetch` | Fetch URLs / search the web | `WebFetch`, `WebSearch` | `web_fetch`, `google_web_search` |
 | `@builtin` | Provider built-in capabilities | (internal) | (internal) |
 | `@cao-mcp-server` | CAO orchestration tools | `handoff`, `assign`, `send_message`, plus Hermes prompt answers via `answer_user_prompt` | Same |
 | `*` | Everything (unrestricted) | All tools | All tools |
@@ -154,7 +155,7 @@ If no `role` or `allowedTools` is set in the profile, the prompt includes an add
 ```
 Agent 'my_agent' launching on claude_code:
   Role:      (not set — using developer defaults)
-  Allowed:   @builtin, fs_*, execute_bash, @cao-mcp-server
+  Allowed:   @builtin, fs_*, execute_bash, web_fetch, @cao-mcp-server
   Directory: /home/user/my-project
 
   Note: No role or allowedTools set — defaulting to 'developer'.
@@ -195,6 +196,7 @@ CAO defines a universal tool vocabulary (`execute_bash`, `fs_read`, `fs_write`, 
 | `fs_read` | `Read` | `read` | `read_file`, `list_directory`, `search_file_content`, `glob` |
 | `fs_write` | `Edit`, `Write` | `write` | `write_file`, `replace` |
 | `fs_list` | `Glob`, `Grep` | `list`, `grep` | `list_directory`, `glob`, `search_file_content` |
+| `web_fetch` | `WebFetch`, `WebSearch` | (not mapped) | `web_fetch`, `google_web_search` |
 
 **Providers that accept CAO vocabulary directly** — Kiro CLI and Q CLI accept `allowedTools` in the agent JSON at install time, using the same vocabulary as CAO. No translation needed. Kimi CLI and Codex use system prompt instructions to enforce restrictions. For all four, CAO passes the `allowedTools` list directly without translation — so no `TOOL_MAPPING` entry exists for them, and none is needed.
 
@@ -324,7 +326,7 @@ Each agent is restricted based on its own profile, not its parent's permissions.
 
 ## Known Limitations
 
-1. **Claude Code tool mapping is incomplete.** The current mapping covers `Bash`, `Read`, `Edit`, `Write`, `Glob`, and `Grep`. Claude Code also has [`WebFetch`](https://code.claude.com/docs/en/permissions#webfetch), `Agent` (subagent), and MCP tools that are not yet mapped to CAO vocabulary. These tools remain **unrestricted** even when `allowedTools` is set — they cannot be blocked via `--disallowedTools`. Future versions will add `web_fetch` and `subagent` to the CAO vocabulary.
+1. **Claude Code tool mapping is nearly complete, with MCP tools the remaining gap.** The current mapping covers `Bash` (and its `Task`/`Monitor`/`BashOutput`/`KillShell` execution family), `Read`, `Edit`, `Write`, `Glob`, `Grep`, and — via `web_fetch` — [`WebFetch`](https://code.claude.com/docs/en/permissions#webfetch) and `WebSearch`. The subagent tool (`Task`) is intentionally **not** a separate category: it is folded into `execute_bash`, because a `Task` subagent spawns with its own full toolset and can run shell, so exposing it standalone would let a profile grant subagent access without `execute_bash` and re-open that escape. Provider MCP tools remain unmapped (see limitation #2) — they cannot be blocked via `--disallowedTools`.
 
 2. **`@cao-mcp-server` is a pass-through marker, not enforced at the provider level.** Including `@cao-mcp-server` in `allowedTools` signals intent (this agent should have orchestration tools), but it does **not** translate to any native `--disallowedTools` flag. MCP tools (`handoff`, `assign`, `send_message`, `answer_user_prompt`) are always available to the agent regardless of `allowedTools` — providers do not currently support blocking individual MCP tools. `answer_user_prompt` is exposed by the MCP server, but its structured prompt-navigation behavior is currently implemented for Hermes workers that report `waiting_user_answer`; other providers may only receive ordinary text input until they implement equivalent prompt states. Additionally, `@cao-mcp-server` is all-or-nothing: there is no way to allow only `send_message` while blocking `assign`. Future versions may support `@cao-mcp-server:send_message` syntax for per-tool MCP control.
 

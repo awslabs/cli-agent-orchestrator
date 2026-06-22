@@ -6,7 +6,7 @@ Skills are reusable blocks of instructional content — domain knowledge, conven
 
 Skills are loaded lazily: only the skill name and description are injected into the agent's prompt at launch. The full content is retrieved on demand when the agent decides it needs it, preserving context window budget.
 
-All skills live in a single directory: `~/.aws/cli-agent-orchestrator/skills/`. There is no distinction between built-in and user-created skills — you can edit, replace, or remove any skill, including the defaults.
+The global skill store lives at `~/.aws/cli-agent-orchestrator/skills/`. There is no distinction between built-in and user-created skills — you can edit, replace, or remove any skill, including the defaults. In addition to the global store, CAO can discover skills from extra directories you register (for example a project's own skills folder) — see [Extra Skill Directories](#extra-skill-directories) below.
 
 ## When to Use Skills
 
@@ -97,6 +97,18 @@ CAO ships with two builtin skills:
 |-------|-------------|
 | `cao-supervisor-protocols` | Multi-agent orchestration patterns for supervisors: `assign`, `handoff`, idle-based message delivery |
 | `cao-worker-protocols` | Worker-side callback and completion rules for assigned and handed-off tasks |
+
+## Extra Skill Directories
+
+Beyond the global store, CAO can discover skills from extra directories you register via the `extra_skill_dirs` setting. This mirrors `extra_agent_dirs` for agent profiles.
+
+Unlike `cao skills add`, which **copies** a skill folder into the global store, an extra directory is **scanned in place** — nothing is copied. This lets you keep a project's skills in the project repo (e.g. `<repo>/.cao/skills`) and register that directory, so the skills stay canonical in their source location: edits are picked up on the next terminal creation, there is no second copy to keep in sync, and the skills are version-controlled alongside the project rather than re-added after every change.
+
+Each registered directory is scanned one level deep — every immediate subfolder that contains a `SKILL.md` is treated as a skill, and subfolders without one are ignored. A registered path may therefore be a broad project root; only its skill subfolders are picked up.
+
+**Resolution order.** Directories are searched global store first, then `extra_skill_dirs` in the configured order. The first *valid* match for a given name wins, so a skill in the global store is never shadowed by a same-named skill in a later extra directory, and an invalid (unloadable) folder does not shadow a later valid one of the same name — `cao skills list` and `load_skill` resolve a name to the same skill.
+
+**Configuration.** Extra skill directories are stored under `extra_skill_dirs` in `~/.aws/cli-agent-orchestrator/settings.json` and managed through the `/settings/skill-dirs` API. See [settings.md](./settings.md#skill-directories) for the request/response format.
 
 ## How Agents Discover Skills
 

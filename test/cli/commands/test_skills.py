@@ -11,6 +11,21 @@ from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.utils.skill_injection import refresh_agent_json_prompt
 
 
+@pytest.fixture(autouse=True)
+def _default_no_extra_skill_dirs(monkeypatch):
+    """Default ``extra_skill_dirs`` to empty for every test.
+
+    These tests patch only ``SKILLS_DIR``; without this they would read the
+    developer's real ``settings.json`` and pick up any ``extra_skill_dirs``
+    there (e.g. a project registered for live skill discovery), making
+    "empty store" assertions flaky on a configured machine.
+    """
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.settings_service.get_extra_skill_dirs",
+        lambda: [],
+    )
+
+
 def _create_skill(folder: Path, name: str, description: str, body: str = "# Skill\n\nBody") -> None:
     """Create a skill folder with SKILL.md and optional content."""
     folder.mkdir(parents=True, exist_ok=True)

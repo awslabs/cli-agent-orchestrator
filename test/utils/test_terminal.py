@@ -10,6 +10,7 @@ from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
     generate_terminal_id,
     generate_window_name,
+    sync_backend_from_server,
     validate_tmux_name,
     wait_for_shell,
     wait_until_status,
@@ -389,3 +390,72 @@ class TestWaitUntilTerminalStatus:
         )
 
         assert result is False
+
+
+# ── sync_backend_from_server (issue #308) ────────────────────────────
+
+
+class TestSyncBackendFromServer:
+    """Tests for sync_backend_from_server() helper."""
+
+    def test_syncs_herdr_backend_from_health(self):
+        """When /health reports terminal_backend='herdr', set_backend is called with herdr."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"terminal_backend": "herdr"}
+        mock_resp.raise_for_status.return_value = None
+
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.requests.get", return_value=mock_resp),
+            patch("cli_agent_orchestrator.backends.factory.BackendFactory.create") as mock_create,
+            patch("cli_agent_orchestrator.backends.registry.set_backend") as mock_set,
+        ):
+            mock_backend = MagicMock()
+            mock_create.return_value = mock_backend
+
+            sync_backend_from_server()
+
+            mock_create.assert_called_once_with(backend_override="herdr")
+            mock_set.assert_called_once_with(mock_backend)
+
+    def test_syncs_tmux_backend_from_health(self):
+        """When /health reports terminal_backend='tmux', set_backend is called with tmux."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"terminal_backend": "tmux"}
+        mock_resp.raise_for_status.return_value = None
+
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.requests.get", return_value=mock_resp),
+            patch("cli_agent_orchestrator.backends.factory.BackendFactory.create") as mock_create,
+            patch("cli_agent_orchestrator.backends.registry.set_backend") as mock_set,
+        ):
+            mock_backend = MagicMock()
+            mock_create.return_value = mock_backend
+
+            sync_backend_from_server()
+
+            mock_create.assert_called_once_with(backend_override="tmux")
+            mock_set.assert_called_once_with(mock_backend)
+
+    def test_silently_handles_connection_error(self):
+        """When server is unreachable, no exception is raised."""
+        import requests as _requests
+
+        with patch(
+            "cli_agent_orchestrator.utils.terminal.requests.get",
+            side_effect=_requests.exceptions.ConnectionError("refused"),
+        ):
+            # Must not raise
+            sync_backend_from_server()
+
+    def test_silently_handles_missing_field(self):
+        """When /health response lacks terminal_backend, no set_backend call."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"status": "ok"}
+        mock_resp.raise_for_status.return_value = None
+
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.requests.get", return_value=mock_resp),
+            patch("cli_agent_orchestrator.backends.registry.set_backend") as mock_set,
+        ):
+            sync_backend_from_server()
+            mock_set.assert_not_called()

@@ -1,5 +1,6 @@
 """Info command for CLI Agent Orchestrator CLI."""
 
+import os
 import subprocess
 
 import click
@@ -20,18 +21,22 @@ def info():
         # Display database path
         click.echo(f"Database path: {DATABASE_FILE}")
 
-        # Try to get current session name from tmux
-        session_name = None
-        try:
-            result = subprocess.run(
-                ["tmux", "display-message", "-p", "#S"],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            session_name = result.stdout.strip()
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            pass
+        # Try to get current session name:
+        # 1. Check CAO_SESSION_NAME env var (set by herdr backend)
+        # 2. Fall back to tmux display-message (works for tmux backend)
+        session_name = os.environ.get("CAO_SESSION_NAME")
+
+        if not session_name:
+            try:
+                result = subprocess.run(
+                    ["tmux", "display-message", "-p", "#S"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                session_name = result.stdout.strip()
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                pass
 
         if session_name and session_name.startswith(SESSION_PREFIX):
             try:

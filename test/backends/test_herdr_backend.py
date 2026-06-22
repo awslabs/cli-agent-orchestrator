@@ -79,55 +79,6 @@ class TestHerdrBackendABC:
             assert callable(getattr(backend, method))
 
 
-# --- Pane ID Resolution ---
-
-
-class TestPaneIdResolution:
-    """Test terminal_id → pane_id resolution with cache."""
-
-    @patch("subprocess.run")
-    def test_resolves_pane_id_from_list(self, mock_run, backend):
-        """Should resolve terminal_id to pane_id via herdr pane list."""
-        panes = [
-            {"terminal_id": "term_abc", "pane_id": "w1-1", "workspace_id": "w1"},
-            {"terminal_id": "term_def", "pane_id": "w1-2", "workspace_id": "w1"},
-        ]
-        mock_run.return_value = _completed(_make_pane_list_response(panes))
-
-        result = backend._resolve_pane_id("term_abc")
-        assert result == "w1-1"
-
-    @patch("subprocess.run")
-    def test_cache_hit_avoids_subprocess(self, mock_run, backend):
-        """Cached pane_id should be returned without calling herdr."""
-        backend._pane_cache["term_cached"] = ("w2-3", time.time())
-
-        result = backend._resolve_pane_id("term_cached")
-        assert result == "w2-3"
-        mock_run.assert_not_called()
-
-    @patch("subprocess.run")
-    def test_cache_expired_calls_subprocess(self, mock_run, backend):
-        """Expired cache entry should trigger a fresh resolve."""
-        backend._pane_cache["term_old"] = ("w2-3", time.time() - 10.0)  # expired
-
-        panes = [{"terminal_id": "term_old", "pane_id": "w2-4", "workspace_id": "w2"}]
-        mock_run.return_value = _completed(_make_pane_list_response(panes))
-
-        result = backend._resolve_pane_id("term_old")
-        assert result == "w2-4"
-        mock_run.assert_called_once()
-
-    @patch("subprocess.run")
-    def test_raises_terminal_not_found(self, mock_run, backend):
-        """Should raise TerminalNotFoundError when terminal_id is not in list."""
-        panes = [{"terminal_id": "term_other", "pane_id": "w1-1", "workspace_id": "w1"}]
-        mock_run.return_value = _completed(_make_pane_list_response(panes))
-
-        with pytest.raises(TerminalNotFoundError, match="term_missing"):
-            backend._resolve_pane_id("term_missing")
-
-
 # --- Command Construction ---
 
 
@@ -521,16 +472,6 @@ class TestHerdrBackendErrors:
 
         with pytest.raises(TerminalBackendError, match="herdr CLI not found"):
             backend._run_herdr(["workspace", "list"])
-
-    def test_invalidate_cache_clears_all(self, backend):
-        """invalidate_cache should empty both caches."""
-        backend._pane_cache["tid1"] = ("w1-1", time.time())
-        backend._workspace_cache["cao-test"] = ("w1", time.time())
-
-        backend.invalidate_cache()
-
-        assert backend._pane_cache == {}
-        assert backend._workspace_cache == {}
 
 
 # --- Multi-pane resolution (S-008) ---

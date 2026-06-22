@@ -120,6 +120,13 @@ RUNTIME_SKILL_PROMPT_PROVIDERS = {
     ProviderType.KIMI_CLI.value,
 }
 
+# Providers whose tool restrictions are prompt-level text only (no native
+# blocking mechanism) — a restricted policy on these is advisory, not enforced.
+SOFT_ENFORCEMENT_PROVIDERS = {
+    ProviderType.KIMI_CLI.value,
+    ProviderType.CODEX.value,
+}
+
 
 async def create_terminal(
     provider: str,
@@ -232,6 +239,20 @@ async def create_terminal(
             mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
             allowed_tools = resolve_allowed_tools(
                 profile.allowedTools, profile.role, mcp_server_names
+            )
+
+        # Soft-enforcement guard: kimi_cli/codex have NO native tool-blocking
+        # mechanism (kimi runs --yolo; restrictions are prompt-level text
+        # only), so a restricted policy on them is advisory, not enforced.
+        # Surface that loudly at launch so operators route restricted or
+        # write-capable roles to hard-enforcement providers instead.
+        if provider in SOFT_ENFORCEMENT_PROVIDERS and allowed_tools and "*" not in allowed_tools:
+            logger.warning(
+                f"Terminal {terminal_id}: provider '{provider}' cannot enforce tool "
+                f"restrictions (soft/prompt-level only) but profile '{agent_profile}' "
+                f"requests {allowed_tools}. Treat this worker as unrestricted; for "
+                f"enforced restrictions use claude_code, kiro_cli, gemini_cli, or "
+                f"copilot_cli."
             )
 
         # Step 3c: Persist terminal metadata to database after restrictions
@@ -672,14 +693,37 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
             except ValueError:
                 pass
 
-            # Full scrollback also failed — return partial.
-            logger.warning(
-                "get_output: %s response marker not found in full_history, returning partial",
-                terminal_id,
-            )
-            return (
-                f"[PARTIAL RESPONSE - response marker not found in full scrollback]\n{full_output}"
-            )
+            # Full scrollback also failed — distinguish overflow from no response.
+            # If the buffer is close to full (>=90% of last escalation cap), the
+            # response marker was likely produced but pushed past the scrollback
+            # limit (overflow).  If the buffer is mostly empty, the agent never
+            # produced a text response (e.g. only tool calls, crash, or timeout).
+            actual_lines = full_output.count("\n") + 1
+            overflow_threshold = int(_ESCALATION_STEPS[-1] * 0.9)
+            if actual_lines >= overflow_threshold:
+                logger.warning(
+                    "get_output: %s response marker not found, buffer near-full "
+                    "(%d lines >= %d threshold) — likely overflow",
+                    terminal_id,
+                    actual_lines,
+                    overflow_threshold,
+                )
+                return (
+                    f"[PARTIAL RESPONSE - response marker not found, buffer overflow likely "
+                    f"({actual_lines} lines retrieved)]\n{full_output}"
+                )
+            else:
+                logger.warning(
+                    "get_output: %s response marker not found, buffer sparse "
+                    "(%d lines < %d threshold) — agent likely produced no text response",
+                    terminal_id,
+                    actual_lines,
+                    overflow_threshold,
+                )
+                return (
+                    f"[NO RESPONSE - agent completed without producing a text response "
+                    f"({actual_lines} lines in buffer)]\n{full_output}"
+                )
 
     except Exception as e:
         logger.error(f"Failed to get output from terminal {terminal_id}: {e}")

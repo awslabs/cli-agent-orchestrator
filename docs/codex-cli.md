@@ -162,6 +162,35 @@ sandbox_mode = "read-only"
 approval_policy = "never"
 ```
 
+### Inline Codex Config Overrides
+
+The `codexConfig` field on an agent profile is a map of Codex config overrides that CAO passes as `-c key=value` flags at launch — the same mechanism used for `developer_instructions` and `mcpServers`. It lets a profile set per-agent Codex knobs (reasoning effort, service tier, fast mode, model, …) **without editing the global `~/.codex/config.toml` or maintaining named profile files**.
+
+- **Keys** may be dotted paths into Codex's config schema (e.g. `model_reasoning_effort`, `service_tier`, `features.fast_mode`).
+- **Values** are serialized to TOML scalars: strings are quoted, booleans and numbers are emitted bare. So `model_reasoning_effort: "xhigh"` becomes `-c model_reasoning_effort="xhigh"` and `features.fast_mode: true` becomes `-c features.fast_mode=true`.
+- Overrides are applied in **both** the default `--yolo` path and the `--profile <codexProfile>` path, so effort/fast-mode knobs work whether or not a named profile governs sandbox/approvals.
+- `codexConfig` **composes** with `codexProfile`. Because Codex applies CLI `-c` overrides last, a key set in both wins from `codexConfig`.
+- Scope is per-session: nothing is written to the user's global `~/.codex/config.toml`.
+
+Example — a developer agent pinned to high reasoning effort and fast mode:
+
+```markdown
+---
+name: backend-developer
+description: Backend developer agent
+provider: codex
+role: developer
+codexConfig:
+  model_reasoning_effort: "xhigh"
+  service_tier: "fast"
+  features.fast_mode: true
+---
+
+You implement backend changes from a task spec.
+```
+
+This launches Codex as `codex --yolo … -c model_reasoning_effort="xhigh" -c service_tier="fast" -c features.fast_mode=true`, applying the effort and fast-mode settings to that agent only.
+
 ## Workflows
 
 ### 1. Interactive single-agent task

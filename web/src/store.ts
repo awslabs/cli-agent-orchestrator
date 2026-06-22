@@ -21,7 +21,7 @@ interface Store {
 
   fetchSessions: () => Promise<void>
   selectSession: (name: string | null) => Promise<void>
-  createSession: (provider: string, agentProfile: string, workingDirectory?: string) => Promise<void>
+  createSession: (provider: string, agentProfile: string, workingDirectory?: string, sessionName?: string) => Promise<void>
   deleteSession: (name: string) => Promise<void>
   showSnackbar: (snackbar: Snackbar) => void
   hideSnackbar: () => void
@@ -72,9 +72,9 @@ export const useStore = create<Store>((set, get) => ({
     }
   },
 
-  createSession: async (provider, agentProfile, workingDirectory) => {
+  createSession: async (provider, agentProfile, workingDirectory, sessionName) => {
     try {
-      await api.createSession(provider, agentProfile, undefined, workingDirectory)
+      await api.createSession(provider, agentProfile, sessionName, workingDirectory)
       get().showSnackbar({ type: 'success', message: 'Session created' })
       await get().fetchSessions()
     } catch (e: any) {

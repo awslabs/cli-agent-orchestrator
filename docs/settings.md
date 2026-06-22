@@ -59,6 +59,24 @@ Add additional directories that are scanned for agent profiles across all provid
 }
 ```
 
+## Skill Directories
+
+CAO discovers skills (loaded on demand via the `load_skill` MCP tool) by scanning, in order (first match wins):
+
+1. **Global skill store** — `~/.aws/cli-agent-orchestrator/skills/`
+2. **Extra custom directories** — User-added paths (`extra_skill_dirs`)
+
+This mirrors agent-profile resolution: a skill in the global store is not shadowed by one with the same name in a later extra directory. `extra_skill_dirs` lets you keep a project's skills in the project repo (e.g. `<repo>/.cao/skills`) and register the directory, instead of copying or symlinking each skill into the global store.
+
+```json
+{
+  "extra_skill_dirs": [
+    "/path/to/team-shared-skills",
+    "/path/to/project-specific-skills"
+  ]
+}
+```
+
 ## settings.json Format
 
 ```json
@@ -70,7 +88,8 @@ Add additional directories that are scanned for agent profiles across all provid
     "codex": "~/.aws/cli-agent-orchestrator/agent-store",
     "cao_installed": "~/.aws/cli-agent-orchestrator/agent-context"
   },
-  "extra_agent_dirs": []
+  "extra_agent_dirs": [],
+  "extra_skill_dirs": []
 }
 ```
 
@@ -80,8 +99,8 @@ Add additional directories that are scanned for agent profiles across all provid
 |--------|----------|-------------|
 | `GET` | `/settings/agent-dirs` | Get current agent directories (merged with defaults) |
 | `POST` | `/settings/agent-dirs` | Update agent directories |
-| `GET` | `/settings/extra-agent-dirs` | Get extra custom directories |
-| `POST` | `/settings/extra-agent-dirs` | Set extra custom directories |
+| `GET` | `/settings/skill-dirs` | Get the global skill store path and extra skill directories |
+| `POST` | `/settings/skill-dirs` | Set extra custom skill directories |
 
 See [api.md](api.md) for the full API reference.
 
