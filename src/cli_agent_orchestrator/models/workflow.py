@@ -198,7 +198,7 @@ class WorkflowSpec(BaseModel):
         errors: List[str] = []
 
         # 1. Names (BR-1)
-        if not _NAME_RE.match(self.name):
+        if not _NAME_RE.fullmatch(self.name):
             errors.append(f"workflow name '{self.name}' is invalid (must match {WORKFLOW_NAME_RE})")
         seen: set[str] = set()
         for step in self.steps:
