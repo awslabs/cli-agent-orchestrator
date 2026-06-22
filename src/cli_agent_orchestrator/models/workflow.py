@@ -202,7 +202,7 @@ class WorkflowSpec(BaseModel):
             errors.append(f"workflow name '{self.name}' is invalid (must match {WORKFLOW_NAME_RE})")
         seen: set[str] = set()
         for step in self.steps:
-            if not _NAME_RE.match(step.id):
+            if not _NAME_RE.fullmatch(step.id):
                 errors.append(f"step id '{step.id}' is invalid (must match {WORKFLOW_NAME_RE})")
             if step.id in seen:
                 errors.append(f"duplicate step id '{step.id}'")
