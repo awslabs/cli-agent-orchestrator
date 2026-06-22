@@ -501,12 +501,40 @@ def _resolve_handoff_provider(agent_profile: str) -> HandoffContext:
 def _terminal_id_from_detail(detail: str) -> Optional[str]:
     """Best-effort extraction of an 8-hex terminal id from an error detail.
 
-    The run-step endpoint surfaces the live terminal in its error message
-    (e.g. "terminal a1b2c3d4 did not reach a ready status ..."). Pull it back
-    out so a failed handoff can still report the orphaned terminal for cleanup.
+    Fallback for an older server that returns a plain-string ``detail`` instead
+    of the structured object. The current run-step endpoint returns terminal_id
+    as a structured field (see ``_parse_run_step_error``); this regex is only
+    used when that field is absent.
     """
     match = re.search(r"terminal ([a-f0-9]{8})\b", detail)
     return match.group(1) if match else None
+
+
+def _parse_run_step_error(
+    response: requests.Response,
+) -> tuple[Optional[str], str, Optional[str]]:
+    """Parse a run-step error response into ``(kind, message, terminal_id)``.
+
+    The run-step endpoint returns a STRUCTURED detail object
+    ``{"message", "kind", "terminal_id"}`` so callers read the failure kind and
+    the live terminal as fields. Falls back to the legacy plain-string detail
+    (+ regex terminal-id scrape) when the structured shape is absent, so a
+    newer client still works against an older server.
+    """
+    try:
+        payload = response.json()
+    except ValueError:
+        fallback = f"status {response.status_code}"
+        return None, fallback, None
+
+    detail = payload.get("detail")
+    if isinstance(detail, dict):
+        message = detail.get("message") or f"status {response.status_code}"
+        return detail.get("kind"), message, detail.get("terminal_id")
+    if isinstance(detail, str) and detail:
+        return None, detail, _terminal_id_from_detail(detail)
+    fallback = f"status {response.status_code}"
+    return None, fallback, None
 
 
 def _send_direct_input_assign(terminal_id: str, message: str) -> None:
@@ -686,19 +714,35 @@ async def _handoff_impl(
 
         if response.status_code != 200:
             # Map the boundary's HTTPException back into a HandoffResult. The
-            # server surfaces the live terminal_id inside the detail message.
-            detail = _extract_error_detail(response, f"status {response.status_code}")
-            tid = _terminal_id_from_detail(detail)
-            # A 504 from the endpoint is the timeout/ERROR end-state.
-            if response.status_code == 504:
+            # run-step endpoint returns a STRUCTURED detail object
+            # ({message, kind, terminal_id}) so we read terminal_id and the
+            # failure kind as fields rather than scraping the message.
+            kind, structured_detail, tid = _parse_run_step_error(response)
+            # worker RAN LONG (timeout) vs CRASHED (terminal reached ERROR) must
+            # be reported distinctly so a 5s crash is not mislabeled as an
+            # N-second timeout. The structured `kind` is authoritative; the
+            # status code is only the fallback when an older server omits it
+            # (504 -> timeout, 502 -> error).
+            if kind == "error" or (kind is None and response.status_code == 502):
+                msg = f"Handoff failed: worker errored ({structured_detail})"
+            elif kind == "timeout" or (kind is None and response.status_code == 504):
                 msg = f"Handoff timed out after {timeout} seconds"
             else:
-                msg = f"Handoff failed: {detail}"
+                msg = f"Handoff failed: {structured_detail}"
             return HandoffResult(success=False, message=msg, output=None, terminal_id=tid)
 
         data = response.json()
         terminal_id = data.get("terminal_id")
-        output = data.get("last_message")
+        # A 200 must carry last_message; surface a malformed body as a failure
+        # rather than silently returning success-with-None.
+        if "last_message" not in data:
+            return HandoffResult(
+                success=False,
+                message="Handoff failed: malformed run-step response (no last_message)",
+                output=None,
+                terminal_id=terminal_id,
+            )
+        output = data["last_message"]
 
         execution_time = time.time() - start_time
         return HandoffResult(

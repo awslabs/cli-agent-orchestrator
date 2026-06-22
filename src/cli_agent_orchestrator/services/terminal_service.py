@@ -567,6 +567,32 @@ def send_special_key(terminal_id: str, key: str) -> bool:
         raise
 
 
+def exit_terminal_cli(terminal_id: str) -> None:
+    """Send the provider-specific exit command to gracefully shut down the CLI.
+
+    Mirrors the ``POST /terminals/{id}/exit`` endpoint: resolve the provider,
+    send ``provider.exit_cli()`` — as a tmux key sequence when it is one (e.g.
+    ``C-d``), else as literal input (e.g. ``/exit``). This is the graceful CLI
+    shutdown that should precede ``delete_terminal`` (which goes straight to
+    ``kill_window``). Both the endpoint and ``run_agent_step`` call this so the
+    exit-then-delete lifecycle is implemented once.
+
+    Raises:
+        ValueError: if no provider is registered for ``terminal_id``.
+    """
+    provider = provider_manager.get_provider(terminal_id)
+    if provider is None:
+        raise ValueError(f"Provider not found for terminal {terminal_id}")
+    exit_command = provider.exit_cli()
+    # Some providers use tmux key sequences (e.g., "C-d" for Ctrl+D) instead of
+    # text commands (e.g., "/exit"). Key sequences must be sent via
+    # send_special_key() to be interpreted by tmux, not as literal text.
+    if exit_command.startswith(("C-", "M-")):
+        send_special_key(terminal_id, exit_command)
+    else:
+        send_input(terminal_id, exit_command)
+
+
 def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
     """Get terminal output.
 

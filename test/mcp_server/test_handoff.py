@@ -217,14 +217,18 @@ class TestHandoffOutcomes:
 
     @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
     def test_endpoint_504_maps_to_timeout_result(self, mock_provider):
-        """A 504 (step timeout / ERROR end-state) becomes a timeout failure and
-        surfaces the live terminal id from the detail for cleanup."""
+        """A 504 (worker ran long) becomes a timeout failure and reads the live
+        terminal id from the STRUCTURED detail field (not a regex scrape)."""
         mock_provider.return_value = _ctx("kiro_cli")
 
         timeout_resp = MagicMock()
         timeout_resp.status_code = 504
         timeout_resp.json.return_value = {
-            "detail": "step on terminal a1b2c3d4 did not complete within 600s"
+            "detail": {
+                "message": "step on terminal a1b2c3d4 did not complete within 600s",
+                "kind": "timeout",
+                "terminal_id": "a1b2c3d4",
+            }
         }
         with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
             mock_requests.post.return_value = timeout_resp
@@ -234,6 +238,69 @@ class TestHandoffOutcomes:
         assert result.success is False
         assert "timed out after 600 seconds" in result.message
         assert result.terminal_id == "a1b2c3d4"
+
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    def test_endpoint_502_maps_to_worker_errored_result(self, mock_provider):
+        """A 502 (worker CRASHED) is reported as an error — NOT as a timeout —
+        so a fast crash is not mislabeled as an N-second timeout."""
+        mock_provider.return_value = _ctx("kiro_cli")
+
+        crash_resp = MagicMock()
+        crash_resp.status_code = 502
+        crash_resp.json.return_value = {
+            "detail": {
+                "message": "terminal a1b2c3d4 reached ERROR status",
+                "kind": "error",
+                "terminal_id": "a1b2c3d4",
+            }
+        }
+        with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+            mock_requests.post.return_value = crash_resp
+            mock_requests.Timeout = Exception
+            result = asyncio.run(_handoff_impl("developer", "Do task", timeout=600))
+
+        assert result.success is False
+        assert "worker errored" in result.message
+        assert "timed out" not in result.message
+        assert result.terminal_id == "a1b2c3d4"
+
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    def test_legacy_string_detail_still_scrapes_terminal_id(self, mock_provider):
+        """Backward-compat: an older server returning a plain-string detail still
+        yields the terminal id via the regex fallback."""
+        mock_provider.return_value = _ctx("kiro_cli")
+
+        legacy_resp = MagicMock()
+        legacy_resp.status_code = 504
+        legacy_resp.json.return_value = {
+            "detail": "step on terminal a1b2c3d4 did not complete within 600s"
+        }
+        with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+            mock_requests.post.return_value = legacy_resp
+            mock_requests.Timeout = Exception
+            result = asyncio.run(_handoff_impl("developer", "Do task", timeout=600))
+
+        assert result.success is False
+        assert result.terminal_id == "a1b2c3d4"
+
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    def test_malformed_200_surfaces_failure(self, mock_provider, _nudge):
+        """A 200 with no last_message must be a failure, not a silent
+        success-with-None."""
+        mock_provider.return_value = _ctx("kiro_cli")
+
+        bad_resp = MagicMock()
+        bad_resp.status_code = 200
+        bad_resp.json.return_value = {"terminal_id": "dev-t1"}  # no last_message
+        with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+            mock_requests.post.return_value = bad_resp
+            mock_requests.Timeout = Exception
+            result = asyncio.run(_handoff_impl("developer", "Do task"))
+
+        assert result.success is False
+        assert "malformed" in result.message
+        assert result.terminal_id == "dev-t1"
 
     @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
     def test_endpoint_500_maps_to_failure_result(self, mock_provider):

@@ -26,6 +26,7 @@ Bolt 3) when sequencing reaches a reserved construct. Bolt 1 never raises it.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional, Union
@@ -42,7 +43,6 @@ from cli_agent_orchestrator.constants import (
     WORKFLOW_OUTPUT_SCHEMA_MAX_DEPTH,
     WORKFLOW_SHIPPED_UNITS,
 )
-from cli_agent_orchestrator.models.terminal import TerminalStatus
 
 logger = logging.getLogger(__name__)
 
@@ -257,21 +257,6 @@ class WorkflowSpec(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Value object returned to the run substrate (N0) — transient, not persisted
-# ---------------------------------------------------------------------------
-class AgentStepResult(BaseModel):
-    """Transient result of one agent step (C3b). Lives only for one step call.
-
-    ``run_agent_step`` returns this ONLY on success (status COMPLETED); all
-    failure modes raise narrow exceptions instead.
-    """
-
-    terminal_id: str
-    last_message: str
-    status: TerminalStatus
-
-
-# ---------------------------------------------------------------------------
 # Validation result (returned by validate_only; never raises) — FR-1.3
 # ---------------------------------------------------------------------------
 class ValidationResult(BaseModel):
@@ -305,16 +290,25 @@ def _default_matches_type(default: Union[str, int, bool], declared: str) -> bool
     return isinstance(default, str)
 
 
-def _schema_depth(node: Any, _depth: int = 1) -> int:
-    """Max nesting depth of a JSON-Schema-like dict/list structure."""
+def _schema_depth(node: Any, _depth: int = 1, _cap: Optional[int] = None) -> int:
+    """Max nesting depth of a JSON-Schema-like dict/list structure.
+
+    Bails as soon as the depth exceeds ``_cap`` (when given) instead of fully
+    descending first. A spec nested deeper than Python's recursion limit is
+    reachable well within the byte cap, so a full descent would raise
+    ``RecursionError`` and escape the non-raising ``validate_only`` contract
+    (FR-1.3). Returning ``_cap + 1`` is enough for the caller's ``> cap`` check.
+    """
+    if _cap is not None and _depth > _cap:
+        return _depth
     if isinstance(node, dict):
         if not node:
             return _depth
-        return max(_schema_depth(v, _depth + 1) for v in node.values())
+        return max(_schema_depth(v, _depth + 1, _cap) for v in node.values())
     if isinstance(node, list):
         if not node:
             return _depth
-        return max(_schema_depth(v, _depth + 1) for v in node)
+        return max(_schema_depth(v, _depth + 1, _cap) for v in node)
     return _depth
 
 
@@ -326,7 +320,9 @@ def _check_output_schema(schema: Dict[str, Any]) -> Optional[str]:
     family) and the parser-divergence bypass is closed (SD-3.1). Returns an
     error string, or None if the schema is acceptable.
     """
-    depth = _schema_depth(schema)
+    # Pass the cap so the walk short-circuits instead of fully descending a
+    # pathologically nested schema (RecursionError would escape validate_only).
+    depth = _schema_depth(schema, _cap=WORKFLOW_OUTPUT_SCHEMA_MAX_DEPTH)
     if depth > WORKFLOW_OUTPUT_SCHEMA_MAX_DEPTH:
         return (
             f"output_schema nesting depth {depth} exceeds max "
@@ -390,8 +386,6 @@ def validate_only(path_or_text: str) -> ValidationResult:
     # raw YAML. A path is read as bytes so the byte-cap precedes parsing.
     text = path_or_text
     try:
-        import os
-
         if os.path.isfile(path_or_text):
             with open(path_or_text, "rb") as fh:
                 raw = fh.read()
@@ -425,11 +419,14 @@ def validate_only(path_or_text: str) -> ValidationResult:
 
     try:
         spec = WorkflowSpec(**data)
-    except ValueError as exc:
+    except (ValueError, TypeError) as exc:
         # Pydantic ValidationError is a ValueError subclass; our aggregated
-        # grammar ValueError lands here too. Split on our "; " join so each
-        # structural reason is a separate entry; Pydantic field errors arrive
-        # as a single (multi-line) string, kept whole.
+        # grammar ValueError lands here too. TypeError is caught because YAML
+        # admits non-string mapping keys (e.g. ``123: foo``) and ``**``-unpacking
+        # such a dict raises TypeError — which must not escape the never-raise
+        # contract (FR-1.3). Split on our "; " join so each structural reason is
+        # a separate entry; Pydantic field errors arrive as a single
+        # (multi-line) string, kept whole.
         message = _extract_validation_message(exc)
         reasons = [r for r in (part.strip() for part in message.split("; ")) if r]
         logger.debug("validate_only: spec failed grammar: %s", reasons)
@@ -441,13 +438,13 @@ def validate_only(path_or_text: str) -> ValidationResult:
     return ValidationResult(status="pass")
 
 
-def _extract_validation_message(exc: ValueError) -> str:
-    """Pull a readable message out of a ValueError (incl. Pydantic's nested form).
+def _extract_validation_message(exc: Exception) -> str:
+    """Pull a readable message out of an exception (incl. Pydantic's nested form).
 
     Our ``validate_grammar`` raises a plain ``ValueError("a; b; c")``; Pydantic
     wraps validator ValueErrors in a ``ValidationError`` whose ``str`` is
-    multi-line. We return the joined grammar message when present, else the
-    full string.
+    multi-line; a non-string YAML key surfaces as a ``TypeError``. We return the
+    joined grammar message when present, else the full string.
     """
     # Pydantic ValidationError exposes .errors(); pull each msg out so our
     # aggregated "a; b; c" survives the wrapping.

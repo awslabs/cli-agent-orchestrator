@@ -65,7 +65,6 @@ from cli_agent_orchestrator.models.memory import (
 )
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalId
 from cli_agent_orchestrator.plugins import PluginRegistry
-from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services import (
     flow_service,
     session_service,
@@ -944,17 +943,7 @@ async def get_terminal_output(
 async def exit_terminal(terminal_id: TerminalId) -> Dict:
     """Send provider-specific exit command to terminal."""
     try:
-        provider = provider_manager.get_provider(terminal_id)
-        if provider is None:
-            raise ValueError(f"Provider not found for terminal {terminal_id}")
-        exit_command = provider.exit_cli()
-        # Some providers use tmux key sequences (e.g., "C-d" for Ctrl+D) instead
-        # of text commands (e.g., "/exit"). Key sequences must be sent via
-        # send_special_key() to be interpreted by tmux, not as literal text.
-        if exit_command.startswith(("C-", "M-")):
-            terminal_service.send_special_key(terminal_id, exit_command)
-        else:
-            terminal_service.send_input(terminal_id, exit_command)
+        terminal_service.exit_terminal_cli(terminal_id)
         return {"success": True}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -966,7 +955,7 @@ async def exit_terminal(terminal_id: TerminalId) -> Dict:
 
 
 @app.post(TERMINALS_RUN_STEP_ROUTE, response_model=RunStepResponse)
-async def run_step(body: RunStepRequest) -> RunStepResponse:
+async def run_step(request: Request, body: RunStepRequest) -> RunStepResponse:
     """Run a single agent step through the shared substrate (N0, #312).
 
     This is the combined server-side endpoint both step callers converge on:
@@ -976,8 +965,10 @@ async def run_step(body: RunStepRequest) -> RunStepResponse:
 
     The handler body is ``await run_agent_step(...)``. Domain failures from the
     substrate are mapped to ``HTTPException`` at this boundary (project Mandated
-    boundary-map rule): a step that times out / errors -> 504, a bad terminal
-    reference -> 404, any other failure -> 500.
+    boundary-map rule): a worker that ran long -> 504, a worker that crashed
+    (ERROR) -> 502, a bad terminal reference -> 404, any other failure -> 500.
+    The plugin registry is threaded so teardown's ``post_kill_terminal`` hooks
+    fire (parity with the DELETE endpoint).
     """
     try:
         result = await run_agent_step(
@@ -991,6 +982,7 @@ async def run_step(body: RunStepRequest) -> RunStepResponse:
             working_directory=body.working_directory,
             caller_id=body.caller_id,
             allowed_tools=body.allowed_tools,
+            registry=get_plugin_registry(request),
         )
         return RunStepResponse(
             terminal_id=result.terminal_id,
@@ -998,10 +990,22 @@ async def run_step(body: RunStepRequest) -> RunStepResponse:
             status=(result.status.value if hasattr(result.status, "value") else str(result.status)),
         )
     except StepExecutionError as e:
-        # Timeout / ERROR end-state — the step did not complete successfully.
-        raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail=str(e))
+        # The step did not complete successfully. Distinguish a worker that
+        # CRASHED (kind="error" -> 502 Bad Gateway) from one that RAN LONG
+        # (kind="timeout" -> 504 Gateway Timeout) so the caller can tell them
+        # apart instead of reporting every failure as a timeout. The detail is a
+        # structured object carrying terminal_id, so callers read it as a field
+        # rather than regex-scraping the message (the future engine reads it too).
+        code = status.HTTP_502_BAD_GATEWAY if e.kind == "error" else status.HTTP_504_GATEWAY_TIMEOUT
+        raise HTTPException(
+            status_code=code,
+            detail={"message": str(e), "kind": e.kind, "terminal_id": e.terminal_id},
+        )
     except TimeoutError as e:
-        raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail={"message": str(e), "kind": "timeout", "terminal_id": None},
+        )
     except ValueError as e:
         # Unknown terminal / bad input surfaced by the terminal layer.
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))

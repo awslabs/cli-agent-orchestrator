@@ -72,6 +72,10 @@ class _SequenceRecorder:
         """The ordered sequence of call kinds (ignoring exact args)."""
         return [c[0] for c in self.calls]
 
+    def send_prompts(self):
+        """The ordered prompts passed to send_input (the step's actual input)."""
+        return [c[2] for c in self.calls if c[0] == "send_input"]
+
 
 def _run_recorded(coro_factory):
     rec = _SequenceRecorder()
@@ -194,3 +198,8 @@ class TestEngineHandoffEquivalence:
                 p.stop()
 
         assert engine.kinds() == handoff.kinds()
+        # Beyond call *kinds* (true by construction since both call the same
+        # run_agent_step), assert the actual ARGS match: the prompt sent to the
+        # worker is identical across paths. Identical kinds alone could not catch
+        # a divergent prompt/timeout — this does.
+        assert engine.send_prompts() == handoff.send_prompts() == ["do the task"]

@@ -9,8 +9,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from cli_agent_orchestrator.constants import TERMINALS_RUN_STEP_ROUTE
-from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.models.workflow import AgentStepResult
+from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.services.agent_step import StepExecutionError
 
 _RUN_STEP = "cli_agent_orchestrator.api.main.run_agent_step"
@@ -43,14 +42,42 @@ class TestRunStepEndpoint:
         assert kwargs["agent"] == "developer"
         assert kwargs["prompt"] == "do it"
 
-    def test_step_execution_error_maps_to_504(self, client):
+    def test_timeout_maps_to_504_with_structured_terminal_id(self, client):
         with patch(
             _RUN_STEP,
-            new=AsyncMock(side_effect=StepExecutionError("terminal abc12345 timed out")),
+            new=AsyncMock(
+                side_effect=StepExecutionError(
+                    "terminal abc12345 did not complete",
+                    kind="timeout",
+                    terminal_id="abc12345",
+                )
+            ),
         ):
             resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body())
         assert resp.status_code == 504
-        assert "abc12345" in resp.json()["detail"]
+        # Structured detail carries terminal_id + kind as fields (no scraping).
+        detail = resp.json()["detail"]
+        assert detail["kind"] == "timeout"
+        assert detail["terminal_id"] == "abc12345"
+
+    def test_worker_error_maps_to_502_with_structured_terminal_id(self, client):
+        """A crashed worker (kind='error') is a distinct status (502) from a
+        timeout (504), so the caller can tell 'crashed' from 'ran long'."""
+        with patch(
+            _RUN_STEP,
+            new=AsyncMock(
+                side_effect=StepExecutionError(
+                    "terminal abc12345 reached ERROR status",
+                    kind="error",
+                    terminal_id="abc12345",
+                )
+            ),
+        ):
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body())
+        assert resp.status_code == 502
+        detail = resp.json()["detail"]
+        assert detail["kind"] == "error"
+        assert detail["terminal_id"] == "abc12345"
 
     def test_value_error_maps_to_404(self, client):
         with patch(_RUN_STEP, new=AsyncMock(side_effect=ValueError("Terminal 'x' not found"))):

@@ -327,6 +327,60 @@ class TestServiceSurfaceNeverRaises:
         assert result.status == "fail"
         assert any("byte cap" in e for e in result.errors)
 
+    def test_non_string_mapping_key_returns_fail_not_raise(self):
+        """A YAML mapping with a non-string key (``123: foo``) makes
+        ``WorkflowSpec(**data)`` raise TypeError on ``**``-unpacking; that must
+        be caught and returned as fail, never escape (FR-1.3 never-raise)."""
+        result = validate_only("123: foo\nname: wf\nsteps: []\n")
+        assert isinstance(result, ValidationResult)
+        assert result.status == "fail"
+        assert result.errors
+
+    def test_over_cap_nested_output_schema_returns_fail_not_raise(self):
+        """An output_schema nested past the depth cap returns a fail with a
+        'depth' reason — never raises out of validate_only (FR-1.3)."""
+        import yaml
+
+        from cli_agent_orchestrator.constants import WORKFLOW_OUTPUT_SCHEMA_MAX_DEPTH
+
+        nested: dict = {}
+        cur = nested
+        for _ in range(WORKFLOW_OUTPUT_SCHEMA_MAX_DEPTH + 5):
+            child: dict = {}
+            cur["a"] = child
+            cur = child
+        spec_doc = {
+            "name": "wf",
+            "steps": [
+                {"id": "s1", "provider": "p", "agent": "a", "prompt": "x", "output_schema": nested}
+            ],
+        }
+        result = validate_only(yaml.dump(spec_doc))
+        assert isinstance(result, ValidationResult)
+        assert result.status == "fail"
+        assert any("depth" in e for e in result.errors)
+
+    def test_schema_depth_short_circuits_past_recursion_limit(self):
+        """_schema_depth must stop descending once it passes the cap, so a
+        structure deeper than Python's recursion limit cannot raise
+        RecursionError (the bug behind the validate_only never-raise breach)."""
+        import sys
+
+        from cli_agent_orchestrator.models.workflow import _schema_depth
+
+        nested: dict = {}
+        cur = nested
+        for _ in range(sys.getrecursionlimit() + 500):
+            child: dict = {}
+            cur["a"] = child
+            cur = child
+        # Returns just over the cap without fully descending — no RecursionError.
+        assert _schema_depth(nested, _cap=8) > 8
+        # And a full (uncapped) descent on the SAME structure WOULD blow the
+        # stack — proving the cap is what protects validate_only.
+        with pytest.raises(RecursionError):
+            _schema_depth(nested)
+
 
 class TestSizeCaps:
     def test_too_many_steps_fails(self):

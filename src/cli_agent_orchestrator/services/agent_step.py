@@ -24,8 +24,8 @@ retry policy (FR-5.3); the HTTP handler maps it to an ``HTTPException``.
 import logging
 from typing import Optional
 
-from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.models.workflow import AgentStepResult
+from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
+from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.terminal_service import OutputMode
@@ -49,7 +49,26 @@ class StepExecutionError(Exception):
     Raised for a readiness/completion timeout or a terminal that reached
     ``TerminalStatus.ERROR``. Narrow by design so the caller (engine) can map
     it to its retry policy and the API boundary can map it to an HTTPException.
+
+    Carries two structured fields so callers never have to scrape the message:
+
+    - ``kind`` distinguishes a worker that *ran long* (``"timeout"``) from one
+      that *crashed* (``"error"``, i.e. the terminal reached ERROR). The two
+      were previously indistinguishable — both surfaced as a 504 "timed out".
+    - ``terminal_id`` is the live terminal the step ran on (when known), so a
+      failed caller can report/clean it up without regex-scraping the message.
     """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        kind: str = "timeout",
+        terminal_id: Optional[str] = None,
+    ) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.terminal_id = terminal_id
 
 
 async def run_agent_step(
@@ -64,6 +83,7 @@ async def run_agent_step(
     working_directory: Optional[str] = None,
     caller_id: Optional[str] = None,
     allowed_tools: Optional[list[str]] = None,
+    registry: Optional[PluginRegistry] = None,
 ) -> AgentStepResult:
     """Run one agent step and return its result (success only).
 
@@ -104,13 +124,18 @@ async def run_agent_step(
         allowed_tools: Resolved allowed-tools list for the freshly created
             terminal (handoff inheritance). None lets ``create_terminal`` derive
             them from the agent profile.
+        registry: Plugin registry forwarded to ``delete_terminal`` on teardown so
+            ``post_kill_terminal`` plugin hooks fire (parity with the DELETE
+            endpoint). None (the in-process engine path today) means no hooks
+            dispatch — behavior unchanged.
 
     Returns:
         ``AgentStepResult`` with status COMPLETED — ONLY on success.
 
     Raises:
-        StepExecutionError: readiness wait timed out, completion wait timed out,
-            or the terminal reached ``TerminalStatus.ERROR``.
+        StepExecutionError: readiness/completion wait timed out (``kind="timeout"``)
+            or the terminal reached ``TerminalStatus.ERROR`` (``kind="error"``).
+            ``terminal_id`` carries the live terminal so the caller can clean up.
         ValueError / TimeoutError: propagated from ``terminal_service`` (e.g.
             terminal-create failure, unknown terminal) — surfaced, never swallowed.
     """
@@ -149,7 +174,9 @@ async def run_agent_step(
             # fail fast. We do NOT auto-delete here: leaving the terminal lets
             # the caller decide (handoff surfaces terminal_id on failure).
             raise StepExecutionError(
-                f"terminal {terminal_id} did not reach a ready status within " f"{ready_timeout}s"
+                f"terminal {terminal_id} did not reach a ready status within " f"{ready_timeout}s",
+                kind="timeout",
+                terminal_id=terminal_id,
             )
 
     assert terminal_id is not None  # for type-checkers: set in both branches
@@ -162,19 +189,31 @@ async def run_agent_step(
     # self-loopback the single-seam rule forbids). False => timeout => raise.
     completed = await wait_until_status(terminal_id, TerminalStatus.COMPLETED, timeout=timeout)
     if not completed:
-        # Distinguish a hard ERROR end-state from a plain timeout for the message.
+        # Distinguish a hard ERROR end-state (worker crashed) from a plain
+        # timeout (worker ran long): the caller must be able to tell them apart
+        # rather than reporting a 5s crash as a 600s timeout.
         current = status_monitor.get_status(terminal_id)
         if current == TerminalStatus.ERROR:
-            raise StepExecutionError(f"terminal {terminal_id} reached ERROR status")
+            raise StepExecutionError(
+                f"terminal {terminal_id} reached ERROR status",
+                kind="error",
+                terminal_id=terminal_id,
+            )
         raise StepExecutionError(
-            f"step on terminal {terminal_id} did not complete within {timeout}s"
+            f"step on terminal {terminal_id} did not complete within {timeout}s",
+            kind="timeout",
+            terminal_id=terminal_id,
         )
 
     # A terminal can reach a transient ERROR state that wait_until_status would
     # not see as COMPLETED, but defensively re-check before claiming success.
     final_status = status_monitor.get_status(terminal_id)
     if final_status == TerminalStatus.ERROR:
-        raise StepExecutionError(f"terminal {terminal_id} reached ERROR status")
+        raise StepExecutionError(
+            f"terminal {terminal_id} reached ERROR status",
+            kind="error",
+            terminal_id=terminal_id,
+        )
 
     # Extract the last agent message via the provider-specific path (mirrors
     # how the handoff caller obtained output: get_output in LAST mode runs the
@@ -188,11 +227,29 @@ async def run_agent_step(
     )
 
     if teardown and created_here:
-        # Best-effort teardown: a delete failure must not turn a successful step
-        # into a failure (the work is done and captured). Log it; never swallow
-        # silently.
+        # Best-effort teardown, exit-then-delete (mirrors the old handoff
+        # lifecycle): first send the provider's graceful exit command, THEN
+        # delete. A failure in either step must not turn a successful step into
+        # a failure (the work is done and already captured). Log it; never
+        # swallow silently.
         try:
-            terminal_service.delete_terminal(terminal_id)
+            # Graceful CLI shutdown before kill_window (e.g. "/exit" for Claude
+            # Code, C-d for others). Skipped implicitly for reused terminals
+            # because this whole block is guarded on created_here.
+            terminal_service.exit_terminal_cli(terminal_id)
+        except (
+            Exception
+        ) as exc:  # noqa: BLE001 — graceful exit is best-effort; step already succeeded
+            logger.warning(
+                "run_agent_step: failed to send graceful exit to terminal %s "
+                "before teardown: %s",
+                terminal_id,
+                exc,
+            )
+        try:
+            # Thread the registry so post_kill_terminal plugin hooks dispatch
+            # (parity with the DELETE endpoint); None = no hooks (engine path).
+            terminal_service.delete_terminal(terminal_id, registry=registry)
         except Exception as exc:  # noqa: BLE001 — teardown is best-effort; step already succeeded
             logger.warning(
                 "run_agent_step: failed to tear down terminal %s after success: %s",
