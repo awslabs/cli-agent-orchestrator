@@ -18,6 +18,7 @@ The provider detects the following terminal states:
 """
 
 import logging
+import os
 import re
 import shlex
 from typing import Optional
@@ -61,13 +62,14 @@ IDLE_PROMPT_PATTERN_LOG = r"\x1b\[38;5;\d+m\[.+?\].*\x1b\[38;5;\d+m>\s*\x1b\[\d*
 # New TUI Patterns (Kiro CLI without --legacy-ui)
 # =============================================================================
 
-# New TUI idle prompt: "Ask a question or describe a task ↵"
-# Case-insensitive match; comma between "question" and "or" is optional
-# (older versions used lowercase with comma, v1.29+ uses capitalized without)
-NEW_TUI_IDLE_PATTERN = r"[Aa]sk a question,? or describe a task"
+# New TUI idle prompt: "Ask a question or describe a task ↵" (≤2.7.x)
+# kiro-cli 2.8.x replaced the input placeholder with a status-bar format:
+#   "saga · auto · ◔ 3%   ~/.aws/cli-agent-orchestrator · (main)"
+# Match either form so both old and new kiro versions are supported.
+NEW_TUI_IDLE_PATTERN = r"[Aa]sk a question,? or describe a task|· (?:auto|manual) · ◔"
 
 # New TUI IDLE prompt pattern for log files (with ANSI codes)
-NEW_TUI_IDLE_PATTERN_LOG = r"[Aa]sk a question,? or describe a task"
+NEW_TUI_IDLE_PATTERN_LOG = r"[Aa]sk a question,? or describe a task|· (?:auto|manual) · ◔"
 
 # TUI separator line: horizontal bar (────) used to delimit sections.
 # Require 20+ chars to avoid matching short markdown separators in agent output.
@@ -91,11 +93,23 @@ TUI_PROCESSING_PATTERN = r"Kiro is working"
 # is interactive, so a paste sent during this window is absorbed by the
 # pre-prompt boot screen and silently dropped (observed during e2e
 # allowed-tools tests).
+#
+# Note: kiro-cli 2.8.x replaced "● Initializing..." with "Initializing ·
+# type to queue a message", which does NOT match this pattern. In 2.8.x the
+# old idle prompt ("Ask a question or describe a task") only appears as part
+# of the final screen render (66 chars before the true idle state), so it no
+# longer needs to be suppressed — it reliably indicates kiro is interactive.
 TUI_INITIALIZING_PATTERN = r"Initializing\.\.\.|\d+ of \d+ mcp servers initialized\.\s*ctrl-c to start chatting now"  # noqa: E501
 
 # TUI permission prompt: shown instead of legacy [y/n/t] format.
 # Requires all three options together to avoid false positives on "Yes"/"No" in agent output.
 TUI_PERMISSION_PATTERN = r"Yes\s+No\s+Always [Aa]llow"
+
+# Seconds to wait for the kiro TUI to reach IDLE during initialization.
+# kiro-cli 2.8.x takes 40-60s to initialize with many MCP servers; the old
+# 30s default was too short, causing every session to fall back to --legacy-ui.
+# Override via CAO_KIRO_TUI_INIT_TIMEOUT env var.
+TUI_INIT_TIMEOUT = float(os.environ.get("CAO_KIRO_TUI_INIT_TIMEOUT", "90"))
 
 # =============================================================================
 # Error Detection
@@ -261,7 +275,7 @@ class KiroCliProvider(BaseProvider):
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
         # message that get_status() interprets as a completed response.
         if not await wait_until_status(
-            self.terminal_id, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=30.0
+            self.terminal_id, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=TUI_INIT_TIMEOUT
         ):
             if yolo:
                 # Yolo already launched with --legacy-ui; no further fallback.
@@ -285,7 +299,7 @@ class KiroCliProvider(BaseProvider):
             status_monitor.notify_input_sent(self.terminal_id)
             get_backend().send_keys(self.session_name, self.window_name, legacy_command)
             if not await wait_until_status(
-                self.terminal_id, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=30.0
+                self.terminal_id, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=TUI_INIT_TIMEOUT
             ):
                 raise TimeoutError("Kiro CLI initialization timed out with TUI and `--legacy-ui`")
 
@@ -343,7 +357,10 @@ class KiroCliProvider(BaseProvider):
         if init_matches:
             last_init_pos = init_matches[-1].end()
             real_idle_after_init = any(m.start() > last_init_pos for m in old_idle_matches)
-            if not real_idle_after_init:
+            # kiro-cli 2.8.x TUI never shows [agent] > prompts; check the new
+            # "· auto · ◔" idle indicator too so init doesn't block detection.
+            new_tui_idle_after_init = any(m.start() > last_init_pos for m in new_tui_idle_matches)
+            if not real_idle_after_init and not new_tui_idle_after_init:
                 return TerminalStatus.PROCESSING
 
         # Check 2: Look for TUI "Kiro is working" ghost text.
