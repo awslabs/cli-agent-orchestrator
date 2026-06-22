@@ -185,6 +185,12 @@ API_BASE_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
 # Default timeout (seconds) for HTTP calls to the CAO API server.
 MCP_REQUEST_TIMEOUT = 30
 
+# Timeout (seconds) for session/terminal creation requests. Provider
+# initialization (TUI startup, MCP server loading) can take 30-60s depending
+# on the number of configured MCP servers. This must be greater than the
+# server-side provider init timeout (currently 30s + 10s shell wait).
+SESSION_CREATE_TIMEOUT = int(os.environ.get("CAO_SESSION_CREATE_TIMEOUT", "120"))
+
 
 # Operators can extend network allowlists via the env vars handled below.
 # Same comma-separated pattern as ``CAO_PROFILE_ALLOWED_HOSTS`` in install_service.

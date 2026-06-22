@@ -14,6 +14,7 @@ from cli_agent_orchestrator.constants import (
     PROVIDERS,
     SERVER_HOST,
     SERVER_PORT,
+    SESSION_CREATE_TIMEOUT,
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.utils.terminal import (
@@ -287,7 +288,10 @@ def launch(
         # Forwarded env vars travel in the JSON body so values (which may
         # contain secrets) don't end up in cao-server's HTTP access log.
         # See issue #248.
-        post_kwargs: dict = {"params": params, "timeout": MCP_REQUEST_TIMEOUT}
+        # Session creation blocks while the provider initializes (~30-40s for
+        # TUI providers like kiro_cli). Use a longer timeout than the default
+        # MCP_REQUEST_TIMEOUT (30s) to avoid client-side read timeouts.
+        post_kwargs: dict = {"params": params, "timeout": SESSION_CREATE_TIMEOUT}
         if forwarded_env:
             post_kwargs["json"] = {"env_vars": forwarded_env}
 
