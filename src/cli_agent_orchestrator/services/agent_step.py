@@ -62,6 +62,8 @@ async def run_agent_step(
     timeout: float = 600.0,
     ready_timeout: float = DEFAULT_READY_TIMEOUT,
     working_directory: Optional[str] = None,
+    caller_id: Optional[str] = None,
+    allowed_tools: Optional[list[str]] = None,
 ) -> AgentStepResult:
     """Run one agent step and return its result (success only).
 
@@ -80,7 +82,12 @@ async def run_agent_step(
             codex handoff banner) is applied BEFORE calling this; the substrate
             sends ``prompt`` verbatim.
         session_name: Optional existing session to create the terminal in. When
-            None, ``terminal_service.create_terminal`` auto-generates one.
+            provided, the terminal is added as a window to that EXISTING session
+            (``new_session=False``). When None, a brand-new tmux session is
+            created for this step (``new_session=True``) — auto-naming the
+            session inside ``create_terminal``. (Passing None with the implicit
+            ``new_session=False`` would always fail: the auto-generated session
+            does not yet exist.)
         reuse_terminal_id: Reuse an existing terminal instead of creating one.
             When set, the create + teardown steps are skipped (no pool; the
             caller owns the terminal's lifecycle).
@@ -91,6 +98,12 @@ async def run_agent_step(
             ready to accept input.
         working_directory: Optional working directory for a freshly created
             terminal (ignored when reusing a terminal).
+        caller_id: Terminal ID of the supervisor creating this terminal, recorded
+            so send_message can route callbacks structurally (issue #284). None
+            for operator-launched / engine steps with no supervisor.
+        allowed_tools: Resolved allowed-tools list for the freshly created
+            terminal (handoff inheritance). None lets ``create_terminal`` derive
+            them from the agent profile.
 
     Returns:
         ``AgentStepResult`` with status COMPLETED — ONLY on success.
@@ -105,10 +118,25 @@ async def run_agent_step(
     terminal_id = reuse_terminal_id
 
     if created_here:
+        # When no session_name is supplied we must CREATE a fresh tmux session
+        # (new_session=True): create_terminal auto-names it. Leaving the default
+        # new_session=False here would auto-generate a name and then immediately
+        # fail with "Session '<name>' not found", since that session does not
+        # exist yet. When a session_name IS supplied, add a window to it
+        # (new_session=False) — this is the handoff "same session as supervisor"
+        # path.
+        new_session = session_name is None
+
         # create_terminal already runs provider.initialize() (which waits for
         # IDLE); a failure raises (ValueError/TimeoutError) and propagates.
         terminal = await terminal_service.create_terminal(
-            provider, agent, session_name=session_name, working_directory=working_directory
+            provider,
+            agent,
+            session_name=session_name,
+            new_session=new_session,
+            working_directory=working_directory,
+            allowed_tools=allowed_tools,
+            caller_id=caller_id,
         )
         terminal_id = terminal.id
 

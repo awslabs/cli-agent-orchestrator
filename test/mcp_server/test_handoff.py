@@ -17,9 +17,20 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from cli_agent_orchestrator.mcp_server.server import (
+    HandoffContext,
     _handoff_impl,
     _shape_handoff_message,
 )
+
+
+def _ctx(provider, session_name=None, caller_id=None, allowed_tools=None):
+    """Build a HandoffContext for mocking _resolve_handoff_provider."""
+    return HandoffContext(
+        provider=provider,
+        session_name=session_name,
+        caller_id=caller_id,
+        allowed_tools=allowed_tools,
+    )
 
 
 def _ok_run_step_response(terminal_id="dev-term", last_message="task done"):
@@ -67,7 +78,7 @@ class TestHandoffMessageContext:
     @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
     def test_codex_provider_sends_banner_to_endpoint(self, mock_provider, _nudge):
         """Codex handoff posts the [CAO Handoff] banner as the prompt."""
-        mock_provider.return_value = "codex"
+        mock_provider.return_value = _ctx("codex")
 
         with patch.dict(os.environ, {"CAO_TERMINAL_ID": "supervisor-abc123"}):
             with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
@@ -90,7 +101,7 @@ class TestHandoffMessageContext:
     @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
     def test_claude_code_provider_no_banner(self, mock_provider, _nudge):
-        mock_provider.return_value = "claude_code"
+        mock_provider.return_value = _ctx("claude_code")
 
         with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
             mock_requests.post.return_value = _ok_run_step_response()
@@ -105,7 +116,7 @@ class TestHandoffMessageContext:
     @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
     def test_kiro_cli_provider_no_banner(self, mock_provider, _nudge):
-        mock_provider.return_value = "kiro_cli"
+        mock_provider.return_value = _ctx("kiro_cli")
 
         with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
             mock_requests.post.return_value = _ok_run_step_response()
@@ -120,7 +131,7 @@ class TestHandoffMessageContext:
     @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
     def test_codex_banner_supervisor_id_from_env(self, mock_provider, _nudge):
-        mock_provider.return_value = "codex"
+        mock_provider.return_value = _ctx("codex")
 
         with patch.dict(os.environ, {"CAO_TERMINAL_ID": "sup-xyz789"}):
             with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
@@ -137,7 +148,7 @@ class TestHandoffMessageContext:
     def test_codex_fast_fail_when_no_env(self, mock_provider):
         """Codex handoff with no CAO_TERMINAL_ID fails visibly and never posts a
         step (issue #284) — never tell a worker its supervisor is 'unknown'."""
-        mock_provider.return_value = "codex"
+        mock_provider.return_value = _ctx("codex")
 
         with patch.dict(os.environ, {}, clear=True):
             with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
@@ -154,7 +165,7 @@ class TestHandoffMessageContext:
     @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
     def test_codex_original_message_preserved(self, mock_provider, _nudge):
-        mock_provider.return_value = "codex"
+        mock_provider.return_value = _ctx("codex")
         original = "Implement the task described in /path/to/task.md. Write tests."
 
         with patch.dict(os.environ, {"CAO_TERMINAL_ID": "sup-111"}):
@@ -189,7 +200,7 @@ class TestHandoffOutcomes:
     def test_success_returns_output_and_terminal_id(self, mock_provider, _nudge):
         """On success the worker output + terminal id are surfaced; the server
         owns teardown (the request asks for teardown=True)."""
-        mock_provider.return_value = "kiro_cli"
+        mock_provider.return_value = _ctx("kiro_cli")
 
         with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
             mock_requests.post.return_value = _ok_run_step_response(
@@ -208,7 +219,7 @@ class TestHandoffOutcomes:
     def test_endpoint_504_maps_to_timeout_result(self, mock_provider):
         """A 504 (step timeout / ERROR end-state) becomes a timeout failure and
         surfaces the live terminal id from the detail for cleanup."""
-        mock_provider.return_value = "kiro_cli"
+        mock_provider.return_value = _ctx("kiro_cli")
 
         timeout_resp = MagicMock()
         timeout_resp.status_code = 504
@@ -226,7 +237,7 @@ class TestHandoffOutcomes:
 
     @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
     def test_endpoint_500_maps_to_failure_result(self, mock_provider):
-        mock_provider.return_value = "kiro_cli"
+        mock_provider.return_value = _ctx("kiro_cli")
 
         err_resp = MagicMock()
         err_resp.status_code = 500
@@ -239,3 +250,94 @@ class TestHandoffOutcomes:
         assert result.success is False
         assert "Handoff failed" in result.message
         assert "boom" in result.message
+
+
+class TestHandoffContextPropagation:
+    """Regression (PR #320): the run-step payload must carry the supervisor's
+    session_name, caller_id and inherited allowed_tools so the worker is created
+    in the SAME tmux session with #284 callback routing + tool inheritance — the
+    observable behavior the old six-call _create_terminal path provided."""
+
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    def test_supervisor_context_in_payload(self, mock_provider, _nudge):
+        mock_provider.return_value = _ctx(
+            "kiro_cli",
+            session_name="cao-supervisor-1",
+            caller_id="sup-abc",
+            allowed_tools=["fs_read", "fs_write"],
+        )
+
+        with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+            mock_requests.post.return_value = _ok_run_step_response()
+            mock_requests.Timeout = Exception
+            result = asyncio.run(_handoff_impl("developer", "Do task"))
+
+        assert result.success is True
+        payload = mock_requests.post.call_args[1]["json"]
+        assert payload["session_name"] == "cao-supervisor-1"
+        assert payload["caller_id"] == "sup-abc"
+        assert payload["allowed_tools"] == ["fs_read", "fs_write"]
+
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    def test_no_supervisor_omits_session_and_caller(self, mock_provider, _nudge):
+        """Outside a CAO terminal there is no supervisor: the payload omits
+        session_name/caller_id/allowed_tools so the server auto-creates a fresh
+        session (new_session=True)."""
+        mock_provider.return_value = _ctx("kiro_cli")  # all context None
+
+        with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+            mock_requests.post.return_value = _ok_run_step_response()
+            mock_requests.Timeout = Exception
+            result = asyncio.run(_handoff_impl("developer", "Do task"))
+
+        assert result.success is True
+        payload = mock_requests.post.call_args[1]["json"]
+        assert "session_name" not in payload
+        assert "caller_id" not in payload
+        assert "allowed_tools" not in payload
+
+
+class TestResolveHandoffProvider:
+    """_resolve_handoff_provider extracts the full supervisor context (not just
+    the provider) from the supervisor terminal metadata."""
+
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_child_allowed_tools")
+    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider")
+    def test_inside_cao_terminal_extracts_context(self, mock_resolve, mock_child_tools):
+        from cli_agent_orchestrator.mcp_server.server import _resolve_handoff_provider
+
+        mock_resolve.return_value = "kiro_cli"
+        mock_child_tools.return_value = "fs_read,fs_write"
+        meta = MagicMock()
+        meta.status_code = 200
+        meta.json.return_value = {
+            "provider": "kiro_cli",
+            "session_name": "cao-sup",
+            "allowed_tools": ["fs_read", "fs_write", "execute_bash"],
+        }
+        meta.raise_for_status.return_value = None
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "sup-xyz"}):
+            with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+                mock_requests.get.return_value = meta
+                ctx = _resolve_handoff_provider("developer")
+
+        assert ctx.provider == "kiro_cli"
+        assert ctx.session_name == "cao-sup"
+        assert ctx.caller_id == "sup-xyz"
+        assert ctx.allowed_tools == ["fs_read", "fs_write"]
+
+    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider")
+    def test_outside_cao_terminal_yields_empty_context(self, mock_resolve):
+        from cli_agent_orchestrator.mcp_server.server import _resolve_handoff_provider
+
+        mock_resolve.return_value = "kiro_cli"
+        with patch.dict(os.environ, {}, clear=True):
+            ctx = _resolve_handoff_provider("developer")
+
+        assert ctx.provider == "kiro_cli"
+        assert ctx.session_name is None
+        assert ctx.caller_id is None
+        assert ctx.allowed_tools is None

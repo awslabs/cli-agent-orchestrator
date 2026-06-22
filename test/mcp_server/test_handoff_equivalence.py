@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from cli_agent_orchestrator.mcp_server.server import HandoffContext
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.agent_step import run_agent_step
 from cli_agent_orchestrator.services.terminal_service import OutputMode
@@ -123,7 +124,7 @@ class TestEngineHandoffEquivalence:
             ):
                 with patch(
                     "cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider",
-                    return_value="kiro_cli",
+                    return_value=HandoffContext("kiro_cli", None, None, None),
                 ):
                     with patch(
                         "cli_agent_orchestrator.mcp_server.server.requests"
@@ -180,7 +181,7 @@ class TestEngineHandoffEquivalence:
             ):
                 with patch(
                     "cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider",
-                    return_value="kiro_cli",
+                    return_value=HandoffContext("kiro_cli", None, None, None),
                 ):
                     with patch(
                         "cli_agent_orchestrator.mcp_server.server.requests"

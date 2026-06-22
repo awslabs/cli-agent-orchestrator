@@ -4,7 +4,7 @@ import logging
 import os
 import re
 import time
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, NamedTuple, Optional, Tuple, Union
 
 import requests
 from fastmcp import FastMCP
@@ -439,24 +439,63 @@ def _send_direct_input_handoff(terminal_id: str, provider: str, message: str) ->
     _send_direct_input(terminal_id, handoff_message, OrchestrationType.HANDOFF)
 
 
-def _resolve_handoff_provider(agent_profile: str) -> str:
-    """Resolve the provider for a handoff WITHOUT creating a terminal.
+class HandoffContext(NamedTuple):
+    """Supervisor-derived context for a handoff, resolved WITHOUT creating a terminal.
 
-    Mirrors the provider-resolution branch of ``_create_terminal``: a worker
-    inherits the supervisor's provider as a FALLBACK (not an override) when run
-    inside a CAO terminal, else uses the default. This lets the codex fast-fail
-    and codex prompt-shaping run caller-side before the single combined call.
+    The worker terminal must be created in the SAME tmux session as the
+    supervisor, inherit the supervisor's allowed-tools, and record the
+    supervisor as its caller (issue #284). These are resolved caller-side from
+    the supervisor metadata so the single combined run-step call carries them.
+    """
+
+    provider: str
+    session_name: Optional[str]
+    caller_id: Optional[str]
+    allowed_tools: Optional[list]
+
+
+def _resolve_handoff_provider(agent_profile: str) -> HandoffContext:
+    """Resolve the handoff context for a worker WITHOUT creating a terminal.
+
+    Mirrors the resolution branch of the former ``_create_terminal``: a worker
+    inherits the supervisor's provider as a FALLBACK (not an override), is placed
+    in the supervisor's session, records the supervisor as ``caller_id`` (#284),
+    and inherits the supervisor's allowed-tools intersected with the child
+    profile. When NOT run inside a CAO terminal there is no supervisor: a fresh
+    session is auto-created (``session_name=None``) and no caller is recorded.
+
+    This lets the codex fast-fail and codex prompt-shaping run caller-side before
+    the single combined run-step call, while preserving the same-session /
+    caller_id / allowed_tools behavior the old six-call path had.
     """
     current_terminal_id = os.environ.get("CAO_TERMINAL_ID")
     if not current_terminal_id:
-        return resolve_provider(agent_profile, fallback_provider=DEFAULT_PROVIDER)
+        return HandoffContext(
+            provider=resolve_provider(agent_profile, fallback_provider=DEFAULT_PROVIDER),
+            session_name=None,
+            caller_id=None,
+            allowed_tools=None,
+        )
 
     response = requests.get(
         f"{API_BASE_URL}/terminals/{current_terminal_id}", timeout=MCP_REQUEST_TIMEOUT
     )
     response.raise_for_status()
     terminal_metadata = response.json()
-    return resolve_provider(agent_profile, fallback_provider=terminal_metadata["provider"])
+
+    provider = resolve_provider(agent_profile, fallback_provider=terminal_metadata["provider"])
+    # Resolve the child's allowed-tools via the same inheritance the old path
+    # used; _resolve_child_allowed_tools returns a comma-separated string (or
+    # None for unrestricted), which we split into the list the payload expects.
+    parent_allowed_tools = terminal_metadata.get("allowed_tools")
+    child_allowed_tools = _resolve_child_allowed_tools(parent_allowed_tools, agent_profile)
+    allowed_tools_list = child_allowed_tools.split(",") if child_allowed_tools else None
+    return HandoffContext(
+        provider=provider,
+        session_name=terminal_metadata["session_name"],
+        caller_id=current_terminal_id,
+        allowed_tools=allowed_tools_list,
+    )
 
 
 def _terminal_id_from_detail(detail: str) -> Optional[str]:
@@ -579,11 +618,16 @@ async def _handoff_impl(
     terminal_id: Optional[str] = None
 
     try:
-        # Resolve the provider WITHOUT creating a terminal, so the codex
-        # fast-fail (which needs CAO_TERMINAL_ID) and the codex prompt-shaping
-        # can both run caller-side before the single combined call. The server
-        # endpoint then creates + drives + tears down the terminal.
-        provider = _resolve_handoff_provider(agent_profile)
+        # Resolve the supervisor context WITHOUT creating a terminal, so the
+        # codex fast-fail (which needs CAO_TERMINAL_ID) and the codex
+        # prompt-shaping can both run caller-side before the single combined
+        # call. The context also carries the supervisor's session_name,
+        # caller_id and inherited allowed_tools so the server creates the worker
+        # in the SAME session with #284 callback routing and tool inheritance
+        # preserved (BR-8 observable-behavior parity). The endpoint then
+        # creates + drives + tears down the terminal.
+        ctx = _resolve_handoff_provider(agent_profile)
+        provider = ctx.provider
 
         # Fail fast for codex: its handoff banner requires CAO_TERMINAL_ID. We
         # check before any terminal is created (no terminal_id to surface yet).
@@ -604,7 +648,9 @@ async def _handoff_impl(
         shaped_message = _shape_handoff_message(provider, message)
 
         # Single combined call: create -> ready-wait -> input -> complete-wait ->
-        # extract -> teardown, all server-side via run_agent_step.
+        # extract -> teardown, all server-side via run_agent_step. session_name
+        # places the worker in the supervisor's session; caller_id/allowed_tools
+        # preserve #284 callback routing and tool inheritance.
         payload: Dict[str, Any] = {
             "provider": provider,
             "agent": agent_profile,
@@ -612,6 +658,12 @@ async def _handoff_impl(
             "teardown": True,
             "timeout": float(timeout),
         }
+        if ctx.session_name:
+            payload["session_name"] = ctx.session_name
+        if ctx.caller_id:
+            payload["caller_id"] = ctx.caller_id
+        if ctx.allowed_tools:
+            payload["allowed_tools"] = ctx.allowed_tools
         if working_directory:
             payload["working_directory"] = working_directory
 

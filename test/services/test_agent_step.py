@@ -99,6 +99,44 @@ class TestHappyPath:
             asyncio.run(run_agent_step("kiro_cli", "dev", "x", working_directory="/tmp/wd"))
         assert m_create.await_args.kwargs["working_directory"] == "/tmp/wd"
 
+    def test_no_session_name_creates_new_session(self):
+        """Regression: session_name=None must create a NEW tmux session
+        (new_session=True). Otherwise create_terminal auto-generates a name and
+        then fails with 'Session not found' because it tries to add a window to
+        a session that does not exist yet."""
+        create, send, delete, get_output, wait, status = _patch_terminal_layer()
+        with create as m_create, send, delete, get_output, wait, status:
+            asyncio.run(run_agent_step("kiro_cli", "dev", "x"))
+        assert m_create.await_args.kwargs["new_session"] is True
+        assert m_create.await_args.kwargs["session_name"] is None
+
+    def test_session_name_adds_to_existing_session(self):
+        """A supplied session_name adds a window to that EXISTING session
+        (new_session=False) — the handoff same-session path."""
+        create, send, delete, get_output, wait, status = _patch_terminal_layer()
+        with create as m_create, send, delete, get_output, wait, status:
+            asyncio.run(run_agent_step("kiro_cli", "dev", "x", session_name="cao-sup"))
+        assert m_create.await_args.kwargs["new_session"] is False
+        assert m_create.await_args.kwargs["session_name"] == "cao-sup"
+
+    def test_caller_id_and_allowed_tools_forwarded_to_create(self):
+        """caller_id (#284 callback routing) and inherited allowed_tools must
+        reach create_terminal for handoff workers."""
+        create, send, delete, get_output, wait, status = _patch_terminal_layer()
+        with create as m_create, send, delete, get_output, wait, status:
+            asyncio.run(
+                run_agent_step(
+                    "kiro_cli",
+                    "dev",
+                    "x",
+                    session_name="cao-sup",
+                    caller_id="sup-123",
+                    allowed_tools=["fs_read", "fs_write"],
+                )
+            )
+        assert m_create.await_args.kwargs["caller_id"] == "sup-123"
+        assert m_create.await_args.kwargs["allowed_tools"] == ["fs_read", "fs_write"]
+
 
 class TestFailureRaises:
     def test_completion_timeout_raises(self):

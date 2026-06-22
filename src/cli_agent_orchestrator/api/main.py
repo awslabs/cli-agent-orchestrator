@@ -177,6 +177,14 @@ class RunStepRequest(BaseModel):
     working_directory: Optional[str] = Field(
         default=None, description="Working directory for a freshly created terminal"
     )
+    caller_id: Optional[str] = Field(
+        default=None,
+        description="Supervisor terminal ID to record for structural callback routing (#284)",
+    )
+    allowed_tools: Optional[list[str]] = Field(
+        default=None,
+        description="Resolved allowed-tools list for a freshly created terminal (handoff inheritance)",
+    )
 
 
 class RunStepResponse(BaseModel):
@@ -981,6 +989,8 @@ async def run_step(body: RunStepRequest) -> RunStepResponse:
             teardown=body.teardown,
             timeout=body.timeout,
             working_directory=body.working_directory,
+            caller_id=body.caller_id,
+            allowed_tools=body.allowed_tools,
         )
         return RunStepResponse(
             terminal_id=result.terminal_id,
