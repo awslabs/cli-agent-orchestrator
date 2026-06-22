@@ -164,8 +164,12 @@ class ClaudeCodeProvider(BaseProvider):
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
         # Determine permission mode for the base command
-        if profile and profile.permissionMode and not yolo:
+        if profile and profile.permissionMode:
             command_parts = ["claude", "--permission-mode", profile.permissionMode]
+        elif yolo:
+            # yolo mode: no --dangerously-skip-permissions flag because
+            # Claude Code refuses it under root/sudo. Let CAO handle permissions.
+            command_parts = ["claude"]
         else:
             command_parts = ["claude", "--dangerously-skip-permissions"]
 
