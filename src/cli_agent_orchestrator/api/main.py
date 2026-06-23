@@ -954,7 +954,20 @@ async def exit_terminal(terminal_id: TerminalId) -> Dict:
         )
 
 
-@app.post(TERMINALS_RUN_STEP_ROUTE, response_model=RunStepResponse)
+@app.post(
+    TERMINALS_RUN_STEP_ROUTE,
+    response_model=RunStepResponse,
+    summary="Run one agent step (shared substrate)",
+    description=(
+        "Failure contract: a non-2xx body is a structured object "
+        "`{message, kind, terminal_id}`. **`kind` is authoritative** — "
+        '`kind="error"` means the worker CRASHED (terminal reached ERROR), '
+        '`kind="timeout"` means it RAN LONG. The HTTP status mirrors `kind` '
+        "(502 = crashed, 504 = ran long) for transport-layer consumers, but a "
+        "caller MUST branch on `kind`, not the status code. `terminal_id` names "
+        "the live terminal (read it as a field; never regex-scrape `message`)."
+    ),
+)
 async def run_step(request: Request, body: RunStepRequest) -> RunStepResponse:
     """Run a single agent step through the shared substrate (N0, #312).
 
@@ -965,8 +978,24 @@ async def run_step(request: Request, body: RunStepRequest) -> RunStepResponse:
 
     The handler body is ``await run_agent_step(...)``. Domain failures from the
     substrate are mapped to ``HTTPException`` at this boundary (project Mandated
-    boundary-map rule): a worker that ran long -> 504, a worker that crashed
-    (ERROR) -> 502, a bad terminal reference -> 404, any other failure -> 500.
+    boundary-map rule).
+
+    Failure contract (the future engine caller depends on this, so it is spelled
+    out, not just inferable from the handler):
+
+    - A failed step returns a STRUCTURED detail object
+      ``{"message": str, "kind": "timeout"|"error", "terminal_id": str|None}``.
+    - ``kind`` is the AUTHORITATIVE discriminator. ``kind="error"`` => the worker
+      CRASHED (the terminal reached ``TerminalStatus.ERROR``); ``kind="timeout"``
+      => the worker RAN LONG (readiness/completion wait elapsed). The HTTP status
+      is derived FROM ``kind`` (``error`` -> 502 Bad Gateway, ``timeout`` -> 504
+      Gateway Timeout) as a convenience for transport-layer consumers — a client
+      that can read the body MUST branch on ``kind``, not the status code.
+    - ``terminal_id`` names the live terminal the step ran on (when known) so a
+      caller can report/clean it up without regex-scraping ``message``.
+    - A bad terminal reference -> 404; any other failure -> 500 (plain-string
+      detail, no ``kind`` — these are not step-execution outcomes).
+
     The plugin registry is threaded so teardown's ``post_kill_terminal`` hooks
     fire (parity with the DELETE endpoint).
     """
