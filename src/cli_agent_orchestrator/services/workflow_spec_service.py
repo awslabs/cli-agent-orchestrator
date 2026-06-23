@@ -83,6 +83,36 @@ def _safe_dir(scan_dir: Optional[str]) -> str:
     return tmux_client._resolve_and_validate_working_directory(scan_dir)
 
 
+def _safe_spec_path(path: str) -> str:
+    """Canonicalize a spec FILE path and bind it to its policy-checked directory.
+
+    The single guarded entry for turning a user/agent-supplied spec path into a
+    real path safe to stat/open. Two stages, mirroring the shared working-dir
+    validator (the CodeQL ``py/path-injection`` two-state model — see
+    ``tmux.py``):
+
+    1. ``os.path.realpath`` canonicalizes the path (resolves symlinks + ``..``).
+       This is the PathNormalization step.
+    2. ``_safe_dir`` policy-checks the containing directory against the
+       blocked-system-directory frozenset, then we assert the resolved file lies
+       INSIDE that validated directory via ``startswith`` — the SafeAccessCheck
+       that clears the normalized path for the filesystem ops downstream.
+
+    Beyond satisfying the scanner this tightens the contract: a path whose
+    realpath escapes its policy-checked directory (e.g. a symlink pointing out)
+    is rejected rather than silently followed.
+
+    Raises:
+        ValueError: the containing directory is blocked, or the resolved file
+            escapes that validated directory.
+    """
+    real_path = os.path.realpath(os.path.abspath(path))
+    safe_dir = _safe_dir(os.path.dirname(real_path))
+    if not real_path.startswith(safe_dir + os.sep):
+        raise ValueError(f"workflow spec path '{path}' escapes its validated directory")
+    return real_path
+
+
 # ---------------------------------------------------------------------------
 # Read path
 # ---------------------------------------------------------------------------
@@ -100,9 +130,9 @@ def load_and_validate(path: str) -> WorkflowSpec:
         ValueError: the directory is blocked, the file is unreadable, or the
             spec fails grammar validation.
     """
-    real_path = os.path.realpath(os.path.abspath(path))
-    # Policy-check the containing directory (never the file itself — files aren't dirs).
-    _safe_dir(os.path.dirname(real_path))
+    # Canonicalize + bind the file to its policy-checked directory (rejects a
+    # blocked dir or a path that escapes it) before any stat/open.
+    real_path = _safe_spec_path(path)
 
     if not os.path.isfile(real_path):
         raise FileNotFoundError(f"workflow spec not found: {path}")
@@ -131,8 +161,7 @@ def validate_only(path: str) -> ValidationResult:
     endpoint adds over the raw model surface. Returns the model's
     ``ValidationResult`` verbatim (status / reserved_notes / errors).
     """
-    real_path = os.path.realpath(os.path.abspath(path))
-    _safe_dir(os.path.dirname(real_path))
+    real_path = _safe_spec_path(path)
     return _model_validate_only(real_path)
 
 
@@ -267,8 +296,13 @@ def get_workflow(name_or_path: str, scan_dir: Optional[str] = None) -> WorkflowS
     canonical source path. Raises ``KeyError`` for an unknown name (-> 404),
     ``FileNotFoundError`` / ``ValueError`` as ``load_and_validate`` does.
     """
-    if os.path.isfile(name_or_path):
-        return load_and_validate(name_or_path)
+    # A path-like argument is canonicalized + bound to its policy-checked
+    # directory BEFORE the stat (never stat raw user input); a bare name falls
+    # through to the index lookup. A blocked/escaping path raises ValueError.
+    if os.sep in name_or_path or (os.altsep and os.altsep in name_or_path):
+        safe_path = _safe_spec_path(name_or_path)
+        if os.path.isfile(safe_path):
+            return load_and_validate(safe_path)
     source_path = _resolve_source_path(name_or_path, scan_dir)
     return load_and_validate(source_path)
 

@@ -103,6 +103,27 @@ class TestLoadAndValidate:
         with pytest.raises(ValueError):
             svc.load_and_validate(str(path))
 
+    def test_blocked_directory_rejected(self, spec_dir):
+        """A spec path in a blocked system directory is rejected before any
+        stat/open (CodeQL py/path-injection guard, PR #326 sec-bot finding)."""
+        with pytest.raises(ValueError):
+            svc.load_and_validate("/etc/passwd.yaml")
+
+    def test_path_escaping_validated_dir_rejected(self, spec_dir, tmp_path):
+        """A spec path whose realpath escapes its policy-checked directory via a
+        symlink is rejected, not silently followed (the containment SafeAccessCheck)."""
+        import os
+
+        # A symlink inside the (allowed) spec_dir pointing at a file in a blocked
+        # dir: realpath resolves OUT of spec_dir, so the containment guard trips.
+        target = "/etc/hosts"
+        link = spec_dir / "sneaky.yaml"
+        if not os.path.exists(target):
+            pytest.skip("no stable blocked-dir target on this platform")
+        os.symlink(target, link)
+        with pytest.raises(ValueError):
+            svc.load_and_validate(str(link))
+
 
 class TestValidateOnly:
     def test_pass(self, spec_dir):
