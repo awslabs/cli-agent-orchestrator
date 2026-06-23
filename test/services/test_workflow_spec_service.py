@@ -95,6 +95,14 @@ class TestLoadAndValidate:
         with pytest.raises(ValueError):
             svc.load_and_validate(str(path))
 
+    def test_non_string_yaml_key_raises_valueerror_not_typeerror(self, spec_dir):
+        """A parseable spec with a non-string mapping key (``1: foo``) must
+        surface as the narrow ``ValueError`` the API maps to 400 — NOT leak a
+        ``TypeError`` from ``WorkflowSpec(**data)`` (PR #320 never-raise class)."""
+        path = _write_spec(spec_dir, "intkey", "1: foo\nname: intkey\nsteps: []\n")
+        with pytest.raises(ValueError):
+            svc.load_and_validate(str(path))
+
 
 class TestValidateOnly:
     def test_pass(self, spec_dir):
@@ -111,6 +119,15 @@ class TestValidateOnly:
 
     def test_fail_does_not_raise(self, spec_dir):
         path = _write_spec(spec_dir, "broken", "name: broken\nsteps: []\n")
+        result = svc.validate_only(str(path))
+        assert result.status == "fail"
+        assert result.errors
+
+    def test_non_string_yaml_key_does_not_raise(self, spec_dir):
+        """A parseable spec with a non-string mapping key must come back as a
+        clean ``fail`` ValidationResult — validate_only NEVER raises (FR-1.3),
+        even when ``WorkflowSpec(**data)`` would raise ``TypeError`` (PR #320)."""
+        path = _write_spec(spec_dir, "intkey", "1: foo\nname: intkey\nsteps: []\n")
         result = svc.validate_only(str(path))
         assert result.status == "fail"
         assert result.errors

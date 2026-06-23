@@ -294,7 +294,7 @@ def delete_workflow(name: str, scan_dir: Optional[str] = None) -> None:
             conn.commit()
         raise KeyError(name)
     except OSError as e:
-        raise ValueError(f"could not delete workflow '{name}': {e}")
+        raise ValueError(f"could not delete workflow '{name}': {e}") from e
     with _connect() as conn:
         conn.execute("DELETE FROM workflow_index WHERE name = ?", (name,))
         conn.commit()

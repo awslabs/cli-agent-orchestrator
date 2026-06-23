@@ -14,7 +14,7 @@ from cli_agent_orchestrator.constants import API_BASE_URL, DEFAULT_PROVIDER, MCP
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.models.workflow import ReturnAck
+from cli_agent_orchestrator.models.workflow_runtime import ReturnAck
 from cli_agent_orchestrator.services.memory_service import (
     MEMORY_DISABLED_MESSAGE,
     MemoryDisabledError,

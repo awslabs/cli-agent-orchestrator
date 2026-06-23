@@ -44,6 +44,18 @@ from cli_agent_orchestrator.constants import (
     WORKFLOW_SHIPPED_UNITS,
 )
 
+# Re-exported from the light runtime module so existing
+# ``from ...models.workflow import StepState / WorkflowIndexRow / ...`` call
+# sites are unaffected. The DTOs themselves live in ``workflow_runtime`` (which
+# imports no jsonschema/yaml) so the MCP server can consume ``ReturnAck`` without
+# pulling this grammar module's heavy deps onto the HTTP seam.
+from cli_agent_orchestrator.models.workflow_runtime import (  # noqa: F401
+    ReturnAck,
+    StepOutputRecord,
+    StepState,
+    WorkflowIndexRow,
+)
+
 logger = logging.getLogger(__name__)
 
 # Compiled once at import; validate_grammar is a pure function of the spec.
@@ -88,17 +100,6 @@ def is_reserved(construct: str) -> bool:
 # ---------------------------------------------------------------------------
 # Enums / reserved vocabulary (defined here; animated by N5+)
 # ---------------------------------------------------------------------------
-class StepState(str, Enum):
-    """Per-step run state. Defined in Bolt 1; instantiated by the engine (N5)."""
-
-    PENDING = "pending"
-    RUNNING = "running"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    SKIPPED = "skipped"
-    COMPLETED_UNVALIDATED = "completed_unvalidated"
-
-
 class RunState(str, Enum):
     """Whole-run state. Defined in Bolt 1; instantiated by the engine (N5)."""
 
@@ -254,59 +255,6 @@ class WorkflowSpec(BaseModel):
         if errors:
             raise ValueError("; ".join(errors))
         return self
-
-
-# ---------------------------------------------------------------------------
-# Bolt 2 (N2/N4) — derived index row + structured-return record/ack
-# ---------------------------------------------------------------------------
-class WorkflowIndexRow(BaseModel):
-    """A derived, non-authoritative projection of a ``WorkflowSpec`` (C4, B2-BR-2).
-
-    Materializes a spec for fast listing. Never authored directly; the whole
-    ``workflow_index`` table is droppable and rebuildable byte-identically from
-    the YAML files on disk (B2-BR-3). Carries NO execution state — runs and
-    per-step state are N5/N6, not here.
-    """
-
-    name: str
-    source_path: str
-    mode: str
-    step_count: int
-    description: str = ""
-    indexed_at: str
-
-
-class StepOutputRecord(BaseModel):
-    """The unit of the in-memory structured-return store (N4, C5, ADR-4).
-
-    Keyed by ``(run_id, step_id)``. In-memory in the MVP; the same shape becomes
-    the N6 journal row with no contract change. ``state`` is the candidate
-    end-state the engine (N5, Bolt 3) acts on: ``COMPLETED`` when the output
-    validated against the step ``output_schema``, else ``COMPLETED_UNVALIDATED``
-    (B2-BR-7 / B2-BR-8). Bolt 2 *populates* these two values; it never drives the
-    reprompt loop.
-    """
-
-    run_id: str
-    step_id: str
-    output: Dict[str, Any]
-    validated: bool
-    errors: List[str] = Field(default_factory=list)
-    state: StepState
-
-
-class ReturnAck(BaseModel):
-    """Structured envelope the MCP ``workflow_return`` tool returns (C6, B2-BR-9).
-
-    Mirrors the existing handoff-tool envelope shape; it is **never** an
-    exception. ``ReturnAck.validated=False`` tells the worker its output did not
-    validate — it does NOT claim the step ran or will run (Q1 honesty discipline);
-    the recovery (reprompt-once) is the engine's, Bolt 3.
-    """
-
-    ok: bool = Field(description="Whether the endpoint accepted and stored the output")
-    validated: bool = Field(description="Whether output passed the step output_schema")
-    errors: List[str] = Field(default_factory=list, description="Schema-violation reasons, if any")
 
 
 # ---------------------------------------------------------------------------

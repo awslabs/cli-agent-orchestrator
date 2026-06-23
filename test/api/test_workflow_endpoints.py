@@ -79,6 +79,15 @@ class TestValidateEndpoint:
         resp = client.post("/workflows/validate", json={"path": "/etc/whatever.yaml"})
         assert resp.status_code == 400
 
+    def test_non_string_yaml_key_returns_fail_not_500(self, client, spec_dir):
+        """A parseable spec with a non-string mapping key (``1: foo``) is a clean
+        200 + status=fail — never an unhandled 500 from a leaked ``TypeError``
+        (regression for the PR #320 never-raise finding, re-checked on Bolt 2)."""
+        path = _write(spec_dir, "intkey", "1: foo\nname: intkey\nsteps: []\n")
+        resp = client.post("/workflows/validate", json={"path": str(path)})
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "fail"
+
 
 class TestListEndpoint:
     def test_list_returns_rows(self, client, isolated_db, spec_dir):
