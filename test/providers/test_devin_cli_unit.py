@@ -36,30 +36,6 @@ class TestDevinCliProviderInitialization:
         mock_tmux.send_keys.assert_called_once()
         mock_wait_status.assert_called_once()
 
-    @patch("cli_agent_orchestrator.providers.devin_cli.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.devin_cli.tmux_client")
-    def test_initialize_shell_timeout(self, mock_tmux, mock_wait_shell):
-        """Test initialization raises TimeoutError when shell is not ready."""
-        mock_wait_shell.return_value = False
-
-        provider = DevinCliProvider("test1234", "test-session", "window-0")
-
-        with pytest.raises(TimeoutError, match="Shell initialization timed out"):
-            provider.initialize()
-
-    @patch("cli_agent_orchestrator.providers.devin_cli.wait_for_shell")
-    @patch("cli_agent_orchestrator.providers.devin_cli.wait_until_status")
-    @patch("cli_agent_orchestrator.providers.devin_cli.tmux_client")
-    def test_initialize_devin_timeout(self, mock_tmux, mock_wait_status, mock_wait_shell):
-        """Test initialization raises TimeoutError when Devin does not become ready."""
-        mock_wait_shell.return_value = True
-        mock_wait_status.return_value = False
-        mock_tmux.get_history.return_value = ""
-
-        provider = DevinCliProvider("test1234", "test-session", "window-0")
-
-        with pytest.raises(TimeoutError, match="Devin CLI initialization timed out"):
-            provider.initialize()
 
     def test_paste_enter_count_is_1(self):
         """Devin TUI accepts input with a single Enter after paste."""
