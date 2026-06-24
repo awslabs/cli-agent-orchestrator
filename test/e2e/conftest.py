@@ -142,6 +142,13 @@ def require_cursor():
     pytest.skip("Cursor CLI (agent / cursor-agent) not installed")
 
 
+@pytest.fixture()
+def require_omp():
+    """Skip test if the OMP CLI (`omp` binary) is not available."""
+    if not _cli_available("omp"):
+        pytest.skip("OMP CLI (omp) not installed")
+
+
 def create_terminal(
     provider: str,
     agent_profile: str,

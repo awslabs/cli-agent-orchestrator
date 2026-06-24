@@ -14,6 +14,7 @@ from cli_agent_orchestrator.providers.gemini_cli import GeminiCliProvider
 from cli_agent_orchestrator.providers.hermes import HermesProvider
 from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
+from cli_agent_orchestrator.providers.omp_cli import OmpCliProvider
 from cli_agent_orchestrator.providers.opencode_cli import OpenCodeCliProvider
 from cli_agent_orchestrator.providers.q_cli import QCliProvider
 
@@ -125,6 +126,16 @@ class ProviderManager:
                 )
             elif provider_type == ProviderType.CURSOR_CLI.value:
                 provider = CursorCliProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    model=model,
+                    skill_prompt=skill_prompt,
+                )
+            elif provider_type == ProviderType.OMP_CLI.value:
+                provider = OmpCliProvider(
                     terminal_id,
                     tmux_session,
                     tmux_window,

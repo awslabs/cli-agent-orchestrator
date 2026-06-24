@@ -122,7 +122,7 @@ class TestAgentProviders:
 
         assert response.status_code == 200
         data = response.json()
-        assert len(data) == 10
+        assert len(data) == 11
         names = [p["name"] for p in data]
         assert "kiro_cli" in names
         assert "claude_code" in names
@@ -134,6 +134,7 @@ class TestAgentProviders:
         assert "copilot_cli" in names
         assert "opencode_cli" in names
         assert "cursor_cli" in names
+        assert "omp_cli" in names
         for p in data:
             assert p["installed"] is True
 

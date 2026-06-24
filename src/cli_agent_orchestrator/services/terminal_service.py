@@ -127,6 +127,16 @@ SOFT_ENFORCEMENT_PROVIDERS = {
     ProviderType.CODEX.value,
 }
 
+# OMP CLI is deliberately excluded from BOTH capability sets above:
+# - RUNTIME_SKILL_PROMPT_PROVIDERS: OMP receives its role (and any skill
+#   catalog) via the install-time context file rather than a launch-time
+#   system prompt, so it has no skill_prompt kwarg to consume.
+# - SOFT_ENFORCEMENT_PROVIDERS: OMP's native tool vocabulary is not yet
+#   characterised, so there is no reliable advisory prompt to emit. Restrictions
+#   still reach the agent via the context file but are not surfaced as a
+#   separate soft-enforcement prompt. Revisit both once OMP's native tool /
+#   approval model is confirmed.
+
 
 async def create_terminal(
     provider: str,
