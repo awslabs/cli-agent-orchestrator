@@ -24,6 +24,7 @@ from cli_agent_orchestrator.utils.terminal import (
 
 # Providers that require workspace folder access
 PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
+    "antigravity_cli",
     "claude_code",
     "codex",
     "copilot_cli",

@@ -12,7 +12,7 @@
 ▸ Thought for 2s, 608 tokens
   Prioritizing Tool Usage
 
-● Read(/Users/markuswohlmuth/.gemini/antigravity-cli/mcp/cao-mcp-server/load_skill.json) (ctrl+o to expand)
+● Read(/Users/example/.gemini/antigravity-cli/mcp/cao-mcp-server/load_skill.json) (ctrl+o to expand)
 
 ▸ Thought for 5s, 247 tokens
   Prioritizing Tool Usage

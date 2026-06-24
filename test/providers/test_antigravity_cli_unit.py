@@ -210,3 +210,341 @@ def test_footer_patterns_smoke():
 
     assert re.search(PROCESSING_FOOTER_PATTERN, "esc to cancel")
     assert re.search(IDLE_FOOTER_PATTERN, "? for shortcuts")
+
+
+def test_blocks_orchestrated_input_while_waiting_user_answer():
+    # agy approval/picker prompts consume pasted text, so the provider opts in.
+    assert make_provider().blocks_orchestrated_input_while_waiting_user_answer is True
+
+
+def test_get_idle_pattern_for_log():
+    pat = make_provider().get_idle_pattern_for_log()
+    import re
+
+    assert re.search(pat, "? for shortcuts")
+
+
+def test_mcp_config_path_default_location():
+    # Exercises the real (un-patched) path resolution.
+    path = make_provider()._mcp_config_path()
+    assert path.name == "mcp_config.json"
+    assert path.parent.name == "config"
+    assert path.parent.parent.name == ".gemini"
+
+
+# --------------------------------------------------------------------------- #
+# Command building — skill prompt + soft tool restriction
+# --------------------------------------------------------------------------- #
+
+
+def test_build_command_appends_security_prompt_when_tool_restricted():
+    from cli_agent_orchestrator.constants import SECURITY_PROMPT
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+    profile = AgentProfile(
+        name="reviewer_gemini", description="Reviewer", system_prompt="You review code."
+    )
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+            return_value="/usr/local/bin/agy",
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.load_agent_profile",
+            return_value=profile,
+        ),
+    ):
+        # Read-only reviewer: restricted tools -> security prompt is appended.
+        cmd = make_provider(
+            agent_profile="reviewer_gemini", allowed_tools=["fs_read", "fs_list"]
+        )._build_agy_command()
+    assert SECURITY_PROMPT.split("\n", 1)[0] in cmd
+
+
+def test_build_command_includes_skill_catalog():
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+    profile = AgentProfile(
+        name="developer_claude", description="Dev", system_prompt="You write code."
+    )
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+            return_value="/usr/local/bin/agy",
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.load_agent_profile",
+            return_value=profile,
+        ),
+    ):
+        cmd = make_provider(
+            agent_profile="developer_claude", skill_prompt="## Available Skills\n- foo: bar"
+        )._build_agy_command()
+    assert "Available Skills" in cmd
+
+
+def test_mcp_registration_accepts_pydantic_mcpserver(tmp_path):
+    import json
+
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile, McpServer
+
+    cfg = tmp_path / "mcp_config.json"
+    # Pre-existing, non-CAO server must be preserved across merge.
+    cfg.write_text(json.dumps({"mcpServers": {"other": {"command": "keep"}}}))
+    profile = AgentProfile(
+        name="reviewer_gemini",
+        description="Reviewer",
+        system_prompt="You review code.",
+        mcpServers={"cao-mcp-server": McpServer(command="uvx", args=["cao-mcp-server"])},
+    )
+    p = make_provider(agent_profile="reviewer_gemini")
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+            return_value="/usr/local/bin/agy",
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.load_agent_profile",
+            return_value=profile,
+        ),
+        patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg),
+    ):
+        p._build_agy_command()
+    data = json.loads(cfg.read_text())
+    assert data["mcpServers"]["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"] == "test-tid"
+    assert data["mcpServers"]["other"]["command"] == "keep"  # untouched
+
+
+def test_mcp_registration_recovers_from_corrupt_config(tmp_path):
+    import json
+
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+    cfg = tmp_path / "mcp_config.json"
+    cfg.write_text("{ this is not valid json")
+    profile = AgentProfile(
+        name="reviewer_gemini",
+        description="Reviewer",
+        mcpServers={"cao-mcp-server": {"command": "uvx", "args": ["cao-mcp-server"]}},
+    )
+    p = make_provider(agent_profile="reviewer_gemini")
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+            return_value="/usr/local/bin/agy",
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.load_agent_profile",
+            return_value=profile,
+        ),
+        patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg),
+    ):
+        p._build_agy_command()  # should not raise; starts fresh
+    data = json.loads(cfg.read_text())
+    assert "cao-mcp-server" in data["mcpServers"]
+
+
+def test_unregister_noop_when_nothing_registered():
+    # No servers registered -> cleanup is a no-op, never touches the filesystem.
+    p = make_provider()
+    p.cleanup()  # must not raise
+    assert p._mcp_server_names == []
+
+
+def test_unregister_handles_missing_file(tmp_path):
+    p = make_provider()
+    p._mcp_server_names = ["cao-mcp-server"]
+    missing = tmp_path / "does_not_exist.json"
+    with patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=missing):
+        p.cleanup()  # file gone -> just resets state
+    assert p._mcp_server_names == []
+
+
+# --------------------------------------------------------------------------- #
+# Extraction — chrome filtering + error paths
+# --------------------------------------------------------------------------- #
+
+
+_RULE = "─" * 30  # input-box separator (SEPARATOR_PATTERN needs >= 20)
+
+
+def test_extract_filters_survey_banner_and_tip():
+    script = (
+        f"{_RULE}\n"
+        "> what is 2+2\n"
+        "  Antigravity CLI 1.0.10\n"  # banner chrome
+        "  └ Tip: press something\n"  # tip chrome
+        "  ⣽ Working...\n"  # spinner chrome
+        "  How's the CLI experience?\n"  # survey chrome
+        "  The answer is 4.\n"  # real content
+        f"{_RULE}\n"
+        ">\n"
+    )
+    out = make_provider().extract_last_message_from_script(script)
+    assert out == "The answer is 4."
+
+
+def test_extract_raises_on_empty_response():
+    # A query followed only by chrome -> no content -> ValueError.
+    script = f"{_RULE}\n> hello\n  ⣽ Working...\n{_RULE}\n>\n"
+    with pytest.raises(ValueError, match="Empty"):
+        make_provider().extract_last_message_from_script(script)
+
+
+def test_extract_filters_stray_footer_in_body():
+    script = f"{_RULE}\n> hi\n  ? for shortcuts\n  Hello there.\n{_RULE}\n>\n"
+    assert make_provider().extract_last_message_from_script(script) == "Hello there."
+
+
+def test_status_unknown_when_no_markers():
+    # Non-empty buffer with no footer / spinner / error markers -> UNKNOWN.
+    assert make_provider().get_status("just some banner text\n") == TerminalStatus.UNKNOWN
+
+
+def test_build_command_raises_on_bad_profile():
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+            return_value="/usr/local/bin/agy",
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.load_agent_profile",
+            side_effect=RuntimeError("boom"),
+        ),
+    ):
+        with pytest.raises(ProviderError, match="Failed to load agent profile"):
+            make_provider(agent_profile="missing")._build_agy_command()
+
+
+def test_profile_model_overrides_constructor_model():
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+    profile = AgentProfile(
+        name="reviewer_gemini",
+        description="Reviewer",
+        system_prompt="You review code.",
+        model="Gemini 3.5 Flash (High)",
+    )
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+            return_value="/usr/local/bin/agy",
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.load_agent_profile",
+            return_value=profile,
+        ),
+    ):
+        cmd = make_provider(
+            agent_profile="reviewer_gemini", model="Gemini 3.1 Pro (High)"
+        )._build_agy_command()
+    assert "Gemini 3.5 Flash (High)" in cmd  # profile wins
+    assert "Gemini 3.1 Pro (High)" not in cmd
+
+
+def test_unregister_warns_on_corrupt_config(tmp_path):
+    cfg = tmp_path / "mcp_config.json"
+    cfg.write_text("{ not valid json")
+    p = make_provider()
+    p._mcp_server_names = ["cao-mcp-server"]
+    with patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg):
+        p.cleanup()  # corrupt file -> logged warning, state reset, no raise
+    assert p._mcp_server_names == []
+
+
+# --------------------------------------------------------------------------- #
+# launch.py PROVIDERS_REQUIRING_WORKSPACE_ACCESS
+# --------------------------------------------------------------------------- #
+
+
+def test_antigravity_cli_in_workspace_access_set():
+    # agy launches with --dangerously-skip-permissions, so it must trigger the
+    # unrestricted-launch warning like the other full-access providers.
+    from cli_agent_orchestrator.cli.commands.launch import (
+        PROVIDERS_REQUIRING_WORKSPACE_ACCESS,
+    )
+
+    assert "antigravity_cli" in PROVIDERS_REQUIRING_WORKSPACE_ACCESS
+
+
+# --------------------------------------------------------------------------- #
+# initialize() lifecycle
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_initialize_success(monkeypatch):
+    p = make_provider(model="Gemini 3.1 Pro (High)")
+
+    sent = {}
+
+    class FakeBackend:
+        def send_keys(self, session, window, command):
+            sent["command"] = command
+
+    async def fake_wait_for_shell(tid, timeout):
+        return True
+
+    async def fake_wait_until_status(tid, statuses, timeout):
+        return True
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+        lambda b: "/usr/local/bin/agy",
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.antigravity_cli.get_backend", lambda: FakeBackend()
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.antigravity_cli.wait_for_shell", fake_wait_for_shell
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.antigravity_cli.wait_until_status",
+        fake_wait_until_status,
+    )
+
+    assert await p.initialize() is True
+    assert p._initialized is True
+    assert sent["command"].startswith("agy --dangerously-skip-permissions")
+
+
+@pytest.mark.asyncio
+async def test_initialize_raises_when_shell_times_out(monkeypatch):
+    async def fake_wait_for_shell(tid, timeout):
+        return False
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.antigravity_cli.wait_for_shell", fake_wait_for_shell
+    )
+    with pytest.raises(TimeoutError, match="Shell"):
+        await make_provider().initialize()
+
+
+@pytest.mark.asyncio
+async def test_initialize_raises_when_agy_times_out(monkeypatch):
+    class FakeBackend:
+        def send_keys(self, session, window, command):
+            pass
+
+    async def fake_wait_for_shell(tid, timeout):
+        return True
+
+    async def fake_wait_until_status(tid, statuses, timeout):
+        return False
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+        lambda b: "/usr/local/bin/agy",
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.antigravity_cli.get_backend", lambda: FakeBackend()
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.antigravity_cli.wait_for_shell", fake_wait_for_shell
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.antigravity_cli.wait_until_status",
+        fake_wait_until_status,
+    )
+    with pytest.raises(TimeoutError, match="initialization timed out"):
+        await make_provider().initialize()

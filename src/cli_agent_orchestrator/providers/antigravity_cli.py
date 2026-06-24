@@ -185,6 +185,18 @@ class AntigravityCliProvider(BaseProvider):
         # sending the task" contract working right after init.
         self._turns: int = 0
 
+    @property
+    def blocks_orchestrated_input_while_waiting_user_answer(self) -> bool:
+        """agy's approval dialogs / pickers consume pasted text as the answer.
+
+        Even with ``--dangerously-skip-permissions`` some interactive prompts
+        can surface; when one is up, an orchestrated assign/handoff message
+        pasted into the input would be read as the prompt's answer. Opting in
+        makes the terminal service hold orchestrated delivery until the prompt
+        clears, while still allowing explicit user-prompt answers.
+        """
+        return True
+
     # ------------------------------------------------------------------ #
     # Launch
     # ------------------------------------------------------------------ #
@@ -364,10 +376,11 @@ class AntigravityCliProvider(BaseProvider):
     def get_status(self, output: Optional[str]) -> TerminalStatus:
         """Detect agy status from the terminal output buffer.
 
-        Priority:
+        Priority (matches the checks below in order):
           1. Empty → UNKNOWN
-          2. PROCESSING — footer "esc to cancel" (or a spinner line) in the tail
-          3. WAITING_USER_ANSWER — an interactive approval / picker prompt
+          2. WAITING_USER_ANSWER — an interactive approval / picker prompt
+             (takes precedence over the processing footer/spinner)
+          3. PROCESSING — footer "esc to cancel" (or a spinner line) in the tail
           4. IDLE / COMPLETED — footer "? for shortcuts" (IDLE pre-first-turn,
              COMPLETED after)
           5. ERROR — matched error pattern

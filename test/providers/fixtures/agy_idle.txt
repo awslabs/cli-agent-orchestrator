@@ -1,8 +1,8 @@
 cd '/tmp/agy_onb/work' && agy --dangerously-skip-permissions
-markuswohlmuth@MacBook-Pro cli-agent-orchestrator % cd '/tmp/agy_onb/work' && agy --dangerously-skip-permissions
+user@host cli-agent-orchestrator % cd '/tmp/agy_onb/work' && agy --dangerously-skip-permissions
 
       ▄▀▀▄        Antigravity CLI 1.0.10
-     ▀▀▀▀▀▀       markus.wohlmuth@bitmovin.com (Antigravity Starter Quota)
+     ▀▀▀▀▀▀       user@example.com (Antigravity Starter Quota)
     ▀▀▀▀▀▀▀▀      Gemini 3.5 Flash (Medium)
    ▄▀▀    ▀▀▄     /tmp/agy_onb/work
   ▄▀▀      ▀▀▄
