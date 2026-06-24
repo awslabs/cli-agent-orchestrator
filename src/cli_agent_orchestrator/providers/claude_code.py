@@ -228,7 +228,7 @@ class ClaudeCodeProvider(BaseProvider):
                     mcp_file.chmod(0o600)
                 except OSError:
                     pass
-                command_parts.extend(["--mcp-config", str(mcp_file)])
+                command_parts.extend(["--mcp-config", str(mcp_file), "--strict-mcp-config"])
 
         # Apply tool restrictions via --disallowedTools flags.
         # --dangerously-skip-permissions bypasses prompts but --disallowedTools

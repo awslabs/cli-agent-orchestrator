@@ -220,9 +220,30 @@ class StatusMonitor:
 
     def _detect_screen(self, terminal_id: str, provider) -> TerminalStatus:
         """Detect status from the terminal's composited pyte screen."""
+        fallback_buffer: Optional[str] = None
         with self._lock:
             scr = self._screens.get(terminal_id)
-            lines: List[str] = list(scr[0].display) if scr is not None else []
+            buffer = self._buffers.get(terminal_id, "")
+            try:
+                lines: List[str] = list(scr[0].display) if scr is not None else []
+            except Exception:
+                # pyte can transiently hold zero-length cell data while rendering
+                # complex TUI redraws. Fall back to raw-buffer detection instead of
+                # letting the quiescence callback tear down status monitoring.
+                logger.exception(
+                    "Error rendering screen status for %s; falling back to raw buffer",
+                    terminal_id,
+                )
+                fallback_buffer = buffer
+                lines = []
+        if fallback_buffer is not None:
+            if provider is None:
+                return TerminalStatus.UNKNOWN
+            try:
+                return provider.get_status(fallback_buffer)
+            except Exception:
+                logger.exception(f"Error detecting fallback status for {terminal_id}")
+                return TerminalStatus.UNKNOWN
         if not lines or provider is None:
             return TerminalStatus.UNKNOWN
         try:

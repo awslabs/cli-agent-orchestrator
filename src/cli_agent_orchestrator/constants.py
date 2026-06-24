@@ -64,8 +64,10 @@ FIFO_DIR.mkdir(parents=True, exist_ok=True)
 # Keeps trailing 8KB of terminal output for pattern matching
 STATE_BUFFER_MAX = 8192
 
-# Max events buffered per subscriber queue before dropping
-EVENT_BUS_MAX_QUEUE_SIZE = 1024
+# Max events buffered per subscriber queue before dropping. Claude's TUI startup
+# can emit thousands of small chunks in a short burst, so keep this comfortably
+# above the old 1024 default while still bounded.
+EVENT_BUS_MAX_QUEUE_SIZE = int(os.environ.get("CAO_EVENT_BUS_MAX_QUEUE_SIZE", "16384"))
 
 # pyte-rendered status detection. When enabled, the StatusMonitor feeds each
 # terminal's output through a pyte terminal emulator and runs detection against
