@@ -66,6 +66,10 @@ SYNC_AUDIT_EVENTS: frozenset = frozenset(
         "stale_claim_pruned",
         "poison_access_zeroed",
         "heal_run_completed",
+        # Emitted when a batch commit fails AFTER an irreversible filesystem
+        # mutation already happened — the DB rolls back but the on-disk change
+        # persists, so the forensic trail must still record it.
+        "heal_partial_mutation",
     }
 )
 NOWAIT_AUDIT_EVENTS: frozenset = frozenset(

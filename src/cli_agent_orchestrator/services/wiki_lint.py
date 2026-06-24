@@ -57,6 +57,13 @@ class LintIssue:
     description: str = ""
     severity: str = "warning"  # "info"|"warning"|"error"
     detected_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # Source container identity. Populated for mutating issue types (orphan_page,
+    # contradiction, stale_claim, poison_frequency) so the healer can refuse to
+    # apply a finding from one container to a same-key memory in another. None on
+    # bookkeeping rows (lint_error / run_lint summaries). run_lint() returns
+    # findings across ALL containers for a scope, so this is the only reliable
+    # discriminator at heal time.
+    scope_id: Optional[str] = None
 
 
 # -----------------------------------------------------------------------------
@@ -126,6 +133,7 @@ def _make_issue(
     related_key: Optional[str] = None,
     description: str = "",
     severity: str = "warning",
+    scope_id: Optional[str] = None,
 ) -> LintIssue:
     """T6.a — sanitise key/related_key/description ONCE at construction.
 
@@ -133,6 +141,10 @@ def _make_issue(
     ``orphan_page`` walks ``wiki/*.md``), so they carry the same single-line
     contract as ``description`` to keep raw control chars/newlines out of the
     rendered table and logs.
+
+    ``scope_id`` is the source container id (passed through verbatim, not a
+    log-rendered string); the healer matches it against the run's target so a
+    finding never crosses containers.
     """
     sanitized = _sanitize_for_log(description, max_len=DESCRIPTION_MAX_CHARS)
     return LintIssue(
@@ -145,6 +157,7 @@ def _make_issue(
         ),
         description=sanitized,
         severity=severity,
+        scope_id=scope_id,
     )
 
 
@@ -263,6 +276,7 @@ def _detect_orphan_pages(
                 key=key,
                 description=f"wiki file present but missing from index and SQLite (scope={scope})",
                 severity="warning",
+                scope_id=scope_id,
             )
         )
     if truncated:
@@ -329,6 +343,7 @@ async def _check_pair(
     body_b: str,
     *,
     timeout_s: float,
+    scope_id: Optional[str] = None,
 ) -> LintIssue:
     """Run the contradiction LLM call for a single pair, return a LintIssue.
 
@@ -395,6 +410,7 @@ async def _check_pair(
             related_key=key_b,
             description=parsed["summary"],
             severity="error",
+            scope_id=scope_id,
         )
     # contradicts=False, no suspicion → no issue. Sentinel value:
     return _make_issue(
@@ -493,6 +509,7 @@ async def _detect_contradictions(
             b["key"],
             b.get("content") or "",
             timeout_s=per_pair_timeout_s,
+            scope_id=a.get("scope_id"),
         )
         for (a, b) in pairs
     ]
@@ -634,6 +651,7 @@ def _detect_stale_claims(rows: list, repo_root_resolved: str) -> list:
                     key=r["key"],
                     description=f"file not found: {path_raw}",
                     severity="error",
+                    scope_id=r.get("scope_id"),
                 )
             )
 
@@ -678,6 +696,7 @@ def _detect_stale_claims(rows: list, repo_root_resolved: str) -> list:
                         key=r["key"],
                         description=f"symbol not found in source: {sym}",
                         severity="warning",
+                        scope_id=r.get("scope_id"),
                     )
                 )
 
@@ -736,6 +755,7 @@ def _detect_poison_frequency(rows_by_scope: dict) -> list:
                         key=r["key"],
                         description=f"access_count={ac} (P95={p95:.1f}, len={content_len})",
                         severity="error",
+                        scope_id=scope_id,
                     )
                 )
     if truncated:

@@ -399,6 +399,7 @@ class TestT9SyncVsNowait:
                 "stale_claim_pruned",
                 "poison_access_zeroed",
                 "heal_run_completed",
+                "heal_partial_mutation",
             }
         )
 

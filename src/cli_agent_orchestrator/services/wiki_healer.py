@@ -101,6 +101,13 @@ class HealAction:
     description: str = ""  # human summary of what was done / would be done
     status: str = "applied"  # "applied"|"skipped"|"error"|"planned"
     pre_strip_paragraph: Optional[str] = None  # only for stale_claim; size-capped
+    # True iff this action already performed an irreversible filesystem mutation
+    # (file unlink / index rewrite / atomic article rewrite) BEFORE the batch
+    # db.commit(). If that commit then fails and the DB rolls back, the on-disk
+    # change persists — the batch handler emits a ``heal_partial_mutation`` audit
+    # so a real file change is never lost from the forensic trail (invariant #7).
+    # DB-only healers (poison) leave this False: a rollback fully restores them.
+    fs_mutated: bool = False
     # Buffered audit payload (event_type, summary, fields). Populated by the
     # healers instead of emitting inline; the batch loop flushes it only AFTER
     # the group's db.commit() succeeds, so a rolled-back mutation never leaves a
@@ -216,7 +223,16 @@ def _strip_stale_paragraph(content: str, stale_id: str) -> tuple[str, Optional[s
     if current:
         paragraphs.append(current)
 
-    pattern = re.compile(r"\b" + re.escape(stale_id) + r"\b")
+    # Path-aware boundaries (P2a). A plain ``\b...\b`` cannot anchor an
+    # identifier that starts or ends with a non-word char, so detector-emitted
+    # paths like ``./src/gone.py`` or ``/tmp/repo/src/gone.py`` never matched.
+    # Use lookarounds over the path-token alphabet instead:
+    #   leading  (?<![\w./-]) — not glued to a preceding path char (so
+    #            ``src/gone.py`` won't match inside ``mysrc/gone.py``);
+    #   trailing (?![\w/-])   — not glued to a following word/``/``/``-`` (so
+    #            ``gone.py`` won't match inside ``gone.python``), while a
+    #            trailing ``.`` is allowed so sentence-final ``…gone.py.`` matches.
+    pattern = re.compile(r"(?<![\w./-])" + re.escape(stale_id) + r"(?![\w/-])")
     target_idx: Optional[int] = None
     for i, para in enumerate(paragraphs):
         if any(pattern.search(ln) for ln in para):
@@ -369,6 +385,9 @@ async def _heal_orphan(
             key,
             status="applied",
             description=desc,
+            # The index rewrite (when it succeeded) is an FS mutation that a DB
+            # rollback cannot undo; flag it so a failed commit still audits.
+            fs_mutated=index_removed,
             audit=(
                 "orphan_pruned",
                 f"deleted orphan wiki file: {key}",
@@ -396,6 +415,7 @@ async def _heal_orphan(
         key,
         status="applied",
         description=f"deleted {wiki_path.name}, index line, metadata row",
+        fs_mutated=True,
         audit=(
             "orphan_pruned",
             f"deleted orphan wiki file: {key}",
@@ -507,6 +527,7 @@ async def _heal_contradiction(
         related_key=loser_key,
         status="applied",
         description=f"kept {winner_key}, forgot {loser_key}",
+        fs_mutated=True,
         audit=(
             "contradiction_resolved",
             f"kept {winner_key}, forgot {loser_key}",
@@ -571,26 +592,18 @@ async def _heal_stale_claim(
     capped_pre_strip = _cap_pre_strip(pre_strip) if pre_strip is not None else None
 
     if pre_strip is None:
-        # No paragraph matched — leave content unchanged, audit + skipped. This
-        # records a read-only outcome (nothing mutated), so it is safe to emit
-        # regardless of the batch commit; buffer it for uniformity.
+        # No paragraph matched — content unchanged, nothing mutated (P3). Emit NO
+        # audit: ``stale_claim_pruned`` is a mutation event, and recording it for
+        # a no-op contradicts the "every applied mutation emits" invariant and
+        # pollutes forensic review with phantom prunes. The skipped status is
+        # surfaced in the report; the audit stream stays mutation-only.
         return HealAction(
             "stale_claim_pruned",
             key,
             status="skipped",
             description=f"stale id {stale_id} not found in article",
             pre_strip_paragraph=None,
-            audit=(
-                "stale_claim_pruned",
-                f"no paragraph found for {stale_id} in {key}",
-                {
-                    "key": key,
-                    "scope": scope,
-                    "scope_id": scope_id or "",
-                    "stale_identifier": stale_id,
-                    "pre_strip_paragraph": "",
-                },
-            ),
+            audit=None,
         )
 
     tmp_path = wiki_path.parent / f".{wiki_path.stem}.strip.tmp"
@@ -633,6 +646,7 @@ async def _heal_stale_claim(
         status="applied",
         description=f"stripped paragraph naming {stale_id}",
         pre_strip_paragraph=capped_pre_strip,
+        fs_mutated=True,
         audit=(
             "stale_claim_pruned",
             f"stripped stale reference to {stale_id} in article {key}",
@@ -780,6 +794,16 @@ async def heal(
             continue
         if t not in by_type:
             continue
+        # Cross-container guard (P1): run_lint() returns findings across ALL
+        # containers for a scope, but the healer mutates using THIS run's
+        # (scope, scope_id). A finding whose source container differs from the
+        # target must never be applied — it would corrupt a same-key memory in a
+        # different project. Skip it before it reaches a healer. lint findings
+        # built before scope_id was threaded carry scope_id=None; a None target
+        # (e.g. global scope) still matches None, so legacy/global flows are
+        # unaffected.
+        if getattr(issue, "scope_id", None) != scope_id:
+            continue
         by_type[t].append(issue)
 
     actions: list = []
@@ -888,9 +912,14 @@ async def heal(
                         actions_applied += 1
                 db.commit()
             except Exception as e:
-                # Roll the whole group back at the DB level; filesystem side effects (if any)
-                # may already have occurred, so surface as errored actions and avoid emitting
-                # mutation audits for this group.
+                # Roll the whole group back at the DB level. A successful action
+                # in this group may already have performed an irreversible
+                # filesystem mutation (file unlink / index rewrite / atomic
+                # rewrite) that the rollback cannot undo. We do NOT emit the
+                # normal mutation audit (the DB state it described was rolled
+                # back), but for each such action we DO emit a dedicated
+                # ``heal_partial_mutation`` event so a real on-disk change is
+                # never lost from the forensic trail (P2b / invariant #7).
                 logger.warning("heal batch group commit failed type=%s: %s", t, type(e).__name__)
                 try:
                     db.rollback()
@@ -899,6 +928,23 @@ async def heal(
                 rolled = actions[group_start:]
                 del actions[group_start:]
                 for a in rolled:
+                    if a.status == "applied" and a.fs_mutated:
+                        ev_key = a.audit[2].get("key", a.key) if a.audit else a.key
+                        await write_audit(
+                            "heal_partial_mutation",
+                            (
+                                f"commit failed ({type(e).__name__}) after filesystem "
+                                f"mutation for {a.issue_type}:{a.key}; DB rolled back, "
+                                f"on-disk change persists"
+                            ),
+                            issue_type=a.issue_type,
+                            key=ev_key,
+                            scope=scope,
+                            scope_id=scope_id or "",
+                            db_rolled_back="true",
+                            fs_partial="true",
+                            error=type(e).__name__,
+                        )
                     actions.append(
                         HealAction(
                             a.issue_type,
@@ -910,6 +956,7 @@ async def heal(
                             ),
                             status="error",
                             pre_strip_paragraph=a.pre_strip_paragraph,
+                            fs_mutated=a.fs_mutated,
                         )
                     )
                 continue
@@ -920,9 +967,11 @@ async def heal(
                     pass
             # Commit succeeded — NOW flush the group's buffered audit events.
             # Emitting only post-commit guarantees the audit log never records a
-            # mutation that was rolled back.
+            # mutation that was rolled back. Gate on status=="applied" (P3): a
+            # buffered audit on a skipped/errored action describes a no-op, and a
+            # mutation event type must never narrate a non-mutation.
             for a in actions[group_start:]:
-                if a.audit is not None:
+                if a.status == "applied" and a.audit is not None:
                     event_type, summary, fields = a.audit
                     await write_audit(event_type, summary, **fields)
     finally:

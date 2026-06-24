@@ -151,6 +151,36 @@ class TestStripAlgorithm:
         assert pre is None
         assert new == content
 
+    def test_relative_dotslash_path_matches(self):
+        # P2a: a leading "./" used to defeat the \b anchor — the detector emits
+        # this path form, so the healer must be able to strip it.
+        content = "intro\n\nrefers to ./src/gone.py which vanished\n\noutro\n"
+        new, pre = _strip_stale_paragraph(content, "./src/gone.py")
+        assert pre is not None
+        assert "./src/gone.py" not in new
+        assert "intro" in new and "outro" in new
+
+    def test_absolute_path_matches(self):
+        # P2a: a leading "/" likewise defeated \b.
+        content = "intro\n\ngone: /tmp/repo/src/gone.py now missing\n\noutro\n"
+        new, pre = _strip_stale_paragraph(content, "/tmp/repo/src/gone.py")
+        assert pre is not None
+        assert "/tmp/repo/src/gone.py" not in new
+
+    def test_trailing_period_path_matches(self):
+        # A sentence-final period after the path must NOT block the match.
+        content = "the file lived at src/gone.py.\n"
+        new, pre = _strip_stale_paragraph(content, "src/gone.py")
+        assert pre is not None
+
+    def test_path_substring_does_not_match(self):
+        # P2a guard: a path that is only a SUFFIX of a longer path token must
+        # not match (boundaries are path-aware, not absent).
+        content = "this is about mysrc/gone.py only\n"
+        new, pre = _strip_stale_paragraph(content, "src/gone.py")
+        assert pre is None
+        assert new == content
+
 
 # ===========================================================================
 # Dry-run: mutates nothing
@@ -357,6 +387,22 @@ class TestStaleClaimFix:
         report = _run(heal(issues, scope="global", scope_id=None, apply=True, svc=svc))
         assert report.actions[0].status == "skipped"
 
+    def test_skipped_no_match_emits_no_mutation_audit(self, svc, audit_base):
+        # P3: a parseable finding whose stale id is NOT present in the article is
+        # a no-op — nothing is mutated. It must NOT emit a stale_claim_pruned
+        # event (a mutation event narrating a non-mutation breaks invariant #7).
+        _store(svc, "article-nm", content="this article only mentions other.py here\n")
+        issues = [
+            _make_issue(
+                issue_type="stale_claim",
+                key="article-nm",
+                description="file not found: missing/ghost.py",
+            )
+        ]
+        report = _run(heal(issues, scope="global", scope_id=None, apply=True, svc=svc))
+        assert report.actions[0].status == "skipped"
+        assert "[stale_claim_pruned]" not in _read_audit(audit_base)
+
     def test_dry_run_does_not_count_unparseable_as_actionable(self, svc, audit_base):
         # The "related_keys references missing key:" stale_claim sub-type has no
         # paragraph to strip; the dry-run plan must show it skipped, not planned,
@@ -476,6 +522,9 @@ class TestAuditAfterCommit:
         # And crucially: NO mutation audit recorded for the rolled-back write.
         log = _read_audit(audit_base)
         assert "[poison_access_zeroed]" not in log
+        # P2b: poison is DB-only — a rollback fully restores it, so there is no
+        # persisted on-disk change and NO partial-mutation event is warranted.
+        assert "[heal_partial_mutation]" not in log
 
     def test_orphan_rollback_emits_no_mutation_audit(self, svc, audit_base, monkeypatch):
         _make_orphan(svc, "orphan-rb")
@@ -486,6 +535,27 @@ class TestAuditAfterCommit:
         assert report.actions[0].status == "error"
         assert "[orphan_pruned]" not in _read_audit(audit_base)
 
+    def test_orphan_rollback_after_fs_mutation_emits_partial_audit(
+        self, svc, audit_base, monkeypatch
+    ):
+        # P2b: the orphan healer unlinks the file + rewrites the index BEFORE the
+        # batch commit. If the commit then fails, the DB rolls back but the file
+        # is already gone — that irreversible change must still be auditable.
+        wiki_path = _make_orphan(svc, "orphan-fs")
+        self._force_commit_failure(svc, monkeypatch)
+        issues = [_make_issue(issue_type="orphan_page", key="orphan-fs")]
+        report = _run(heal(issues, scope="global", scope_id=None, apply=True, svc=svc))
+
+        assert report.actions[0].status == "error"
+        # Filesystem mutation persisted despite the DB rollback...
+        assert not wiki_path.exists()
+        log = _read_audit(audit_base)
+        # ...so a heal_partial_mutation event records it, and the normal
+        # mutation event (which described rolled-back DB state) is NOT emitted.
+        assert "[heal_partial_mutation]" in log
+        assert "key=orphan-fs" in log
+        assert "[orphan_pruned]" not in log
+
     def test_successful_commit_still_emits_audit(self, svc, audit_base):
         # Control: the happy path still emits the mutation audit (post-commit).
         _make_orphan(svc, "orphan-ok")
@@ -493,6 +563,127 @@ class TestAuditAfterCommit:
         report = _run(heal(issues, scope="global", scope_id=None, apply=True, svc=svc))
         assert report.actions[0].status == "applied"
         assert "[orphan_pruned]" in _read_audit(audit_base)
+
+
+# ===========================================================================
+# Cross-container safety (P1): a finding from project B must never be applied
+# to a same-key memory in project A.
+# ===========================================================================
+
+
+class TestCrossContainerGuard:
+    def _seed_two_projects(self, svc, key, *, access_a=12, access_b=999):
+        """Two PROJECT rows sharing one key under different scope_id."""
+        now = datetime.now(timezone.utc)
+        with svc._get_db_session() as db:
+            for sid, ac in (("project_a", access_a), ("project_b", access_b)):
+                db.add(
+                    MemoryMetadataModel(
+                        key=key,
+                        scope="project",
+                        scope_id=sid,
+                        memory_type="reference",
+                        file_path=str(svc.get_wiki_path("project", sid, key)),
+                        tags="",
+                        updated_at=now,
+                        created_at=now,
+                        access_count=ac,
+                    )
+                )
+            db.commit()
+
+    def test_poison_finding_from_other_project_is_filtered(self, svc, audit_base):
+        # The reproduced P1 blocker: a poison_frequency finding tagged with
+        # project B's scope_id must NOT zero project A's same-key row when heal
+        # runs for project A.
+        self._seed_two_projects(svc, "shared-key")
+        issue = _make_issue(
+            issue_type="poison_frequency",
+            key="shared-key",
+            description="access_count=999",
+            scope_id="project_b",
+        )
+        report = _run(
+            heal(
+                [issue],
+                scope="project",
+                scope_id="project_a",
+                apply=True,
+                aggressive=True,
+                svc=svc,
+            )
+        )
+        # Filtered before reaching a healer — no action produced.
+        assert all(a.status != "applied" for a in report.actions)
+        # Both rows untouched.
+        assert (
+            int(_row(svc, "shared-key", scope="project", scope_id="project_a").access_count) == 12
+        )
+        assert (
+            int(_row(svc, "shared-key", scope="project", scope_id="project_b").access_count) == 999
+        )
+        assert "[poison_access_zeroed]" not in _read_audit(audit_base)
+
+    def test_matching_scope_id_still_applies(self, svc, audit_base):
+        # Control: a finding tagged with the TARGET scope_id still applies.
+        self._seed_two_projects(svc, "shared-key")
+        issue = _make_issue(
+            issue_type="poison_frequency",
+            key="shared-key",
+            description="access_count=12",
+            scope_id="project_a",
+        )
+        report = _run(
+            heal(
+                [issue],
+                scope="project",
+                scope_id="project_a",
+                apply=True,
+                aggressive=True,
+                svc=svc,
+            )
+        )
+        assert report.actions[0].status == "applied"
+        assert int(_row(svc, "shared-key", scope="project", scope_id="project_a").access_count) == 0
+        # Project B is the bystander — never touched.
+        assert (
+            int(_row(svc, "shared-key", scope="project", scope_id="project_b").access_count) == 999
+        )
+
+    def test_contradiction_finding_from_other_project_is_filtered(self, svc, audit_base):
+        # contradiction re-reads rows by (key, scope, target scope_id); a finding
+        # from another container must be dropped before that re-read.
+        self._seed_two_projects(svc, "key-a")
+        self._seed_two_projects(svc, "key-b")
+        issue = _make_issue(
+            issue_type="contradiction",
+            key="key-a",
+            related_key="key-b",
+            description="they conflict",
+            scope_id="project_b",
+        )
+        report = _run(heal([issue], scope="project", scope_id="project_a", apply=True, svc=svc))
+        assert all(a.status != "applied" for a in report.actions)
+        # Project A's rows both survive (nothing forgotten).
+        assert _row(svc, "key-a", scope="project", scope_id="project_a") is not None
+        assert _row(svc, "key-b", scope="project", scope_id="project_a") is not None
+
+    def test_stale_claim_finding_from_other_project_is_filtered(self, svc, audit_base):
+        # A stale_claim finding from project B must not strip project A's article.
+        wiki_path = svc.get_wiki_path("project", "project_a", "doc")
+        wiki_path.parent.mkdir(parents=True, exist_ok=True)
+        body = "intro\n\nrefers to src/gone.py here\n\noutro\n"
+        wiki_path.write_text(body, encoding="utf-8")
+        issue = _make_issue(
+            issue_type="stale_claim",
+            key="doc",
+            description="file not found: src/gone.py",
+            scope_id="project_b",
+        )
+        report = _run(heal([issue], scope="project", scope_id="project_a", apply=True, svc=svc))
+        assert all(a.status != "applied" for a in report.actions)
+        # Article A untouched — the stale paragraph is still present.
+        assert wiki_path.read_text(encoding="utf-8") == body
 
 
 # ===========================================================================
