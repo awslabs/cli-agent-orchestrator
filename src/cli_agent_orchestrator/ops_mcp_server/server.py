@@ -32,8 +32,10 @@ mcp = FastMCP(
     3. install_profile to install a profile for a target provider
     4. launch_session to start a new CAO session
     5. send_session_message to deliver a prompt to a running terminal
-    6. get_session_info or list_sessions to monitor progress
-    7. shutdown_session to clean up when done
+    6. get_terminal_status to poll a worker until it finishes a task
+    7. get_terminal_output to read a worker's result (or review its files/git diff)
+    8. get_session_info or list_sessions to monitor overall progress
+    9. shutdown_session to clean up when done
     """,
 )
 
@@ -321,6 +323,83 @@ async def send_session_message(
         message=f"Message queued for terminal '{terminal_id}'",
         terminal_id=terminal_id,
     )
+
+
+@mcp.tool()
+async def get_terminal_status(
+    terminal_id: Annotated[str, Field(description="The terminal ID to inspect")],
+) -> JsonDict:
+    """Get a single terminal's live status and metadata.
+
+    Use this to poll a worker an external supervisor launched: it returns the
+    current status (one of unknown / idle / processing / completed /
+    waiting_user_answer / error) so the supervisor knows when a delegated task
+    has finished before reading its output.
+
+    Args:
+        terminal_id: Target terminal ID (from launch_session or get_session_info)
+
+    Returns:
+        Dict with id, name, provider, session_name, agent_profile, status,
+        last_active — or {"success": False, "message": ...} on error
+    """
+    data, error = _request_json(
+        "get",
+        f"/terminals/{terminal_id}",
+        operation=f"Get terminal status for '{terminal_id}'",
+    )
+    if error:
+        return {"success": False, "message": error}
+    if isinstance(data, dict):
+        return data
+    return {"success": False, "message": "Get terminal status failed: invalid response payload"}
+
+
+@mcp.tool()
+async def get_terminal_output(
+    terminal_id: Annotated[str, Field(description="The terminal ID to read output from")],
+    mode: Annotated[
+        str,
+        Field(
+            description=(
+                "'last' returns only the worker's final response (provider-extracted); "
+                "'full' returns the recent rolling output buffer."
+            )
+        ),
+    ] = "last",
+) -> JsonDict:
+    """Read a worker terminal's output so the supervisor can review its work.
+
+    Pair with get_terminal_status: poll until status is completed/idle, then
+    read with mode='last' to get the worker's final message. Note the returned
+    text is screen-scraped from the worker's TUI and can be truncated on very
+    long turns — for code review, prefer inspecting the worker's files / git
+    diff directly rather than relying solely on this text.
+
+    Args:
+        terminal_id: Target terminal ID
+        mode: 'last' (final response, default) or 'full' (rolling buffer)
+
+    Returns:
+        Dict with output and mode, or {"success": False, "message": ...} on error
+    """
+    normalized = (mode or "last").lower()
+    if normalized not in ("last", "full"):
+        return {
+            "success": False,
+            "message": f"Get terminal output failed: mode must be 'last' or 'full', got '{mode}'",
+        }
+    data, error = _request_json(
+        "get",
+        f"/terminals/{terminal_id}/output",
+        params={"mode": normalized},
+        operation=f"Get terminal output for '{terminal_id}'",
+    )
+    if error:
+        return {"success": False, "message": error}
+    if isinstance(data, dict):
+        return data
+    return {"success": False, "message": "Get terminal output failed: invalid response payload"}
 
 
 @mcp.tool()

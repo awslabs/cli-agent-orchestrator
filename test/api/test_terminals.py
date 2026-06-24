@@ -251,98 +251,40 @@ class TestTerminalCreationWithWorkingDirectory:
 class TestExitTerminalEndpoint:
     """Test POST /terminals/{terminal_id}/exit endpoint.
 
-    Verifies that text commands (e.g., /exit) are sent via send_input()
-    and tmux special key sequences (e.g., C-d) are sent via send_special_key().
+    The endpoint now delegates to ``terminal_service.exit_terminal_cli`` (the
+    shared graceful-shutdown helper); the send_input-vs-send_special_key
+    branching is unit-tested in test_terminal_service.py. These tests pin the
+    boundary contract: delegation + domain-error -> HTTP-status mapping.
     """
 
-    def test_exit_terminal_text_command(self, client):
-        """Text exit commands (e.g., /exit) should use send_input."""
-        mock_provider = MagicMock()
-        mock_provider.exit_cli.return_value = "/exit"
-
-        with (
-            patch("cli_agent_orchestrator.api.main.provider_manager") as mock_pm,
-            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
-        ):
-            mock_pm.get_provider.return_value = mock_provider
-
+    def test_exit_terminal_delegates_and_returns_success(self, client):
+        """A successful exit delegates to exit_terminal_cli and returns 200."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
             response = client.post("/terminals/abcd1234/exit")
 
             assert response.status_code == 200
             assert response.json() == {"success": True}
-            mock_svc.send_input.assert_called_once_with("abcd1234", "/exit")
-            mock_svc.send_special_key.assert_not_called()
+            mock_svc.exit_terminal_cli.assert_called_once_with("abcd1234")
 
-    def test_exit_terminal_special_key(self, client):
-        """Tmux key sequences (e.g., C-d) should use send_special_key."""
-        mock_provider = MagicMock()
-        mock_provider.exit_cli.return_value = "C-d"
-
-        with (
-            patch("cli_agent_orchestrator.api.main.provider_manager") as mock_pm,
-            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
-        ):
-            mock_pm.get_provider.return_value = mock_provider
-
-            response = client.post("/terminals/abcd1234/exit")
-
-            assert response.status_code == 200
-            assert response.json() == {"success": True}
-            mock_svc.send_special_key.assert_called_once_with("abcd1234", "C-d")
-            mock_svc.send_input.assert_not_called()
-
-    def test_exit_terminal_meta_key(self, client):
-        """Meta key sequences (M-x) should also use send_special_key."""
-        mock_provider = MagicMock()
-        mock_provider.exit_cli.return_value = "M-x"
-
-        with (
-            patch("cli_agent_orchestrator.api.main.provider_manager") as mock_pm,
-            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
-        ):
-            mock_pm.get_provider.return_value = mock_provider
-
-            response = client.post("/terminals/abcd1234/exit")
-
-            assert response.status_code == 200
-            mock_svc.send_special_key.assert_called_once_with("abcd1234", "M-x")
-            mock_svc.send_input.assert_not_called()
-
-    def test_exit_terminal_provider_not_found(self, client):
-        """Should return 404 when provider is not found."""
-        with patch("cli_agent_orchestrator.api.main.provider_manager") as mock_pm:
-            mock_pm.get_provider.side_effect = ValueError("Terminal not found in database")
-
-            response = client.post("/terminals/deadbeef/exit")
-
-            assert response.status_code == 404
-
-    def test_exit_terminal_server_error(self, client):
-        """Should return 500 on unexpected errors."""
-        mock_provider = MagicMock()
-        mock_provider.exit_cli.return_value = "/exit"
-
-        with (
-            patch("cli_agent_orchestrator.api.main.provider_manager") as mock_pm,
-            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
-        ):
-            mock_pm.get_provider.return_value = mock_provider
-            mock_svc.send_input.side_effect = RuntimeError("TMux error")
-
-            response = client.post("/terminals/abcd1234/exit")
-
-            assert response.status_code == 500
-            assert "Failed to exit terminal" in response.json()["detail"]
-
-    def test_exit_terminal_provider_returns_none(self, client):
-        """Should return 404 when get_provider returns None (not ValueError)."""
-        with patch("cli_agent_orchestrator.api.main.provider_manager") as mock_pm:
-            mock_pm.get_provider.return_value = None
+    def test_exit_terminal_value_error_maps_to_404(self, client):
+        """A ValueError (e.g. no provider) maps to 404 at the boundary."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.exit_terminal_cli.side_effect = ValueError("Provider not found for terminal x")
 
             response = client.post("/terminals/deadbeef/exit")
 
             assert response.status_code == 404
             assert "Provider not found" in response.json()["detail"]
+
+    def test_exit_terminal_server_error_maps_to_500(self, client):
+        """An unexpected error maps to 500."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.exit_terminal_cli.side_effect = RuntimeError("TMux error")
+
+            response = client.post("/terminals/abcd1234/exit")
+
+            assert response.status_code == 500
+            assert "Failed to exit terminal" in response.json()["detail"]
 
 
 class TestDeleteTerminalEndpoint:

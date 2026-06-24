@@ -103,6 +103,17 @@ def get_session(session_name: str) -> Dict:
             raise ValueError(f"Session '{session_name}' not found")
 
         terminals = list_terminals_by_session(session_name)
+        # Enrich each terminal with its live status. list_terminals_by_session
+        # reads only the DB row (no status column), but callers monitoring an
+        # orchestration — the web UI, and the cao-ops-mcp get_session_info tool
+        # an external supervisor polls — need to distinguish
+        # IDLE/PROCESSING/COMPLETED/ERROR per terminal. status_monitor is the
+        # single source of truth and is backend-aware (tmux push vs herdr
+        # native), so derive it here rather than persisting a stale column.
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        for terminal in terminals:
+            terminal["status"] = status_monitor.get_status(terminal["id"]).value
         return {"session": session_data, "terminals": terminals}
 
     except Exception as e:

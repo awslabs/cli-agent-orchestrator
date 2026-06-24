@@ -17,6 +17,8 @@ from cli_agent_orchestrator.ops_mcp_server.server import (
     _launch_session_impl,
     get_profile_details,
     get_session_info,
+    get_terminal_output,
+    get_terminal_status,
     install_profile,
     launch_session,
     list_profiles,
@@ -521,6 +523,100 @@ class TestSessionLifecycleTools:
         assert result == {
             "success": False,
             "message": "Shutdown session 'cao-123' failed: delete failed",
+        }
+
+
+@pytest.mark.asyncio
+class TestTerminalMonitoringTools:
+    """Tests for the worker-monitoring tools used by an external supervisor."""
+
+    async def test_get_terminal_status_returns_terminal_payload(self) -> None:
+        """A successful status read returns the terminal dict including status."""
+        payload = {
+            "id": "term-123",
+            "name": "developer-0",
+            "provider": "claude_code",
+            "session_name": "cao-abc",
+            "agent_profile": "dev-sonnet",
+            "status": "processing",
+            "last_active": "2026-06-11T00:00:00",
+        }
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data=payload),
+        ) as mock_request:
+            result = await get_terminal_status(terminal_id="term-123")
+
+        assert result == payload
+        mock_request.assert_called_once_with(
+            "get",
+            "http://127.0.0.1:9889/terminals/term-123",
+            params=None,
+            json=None,
+        )
+
+    async def test_get_terminal_status_returns_failure_for_not_found(self) -> None:
+        """A 404 surfaces as a failure dict, not an exception."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(status_code=404, json_data={"detail": "Terminal not found"}),
+        ):
+            result = await get_terminal_status(terminal_id="missing")
+
+        assert result == {
+            "success": False,
+            "message": "Get terminal status for 'missing' failed: Terminal not found",
+        }
+
+    async def test_get_terminal_output_defaults_to_last_mode(self) -> None:
+        """Output defaults to the provider-extracted last response."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data={"output": "done: added foo()", "mode": "last"}),
+        ) as mock_request:
+            result = await get_terminal_output(terminal_id="term-123")
+
+        assert result == {"output": "done: added foo()", "mode": "last"}
+        mock_request.assert_called_once_with(
+            "get",
+            "http://127.0.0.1:9889/terminals/term-123/output",
+            params={"mode": "last"},
+            json=None,
+        )
+
+    async def test_get_terminal_output_passes_full_mode(self) -> None:
+        """mode='full' is forwarded as a query param (case-insensitive)."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data={"output": "buffer...", "mode": "full"}),
+        ) as mock_request:
+            result = await get_terminal_output(terminal_id="term-123", mode="FULL")
+
+        assert result["mode"] == "full"
+        assert mock_request.call_args.kwargs["params"] == {"mode": "full"}
+
+    async def test_get_terminal_output_rejects_invalid_mode_without_calling_api(self) -> None:
+        """An unsupported mode fails fast and never hits the API."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+        ) as mock_request:
+            result = await get_terminal_output(terminal_id="term-123", mode="tail")
+
+        assert result["success"] is False
+        assert "must be 'last' or 'full'" in result["message"]
+        mock_request.assert_not_called()
+
+    async def test_get_terminal_output_returns_failure_on_api_error(self) -> None:
+        """Transport errors surface as a failure dict."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            side_effect=requests.ConnectionError("api offline"),
+        ):
+            result = await get_terminal_output(terminal_id="term-123")
+
+        assert result == {
+            "success": False,
+            "message": "Get terminal output for 'term-123' failed: api offline",
         }
 
 
