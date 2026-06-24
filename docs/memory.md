@@ -2,7 +2,6 @@
 
 CAO's memory system gives agents persistent, cross-session storage. Agents store facts, decisions, and preferences during a session; CAO injects relevant memories back as context when the agent starts its next session.
 
-> For how it works under the hood — the three storage layers, the SQLite schema, and the read/write paths — see [`memory-internals.md`](memory-internals.md).
 
 ## Capabilities
 
