@@ -45,7 +45,7 @@ import re
 import shlex
 import shutil
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import SECURITY_PROMPT
@@ -413,6 +413,65 @@ class AntigravityCliProvider(BaseProvider):
             return TerminalStatus.COMPLETED if self._turns > 0 else TerminalStatus.IDLE
 
         if re.search(ERROR_PATTERN, clean, re.MULTILINE):
+            return TerminalStatus.ERROR
+
+        return TerminalStatus.UNKNOWN
+
+    # Opt in to pyte rendered-screen detection (gated by CAO_PYTE_STATUS).
+    # The raw-stream get_status() above is unreliable for agy: when the footer
+    # flips from "esc to cancel" (PROCESSING) back to "? for shortcuts" (IDLE),
+    # agy overwrites it in place with cursor moves. The append-only pipe-pane
+    # log keeps BOTH strings after strip_terminal_escapes(), so the stale
+    # "esc to cancel" pins the terminal to PROCESSING forever — the session
+    # never reaches IDLE and POST /sessions times out. A composited pyte
+    # viewport resolves the in-place redraw, leaving only the live footer.
+    supports_screen_detection = True
+
+    def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
+        """Detect agy status from a pyte-composited viewport (escape-free rows).
+
+        Same footer precedence as get_status, but anchored on the rendered
+        bottom region rather than the raw redraw stream. Because the viewport
+        has every in-place footer rewrite already resolved, exactly one of
+        ``esc to cancel`` / ``? for shortcuts`` is present — eliminating the
+        stale-footer false PROCESSING the raw-stream path suffers from.
+
+        The StatusMonitor only invokes this on settled / rising-edge frames, so
+        the footer reflects a real end state, not a half-drawn one.
+
+        Precedence:
+          1. Empty → UNKNOWN
+          2. WAITING_USER_ANSWER — interactive approval / picker prompt
+          3. PROCESSING — footer "esc to cancel" or a spinner line in the tail
+          4. IDLE / COMPLETED — footer "? for shortcuts" (IDLE pre-first-turn,
+             COMPLETED after)
+          5. ERROR — matched error pattern
+          6. UNKNOWN — nothing matched
+        """
+        rows = [ln.rstrip() for ln in screen_lines if ln.strip()]
+        if not rows:
+            return TerminalStatus.UNKNOWN
+
+        joined = "\n".join(rows)
+        # The footer lives on the last rendered row; the spinner sits just above
+        # it. A small bottom window keeps stale response text from matching.
+        bottom_rows = rows[-12:]
+        bottom = "\n".join(bottom_rows)
+
+        # Interactive prompt blocking on user input takes precedence over a
+        # plain processing state.
+        if re.search(WAITING_USER_ANSWER_PATTERN, bottom):
+            return TerminalStatus.WAITING_USER_ANSWER
+
+        if re.search(PROCESSING_FOOTER_PATTERN, bottom) or any(
+            re.search(PROCESSING_SPINNER_PATTERN, line) for line in bottom_rows
+        ):
+            return TerminalStatus.PROCESSING
+
+        if re.search(IDLE_FOOTER_PATTERN, bottom):
+            return TerminalStatus.COMPLETED if self._turns > 0 else TerminalStatus.IDLE
+
+        if re.search(ERROR_PATTERN, joined, re.MULTILINE):
             return TerminalStatus.ERROR
 
         return TerminalStatus.UNKNOWN

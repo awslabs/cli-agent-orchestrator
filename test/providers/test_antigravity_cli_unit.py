@@ -86,6 +86,79 @@ def test_status_error():
 
 
 # --------------------------------------------------------------------------- #
+# pyte rendered-screen status detection (get_status_from_screen)
+# --------------------------------------------------------------------------- #
+
+
+def test_provider_opts_into_screen_detection():
+    assert make_provider().supports_screen_detection is True
+
+
+def test_screen_status_idle_when_only_ready_footer():
+    # A composited viewport resolves in-place redraws: only the live footer
+    # remains. The bottom row carries "? for shortcuts" ⇒ IDLE pre-first-turn.
+    screen = [
+        "> ",
+        "─" * 80,
+        "? for shortcuts                                  Gemini 3.1 Pro (High)",
+    ]
+    assert make_provider().get_status_from_screen(screen) == TerminalStatus.IDLE
+
+
+def test_screen_status_completed_after_turn():
+    p = make_provider()
+    p.mark_input_received()
+    screen = ["> hi", "  done", "─" * 80, "? for shortcuts        Gemini 3.1 Pro (High)"]
+    assert p.get_status_from_screen(screen) == TerminalStatus.COMPLETED
+
+
+def test_screen_status_processing_footer():
+    screen = ["⣽  Working...", "esc to cancel        Gemini 3.1 Pro (High)"]
+    assert make_provider().get_status_from_screen(screen) == TerminalStatus.PROCESSING
+
+
+def test_screen_status_waiting_user_answer():
+    screen = ["Do you want to allow this action? [y/n]"]
+    assert make_provider().get_status_from_screen(screen) == TerminalStatus.WAITING_USER_ANSWER
+
+
+def test_screen_status_empty_is_unknown():
+    assert make_provider().get_status_from_screen([]) == TerminalStatus.UNKNOWN
+    assert make_provider().get_status_from_screen(["   ", ""]) == TerminalStatus.UNKNOWN
+
+
+def test_screen_resolves_stale_processing_footer_regression():
+    """Regression for the init-timeout bug: the append-only stream keeps both
+    footers when agy overwrites "esc to cancel" with "? for shortcuts", so the
+    raw get_status() latches PROCESSING. A composited pyte viewport (the screen
+    path) shows only the final ready footer ⇒ IDLE, so the session reaches
+    ready and POST /sessions returns instead of timing out.
+    """
+    p = make_provider()
+    # Raw append-only stream: stale "esc to cancel" survives below the response,
+    # with the live ready footer rendered last — raw path wrongly says PROCESSING.
+    raw = (
+        "> analyze this\n  here is the analysis\n"
+        + "esc to cancel   Gemini 3.1 Pro (High)\n"
+        + ("\n" * 3)
+        + "? for shortcuts   Gemini 3.1 Pro (High)\n"
+    )
+    assert p.get_status(raw) == TerminalStatus.PROCESSING
+
+    # Composited viewport: the in-place rewrite is resolved, leaving only the
+    # ready footer ⇒ IDLE.
+    screen = [
+        "> analyze this",
+        "  here is the analysis",
+        "─" * 80,
+        "> ",
+        "─" * 80,
+        "? for shortcuts   Gemini 3.1 Pro (High)",
+    ]
+    assert p.get_status_from_screen(screen) == TerminalStatus.IDLE
+
+
+# --------------------------------------------------------------------------- #
 # Response extraction
 # --------------------------------------------------------------------------- #
 
