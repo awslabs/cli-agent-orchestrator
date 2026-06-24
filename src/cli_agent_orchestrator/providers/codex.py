@@ -5,7 +5,7 @@ import logging
 import re
 import shlex
 import time
-from typing import Optional
+from typing import Any, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -117,6 +117,57 @@ def _compute_tui_footer_cutoff(all_lines: list) -> int:
             break
 
     return len("\n".join(all_lines[:footer_start_idx]))
+
+
+def _toml_scalar(value: Any) -> str:
+    """Serialize a Python scalar to a TOML literal for a ``-c key=<value>`` override.
+
+    Strings become quoted TOML basic strings (backslash, quote, tab, CR, and newline escaped so
+    tmux ``send_keys`` keeps the launch command on one line); bools become
+    ``true``/``false``; ints and floats are emitted bare. Non-scalar values (dict/list/None) raise ``TypeError`` so a misconfigured profile fails fast. ``bool`` is checked
+    before ``int`` because ``bool`` is a subclass of ``int`` in Python, so the
+    order here is load-bearing — a flipped order would render ``True`` as ``1``.
+    """
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if not isinstance(value, str):
+        raise TypeError(
+            "codexConfig values must be scalars (str, bool, int, or float); "
+            f"got {type(value).__name__}"
+        )
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\t", "\\t")
+        .replace("\r", "\\r")
+        .replace("\n", "\\n")
+    )
+    return f'"{escaped}"'
+
+
+_CODEX_CONFIG_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _toml_override(key: str, value: Any) -> str:
+    """Build one ``key=<toml-scalar>`` Codex ``-c`` override, validating the key.
+
+    Keys must be non-empty dotted config paths over ``[A-Za-z0-9_.-]`` (e.g.
+    ``features.fast_mode``); spaces, ``=``, quotes, or control characters are
+    rejected so a misconfigured profile fails fast instead of silently emitting
+    a malformed ``-c`` override. Value-serialization failures from
+    :func:`_toml_scalar` are re-raised with the offending key for context.
+    """
+    if not isinstance(key, str) or not _CODEX_CONFIG_KEY_PATTERN.match(key):
+        raise ValueError(
+            f"Invalid codexConfig key {key!r}: must be a dotted config path over "
+            "[A-Za-z0-9_.-] (e.g. 'features.fast_mode')"
+        )
+    try:
+        return f"{key}={_toml_scalar(value)}"
+    except TypeError as exc:
+        raise TypeError(f"codexConfig key '{key}': {exc}") from exc
 
 
 def _find_assistant_marker(text: str) -> Optional[re.Match[str]]:
@@ -254,6 +305,17 @@ class CodexProvider(BaseProvider):
                     # is silently rejected and falls back to the 60s default.
                     if "tool_timeout_sec" not in cfg:
                         command_parts.extend(["-c", f"{prefix}.tool_timeout_sec=600.0"])
+
+            # Inline Codex config overrides (-c key=value). Lets a profile set
+            # per-agent Codex knobs — reasoning effort, service tier, fast mode,
+            # etc. — without editing the global ~/.codex/config.toml or
+            # maintaining named profile files. Keys may be dotted config paths
+            # (e.g. "features.fast_mode"); values are serialized to TOML
+            # scalars. Emitted last so they take precedence over CAO's own
+            # overrides and the profile/config defaults on key conflicts.
+            if profile.codexConfig:
+                for key, value in profile.codexConfig.items():
+                    command_parts.extend(["-c", _toml_override(key, value)])
 
         return shlex.join(command_parts)
 

@@ -12,8 +12,10 @@ from cli_agent_orchestrator.services.settings_service import (
     _save,
     get_agent_dirs,
     get_extra_agent_dirs,
+    get_extra_skill_dirs,
     set_agent_dirs,
     set_extra_agent_dirs,
+    set_extra_skill_dirs,
 )
 
 
@@ -201,3 +203,75 @@ class TestSetExtraAgentDirs:
         set_extra_agent_dirs(["/something"])
         set_extra_agent_dirs([])
         assert get_extra_agent_dirs() == []
+
+
+class TestGetExtraSkillDirs:
+    """Tests for get_extra_skill_dirs function."""
+
+    def test_returns_empty_list_when_none_set(self, settings_file):
+        """get_extra_skill_dirs returns [] when no extra dirs configured."""
+        result = get_extra_skill_dirs()
+        assert result == []
+
+    def test_returns_saved_extra_dirs(self, settings_file):
+        """get_extra_skill_dirs returns the saved list."""
+        settings_file.write_text(json.dumps({"extra_skill_dirs": ["/a", "/b"]}))
+        result = get_extra_skill_dirs()
+        assert result == ["/a", "/b"]
+
+    def test_filters_non_string_and_empty_entries(self, settings_file):
+        """Malformed persisted entries (null/numbers/blank) are dropped, not returned.
+
+        Otherwise Path(extra) in _skill_search_dirs() would raise TypeError and
+        break skill listing/loading.
+        """
+        settings_file.write_text(
+            json.dumps({"extra_skill_dirs": ["/valid", None, 123, "", "  ", "/also-valid"]})
+        )
+        assert get_extra_skill_dirs() == ["/valid", "/also-valid"]
+
+
+class TestSetExtraSkillDirs:
+    """Tests for set_extra_skill_dirs function."""
+
+    def test_saves_and_returns_dirs(self, settings_file):
+        """set_extra_skill_dirs saves dirs and returns them."""
+        result = set_extra_skill_dirs(["/dir1", "/dir2"])
+        assert result == ["/dir1", "/dir2"]
+
+    def test_strips_empty_strings(self, settings_file):
+        """set_extra_skill_dirs removes empty or whitespace-only strings."""
+        result = set_extra_skill_dirs(["/valid", "", "  ", "/also-valid"])
+        assert result == ["/valid", "/also-valid"]
+
+    def test_ignores_non_string_entries(self, settings_file):
+        """Non-string entries are dropped rather than crashing on .strip()."""
+        result = set_extra_skill_dirs(["/valid", None, 123, "/also-valid"])
+        assert result == ["/valid", "/also-valid"]
+
+    def test_persists_to_disk(self, settings_file):
+        """set_extra_skill_dirs persists to disk so get_extra_skill_dirs reads it."""
+        set_extra_skill_dirs(["/persisted"])
+        assert get_extra_skill_dirs() == ["/persisted"]
+
+    def test_replaces_previous_list(self, settings_file):
+        """set_extra_skill_dirs replaces the entire previous list."""
+        set_extra_skill_dirs(["/first"])
+        set_extra_skill_dirs(["/second"])
+        assert get_extra_skill_dirs() == ["/second"]
+
+    def test_empty_list_clears_previous(self, settings_file):
+        """Setting an empty list clears all extra dirs."""
+        set_extra_skill_dirs(["/something"])
+        set_extra_skill_dirs([])
+        assert get_extra_skill_dirs() == []
+
+
+class TestExtraAgentAndSkillDirsAreIndependent:
+    """The agent and skill extra-dir lists are stored under separate keys."""
+
+    def test_independent_keys(self, settings_file):
+        set_extra_agent_dirs(["/agents"])
+        set_extra_skill_dirs(["/skills"])
+        assert get_extra_agent_dirs() == ["/agents"]
+        assert get_extra_skill_dirs() == ["/skills"]

@@ -7,7 +7,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
-from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
+from cli_agent_orchestrator.utils.agent_profiles import (
+    load_agent_profile,
+    parse_agent_profile_text,
+    resolve_provider,
+)
 
 
 class TestLoadAgentProfile:
@@ -622,3 +626,43 @@ class TestLoadAgentProfileEnvResolution:
         assert profile.system_prompt == "Body token: builtin-secret"
         assert profile.mcpServers is not None
         assert profile.mcpServers["service"]["env"]["API_TOKEN"] == "builtin-secret"
+
+
+class TestCodexConfigParsing:
+    """codexConfig frontmatter parses into the AgentProfile field."""
+
+    def test_codex_config_parses_dotted_keys_and_mixed_value_types(self):
+        text = (
+            "---\n"
+            "name: codex-agent\n"
+            "description: Codex agent with inline config\n"
+            "provider: codex\n"
+            "codexConfig:\n"
+            '  model_reasoning_effort: "xhigh"\n'
+            '  service_tier: "fast"\n'
+            "  features.fast_mode: true\n"
+            "---\n"
+            "System prompt content"
+        )
+
+        profile = parse_agent_profile_text(text, "codex-agent")
+
+        assert profile.codexConfig == {
+            "model_reasoning_effort": "xhigh",
+            "service_tier": "fast",
+            "features.fast_mode": True,
+        }
+
+    def test_codex_config_defaults_to_none_when_absent(self):
+        text = (
+            "---\n"
+            "name: codex-agent\n"
+            "description: Codex agent without inline config\n"
+            "provider: codex\n"
+            "---\n"
+            "System prompt content"
+        )
+
+        profile = parse_agent_profile_text(text, "codex-agent")
+
+        assert profile.codexConfig is None

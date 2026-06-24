@@ -585,3 +585,57 @@ class TestOpenCodeCliAssign:
         - handoff (blocking): inbox delivery triggers supervisor state transition
         """
         _run_assign_with_callback_test(provider="opencode_cli")
+
+
+# ---------------------------------------------------------------------------
+# Cursor CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestCursorCliAssign:
+    """E2E assign tests for the Cursor CLI provider using examples/assign/ profiles.
+
+    Requires:
+    - ``agent`` (or legacy ``cursor-agent``) binary on PATH (skip otherwise
+      via ``require_cursor`` fixture).
+    - Running CAO server.
+    - Agent profiles installed for cursor_cli::
+
+        cao install examples/assign/data_analyst.md --provider cursor_cli
+        cao install examples/assign/report_generator.md --provider cursor_cli
+        cao install developer --provider cursor_cli  # for callback test
+
+    Run::
+
+        uv run pytest -m e2e test/e2e/test_assign.py -k cursor -v
+    """
+
+    def test_assign_data_analyst(self, require_cursor):
+        """Cursor CLI data_analyst receives dataset, performs statistical analysis."""
+        _run_assign_test(
+            provider="cursor_cli",
+            agent_profile="data_analyst",
+            task_message=DATA_ANALYST_TASK,
+            content_keywords=DATA_ANALYST_KEYWORDS,
+        )
+
+    def test_assign_report_generator(self, require_cursor):
+        """Cursor CLI report_generator creates a report template."""
+        _run_assign_test(
+            provider="cursor_cli",
+            agent_profile="report_generator",
+            task_message=REPORT_GENERATOR_TASK,
+            content_keywords=REPORT_GENERATOR_KEYWORDS,
+        )
+
+    def test_assign_with_callback(self, require_cursor):
+        """Cursor CLI full round-trip: worker completes → sends result → supervisor receives.
+
+        Validates all four orchestration modes in a single flow:
+        - assign (non-blocking): supervisor terminal created and stays IDLE
+        - send_message (inbox delivery): worker pushes result to supervisor inbox
+        - status transitions: IDLE → PROCESSING → COMPLETED across concurrent terminals
+        - handoff (blocking): inbox delivery triggers supervisor state transition
+        """
+        _run_assign_with_callback_test(provider="cursor_cli")

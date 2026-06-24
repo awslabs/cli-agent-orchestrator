@@ -34,7 +34,7 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -616,6 +616,78 @@ class KimiCliProvider(BaseProvider):
 
         # No prompt visible and no error: Kimi is actively processing/streaming
         return TerminalStatus.PROCESSING
+
+    # Opt in to pyte rendered-screen detection (gated by CAO_PYTE_STATUS).
+    supports_screen_detection = True
+
+    def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
+        """Detect status from a pyte-composited viewport (escape-free rows).
+
+        The composited screen removes the need for the raw-stream hacks the
+        buffer path carries (the get_history re-capture and the dispatch-grace
+        window): a spinner visible in the rendered pane tail is unambiguously
+        live, and the response bullets are present without eviction. Called by
+        the StatusMonitor only on settled / rising-edge frames.
+        """
+        rows = [ln.rstrip() for ln in screen_lines if ln.strip()]
+        if not rows:
+            return TerminalStatus.UNKNOWN
+        joined = "\n".join(rows)
+        tail = rows[-18:]
+
+        # Boot gate: Kimi draws its status bar BEFORE it can accept input —
+        # while MCP servers are still connecting it shows "connecting to mcp
+        # servers" / "cao-mcp-server (connecting)". Reporting IDLE here is
+        # premature: a message delivered in this window is pasted into the boot
+        # screen and silently absorbed (observed live — an inbox message
+        # delivered 1.3s after a premature IDLE left the receiver stuck). Treat
+        # the connecting state as PROCESSING so init waits for a real ready
+        # prompt.
+        #
+        # Scan only NON-bullet lines. This boot chrome renders in the status-bar
+        # / spinner region (braille-prefixed status lines, the "connecting to mcp
+        # servers" progress line), never as a "•" response bullet. Searching the
+        # whole composited screen would re-strand a genuinely COMPLETED turn as
+        # PROCESSING whenever its response text merely MENTIONS "(connecting)" /
+        # "connecting to mcp servers" — plausible in an MCP orchestrator — and
+        # since the boot gate precedes the ready check and re-fires on every
+        # settled frame, the inbox (delivers only on IDLE/COMPLETED) would then
+        # never deliver to that terminal.
+        if any(
+            re.search(r"connecting to mcp servers|\(connecting\)", ln, re.IGNORECASE)
+            for ln in rows
+            if not re.match(r"\s*•", ln)
+        ):
+            return TerminalStatus.PROCESSING
+
+        # Newest "Kimi Code" TUI: readiness is the status bar / context footer.
+        if re.search(NEW_TUI_STATUS_PATTERN, joined):
+            if any(_is_live_turn_spinner_line(ln) for ln in tail):
+                return TerminalStatus.PROCESSING
+            if re.search(ERROR_PATTERN, joined, re.MULTILINE):
+                return TerminalStatus.ERROR
+            return (
+                TerminalStatus.COMPLETED
+                if re.search(ANY_BULLET_PATTERN, joined)
+                else TerminalStatus.IDLE
+            )
+
+        # Legacy emoji-prompt TUI: bare ✨/💫 prompt visible at the bottom.
+        if any(re.search(IDLE_PROMPT_PATTERN, ln) for ln in tail):
+            return (
+                TerminalStatus.COMPLETED
+                if re.search(ANY_BULLET_PATTERN, joined)
+                else TerminalStatus.IDLE
+            )
+
+        if re.search(ERROR_PATTERN, joined, re.MULTILINE):
+            return TerminalStatus.ERROR
+        # No Kimi TUI chrome on the composited screen at all (boot screen, or a
+        # torn-down pane back at the shell). On the RAW path "no prompt = still
+        # streaming" is a safe default, but on a fully rendered screen the
+        # absence of all TUI chrome means we are NOT looking at an active Kimi
+        # turn — so report UNKNOWN rather than a false PROCESSING.
+        return TerminalStatus.UNKNOWN
 
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract Kimi's final response from terminal output.

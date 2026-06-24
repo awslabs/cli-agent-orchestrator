@@ -135,6 +135,34 @@ class BaseProvider(ABC):
         """
         pass
 
+    # Opt-in flag for pyte-rendered status detection. A provider sets this True
+    # ONLY when it ships a purpose-built get_status_from_screen() calibrated for
+    # a composited fixed-height viewport (not the raw byte stream). When False,
+    # the StatusMonitor never routes this provider through the screen path even
+    # if CAO_PYTE_STATUS is on — protecting providers (and kiro_cli, which
+    # depends on raw \r) whose detectors are tuned for the raw stream.
+    supports_screen_detection: bool = False
+
+    def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
+        """Detect status from a pyte-rendered screen (composited viewport).
+
+        ``screen_lines`` is ``pyte.Screen.display``: a fixed-height list of
+        viewport rows with all cursor moves and in-place redraws already
+        resolved, escape-free, right-padded with spaces. The StatusMonitor
+        calls this (instead of get_status) when CAO_PYTE_STATUS is enabled AND
+        ``supports_screen_detection`` is True. It is invoked on two edges only —
+        the RISING edge (output resumes after a quiet period) and at QUIESCENCE
+        (no new output for the debounce window) — never mid-burst, so a frame is
+        either freshly-resumed or fully settled, not half-drawn. Detectors must
+        not assume every frame is fully settled.
+
+        Default implementation joins the rows into a newline-delimited string
+        and delegates to get_status — a safe no-op fallback for providers that
+        have not been migrated. Override with a viewport-anchored detector
+        (see ClaudeCodeProvider) and set ``supports_screen_detection = True``.
+        """
+        return self.get_status("\n".join(screen_lines))
+
     @property
     def paste_submit_delay(self) -> float:
         """Seconds to wait after a bracketed paste before sending the Enter key.

@@ -166,3 +166,68 @@ class TestSetAgentDirsEndpoint:
         data = response.json()
         assert data["agent_dirs"] == {}
         assert data["extra_dirs"] == []
+
+
+class TestGetSkillDirsEndpoint:
+    """Tests for GET /settings/skill-dirs endpoint."""
+
+    def test_returns_skills_dir_and_extra_dirs(self, client):
+        """GET /settings/skill-dirs returns the global store path and extra_dirs."""
+        with patch(
+            "cli_agent_orchestrator.services.settings_service.get_extra_skill_dirs",
+            return_value=["/extra/skills1", "/extra/skills2"],
+        ):
+            response = client.get("/settings/skill-dirs")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert "skills_dir" in data
+        assert data["extra_dirs"] == ["/extra/skills1", "/extra/skills2"]
+
+    def test_returns_empty_extra_dirs_when_none(self, client):
+        """GET /settings/skill-dirs returns empty extra_dirs when none configured."""
+        with patch(
+            "cli_agent_orchestrator.services.settings_service.get_extra_skill_dirs",
+            return_value=[],
+        ):
+            response = client.get("/settings/skill-dirs")
+
+        assert response.status_code == 200
+        assert response.json()["extra_dirs"] == []
+
+
+class TestSetSkillDirsEndpoint:
+    """Tests for POST /settings/skill-dirs endpoint."""
+
+    def test_updates_extra_dirs(self, client):
+        """POST /settings/skill-dirs updates extra_dirs and returns them."""
+        with (
+            patch(
+                "cli_agent_orchestrator.services.settings_service.set_extra_skill_dirs",
+                return_value=["/new/skills"],
+            ),
+            patch(
+                "cli_agent_orchestrator.services.settings_service.get_extra_skill_dirs",
+                return_value=["/new/skills"],
+            ),
+        ):
+            response = client.post(
+                "/settings/skill-dirs",
+                json={"extra_dirs": ["/new/skills"]},
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert "skills_dir" in data
+        assert data["extra_dirs"] == ["/new/skills"]
+
+    def test_empty_body_returns_existing(self, client):
+        """POST /settings/skill-dirs with empty body returns existing extra dirs."""
+        with patch(
+            "cli_agent_orchestrator.services.settings_service.get_extra_skill_dirs",
+            return_value=[],
+        ):
+            response = client.post("/settings/skill-dirs", json={})
+
+        assert response.status_code == 200
+        assert response.json()["extra_dirs"] == []

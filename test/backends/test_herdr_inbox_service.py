@@ -744,6 +744,115 @@ class TestHerdrInboxServiceLifecycleEvents:
         mock_delete.assert_not_called()
         mock_meta.assert_not_called()
 
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    def test_pane_closed_skips_delete_when_label_still_live(self, mock_meta, mock_delete, mock_run):
+        """Replayed close for a reused compact pane_id must NOT delete a live terminal.
+
+        herdr (0.6.8) replays ALL historical pane_closed events on every fresh
+        events.subscribe and reuses compact pane_ids when a tab is killed and a
+        new tab takes the same index. So a replayed close for an OLD incarnation
+        of pane-3 arrives mapped to the NEW terminal now occupying pane-3.
+
+        The tab label (tmux_window) is unique per incarnation, so when the label
+        is still live in herdr the close is stale and must be ignored.
+        """
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        # New incarnation: terminal "9d00610c" occupies reused pane-3 with a
+        # fresh unique label.
+        service.register_terminal("9d00610c", "pane-3", is_kiro=False)
+        mock_meta.return_value = {
+            "tmux_session": "cao-investigation",
+            "tmux_window": "sherlock-e8dc",
+        }
+
+        # herdr tab list shows the label is still live (new incarnation alive).
+        tab_list_response = json.dumps(
+            {"result": {"tabs": [{"label": "sherlock-e8dc", "workspace_id": "ws-1"}]}}
+        )
+
+        def subprocess_side_effect(cmd, **_):
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = tab_list_response
+            return m
+
+        mock_run.side_effect = subprocess_side_effect
+
+        service._handle_lifecycle_event("pane.closed", {"pane_id": "pane-3"})
+
+        # The live terminal must survive: no delete, maps intact.
+        mock_delete.assert_not_called()
+        assert service._pane_to_terminal.get("pane-3") == "9d00610c"
+        assert service._terminal_to_pane.get("9d00610c") == "pane-3"
+
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    def test_pane_closed_deletes_when_label_gone(self, mock_meta, mock_delete, mock_run):
+        """Genuine close (label absent from herdr) still deletes the terminal.
+
+        This is the user-initiated-close path: no kill_window ran, so the
+        pane_closed event is the only signal. The tab label is genuinely gone
+        from herdr, so the terminal must be cleaned up.
+        """
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal("9d00610c", "pane-3", is_kiro=False)
+        mock_meta.return_value = {
+            "tmux_session": "cao-investigation",
+            "tmux_window": "sherlock-e8dc",
+        }
+
+        # herdr tab list does NOT contain the label — genuinely closed.
+        tab_list_response = json.dumps(
+            {"result": {"tabs": [{"label": "other-tab", "workspace_id": "ws-1"}]}}
+        )
+
+        def subprocess_side_effect(cmd, **_):
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = tab_list_response
+            return m
+
+        mock_run.side_effect = subprocess_side_effect
+
+        service._handle_lifecycle_event("pane.closed", {"pane_id": "pane-3"})
+
+        mock_delete.assert_called_once_with("9d00610c")
+        assert "pane-3" not in service._pane_to_terminal
+        assert "9d00610c" not in service._terminal_to_pane
+
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    def test_pane_closed_deletes_when_herdr_query_fails(self, mock_meta, mock_delete, mock_run):
+        """If herdr cannot be queried, fall back to deleting (fail toward cleanup).
+
+        We must never leave a terminal we believe is open when it may be closed,
+        so an unreachable herdr makes the liveness check fail toward delete.
+        """
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal("9d00610c", "pane-3", is_kiro=False)
+        mock_meta.return_value = {
+            "tmux_session": "cao-investigation",
+            "tmux_window": "sherlock-e8dc",
+        }
+
+        def subprocess_side_effect(cmd, **_):
+            m = MagicMock()
+            m.returncode = 1  # herdr query failed
+            m.stdout = ""
+            m.stderr = "boom"
+            return m
+
+        mock_run.side_effect = subprocess_side_effect
+
+        service._handle_lifecycle_event("pane.closed", {"pane_id": "pane-3"})
+
+        mock_delete.assert_called_once_with("9d00610c")
+        assert "pane-3" not in service._pane_to_terminal
+
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
     @patch("cli_agent_orchestrator.clients.database.delete_terminals_by_session")
     def test_workspace_closed_removes_all_terminals_for_session(
@@ -927,6 +1036,227 @@ class TestHerdrInboxServiceLifecycleEvents:
         _run_async(run())
 
         callback.assert_called_once_with("tid-a")
+
+
+class TestHerdrInboxServiceReconcileLiveTerminal:
+    """Reconcile MUST NOT delete a terminal whose tab label is still live.
+
+    herdr renumbers compact pane_ids when a sibling tab closes, so a live
+    terminal's stored pane_id can fall out of `herdr pane list`. The stale-pane
+    diff then treats it as dead. Identity must come from the durable tab label
+    (tmux_window), not the ephemeral pane_id: a live label means the pane was
+    renumbered (re-map it), an absent label means it was genuinely closed
+    (delete it).
+    """
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    def test_reconcile_remaps_renumbered_but_live_pane(
+        self, mock_meta, mock_delete, mock_run, mock_get_backend
+    ):
+        """Stored pane_id missing from live list but tab label live -> re-map, never delete."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal("tid1", "pane-old")
+        mock_meta.return_value = {"tmux_session": "sess", "tmux_window": "win-1"}
+
+        # Live pane list no longer contains pane-old (renumbered to pane-new).
+        pane_list_response = json.dumps({"result": {"panes": [{"pane_id": "pane-new"}]}})
+        # Empty workspace list bypasses the DB cross-check; isolates stale-pane logic.
+        ws_list_response = json.dumps({"result": {"workspaces": []}})
+        # _label_still_live() sees win-1 as a live tab -> pane was renumbered, not closed.
+        tab_list_response = json.dumps(
+            {"result": {"tabs": [{"label": "win-1", "workspace_id": "ws-1"}]}}
+        )
+
+        def subprocess_side_effect(cmd, **_):
+            m = MagicMock()
+            m.returncode = 0
+            if "pane" in cmd and "list" in cmd:
+                m.stdout = pane_list_response
+            elif "tab" in cmd and "list" in cmd:
+                m.stdout = tab_list_response
+            else:
+                m.stdout = ws_list_response
+            return m
+
+        mock_run.side_effect = subprocess_side_effect
+
+        mock_backend = MagicMock()
+        mock_backend.get_pane_id.return_value = "pane-new"
+        mock_get_backend.return_value = mock_backend
+
+        _run_async(service._reconcile())
+
+        # Live terminal survives: NOT deleted.
+        mock_delete.assert_not_called()
+        # Re-mapped to the current pane_id.
+        assert service._pane_to_terminal.get("pane-new") == "tid1"
+        assert service._terminal_to_pane.get("tid1") == "pane-new"
+        # Old (renumbered-away) pane_id is gone from the map.
+        assert "pane-old" not in service._pane_to_terminal
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    def test_reconcile_deletes_when_tab_label_gone(
+        self, mock_meta, mock_delete, mock_run, mock_get_backend
+    ):
+        """Stored pane_id missing AND tab label absent from herdr -> prune maps + delete."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal("tid1", "pane-old")
+        service._working_since["tid1"] = time.time()
+        mock_meta.return_value = {"tmux_session": "sess", "tmux_window": "win-gone"}
+
+        pane_list_response = json.dumps({"result": {"panes": [{"pane_id": "pane-other"}]}})
+        ws_list_response = json.dumps({"result": {"workspaces": []}})
+        # win-gone is NOT among live tab labels -> genuinely closed.
+        tab_list_response = json.dumps(
+            {"result": {"tabs": [{"label": "some-other-window", "workspace_id": "ws-1"}]}}
+        )
+
+        def subprocess_side_effect(cmd, **_):
+            m = MagicMock()
+            m.returncode = 0
+            if "pane" in cmd and "list" in cmd:
+                m.stdout = pane_list_response
+            elif "tab" in cmd and "list" in cmd:
+                m.stdout = tab_list_response
+            else:
+                m.stdout = ws_list_response
+            return m
+
+        mock_run.side_effect = subprocess_side_effect
+        mock_get_backend.return_value = MagicMock()
+
+        _run_async(service._reconcile())
+
+        # Genuinely-closed terminal is cleaned up.
+        mock_delete.assert_called_once_with("tid1")
+        assert "pane-old" not in service._pane_to_terminal
+        assert "tid1" not in service._terminal_to_pane
+        assert "tid1" not in service._working_since
+
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    def test_reconcile_does_not_kill_live_workspace_on_pane_diff(
+        self, mock_meta, mock_list, mock_delete, mock_run, mock_get_backend
+    ):
+        """A live workspace (label present) must NOT be killed merely because its
+        pane failed the pane_id set diff. The renumbered pane is re-mapped and the
+        workspace stays alive."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        service.register_terminal("tid1", "pane-old")
+        mock_meta.return_value = {"tmux_session": "sess", "tmux_window": "win-1"}
+
+        pane_list_response = json.dumps({"result": {"panes": [{"pane_id": "pane-new"}]}})
+        # Workspace "sess" is LIVE.
+        ws_list_response = json.dumps(
+            {"result": {"workspaces": [{"workspace_id": "ws-1", "label": "sess"}]}}
+        )
+        # Tab label win-1 is LIVE.
+        tab_list_response = json.dumps(
+            {"result": {"tabs": [{"label": "win-1", "workspace_id": "ws-1"}]}}
+        )
+
+        def subprocess_side_effect(cmd, **_):
+            m = MagicMock()
+            m.returncode = 0
+            if "pane" in cmd and "list" in cmd:
+                m.stdout = pane_list_response
+            elif "tab" in cmd and "list" in cmd:
+                m.stdout = tab_list_response
+            else:
+                m.stdout = ws_list_response
+            return m
+
+        mock_run.side_effect = subprocess_side_effect
+        # DB cross-check: terminal's window matches a live tab -> not a ghost.
+        mock_list.return_value = [{"id": "tid1", "tmux_window": "win-1"}]
+
+        mock_backend = MagicMock()
+        mock_backend.get_pane_id.return_value = "pane-new"
+        mock_get_backend.return_value = mock_backend
+
+        _run_async(service._reconcile())
+
+        # The live workspace must NOT be killed.
+        mock_backend.kill_session.assert_not_called()
+        # And the live terminal must NOT be deleted.
+        mock_delete.assert_not_called()
+        # Terminal re-mapped, still owned by the session.
+        assert service._terminal_to_pane.get("tid1") == "pane-new"
+
+
+class TestHerdrInboxServiceWorkspaceClosedLiveResolution:
+    """workspace.closed cleanup must not depend on _workspace_to_session having
+    been populated by a prior _reconcile(). It must resolve session identity from
+    live herdr state at event time so a real workspace close always cleans up.
+    """
+
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
+    @patch("cli_agent_orchestrator.clients.database.delete_terminals_by_session")
+    def test_workspace_closed_resolves_uncached_workspace_from_live_herdr(
+        self, mock_delete_by_session, mock_meta, mock_run
+    ):
+        """workspace_id NOT in the in-memory map is resolved via herdr workspace
+        list, then the session's terminals are deleted."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+        # Map is empty — the workspace closed before any reconcile cached it.
+        assert service._workspace_to_session == {}
+        service.register_terminal("tid1", "p-1")
+        mock_meta.side_effect = lambda tid: {"tmux_session": "sess-new"} if tid == "tid1" else None
+
+        # Live herdr resolves ws-new -> sess-new.
+        ws_list_response = json.dumps(
+            {"result": {"workspaces": [{"workspace_id": "ws-new", "label": "sess-new"}]}}
+        )
+
+        def subprocess_side_effect(cmd, **_):
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = ws_list_response
+            return m
+
+        mock_run.side_effect = subprocess_side_effect
+
+        service._handle_lifecycle_event("workspace.closed", {"workspace_id": "ws-new"})
+
+        # Resolved live -> session terminals deleted despite empty in-memory map.
+        mock_delete_by_session.assert_called_once_with("sess-new")
+        # Map pruned for the closed session's terminal.
+        assert "p-1" not in service._pane_to_terminal
+        assert "tid1" not in service._terminal_to_pane
+
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    @patch("cli_agent_orchestrator.clients.database.delete_terminals_by_session")
+    def test_workspace_closed_unresolvable_is_safe_noop(self, mock_delete_by_session, mock_run):
+        """workspace_id absent from both the map and live herdr state -> no deletions."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+
+        # Live herdr does not know this workspace either.
+        ws_list_response = json.dumps(
+            {"result": {"workspaces": [{"workspace_id": "ws-other", "label": "sess-other"}]}}
+        )
+
+        def subprocess_side_effect(cmd, **_):
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = ws_list_response
+            return m
+
+        mock_run.side_effect = subprocess_side_effect
+
+        service._handle_lifecycle_event("workspace.closed", {"workspace_id": "ws-ghost"})
+
+        # Nothing destructive happens.
+        mock_delete_by_session.assert_not_called()
 
 
 class TestHerdrInboxServiceSocketPath:

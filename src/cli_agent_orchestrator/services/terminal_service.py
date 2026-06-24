@@ -120,6 +120,13 @@ RUNTIME_SKILL_PROMPT_PROVIDERS = {
     ProviderType.KIMI_CLI.value,
 }
 
+# Providers whose tool restrictions are prompt-level text only (no native
+# blocking mechanism) — a restricted policy on these is advisory, not enforced.
+SOFT_ENFORCEMENT_PROVIDERS = {
+    ProviderType.KIMI_CLI.value,
+    ProviderType.CODEX.value,
+}
+
 
 async def create_terminal(
     provider: str,
@@ -232,6 +239,20 @@ async def create_terminal(
             mcp_server_names = list(profile.mcpServers.keys()) if profile.mcpServers else None
             allowed_tools = resolve_allowed_tools(
                 profile.allowedTools, profile.role, mcp_server_names
+            )
+
+        # Soft-enforcement guard: kimi_cli/codex have NO native tool-blocking
+        # mechanism (kimi runs --yolo; restrictions are prompt-level text
+        # only), so a restricted policy on them is advisory, not enforced.
+        # Surface that loudly at launch so operators route restricted or
+        # write-capable roles to hard-enforcement providers instead.
+        if provider in SOFT_ENFORCEMENT_PROVIDERS and allowed_tools and "*" not in allowed_tools:
+            logger.warning(
+                f"Terminal {terminal_id}: provider '{provider}' cannot enforce tool "
+                f"restrictions (soft/prompt-level only) but profile '{agent_profile}' "
+                f"requests {allowed_tools}. Treat this worker as unrestricted; for "
+                f"enforced restrictions use claude_code, kiro_cli, gemini_cli, or "
+                f"copilot_cli."
             )
 
         # Step 3c: Persist terminal metadata to database after restrictions
@@ -546,6 +567,32 @@ def send_special_key(terminal_id: str, key: str) -> bool:
         raise
 
 
+def exit_terminal_cli(terminal_id: str) -> None:
+    """Send the provider-specific exit command to gracefully shut down the CLI.
+
+    Mirrors the ``POST /terminals/{id}/exit`` endpoint: resolve the provider,
+    send ``provider.exit_cli()`` — as a tmux key sequence when it is one (e.g.
+    ``C-d``), else as literal input (e.g. ``/exit``). This is the graceful CLI
+    shutdown that should precede ``delete_terminal`` (which goes straight to
+    ``kill_window``). Both the endpoint and ``run_agent_step`` call this so the
+    exit-then-delete lifecycle is implemented once.
+
+    Raises:
+        ValueError: if no provider is registered for ``terminal_id``.
+    """
+    provider = provider_manager.get_provider(terminal_id)
+    if provider is None:
+        raise ValueError(f"Provider not found for terminal {terminal_id}")
+    exit_command = provider.exit_cli()
+    # Some providers use tmux key sequences (e.g., "C-d" for Ctrl+D) instead of
+    # text commands (e.g., "/exit"). Key sequences must be sent via
+    # send_special_key() to be interpreted by tmux, not as literal text.
+    if exit_command.startswith(("C-", "M-")):
+        send_special_key(terminal_id, exit_command)
+    else:
+        send_input(terminal_id, exit_command)
+
+
 def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
     """Get terminal output.
 
@@ -672,14 +719,37 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
             except ValueError:
                 pass
 
-            # Full scrollback also failed — return partial.
-            logger.warning(
-                "get_output: %s response marker not found in full_history, returning partial",
-                terminal_id,
-            )
-            return (
-                f"[PARTIAL RESPONSE - response marker not found in full scrollback]\n{full_output}"
-            )
+            # Full scrollback also failed — distinguish overflow from no response.
+            # If the buffer is close to full (>=90% of last escalation cap), the
+            # response marker was likely produced but pushed past the scrollback
+            # limit (overflow).  If the buffer is mostly empty, the agent never
+            # produced a text response (e.g. only tool calls, crash, or timeout).
+            actual_lines = full_output.count("\n") + 1
+            overflow_threshold = int(_ESCALATION_STEPS[-1] * 0.9)
+            if actual_lines >= overflow_threshold:
+                logger.warning(
+                    "get_output: %s response marker not found, buffer near-full "
+                    "(%d lines >= %d threshold) — likely overflow",
+                    terminal_id,
+                    actual_lines,
+                    overflow_threshold,
+                )
+                return (
+                    f"[PARTIAL RESPONSE - response marker not found, buffer overflow likely "
+                    f"({actual_lines} lines retrieved)]\n{full_output}"
+                )
+            else:
+                logger.warning(
+                    "get_output: %s response marker not found, buffer sparse "
+                    "(%d lines < %d threshold) — agent likely produced no text response",
+                    terminal_id,
+                    actual_lines,
+                    overflow_threshold,
+                )
+                return (
+                    f"[NO RESPONSE - agent completed without producing a text response "
+                    f"({actual_lines} lines in buffer)]\n{full_output}"
+                )
 
     except Exception as e:
         logger.error(f"Failed to get output from terminal {terminal_id}: {e}")

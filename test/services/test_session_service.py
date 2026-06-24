@@ -118,6 +118,32 @@ class TestGetSession:
         assert len(result["terminals"]) == 1
         mock_get_backend.return_value.session_exists.assert_called_once_with("cao-test")
 
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor.get_status")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_get_session_enriches_terminals_with_live_status(
+        self, mock_get_backend, mock_list_terminals, mock_get_status
+    ):
+        """Each terminal should carry its live status (consumed by the web UI
+        and the cao-ops-mcp get_session_info tool an external supervisor polls)."""
+        from cli_agent_orchestrator.models.terminal import TerminalStatus
+
+        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.list_sessions.return_value = [{"id": "cao-test"}]
+        mock_list_terminals.return_value = [
+            {"id": "term-a", "tmux_session": "cao-test"},
+            {"id": "term-b", "tmux_session": "cao-test"},
+        ]
+        mock_get_status.side_effect = lambda tid: {
+            "term-a": TerminalStatus.PROCESSING,
+            "term-b": TerminalStatus.COMPLETED,
+        }[tid]
+
+        result = get_session("cao-test")
+
+        assert result["terminals"][0]["status"] == "processing"
+        assert result["terminals"][1]["status"] == "completed"
+
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_get_session_not_found(self, mock_get_backend):
         """Test getting non-existent session."""

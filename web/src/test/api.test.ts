@@ -85,6 +85,24 @@ describe('API wrapper', () => {
     )
   })
 
+  it('createSession includes session name (url-encoded) when provided', async () => {
+    mockResponse({ id: 't1' })
+    await api.createSession('kiro_cli', 'developer', 'my session/1')
+    expect(mockFetch).toHaveBeenCalledWith(
+      expect.stringContaining('session_name=my%20session%2F1'),
+      expect.any(Object)
+    )
+  })
+
+  it('createSession url-encodes provider and agent_profile', async () => {
+    mockResponse({ id: 't1' })
+    await api.createSession('kiro_cli', 'my agent/v2')
+    expect(mockFetch).toHaveBeenCalledWith(
+      expect.stringContaining('agent_profile=my%20agent%2Fv2'),
+      expect.any(Object)
+    )
+  })
+
   it('deleteSession sends DELETE', async () => {
     mockResponse({ success: true, deleted: [], errors: [] })
     await api.deleteSession('s1')

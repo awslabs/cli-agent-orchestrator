@@ -25,6 +25,29 @@ def _write_skill(folder: Path, name: str, description: str, body: str = "# Title
     return skill_file
 
 
+@pytest.fixture(autouse=True)
+def _default_no_extra_skill_dirs(monkeypatch):
+    """Default ``extra_skill_dirs`` to empty for every test.
+
+    Existing tests patch only ``SKILLS_DIR``; without this they would read the
+    developer's real ``settings.json``. Tests that exercise extra dirs override
+    this via ``_use_skill_dirs``.
+    """
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.settings_service.get_extra_skill_dirs",
+        lambda: [],
+    )
+
+
+def _use_skill_dirs(monkeypatch, global_dir, extra_dirs):
+    """Point skill resolution at a global store plus a list of extra directories."""
+    monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", global_dir)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.settings_service.get_extra_skill_dirs",
+        lambda: [str(d) for d in extra_dirs],
+    )
+
+
 class TestLoadSkillMetadata:
     """Tests for load_skill_metadata."""
 
@@ -179,6 +202,129 @@ class TestListSkills:
         assert [skill.name for skill in skills] == ["valid-skill"]
         assert "Skipping invalid skill folder" in caplog.text
         assert "broken-skill" in caplog.text
+
+
+class TestExtraSkillDirs:
+    """Resolving skills from ``extra_skill_dirs`` (mirrors ``extra_agent_dirs``)."""
+
+    def test_load_metadata_from_extra_dir(self, tmp_path, monkeypatch):
+        global_dir = tmp_path / "global"
+        global_dir.mkdir()
+        extra = tmp_path / "project"
+        _write_skill(extra / "task", "task", "Project task workflow")
+        _use_skill_dirs(monkeypatch, global_dir, [extra])
+
+        metadata = load_skill_metadata("task")
+
+        assert metadata == SkillMetadata(name="task", description="Project task workflow")
+
+    def test_load_content_from_extra_dir(self, tmp_path, monkeypatch):
+        global_dir = tmp_path / "global"
+        global_dir.mkdir()
+        extra = tmp_path / "project"
+        _write_skill(extra / "task", "task", "Project task", body="# Task\n\nSteps.")
+        _use_skill_dirs(monkeypatch, global_dir, [extra])
+
+        assert load_skill_content("task") == "# Task\n\nSteps."
+
+    def test_global_store_takes_precedence_over_extra_dir(self, tmp_path, monkeypatch):
+        global_dir = tmp_path / "global"
+        _write_skill(global_dir / "task", "task", "Global task")
+        extra = tmp_path / "project"
+        _write_skill(extra / "task", "task", "Project task")
+        _use_skill_dirs(monkeypatch, global_dir, [extra])
+
+        assert load_skill_metadata("task").description == "Global task"
+
+    def test_list_includes_global_and_extra_dirs(self, tmp_path, monkeypatch):
+        global_dir = tmp_path / "global"
+        _write_skill(global_dir / "alpha", "alpha", "Global alpha")
+        extra = tmp_path / "project"
+        _write_skill(extra / "beta", "beta", "Project beta")
+        _use_skill_dirs(monkeypatch, global_dir, [extra])
+
+        assert [skill.name for skill in list_skills()] == ["alpha", "beta"]
+
+    def test_list_dedups_with_global_winning_over_extra(self, tmp_path, monkeypatch):
+        global_dir = tmp_path / "global"
+        _write_skill(global_dir / "task", "task", "Global task")
+        extra = tmp_path / "project"
+        _write_skill(extra / "task", "task", "Project task")
+        _use_skill_dirs(monkeypatch, global_dir, [extra])
+
+        skills = list_skills()
+
+        assert [skill.name for skill in skills] == ["task"]
+        assert skills[0].description == "Global task"
+
+    def test_list_skips_non_skill_subdir_silently(self, tmp_path, monkeypatch, caplog):
+        global_dir = tmp_path / "global"
+        _write_skill(global_dir / "alpha", "alpha", "Global alpha")
+        extra = tmp_path / "project"
+        _write_skill(extra / "task", "task", "Project task")
+        (extra / "node_modules").mkdir(parents=True)  # unrelated folder, no SKILL.md
+        _use_skill_dirs(monkeypatch, global_dir, [extra])
+
+        skills = list_skills()
+
+        assert [skill.name for skill in skills] == ["alpha", "task"]
+        assert "node_modules" not in caplog.text
+
+    def test_list_skips_missing_extra_dir(self, tmp_path, monkeypatch):
+        global_dir = tmp_path / "global"
+        _write_skill(global_dir / "alpha", "alpha", "Global alpha")
+        missing = tmp_path / "does-not-exist"
+        _use_skill_dirs(monkeypatch, global_dir, [missing])
+
+        assert [skill.name for skill in list_skills()] == ["alpha"]
+
+    def test_missing_skill_falls_back_to_global_path_error(self, tmp_path, monkeypatch):
+        global_dir = tmp_path / "global"
+        global_dir.mkdir()
+        extra = tmp_path / "project"
+        extra.mkdir()
+        _use_skill_dirs(monkeypatch, global_dir, [extra])
+
+        with pytest.raises(FileNotFoundError, match="Skill folder does not exist"):
+            load_skill_metadata("nope")
+
+    def test_invalid_earlier_skill_does_not_shadow_valid_extra(self, tmp_path, monkeypatch):
+        """A broken same-named folder in an earlier dir must not hide a valid later one.
+
+        ``list_skills`` already skips the invalid folder and advertises the
+        valid extra-dir skill; ``_resolve_skill_path`` must agree so ``load_skill``
+        succeeds for the same name ("first valid match wins").
+        """
+        global_dir = tmp_path / "global"
+        # Invalid: folder name does not match the declared skill name.
+        broken = global_dir / "task"
+        broken.mkdir(parents=True)
+        (broken / "SKILL.md").write_text("---\nname: other\ndescription: Broken\n---\n\nBody\n")
+        extra = tmp_path / "project"
+        _write_skill(extra / "task", "task", "Project task", body="# Task\n\nSteps.")
+        _use_skill_dirs(monkeypatch, global_dir, [extra])
+
+        # list and load must agree: both resolve to the valid extra-dir skill.
+        assert "task" in [skill.name for skill in list_skills()]
+        assert load_skill_metadata("task").description == "Project task"
+        assert load_skill_content("task") == "# Task\n\nSteps."
+
+    def test_invalid_only_skill_surfaces_validation_error(self, tmp_path, monkeypatch):
+        """When the only same-named folder is invalid, the real validation error is raised.
+
+        The fallback preserves the meaningful error instead of degrading to a
+        generic "Skill folder does not exist".
+        """
+        global_dir = tmp_path / "global"
+        broken = global_dir / "task"
+        broken.mkdir(parents=True)
+        (broken / "SKILL.md").write_text("---\nname: other\ndescription: Broken\n---\n\nBody\n")
+        extra = tmp_path / "project"
+        extra.mkdir()
+        _use_skill_dirs(monkeypatch, global_dir, [extra])
+
+        with pytest.raises(ValueError, match="does not match skill name"):
+            load_skill_metadata("task")
 
 
 class TestValidateSkillFolder:

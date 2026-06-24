@@ -39,6 +39,24 @@ class TestHealthCheck:
         assert components["herdr"] in ("ok", "unavailable")
         assert components["claude"] in ("ok", "unavailable")
 
+    def test_health_reports_terminal_backend_tmux(self, client):
+        """GET /health reports terminal_backend matching the active backend (tmux)."""
+        with patch("cli_agent_orchestrator.api.main.get_backend") as mock_backend:
+            mock_backend.return_value = MagicMock(spec=[])  # not HerdrBackend
+            response = client.get("/health")
+        data = response.json()
+        assert data["terminal_backend"] == "tmux"
+
+    def test_health_reports_terminal_backend_herdr(self, client):
+        """GET /health reports terminal_backend='herdr' when server uses HerdrBackend."""
+        from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
+        mock_herdr = MagicMock(spec=HerdrBackend)
+        with patch("cli_agent_orchestrator.api.main.get_backend", return_value=mock_herdr):
+            response = client.get("/health")
+        data = response.json()
+        assert data["terminal_backend"] == "herdr"
+
 
 # ── Agent profiles endpoint ──────────────────────────────────────────
 
@@ -104,7 +122,7 @@ class TestAgentProviders:
 
         assert response.status_code == 200
         data = response.json()
-        assert len(data) == 9
+        assert len(data) == 10
         names = [p["name"] for p in data]
         assert "kiro_cli" in names
         assert "claude_code" in names
@@ -115,6 +133,7 @@ class TestAgentProviders:
         assert "kimi_cli" in names
         assert "copilot_cli" in names
         assert "opencode_cli" in names
+        assert "cursor_cli" in names
         for p in data:
             assert p["installed"] is True
 
@@ -1279,7 +1298,13 @@ class TestMainEntryPoint:
 
             main()
 
-            mock_uvicorn.assert_called_once_with(app, host="0.0.0.0", port=9999)
+            mock_uvicorn.assert_called_once()
+            call_kwargs = mock_uvicorn.call_args.kwargs
+            assert mock_uvicorn.call_args.args[0] is app
+            assert call_kwargs["host"] == "0.0.0.0"
+            assert call_kwargs["port"] == 9999
+            assert call_kwargs["proxy_headers"] is True
+            assert "forwarded_allow_ips" in call_kwargs
 
     def test_main_with_agents_dir(self):
         """main() sets KIRO_AGENTS_DIR when --agents-dir is provided."""
@@ -1322,7 +1347,13 @@ class TestMainEntryPoint:
 
             assert parent.mock_calls == [
                 call.add_cors("0.0.0.0", 9999),
-                call.uvicorn_run(app, host="0.0.0.0", port=9999),
+                call.uvicorn_run(
+                    app,
+                    host="0.0.0.0",
+                    port=9999,
+                    proxy_headers=True,
+                    forwarded_allow_ips=parent.uvicorn_run.call_args.kwargs["forwarded_allow_ips"],
+                ),
             ]
 
     def test_main_terminal_flag_overrides_backend(self):

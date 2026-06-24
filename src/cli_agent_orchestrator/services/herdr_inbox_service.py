@@ -370,54 +370,113 @@ class HerdrInboxService:
             except (json.JSONDecodeError, KeyError) as e:
                 logger.warning(f"Reconcile: failed to parse tab list: {e}")
 
-        # Find and prune stale panes
+        # Find stale panes: stored pane_id no longer in herdr's live pane list.
+        #
+        # A stale pane_id does NOT mean the terminal is dead. herdr renumbers
+        # compact pane_ids when a sibling tab in the workspace closes, so a
+        # still-running terminal's stored pane_id can fall out of the live list
+        # while its tab is very much alive. Identity must come from the durable
+        # tab label (tmux_window), never the ephemeral pane_id.
         stale_pane_ids = set(self._pane_to_terminal.keys()) - live_pane_ids
         if not stale_pane_ids:
             logger.debug("Reconcile: all panes live, nothing to prune")
             return
 
-        # Track which sessions lose terminals
-        affected_sessions: Dict[str, int] = {}  # session_name -> remaining count
+        # Live workspace labels, used to gate workspace teardown below: never
+        # kill a workspace whose label is still present in herdr.
+        live_workspace_labels = set(self._workspace_to_session.values())
+
+        # Sessions that genuinely lost a terminal (deleted, not re-mapped).
+        affected_sessions: Set[str] = set()
+        remapped = 0
+        deleted = 0
 
         for pane_id in stale_pane_ids:
-            terminal_id = self._pane_to_terminal.pop(pane_id, None)
+            terminal_id = self._pane_to_terminal.get(pane_id)
             if not terminal_id:
+                self._pane_to_terminal.pop(pane_id, None)
                 continue
 
-            # Get session name before deleting
+            # Session/window identity before any mutation.
             meta = get_terminal_metadata(terminal_id)
-            term_session = meta["tmux_session"] if meta else None
+            term_session: Optional[str] = meta["tmux_session"] if meta else None
+            term_window: Optional[str] = meta["tmux_window"] if meta else None
 
-            # Remove from all maps
+            # Re-map renumbered-but-live panes instead of deleting. A live tab
+            # label means the pane_id was renumbered, not closed: re-resolve the
+            # current pane_id and update both maps. Only when re-resolution fails
+            # do we fall through to the delete path.
+            if term_window and self._label_still_live(term_window):
+                try:
+                    # Invalidate pane cache so get_pane_id does a fresh label-based
+                    # lookup instead of returning the stale pane_id we just proved
+                    # is no longer live. See PR #309 review comment.
+                    backend = get_backend()
+                    if hasattr(backend, "_pane_cache"):
+                        backend._pane_cache.pop(terminal_id, None)
+                    new_pane_id = backend.get_pane_id(terminal_id, term_session or "", term_window)
+                except Exception as e:
+                    logger.warning(
+                        "Reconcile: tab %s live but pane re-resolve failed for %s (%s); "
+                        "deleting",
+                        term_window,
+                        terminal_id,
+                        e,
+                    )
+                else:
+                    self._pane_to_terminal.pop(pane_id, None)
+                    self._pane_to_terminal[new_pane_id] = terminal_id
+                    self._terminal_to_pane[terminal_id] = new_pane_id
+                    logger.info(
+                        "Reconcile: re-mapped %s %s -> %s (pane renumbered, tab still live)",
+                        terminal_id,
+                        pane_id,
+                        new_pane_id,
+                    )
+                    remapped += 1
+                    continue
+
+            # Tab label genuinely gone (or re-resolve failed): prune maps and
+            # delete the orphaned DB record.
+            self._pane_to_terminal.pop(pane_id, None)
             self._terminal_to_pane.pop(terminal_id, None)
             self._kiro_terminals.discard(terminal_id)
             self._working_since.pop(terminal_id, None)
 
-            # Delete orphaned DB record
             try:
                 delete_terminal(terminal_id)
+                deleted += 1
             except Exception as e:
                 logger.warning(f"Reconcile: failed to delete terminal {terminal_id}: {e}")
 
             if term_session:
-                affected_sessions.setdefault(term_session, 0)
+                affected_sessions.add(term_session)
 
-        # Count remaining terminals per affected session
-        for tid, _ in self._terminal_to_pane.items():
-            meta = get_terminal_metadata(tid)
-            if meta and meta["tmux_session"] in affected_sessions:
-                affected_sessions[meta["tmux_session"]] += 1
+        # Kill a workspace only when its label is gone from herdr AND no managed
+        # terminal remains for the session. A live label means the workspace is
+        # alive and its panes were merely renumbered — killing it would tear down
+        # working agents.
+        if affected_sessions:
+            remaining_by_session: Dict[str, int] = {s: 0 for s in affected_sessions}
+            for tid in self._terminal_to_pane:
+                meta = get_terminal_metadata(tid)
+                if meta and meta["tmux_session"] in remaining_by_session:
+                    remaining_by_session[meta["tmux_session"]] += 1
 
-        # Kill workspaces with zero remaining terminals
-        for session_name, remaining in affected_sessions.items():
-            if remaining == 0:
-                try:
-                    get_backend().kill_session(session_name)
-                    logger.info(f"Reconcile: killed empty workspace {session_name}")
-                except Exception as e:
-                    logger.warning(f"Reconcile: failed to kill workspace {session_name}: {e}")
+            for session_name, remaining in remaining_by_session.items():
+                if remaining == 0 and session_name not in live_workspace_labels:
+                    try:
+                        get_backend().kill_session(session_name)
+                        logger.info(f"Reconcile: killed empty workspace {session_name}")
+                    except Exception as e:
+                        logger.warning(f"Reconcile: failed to kill workspace {session_name}: {e}")
 
-        logger.info(f"Reconcile: pruned {len(stale_pane_ids)} stale panes")
+        logger.info(
+            "Reconcile: %d stale pane(s) — %d re-mapped, %d deleted",
+            len(stale_pane_ids),
+            remapped,
+            deleted,
+        )
 
     async def _connect(self) -> None:
         """Connect to the herdr socket."""
@@ -522,6 +581,72 @@ class HerdrInboxService:
                     if terminal_id not in self._working_since:
                         self._working_since[terminal_id] = time.time()
 
+    def _label_still_live(self, window_name: str) -> bool:
+        """Return True if a tab with this label is still live in herdr.
+
+        Used to disambiguate herdr's reused compact pane_ids on replayed
+        pane_closed events. The tab label is unique per incarnation, so a live
+        label means the close event refers to an older incarnation and is stale.
+
+        Fails toward False (not live) when herdr can't be queried, so the caller
+        proceeds with cleanup rather than leaving a possibly-closed terminal.
+        """
+        try:
+            result = subprocess.run(
+                ["herdr", "--session", self._herdr_session, "tab", "list"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode != 0:
+                logger.warning(
+                    "_label_still_live: herdr tab list failed (rc=%s): %s",
+                    result.returncode,
+                    result.stderr.strip(),
+                )
+                return False
+            tab_data = json.loads(result.stdout)
+            tabs = tab_data.get("result", {}).get("tabs", [])
+            live_labels = {tab.get("label", "") for tab in tabs}
+            return window_name in live_labels
+        except (subprocess.SubprocessError, json.JSONDecodeError, KeyError, OSError) as e:
+            logger.warning("_label_still_live: could not query herdr (%s)", e)
+            return False
+
+    def _resolve_session_from_herdr(self, workspace_id: str) -> Optional[str]:
+        """Resolve a workspace_id to its session name from live herdr state.
+
+        Used by workspace.closed handling when the in-memory _workspace_to_session
+        map (populated only by _reconcile) does not contain the closed
+        workspace_id. Queries herdr workspace list, refreshes the whole map from
+        the result, and returns the label for workspace_id if found.
+
+        Returns None when herdr cannot be queried or the workspace_id is not in
+        the live list, so the caller can treat the event as unresolvable and take
+        no destructive action.
+        """
+        try:
+            result = subprocess.run(
+                ["herdr", "--session", self._herdr_session, "workspace", "list"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode != 0:
+                logger.warning(
+                    "_resolve_session_from_herdr: herdr workspace list failed (rc=%s): %s",
+                    result.returncode,
+                    result.stderr.strip(),
+                )
+                return None
+            ws_data = json.loads(result.stdout)
+            workspaces = ws_data.get("result", {}).get("workspaces", [])
+            self._workspace_to_session = {ws["workspace_id"]: ws["label"] for ws in workspaces}
+            return self._workspace_to_session.get(workspace_id)
+        except (subprocess.SubprocessError, json.JSONDecodeError, KeyError, OSError) as e:
+            logger.warning("_resolve_session_from_herdr: could not query herdr (%s)", e)
+            return None
+
     def _handle_lifecycle_event(self, event_type: str, data: dict) -> None:
         """Handle pane.closed and workspace.closed events."""
         from cli_agent_orchestrator.backends.registry import get_backend
@@ -540,6 +665,31 @@ class HerdrInboxService:
             # Get session before cleanup
             meta = get_terminal_metadata(terminal_id)
             session_name = meta["tmux_session"] if meta else None
+
+            # Guard against herdr's compact pane_id reuse + event replay.
+            #
+            # herdr (0.6.8) reuses compact pane_ids when a tab is killed and a
+            # new tab takes the same index, AND replays the ENTIRE pane_closed
+            # history on every fresh events.subscribe (which register_terminal
+            # triggers via _force_reconnect). So a replayed close for an OLD
+            # incarnation of this pane_id arrives mapped to the terminal that now
+            # occupies the reused index — deleting a live terminal.
+            #
+            # The tab label (tmux_window) is unique per incarnation, so confirm
+            # the label is genuinely gone from herdr before deleting. If the
+            # label is still live, this close is stale (replayed) — ignore it.
+            # If herdr can't be queried, fall toward delete: never leave a
+            # terminal we think is open when it may actually be closed.
+            window_name = meta["tmux_window"] if meta else None
+            if window_name and self._label_still_live(window_name):
+                logger.info(
+                    "pane.closed: ignoring stale close for %s (pane=%s) — "
+                    "label %s still live in herdr (compact pane_id reused)",
+                    terminal_id,
+                    pane_id,
+                    window_name,
+                )
+                return
 
             # Remove from maps
             self._pane_to_terminal.pop(pane_id, None)
@@ -572,7 +722,15 @@ class HerdrInboxService:
             workspace_id = data.get("workspace_id", "")
             session_name = self._workspace_to_session.get(workspace_id)
             if not session_name:
-                return
+                # The in-memory map is populated only by _reconcile(); a workspace
+                # that closed before any reconcile cached it would otherwise be a
+                # silent no-op, leaking the session's terminals as orphan rows.
+                # Resolve the session identity from live herdr state instead of
+                # trusting the map. Only treat the event as unresolvable after the
+                # live query also fails to identify a session.
+                session_name = self._resolve_session_from_herdr(workspace_id)
+                if not session_name:
+                    return
 
             # Delete all DB terminals for this session
             try:

@@ -6,7 +6,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.providers.codex import CodexProvider, ProviderError
+from cli_agent_orchestrator.providers.codex import (
+    CodexProvider,
+    ProviderError,
+    _toml_override,
+    _toml_scalar,
+)
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -433,6 +438,162 @@ class TestCodexProviderCodexProfile:
 
         assert "--yolo" in command
         assert "--profile" not in command
+
+
+class TestTomlScalar:
+    """Tests for ``_toml_scalar`` TOML-literal serialization."""
+
+    def test_string_is_quoted(self):
+        assert _toml_scalar("xhigh") == '"xhigh"'
+
+    def test_bool_true_is_bare(self):
+        assert _toml_scalar(True) == "true"
+
+    def test_bool_false_is_bare(self):
+        assert _toml_scalar(False) == "false"
+
+    def test_bool_checked_before_int(self):
+        # bool is a subclass of int; True must render as "true", not "1".
+        assert _toml_scalar(True) == "true"
+        assert _toml_scalar(1) == "1"
+
+    def test_int_is_bare(self):
+        assert _toml_scalar(600) == "600"
+
+    def test_float_is_bare(self):
+        assert _toml_scalar(600.0) == "600.0"
+
+    def test_string_escapes_quotes_and_backslashes(self):
+        assert _toml_scalar('a"b\\c') == '"a\\"b\\\\c"'
+
+    def test_string_escapes_newlines(self):
+        # Literal newlines would split the tmux command across lines.
+        assert "\n" not in _toml_scalar("line1\nline2")
+        assert _toml_scalar("line1\nline2") == '"line1\\nline2"'
+
+    def test_string_escapes_tabs_and_carriage_returns(self):
+        assert _toml_scalar("a\tb\rc") == '"a\\tb\\rc"'
+
+    @pytest.mark.parametrize("value", [{"a": 1}, ["x"], None])
+    def test_rejects_non_scalar(self, value):
+        with pytest.raises(TypeError):
+            _toml_scalar(value)
+
+
+class TestTomlOverride:
+    """Tests for ``_toml_override`` key validation."""
+
+    def test_builds_override_for_valid_dotted_key(self):
+        assert _toml_override("features.fast_mode", True) == "features.fast_mode=true"
+        assert _toml_override("model_reasoning_effort", "xhigh") == 'model_reasoning_effort="xhigh"'
+
+    @pytest.mark.parametrize("key", ["bad key", "a=b", 'k"x', "key\ninjected", "", "a/b"])
+    def test_rejects_unsafe_key(self, key):
+        # Unsafe keys would produce a malformed -c override or split the tmux
+        # command across lines; fail fast instead.
+        with pytest.raises(ValueError, match="Invalid codexConfig key"):
+            _toml_override(key, "v")
+
+    def test_non_scalar_value_error_names_offending_key(self):
+        with pytest.raises(TypeError, match="codexConfig key 'features.x'"):
+            _toml_override("features.x", {"nested": 1})
+
+
+class TestCodexProviderCodexConfig:
+    """Tests that profile.codexConfig emits inline ``-c key=value`` overrides."""
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_codex_config_emits_c_overrides_in_yolo_path(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = None
+        mock_profile.codexConfig = {
+            "model_reasoning_effort": "xhigh",
+            "service_tier": "fast",
+            "features.fast_mode": True,
+        }
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+
+        # Default --yolo path is kept; overrides are appended as -c key=value.
+        # String values are shlex-quoted (the inner key="value" is preserved);
+        # the bool value is emitted bare.
+        assert "--yolo" in command
+        assert 'model_reasoning_effort="xhigh"' in command
+        assert 'service_tier="fast"' in command
+        assert "features.fast_mode=true" in command
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_codex_config_composes_with_codex_profile(self, mock_load):
+        # codexConfig must apply in the --profile path too, so effort/fast-mode
+        # knobs work whether or not a named profile governs sandbox/approvals.
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = "cao_reviewer"
+        mock_profile.codexConfig = {"model_reasoning_effort": "high"}
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+
+        assert "--profile cao_reviewer" in command
+        assert "--yolo" not in command
+        assert 'model_reasoning_effort="high"' in command
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_codex_config_none_emits_no_overrides(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = None
+        mock_profile.codexConfig = None
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+
+        assert command == "codex --yolo --no-alt-screen --disable shell_snapshot"
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_codex_config_empty_dict_emits_no_overrides(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = None
+        mock_profile.codexConfig = {}
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+
+        assert command == "codex --yolo --no-alt-screen --disable shell_snapshot"
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_codex_config_composes_with_mcp_and_model(self, mock_load):
+        # Regression guard: codexConfig overrides sit alongside the model flag
+        # and the -c mcp_servers... wiring without clobbering either.
+        mock_profile = MagicMock()
+        mock_profile.model = "gpt-5.5"
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = {"cao-mcp-server": {"command": "uvx", "args": ["cao-mcp-server"]}}
+        mock_profile.codexProfile = None
+        mock_profile.codexConfig = {"model_reasoning_effort": "xhigh"}
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider("tid", "sess", "win", "agent")
+        command = provider._build_codex_command()
+
+        assert "--model gpt-5.5" in command
+        assert "mcp_servers.cao-mcp-server.command=" in command
+        assert 'model_reasoning_effort="xhigh"' in command
 
 
 class TestCodexProviderStatusDetection:

@@ -610,3 +610,44 @@ class TestCopilotCliSupervisorOrchestration:
     def test_supervisor_assign_three_analysts(self, require_copilot):
         """Supervisor assigns A/B/C analysts, receives callbacks, and finalizes report."""
         _run_supervisor_assign_three_analysts_test(provider="copilot_cli")
+
+
+# ---------------------------------------------------------------------------
+# Cursor CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestCursorCliSupervisorOrchestration:
+    """E2E supervisor orchestration tests for the Cursor CLI provider.
+
+    Validates that a Cursor CLI supervisor agent can autonomously drive
+    the assign + handoff + send_message flow via the cao-mcp-server
+    tools — the canonical multi-agent e2e test from the
+    ``examples/assign/`` scenario.
+
+    Requires the ``agent`` (or legacy ``cursor-agent``) binary on PATH
+    and the agent profiles installed for cursor_cli::
+
+        cao install examples/assign/analysis_supervisor.md --provider cursor_cli
+        cao install examples/assign/data_analyst.md --provider cursor_cli
+        cao install examples/assign/report_generator.md --provider cursor_cli
+    """
+
+    def test_supervisor_handoff(self, require_cursor):
+        """Cursor CLI supervisor uses handoff MCP tool to delegate to report_generator."""
+        _run_supervisor_handoff_test(provider="cursor_cli")
+
+    def test_supervisor_assign_and_handoff(self, require_cursor):
+        """Cursor CLI supervisor uses assign + handoff to orchestrate multi-agent workflow."""
+        _run_supervisor_assign_test(provider="cursor_cli")
+
+    def test_supervisor_assign_three_analysts(self, require_cursor):
+        """Cursor CLI supervisor assigns 3 analysts, receives callbacks, finalizes report.
+
+        The canonical ``examples/assign/`` smoke test: parallel assign
+        of three data analysts, sequential handoff to report generator,
+        inbox delivery of worker results, supervisor final assembly
+        without doing the analysis work itself.
+        """
+        _run_supervisor_assign_three_analysts_test(provider="cursor_cli")

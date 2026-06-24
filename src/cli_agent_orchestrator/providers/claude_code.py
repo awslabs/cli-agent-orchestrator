@@ -6,7 +6,7 @@ import re
 import shlex
 import time
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -604,6 +604,87 @@ class ClaudeCodeProvider(BaseProvider):
 
         # IDLE: shell prompt visible but no response yet (e.g. just initialized).
         if last_idle:
+            return TerminalStatus.IDLE
+
+        return TerminalStatus.UNKNOWN
+
+    # Opt in to pyte rendered-screen detection (gated by CAO_PYTE_STATUS). The
+    # detector below is tuned for a COMPOSITED viewport, not the raw stream.
+    supports_screen_detection = True
+
+    def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
+        """Detect status from a pyte-composited viewport (escape-free rows).
+
+        Anchors on the bottom of the rendered screen — exactly what a human
+        sees — rather than scanning a raw redraw stream. The StatusMonitor only
+        calls this on settled / rising-edge frames (quiescence debounce), so it
+        does not need to tolerate mid-repaint frames.
+
+        Precedence: a live spinner in the bottom region wins (PROCESSING); then
+        the Ink selection footer (WAITING_USER_ANSWER); then, if the BOXED input
+        prompt is visible, COMPLETED when a response/completion-summary is on
+        screen above it, else IDLE.
+
+        The prompt must be the real input box — a ``❯``/``>`` line adjacent to a
+        ``────`` separator — NOT any line containing ``> ``. During launch the
+        echoed command (whose system-prompt text contains ``> ``) would
+        otherwise read as an idle prompt and declare the terminal ready before
+        Claude's TUI has even rendered, breaking init (observed live).
+        """
+        rows = [ln.rstrip() for ln in screen_lines if ln.strip()]
+        if not rows:
+            return TerminalStatus.UNKNOWN
+        joined = "\n".join(rows)
+        bottom = rows[-25:]
+
+        # Live spinner: "✻ <gerund>… (…)" — the boxed-prompt spinner or a bare
+        # spinner line. Visible in a composited frame ⇒ genuinely working.
+        #
+        # Use ONLY the gerund-first NEW_TUI_BOX_SPINNER_PATTERN, not the looser
+        # NEW_TUI_SPINNER_PATTERN. The loose pattern ([glyph][^\n]*ing…) is
+        # documented (see its definition) as too permissive precisely because
+        # its glyph class includes the markdown bullets "·"/"*", so a settled
+        # response bullet ending in a gerund + ellipsis ("* …after deploying…")
+        # in the bottom region reads as a live spinner — a false PROCESSING that
+        # then latches and starves InboxService (delivers only on IDLE/COMPLETED).
+        # The raw get_status() path already switched to the tight pattern for the
+        # same reason; the screen path must match.
+        if any(NEW_TUI_BOX_SPINNER_PATTERN.search(ln) for ln in bottom):
+            return TerminalStatus.PROCESSING
+
+        bottom_joined = "\n".join(bottom)
+        if (
+            re.search(WAITING_USER_ANSWER_PATTERN, bottom_joined)
+            and not re.search(TRUST_PROMPT_PATTERN, joined)
+            and not re.search(BYPASS_PROMPT_PATTERN, joined)
+        ):
+            return TerminalStatus.WAITING_USER_ANSWER
+
+        # Real input box: a prompt line with a "────" rail BOTH within 2 rows
+        # above AND within 2 rows below — the "──── / ❯ / ────" box Claude pins
+        # to the bottom of the viewport.
+        sep_idx = [i for i, ln in enumerate(rows) if re.search(r"─{8,}", ln)]
+        # Prompt line: ❯/> followed by whitespace OR alone at end-of-line. The
+        # bare-glyph case matters because rows are rstrip()ed: an EMPTY prompt
+        # box renders as "❯" + pyte's space padding, which rstrip reduces to a
+        # bare "❯" that IDLE_PROMPT_PATTERN (glyph + whitespace) cannot match.
+        # We deliberately do NOT require the prompt line to be empty — a ready
+        # box carries placeholder text (❯ Try "fix typecheck errors").
+        prompt_idx = [i for i, ln in enumerate(rows) if re.search(r"[>❯](?:[\s\xa0]|$)", ln)]
+        # Require BOTH rails, not just one nearby separator: during launch the
+        # echoed "> " system-prompt quote can land within 2 rows of a single
+        # early-painted ──── rule, which a one-sided adjacency misread as a ready
+        # prompt (premature IDLE on init — the first task then hits a not-ready
+        # agent). The real box always has a rail above AND below the prompt.
+        boxed_prompt = any(
+            any(0 < pi - si <= 2 for si in sep_idx) and any(0 < si - pi <= 2 for si in sep_idx)
+            for pi in prompt_idx
+        )
+        if boxed_prompt:
+            if re.search(
+                GET_STATUS_COMPLETION_PATTERN, joined
+            ) or EXTRACTION_RESPONSE_PATTERN.search(joined):
+                return TerminalStatus.COMPLETED
             return TerminalStatus.IDLE
 
         return TerminalStatus.UNKNOWN

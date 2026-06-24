@@ -125,7 +125,7 @@ export const api = {
   listSessions: () => fetchJSON<Session[]>('/sessions'),
   getSession: (name: string) => fetchJSON<SessionDetail>(`/sessions/${name}`),
   createSession: (provider: string, agentProfile: string, sessionName?: string, workingDirectory?: string) =>
-    fetchJSON<Terminal>(`/sessions?provider=${provider}&agent_profile=${agentProfile}${sessionName ? `&session_name=${sessionName}` : ''}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}`, { method: 'POST', timeoutMs: 90000 }),
+    fetchJSON<Terminal>(`/sessions?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${sessionName ? `&session_name=${encodeURIComponent(sessionName)}` : ''}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}`, { method: 'POST', timeoutMs: 90000 }),
   deleteSession: (name: string) => fetchJSON<{ success: boolean; deleted: string[]; errors: any[] }>(`/sessions/${name}`, { method: 'DELETE' }),
 
   // Terminals
@@ -141,7 +141,7 @@ export const api = {
   getWorkingDirectory: (id: string) =>
     fetchJSON<{ working_directory: string | null }>(`/terminals/${id}/working-directory`),
   addTerminalToSession: (sessionName: string, provider: string, agentProfile: string, workingDirectory?: string) =>
-    fetchJSON<Terminal>(`/sessions/${sessionName}/terminals?provider=${provider}&agent_profile=${agentProfile}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}`, { method: 'POST', timeoutMs: 90000 }),
+    fetchJSON<Terminal>(`/sessions/${sessionName}/terminals?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}`, { method: 'POST', timeoutMs: 90000 }),
 
   // Inbox
   getInboxMessages: (terminalId: string, limit?: number, status?: string) =>

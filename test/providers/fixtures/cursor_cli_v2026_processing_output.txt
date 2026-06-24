@@ -1,0 +1,12 @@
+  Cursor Agent
+  v2026.06.15-03-48-54-da23e37
+  Use subagents to parallelize work and preserve context.
+
+  ⠠⠛ Composing  23 tokens
+    Tip: Use /auto-run to skip all approvals.
+
+  [48;5;233m [2m→ [0;7m[48;5;233mA[0;2m[48;5;233mdd a follow-up[0m[48;5;233m                                                       [0m                       [2mctrl+c to stop[0m [49m
+  [48;5;233m                                                                       [49m
+
+  [2mComposer 2.5 Fast[0m                                             [35mRun Everything[39m
+  [2m/workspaces/cli-agent-orchestrator · feat/cursor-cli-provider · #296[0m
