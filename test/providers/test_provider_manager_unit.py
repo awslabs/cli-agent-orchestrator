@@ -9,6 +9,7 @@ from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
 from cli_agent_orchestrator.providers.hermes import HermesProvider
 from cli_agent_orchestrator.providers.manager import ProviderManager
+from cli_agent_orchestrator.providers.omp_cli import OmpCliProvider
 
 
 def test_create_provider_codex_stores_mapping():
@@ -63,6 +64,20 @@ def test_create_provider_unknown_type_raises():
             tmux_window="w1",
             agent_profile=None,
         )
+
+
+def test_create_provider_omp_cli_stores_mapping():
+    manager = ProviderManager()
+    provider = manager.create_provider(
+        ProviderType.OMP_CLI.value,
+        terminal_id="t1",
+        tmux_session="s1",
+        tmux_window="w1",
+        agent_profile=None,
+    )
+
+    assert isinstance(provider, OmpCliProvider)
+    assert manager.get_provider("t1") is provider
 
 
 def test_get_provider_creates_on_demand_from_metadata():

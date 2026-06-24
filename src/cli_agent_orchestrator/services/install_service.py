@@ -359,6 +359,15 @@ def install_agent(
             else:
                 remove_agent_tools(agent_id)
 
+        elif provider == ProviderType.OMP_CLI.value:
+            # OMP CLI has no native agent-config format yet: the CAO role
+            # context is delivered via the install-time context file (written
+            # for every provider above) and read by `omp` at startup. agent_file
+            # stays None. This branch is intentionally explicit so a future
+            # native OMP agent format can slot in here without touching the
+            # fall-through default path.
+            pass
+
         return InstallResult(
             success=True,
             message=f"Agent '{profile.name}' installed successfully",
