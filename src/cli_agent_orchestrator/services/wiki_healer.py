@@ -798,12 +798,17 @@ async def heal(
         # containers for a scope, but the healer mutates using THIS run's
         # (scope, scope_id). A finding whose source container differs from the
         # target must never be applied — it would corrupt a same-key memory in a
-        # different project. Skip it before it reaches a healer. lint findings
-        # built before scope_id was threaded carry scope_id=None; a None target
-        # (e.g. global scope) still matches None, so legacy/global flows are
-        # unaffected.
-        if getattr(issue, "scope_id", None) != scope_id:
-            continue
+        # different project.
+        src_scope_id = getattr(issue, "scope_id", None)
+        if src_scope_id != scope_id:
+            # Allow scope_id-less stale_claim findings only when they are unhealable
+            # (e.g. "related_keys references missing key") so they can be surfaced as skipped.
+            if not (
+                t == "stale_claim"
+                and src_scope_id is None
+                and _parse_stale_identifier(issue.description) is None
+            ):
+                continue
         by_type[t].append(issue)
 
     actions: list = []
