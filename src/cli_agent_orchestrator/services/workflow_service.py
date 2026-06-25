@@ -23,11 +23,14 @@ _substitute, §5 cancel_run, §6 get_run_status, §7 reserved seams).
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+
+from pydantic import ValidationError
 
 from cli_agent_orchestrator.constants import (
     WORKFLOW_DEFAULT_STEP_RETRIES,
@@ -47,6 +50,7 @@ from cli_agent_orchestrator.models.workflow_runtime import (
     StepStatus,
     WorkflowRunResult,
 )
+from cli_agent_orchestrator.services import workflow_journal
 from cli_agent_orchestrator.services.agent_step import StepExecutionError, run_agent_step
 from cli_agent_orchestrator.services.step_output_store import (
     _validate_key_part,
@@ -64,6 +68,24 @@ class WorkflowEngineError(Exception):
     is raised only when the engine reaches a state that should be impossible —
     e.g. a template references an upstream step that never produced output
     (an authoring error surfaced loudly, never a silent blank fill, B3-BR-14).
+    """
+
+
+class ResumeNotAllowedError(ValueError):
+    """Resume rejected because the run is terminal or still live (B4-BR-7/7a -> 409).
+
+    A ``ValueError`` subclass so any caller catching ``ValueError`` broadly still
+    works (no contract break); the resume route catches THIS type before any bare
+    ``ValueError`` to map it to 409 (business-logic-model §5, reviewer N1).
+    """
+
+
+class ResumeCorruptError(ValueError):
+    """Resume rejected because ``spec_snapshot`` will not deserialize (B4 -> 422).
+
+    A ``ValueError`` subclass; the resume route catches it before any bare
+    ``ValueError`` to map an undeserializable snapshot to 422 (business-logic-model
+    §5). The run is unresumable and the failure is surfaced clearly, never silently.
     """
 
 
@@ -113,6 +135,117 @@ run_registry: Dict[str, RunRecord] = {}
 def _now() -> str:
     """ISO-8601 Z timestamp (bookkeeping only — never an ordering key)."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------------------------------------------------------------------------
+# N6 — durable run journal write-through (best-effort, B4-BR-5)
+# ---------------------------------------------------------------------------
+# Every engine transition mutates the in-memory ``RunRecord`` FIRST (preserving
+# the FR-5.5 live-read floor), THEN writes the journal here. A write failure is
+# logged and SWALLOWED — it must NEVER raise into the engine drive loop (only
+# durability/resumability is degraded for that run, B4-BR-5 / B4-RD-1). The
+# terminal run-state write is logged at WARNING because it gates resumability;
+# the per-step/current-step writes are logged at DEBUG.
+
+
+def _output_json(record: Optional[StepOutputRecord]) -> Optional[str]:
+    """Serialize a step's structured output to JSON, or ``None`` (E2)."""
+    if record is None:
+        return None
+    return json.dumps(record.output)
+
+
+def _record_from_json(output_json: Optional[str]) -> Optional[StepOutputRecord]:
+    """Rebuild a minimal ``StepOutputRecord`` carrying the persisted output (§2).
+
+    On rebuild only the structured ``output`` map is needed for ``{{step.field}}``
+    templating into successors — a kept (COMPLETED) step's output is reused. The
+    record is reconstructed as ``validated=True`` (it was persisted as a settled
+    output); ``errors`` is empty. Returns ``None`` when no output was persisted.
+    A malformed JSON blob degrades to ``None`` (never raises into the rebuild).
+    """
+    if output_json is None:
+        return None
+    try:
+        data = json.loads(output_json)
+    except (ValueError, TypeError) as e:
+        logger.debug("journal: dropping unparseable step output_json: %s", e)
+        return None
+    if not isinstance(data, dict):
+        return None
+    return StepOutputRecord(
+        run_id="",
+        step_id="",
+        output=data,
+        validated=True,
+        errors=[],
+        state=StepState.COMPLETED,
+    )
+
+
+def _journal_insert_run(record: RunRecord) -> None:
+    """Best-effort INSERT of the run + its seeded steps at ``start_run`` (§1)."""
+    try:
+        workflow_journal.insert_run(
+            run_id=record.run_id,
+            workflow_name=record.workflow_name,
+            spec_snapshot=record.spec.model_dump_json(),
+            inputs_json=json.dumps(record.inputs),
+            state=record.state.value,
+            started_at=record.started_at,
+        )
+        workflow_journal.insert_steps(
+            record.run_id,
+            [(step.id, StepState.PENDING.value) for step in record.spec.steps],
+            _now(),
+        )
+    except (
+        Exception
+    ) as e:  # noqa: BLE001 — journal write is best-effort; in-memory floor still serves live reads
+        logger.warning("journal: insert_run for '%s' failed (run continues): %s", record.run_id, e)
+
+
+def _journal_step(record: RunRecord, step_id: str) -> None:
+    """Best-effort UPDATE of one step's durable state from the in-memory record."""
+    st = record.step_states[step_id]
+    try:
+        workflow_journal.update_step(
+            run_id=record.run_id,
+            step_id=step_id,
+            state=st.state.value,
+            attempts=st.attempts,
+            updated_at=_now(),
+            output_json=_output_json(st.output),
+            error=st.error,
+        )
+    except (
+        Exception
+    ) as e:  # noqa: BLE001 — journal write is best-effort; in-memory floor still serves live reads
+        logger.debug("journal: update_step '%s/%s' failed: %s", record.run_id, step_id, e)
+
+
+def _journal_current_step(record: RunRecord) -> None:
+    """Best-effort UPDATE of ``workflow_run.current_step_id``."""
+    try:
+        workflow_journal.update_run_current_step(record.run_id, record.current_step_id)
+    except (
+        Exception
+    ) as e:  # noqa: BLE001 — journal write is best-effort; in-memory floor still serves live reads
+        logger.debug("journal: update_run_current_step '%s' failed: %s", record.run_id, e)
+
+
+def _journal_run_state(record: RunRecord) -> None:
+    """Best-effort UPDATE of the terminal run state (logged at WARNING — gates resume)."""
+    try:
+        workflow_journal.update_run_state(record.run_id, record.state.value, record.finished_at)
+    except (
+        Exception
+    ) as e:  # noqa: BLE001 — journal write is best-effort; in-memory floor still serves live reads
+        logger.warning(
+            "journal: terminal state write for '%s' failed (resumability degraded): %s",
+            record.run_id,
+            e,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +483,9 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
     record.current_step_id = step.id
     st = record.step_states[step.id]
     st.state = StepState.RUNNING
+    # Journal write-through (§1): record the step RUNNING + the live current step.
+    _journal_step(record, step.id)
+    _journal_current_step(record)
 
     # OUTER: run-failure retry loop. attempts range 1..n_retries+1.
     for attempt in range(1, n_retries + 2):
@@ -381,10 +517,12 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
             continue  # consume an attempt, retry the same prompt
         # Settled (COMPLETED or COMPLETED_UNVALIDATED) — neither is a run-failure.
         st.state = outcome
+        _journal_step(record, step.id)  # §1: persist settled state + output + attempts
         return
 
     # Attempts exhausted: every attempt raised StepExecutionError.
     st.state = StepState.FAILED
+    _journal_step(record, step.id)  # §1: persist FAILED state + last error + attempts
     if (step.on_failure or "halt") == "halt":
         # Engine halts; start_run skips the remaining steps (§1). on_failure ==
         # "continue" leaves the run RUNNING and sequencing continues.
@@ -402,6 +540,7 @@ def _skip_remaining(record: RunRecord, order: List[WorkflowStep], from_index: in
         st = record.step_states[step.id]
         if st.state == StepState.PENDING:
             st.state = StepState.SKIPPED
+            _journal_step(record, step.id)  # §1: persist the skip
 
 
 def _build_result(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunResult:
@@ -469,8 +608,9 @@ async def start_run(spec: WorkflowSpec, inputs: Dict[str, Any], run_id: str) -> 
         step_states={step.id: StepRunState(step_id=step.id) for step in spec.steps},
         started_at=_now(),
     )
-    # 4. Register.
+    # 4. Register (in-memory floor) + journal the run + seed every step (§1).
     run_registry[run_id] = record
+    _journal_insert_run(record)
 
     # 5. Deterministic sequencing order.
     order = _topological_order(spec)
@@ -505,6 +645,9 @@ async def start_run(spec: WorkflowSpec, inputs: Dict[str, Any], run_id: str) -> 
         record.state = RunState.FAILED
         record.current_step_id = None
         record.finished_at = _now()
+        # Persist the terminal FAILED state (best-effort) before re-raising (§1).
+        _journal_current_step(record)
+        _journal_run_state(record)
         logger.error("start_run: run '%s' failed with an engine error", run_id)
         raise
 
@@ -513,6 +656,9 @@ async def start_run(spec: WorkflowSpec, inputs: Dict[str, Any], run_id: str) -> 
         record.state = RunState.COMPLETED
     record.current_step_id = None
     record.finished_at = _now()
+    # Journal the terminal run state + cleared current step (§1, B4-BR-5).
+    _journal_current_step(record)
+    _journal_run_state(record)
 
     # 8. Aggregate the result.
     return _build_result(record, order)
@@ -555,6 +701,15 @@ def get_run_status(run_id: str) -> RunStatus:
     """
     record = run_registry.get(run_id)
     if record is None:
+        # Cache miss (cold read / after a restart): rebuild from the journal ONCE,
+        # then re-populate the cache (§2, B4-BR-4). A genuinely-absent run (absent
+        # from BOTH cache and journal) raises KeyError -> 404 (F1, contract
+        # unchanged). The rebuild returns None on absent and NEVER raises ValueError
+        # on this status read path.
+        record = _rebuild_record_from_journal(run_id)
+        if record is not None:
+            run_registry[run_id] = record
+    if record is None:
         raise KeyError(f"unknown run_id '{run_id}'")
     return RunStatus(
         run_id=record.run_id,
@@ -565,6 +720,67 @@ def get_run_status(run_id: str) -> RunStatus:
             for sid, st in record.step_states.items()
         ],
     )
+
+
+# ---------------------------------------------------------------------------
+# §2 — registry-as-cache rebuild from the durable journal (Q1=B, B4-BR-3/4)
+# ---------------------------------------------------------------------------
+def _rebuild_record_from_journal(run_id: str) -> Optional[RunRecord]:
+    """Rebuild the in-memory ``RunRecord`` from the durable journal (§2, F2/F8).
+
+    Returns ``None`` when no ``workflow_run`` row exists for ``run_id`` (the caller
+    raises ``KeyError`` itself — this helper never raises on an absent run, F1).
+    The reconstructed dataclass uses the EXACT shipped ``RunRecord`` field binding
+    (``workflow_name`` is required; ``started_at``/``finished_at`` are restored from
+    the row — F2). ``step_states`` is seeded for EVERY step of the snapshotted spec
+    (PENDING) BEFORE overlaying persisted rows, so a partial ``insert_steps`` write
+    can never leave a step absent from the rebuilt record (F8 / B4-RD-3) — the
+    engine drive's ``record.step_states[step.id]`` stays total.
+
+    ``reprompted``/``terminal_id`` are NOT journaled (F3): on a kept step they are
+    irrelevant (it is skipped), on a reset step they are cleared anyway (B4-BR-9),
+    so they default here.
+    """
+    try:
+        row = workflow_journal.get_run(run_id)
+    except (
+        Exception
+    ) as e:  # noqa: BLE001 — journal read is best-effort; a missing/failed table degrades to "absent" (B4-RD-4), the caller raises KeyError -> 404
+        logger.debug("journal: get_run('%s') failed; treating as absent: %s", run_id, e)
+        return None
+    if row is None:
+        return None
+
+    spec = WorkflowSpec.model_validate_json(row.spec_snapshot)
+    record = RunRecord(
+        run_id=row.run_id,
+        workflow_name=row.workflow_name,
+        spec=spec,
+        inputs=json.loads(row.inputs_json),
+        state=RunState(row.state),
+        current_step_id=row.current_step_id,
+        started_at=row.started_at,
+        finished_at=row.finished_at,
+    )
+    # F8: seed EVERY spec step PENDING first, then overlay durable rows.
+    for step in spec.steps:
+        record.step_states[step.id] = StepRunState(step_id=step.id, state=StepState.PENDING)
+    try:
+        step_rows = workflow_journal.get_steps(run_id)
+    except (
+        Exception
+    ) as e:  # noqa: BLE001 — journal read is best-effort; on failure the seeded PENDING states stand (B4-RD-3)
+        logger.debug("journal: get_steps('%s') failed; using seeded PENDING: %s", run_id, e)
+        step_rows = []
+    for srow in step_rows:
+        record.step_states[srow.step_id] = StepRunState(
+            step_id=srow.step_id,
+            state=StepState(srow.state),
+            attempts=srow.attempts,
+            output=_record_from_json(srow.output_json),
+            error=srow.error,
+        )
+    return record
 
 
 # ---------------------------------------------------------------------------
@@ -586,9 +802,142 @@ def _dispatch_reserved_mode(spec: WorkflowSpec) -> None:
     raise NotBuiltYetError(f"workflow mode '{spec.mode}' is reserved (not built yet)")
 
 
-def resume_from_last_completed(run_id: str) -> WorkflowRunResult:
-    """RESERVED (N6) — durable resume. Raises ``NotBuiltYetError`` (B3-BR-10)."""
-    raise NotBuiltYetError("resume_from_last_completed is reserved (not built yet; unit N6)")
+async def resume_from_last_completed(run_id: str) -> WorkflowRunResult:
+    """Resume a crashed/failed run from its durable journal (§3, FR-6.2, N6).
+
+    Un-reserves the B3-BR-10 stub. The algorithm (business-logic-model §3):
+
+    1. Validate ``run_id`` via the shared key validator (B4-BR-2) -> ``ValueError``
+       (-> 400) on a malformed/traversal key.
+    2. **Liveness guard** (B4-BR-7a, F4): if the run is present in the live
+       ``run_registry`` AND its in-memory ``state == RUNNING``, it is actively
+       executing in THIS process -> ``ResumeNotAllowedError`` (-> 409). Never
+       double-drive a live run.
+    3. Load the ``workflow_run`` row; absent -> ``KeyError`` (-> 404, F1).
+    4. A ``COMPLETED``/``CANCELLED`` run is terminal and not resumable ->
+       ``ResumeNotAllowedError`` (-> 409, B4-BR-7). A ``FAILED`` run, or a
+       ``RUNNING`` row with NO live record (a crash remnant), IS resumable.
+    5. Deserialize ``spec_snapshot`` (Q2=B, B4-BR-8); a corrupt snapshot ->
+       ``ResumeCorruptError`` (-> 422).
+    6. Rebuild the ``RunRecord`` cache (§2, seeds all steps), then apply the Q3=A
+       skip/re-run boundary (B4-BR-9): keep ``COMPLETED``/``COMPLETED_UNVALIDATED``
+       (output reused for templating), UNCONDITIONALLY reset every other state to
+       ``PENDING`` (attempts=0, terminal_id=None, error=None, reprompted=False) so
+       the failed step + its halted successors re-run with a fresh terminal
+       (B4-BR-10).
+    7. Re-enter the SAME Bolt-3 drive over the snapshotted spec's topo order (a
+       single execution path, no resume/normal divergence — B4-RD-5). The drive
+       skips non-``PENDING`` steps, so the reset above is the only resume-specific
+       transformation; persisted inputs are the RESOLVED snapshot, not re-validated
+       (B4-BR-10a).
+    """
+    # 1. Validate the run_id key via the shared validator (B4-BR-2).
+    _validate_key_part(run_id, "run_id")
+
+    # 2. Liveness guard (B4-BR-7a / F4): never resume a run still executing here.
+    live = run_registry.get(run_id)
+    if live is not None and live.state == RunState.RUNNING:
+        raise ResumeNotAllowedError(
+            f"run '{run_id}' is currently executing; cannot resume a live run"
+        )
+
+    # 3. Load the durable row; absent (or an unreadable journal) -> KeyError -> 404 (F1).
+    try:
+        row = workflow_journal.get_run(run_id)
+    except (
+        Exception
+    ) as e:  # noqa: BLE001 — journal read is best-effort; an unreadable journal means nothing to resume (B4-RD-4)
+        logger.debug("journal: resume get_run('%s') failed; treating as absent: %s", run_id, e)
+        row = None
+    if row is None:
+        raise KeyError(f"unknown run_id '{run_id}'")
+
+    # 4. Terminal runs are not resumable (B4-BR-7).
+    state = RunState(row.state)
+    if state in (RunState.COMPLETED, RunState.CANCELLED):
+        raise ResumeNotAllowedError(f"run '{run_id}' is {state.value}; not resumable")
+
+    # 5. Deserialize the snapshotted spec (Q2=B, B4-BR-8); corrupt -> 422.
+    try:
+        spec = WorkflowSpec.model_validate_json(row.spec_snapshot)
+    except ValidationError as e:
+        raise ResumeCorruptError(f"run '{run_id}' snapshot is corrupt: {e}")
+
+    # 6. Rebuild the cache (§2) and apply the Q3=A skip/re-run boundary (B4-BR-9).
+    record = _rebuild_record_from_journal(run_id)
+    if record is None:  # pragma: no cover — row existed above; defensive
+        raise KeyError(f"unknown run_id '{run_id}'")
+    for st in record.step_states.values():
+        if st.state in (StepState.COMPLETED, StepState.COMPLETED_UNVALIDATED):
+            continue  # keep done; output reused for {{steps.<id>.output.<field>}}
+        st.state = StepState.PENDING
+        st.attempts = 0
+        st.reprompted = False
+        st.terminal_id = None  # fresh terminal on re-run (B4-BR-10)
+        st.error = None
+        st.output = None
+
+    # Re-open the run and re-register the rebuilt record as the live cache.
+    record.state = RunState.RUNNING
+    record.cancelled = False
+    record.current_step_id = None
+    record.finished_at = None
+    run_registry[run_id] = record
+    try:
+        workflow_journal.update_run_state(run_id, RunState.RUNNING.value, None)
+    except (
+        Exception
+    ) as e:  # noqa: BLE001 — journal write is best-effort; in-memory floor still serves live reads
+        logger.warning("journal: resume reopen state write for '%s' failed: %s", run_id, e)
+
+    # 7. Re-enter the SAME B3 drive over the snapshotted spec's topo order (B4-RD-5).
+    return await _drive_resume(record, _topological_order(spec))
+
+
+async def _drive_resume(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunResult:
+    """Re-drive a rebuilt record over ``order`` — the SAME B3 sequencing loop (§3).
+
+    This is the resume tail of ``start_run``'s sequencing loop (steps 6–8), reused
+    verbatim so resume cannot diverge from the normal drive (single execution path,
+    B4-RD-5): a non-``PENDING`` (kept) step is skipped by ``_run_step`` not running
+    for it — the loop only calls ``_run_step`` for steps the reset left ``PENDING``.
+    """
+    try:
+        for index, step in enumerate(order):
+            if record.cancelled:  # B3-BR-7 — cancel observed at a step boundary
+                _skip_remaining(record, order, from_index=index)
+                record.state = RunState.CANCELLED
+                break
+            st = record.step_states[step.id]
+            if st.state in (StepState.COMPLETED, StepState.COMPLETED_UNVALIDATED):
+                continue  # kept on resume (B4-BR-9) — do not re-run a done step
+            await _run_step(record, step)
+            if record.state == RunState.FAILED:  # halt (B3-BR-4 on_failure=halt)
+                _skip_remaining(record, order, from_index=index + 1)
+                break
+    except WorkflowEngineError:
+        if record.current_step_id is not None:
+            cur = record.step_states.get(record.current_step_id)
+            if cur is not None and cur.state not in (
+                StepState.COMPLETED,
+                StepState.COMPLETED_UNVALIDATED,
+            ):
+                cur.state = StepState.FAILED
+        record.state = RunState.FAILED
+        record.current_step_id = None
+        record.finished_at = _now()
+        _journal_current_step(record)
+        _journal_run_state(record)
+        logger.error("resume: run '%s' failed with an engine error", record.run_id)
+        raise
+
+    if record.state not in (RunState.FAILED, RunState.CANCELLED):
+        record.state = RunState.COMPLETED
+    record.current_step_id = None
+    record.finished_at = _now()
+    _journal_current_step(record)
+    _journal_run_state(record)
+    return _build_result(record, order)
 
 
 def _run_parallel(record: Optional[RunRecord], steps: Any) -> None:

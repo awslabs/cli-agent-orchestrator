@@ -513,8 +513,9 @@ async def test_reserved_loop_mode_raises(monkeypatch):
 
 
 def test_reserved_seam_methods_raise():
-    with pytest.raises(NotBuiltYetError):
-        ws.resume_from_last_completed("r")
+    # ``resume_from_last_completed`` is NO LONGER reserved as of Bolt 4 / N6 — it is
+    # un-reserved here and exercised by test_workflow_journal_resume.py. The
+    # remaining parallel/loop/guard seams stay reserved (N7/N8).
     with pytest.raises(NotBuiltYetError):
         ws._run_parallel(None, None)
     with pytest.raises(NotBuiltYetError):

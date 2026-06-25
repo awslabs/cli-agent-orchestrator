@@ -1253,6 +1253,36 @@ async def cancel_workflow_run_endpoint(run_id: str) -> Dict:
     return {"success": True, "run_id": run_id}
 
 
+@app.post("/workflows/runs/{run_id}/resume")
+async def resume_workflow_run_endpoint(run_id: str) -> Dict:
+    """Resume a crashed/failed run from its durable journal (FR-6.2, N6).
+
+    Re-drives the snapshotted spec from the journal, skipping already-completed
+    steps and re-running the rest with fresh terminals; awaited INLINE like the run
+    endpoint and returns the same ``WorkflowRunResult``. Error mapping
+    (business-logic-model §5): malformed run_id -> 400, unknown run -> 404, terminal
+    or live-RUNNING run -> 409, corrupt snapshot -> 422. The two resume subtypes are
+    caught BEFORE the bare ``ValueError`` arm so they map to their distinct codes.
+    """
+    from cli_agent_orchestrator.services import workflow_service
+
+    try:
+        result = await workflow_service.resume_from_last_completed(run_id)
+    except KeyError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
+    except workflow_service.ResumeNotAllowedError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except workflow_service.ResumeCorruptError as e:
+        # 422 by literal code: the ``status`` alias name differs across Starlette
+        # versions in the CI matrix; the integer is stable and warning-free.
+        raise HTTPException(status_code=422, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except workflow_service.WorkflowEngineError as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    return result.model_dump()
+
+
 @app.delete("/terminals/{terminal_id}")
 async def delete_terminal(request: Request, terminal_id: TerminalId) -> Dict:
     """Delete a terminal."""

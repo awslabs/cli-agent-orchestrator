@@ -161,6 +161,8 @@ def init_db() -> None:
     _migrate_add_last_compiled_at()
     _migrate_add_related_keys()
     _migrate_workflow_index()
+    _migrate_workflow_run()
+    _migrate_workflow_run_step()
 
 
 def _migrate_project_aliases_schema() -> None:
@@ -324,6 +326,75 @@ def _migrate_workflow_index() -> None:
             )
     except Exception as e:  # noqa: BLE001 — derived table; rebuilt on next list
         logger.debug(f"workflow_index migration skipped: {e}")
+
+
+def _migrate_workflow_run() -> None:
+    """Create the durable ``workflow_run`` journal table if missing (issue #312, N6).
+
+    The run aggregate root: one row per run, keyed by ``run_id`` (E1,
+    domain-entities). Per Q1=B this is the **source of truth** for run execution
+    state; the Bolt-3 in-memory ``run_registry`` is a cache over it. No loop
+    columns (``iteration_counter`` etc.) — deferred to N8 (Q4=B, B4-BR-12).
+
+    Idempotent (``CREATE TABLE IF NOT EXISTS``), zero-arg and self-connecting —
+    mirrors ``_migrate_workflow_index`` (B2, B4-BR-1). Failure is logged at debug
+    and never propagated: a missing table is recoverable, the next write retries
+    the path and the live run completes on the in-memory floor (B4-RD-4).
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS workflow_run ("
+                "run_id TEXT PRIMARY KEY, "
+                "workflow_name TEXT NOT NULL, "
+                "spec_snapshot TEXT NOT NULL, "
+                "inputs_json TEXT NOT NULL, "
+                "state TEXT NOT NULL, "
+                "current_step_id TEXT, "
+                "started_at TEXT NOT NULL, "
+                "finished_at TEXT"
+                ")"
+            )
+    except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
+        logger.debug(f"workflow_run migration skipped: {e}")
+
+
+def _migrate_workflow_run_step() -> None:
+    """Create the durable ``workflow_run_step`` table if missing (issue #312, N6).
+
+    Per-step durable state: one row per ``(run_id, step_id)`` (E2,
+    domain-entities). ``reprompted``/``terminal_id`` are deliberately NOT
+    journaled (F3) — they are in-memory-only and defaulted on rebuild. No
+    ``which_guard_fired``/``iterations_run`` columns — N8 adds them via its own
+    additive migrator (Q4=B, B4-BR-12).
+
+    Idempotent, zero-arg, self-connecting; failure logged at debug and never
+    propagated (B4-BR-1 / B4-RD-4), same precedent as ``_migrate_workflow_index``.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS workflow_run_step ("
+                "run_id TEXT NOT NULL, "
+                "step_id TEXT NOT NULL, "
+                "state TEXT NOT NULL, "
+                "attempts INTEGER NOT NULL, "
+                "output_json TEXT, "
+                "error TEXT, "
+                "updated_at TEXT NOT NULL, "
+                "PRIMARY KEY (run_id, step_id)"
+                ")"
+            )
+    except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
+        logger.debug(f"workflow_run_step migration skipped: {e}")
 
 
 def _migrate_terminals_schema() -> None:
