@@ -1457,7 +1457,7 @@ async def workflow_return(
         response = requests.post(
             f"{API_BASE_URL}/workflows/runs/{run_id}/steps/{step_id}/output",
             json=payload,
-            timeout=MCP_REQUEST_TIMEOUT,
+            timeout=_mcp_timeout(),
         )
     except requests.RequestException as e:
         return ReturnAck(
