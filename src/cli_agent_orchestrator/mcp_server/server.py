@@ -10,7 +10,7 @@ import requests
 from fastmcp import FastMCP
 from pydantic import Field
 
-from cli_agent_orchestrator.constants import API_BASE_URL, DEFAULT_PROVIDER, MCP_REQUEST_TIMEOUT
+from cli_agent_orchestrator.constants import API_BASE_URL, DEFAULT_PROVIDER
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -19,10 +19,17 @@ from cli_agent_orchestrator.services.memory_service import (
     MEMORY_DISABLED_MESSAGE,
     MemoryDisabledError,
 )
+from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 from cli_agent_orchestrator.utils.terminal import generate_session_name, wait_until_terminal_status
 
 logger = logging.getLogger(__name__)
+
+
+def _mcp_timeout() -> float:
+    """Get MCP request timeout from server settings."""
+    return float(get_server_settings()["mcp_request_timeout"])
+
 
 # Environment variable to enable/disable working_directory parameter
 ENABLE_WORKING_DIRECTORY = os.getenv("CAO_ENABLE_WORKING_DIRECTORY", "false").lower() == "true"
@@ -44,7 +51,7 @@ def _get_cleanup_nudge() -> str:
         return ""
     try:
         resp = requests.get(
-            f"{API_BASE_URL}/terminals/{current_terminal_id}", timeout=MCP_REQUEST_TIMEOUT
+            f"{API_BASE_URL}/terminals/{current_terminal_id}", timeout=_mcp_timeout()
         )
         if resp.status_code != 200:
             return ""
@@ -52,7 +59,7 @@ def _get_cleanup_nudge() -> str:
         if not session_name:
             return ""
         resp = requests.get(
-            f"{API_BASE_URL}/sessions/{session_name}/terminals", timeout=MCP_REQUEST_TIMEOUT
+            f"{API_BASE_URL}/sessions/{session_name}/terminals", timeout=_mcp_timeout()
         )
         if resp.status_code != 200:
             return ""
@@ -164,7 +171,7 @@ def _create_terminal(
     if current_terminal_id:
         # Get terminal metadata via API
         response = requests.get(
-            f"{API_BASE_URL}/terminals/{current_terminal_id}", timeout=MCP_REQUEST_TIMEOUT
+            f"{API_BASE_URL}/terminals/{current_terminal_id}", timeout=_mcp_timeout()
         )
         response.raise_for_status()
         terminal_metadata = response.json()
@@ -179,7 +186,7 @@ def _create_terminal(
             try:
                 response = requests.get(
                     f"{API_BASE_URL}/terminals/{current_terminal_id}/working-directory",
-                    timeout=MCP_REQUEST_TIMEOUT,
+                    timeout=_mcp_timeout(),
                 )
                 if response.status_code == 200:
                     working_directory = response.json().get("working_directory")
@@ -210,7 +217,7 @@ def _create_terminal(
         response = requests.post(
             f"{API_BASE_URL}/sessions/{session_name}/terminals",
             params=params,
-            timeout=MCP_REQUEST_TIMEOUT,
+            timeout=_mcp_timeout(),
         )
         response.raise_for_status()
         terminal = response.json()
@@ -226,9 +233,7 @@ def _create_terminal(
         if working_directory:
             params["working_directory"] = working_directory
 
-        response = requests.post(
-            f"{API_BASE_URL}/sessions", params=params, timeout=MCP_REQUEST_TIMEOUT
-        )
+        response = requests.post(f"{API_BASE_URL}/sessions", params=params, timeout=_mcp_timeout())
         response.raise_for_status()
         terminal = response.json()
 
@@ -258,7 +263,7 @@ def _send_direct_input(
             "sender_id": os.environ.get("CAO_TERMINAL_ID", "supervisor"),
             "orchestration_type": orchestration_type,
         },
-        timeout=MCP_REQUEST_TIMEOUT,
+        timeout=_mcp_timeout(),
     )
     response.raise_for_status()
 
@@ -280,7 +285,7 @@ def _send_user_prompt_answer(terminal_id: str, answer: str) -> Dict[str, Any]:
 
     try:
         status_response = requests.get(
-            f"{API_BASE_URL}/terminals/{terminal_id}", timeout=MCP_REQUEST_TIMEOUT
+            f"{API_BASE_URL}/terminals/{terminal_id}", timeout=_mcp_timeout()
         )
         status_response.raise_for_status()
         terminal = status_response.json()
@@ -307,7 +312,7 @@ def _send_user_prompt_answer(terminal_id: str, answer: str) -> Dict[str, Any]:
                 "message": answer,
                 "sender_id": os.environ.get("CAO_TERMINAL_ID", "supervisor"),
             },
-            timeout=MCP_REQUEST_TIMEOUT,
+            timeout=_mcp_timeout(),
         )
         response.raise_for_status()
         return {
@@ -335,7 +340,7 @@ def _try_send_hermes_prompt_answer(terminal_id: str, answer: str) -> Optional[Di
     output_response = requests.get(
         f"{API_BASE_URL}/terminals/{terminal_id}/output",
         params={"mode": "full"},
-        timeout=MCP_REQUEST_TIMEOUT,
+        timeout=_mcp_timeout(),
     )
     output_response.raise_for_status()
     output = output_response.json().get("output", "")
@@ -380,7 +385,7 @@ def _send_terminal_key(terminal_id: str, key: str) -> None:
     response = requests.post(
         f"{API_BASE_URL}/terminals/{terminal_id}/key",
         params={"key": key},
-        timeout=MCP_REQUEST_TIMEOUT,
+        timeout=_mcp_timeout(),
     )
     response.raise_for_status()
 
@@ -392,7 +397,7 @@ def _send_terminal_input(terminal_id: str, message: str) -> None:
             "message": message,
             "sender_id": os.environ.get("CAO_TERMINAL_ID", "supervisor"),
         },
-        timeout=MCP_REQUEST_TIMEOUT,
+        timeout=_mcp_timeout(),
     )
     response.raise_for_status()
 
@@ -479,7 +484,7 @@ def _resolve_handoff_provider(agent_profile: str) -> HandoffContext:
         )
 
     response = requests.get(
-        f"{API_BASE_URL}/terminals/{current_terminal_id}", timeout=MCP_REQUEST_TIMEOUT
+        f"{API_BASE_URL}/terminals/{current_terminal_id}", timeout=_mcp_timeout()
     )
     response.raise_for_status()
     terminal_metadata = response.json()
@@ -582,7 +587,7 @@ def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
             "sender_id": sender_id,
             "message": message,
         },
-        timeout=MCP_REQUEST_TIMEOUT,
+        timeout=_mcp_timeout(),
     )
     response.raise_for_status()
     return response.json()
@@ -604,7 +609,7 @@ def _extract_error_detail(response: requests.Response, fallback: str) -> str:
 def _load_skill_impl(name: str) -> Union[str, Dict[str, Any]]:
     """Fetch a skill body from cao-server and return content or a structured error."""
     try:
-        response = requests.get(f"{API_BASE_URL}/skills/{name}", timeout=MCP_REQUEST_TIMEOUT)
+        response = requests.get(f"{API_BASE_URL}/skills/{name}", timeout=_mcp_timeout())
         response.raise_for_status()
         return response.json()["content"]
     except requests.HTTPError as exc:
@@ -899,7 +904,7 @@ def _assign_impl(
         if not wait_until_terminal_status(
             terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-            timeout=60.0,
+            timeout=float(get_server_settings()["provider_init_timeout"]),
         ):
             return {
                 "success": False,
@@ -1036,7 +1041,7 @@ def _send_message_impl(receiver_id: Optional[str], message: str) -> Dict[str, An
                     ),
                 }
             response = requests.get(
-                f"{API_BASE_URL}/terminals/{own_terminal_id}", timeout=MCP_REQUEST_TIMEOUT
+                f"{API_BASE_URL}/terminals/{own_terminal_id}", timeout=_mcp_timeout()
             )
             try:
                 response.raise_for_status()
@@ -1182,7 +1187,7 @@ def delete_terminal(
     """
     try:
         response = requests.delete(
-            f"{API_BASE_URL}/terminals/{terminal_id}", timeout=MCP_REQUEST_TIMEOUT
+            f"{API_BASE_URL}/terminals/{terminal_id}", timeout=_mcp_timeout()
         )
         response.raise_for_status()
         return {"success": True, "message": f"Terminal {terminal_id} deleted successfully"}
@@ -1206,9 +1211,7 @@ def _get_terminal_context_from_env() -> Optional[Dict[str, Any]]:
         return None
 
     try:
-        response = requests.get(
-            f"{API_BASE_URL}/terminals/{terminal_id}", timeout=MCP_REQUEST_TIMEOUT
-        )
+        response = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=_mcp_timeout())
         response.raise_for_status()
         meta = response.json()
         ctx: Dict[str, Any] = {
@@ -1221,7 +1224,7 @@ def _get_terminal_context_from_env() -> Optional[Dict[str, Any]]:
         try:
             wd_resp = requests.get(
                 f"{API_BASE_URL}/terminals/{terminal_id}/working-directory",
-                timeout=MCP_REQUEST_TIMEOUT,
+                timeout=_mcp_timeout(),
             )
             if wd_resp.status_code == 200:
                 ctx["cwd"] = wd_resp.json().get("working_directory")
