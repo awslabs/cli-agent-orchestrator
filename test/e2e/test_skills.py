@@ -218,6 +218,15 @@ class TestGeminiCliSkills:
         _run_skill_injection_test(provider="gemini_cli", agent_profile="developer")
 
 
+@pytest.mark.e2e
+class TestAntigravityCliSkills:
+    """E2E skill injection tests for the Antigravity CLI provider."""
+
+    def test_skill_catalog_injected(self, require_antigravity):
+        """Antigravity CLI terminal command contains the injected skill catalog."""
+        _run_skill_injection_test(provider="antigravity_cli", agent_profile="developer")
+
+
 # ---------------------------------------------------------------------------
 # Skill API endpoint test (deterministic — no agent needed)
 # ---------------------------------------------------------------------------

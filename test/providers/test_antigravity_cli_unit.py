@@ -178,8 +178,12 @@ def test_extract_raises_without_query():
 def test_extract_filters_thought_and_tool_chrome():
     # Captured from a live agy reviewer turn that called cao-mcp-server.
     out = make_provider().extract_last_message_from_script(load_fixture("agy_review_completed.txt"))
-    assert "▸" not in out  # thought-process lines filtered
+    assert "▸" not in out  # thought-process header lines filtered
     assert "●" not in out  # tool-call lines filtered
+    # The collapsed-thought title line that follows each "▸ Thought" header
+    # ("Prioritizing Tool Usage" / "Prioritizing Tool Specificity") is chrome,
+    # not response content, and must not leak into the extracted message.
+    assert "Prioritizing" not in out
     assert "CRITICAL BUG" in out  # actual review content preserved
     assert "CHANGES_REQUESTED" in out
 
@@ -417,6 +421,71 @@ def test_mcp_registration_recovers_from_corrupt_config(tmp_path):
     assert "cao-mcp-server" in data["mcpServers"]
 
 
+@pytest.mark.parametrize("payload", ["[1, 2, 3]", '"just a string"', "42"])
+def test_mcp_registration_recovers_from_non_dict_config(tmp_path, payload):
+    # The shared ~/.gemini/config/mcp_config.json may hold valid JSON of an
+    # unexpected shape (list/string/number). Registration must normalize it
+    # rather than raise AttributeError/TypeError on setdefault()/mutation.
+    import json
+
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+    cfg = tmp_path / "mcp_config.json"
+    cfg.write_text(payload)
+    profile = AgentProfile(
+        name="reviewer_gemini",
+        description="Reviewer",
+        mcpServers={"cao-mcp-server": {"command": "uvx", "args": ["cao-mcp-server"]}},
+    )
+    p = make_provider(agent_profile="reviewer_gemini")
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+            return_value="/usr/local/bin/agy",
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.load_agent_profile",
+            return_value=profile,
+        ),
+        patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg),
+    ):
+        p._build_agy_command()  # must not raise
+    data = json.loads(cfg.read_text())
+    assert isinstance(data, dict)
+    assert "cao-mcp-server" in data["mcpServers"]
+
+
+def test_mcp_registration_replaces_non_dict_mcpservers(tmp_path):
+    # A dict root but a non-dict "mcpServers" value must be replaced, not mutated.
+    import json
+
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+    cfg = tmp_path / "mcp_config.json"
+    cfg.write_text(json.dumps({"mcpServers": ["unexpected", "list"]}))
+    profile = AgentProfile(
+        name="reviewer_gemini",
+        description="Reviewer",
+        mcpServers={"cao-mcp-server": {"command": "uvx", "args": ["cao-mcp-server"]}},
+    )
+    p = make_provider(agent_profile="reviewer_gemini")
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+            return_value="/usr/local/bin/agy",
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.load_agent_profile",
+            return_value=profile,
+        ),
+        patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg),
+    ):
+        p._build_agy_command()  # must not raise
+    data = json.loads(cfg.read_text())
+    assert isinstance(data["mcpServers"], dict)
+    assert "cao-mcp-server" in data["mcpServers"]
+
+
 def test_unregister_noop_when_nothing_registered():
     # No servers registered -> cleanup is a no-op, never touches the filesystem.
     p = make_provider()
@@ -522,6 +591,19 @@ def test_unregister_warns_on_corrupt_config(tmp_path):
     p._mcp_server_names = ["cao-mcp-server"]
     with patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg):
         p.cleanup()  # corrupt file -> logged warning, state reset, no raise
+    assert p._mcp_server_names == []
+
+
+@pytest.mark.parametrize("payload", ["[1, 2, 3]", '"just a string"', "42"])
+def test_unregister_handles_non_dict_config(tmp_path, payload):
+    # Valid-but-unexpected JSON shape must not raise during teardown, and the
+    # internal state must always be cleared (finally block).
+    cfg = tmp_path / "mcp_config.json"
+    cfg.write_text(payload)
+    p = make_provider()
+    p._mcp_server_names = ["cao-mcp-server"]
+    with patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg):
+        p.cleanup()  # non-dict config -> no raise, state reset
     assert p._mcp_server_names == []
 
 

@@ -301,3 +301,17 @@ class TestCursorCliSendMessage:
     def test_send_message_to_inbox(self, require_cursor):
         """Send a message to another Cursor CLI terminal's inbox and verify delivery."""
         _run_send_message_test(provider="cursor_cli", agent_profile="developer")
+
+
+# ---------------------------------------------------------------------------
+# Antigravity CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestAntigravityCliSendMessage:
+    """E2E send_message tests for the Antigravity CLI provider."""
+
+    def test_send_message_to_inbox(self, require_antigravity):
+        """Send a message to another Antigravity CLI terminal's inbox and verify delivery."""
+        _run_send_message_test(provider="antigravity_cli", agent_profile="developer")

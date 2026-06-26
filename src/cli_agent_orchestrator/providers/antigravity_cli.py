@@ -295,7 +295,25 @@ class AntigravityCliProvider(BaseProvider):
             logger.warning("Could not read %s, starting fresh: %s", path, exc)
             config = {}
 
+        # The file is shared with the user's own agy config; tolerate a valid-
+        # but-unexpected shape (e.g. a JSON list/string) instead of raising.
+        if not isinstance(config, dict):
+            logger.warning(
+                "MCP config root in %s is %s, not an object; resetting",
+                path,
+                type(config).__name__,
+            )
+            config = {}
+
         servers = config.setdefault("mcpServers", {})
+        if not isinstance(servers, dict):
+            logger.warning(
+                "'mcpServers' in %s is %s, not an object; replacing",
+                path,
+                type(servers).__name__,
+            )
+            servers = {}
+            config["mcpServers"] = servers
         for server_name, server_config in mcp_servers.items():
             if isinstance(server_config, dict):
                 cfg = dict(server_config)
@@ -325,14 +343,18 @@ class AntigravityCliProvider(BaseProvider):
         try:
             with open(path) as f:
                 config = json.load(f)
-            servers = config.get("mcpServers", {})
-            for name in self._mcp_server_names:
-                servers.pop(name, None)
-            with open(path, "w") as f:
-                json.dump(config, f, indent=2)
+            servers = config.get("mcpServers") if isinstance(config, dict) else None
+            if isinstance(servers, dict):
+                for name in self._mcp_server_names:
+                    servers.pop(name, None)
+                with open(path, "w") as f:
+                    json.dump(config, f, indent=2)
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("Failed to unregister MCP servers from %s: %s", path, exc)
-        self._mcp_server_names = []
+        finally:
+            # Always clear our state so a malformed config can never leave stale
+            # names behind and block terminal teardown.
+            self._mcp_server_names = []
 
     async def initialize(self) -> bool:
         """Initialize the Antigravity CLI provider by starting ``agy``.
@@ -523,26 +545,44 @@ class AntigravityCliProvider(BaseProvider):
                 end_idx = i
                 break
 
+        def _is_chrome(text_line: str) -> bool:
+            """True if the line is recognized TUI chrome (not response content)."""
+            stripped_line = text_line.strip()
+            return bool(
+                re.search(SEPARATOR_PATTERN, text_line)
+                or re.search(_FOOTER_LINE_PATTERN, stripped_line)
+                or re.search(_TIP_PATTERN, stripped_line)
+                or re.search(PROCESSING_SPINNER_PATTERN, stripped_line)
+                or re.search(_THOUGHT_PATTERN, text_line)
+                or re.search(_TOOL_CALL_PATTERN, text_line)
+                or re.search(_SURVEY_PATTERN, stripped_line)
+                or re.search(_BANNER_PATTERN, stripped_line)
+            )
+
+        body = lines[last_query_idx + 1 : end_idx]
         response_lines: list[str] = []
-        for line in lines[last_query_idx + 1 : end_idx]:
+        i = 0
+        n = len(body)
+        while i < n:
+            line = body[i]
             stripped = line.strip()
+            i += 1
             if not stripped:
                 continue
-            if re.search(SEPARATOR_PATTERN, line):
-                continue
-            if re.search(_FOOTER_LINE_PATTERN, stripped):
-                continue
-            if re.search(_TIP_PATTERN, stripped):
-                continue
-            if re.search(PROCESSING_SPINNER_PATTERN, stripped):
-                continue
             if re.search(_THOUGHT_PATTERN, line):
+                # agy renders a collapsed thought as the "▸ Thought for Xs, N
+                # tokens" header immediately followed by one indented auto-
+                # generated title line (e.g. "Prioritizing Tool Usage"). The
+                # header is chrome; so is that single title line. Skip past any
+                # blanks then drop exactly the next non-blank line, but only if
+                # it isn't itself recognized chrome (a thought with no title
+                # must not consume real response content that follows).
+                while i < n and not body[i].strip():
+                    i += 1
+                if i < n and not _is_chrome(body[i]):
+                    i += 1
                 continue
-            if re.search(_TOOL_CALL_PATTERN, line):
-                continue
-            if re.search(_SURVEY_PATTERN, stripped):
-                continue
-            if re.search(_BANNER_PATTERN, stripped):
+            if _is_chrome(line):
                 continue
             response_lines.append(stripped)
 

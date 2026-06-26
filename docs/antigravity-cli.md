@@ -17,6 +17,12 @@ agy --version
 agy models   # confirms auth + lists model strings
 ```
 
+## Backend Support
+
+The provider currently requires the **tmux** backend (`cao-server --terminal tmux`, the default). It opts into screen-based status detection (`supports_screen_detection = True`), which is driven by the FIFO / pyte pipeline that tmux provides.
+
+The **herdr** backend is **not yet supported**: herdr uses an event inbox and skips the FIFO pipeline for providers it has no native status integration for, so `agy`'s state is never observed and terminals time out. Generic herdr FIFO support for non-native providers is tracked as a follow-up; until then, run antigravity_cli on the tmux backend.
+
 ## Quick Start
 
 ```bash
@@ -62,7 +68,7 @@ The TUI footer is identical for IDLE and COMPLETED, so the two are split on an i
 ? for shortcuts            <model>
 ```
 
-Response extraction returns the text between the last echoed `> <query>` line and the next full-width separator, with TUI chrome (banner, separators, footer, tips, spinner) filtered out.
+Response extraction returns the text between the last echoed `> <query>` line and the next full-width separator, with TUI chrome filtered out: banner, separators, footer, tips, spinner, tool-call lines (`●  …`), and the collapsed-thought header (`▸ Thought for …`) together with the single auto-generated title line that follows it.
 
 ## MCP Servers
 
