@@ -14,6 +14,7 @@ from cli_agent_orchestrator.constants import API_BASE_URL, DEFAULT_PROVIDER
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.models.workflow_runtime import ReturnAck
 from cli_agent_orchestrator.services.memory_service import (
     MEMORY_DISABLED_MESSAGE,
     MemoryDisabledError,
@@ -1411,6 +1412,68 @@ async def memory_forget(
         return {"success": False, "disabled": True, "error": str(e)}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def workflow_return(
+    output: Dict[str, Any] = Field(description="The structured JSON output for this workflow step"),
+    output_schema: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Optional JSON-Schema (Draft 2020-12) to validate the output against. "
+            "Pass the step's declared output_schema so the seam can validate it."
+        ),
+    ),
+) -> Dict[str, Any]:
+    """Return a structured output for the current workflow step (issue #312, N4).
+
+    Reads the run/step identity from ``CAO_WORKFLOW_RUN_ID`` / ``CAO_WORKFLOW_STEP_ID``
+    and POSTs the output to the single-seam structured-return endpoint, which
+    validates it against ``output_schema`` and stores it for the run engine to
+    read back (Bolt 3).
+
+    Returns a structured ``ReturnAck`` envelope on EVERY path — it never raises
+    into the agent loop (best-effort non-blocking promise, B2-BR-9). A
+    ``validated=False`` ack means the output did not match the schema; it does
+    NOT mean the step ran or will run.
+    """
+    run_id = os.environ.get("CAO_WORKFLOW_RUN_ID")
+    step_id = os.environ.get("CAO_WORKFLOW_STEP_ID")
+    if not run_id or not step_id:
+        return ReturnAck(
+            ok=False,
+            validated=False,
+            errors=[
+                "CAO_WORKFLOW_RUN_ID / CAO_WORKFLOW_STEP_ID not set — "
+                "workflow_return must run inside a workflow step context."
+            ],
+        ).model_dump()
+
+    payload: Dict[str, Any] = {"output": output}
+    if output_schema is not None:
+        payload["output_schema"] = output_schema
+
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/workflows/runs/{run_id}/steps/{step_id}/output",
+            json=payload,
+            timeout=_mcp_timeout(),
+        )
+    except requests.RequestException as e:
+        return ReturnAck(
+            ok=False, validated=False, errors=[f"could not reach cao-server: {e}"]
+        ).model_dump()
+
+    if response.status_code != 200:
+        detail = _extract_error_detail(response, f"status {response.status_code}")
+        return ReturnAck(ok=False, validated=False, errors=[detail]).model_dump()
+
+    data = response.json()
+    return ReturnAck(
+        ok=True,
+        validated=bool(data.get("validated", False)),
+        errors=list(data.get("errors", [])),
+    ).model_dump()
 
 
 def main():
