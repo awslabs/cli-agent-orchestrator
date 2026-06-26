@@ -275,3 +275,56 @@ class TestExtraAgentAndSkillDirsAreIndependent:
         set_extra_skill_dirs(["/skills"])
         assert get_extra_agent_dirs() == ["/agents"]
         assert get_extra_skill_dirs() == ["/skills"]
+
+
+class TestGetServerSettings:
+    """Tests for get_server_settings function."""
+
+    def test_returns_defaults_when_no_settings(self, settings_file):
+        """Returns default values when no server section exists."""
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        result = get_server_settings()
+        assert result == {
+            "mcp_request_timeout": 30,
+            "event_bus_max_queue_size": 1024,
+            "provider_init_timeout": 60,
+            "startup_prompt_handler_timeout": 20,
+        }
+
+    def test_reads_custom_values(self, settings_file):
+        """Reads custom values from settings.json."""
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        _save({"server": {"mcp_request_timeout": 120, "provider_init_timeout": 90}})
+        result = get_server_settings()
+        assert result["mcp_request_timeout"] == 120
+        assert result["provider_init_timeout"] == 90
+        # Unset keys keep defaults
+        assert result["event_bus_max_queue_size"] == 1024
+        assert result["startup_prompt_handler_timeout"] == 20
+
+    def test_ignores_unknown_keys(self, settings_file):
+        """Unknown keys in server section are ignored."""
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        _save({"server": {"unknown_key": 999, "mcp_request_timeout": 60}})
+        result = get_server_settings()
+        assert "unknown_key" not in result
+        assert result["mcp_request_timeout"] == 60
+
+    def test_invalid_type_falls_back_to_default(self, settings_file):
+        """Invalid types fall back to defaults with warning."""
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        _save({"server": {"mcp_request_timeout": "not_a_number"}})
+        result = get_server_settings()
+        assert result["mcp_request_timeout"] == 30
+
+    def test_negative_value_falls_back_to_default(self, settings_file):
+        """Negative values fall back to defaults."""
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        _save({"server": {"provider_init_timeout": -5}})
+        result = get_server_settings()
+        assert result["provider_init_timeout"] == 60

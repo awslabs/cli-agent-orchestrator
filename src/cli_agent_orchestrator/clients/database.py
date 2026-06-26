@@ -160,6 +160,7 @@ def init_db() -> None:
     _migrate_add_access_count()
     _migrate_add_last_compiled_at()
     _migrate_add_related_keys()
+    _migrate_workflow_index()
 
 
 def _migrate_project_aliases_schema() -> None:
@@ -290,6 +291,39 @@ def _migrate_add_related_keys() -> None:
                 logger.info("Migration: added related_keys column to memory_metadata")
     except Exception as e:
         logger.debug(f"Migration check for related_keys failed: {e}")
+
+
+def _migrate_workflow_index() -> None:
+    """Create the derived ``workflow_index`` table if missing (issue #312, N2).
+
+    The table is a **derived, non-authoritative** projection of the workflow
+    spec YAML files on disk (B2-BR-2): it can be dropped and rebuilt
+    byte-identically from the files alone (``rebuild_index_from_files``). It
+    carries no run/execution state — runs and per-step state are N5/N6.
+
+    Idempotent (``CREATE TABLE IF NOT EXISTS``), zero-arg and self-connecting —
+    mirrors the existing ``_migrate_memory_indexes`` pattern. Failure is logged
+    at debug and never propagated (a missing index table is recoverable: the
+    next ``list`` rebuilds it).
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS workflow_index ("
+                "name TEXT PRIMARY KEY, "
+                "source_path TEXT NOT NULL, "
+                "mode TEXT NOT NULL, "
+                "step_count INTEGER NOT NULL, "
+                "description TEXT NOT NULL DEFAULT '', "
+                "indexed_at TEXT NOT NULL"
+                ")"
+            )
+    except Exception as e:  # noqa: BLE001 — derived table; rebuilt on next list
+        logger.debug(f"workflow_index migration skipped: {e}")
 
 
 def _migrate_terminals_schema() -> None:
