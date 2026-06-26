@@ -194,6 +194,34 @@ class RunStepResponse(BaseModel):
     status: str
 
 
+class WorkflowValidateRequest(BaseModel):
+    """Request body for ``POST /workflows/validate`` (Bolt 2, N2)."""
+
+    path: str = Field(description="Filesystem path to the workflow spec YAML file")
+
+
+class StepOutputRequest(BaseModel):
+    """Request body for the structured-return endpoint (Bolt 2, N4, C5).
+
+    For the synthetic-key MVP there is no run record, so the step's
+    ``output_schema`` arrives WITH the request (F2) rather than being re-resolved
+    from a run aggregate.
+    """
+
+    output: Dict = Field(description="The worker-emitted JSON output for the step")
+    output_schema: Optional[Dict] = Field(
+        default=None, description="The step's JSON-Schema (Draft 2020-12); None = no validation"
+    )
+
+
+class StepOutputResponse(BaseModel):
+    """Response for the structured-return endpoint — mirrors the stored record."""
+
+    validated: bool
+    errors: List[str]
+    state: str
+
+
 class SkillContentResponse(BaseModel):
     """Response model for a skill content lookup."""
 
@@ -1043,6 +1071,105 @@ async def run_step(request: Request, body: RunStepRequest) -> RunStepResponse:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to run step: {str(e)}",
         )
+
+
+# =============================================================================
+# Workflow authoring + structured-return endpoints (issue #312, Bolt 2)
+# =============================================================================
+# Single integration seam for the `cao workflow` CLI verbs and the
+# `workflow_return` MCP tool (B2-BR-10). Core services raise narrow exceptions;
+# this boundary maps them to HTTPException (B2-BR-9): ValueError -> 400,
+# FileNotFoundError/KeyError -> 404. The run/cancel/status endpoints are Bolt 3.
+
+
+@app.post("/workflows/validate")
+async def validate_workflow_endpoint(body: WorkflowValidateRequest) -> Dict:
+    """Validate a workflow spec without running it (FR-1.3). Returns ValidationResult."""
+    from cli_agent_orchestrator.services import workflow_spec_service
+
+    try:
+        result = workflow_spec_service.validate_only(body.path)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return result.model_dump()
+
+
+@app.get("/workflows")
+async def list_workflows_endpoint(dir: Optional[str] = Query(default=None)) -> List[Dict]:
+    """List indexed workflows, rebuilt from the spec files on disk (FR-2.1)."""
+    from cli_agent_orchestrator.services import workflow_spec_service
+
+    try:
+        rows = workflow_spec_service.list_workflows(scan_dir=dir)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return [row.model_dump() for row in rows]
+
+
+@app.get("/workflows/{name}")
+async def get_workflow_endpoint(name: str) -> Dict:
+    """Return the parsed/validated spec for a workflow name (FR-2.1)."""
+    from cli_agent_orchestrator.services import workflow_spec_service
+
+    try:
+        spec = workflow_spec_service.get_workflow(name)
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown workflow '{name}'"
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return spec.model_dump()
+
+
+@app.delete("/workflows/{name}")
+async def delete_workflow_endpoint(name: str) -> Dict:
+    """Delete a workflow's spec file and its index row (FR-2.4)."""
+    from cli_agent_orchestrator.services import workflow_spec_service
+
+    try:
+        workflow_spec_service.delete_workflow(name)
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown workflow '{name}'"
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return {"success": True, "name": name}
+
+
+@app.post(
+    "/workflows/runs/{run_id}/steps/{step_id}/output",
+    response_model=StepOutputResponse,
+)
+async def record_step_output_endpoint(
+    run_id: str, step_id: str, body: StepOutputRequest
+) -> StepOutputResponse:
+    """Record a worker's structured output for a step (FR-4.1, C5).
+
+    Validation lives at this seam (ADR-4). A schema-invalid output does NOT 500 —
+    it is stored with ``validated=False`` / state ``COMPLETED_UNVALIDATED`` and
+    returned as a 200 (the engine acts on the flag in Bolt 3). A malformed
+    ``run_id`` / ``step_id`` (failing the name regex) maps to 400.
+    """
+    from cli_agent_orchestrator.services.step_output_store import record_step_output
+
+    try:
+        record = record_step_output(
+            run_id=run_id,
+            step_id=step_id,
+            output=body.output,
+            output_schema=body.output_schema,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return StepOutputResponse(
+        validated=record.validated,
+        errors=record.errors,
+        state=record.state.value,
+    )
 
 
 @app.delete("/terminals/{terminal_id}")
