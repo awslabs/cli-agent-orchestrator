@@ -12,6 +12,7 @@ fixture creates the directory under the user's home (always outside the blocked
 frozenset) and verifies it passes the real shared validator.
 """
 
+import os
 import sqlite3
 import uuid
 from pathlib import Path
@@ -75,14 +76,14 @@ def _write_spec(spec_dir: Path, name: str, body: str = None) -> Path:
 class TestLoadAndValidate:
     def test_loads_valid_spec(self, spec_dir):
         path = _write_spec(spec_dir, "alpha")
-        spec = svc.load_and_validate(str(path))
+        spec = svc.load_and_validate(str(path), base_dir=str(spec_dir))
         assert spec.name == "alpha"
         assert spec.mode == "sequential"
         assert len(spec.steps) == 1
 
     def test_missing_file_raises_filenotfound(self, spec_dir):
         with pytest.raises(FileNotFoundError):
-            svc.load_and_validate(str(spec_dir / "nope.yaml"))
+            svc.load_and_validate(str(spec_dir / "nope.yaml"), base_dir=str(spec_dir))
 
     def test_invalid_spec_raises_valueerror(self, spec_dir):
         # Duplicate step id -> grammar fail -> ValueError (maps to 400).
@@ -93,7 +94,7 @@ class TestLoadAndValidate:
         )
         path = _write_spec(spec_dir, "bad", bad)
         with pytest.raises(ValueError):
-            svc.load_and_validate(str(path))
+            svc.load_and_validate(str(path), base_dir=str(spec_dir))
 
     def test_non_string_yaml_key_raises_valueerror_not_typeerror(self, spec_dir):
         """A parseable spec with a non-string mapping key (``1: foo``) must
@@ -101,7 +102,7 @@ class TestLoadAndValidate:
         ``TypeError`` from ``WorkflowSpec(**data)`` (PR #320 never-raise class)."""
         path = _write_spec(spec_dir, "intkey", "1: foo\nname: intkey\nsteps: []\n")
         with pytest.raises(ValueError):
-            svc.load_and_validate(str(path))
+            svc.load_and_validate(str(path), base_dir=str(spec_dir))
 
     def test_blocked_directory_rejected(self, spec_dir):
         """A spec path in a blocked system directory is rejected before any
@@ -110,37 +111,76 @@ class TestLoadAndValidate:
             svc.load_and_validate("/etc/passwd.yaml")
 
     def test_path_escaping_validated_dir_rejected(self, spec_dir, tmp_path):
-        """A spec path whose realpath escapes its policy-checked directory via a
-        symlink is rejected, not silently followed (the containment SafeAccessCheck)."""
+        """A spec path whose realpath escapes its configured base directory via a
+        symlink is rejected, not silently followed (the now load-bearing
+        containment SafeAccessCheck — PR #326 dead-assertion fix)."""
         import os
 
-        # A symlink inside the (allowed) spec_dir pointing at a file in a blocked
-        # dir: realpath resolves OUT of spec_dir, so the containment guard trips.
+        # A symlink inside the (allowed) base dir pointing OUT of it: realpath
+        # resolves outside spec_dir, so the containment guard trips even though
+        # spec_dir itself is the bound base.
         target = "/etc/hosts"
         link = spec_dir / "sneaky.yaml"
         if not os.path.exists(target):
-            pytest.skip("no stable blocked-dir target on this platform")
+            pytest.skip("no stable escape target on this platform")
         os.symlink(target, link)
         with pytest.raises(ValueError):
-            svc.load_and_validate(str(link))
+            svc.load_and_validate(str(link), base_dir=str(spec_dir))
+
+    def test_valid_spec_outside_base_dir_rejected(self, spec_dir, tmp_path):
+        """A perfectly valid spec that resolves OUTSIDE the configured base is
+        rejected — the containment check now constrains something (Option A,
+        PR #326 dead-assertion fix). Previously this passed because the base was
+        derived from the file's own parent (tautological)."""
+        # Write a valid spec in one allowed dir, but bind the base to a DIFFERENT
+        # allowed dir. The spec resolves outside that base -> ValueError.
+        other_base = Path.home() / ".cao-test-workflows" / uuid.uuid4().hex
+        other_base.mkdir(parents=True, exist_ok=True)
+        try:
+            tmux_client._resolve_and_validate_working_directory(str(other_base))
+            path = _write_spec(spec_dir, "stray")
+            with pytest.raises(ValueError, match="escapes its validated directory"):
+                svc.load_and_validate(str(path), base_dir=str(other_base))
+        finally:
+            import shutil
+
+            shutil.rmtree(other_base, ignore_errors=True)
+
+    def test_file_read_once_no_toctou(self, spec_dir, monkeypatch):
+        """The spec file is opened EXACTLY ONCE (PR #326 TOCTOU fix): the same
+        decoded text feeds grammar validation and model construction. A second
+        read could pick up a mutated revision that never cleared validation."""
+        path = _write_spec(spec_dir, "once")
+        real_open = open
+        opens = {"count": 0}
+
+        def counting_open(file, *a, **kw):
+            if str(file) == os.path.realpath(str(path)):
+                opens["count"] += 1
+            return real_open(file, *a, **kw)
+
+        monkeypatch.setattr("builtins.open", counting_open)
+        spec = svc.load_and_validate(str(path), base_dir=str(spec_dir))
+        assert spec.name == "once"
+        assert opens["count"] == 1
 
 
 class TestValidateOnly:
     def test_pass(self, spec_dir):
         path = _write_spec(spec_dir, "ok")
-        result = svc.validate_only(str(path))
+        result = svc.validate_only(str(path), base_dir=str(spec_dir))
         assert result.status == "pass"
 
     def test_pass_reserved_for_parallel(self, spec_dir):
         body = _GOOD_SPEC.format(name="par").replace("mode: sequential", "mode: parallel")
         path = _write_spec(spec_dir, "par", body)
-        result = svc.validate_only(str(path))
+        result = svc.validate_only(str(path), base_dir=str(spec_dir))
         assert result.status == "pass_reserved"
         assert any("reserved" in n for n in result.reserved_notes)
 
     def test_fail_does_not_raise(self, spec_dir):
         path = _write_spec(spec_dir, "broken", "name: broken\nsteps: []\n")
-        result = svc.validate_only(str(path))
+        result = svc.validate_only(str(path), base_dir=str(spec_dir))
         assert result.status == "fail"
         assert result.errors
 
@@ -149,7 +189,7 @@ class TestValidateOnly:
         clean ``fail`` ValidationResult — validate_only NEVER raises (FR-1.3),
         even when ``WorkflowSpec(**data)`` would raise ``TypeError`` (PR #320)."""
         path = _write_spec(spec_dir, "intkey", "1: foo\nname: intkey\nsteps: []\n")
-        result = svc.validate_only(str(path))
+        result = svc.validate_only(str(path), base_dir=str(spec_dir))
         assert result.status == "fail"
         assert result.errors
 
@@ -166,7 +206,7 @@ class TestIndexUpsertAndList:
 
     def test_upsert_is_idempotent_on_name(self, isolated_db, spec_dir):
         path = _write_spec(spec_dir, "dupe")
-        spec = svc.load_and_validate(str(path))
+        spec = svc.load_and_validate(str(path), base_dir=str(spec_dir))
         svc.upsert_index(spec, str(path))
         svc.upsert_index(spec, str(path))  # second upsert must not duplicate
         rows = svc.list_workflows(scan_dir=str(spec_dir))
