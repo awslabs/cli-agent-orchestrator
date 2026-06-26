@@ -439,7 +439,25 @@ class StatusMonitor:
                     return TerminalStatus.UNKNOWN
 
         with self._lock:
-            return self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
+            cached = self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
+            # When cached status is PROCESSING, the debounced detection may be
+            # stuck: TUI providers (kiro-cli) can send escape sequences
+            # continuously after becoming idle, preventing the 200ms quiescence
+            # timer from ever firing. Do a fresh detection from the current
+            # buffer so poll-based callers (wait_until_status) catch the
+            # PROCESSING→ready transition without waiting for stream silence.
+            if cached == TerminalStatus.PROCESSING:
+                buffer = self._buffers.get(terminal_id, "")
+                if buffer:
+                    fresh = self._detect_status(terminal_id, buffer)
+                    logger.debug(
+                        f"get_status [{terminal_id}]: cached=PROCESSING, "
+                        f"fresh={fresh.value}, buffer_len={len(buffer)}"
+                    )
+                    if fresh != TerminalStatus.PROCESSING and fresh != TerminalStatus.UNKNOWN:
+                        self._apply_detection(terminal_id, fresh)
+                        return fresh
+            return cached
 
     def get_buffer(self, terminal_id: str) -> str:
         """Get accumulated output buffer for a terminal."""
