@@ -396,6 +396,7 @@ class MemoryService:
             "project",
             "agent",
             "global",
+            "federated",
         }:
             return explicit
         return "global"
@@ -413,6 +414,11 @@ class MemoryService:
         agent   → agent_profile
         """
         if scope == MemoryScope.GLOBAL.value:
+            return None
+
+        # ``federated`` is a single machine-wide tier with no per-id
+        # isolation — like ``global``, its scope_id is always None.
+        if scope == MemoryScope.FEDERATED.value:
             return None
 
         ctx = terminal_context or {}
@@ -538,6 +544,10 @@ class MemoryService:
         # container directory.
         if scope == MemoryScope.PROJECT.value and scope_id:
             return self.base_dir / scope_id
+        # ``federated`` is a machine-wide shared tier living in its own
+        # top-level container, a sibling of ``global``.
+        if scope == MemoryScope.FEDERATED.value:
+            return self.base_dir / "federated"
         return self.base_dir / "global"
 
     def get_wiki_path(self, scope: str, scope_id: Optional[str], key: str) -> Path:
@@ -597,6 +607,18 @@ class MemoryService:
         # Validate
         MemoryScope(scope)
         MemoryType(memory_type)
+
+        # Federated writes are credential-gated. The machine-wide shared
+        # tier rejects content matching common secret patterns. The log
+        # line carries the pattern NAME only — never content bytes.
+        if scope == MemoryScope.FEDERATED.value:
+            from cli_agent_orchestrator.services.secret_gate import scan_for_secrets
+
+            hit = scan_for_secrets(content)
+            if hit:
+                # Do not log detector output; emit only a constant event marker.
+                logger.warning("federated_secret_rejected")
+                raise ValueError(f"federated write rejected: matched credential pattern {hit!r}")
 
         # Store-time cross-scope write guard. A caller may
         # only write a scope it is authorised for (SCOPE_RANK). The caller
@@ -1897,6 +1919,7 @@ class MemoryService:
                 MemoryScope.PROJECT.value: 1,
                 MemoryScope.GLOBAL.value: 2,
                 MemoryScope.AGENT.value: 3,
+                MemoryScope.FEDERATED.value: 4,
             }
             results.sort(key=lambda m: (precedence.get(m.scope, 99), -m.updated_at.timestamp()))
 
@@ -2134,11 +2157,24 @@ class MemoryService:
         if global_dir.exists():
             dirs.append(global_dir)
 
+        # Include the machine-wide federated tier when present. The
+        # ``.exists()`` guard preserves the byte-identical search-dir
+        # invariant: with no federated memories on disk, the dir list is
+        # unchanged from pre-federation behaviour.
+        federated_dir = self.base_dir / "federated"
+        if federated_dir.exists() and federated_dir not in dirs:
+            dirs.append(federated_dir)
+
         if scan_all:
             # Enumerate all project-hash dirs (for CLI use where user owns the filesystem)
             if self.base_dir.exists():
                 for child in sorted(self.base_dir.iterdir()):
-                    if child.is_dir() and child.name != "global" and child not in dirs:
+                    if (
+                        child.is_dir()
+                        and child.name != "global"
+                        and child.name != "federated"
+                        and child not in dirs
+                    ):
                         dirs.append(child)
         elif terminal_context:
             # Include the specific project dir for this terminal's cwd

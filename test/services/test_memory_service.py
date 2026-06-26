@@ -241,15 +241,27 @@ class TestRecallScopePrecedence:
                 terminal_context=ctx,
             )
         )
+        _run(
+            svc.store(
+                content="federated fact",
+                scope="federated",
+                memory_type="project",
+                key="fact-federated",
+                terminal_context=ctx,
+            )
+        )
 
         results = _run(svc.recall(query="fact", terminal_context=ctx))
 
-        # Session should come before project, project before global
+        # Session should come before project, project before global,
+        # global before federated (federated has lowest precedence).
         scopes = [m.scope for m in results]
         if "session" in scopes and "project" in scopes:
             assert scopes.index("session") < scopes.index("project")
         if "project" in scopes and "global" in scopes:
             assert scopes.index("project") < scopes.index("global")
+        if "global" in scopes and "federated" in scopes:
+            assert scopes.index("global") < scopes.index("federated")
 
 
 class TestRecallQueryMatching:
@@ -1166,3 +1178,225 @@ class TestSessionScopeIdRoundTrip:
         # CLI scan_all path still sees both.
         results_all = await svc.recall(scope="session", terminal_context=None, scan_all=True)
         assert {m.key for m in results_all} == {"a-key", "b-key"}
+
+
+# ===========================================================================
+# FEDERATED scope (issue #313) — machine-wide shared tier
+# ===========================================================================
+
+
+def _federated_engine(tmp_path: Path):
+    """Build an isolated SQLite engine so DB-row assertions are deterministic."""
+    from sqlalchemy import create_engine
+
+    from cli_agent_orchestrator.clients.database import Base
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'fed.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(bind=engine)
+    return engine
+
+
+def _fed_row(engine, key: str):
+    from sqlalchemy.orm import sessionmaker
+
+    from cli_agent_orchestrator.clients.database import MemoryMetadataModel
+
+    Session = sessionmaker(bind=engine)
+    with Session() as db:
+        return (
+            db.query(MemoryMetadataModel)
+            .filter_by(key=key, scope="federated", scope_id=None)
+            .first()
+        )
+
+
+class TestFederatedScope:
+    """Federated tier: store/recall roundtrip, precedence, layout, forget,
+    scope_id resolution, search-dir invariant, and the secret gate.
+    """
+
+    def test_federated_store_recall_roundtrip(self, tmp_path: Path):
+        svc = MemoryService(base_dir=tmp_path)
+        ctx = _make_terminal_context()
+        _run(
+            svc.store(
+                content="federated shared note about widgets",
+                scope="federated",
+                memory_type="reference",
+                key="fed-note",
+                terminal_context=ctx,
+            )
+        )
+        results = _run(svc.recall(query="widgets", terminal_context=ctx))
+        assert any(m.key == "fed-note" and m.scope == "federated" for m in results)
+
+    def test_federated_recall_ranks_last(self, tmp_path: Path):
+        """With one memory per scope sharing the query term, federated ranks
+        after global (lowest precedence).
+        """
+        svc = MemoryService(base_dir=tmp_path)
+        ctx = _make_terminal_context()
+        for scope, key in (
+            ("session", "rank-session"),
+            ("project", "rank-project"),
+            ("global", "rank-global"),
+            ("federated", "rank-federated"),
+        ):
+            _run(
+                svc.store(
+                    content="shared rankterm content",
+                    scope=scope,
+                    memory_type="reference",
+                    key=key,
+                    terminal_context=ctx,
+                )
+            )
+        results = _run(svc.recall(query="rankterm", terminal_context=ctx))
+        scopes = [m.scope for m in results]
+        assert "global" in scopes and "federated" in scopes
+        assert scopes.index("global") < scopes.index("federated")
+
+    def test_federated_file_location(self, tmp_path: Path):
+        """Wiki file lands at base/federated/wiki/federated/{key}.md."""
+        svc = MemoryService(base_dir=tmp_path)
+        ctx = _make_terminal_context()
+        mem = _run(
+            svc.store(
+                content="federated layout content",
+                scope="federated",
+                memory_type="reference",
+                key="fed-layout",
+                terminal_context=ctx,
+            )
+        )
+        expected = tmp_path / "federated" / "wiki" / "federated" / "fed-layout.md"
+        assert expected.exists()
+        assert Path(mem.file_path).resolve() == expected.resolve()
+
+    def test_federated_forget_removes_file_index_and_row(self, tmp_path: Path):
+        engine = _federated_engine(tmp_path)
+        svc = MemoryService(base_dir=tmp_path, db_engine=engine)
+        ctx = _make_terminal_context()
+        _run(
+            svc.store(
+                content="federated forgettable content",
+                scope="federated",
+                memory_type="reference",
+                key="fed-forget",
+                terminal_context=ctx,
+            )
+        )
+        wiki = tmp_path / "federated" / "wiki" / "federated" / "fed-forget.md"
+        assert wiki.exists()
+        assert _fed_row(engine, "fed-forget") is not None
+        index_path = svc.get_index_path("federated", None)
+        assert "[fed-forget]" in index_path.read_text(encoding="utf-8")
+
+        ok = _run(svc.forget(key="fed-forget", scope="federated", terminal_context=ctx))
+        assert ok is True
+        assert not wiki.exists()
+        assert _fed_row(engine, "fed-forget") is None
+        assert "[fed-forget]" not in index_path.read_text(encoding="utf-8")
+
+    def test_federated_resolve_scope_id_is_none(self, tmp_path: Path):
+        svc = MemoryService(base_dir=tmp_path)
+        ctx = _make_terminal_context()
+        assert svc.resolve_scope_id("federated", ctx) is None
+
+    def test_empty_federated_search_dirs_byte_identical(self, tmp_path: Path):
+        """When no federated dir exists, the search-dir list is unchanged from
+        pre-federation behaviour; an empty federated dir is only appended once
+        it actually exists (guards the recency invariant).
+        """
+        svc = MemoryService(base_dir=tmp_path)
+        ctx = _make_terminal_context()
+        # Seed a global memory so the global dir exists.
+        _run(
+            svc.store(
+                content="global seed",
+                scope="global",
+                memory_type="reference",
+                key="seed",
+                terminal_context=ctx,
+            )
+        )
+        fed_dir = tmp_path / "federated"
+        assert not fed_dir.exists()
+        dirs_absent = svc._get_search_dirs(None, ctx)
+        assert fed_dir not in dirs_absent
+
+        # Creating an empty federated dir adds it; removing it reverts.
+        fed_dir.mkdir(parents=True)
+        dirs_present = svc._get_search_dirs(None, ctx)
+        assert fed_dir in dirs_present
+
+        fed_dir.rmdir()
+        dirs_again = svc._get_search_dirs(None, ctx)
+        assert dirs_again == dirs_absent
+
+    def test_scan_all_does_not_list_federated_twice(self, tmp_path: Path):
+        svc = MemoryService(base_dir=tmp_path)
+        ctx = _make_terminal_context()
+        _run(
+            svc.store(
+                content="federated scanall content",
+                scope="federated",
+                memory_type="reference",
+                key="fed-scanall",
+                terminal_context=ctx,
+            )
+        )
+        dirs = svc._get_search_dirs(None, ctx, scan_all=True)
+        fed_dir = (tmp_path / "federated").resolve()
+        matches = [d for d in dirs if d.resolve() == fed_dir]
+        assert len(matches) == 1
+
+    def test_federated_secret_rejected_nothing_written(self, tmp_path: Path, caplog):
+        """An AKIA key on a federated write raises ValueError and writes
+        nothing (no wiki file, no db row); the error/log carries no secrets.
+        """
+        engine = _federated_engine(tmp_path)
+        svc = MemoryService(base_dir=tmp_path, db_engine=engine)
+        ctx = _make_terminal_context()
+        secret = "deploy creds AKIAIOSFODNN7EXAMPLE here"
+        with caplog.at_level("WARNING", logger="cli_agent_orchestrator.services.memory_service"):
+            with pytest.raises(ValueError) as exc_info:
+                _run(
+                    svc.store(
+                        content=secret,
+                        scope="federated",
+                        memory_type="reference",
+                        key="fed-secret",
+                        terminal_context=ctx,
+                    )
+                )
+        # No secret bytes in the raised message.
+        assert "AKIAIOSFODNN7EXAMPLE" not in str(exc_info.value)
+        # No secret bytes in any log record.
+        for rec in caplog.records:
+            assert "AKIAIOSFODNN7EXAMPLE" not in rec.getMessage()
+        # Nothing persisted.
+        wiki = tmp_path / "federated" / "wiki" / "federated" / "fed-secret.md"
+        assert not wiki.exists()
+        assert _fed_row(engine, "fed-secret") is None
+
+    def test_same_secret_content_allowed_at_global_scope(self, tmp_path: Path):
+        """The gate is federated-only: identical AKIA-bearing content stores
+        fine at scope=global.
+        """
+        svc = MemoryService(base_dir=tmp_path)
+        ctx = _make_terminal_context()
+        secret = "deploy creds AKIAIOSFODNN7EXAMPLE here"
+        mem = _run(
+            svc.store(
+                content=secret,
+                scope="global",
+                memory_type="reference",
+                key="glob-secret-ok",
+                terminal_context=ctx,
+            )
+        )
+        assert Path(mem.file_path).exists()
