@@ -39,6 +39,7 @@ from typing import Any, Dict, List, Optional
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
@@ -411,8 +412,9 @@ class KimiCliProvider(BaseProvider):
             TimeoutError: If shell or Kimi CLI doesn't start within timeout
         """
         # Wait for shell prompt to appear in the tmux window
-        if not await wait_for_shell(self.terminal_id, timeout=10.0):
-            raise TimeoutError("Shell initialization timed out after 10 seconds")
+        init_timeout = get_server_settings()["provider_init_timeout"]
+        if not await wait_for_shell(self.terminal_id, timeout=init_timeout):
+            raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
 
         # Build properly escaped command string
         command = self._build_kimi_command()

@@ -128,8 +128,12 @@ class StatusMonitor:
                 self._feed_screen_locked(terminal_id, chunk)
 
         if not use_screen:
-            # Provider regex analysis can be slow — run it outside the lock.
-            self._apply_detection(terminal_id, self._detect_status(terminal_id, buffer))
+            # Debounced raw detection: same rising-edge + quiescence pattern as
+            # the pyte path.  Detects immediately on the first chunk after quiet
+            # (catches PROCESSING transition), then waits for output to settle
+            # before re-detecting (catches IDLE/COMPLETED without running costly
+            # regex on every single chunk during bursts).
+            self._schedule_raw_detection(terminal_id, buffer)
             return
 
         self._schedule_screen_detection(terminal_id, provider)
@@ -270,6 +274,48 @@ class StatusMonitor:
             self._bursting[terminal_id] = False
             self._quiesce_handle.pop(terminal_id, None)
         self._apply_detection(terminal_id, self._detect_screen(terminal_id, provider))
+
+    def _schedule_raw_detection(self, terminal_id: str, buffer: str) -> None:
+        """Edge-debounce detection on the raw rolling buffer.
+
+        Detects on every chunk while the terminal is in a ready/armed state
+        (to catch the IDLE→PROCESSING transition immediately). Once PROCESSING
+        is observed, switches to quiescence-only detection (the busy→ready
+        transition only matters after output settles). This prevents queue
+        overflow during sustained output while ensuring InboxService never
+        pastes into a busy terminal.
+        """
+        loop = self._running_loop()
+        if loop is None:
+            self._apply_detection(terminal_id, self._detect_status(terminal_id, buffer))
+            return
+        self._loop = loop
+
+        with self._lock:
+            was_bursting = self._bursting.get(terminal_id, False)
+            self._bursting[terminal_id] = True
+            handle = self._quiesce_handle.pop(terminal_id, None)
+            last_status = self._last_status.get(terminal_id)
+        self._cancel_quiesce_handle(handle)
+
+        # While terminal is ready/armed, detect on every chunk so the
+        # IDLE→PROCESSING transition is never missed (prevents stale-IDLE
+        # delivery by InboxService). Once PROCESSING is observed, debounce.
+        if not was_bursting or last_status in _STICKY_READY_STATUSES or last_status is None:
+            detected = self._detect_status(terminal_id, buffer)
+            self._apply_detection(terminal_id, detected)
+
+        new_handle = loop.call_later(PYTE_QUIESCENCE_DELAY_S, self._on_raw_quiescent, terminal_id)
+        with self._lock:
+            self._quiesce_handle[terminal_id] = new_handle
+
+    def _on_raw_quiescent(self, terminal_id: str) -> None:
+        """Quiescence timer fired for raw path: re-detect from current buffer."""
+        with self._lock:
+            self._bursting[terminal_id] = False
+            self._quiesce_handle.pop(terminal_id, None)
+            buffer = self._buffers.get(terminal_id, "")
+        self._apply_detection(terminal_id, self._detect_status(terminal_id, buffer))
 
     @staticmethod
     def _running_loop() -> Optional[asyncio.AbstractEventLoop]:

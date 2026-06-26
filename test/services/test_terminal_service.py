@@ -1,13 +1,16 @@
 """Unit tests for terminal service get_working_directory and send_special_key functions."""
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from cli_agent_orchestrator.services.terminal_service import (
+    exit_terminal_cli,
     get_working_directory,
     send_special_key,
 )
+
+_TS = "cli_agent_orchestrator.services.terminal_service"
 
 
 class TestTerminalServiceWorkingDirectory:
@@ -214,3 +217,57 @@ class TestSendSpecialKey:
         mock_tmux_client.send_special_key.assert_called_once_with(
             "cao-session", "developer-mnop", "Escape"
         )
+
+
+class TestExitTerminalCli:
+    """Tests for exit_terminal_cli — the graceful CLI shutdown helper shared by
+    the exit endpoint and run_agent_step teardown (issue #312 review fix #4)."""
+
+    @patch(f"{_TS}.send_input")
+    @patch(f"{_TS}.send_special_key")
+    @patch(f"{_TS}.provider_manager")
+    def test_text_command_uses_send_input(self, mock_pm, mock_special, mock_input):
+        """A text exit command (e.g. /exit) is sent via send_input."""
+        provider = MagicMock()
+        provider.exit_cli.return_value = "/exit"
+        mock_pm.get_provider.return_value = provider
+
+        exit_terminal_cli("abcd1234")
+
+        mock_input.assert_called_once_with("abcd1234", "/exit")
+        mock_special.assert_not_called()
+
+    @patch(f"{_TS}.send_input")
+    @patch(f"{_TS}.send_special_key")
+    @patch(f"{_TS}.provider_manager")
+    def test_ctrl_key_uses_send_special_key(self, mock_pm, mock_special, mock_input):
+        """A tmux key sequence (e.g. C-d) is sent via send_special_key."""
+        provider = MagicMock()
+        provider.exit_cli.return_value = "C-d"
+        mock_pm.get_provider.return_value = provider
+
+        exit_terminal_cli("abcd1234")
+
+        mock_special.assert_called_once_with("abcd1234", "C-d")
+        mock_input.assert_not_called()
+
+    @patch(f"{_TS}.send_input")
+    @patch(f"{_TS}.send_special_key")
+    @patch(f"{_TS}.provider_manager")
+    def test_meta_key_uses_send_special_key(self, mock_pm, mock_special, mock_input):
+        """A meta key sequence (M-x) also routes via send_special_key."""
+        provider = MagicMock()
+        provider.exit_cli.return_value = "M-x"
+        mock_pm.get_provider.return_value = provider
+
+        exit_terminal_cli("abcd1234")
+
+        mock_special.assert_called_once_with("abcd1234", "M-x")
+        mock_input.assert_not_called()
+
+    @patch(f"{_TS}.provider_manager")
+    def test_no_provider_raises_value_error(self, mock_pm):
+        """No registered provider -> ValueError (mapped to 404 at the boundary)."""
+        mock_pm.get_provider.return_value = None
+        with pytest.raises(ValueError, match="Provider not found"):
+            exit_terminal_cli("deadbeef")

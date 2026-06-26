@@ -25,6 +25,7 @@ from typing import Optional
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
@@ -215,8 +216,9 @@ class KiroCliProvider(BaseProvider):
 
         # Step 1: Wait for shell prompt to appear in the tmux window
         # This ensures the terminal is ready before we send commands
-        if not await wait_for_shell(self.terminal_id, timeout=10.0):
-            raise TimeoutError("Shell initialization timed out after 10 seconds")
+        init_timeout = get_server_settings()["provider_init_timeout"]
+        if not await wait_for_shell(self.terminal_id, timeout=init_timeout):
+            raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
 
         # Capture the shell process name before launching kiro — used later to detect kiro exit
         self.shell_baseline = get_backend().get_pane_current_command(
@@ -261,7 +263,9 @@ class KiroCliProvider(BaseProvider):
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
         # message that get_status() interprets as a completed response.
         if not await wait_until_status(
-            self.terminal_id, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=30.0
+            self.terminal_id,
+            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+            timeout=float(get_server_settings()["provider_init_timeout"]),
         ):
             if yolo:
                 # Yolo already launched with --legacy-ui; no further fallback.
@@ -271,8 +275,11 @@ class KiroCliProvider(BaseProvider):
             # Exit the current session and start fresh with --legacy-ui
             status_monitor.notify_input_sent(self.terminal_id)
             get_backend().send_keys(self.session_name, self.window_name, "/exit")
-            if not await wait_for_shell(self.terminal_id, timeout=10.0):
-                raise TimeoutError("Shell recovery timed out after --legacy-ui fallback")
+            init_timeout = get_server_settings()["provider_init_timeout"]
+            if not await wait_for_shell(self.terminal_id, timeout=init_timeout):
+                raise TimeoutError(
+                    f"Shell recovery timed out after {init_timeout}s (--legacy-ui fallback)"
+                )
             # Clear the StatusMonitor buffer so the --legacy-ui attempt is detected
             # against a clean buffer, not one still full of stale TUI marker bytes
             # from the failed first attempt (which would otherwise time out too).
@@ -285,7 +292,9 @@ class KiroCliProvider(BaseProvider):
             status_monitor.notify_input_sent(self.terminal_id)
             get_backend().send_keys(self.session_name, self.window_name, legacy_command)
             if not await wait_until_status(
-                self.terminal_id, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=30.0
+                self.terminal_id,
+                {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
+                timeout=float(get_server_settings()["provider_init_timeout"]),
             ):
                 raise TimeoutError("Kiro CLI initialization timed out with TUI and `--legacy-ui`")
 

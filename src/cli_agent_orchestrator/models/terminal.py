@@ -42,3 +42,19 @@ class Terminal(BaseModel):
         None, description="Current terminal status (live only)"
     )
     last_active: Optional[datetime] = Field(None, description="Last active timestamp")
+
+
+class AgentStepResult(BaseModel):
+    """Transient result of one agent step (issue #312, C3b). Not persisted.
+
+    ``run_agent_step`` returns this ONLY on success (status COMPLETED); all
+    failure modes raise narrow exceptions instead. It lives here in the terminal
+    layer (not the workflow module) because it is the generic step substrate's
+    return type and is conceptually workflow-independent — keeping it out of
+    ``models/workflow.py`` lets ``services/agent_step.py`` avoid importing the
+    workflow module (and its jsonschema/yaml deps).
+    """
+
+    terminal_id: str
+    last_message: str
+    status: TerminalStatus

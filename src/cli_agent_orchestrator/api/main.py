@@ -50,6 +50,7 @@ from cli_agent_orchestrator.constants import (
     SERVER_HOST,
     SERVER_PORT,
     SERVER_VERSION,
+    TERMINALS_RUN_STEP_ROUTE,
     TRUSTED_FORWARDER_IPS,
     WS_ALLOWED_CLIENTS,
     add_local_cors_origins,
@@ -64,12 +65,12 @@ from cli_agent_orchestrator.models.memory import (
 )
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalId
 from cli_agent_orchestrator.plugins import PluginRegistry
-from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services import (
     flow_service,
     session_service,
     terminal_service,
 )
+from cli_agent_orchestrator.services.agent_step import StepExecutionError, run_agent_step
 from cli_agent_orchestrator.services.cleanup_service import (
     cleanup_expired_memories,
     cleanup_old_data,
@@ -152,6 +153,73 @@ async def inbox_reconciliation_daemon(registry: PluginRegistry) -> None:
 class TerminalOutputResponse(BaseModel):
     output: str
     mode: str
+
+
+class RunStepRequest(BaseModel):
+    """Request body for the combined step-execution endpoint (N0, #312)."""
+
+    provider: str = Field(description="Provider type (e.g. 'kiro_cli', 'claude_code')")
+    agent: str = Field(description="Agent profile name")
+    prompt: str = Field(description="Prompt to send (caller applies any prompt shaping first)")
+    session_name: Optional[str] = Field(
+        default=None,
+        description="Existing session to create the terminal in; auto-generated if None",
+    )
+    reuse_terminal_id: Optional[str] = Field(
+        default=None, description="Reuse an existing terminal (skips create + teardown)"
+    )
+    teardown: bool = Field(
+        default=True,
+        description="Delete the created terminal after the step (ignored when reusing)",
+    )
+    timeout: float = Field(default=600.0, description="Max seconds to wait for completion", gt=0)
+    working_directory: Optional[str] = Field(
+        default=None, description="Working directory for a freshly created terminal"
+    )
+    caller_id: Optional[str] = Field(
+        default=None,
+        description="Supervisor terminal ID to record for structural callback routing (#284)",
+    )
+    allowed_tools: Optional[list[str]] = Field(
+        default=None,
+        description="Resolved allowed-tools list for a freshly created terminal (handoff inheritance)",
+    )
+
+
+class RunStepResponse(BaseModel):
+    """Response wrapping an ``AgentStepResult`` from ``run_agent_step``."""
+
+    terminal_id: str
+    last_message: str
+    status: str
+
+
+class WorkflowValidateRequest(BaseModel):
+    """Request body for ``POST /workflows/validate`` (Bolt 2, N2)."""
+
+    path: str = Field(description="Filesystem path to the workflow spec YAML file")
+
+
+class StepOutputRequest(BaseModel):
+    """Request body for the structured-return endpoint (Bolt 2, N4, C5).
+
+    For the synthetic-key MVP there is no run record, so the step's
+    ``output_schema`` arrives WITH the request (F2) rather than being re-resolved
+    from a run aggregate.
+    """
+
+    output: Dict = Field(description="The worker-emitted JSON output for the step")
+    output_schema: Optional[Dict] = Field(
+        default=None, description="The step's JSON-Schema (Draft 2020-12); None = no validation"
+    )
+
+
+class StepOutputResponse(BaseModel):
+    """Response for the structured-return endpoint — mirrors the stored record."""
+
+    validated: bool
+    errors: List[str]
+    state: str
 
 
 class SkillContentResponse(BaseModel):
@@ -904,17 +972,7 @@ async def get_terminal_output(
 async def exit_terminal(terminal_id: TerminalId) -> Dict:
     """Send provider-specific exit command to terminal."""
     try:
-        provider = provider_manager.get_provider(terminal_id)
-        if provider is None:
-            raise ValueError(f"Provider not found for terminal {terminal_id}")
-        exit_command = provider.exit_cli()
-        # Some providers use tmux key sequences (e.g., "C-d" for Ctrl+D) instead
-        # of text commands (e.g., "/exit"). Key sequences must be sent via
-        # send_special_key() to be interpreted by tmux, not as literal text.
-        if exit_command.startswith(("C-", "M-")):
-            terminal_service.send_special_key(terminal_id, exit_command)
-        else:
-            terminal_service.send_input(terminal_id, exit_command)
+        terminal_service.exit_terminal_cli(terminal_id)
         return {"success": True}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -923,6 +981,196 @@ async def exit_terminal(terminal_id: TerminalId) -> Dict:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to exit terminal: {str(e)}",
         )
+
+
+@app.post(
+    TERMINALS_RUN_STEP_ROUTE,
+    response_model=RunStepResponse,
+    summary="Run one agent step (shared substrate)",
+    description=(
+        "Failure contract: a non-2xx body is a structured object "
+        "`{message, kind, terminal_id}`. **`kind` is authoritative** — "
+        '`kind="error"` means the worker CRASHED (terminal reached ERROR), '
+        '`kind="timeout"` means it RAN LONG. The HTTP status mirrors `kind` '
+        "(502 = crashed, 504 = ran long) for transport-layer consumers, but a "
+        "caller MUST branch on `kind`, not the status code. `terminal_id` names "
+        "the live terminal (read it as a field; never regex-scrape `message`)."
+    ),
+)
+async def run_step(request: Request, body: RunStepRequest) -> RunStepResponse:
+    """Run a single agent step through the shared substrate (N0, #312).
+
+    This is the combined server-side endpoint both step callers converge on:
+    the handoff MCP client reaches it over HTTP (one call replacing its former
+    six granular round-trips); the run engine (N5) calls ``run_agent_step``
+    directly in-process and never round-trips here (single-seam rule, ADR-3).
+
+    The handler body is ``await run_agent_step(...)``. Domain failures from the
+    substrate are mapped to ``HTTPException`` at this boundary (project Mandated
+    boundary-map rule).
+
+    Failure contract (the future engine caller depends on this, so it is spelled
+    out, not just inferable from the handler):
+
+    - A failed step returns a STRUCTURED detail object
+      ``{"message": str, "kind": "timeout"|"error", "terminal_id": str|None}``.
+    - ``kind`` is the AUTHORITATIVE discriminator. ``kind="error"`` => the worker
+      CRASHED (the terminal reached ``TerminalStatus.ERROR``); ``kind="timeout"``
+      => the worker RAN LONG (readiness/completion wait elapsed). The HTTP status
+      is derived FROM ``kind`` (``error`` -> 502 Bad Gateway, ``timeout`` -> 504
+      Gateway Timeout) as a convenience for transport-layer consumers — a client
+      that can read the body MUST branch on ``kind``, not the status code.
+    - ``terminal_id`` names the live terminal the step ran on (when known) so a
+      caller can report/clean it up without regex-scraping ``message``.
+    - A bad terminal reference -> 404; any other failure -> 500 (plain-string
+      detail, no ``kind`` — these are not step-execution outcomes).
+
+    The plugin registry is threaded so teardown's ``post_kill_terminal`` hooks
+    fire (parity with the DELETE endpoint).
+    """
+    try:
+        result = await run_agent_step(
+            provider=body.provider,
+            agent=body.agent,
+            prompt=body.prompt,
+            session_name=body.session_name,
+            reuse_terminal_id=body.reuse_terminal_id,
+            teardown=body.teardown,
+            timeout=body.timeout,
+            working_directory=body.working_directory,
+            caller_id=body.caller_id,
+            allowed_tools=body.allowed_tools,
+            registry=get_plugin_registry(request),
+        )
+        return RunStepResponse(
+            terminal_id=result.terminal_id,
+            last_message=result.last_message,
+            status=(result.status.value if hasattr(result.status, "value") else str(result.status)),
+        )
+    except StepExecutionError as e:
+        # The step did not complete successfully. Distinguish a worker that
+        # CRASHED (kind="error" -> 502 Bad Gateway) from one that RAN LONG
+        # (kind="timeout" -> 504 Gateway Timeout) so the caller can tell them
+        # apart instead of reporting every failure as a timeout. The detail is a
+        # structured object carrying terminal_id, so callers read it as a field
+        # rather than regex-scraping the message (the future engine reads it too).
+        code = status.HTTP_502_BAD_GATEWAY if e.kind == "error" else status.HTTP_504_GATEWAY_TIMEOUT
+        raise HTTPException(
+            status_code=code,
+            detail={"message": str(e), "kind": e.kind, "terminal_id": e.terminal_id},
+        )
+    except TimeoutError as e:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail={"message": str(e), "kind": "timeout", "terminal_id": None},
+        )
+    except ValueError as e:
+        # Unknown terminal / bad input surfaced by the terminal layer.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to run step: {str(e)}",
+        )
+
+
+# =============================================================================
+# Workflow authoring + structured-return endpoints (issue #312, Bolt 2)
+# =============================================================================
+# Single integration seam for the `cao workflow` CLI verbs and the
+# `workflow_return` MCP tool (B2-BR-10). Core services raise narrow exceptions;
+# this boundary maps them to HTTPException (B2-BR-9): ValueError -> 400,
+# FileNotFoundError/KeyError -> 404. The run/cancel/status endpoints are Bolt 3.
+
+
+@app.post("/workflows/validate")
+async def validate_workflow_endpoint(body: WorkflowValidateRequest) -> Dict:
+    """Validate a workflow spec without running it (FR-1.3). Returns ValidationResult."""
+    from cli_agent_orchestrator.services import workflow_spec_service
+
+    try:
+        result = workflow_spec_service.validate_only(body.path)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return result.model_dump()
+
+
+@app.get("/workflows")
+async def list_workflows_endpoint(dir: Optional[str] = Query(default=None)) -> List[Dict]:
+    """List indexed workflows, rebuilt from the spec files on disk (FR-2.1)."""
+    from cli_agent_orchestrator.services import workflow_spec_service
+
+    try:
+        rows = workflow_spec_service.list_workflows(scan_dir=dir)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return [row.model_dump() for row in rows]
+
+
+@app.get("/workflows/{name}")
+async def get_workflow_endpoint(name: str) -> Dict:
+    """Return the parsed/validated spec for a workflow name (FR-2.1)."""
+    from cli_agent_orchestrator.services import workflow_spec_service
+
+    try:
+        spec = workflow_spec_service.get_workflow(name)
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown workflow '{name}'"
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return spec.model_dump()
+
+
+@app.delete("/workflows/{name}")
+async def delete_workflow_endpoint(name: str) -> Dict:
+    """Delete a workflow's spec file and its index row (FR-2.4)."""
+    from cli_agent_orchestrator.services import workflow_spec_service
+
+    try:
+        workflow_spec_service.delete_workflow(name)
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown workflow '{name}'"
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return {"success": True, "name": name}
+
+
+@app.post(
+    "/workflows/runs/{run_id}/steps/{step_id}/output",
+    response_model=StepOutputResponse,
+)
+async def record_step_output_endpoint(
+    run_id: str, step_id: str, body: StepOutputRequest
+) -> StepOutputResponse:
+    """Record a worker's structured output for a step (FR-4.1, C5).
+
+    Validation lives at this seam (ADR-4). A schema-invalid output does NOT 500 —
+    it is stored with ``validated=False`` / state ``COMPLETED_UNVALIDATED`` and
+    returned as a 200 (the engine acts on the flag in Bolt 3). A malformed
+    ``run_id`` / ``step_id`` (failing the name regex) maps to 400.
+    """
+    from cli_agent_orchestrator.services.step_output_store import record_step_output
+
+    try:
+        record = record_step_output(
+            run_id=run_id,
+            step_id=step_id,
+            output=body.output,
+            output_schema=body.output_schema,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return StepOutputResponse(
+        validated=record.validated,
+        errors=record.errors,
+        state=record.state.value,
+    )
 
 
 @app.delete("/terminals/{terminal_id}")
