@@ -10,6 +10,23 @@ import pytest
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider, ProviderError
 
+
+@pytest.fixture(autouse=True)
+def cleanup_tmp_files():
+    """Remove temp prompt/mcp files created by _build_claude_command during tests."""
+    yield
+    tmp_dir = Path.home() / ".aws" / "cli-agent-orchestrator" / "tmp"
+    if tmp_dir.exists():
+        for f in tmp_dir.glob("test*.prompt"):
+            f.unlink(missing_ok=True)
+        for f in tmp_dir.glob("test*.mcp.json"):
+            f.unlink(missing_ok=True)
+        for f in tmp_dir.glob("term-*.prompt"):
+            f.unlink(missing_ok=True)
+        for f in tmp_dir.glob("term-*.mcp.json"):
+            f.unlink(missing_ok=True)
+
+
 # All initialization tests need to patch _ensure_skip_bypass_prompt_setting
 # to avoid writing to the real ~/.claude/settings.json.
 _PATCH_SETTINGS = patch.object(ClaudeCodeProvider, "_ensure_skip_bypass_prompt_setting")
@@ -170,7 +187,7 @@ class TestClaudeCodeProviderInitialization:
         command = provider._build_claude_command()
 
         assert "--agent my-claude-agent" in command
-        assert "--append-system-prompt" not in command
+        assert "--append-system-prompt-file" not in command
         assert "--mcp-config" not in command
 
     @pytest.mark.asyncio
@@ -1094,7 +1111,7 @@ class TestClaudeCodeProviderMisc:
         command = provider._build_claude_command()
 
         assert "claude" in command
-        assert "--append-system-prompt" in command
+        assert "--append-system-prompt-file" in command
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     def test_build_command_mcp_injects_terminal_id(self, mock_load):
@@ -1112,13 +1129,14 @@ class TestClaudeCodeProviderMisc:
         command = provider._build_claude_command()
 
         assert "--mcp-config" in command
-        # Extract the JSON arg after --mcp-config
+        # Extract the file path arg after --mcp-config
         parts = command.split("--mcp-config ")
-        mcp_json_str = parts[1].strip()
-        # shlex.join wraps the JSON in single quotes; strip them
-        if mcp_json_str.startswith("'") and mcp_json_str.endswith("'"):
-            mcp_json_str = mcp_json_str[1:-1]
-        mcp_data = json.loads(mcp_json_str)
+        mcp_file_path = parts[1].strip().split()[0]
+        # shlex.join wraps in single quotes; strip them
+        if mcp_file_path.startswith("'") and mcp_file_path.endswith("'"):
+            mcp_file_path = mcp_file_path[1:-1]
+        mcp_data = json.loads(Path(mcp_file_path).read_text())
+        Path(mcp_file_path).unlink(missing_ok=True)
         server_env = mcp_data["mcpServers"]["cao-mcp-server"]["env"]
         assert server_env["CAO_TERMINAL_ID"] == "term-42"
 
@@ -1141,10 +1159,11 @@ class TestClaudeCodeProviderMisc:
         command = provider._build_claude_command()
 
         parts = command.split("--mcp-config ")
-        mcp_json_str = parts[1].strip()
-        if mcp_json_str.startswith("'") and mcp_json_str.endswith("'"):
-            mcp_json_str = mcp_json_str[1:-1]
-        mcp_data = json.loads(mcp_json_str)
+        mcp_file_path = parts[1].strip().split()[0]
+        if mcp_file_path.startswith("'") and mcp_file_path.endswith("'"):
+            mcp_file_path = mcp_file_path[1:-1]
+        mcp_data = json.loads(Path(mcp_file_path).read_text())
+        Path(mcp_file_path).unlink(missing_ok=True)
         server_env = mcp_data["mcpServers"]["my-server"]["env"]
         # Original vars preserved
         assert server_env["MY_VAR"] == "my_value"
@@ -1171,10 +1190,11 @@ class TestClaudeCodeProviderMisc:
         command = provider._build_claude_command()
 
         parts = command.split("--mcp-config ")
-        mcp_json_str = parts[1].strip()
-        if mcp_json_str.startswith("'") and mcp_json_str.endswith("'"):
-            mcp_json_str = mcp_json_str[1:-1]
-        mcp_data = json.loads(mcp_json_str)
+        mcp_file_path = parts[1].strip().split()[0]
+        if mcp_file_path.startswith("'") and mcp_file_path.endswith("'"):
+            mcp_file_path = mcp_file_path[1:-1]
+        mcp_data = json.loads(Path(mcp_file_path).read_text())
+        Path(mcp_file_path).unlink(missing_ok=True)
         server_env = mcp_data["mcpServers"]["my-server"]["env"]
         # Should keep the user-provided value, NOT overwrite with term-99
         assert server_env["CAO_TERMINAL_ID"] == "user-provided-id"

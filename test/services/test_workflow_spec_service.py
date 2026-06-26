@@ -193,6 +193,30 @@ class TestValidateOnly:
         assert result.status == "fail"
         assert result.errors
 
+    def test_missing_file_returns_fail_not_raises(self, spec_dir):
+        """A nonexistent (but in-policy) spec path is a ``fail`` result, NOT an
+        exception — the service reads the file behind the guard and degrades to
+        the model's never-raise contract (PR #326 CodeQL text-only refactor)."""
+        result = svc.validate_only(str(spec_dir / "ghost.yaml"), base_dir=str(spec_dir))
+        assert result.status == "fail"
+        assert result.errors
+
+    def test_model_validate_only_never_opens_a_path(self, spec_dir, monkeypatch):
+        """The model-level ``validate_only`` is text-only: it must NEVER call
+        ``open`` even when handed a string that happens to be a real file path
+        (PR #326 — removes the path-injection sink at the source)."""
+        from cli_agent_orchestrator.models import workflow as model
+
+        path = _write_spec(spec_dir, "decoy")
+
+        def _boom(*a, **kw):
+            raise AssertionError("model.validate_only must not open the filesystem")
+
+        monkeypatch.setattr("builtins.open", _boom)
+        # Passing a real path string -> treated as raw YAML text, no open() call.
+        result = model.validate_only(str(path))
+        assert result.status == "fail"  # the path string is not valid spec YAML
+
 
 class TestIndexUpsertAndList:
     def test_upsert_then_list(self, isolated_db, spec_dir):

@@ -11,7 +11,7 @@ import re
 import threading
 from typing import Dict, List, Optional, Tuple
 
-from cli_agent_orchestrator.constants import EVENT_BUS_MAX_QUEUE_SIZE
+from cli_agent_orchestrator.services.settings_service import get_server_settings
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +48,9 @@ class EventBus:
 
     def subscribe(self, pattern: str) -> asyncio.Queue:
         """Subscribe to a topic pattern (e.g., 'terminal.*.output'). Returns async queue."""
-        queue: asyncio.Queue = asyncio.Queue(maxsize=EVENT_BUS_MAX_QUEUE_SIZE)
+        queue: asyncio.Queue = asyncio.Queue(
+            maxsize=get_server_settings()["event_bus_max_queue_size"]
+        )
 
         with self._lock:
             if "*" in pattern:
