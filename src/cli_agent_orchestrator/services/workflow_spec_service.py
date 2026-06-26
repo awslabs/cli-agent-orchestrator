@@ -167,15 +167,32 @@ def load_and_validate(path: str, base_dir: Optional[str] = None) -> WorkflowSpec
 
 
 def validate_only(path: str, base_dir: Optional[str] = None) -> ValidationResult:
-    """Thin delegate to Bolt 1's ``validate_only`` (FR-1.3). NEVER raises.
+    """Read a spec file behind the path guard and validate its grammar (FR-1.3).
 
-    The directory is policy-checked first (B2-BR-1) so an out-of-policy path is a
-    ``ValueError`` (-> 400) rather than a silent ``fail`` — the only behavior the
-    endpoint adds over the raw model surface. Returns the model's
-    ``ValidationResult`` verbatim (status / reserved_notes / errors).
+    The path is canonicalized + bound to its configured base directory first
+    (B2-BR-1) so an out-of-policy path is a ``ValueError`` (-> 400). The file is
+    read here (behind the guard) and only its decoded TEXT is handed to the
+    model's text-only ``validate_only`` — the model never touches the filesystem
+    (removes the path-injection sink at the source). A missing/unreadable file
+    becomes a ``fail`` ValidationResult so the surface still NEVER raises for a
+    well-formed-but-absent spec, matching the model's never-raise contract.
+
+    Raises:
+        ValueError: the base directory is blocked or the path escapes it.
     """
     real_path = _safe_spec_path(path, base_dir)
-    return _model_validate_only(real_path)
+    try:
+        with open(real_path, "rb") as fh:
+            raw = fh.read()
+    except OSError as exc:
+        logger.debug("validate_only: could not read spec %s: %s", real_path, exc)
+        return ValidationResult(status="fail", errors=[f"could not read spec: {exc}"])
+    if len(raw) > WORKFLOW_MAX_SPEC_BYTES:
+        return ValidationResult(
+            status="fail",
+            errors=[f"spec is {len(raw)} bytes (max {WORKFLOW_MAX_SPEC_BYTES})"],
+        )
+    return _model_validate_only(raw.decode("utf-8", errors="replace"))
 
 
 # ---------------------------------------------------------------------------
