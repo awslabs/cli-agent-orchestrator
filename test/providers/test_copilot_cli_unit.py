@@ -552,3 +552,24 @@ class TestCopilotCliProviderMisc:
         provider._initialized = True
         provider.cleanup()
         assert provider._initialized is False
+
+
+class TestCopilotCliServerSettings:
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.copilot_cli.get_server_settings")
+    @patch("cli_agent_orchestrator.providers.copilot_cli.wait_for_shell")
+    async def test_initialize_uses_provider_init_timeout(self, mock_wait_shell, mock_settings):
+        """initialize() reads provider_init_timeout from server settings."""
+        mock_settings.return_value = {
+            "mcp_request_timeout": 120,
+            "event_bus_max_queue_size": 8192,
+            "provider_init_timeout": 45,
+            "startup_prompt_handler_timeout": 5,
+        }
+        mock_wait_shell.return_value = False
+        provider = CopilotCliProvider("test1234", "test-session", "window-0")
+
+        with pytest.raises(TimeoutError):
+            await provider.initialize()
+
+        mock_wait_shell.assert_called_once_with("test1234", timeout=45)

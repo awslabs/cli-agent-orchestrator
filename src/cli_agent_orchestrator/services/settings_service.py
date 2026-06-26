@@ -67,6 +67,69 @@ def set_agent_dirs(dirs: Dict[str, str]) -> Dict[str, str]:
     return get_agent_dirs()
 
 
+# Default server tuning values
+_SERVER_DEFAULTS = {
+    "mcp_request_timeout": 30,
+    "event_bus_max_queue_size": 1024,
+    "provider_init_timeout": 60,
+    "startup_prompt_handler_timeout": 20,
+}
+
+
+_server_settings_cache: Optional[Dict[str, Any]] = None
+_server_settings_mtime_ns: int = -1
+
+
+def get_server_settings() -> Dict[str, Any]:
+    """Get server tuning settings (cached; re-reads only when file changes).
+
+    Returns a dict with the following keys (defaults shown):
+      - mcp_request_timeout (30): Seconds to wait for MCP HTTP calls
+      - event_bus_max_queue_size (1024): Max events buffered per subscriber
+      - provider_init_timeout (60): Seconds to wait for a CLI agent to reach IDLE
+      - startup_prompt_handler_timeout (20): Seconds to handle startup prompts
+        (e.g., workspace trust dialogs) before giving up
+
+    Values can be set in ~/.aws/cli-agent-orchestrator/settings.json under
+    the "server" key:
+
+        {
+          "server": {
+            "mcp_request_timeout": 120,
+            "event_bus_max_queue_size": 8192,
+            "provider_init_timeout": 90,
+            "startup_prompt_handler_timeout": 5
+          }
+        }
+    """
+    global _server_settings_cache, _server_settings_mtime_ns
+    # Cache: only re-read when the file has changed
+    try:
+        mtime_ns = SETTINGS_FILE.stat().st_mtime_ns if SETTINGS_FILE.exists() else -1
+    except OSError:
+        mtime_ns = -1
+    if _server_settings_cache is not None and mtime_ns == _server_settings_mtime_ns:
+        return dict(_server_settings_cache)
+
+    settings = _load()
+    saved = settings.get("server", {})
+    if not isinstance(saved, dict):
+        logger.warning("Invalid settings.server=%r (expected object); using defaults", saved)
+        saved = {}
+    result = dict(_SERVER_DEFAULTS)
+    result.update({k: v for k, v in saved.items() if k in _SERVER_DEFAULTS})
+    # Validate types and ranges; coerce to int for queue size
+    for key, default in _SERVER_DEFAULTS.items():
+        val = result[key]
+        if isinstance(val, bool) or not isinstance(val, (int, float)) or val <= 0:
+            logger.warning(f"Invalid server setting {key}={val!r}, using default {default}")
+            result[key] = default
+    result["event_bus_max_queue_size"] = int(result["event_bus_max_queue_size"])
+    _server_settings_cache = result
+    _server_settings_mtime_ns = mtime_ns
+    return dict(result)
+
+
 def get_memory_settings() -> Dict[str, Any]:
     """Get memory-related settings.
 

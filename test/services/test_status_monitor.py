@@ -324,3 +324,33 @@ class TestQuiescenceTimerCancel:
         # No timer scheduled for this terminal — must not blow up.
         sm.clear_terminal("missing")
         sm._loop.call_soon_threadsafe.assert_not_called()
+
+
+class TestRawDebounceArmedDetection:
+    """Regression: raw debounce must detect PROCESSING on later chunks while armed."""
+
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    def test_armed_ready_detects_processing_on_second_chunk(self, mock_get_backend, mock_pm):
+        """When terminal is IDLE (armed), chunk 1 is UNKNOWN, chunk 2 has PROCESSING
+        marker — PROCESSING must be detected immediately, not deferred to quiescence."""
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = MagicMock()
+        provider.supports_screen_detection = False
+        mock_pm.get_provider.return_value = provider
+
+        sm = StatusMonitor()
+        # Simulate terminal already at IDLE (armed state)
+        sm._last_status["t1"] = TerminalStatus.IDLE
+        sm._allow_processing_revert["t1"] = True
+
+        # Mock _detect_status: first call returns UNKNOWN, second returns PROCESSING
+        detect_results = iter([TerminalStatus.UNKNOWN, TerminalStatus.PROCESSING])
+        sm._detect_status = lambda tid, buf: next(detect_results)
+
+        # Chunk 1: UNKNOWN — should still attempt detection (terminal is ready)
+        sm._process_chunk("t1", "neutral output")
+        # Chunk 2: PROCESSING — must detect immediately, not wait for quiescence
+        sm._process_chunk("t1", "● Working on task...")
+
+        assert sm._last_status["t1"] == TerminalStatus.PROCESSING
