@@ -362,11 +362,8 @@ class KiroCliProvider(BaseProvider):
         # the spinner disappears and the idle prompt appears. In the raw
         # FIFO buffer, the idle prompt text lands AFTER the last spinner
         # frame, so checking new_tui_idle_matches after last_init_pos is a
-        # reliable post-init signal.
-        #
-        # The Copilot concern about the placeholder appearing during boot
-        # doesn't apply in practice: during the spinner, ONLY spinner frames
-        # are written to the stream. The idle prompt only enters the buffer
+        # reliable post-init signal. During the spinner, only spinner frames
+        # are written to the stream; the idle prompt only enters the buffer
         # when the TUI redraws after init completes.
         init_matches = list(re.finditer(TUI_INITIALIZING_PATTERN, clean_output))
         if init_matches:

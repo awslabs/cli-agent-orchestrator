@@ -1387,7 +1387,7 @@ class TestKiroCliTuiMode:
         assert not re.search(TUI_PROCESSING_PATTERN, "Kiro is idle")
 
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
-    def test_tui_initializing_without_idle_yields_processing(self, mock_tmux):
+    def test_tui_initializing_without_idle_yields_processing(self, mock_backend):
         """Spinner visible without idle prompt means still initializing."""
         output = (
             "● Initializing...\n"
@@ -1401,7 +1401,7 @@ class TestKiroCliTuiMode:
         assert status == TerminalStatus.PROCESSING
 
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
-    def test_tui_initializing_with_idle_after_yields_idle(self, mock_tmux):
+    def test_tui_initializing_with_idle_after_yields_idle(self, mock_backend):
         """Idle prompt appearing after init text means TUI finished booting.
 
         In the raw FIFO stream, the idle prompt only enters the buffer after
@@ -1454,6 +1454,17 @@ class TestKiroCliTuiMode:
             TUI_INITIALIZING_PATTERN,
             "2 of 5 mcp servers initialized. ctrl-c to start chatting now",
         )
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    def test_kiro_28x_initializing_without_idle_yields_processing(self, mock_backend):
+        """kiro 2.8.x boot text without idle prompt means still loading."""
+        output = (
+            " Initializing · type to queue a message\n"
+            "────────────────────────────────────────────────────\n"
+            "developer · auto · ◔ 0%\n"
+        )
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
 
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
     def test_mcp_server_init_without_idle_yields_processing(self, mock_backend):

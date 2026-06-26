@@ -448,16 +448,19 @@ class StatusMonitor:
             # PROCESSING→ready transition without waiting for stream silence.
             if cached == TerminalStatus.PROCESSING:
                 buffer = self._buffers.get(terminal_id, "")
-                if buffer:
-                    fresh = self._detect_status(terminal_id, buffer)
-                    logger.debug(
-                        f"get_status [{terminal_id}]: cached=PROCESSING, "
-                        f"fresh={fresh.value}, buffer_len={len(buffer)}"
-                    )
-                    if fresh != TerminalStatus.PROCESSING and fresh != TerminalStatus.UNKNOWN:
-                        self._apply_detection(terminal_id, fresh)
-                        return fresh
-            return cached
+            else:
+                buffer = ""
+
+        if cached == TerminalStatus.PROCESSING and buffer:
+            fresh = self._detect_status(terminal_id, buffer)
+            logger.debug(
+                f"get_status [{terminal_id}]: cached=PROCESSING, "
+                f"fresh={fresh.value}, buffer_len={len(buffer)}"
+            )
+            if fresh != TerminalStatus.PROCESSING and fresh != TerminalStatus.UNKNOWN:
+                self._apply_detection(terminal_id, fresh)
+                return fresh
+        return cached
 
     def get_buffer(self, terminal_id: str) -> str:
         """Get accumulated output buffer for a terminal."""
