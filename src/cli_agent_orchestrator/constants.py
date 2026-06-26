@@ -13,6 +13,15 @@ from pathlib import Path
 
 from cli_agent_orchestrator.models.provider import ProviderType
 
+
+def _env_int(name: str, default: int) -> int:
+    """Read an integer env var, falling back when the value is invalid."""
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
 # =============================================================================
 # Session Configuration
 # =============================================================================
@@ -67,7 +76,7 @@ STATE_BUFFER_MAX = 8192
 # Max events buffered per subscriber queue before dropping. Claude's TUI startup
 # can emit thousands of small chunks in a short burst, so keep this comfortably
 # above the old 1024 default while still bounded.
-EVENT_BUS_MAX_QUEUE_SIZE = int(os.environ.get("CAO_EVENT_BUS_MAX_QUEUE_SIZE", "16384"))
+EVENT_BUS_MAX_QUEUE_SIZE = _env_int("CAO_EVENT_BUS_MAX_QUEUE_SIZE", 16384)
 
 # pyte-rendered status detection. When enabled, the StatusMonitor feeds each
 # terminal's output through a pyte terminal emulator and runs detection against

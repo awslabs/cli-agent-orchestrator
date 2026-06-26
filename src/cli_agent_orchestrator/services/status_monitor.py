@@ -242,7 +242,7 @@ class StatusMonitor:
             try:
                 return provider.get_status(fallback_buffer)
             except Exception:
-                logger.exception(f"Error detecting fallback status for {terminal_id}")
+                logger.exception("Error detecting fallback status for %s", terminal_id)
                 return TerminalStatus.UNKNOWN
         if not lines or provider is None:
             return TerminalStatus.UNKNOWN
