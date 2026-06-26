@@ -83,8 +83,8 @@ def _safe_dir(scan_dir: Optional[str]) -> str:
     return tmux_client._resolve_and_validate_working_directory(scan_dir)
 
 
-def _safe_spec_path(path: str) -> str:
-    """Canonicalize a spec FILE path and bind it to its policy-checked directory.
+def _safe_spec_path(path: str, base_dir: Optional[str] = None) -> str:
+    """Canonicalize a spec FILE path and bind it to a CONFIGURED base directory.
 
     The single guarded entry for turning a user/agent-supplied spec path into a
     real path safe to stat/open. Two stages, mirroring the shared working-dir
@@ -93,22 +93,25 @@ def _safe_spec_path(path: str) -> str:
 
     1. ``os.path.realpath`` canonicalizes the path (resolves symlinks + ``..``).
        This is the PathNormalization step.
-    2. ``_safe_dir`` policy-checks the containing directory against the
-       blocked-system-directory frozenset, then we assert the resolved file lies
-       INSIDE that validated directory via ``startswith`` — the SafeAccessCheck
-       that clears the normalized path for the filesystem ops downstream.
+    2. ``_safe_dir`` policy-checks the base directory (``base_dir`` if given,
+       else ``WORKFLOW_SPEC_DIR``) against the blocked-system-directory
+       frozenset, then we assert the resolved file lies INSIDE that validated
+       base via ``startswith`` — the SafeAccessCheck that clears the normalized
+       path for the filesystem ops downstream.
 
-    Beyond satisfying the scanner this tightens the contract: a path whose
-    realpath escapes its policy-checked directory (e.g. a symlink pointing out)
-    is rejected rather than silently followed.
+    The base is a SEPARATELY-derived configured root, NOT the file's own parent —
+    so the containment check is load-bearing: a spec must resolve inside the
+    workflow directory (or the caller-supplied ``scan_dir``). A path whose
+    realpath escapes that base (e.g. a symlink pointing out, ``..`` traversal, or
+    an arbitrary external path) is rejected rather than silently followed.
 
     Raises:
-        ValueError: the containing directory is blocked, or the resolved file
-            escapes that validated directory.
+        ValueError: the base directory is blocked, or the resolved file escapes
+            that validated base directory.
     """
     real_path = os.path.realpath(os.path.abspath(path))
-    safe_dir = _safe_dir(os.path.dirname(real_path))
-    if not real_path.startswith(safe_dir + os.sep):
+    safe_base = _safe_dir(base_dir)  # None -> WORKFLOW_SPEC_DIR; realpath + blocked-dir guard
+    if real_path != safe_base and not real_path.startswith(safe_base + os.sep):
         raise ValueError(f"workflow spec path '{path}' escapes its validated directory")
     return real_path
 
@@ -116,7 +119,7 @@ def _safe_spec_path(path: str) -> str:
 # ---------------------------------------------------------------------------
 # Read path
 # ---------------------------------------------------------------------------
-def load_and_validate(path: str) -> WorkflowSpec:
+def load_and_validate(path: str, base_dir: Optional[str] = None) -> WorkflowSpec:
     """Load a spec file, validate its grammar, and return the typed model (C2).
 
     The single read path. The containing directory is policy-checked by the
@@ -125,27 +128,37 @@ def load_and_validate(path: str) -> WorkflowSpec:
     ``ValueError`` so the boundary maps it to 400. A ``pass_reserved`` spec loads
     successfully — reserved-ness is not a load error (Bolt-1 BR-3).
 
+    The file is read EXACTLY ONCE: the same decoded text is fed to grammar
+    validation and to model construction. Reading twice (validate the path, then
+    re-open it) opened a TOCTOU window — validate could pass on revision A while
+    the second read loaded revision B that never cleared grammar validation
+    (PR #326 review). One read, one parse, no window.
+
     Raises:
         FileNotFoundError: the path is not an existing file.
         ValueError: the directory is blocked, the file is unreadable, or the
             spec fails grammar validation.
     """
-    # Canonicalize + bind the file to its policy-checked directory (rejects a
-    # blocked dir or a path that escapes it) before any stat/open.
-    real_path = _safe_spec_path(path)
+    # Canonicalize + bind the file to its configured base directory (rejects a
+    # blocked base or a path that escapes it) before any stat/open.
+    real_path = _safe_spec_path(path, base_dir)
 
     if not os.path.isfile(real_path):
         raise FileNotFoundError(f"workflow spec not found: {path}")
 
-    result = _model_validate_only(real_path)  # Bolt-1 surface; NEVER raises (BR-7)
-    if result.status == "fail":
-        raise ValueError("; ".join(result.errors) or "spec failed validation")
-
+    # Single read: byte-cap, decode, then reuse the text for BOTH validation and
+    # construction so they see byte-identical content (closes the TOCTOU window).
     with open(real_path, "rb") as fh:
         raw = fh.read()
     if len(raw) > WORKFLOW_MAX_SPEC_BYTES:
         raise ValueError(f"spec is {len(raw)} bytes (max {WORKFLOW_MAX_SPEC_BYTES})")
-    data = yaml.safe_load(raw.decode("utf-8"))
+    text = raw.decode("utf-8")
+
+    result = _model_validate_only(text)  # raw text, not path; NEVER raises (BR-7)
+    if result.status == "fail":
+        raise ValueError("; ".join(result.errors) or "spec failed validation")
+
+    data = yaml.safe_load(text)
     if not isinstance(data, dict):
         raise ValueError("spec root must be a mapping (YAML object)")
     # WorkflowSpec construction re-runs grammar validation; it cannot fail here
@@ -153,7 +166,7 @@ def load_and_validate(path: str) -> WorkflowSpec:
     return WorkflowSpec(**data)
 
 
-def validate_only(path: str) -> ValidationResult:
+def validate_only(path: str, base_dir: Optional[str] = None) -> ValidationResult:
     """Thin delegate to Bolt 1's ``validate_only`` (FR-1.3). NEVER raises.
 
     The directory is policy-checked first (B2-BR-1) so an out-of-policy path is a
@@ -161,7 +174,7 @@ def validate_only(path: str) -> ValidationResult:
     endpoint adds over the raw model surface. Returns the model's
     ``ValidationResult`` verbatim (status / reserved_notes / errors).
     """
-    real_path = _safe_spec_path(path)
+    real_path = _safe_spec_path(path, base_dir)
     return _model_validate_only(real_path)
 
 
@@ -235,7 +248,9 @@ def rebuild_index_from_files(scan_dir: Optional[str] = None) -> int:
     rows = 0
     for path in paths:
         try:
-            spec = load_and_validate(path)
+            # Bind containment to the SAME dir we globbed from (not WORKFLOW_SPEC_DIR)
+            # so a caller-supplied scan_dir resolves its own specs.
+            spec = load_and_validate(path, base_dir=safe_dir)
         except (ValueError, FileNotFoundError) as e:
             logger.warning("rebuild: skipping unparseable spec %s: %s", path, e)
             continue
@@ -251,6 +266,12 @@ def list_workflows(scan_dir: Optional[str] = None) -> List[WorkflowIndexRow]:
     (B2-BR-2), so a transparent rebuild guarantees the listing reflects disk and
     is byte-identical after a manual drop. Rows are returned ``ORDER BY name`` —
     the single ordering key the byte-identity invariant rests on (B2-BR-3).
+
+    COST CEILING: each of ``list`` / ``get`` / ``delete`` triggers a FULL O(n)
+    rebuild (glob + n reads + n parses + n upserts). Fine for the handful of
+    specs Bolt 2 targets, but a future caller (e.g. the run engine) MUST NOT call
+    ``get_workflow`` in a loop — a 100-step workflow would be 100 rebuilds =
+    O(n²) reads. Resolve the spec once and pass it down instead.
     """
     rebuild_index_from_files(scan_dir)
     with _connect() as conn:
@@ -296,15 +317,17 @@ def get_workflow(name_or_path: str, scan_dir: Optional[str] = None) -> WorkflowS
     canonical source path. Raises ``KeyError`` for an unknown name (-> 404),
     ``FileNotFoundError`` / ``ValueError`` as ``load_and_validate`` does.
     """
-    # A path-like argument is canonicalized + bound to its policy-checked
+    # A path-like argument is canonicalized + bound to its configured base
     # directory BEFORE the stat (never stat raw user input); a bare name falls
     # through to the index lookup. A blocked/escaping path raises ValueError.
     if os.sep in name_or_path or (os.altsep and os.altsep in name_or_path):
-        safe_path = _safe_spec_path(name_or_path)
+        safe_path = _safe_spec_path(name_or_path, scan_dir)
         if os.path.isfile(safe_path):
-            return load_and_validate(safe_path)
+            return load_and_validate(safe_path, base_dir=scan_dir)
+    # The resolved source_path lives under scan_dir (the index was rebuilt from
+    # it), so bind containment to that same dir on load.
     source_path = _resolve_source_path(name_or_path, scan_dir)
-    return load_and_validate(source_path)
+    return load_and_validate(source_path, base_dir=scan_dir)
 
 
 def delete_workflow(name: str, scan_dir: Optional[str] = None) -> None:
