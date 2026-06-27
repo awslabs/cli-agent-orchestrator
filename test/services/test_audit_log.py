@@ -393,6 +393,13 @@ class TestT9SyncVsNowait:
         assert SYNC_AUDIT_EVENTS == frozenset(
             {
                 "lint_run_completed",
+                # Phase 4 U1 — wiki self-healing mutations.
+                "orphan_pruned",
+                "contradiction_resolved",
+                "stale_claim_pruned",
+                "poison_access_zeroed",
+                "heal_run_completed",
+                "heal_partial_mutation",
             }
         )
 

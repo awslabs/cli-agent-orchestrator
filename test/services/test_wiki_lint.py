@@ -541,6 +541,48 @@ class TestT2SemaphoreAndTimeouts:
         ]
         assert timeouts, f"expected at least one timeout lint_error; got {issues}"
 
+    def test_build_pairs_does_not_cross_containers(self):
+        """Same key + same tag in two project containers MUST NOT pair.
+
+        Regression for cross-project corruption: a cross-container pair stamps a
+        contradiction finding with one container's scope_id, which `cao memory
+        heal --scope project --apply` would then apply (and delete) in that
+        container on evidence sourced from the other container.
+        """
+        rows = [
+            _row("beta", scope="project", scope_id="project_a", tags="shared", content="x" * 100),
+            _row("beta", scope="project", scope_id="project_b", tags="shared", content="y" * 100),
+        ]
+        pairs, original = _build_pairs(rows, max_pairs=50)
+        assert pairs == []
+        assert original == 0
+
+    def test_build_pairs_within_container_still_pairs(self):
+        """Two distinct rows sharing a tag in the SAME container still pair, so
+        the cross-container guard is not over-broad."""
+        rows = [
+            _row("alpha", scope="project", scope_id="project_a", tags="shared", content="x" * 100),
+            _row("gamma", scope="project", scope_id="project_a", tags="shared", content="y" * 100),
+        ]
+        pairs, original = _build_pairs(rows, max_pairs=50)
+        assert len(pairs) == 1
+        a, b = pairs[0]
+        assert (a["scope_id"], b["scope_id"]) == ("project_a", "project_a")
+
+    def test_same_key_pairs_independent_across_containers(self):
+        """A same-key pair in container A must not suppress (via de-dupe) a
+        legitimate same-key pair in container B."""
+        rows = [
+            _row("dup", scope="project", scope_id="project_a", tags="shared", content="a" * 100),
+            _row("dup", scope="project", scope_id="project_a", tags="shared", content="b" * 100),
+            _row("dup", scope="project", scope_id="project_b", tags="shared", content="c" * 100),
+            _row("dup", scope="project", scope_id="project_b", tags="shared", content="d" * 100),
+        ]
+        pairs, _ = _build_pairs(rows, max_pairs=50)
+        assert len(pairs) == 2
+        for a, b in pairs:
+            assert a["scope_id"] == b["scope_id"]
+
 
 # ===========================================================================
 # T3 — detected_at visible in CLI table, JSON output, daily log
