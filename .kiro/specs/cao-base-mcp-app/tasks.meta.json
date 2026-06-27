@@ -1,0 +1,13 @@
+{
+  "pbtResults": {
+    "2.2 Write property test for `normalize_kind` totality (Hypothesis)": {
+      "status": "passed",
+      "lastRunTimestamp": 1782362737986
+    },
+    "2.4 Write property test for `history()` bound and order (Hypothesis)": {
+      "status": "passed",
+      "lastRunTimestamp": 1782362738153
+    }
+  },
+  "executionHistory": {}
+}

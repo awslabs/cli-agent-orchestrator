@@ -19,6 +19,7 @@ from typing import Annotated, Dict, List, Optional, cast
 from fastapi import (
     BackgroundTasks,
     Body,
+    Depends,
     FastAPI,
     HTTPException,
     Query,
@@ -42,6 +43,7 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.constants import (
     ALLOWED_HOSTS,
+    API_BASE_URL,
     CAO_HOME_DIR,
     CORS_ORIGINS,
     DEFAULT_PROVIDER,
@@ -55,6 +57,7 @@ from cli_agent_orchestrator.constants import (
     WS_ALLOWED_CLIENTS,
     add_local_cors_origins,
 )
+from cli_agent_orchestrator.ext_apps import mount_widget_static
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.memory import (
@@ -65,6 +68,12 @@ from cli_agent_orchestrator.models.memory import (
 )
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalId
 from cli_agent_orchestrator.plugins import PluginRegistry
+from cli_agent_orchestrator.security.auth import (
+    SCOPES_SUPPORTED,
+    get_authorization_servers,
+    get_current_scopes,
+    is_auth_enabled,
+)
 from cli_agent_orchestrator.services import (
     flow_service,
     session_service,
@@ -442,6 +451,32 @@ app.add_middleware(
 )
 
 
+@app.get("/.well-known/oauth-protected-resource")
+async def oauth_protected_resource_metadata():
+    """RFC 9728 Protected Resource Metadata.
+
+    Advertises the resource audience, the authorization server(s), the supported
+    scopes (``cao:read``/``cao:write``/``cao:admin``), and the supported bearer
+    methods so OAuth clients can discover how to obtain access. Returns HTTP 404
+    when auth is disabled (default-off), so the localhost-only posture is
+    byte-for-byte unchanged (Requirement 15.2).
+    """
+    if not is_auth_enabled():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="auth disabled")
+
+    audience = (
+        os.getenv("CAO_AUTH_AUDIENCE", "").strip()
+        or os.getenv("AUTH0_AUDIENCE", "").strip()
+        or API_BASE_URL
+    )
+    return {
+        "resource": audience,
+        "authorization_servers": get_authorization_servers(),
+        "scopes_supported": SCOPES_SUPPORTED,
+        "bearer_methods_supported": ["header"],
+    }
+
+
 @app.get("/health")
 async def health_check():
     import shutil
@@ -464,6 +499,52 @@ async def health_check():
             "claude": _probe("claude"),
         },
     }
+
+
+@app.get("/events")
+async def events_stream():
+    """Stream live, normalized fleet events to the iframe as Server-Sent Events.
+
+    Events come from the in-process ``SseBus`` (fed by the ``EventLogPublisher``
+    plugin). The bus is drop-on-slow with a bounded per-subscriber queue, so one
+    stalled iframe never applies back-pressure to the orchestration core; gaps are
+    backfilled by the client via ``/events/history`` / ``cao_fetch_history``.
+    """
+    from fastapi.responses import StreamingResponse
+
+    from cli_agent_orchestrator.services.sse_bus import get_bus
+
+    async def event_generator():
+        async for event in get_bus().subscribe():
+            yield f"data: {json.dumps(event)}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@app.get("/events/history")
+async def events_history(
+    limit: int = 500,
+    since: Optional[str] = None,
+    kinds: Optional[str] = None,
+) -> Dict:
+    """Replay recent fleet events from the ring buffer (JSON, newest-last).
+
+    Events are already normalized to the six-primitive vocabulary at append time.
+    ``kinds`` is an optional comma-separated filter; ``since`` is an ISO-8601
+    timestamp lower bound (exclusive).
+    """
+    from cli_agent_orchestrator.services.event_log_service import get_event_log
+
+    kinds_filter = [k.strip() for k in kinds.split(",") if k.strip()] if kinds else None
+    events = get_event_log().history(limit=limit, since=since, kinds=kinds_filter)
+    return {"events": events}
+
+
+# Topology widget static bundle at /widgets/topology/ — the vanilla SSE-driven
+# view consumed alongside the /events stream above. The mount is default-off
+# (no-op unless CAO_MCP_APPS_ENABLED is set) and idempotent, so re-importing this
+# module under dev/reload is safe.
+mount_widget_static(app)
 
 
 @app.get("/agents/profiles")
@@ -656,6 +737,7 @@ async def create_session(
     allowed_tools: Optional[str] = None,
     memory_manager: Optional[str] = None,
     env_vars: Optional[Dict[str, str]] = Body(default=None, embed=True),
+    _scopes: List[str] = Depends(get_current_scopes),
 ) -> Terminal:
     """Create a new session with exactly one terminal.
 
@@ -762,7 +844,11 @@ async def get_session(session_name: str) -> Dict:
 
 
 @app.delete("/sessions/{session_name}")
-async def delete_session(request: Request, session_name: str) -> Dict:
+async def delete_session(
+    request: Request,
+    session_name: str,
+    _scopes: List[str] = Depends(get_current_scopes),
+) -> Dict:
     try:
         validate_tmux_name(session_name, "session_name")
     except ValueError as e:
@@ -907,6 +993,7 @@ async def send_terminal_input(
     message: str,
     sender_id: Optional[str] = None,
     orchestration_type: Optional[OrchestrationType] = None,
+    _scopes: List[str] = Depends(get_current_scopes),
 ) -> Dict:
     try:
         success = terminal_service.send_input(
@@ -929,7 +1016,11 @@ async def send_terminal_input(
 
 
 @app.post("/terminals/{terminal_id}/key")
-async def send_terminal_key(terminal_id: TerminalId, key: str) -> Dict:
+async def send_terminal_key(
+    terminal_id: TerminalId,
+    key: str,
+    _scopes: List[str] = Depends(get_current_scopes),
+) -> Dict:
     """Send a tmux special key to a terminal."""
     if not TMUX_KEY_PATTERN.fullmatch(key):
         raise HTTPException(
@@ -1196,6 +1287,7 @@ async def create_inbox_message_endpoint(
     receiver_id: TerminalId,
     sender_id: str,
     message: str,
+    _scopes: List[str] = Depends(get_current_scopes),
 ) -> Dict:
     """Create inbox message and attempt immediate delivery."""
     try:

@@ -1476,6 +1476,24 @@ async def workflow_return(
     ).model_dump()
 
 
+# Register the MCP App tools (render_dashboard / render_agent_view / cao_fetch_history /
+# subscribe_events / submit_command) and the ui://cao/* resources. This is a no-op that
+# returns False unless CAO_MCP_APPS_ENABLED is set, so the default posture is unchanged.
+from cli_agent_orchestrator.mcp_server.app_tools import register_app_tools  # noqa: E402
+
+register_app_tools(mcp)
+
+# Topology widget (cao://widget/topology, with a /widgets/topology/ static
+# fallback) and SEP-2133 capability advertisement. Both are default-off (no-op
+# unless CAO_MCP_APPS_ENABLED is set) and best-effort, so the default posture is
+# unchanged. advertise_capability makes the initialize handshake announce
+# io.modelcontextprotocol/ui so SEP-1865 hosts discover the surface.
+from cli_agent_orchestrator.ext_apps import advertise_capability, register_widget  # noqa: E402
+
+register_widget(mcp)
+advertise_capability(mcp)
+
+
 def main():
     """Main entry point for the MCP server."""
     mcp.run()
