@@ -428,6 +428,12 @@ def _build_pairs(rows: list, max_pairs: int) -> tuple[list, int]:
     Returns ``(pairs, original_count)`` so the caller can emit a
     ``lint_error info`` if truncated.
     """
+    # Bucket by (scope, scope_id, tag), NOT tag alone: a contradiction can only
+    # be remediated within a single container (the healer re-reads both keys in
+    # the finding's scope_id), so pairing rows from two different project
+    # containers would let `cao memory heal` delete a current-project memory on
+    # cross-project evidence. Mirrors poison_frequency/graph_density, which
+    # already iterate per-container via rows_by_scope.
     tag_buckets: dict = {}
     for r in rows:
         body_len = len((r.get("content") or ""))
@@ -437,18 +443,22 @@ def _build_pairs(rows: list, max_pairs: int) -> tuple[list, int]:
             t = tag.strip()
             if not t:
                 continue
-            tag_buckets.setdefault(t, []).append(r)
+            bucket_key = (r.get("scope"), r.get("scope_id"), t)
+            tag_buckets.setdefault(bucket_key, []).append(r)
     seen: set = set()
     pairs: list = []
-    for bucket in tag_buckets.values():
+    for (sc, sc_id, _tag), bucket in tag_buckets.items():
         if len(bucket) < 2:
             continue
         for i, a in enumerate(bucket):
             for b in bucket[i + 1 :]:
-                key_pair = tuple(sorted([a["key"], b["key"]]))
-                if key_pair in seen:
+                # De-dupe within the container: include scope identity so a
+                # same-key pair in container A cannot suppress a legitimate
+                # same-key pair in container B.
+                dedupe_key = (sc, sc_id, *sorted([a["key"], b["key"]]))
+                if dedupe_key in seen:
                     continue
-                seen.add(key_pair)
+                seen.add(dedupe_key)
                 pairs.append((a, b))
     original = len(pairs)
 
@@ -501,6 +511,14 @@ async def _detect_contradictions(
         )
         return issues
 
+    # Defense in depth: never run a contradiction check across two containers,
+    # even if a future caller bypasses _build_pairs' per-container bucketing. A
+    # cross-container pair has no single scope_id the healer can safely act on.
+    same_container_pairs = [
+        (a, b)
+        for (a, b) in pairs
+        if (a.get("scope"), a.get("scope_id")) == (b.get("scope"), b.get("scope_id"))
+    ]
     tasks = [
         _check_pair(
             client,
@@ -511,7 +529,7 @@ async def _detect_contradictions(
             timeout_s=per_pair_timeout_s,
             scope_id=a.get("scope_id"),
         )
-        for (a, b) in pairs
+        for (a, b) in same_container_pairs
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     for r in results:
