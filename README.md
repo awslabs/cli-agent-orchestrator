@@ -199,6 +199,24 @@ Then open http://localhost:9889.
 
 For hot-reload dev mode, remote access over SSH, and rebuilding the frontend from source (only these require Node.js), see [docs/web-ui.md](docs/web-ui.md). For frontend architecture, see [web/README.md](web/README.md).
 
+## MCP Apps — host-rendered fleet UI
+
+Beyond the browser dashboard, CAO can render its fleet UI **inside an MCP App-capable host** (Claude Desktop, Cursor, VS Code Insiders, Goose) using the [SEP-1865 "MCP Apps"](https://modelcontextprotocol.io/seps/1865-mcp-apps-interactive-user-interfaces-for-mcp) extension — so you observe and steer agents without leaving your chat host. It ships three single-file views (`ui://cao/dashboard`, `ui://cao/agent`, `ui://cao/event-stream`) plus a build-free topology widget, backed by an in-process event ring buffer and a single audited `submit_command` mutation path.
+
+![CAO MCP Apps — fleet dashboard rendered in an MCP App host](docs/media/mcp-apps-dashboard.png)
+
+*The fleet dashboard rendered from the built `ui://cao/dashboard` bundle. Full motion walk-through (dashboard → agent detail → live event stream): [`docs/media/mcp-apps-demo.webm`](docs/media/mcp-apps-demo.webm). Regenerate via `cd cao_mcp_apps && npm run build:all && node scripts/record-demo.mjs`.*
+
+It is **default-off and behavior-preserving** — packaged as the built-in `mcp_apps` plugin and registered only when enabled:
+
+```bash
+export CAO_MCP_APPS_ENABLED=true
+cao-server        # REST + SSE /events on :9889
+cao-mcp-server    # registers the MCP App tools/resources for your host
+```
+
+New in this area: `src/cli_agent_orchestrator/ext_apps/` (resources + topology widget), `cao_mcp_apps/` (JIT-free React views), `src/cli_agent_orchestrator/plugins/builtin/mcp_apps.py` (the plugin), with docs in [docs/mcp-apps.md](docs/mcp-apps.md), a worked example in [examples/mcp-apps/](examples/mcp-apps/), and the [skills/cao-mcp-apps](skills/cao-mcp-apps/SKILL.md) operator playbook. Optional default-off OAuth 2.1 scopes (`cao:read`/`cao:write`/`cao:admin`) gate mutations when an IdP is configured.
+
 ## Multi-Agent Orchestration
 
 CAO agents coordinate through a local HTTP server (default `localhost:9889`). CLI agents reach it via MCP tools to route messages, track status, and drive orchestration.

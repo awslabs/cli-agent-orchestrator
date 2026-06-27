@@ -1413,6 +1413,18 @@ async def memory_forget(
         return {"success": False, "error": str(e)}
 
 
+# The MCP Apps surface — tools (render_dashboard / render_agent_view /
+# cao_fetch_history / subscribe_events / submit_command), the ui://cao/* resources,
+# the topology widget (cao://widget/topology + /widgets/topology/), and the SEP-2133
+# capability advertisement — is packaged as the built-in ``mcp_apps`` plugin and
+# registered here through the cao.plugins entry-point group (each plugin's
+# on_mcp_server hook runs best-effort). The surface is default-off: a no-op unless
+# CAO_MCP_APPS_ENABLED is set, so the default posture is unchanged.
+from cli_agent_orchestrator.plugins.registry import register_mcp_server_surfaces  # noqa: E402
+
+register_mcp_server_surfaces(mcp)
+
+
 def main():
     """Main entry point for the MCP server."""
     mcp.run()

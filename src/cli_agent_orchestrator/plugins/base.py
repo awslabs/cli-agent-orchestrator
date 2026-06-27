@@ -4,7 +4,7 @@ This module defines the marker base class plugin authors subclass and the
 decorator used to associate async plugin methods with CAO event types.
 """
 
-from typing import Awaitable, Callable, ParamSpec, TypeVar
+from typing import Any, Awaitable, Callable, ParamSpec, TypeVar
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -30,6 +30,15 @@ class CaoPlugin:
         """Called once on server shutdown.
 
         Override to close connections or flush buffers.
+        """
+
+    def on_mcp_server(self, mcp: Any) -> None:
+        """Called once at MCP server startup with the FastMCP server instance.
+
+        Override to register MCP tools, resources, or capabilities on ``mcp``.
+        Runs synchronously while the server module initializes (before
+        ``mcp.run()``). Default: no-op. Best-effort — the registry isolates
+        failures so a broken plugin never blocks server startup.
         """
 
 
