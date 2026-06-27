@@ -519,6 +519,15 @@ async def _detect_contradictions(
         for (a, b) in pairs
         if (a.get("scope"), a.get("scope_id")) == (b.get("scope"), b.get("scope_id"))
     ]
+    dropped = len(pairs) - len(same_container_pairs)
+    if dropped:
+        # Should be unreachable while _build_pairs buckets per-container; surface
+        # a regression there rather than silently degrading detection.
+        logger.warning(
+            "contradiction: dropped %d cross-container pair(s) — _build_pairs "
+            "bucketing regression?",
+            dropped,
+        )
     tasks = [
         _check_pair(
             client,
