@@ -36,6 +36,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from cli_agent_orchestrator.constants import (
     WORKFLOW_MAX_INPUTS,
+    WORKFLOW_MAX_RETRIES,
     WORKFLOW_MAX_SPEC_BYTES,
     WORKFLOW_MAX_STEPS,
     WORKFLOW_NAME_RE,
@@ -50,9 +51,14 @@ from cli_agent_orchestrator.constants import (
 # pulling this grammar module's heavy deps onto the HTTP seam.
 from cli_agent_orchestrator.models.workflow_runtime import (  # noqa: F401
     ReturnAck,
+    RunState,
+    RunStatus,
     StepOutputRecord,
+    StepResult,
     StepState,
+    StepStatus,
     WorkflowIndexRow,
+    WorkflowRunResult,
 )
 
 logger = logging.getLogger(__name__)
@@ -99,14 +105,6 @@ def is_reserved(construct: str) -> bool:
 # ---------------------------------------------------------------------------
 # Enums / reserved vocabulary (defined here; animated by N5+)
 # ---------------------------------------------------------------------------
-class RunState(str, Enum):
-    """Whole-run state. Defined in Bolt 1; instantiated by the engine (N5)."""
-
-    RUNNING = "running"
-    COMPLETED = "completed"
-    FAILED = "failed"
-
-
 class LoopGuard(str, Enum):
     """Loop guardrail vocabulary (FR-8.2). Validated structurally now (BR-4),
     enforced at run time by N8."""
@@ -163,6 +161,12 @@ class WorkflowStep(BaseModel):
     on_no_progress: Optional[str] = None
     # Per-step failure policy (FR-5.3). Semantics are N5's.
     on_failure: Optional[Literal["halt", "continue"]] = None
+    # Per-step run-failure retry budget (FR-5.3, B3-BR-3). Separate from
+    # ``on_failure``: ``retries`` = how many EXTRA attempts on a run-failure
+    # (None -> engine default of WORKFLOW_DEFAULT_STEP_RETRIES); ``on_failure`` =
+    # what to do once attempts are exhausted. ``retries: 0`` => exactly one
+    # attempt, no retry. Validated in ``validate_grammar`` (0..WORKFLOW_MAX_RETRIES).
+    retries: Optional[int] = None
 
     def is_loop(self) -> bool:
         """True if this step declares ANY loop field (so BR-4 applies)."""
@@ -232,6 +236,23 @@ class WorkflowSpec(BaseModel):
                 schema_error = _check_output_schema(step.output_schema)
                 if schema_error is not None:
                     errors.append(f"step '{step.id}': {schema_error}")
+
+        # 4b. Per-step retry budget (B3-BR-3): if present, must be an integer in
+        # [0, WORKFLOW_MAX_RETRIES]. Omitted -> engine default (regression-safe:
+        # a spec without ``retries`` parses exactly as before). ``bool`` is a
+        # subclass of ``int`` so reject it explicitly (``retries: true`` is not 1).
+        for step in self.steps:
+            if step.retries is not None:
+                if isinstance(step.retries, bool) or not isinstance(step.retries, int):
+                    errors.append(
+                        f"step '{step.id}': retries must be an integer "
+                        f"(0..{WORKFLOW_MAX_RETRIES})"
+                    )
+                elif not (0 <= step.retries <= WORKFLOW_MAX_RETRIES):
+                    errors.append(
+                        f"step '{step.id}': retries {step.retries} out of range "
+                        f"(0..{WORKFLOW_MAX_RETRIES})"
+                    )
 
         # 5. Loop guardrail completeness — structural floor (BR-4/FR-8.2).
         for step in self.steps:
