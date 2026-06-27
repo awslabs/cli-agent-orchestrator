@@ -1,0 +1,112 @@
+"""Unit tests for the SSE fan-out bus (services/sse_bus.py).
+
+Covers drop-on-slow back-pressure, non-blocking publish, multi-subscriber
+isolation, subscriber registration/removal, and the singleton accessor.
+"""
+
+import asyncio
+
+import pytest
+
+from cli_agent_orchestrator.services import sse_bus as sse_bus_module
+from cli_agent_orchestrator.services.sse_bus import SseBus, get_bus
+
+
+async def _start(bus: SseBus):
+    """Subscribe and advance the generator to its first ``await queue.get()``.
+
+    Returns the generator and the in-flight ``__anext__`` task so the caller can
+    consume one event (``await task``) or cancel for cleanup.
+    """
+
+    gen = bus.subscribe()
+    task = asyncio.ensure_future(gen.__anext__())
+    await asyncio.sleep(0)  # let the generator register its queue
+    return gen, task
+
+
+async def _stop(gen, task) -> None:
+    """Cancel the in-flight read and let the generator's finally remove the sub."""
+
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, StopAsyncIteration):
+        pass
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_publish_delivers_to_subscriber() -> None:
+    """A subscribed iframe receives published events."""
+
+    bus = SseBus()
+    gen, task = await _start(bus)
+
+    bus.publish({"id": "1", "kind": "launch"})
+    received = await task
+    assert received == {"id": "1", "kind": "launch"}
+
+    await gen.aclose()
+
+
+@pytest.mark.asyncio
+async def test_full_queue_drops_without_blocking_producer() -> None:
+    """A full subscriber queue drops events; publish returns immediately."""
+
+    bus = SseBus()
+    gen, task = await _start(bus)
+
+    # Fill well past the bounded capacity. None of these should raise or block
+    # even though the subscriber never drains its queue.
+    for i in range(sse_bus_module.SSE_MAX_QUEUE_SIZE + 50):
+        bus.publish({"id": str(i)})
+
+    assert bus.subscriber_count == 1
+    await _stop(gen, task)
+
+
+@pytest.mark.asyncio
+async def test_slow_subscriber_does_not_starve_healthy_subscriber() -> None:
+    """A stalled subscriber's full queue must not stop delivery to others."""
+
+    bus = SseBus()
+
+    # Slow subscriber: registered but never drained; fill its queue.
+    slow_gen, slow_task = await _start(bus)
+    for i in range(sse_bus_module.SSE_MAX_QUEUE_SIZE + 5):
+        bus.publish({"id": f"pre-{i}"})
+
+    # Healthy subscriber joins now with an empty queue.
+    healthy_gen, healthy_task = await _start(bus)
+
+    bus.publish({"id": "healthy-event"})
+    received = await asyncio.wait_for(healthy_task, timeout=1.0)
+    assert received == {"id": "healthy-event"}
+
+    await _stop(slow_gen, slow_task)
+    await healthy_gen.aclose()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_removes_subscriber_from_active_set() -> None:
+    """Closing the generator removes the subscriber's queue."""
+
+    bus = SseBus()
+    gen, task = await _start(bus)
+    assert bus.subscriber_count == 1
+
+    await _stop(gen, task)
+    assert bus.subscriber_count == 0
+
+
+def test_publish_with_no_subscribers_is_noop() -> None:
+    """Publishing to an empty bus does not raise."""
+
+    bus = SseBus()
+    bus.publish({"id": "x"})
+    assert bus.subscriber_count == 0
+
+
+def test_get_bus_returns_singleton() -> None:
+    assert get_bus() is get_bus()
