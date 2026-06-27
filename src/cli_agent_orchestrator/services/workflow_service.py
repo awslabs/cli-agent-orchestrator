@@ -356,6 +356,7 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
         if record.cancelled:  # boundary check (B3-BR-7)
             return
         st.attempts = attempt
+        st.error = None
         prompt = _substitute(step.prompt, record)  # §4 templating
         try:
             result = await run_agent_step(
