@@ -1250,7 +1250,7 @@ class TestClaudeCodeProviderPermissionMode:
         assert "--dangerously-skip-permissions" not in command
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
-    def test_yolo_overrides_permission_mode(self, mock_load):
+    def test_permission_mode_takes_priority_over_yolo(self, mock_load):
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.system_prompt = None
@@ -1261,8 +1261,8 @@ class TestClaudeCodeProviderPermissionMode:
         provider = ClaudeCodeProvider("tid", "sess", "win", "agent", allowed_tools=["*"])
         command = provider._build_claude_command()
 
-        assert "--dangerously-skip-permissions" in command
-        assert "--permission-mode" not in command
+        assert "--permission-mode auto" in command
+        assert "--dangerously-skip-permissions" not in command
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     def test_legacy_profile_without_permission_mode(self, mock_load):
