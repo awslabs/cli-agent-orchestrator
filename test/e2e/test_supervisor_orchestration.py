@@ -669,3 +669,44 @@ class TestAntigravityCliSupervisorOrchestration:
     def test_supervisor_assign_and_handoff(self, require_antigravity):
         """Supervisor uses assign + handoff to orchestrate multi-agent workflow."""
         _run_supervisor_assign_test(provider="antigravity_cli")
+
+
+# ---------------------------------------------------------------------------
+# Devin CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestDevinCliSupervisorOrchestration:
+    """E2E supervisor orchestration tests for the Devin CLI provider.
+
+    Validates that a Devin CLI supervisor agent can autonomously drive
+    the assign + handoff + send_message flow via the cao-mcp-server
+    tools — the canonical multi-agent e2e test from the
+    ``examples/assign/`` scenario.
+
+    Requires the ``devin`` binary on PATH
+    and the agent profiles installed for devin_cli::
+
+        cao install examples/assign/analysis_supervisor.md --provider devin_cli
+        cao install examples/assign/data_analyst.md --provider devin_cli
+        cao install examples/assign/report_generator.md --provider devin_cli
+    """
+
+    def test_supervisor_handoff(self, require_devin):
+        """Devin CLI supervisor uses handoff MCP tool to delegate to report_generator."""
+        _run_supervisor_handoff_test(provider="devin_cli")
+
+    def test_supervisor_assign_and_handoff(self, require_devin):
+        """Devin CLI supervisor uses assign + handoff to orchestrate multi-agent workflow."""
+        _run_supervisor_assign_test(provider="devin_cli")
+
+    def test_supervisor_assign_three_analysts(self, require_devin):
+        """Devin CLI supervisor assigns 3 analysts, receives callbacks, finalizes report.
+
+        The canonical ``examples/assign/`` smoke test: parallel assign
+        of three data analysts, sequential handoff to report generator,
+        inbox delivery of worker results, supervisor final assembly
+        without doing the analysis work itself.
+        """
+        _run_supervisor_assign_three_analysts_test(provider="devin_cli")

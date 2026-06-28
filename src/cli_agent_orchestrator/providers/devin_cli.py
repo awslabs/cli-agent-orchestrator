@@ -136,30 +136,73 @@ class DevinCliProvider(BaseProvider):
         return shlex.join(command_parts)
 
     def _build_mcp_config(self) -> Optional[dict]:
-        """Build the MCP server config dict for --config."""
+        """Build the MCP server config dict for --config.
+
+        Merges MCP servers from agent profile with user's existing Devin config,
+        and ensures CAO_TERMINAL_ID is set in server environments for orchestration.
+        """
         import shutil
+        from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 
-        venv_script = Path(sys.executable).with_name("cao-mcp-server")
-        found_script = shutil.which("cao-mcp-server")
-        if venv_script.exists():
-            mcp_command = str(venv_script)
-            mcp_args: list = []
-        elif found_script:
-            mcp_command = found_script
-            mcp_args = []
+        # Load user's existing Devin config to preserve their settings
+        user_config_path = Path.home() / ".config" / "devin" / "config.json"
+        if user_config_path.exists():
+            try:
+                base_config = json.loads(user_config_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                base_config = {}
         else:
-            mcp_command = sys.executable
-            mcp_args = ["-m", "cli_agent_orchestrator.mcp_server.server"]
-
-        return {
-            "mcpServers": {
-                "cao-mcp-server": {
-                    "command": mcp_command,
-                    "args": mcp_args,
-                    "env": {"CAO_TERMINAL_ID": self.terminal_id},
-                }
+            # Minimal config to skip the first-run wizard
+            base_config = {
+                "shell": {"setup_complete": True},
+                "theme_mode": "dark",
             }
-        }
+
+        # Start with existing MCP servers or empty dict
+        existing_mcp = base_config.get("mcpServers", {})
+
+        # Add cao-mcp-server if not already present (for orchestration tools)
+        if "cao-mcp-server" not in existing_mcp:
+            venv_script = Path(sys.executable).with_name("cao-mcp-server")
+            found_script = shutil.which("cao-mcp-server")
+            if venv_script.exists():
+                mcp_command = str(venv_script)
+                mcp_args: list = []
+            elif found_script:
+                mcp_command = found_script
+                mcp_args = []
+            else:
+                mcp_command = sys.executable
+                mcp_args = ["-m", "cli_agent_orchestrator.mcp_server.server"]
+
+            existing_mcp["cao-mcp-server"] = {
+                "command": mcp_command,
+                "args": mcp_args,
+                "env": {"CAO_TERMINAL_ID": self.terminal_id},
+            }
+
+        # Merge MCP servers from agent profile if present
+        if self._agent_profile:
+            try:
+                profile = load_agent_profile(self._agent_profile)
+                if profile.mcpServers:
+                    for server_name, server_config in profile.mcpServers.items():
+                        if isinstance(server_config, dict):
+                            existing_mcp[server_name] = dict(server_config)
+                        else:
+                            existing_mcp[server_name] = server_config.model_dump(exclude_none=True)
+                        # Ensure CAO_TERMINAL_ID is set for orchestration
+                        env = existing_mcp[server_name].get("env", {})
+                        if "CAO_TERMINAL_ID" not in env:
+                            env["CAO_TERMINAL_ID"] = self.terminal_id
+                            existing_mcp[server_name]["env"] = env
+            except (FileNotFoundError, RuntimeError, OSError):
+                logger.debug(
+                    "Could not load agent profile '%s' for MCP config", self._agent_profile
+                )
+
+        base_config["mcpServers"] = existing_mcp
+        return base_config
 
     def initialize(self) -> bool:
         """Initialize Devin CLI provider."""
