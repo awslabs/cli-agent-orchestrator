@@ -676,6 +676,7 @@ async def list_providers_endpoint() -> List[Dict]:
         "copilot_cli": "copilot",
         "opencode_cli": "opencode",
         "cursor_cli": "agent",
+        "antigravity_cli": "agy",
         "devin_cli": "devin",
     }
     result = []
