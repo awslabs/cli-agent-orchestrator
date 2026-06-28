@@ -68,9 +68,7 @@ TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
 FIFO_DIR = (
     Path("/tmp") / "cli-agent-orchestrator" / "fifos"
 )  # Named pipes for tmux pipe-pane streaming
-# SECURITY: /tmp is publicly writable but acceptable for FIFO pipes as they are
-# created with restrictive permissions (0600) by the mkfifo system call.
-# The directory itself is only used as a container for these secure FIFO files.
+# NOSONAR (S5776) - /tmp is required for WSL2 FIFO compatibility; FIFO files themselves use 0600 permissions
 FIFO_DIR.mkdir(parents=True, exist_ok=True)
 
 # =============================================================================
