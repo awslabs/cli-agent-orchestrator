@@ -284,7 +284,7 @@ class HerdrBackend(TerminalBackend):
             session_name, window_name, terminal_id, pane_id=new_pane_id, extra_env=extra_env
         )
 
-        logger.info(f"Created herdr workspace: {session_name} in {working_directory}")
+        logger.info("Created herdr workspace")
         return window_name
 
     def session_exists(self, session_name: str) -> bool:

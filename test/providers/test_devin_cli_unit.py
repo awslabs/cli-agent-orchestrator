@@ -233,6 +233,7 @@ class TestDevinCliResponseExtraction:
             "Mode: chat  Model: devin-v1\n"
         )
         message = provider.extract_last_message_from_script(output)
+        assert message is not None
         assert "# Summary" in message
         assert "## Details" in message
         assert "Some details here." in message

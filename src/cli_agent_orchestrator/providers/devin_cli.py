@@ -197,9 +197,13 @@ You are restricted to only use the following tools: {tools_list}
             if system_prompt:
                 # If we already have a prompt-file from allowed_tools, append the system prompt AFTER security constraint
                 if self._temp_prompt_file:
-                    existing_content = Path(self._temp_prompt_file).read_text()
+                    # Validate the temp file path is within the system temp directory
+                    temp_path = Path(self._temp_prompt_file)
+                    if not temp_path.is_absolute() or not str(temp_path).startswith(tempfile.gettempdir()):
+                        raise ValueError("Invalid temporary file path")
+                    existing_content = temp_path.read_text()
                     combined_prompt = f"{existing_content}\n\n{system_prompt}"
-                    Path(self._temp_prompt_file).write_text(combined_prompt)
+                    temp_path.write_text(combined_prompt)
                 else:
                     self._write_prompt_file(system_prompt)
                     command_parts.extend(["--prompt-file", self._temp_prompt_file])
@@ -293,7 +297,7 @@ You are restricted to only use the following tools: {tools_list}
         if not has_prompt and re.search(STATUS_BAR_PATTERN, clean_output):
             last_lines = "\n".join(clean_output.split("\n")[-6:])
             has_prompt = re.search(r"^[\s]*#", last_lines, re.MULTILINE)
-        return has_prompt
+        return bool(has_prompt)
 
     def get_status(self, buffer: str) -> TerminalStatus:
         """Detect Devin CLI state from terminal output.
