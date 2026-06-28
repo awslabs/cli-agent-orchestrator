@@ -163,12 +163,19 @@ class ClaudeCodeProvider(BaseProvider):
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
-        # Determine permission mode for the base command
+        # Determine permission mode for the base command.
+        # Priority: explicit permissionMode > yolo/root detection > default yolo.
+        #
+        # Root/sudo guard: Claude Code rejects --dangerously-skip-permissions when
+        # running as root. We only omit it for yolo+root; non-root yolo still needs
+        # the flag so Claude won't prompt for tool approval inside a headless tmux
+        # pane and silently block handoff/assign flows.
+        is_root = getattr(os, "geteuid", lambda: -1)() == 0
+
         if profile and profile.permissionMode:
             command_parts = ["claude", "--permission-mode", profile.permissionMode]
-        elif yolo:
-            # yolo mode: no --dangerously-skip-permissions flag because
-            # Claude Code refuses it under root/sudo. Let CAO handle permissions.
+        elif yolo and is_root:
+            # Root users cannot use --dangerously-skip-permissions; omit it entirely.
             command_parts = ["claude"]
         else:
             command_parts = ["claude", "--dangerously-skip-permissions"]

@@ -1260,6 +1260,68 @@ class TestClaudeCodeProviderPermissionMode:
         assert "--permission-mode" not in command
 
 
+class TestClaudeCodeProviderYoloRootRegression:
+    """Regression tests for yolo + root/non-root --dangerously-skip-permissions logic.
+
+    Ensures that the root-user guard (PR #322) only omits --dangerously-skip-permissions
+    when running as root, and does not break normal non-root yolo launches.
+    """
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.os")
+    def test_yolo_non_root_includes_dangerously_skip_permissions(self, mock_os, mock_load):
+        """yolo + no permissionMode + non-root => includes --dangerously-skip-permissions."""
+        mock_os.geteuid.return_value = 1000  # non-root
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", allowed_tools=["*"])
+        command = provider._build_claude_command()
+
+        assert "--dangerously-skip-permissions" in command
+        assert "--permission-mode" not in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.os")
+    def test_yolo_root_omits_dangerously_skip_permissions(self, mock_os, mock_load):
+        """yolo + no permissionMode + root => omits --dangerously-skip-permissions."""
+        mock_os.geteuid.return_value = 0  # root
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", allowed_tools=["*"])
+        command = provider._build_claude_command()
+
+        assert "--dangerously-skip-permissions" not in command
+        assert "--permission-mode" not in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.os")
+    def test_yolo_with_permission_mode_uses_permission_mode_flag(self, mock_os, mock_load):
+        """yolo + permissionMode => uses --permission-mode <value>, omits --dangerously-skip-permissions."""
+        mock_os.geteuid.return_value = 1000  # non-root; permissionMode should still win
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = "auto"
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", allowed_tools=["*"])
+        command = provider._build_claude_command()
+
+        assert "--permission-mode auto" in command
+        assert "--dangerously-skip-permissions" not in command
+
+
 class TestClaudeCodeProviderStartupPrompts:
     """Tests for Claude Code startup prompt handling (trust + bypass)."""
 
