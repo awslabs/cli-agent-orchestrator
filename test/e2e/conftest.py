@@ -135,6 +135,13 @@ def require_hermes():
 
 
 @pytest.fixture()
+def require_antigravity():
+    """Skip test if Antigravity CLI (``agy``) is not available."""
+    if not _cli_available("agy"):
+        pytest.skip("Antigravity CLI (agy) not installed")
+
+
+@pytest.fixture()
 def require_cursor():
     """Skip test if Cursor CLI (agent or cursor-agent) is not available."""
     if _cli_available("agent") or _cli_available("cursor-agent"):

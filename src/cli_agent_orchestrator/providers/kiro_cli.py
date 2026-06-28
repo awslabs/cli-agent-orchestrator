@@ -92,7 +92,15 @@ TUI_PROCESSING_PATTERN = r"Kiro is working"
 # is interactive, so a paste sent during this window is absorbed by the
 # pre-prompt boot screen and silently dropped (observed during e2e
 # allowed-tools tests).
-TUI_INITIALIZING_PATTERN = r"Initializing\.\.\.|\d+ of \d+ mcp servers initialized\.\s*ctrl-c to start chatting now"  # noqa: E501
+#
+# kiro-cli 2.8.x also shows "Initializing · type to queue a message" during
+# boot (different from the "Initializing..." with three dots).
+TUI_INITIALIZING_PATTERN = (
+    r"Initializing\.\.\."
+    r"|\d+ of \d+ mcp servers initialized\.\s*ctrl-c to start chatting now"
+    r"|Initializing\s*·\s*type to queue a message"
+)
+
 
 # TUI permission prompt: shown instead of legacy [y/n/t] format.
 # Requires all three options together to avoid false positives on "Yes"/"No" in agent output.
@@ -348,11 +356,21 @@ class KiroCliProvider(BaseProvider):
         # Treat the init line as PROCESSING only when no real ``[agent] >``
         # idle prompt appears AFTER the last init match — mirrors the
         # TUI_PROCESSING_PATTERN ghost-text guard below.
+        #
+        # kiro-cli 2.8.x TUI shows "● Initializing..." (animated spinner)
+        # during MCP boot. Once MCP finishes, the TUI redraws completely:
+        # the spinner disappears and the idle prompt appears. In the raw
+        # FIFO buffer, the idle prompt text lands AFTER the last spinner
+        # frame, so checking new_tui_idle_matches after last_init_pos is a
+        # reliable post-init signal. During the spinner, only spinner frames
+        # are written to the stream; the idle prompt only enters the buffer
+        # when the TUI redraws after init completes.
         init_matches = list(re.finditer(TUI_INITIALIZING_PATTERN, clean_output))
         if init_matches:
             last_init_pos = init_matches[-1].end()
             real_idle_after_init = any(m.start() > last_init_pos for m in old_idle_matches)
-            if not real_idle_after_init:
+            new_idle_after_init = any(m.start() > last_init_pos for m in new_tui_idle_matches)
+            if not real_idle_after_init and not new_idle_after_init:
                 return TerminalStatus.PROCESSING
 
         # Check 2: Look for TUI "Kiro is working" ghost text.

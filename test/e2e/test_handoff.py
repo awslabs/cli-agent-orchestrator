@@ -360,3 +360,37 @@ class TestCursorCliHandoff:
             ),
             content_keywords=["multiply", "product", "return", "def"],
         )
+
+
+# ---------------------------------------------------------------------------
+# Antigravity CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestAntigravityCliHandoff:
+    """E2E handoff tests for the Antigravity CLI provider."""
+
+    def test_handoff_simple_function(self, require_antigravity):
+        """Antigravity CLI developer creates a simple Python function and returns output."""
+        _run_handoff_test(
+            provider="antigravity_cli",
+            agent_profile="developer",
+            task_message=(
+                "Create a Python function called 'greet' that takes a name parameter "
+                "and returns 'Hello, {name}!'. Output only the function code."
+            ),
+            content_keywords=["greet", "hello", "def"],
+        )
+
+    def test_handoff_second_task(self, require_antigravity):
+        """Antigravity CLI developer handles a second independent task."""
+        _run_handoff_test(
+            provider="antigravity_cli",
+            agent_profile="developer",
+            task_message=(
+                "Create a Python function called 'square' that takes a parameter n "
+                "and returns n squared. Output only the function code."
+            ),
+            content_keywords=["square", "return", "def"],
+        )

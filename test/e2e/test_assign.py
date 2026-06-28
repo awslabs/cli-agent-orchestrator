@@ -639,3 +639,59 @@ class TestCursorCliAssign:
         - handoff (blocking): inbox delivery triggers supervisor state transition
         """
         _run_assign_with_callback_test(provider="cursor_cli")
+
+
+# ---------------------------------------------------------------------------
+# Antigravity CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestAntigravityCliAssign:
+    """E2E assign tests for the Antigravity CLI provider using examples/assign/ profiles.
+
+    Requires:
+    - ``agy`` binary on PATH (skip otherwise via ``require_antigravity`` fixture).
+    - Running CAO server.
+    - Agent profiles installed for antigravity_cli::
+
+        cao install examples/assign/data_analyst.md --provider antigravity_cli
+        cao install examples/assign/report_generator.md --provider antigravity_cli
+        cao install developer --provider antigravity_cli  # for callback test
+
+    Run::
+
+        uv run pytest -m e2e test/e2e/test_assign.py -k Antigravity -v
+    """
+
+    def test_assign_data_analyst(self, require_antigravity):
+        """Antigravity CLI data_analyst receives dataset, performs statistical analysis.
+
+        Like Gemini CLI, agy's data_analyst profile tends to call send_message
+        rather than print raw results, so we accept the broader orchestration
+        keywords in addition to the statistical ones.
+        """
+        _run_assign_test(
+            provider="antigravity_cli",
+            agent_profile="data_analyst",
+            task_message=DATA_ANALYST_TASK,
+            content_keywords=DATA_ANALYST_KEYWORDS
+            + [
+                "analysis",
+                "send_message",
+                "CAO_TERMINAL_ID",
+            ],
+        )
+
+    def test_assign_report_generator(self, require_antigravity):
+        """Antigravity CLI report_generator creates a report template."""
+        _run_assign_test(
+            provider="antigravity_cli",
+            agent_profile="report_generator",
+            task_message=REPORT_GENERATOR_TASK,
+            content_keywords=REPORT_GENERATOR_KEYWORDS,
+        )
+
+    def test_assign_with_callback(self, require_antigravity):
+        """Antigravity CLI full round-trip: worker completes → sends result → supervisor receives."""
+        _run_assign_with_callback_test(provider="antigravity_cli")

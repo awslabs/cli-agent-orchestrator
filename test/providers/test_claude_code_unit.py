@@ -1,6 +1,7 @@
 """Unit tests for Claude Code provider."""
 
 import json
+import shlex
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, mock_open, patch
@@ -30,6 +31,16 @@ def cleanup_tmp_files():
 # All initialization tests need to patch _ensure_skip_bypass_prompt_setting
 # to avoid writing to the real ~/.claude/settings.json.
 _PATCH_SETTINGS = patch.object(ClaudeCodeProvider, "_ensure_skip_bypass_prompt_setting")
+
+
+def _extract_mcp_config(command: str) -> dict:
+    args = shlex.split(command)
+    assert "--strict-mcp-config" in args
+    mcp_file = Path(args[args.index("--mcp-config") + 1])
+    try:
+        return json.loads(mcp_file.read_text())
+    finally:
+        mcp_file.unlink(missing_ok=True)
 
 
 class TestClaudeCodeProviderInitialization:
@@ -1129,14 +1140,7 @@ class TestClaudeCodeProviderMisc:
         command = provider._build_claude_command()
 
         assert "--mcp-config" in command
-        # Extract the file path arg after --mcp-config
-        parts = command.split("--mcp-config ")
-        mcp_file_path = parts[1].strip().split()[0]
-        # shlex.join wraps in single quotes; strip them
-        if mcp_file_path.startswith("'") and mcp_file_path.endswith("'"):
-            mcp_file_path = mcp_file_path[1:-1]
-        mcp_data = json.loads(Path(mcp_file_path).read_text())
-        Path(mcp_file_path).unlink(missing_ok=True)
+        mcp_data = _extract_mcp_config(command)
         server_env = mcp_data["mcpServers"]["cao-mcp-server"]["env"]
         assert server_env["CAO_TERMINAL_ID"] == "term-42"
 
@@ -1158,12 +1162,7 @@ class TestClaudeCodeProviderMisc:
         provider = ClaudeCodeProvider("term-99", "test-session", "window-0", "test-agent")
         command = provider._build_claude_command()
 
-        parts = command.split("--mcp-config ")
-        mcp_file_path = parts[1].strip().split()[0]
-        if mcp_file_path.startswith("'") and mcp_file_path.endswith("'"):
-            mcp_file_path = mcp_file_path[1:-1]
-        mcp_data = json.loads(Path(mcp_file_path).read_text())
-        Path(mcp_file_path).unlink(missing_ok=True)
+        mcp_data = _extract_mcp_config(command)
         server_env = mcp_data["mcpServers"]["my-server"]["env"]
         # Original vars preserved
         assert server_env["MY_VAR"] == "my_value"
@@ -1189,12 +1188,7 @@ class TestClaudeCodeProviderMisc:
         provider = ClaudeCodeProvider("term-99", "test-session", "window-0", "test-agent")
         command = provider._build_claude_command()
 
-        parts = command.split("--mcp-config ")
-        mcp_file_path = parts[1].strip().split()[0]
-        if mcp_file_path.startswith("'") and mcp_file_path.endswith("'"):
-            mcp_file_path = mcp_file_path[1:-1]
-        mcp_data = json.loads(Path(mcp_file_path).read_text())
-        Path(mcp_file_path).unlink(missing_ok=True)
+        mcp_data = _extract_mcp_config(command)
         server_env = mcp_data["mcpServers"]["my-server"]["env"]
         # Should keep the user-provided value, NOT overwrite with term-99
         assert server_env["CAO_TERMINAL_ID"] == "user-provided-id"

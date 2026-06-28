@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- add Antigravity CLI (`agy`) provider — Google's terminal-native coding agent and the successor to the Gemini CLI after the free "Login with Google" path was retired (#323)
+
 - add built-in Hermes provider support through profile-configured `hermesProfile` wrappers
 
 ## [2.2.0] - 2026-06-04

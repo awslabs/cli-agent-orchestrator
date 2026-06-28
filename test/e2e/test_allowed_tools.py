@@ -645,3 +645,45 @@ class TestCursorCliAllowedTools:
             agent_profile="developer",
             allowed_tools="@builtin,fs_read,@cao-mcp-server",
         )
+
+
+# ---------------------------------------------------------------------------
+# Antigravity CLI provider — soft enforcement via SECURITY_PROMPT
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestAntigravityCliAllowedTools:
+    """E2E allowedTools tests for the Antigravity CLI provider.
+
+    Antigravity CLI does not expose a native --disallowedTools flag;
+    restrictions are enforced softly via the SECURITY_PROMPT appended
+    to the system prompt. This is advisory only.
+    """
+
+    @pytest.mark.xfail(
+        reason="Antigravity CLI lacks native --disallowedTools; soft enforcement is advisory only",
+        strict=False,
+    )
+    def test_restricted_supervisor_cannot_bash(self, require_antigravity):
+        """Supervisor with only @cao-mcp-server should not execute bash."""
+        _run_restricted_tool_test(
+            provider="antigravity_cli",
+            agent_profile="code_supervisor",
+            allowed_tools="@cao-mcp-server",
+        )
+
+    def test_unrestricted_developer_can_bash(self, require_antigravity):
+        """Developer with wildcard allowedTools can execute bash."""
+        _run_unrestricted_tool_test(
+            provider="antigravity_cli",
+            agent_profile="developer",
+        )
+
+    def test_allowed_tools_stored_in_metadata(self, require_antigravity):
+        """allowed_tools is persisted and returned by GET /terminals."""
+        _run_allowed_tools_stored_test(
+            provider="antigravity_cli",
+            agent_profile="developer",
+            allowed_tools="@builtin,fs_read,@cao-mcp-server",
+        )

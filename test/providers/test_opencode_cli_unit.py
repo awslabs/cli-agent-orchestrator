@@ -164,6 +164,88 @@ class TestGetStatusFromFixtures:
         assert provider.get_status("random text without any tui markers") == TerminalStatus.UNKNOWN
 
 
+class TestGetStatusFromScreen:
+    """Pin OpenCode's pyte-rendered screen detector.
+
+    The screen path receives escape-free viewport rows, so it should classify the
+    same user-visible TUI markers without relying on the rolling raw buffer.
+    """
+
+    def test_idle_footer_returns_idle(self):
+        provider = make_provider()
+
+        assert provider.get_status_from_screen(["", "tab agents  ctrl+p commands  • OpenCode"]) == (
+            TerminalStatus.IDLE
+        )
+
+    def test_processing_footer_returns_processing(self):
+        provider = make_provider()
+
+        assert provider.get_status_from_screen(["⬝⬝⬝⬝  esc interrupt   ctrl+p commands"]) == (
+            TerminalStatus.PROCESSING
+        )
+
+    def test_stale_processing_footer_followed_by_idle_returns_idle(self):
+        provider = make_provider()
+
+        assert (
+            provider.get_status_from_screen(
+                [
+                    "⬝⬝⬝⬝  esc interrupt",
+                    "",
+                    "tab agents  ctrl+p commands  • OpenCode",
+                ]
+            )
+            == TerminalStatus.IDLE
+        )
+
+    def test_stale_processing_footer_followed_by_completion_returns_completed(self):
+        provider = make_provider()
+
+        assert (
+            provider.get_status_from_screen(
+                [
+                    "⬝⬝⬝⬝  esc interrupt",
+                    "Hello from OpenCode",
+                    "▣  Build · Big Pickle · 7.2s",
+                    "tab agents  ctrl+p commands  • OpenCode",
+                ]
+            )
+            == TerminalStatus.COMPLETED
+        )
+
+    def test_completion_marker_followed_by_idle_returns_completed(self):
+        provider = make_provider()
+
+        assert (
+            provider.get_status_from_screen(
+                [
+                    "Hello from OpenCode",
+                    "▣  Build · Big Pickle · 7.2s",
+                    "tab agents  ctrl+p commands  • OpenCode",
+                ]
+            )
+            == TerminalStatus.COMPLETED
+        )
+
+    def test_permission_prompt_without_idle_returns_waiting_user_answer(self):
+        provider = make_provider()
+
+        assert provider.get_status_from_screen(["△  Permission required", "Allow command?"]) == (
+            TerminalStatus.WAITING_USER_ANSWER
+        )
+
+    def test_blank_screen_returns_unknown(self):
+        provider = make_provider()
+
+        assert provider.get_status_from_screen(["", "   "]) == TerminalStatus.UNKNOWN
+
+    def test_unrecognized_nonblank_screen_returns_unknown(self):
+        provider = make_provider()
+
+        assert provider.get_status_from_screen(["OpenCode is repainting"]) == TerminalStatus.UNKNOWN
+
+
 # ---------------------------------------------------------------------------
 # (c)  Stale ``esc interrupt`` + idle footer on later line → IDLE
 # ---------------------------------------------------------------------------
