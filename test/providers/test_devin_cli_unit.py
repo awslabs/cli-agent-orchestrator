@@ -110,7 +110,7 @@ class TestDevinCliProviderStatusDetection:
     @patch("cli_agent_orchestrator.providers.devin_cli.tmux_client")
     def test_get_status_esc_to_interrupt(self, mock_tmux):
         """PROCESSING: 'esc to interrupt' spinner is present."""
-        buffer = "> write some code\n" "esc to interrupt\n" "#\n" "Mode: chat  Model: devin-v1\n"
+        buffer = "> write some code\nesc to interrupt\n#\nMode: chat  Model: devin-v1\n"
 
         provider = DevinCliProvider("test1234", "test-session", "window-0")
         status = provider.get_status(buffer)
@@ -137,6 +137,7 @@ class TestDevinCliResponseExtraction:
         output = load_fixture("devin_cli_completed_output.txt")
         message = provider.extract_last_message_from_script(output)
 
+        assert message is not None
         assert "README.md" in message
         assert "src/" in message
 
@@ -146,6 +147,7 @@ class TestDevinCliResponseExtraction:
         output = load_fixture("devin_cli_complex_response.txt")
         message = provider.extract_last_message_from_script(output)
 
+        assert message is not None
         assert "orchestrator" in message.lower()
         assert "providers" in message.lower()
 
@@ -212,6 +214,7 @@ class TestDevinCliResponseExtraction:
         message = provider.extract_last_message_from_script(output)
 
         # The full response including the "# Overview" heading must be returned.
+        assert message is not None
         assert "# Overview" in message
         assert "Supported providers" in message
 

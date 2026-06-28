@@ -24,37 +24,43 @@ test.describe('Devin CLI Provider E2E Tests', () => {
   test('should open Spawn Agent modal and show Devin CLI option', async ({ page }) => {
     // Wait for the page to load
     await page.waitForTimeout(2000);
-    
+
     // Click Spawn Agent button
     const spawnButton = page.getByText('Spawn Agent');
     await spawnButton.click();
-    
+
     // Wait for modal to appear
     await page.waitForTimeout(1000);
-    
+
     // Check if modal is visible
     const modal = page.locator('dialog, [role="dialog"], .fixed').first();
     const isVisible = await modal.isVisible();
-    
+
+    expect(isVisible).toBe(true);
+
     if (isVisible) {
       // Look for provider selector
       const content = await page.content();
       console.log('Modal content:', content.substring(0, 1000));
-      
+
       // Check if Devin CLI is mentioned
       const hasDevin = content.includes('devin') || content.includes('Devin');
       console.log('Devin CLI mentioned:', hasDevin);
+      expect(hasDevin).toBe(true);
     }
   });
 
   test('should show Devin CLI in providers list', async ({ page }) => {
     // Wait for the page to load
     await page.waitForTimeout(2000);
-    
+
     // Try to find providers section or button
     const content = await page.content();
     console.log('Page content length:', content.length);
     console.log('Page content preview:', content.substring(0, 500));
+
+    // Verify page has content
+    expect(content.length).toBeGreaterThan(0);
   });
 
   test('should create session with Devin CLI provider', async ({ page }) => {
