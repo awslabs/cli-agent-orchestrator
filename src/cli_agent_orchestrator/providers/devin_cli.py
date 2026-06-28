@@ -137,11 +137,14 @@ class DevinCliProvider(BaseProvider):
 You are restricted to only use the following tools: {tools}
 """.format(tools=", ".join(self._allowed_tools))
 
-            self._temp_prompt_file = tempfile.mktemp(
+            with tempfile.NamedTemporaryFile(
+                mode="w",
                 prefix="cao_devin_prompt_",
                 suffix=".md",
-            )
-            Path(self._temp_prompt_file).write_text(security_constraint)
+                delete=False,
+            ) as f:
+                self._temp_prompt_file = f.name
+                f.write(security_constraint)
             command_parts.extend(["--prompt-file", self._temp_prompt_file])
 
         if self._agent_profile is not None:
@@ -160,11 +163,14 @@ You are restricted to only use the following tools: {tools}
                     combined_prompt = f"{existing_content}\n\n{system_prompt}"
                     Path(self._temp_prompt_file).write_text(combined_prompt)
                 else:
-                    self._temp_prompt_file = tempfile.mktemp(
+                    with tempfile.NamedTemporaryFile(
+                        mode="w",
                         prefix="cao_devin_prompt_",
                         suffix=".md",
-                    )
-                    Path(self._temp_prompt_file).write_text(system_prompt)
+                        delete=False,
+                    ) as f:
+                        self._temp_prompt_file = f.name
+                        f.write(system_prompt)
                     command_parts.extend(["--prompt-file", self._temp_prompt_file])
 
             # Add MCP config if present
@@ -197,11 +203,14 @@ You are restricted to only use the following tools: {tools}
 
                 base_config["mcpServers"] = existing_mcp
 
-                self._temp_config_file = tempfile.mktemp(
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
                     prefix="cao_devin_config_",
                     suffix=".json",
-                )
-                Path(self._temp_config_file).write_text(json.dumps(base_config, indent=2))
+                    delete=False,
+                ) as f:
+                    self._temp_config_file = f.name
+                    f.write(json.dumps(base_config, indent=2))
                 command_parts.extend(["--config", self._temp_config_file])
 
         return shlex.join(command_parts)
