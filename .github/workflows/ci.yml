@@ -66,14 +66,9 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
-          registry-url: "https://registry.npmjs.org"
-
-      - name: Clear npm cache
-        run: npm cache clean --force
-        working-directory: web
 
       - name: Install dependencies
-        run: rm -f package-lock.json && npm install --registry=https://registry.npmjs.org
+        run: rm -f package-lock.json && npm install
         working-directory: web
 
       - name: Type check
