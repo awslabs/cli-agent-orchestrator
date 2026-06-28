@@ -333,9 +333,14 @@ class TmuxClient:
             validated_session = validate_tmux_name(session_name, "session_name")
             validated_window = validate_tmux_name(window_name, "window_name")
             target = f"{validated_session}:{validated_window}"
+            # Send the text once, then send Enter separately enter_count times
+            subprocess.run(
+                ["tmux", "send-keys", "-l", "-t", target, keys],
+                check=True,
+            )
             for i in range(enter_count):
                 subprocess.run(
-                    ["tmux", "send-keys", "-t", target, keys, "C-m"],
+                    ["tmux", "send-keys", "-t", target, "C-m"],
                     check=True,
                 )
                 if i < enter_count - 1:

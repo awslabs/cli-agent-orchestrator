@@ -153,6 +153,10 @@ You are restricted to only use the following tools: {tools_list}
 
     def _merge_mcp_servers(self, base_config: dict, mcp_servers: dict) -> None:
         """Merge profile MCP servers into existing config."""
+        # Ensure mcpServers is a dict in base_config
+        if not isinstance(base_config.get("mcpServers"), dict):
+            base_config["mcpServers"] = {}
+        
         existing_mcp = base_config.get("mcpServers", {})
         for server_name, server_config in mcp_servers.items():
             if isinstance(server_config, dict):
@@ -326,8 +330,8 @@ You are restricted to only use the following tools: {tools_list}
         if self._is_processing(lines):
             return TerminalStatus.PROCESSING
 
-        # 2. Check for the # prompt with fallback
-        has_prompt = self._detect_prompt_with_fallback(clean_output)
+        # 2. Check for the # prompt using horizontal-rule-aware detector
+        has_prompt = self._has_input_prompt(lines)
 
         if has_prompt:
             # Check for user input to distinguish IDLE from COMPLETED

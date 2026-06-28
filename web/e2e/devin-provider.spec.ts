@@ -37,19 +37,6 @@ test.describe('Devin CLI Provider E2E Tests', () => {
     expect(hasDevin).toBe(true);
   });
 
-  test('should show Devin CLI in providers list', async ({ page }) => {
-    // Wait for the page to load by checking for content
-    await page.waitForLoadState('networkidle');
-
-    // Try to find providers section or button
-    const content = await page.content();
-    console.log('Page content length:', content.length);
-    console.log('Page content preview:', content.substring(0, 500));
-
-    // Verify page has content
-    expect(content.length).toBeGreaterThan(0);
-  });
-
   test('should show Devin CLI as available provider', async ({ page }) => {
     const response = await page.request.get('http://localhost:9889/agents/providers');
     const providers = await response.json();
@@ -129,26 +116,7 @@ test.describe('Devin CLI Provider E2E Tests', () => {
         }
       }
     } catch (error) {
-      console.log('First approach failed:', error);
-    }
-
-    // Approach 2: Try clicking again if first didn't work
-    if (!modalOpened) {
-      try {
-        const buttonWithClass = page.locator('button').filter({ hasText: 'Spawn Agent' });
-        await buttonWithClass.first().click({ force: true });
-
-        const modalContainer = page.locator('.fixed.inset-0').first();
-        await modalContainer.waitFor({ state: 'visible', timeout: 5000 });
-        const containerVisible = await modalContainer.isVisible();
-        console.log('Modal visible after second click:', containerVisible);
-
-        if (containerVisible) {
-          modalOpened = true;
-        }
-      } catch (error) {
-        console.log('Second approach failed:', error);
-      }
+      console.log('Modal open attempt failed:', error);
     }
 
     // If modal still not opened, skip the rest of the test
@@ -186,7 +154,7 @@ test.describe('Devin CLI Provider E2E Tests', () => {
 
         if (devinOptionVisible) {
           console.log('✅ Devin CLI option is available in the provider dropdown!');
-          await page.mouse.click(0, 0); // Close dropdown
+          await page.keyboard.press('Escape'); // Close dropdown
         } else {
           console.log('❌ Devin CLI option not found in dropdown');
         }

@@ -473,6 +473,8 @@ class StatusMonitor:
 
     def _get_fallback_from_history(self, terminal_id: str) -> Optional[TerminalStatus]:
         """Fallback for tmux backends when FIFO buffer is empty (WSL limitation)."""
+        from cli_agent_orchestrator.backends.registry import get_backend
+
         try:
             provider = provider_manager.get_provider(terminal_id)
         except Exception:
