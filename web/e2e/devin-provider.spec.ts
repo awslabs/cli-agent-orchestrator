@@ -67,23 +67,23 @@ test.describe('Devin CLI Provider E2E Tests', () => {
     // Test the API directly through the browser
     const response = await page.request.get('http://localhost:9889/agents/providers');
     const providers = await response.json();
-    
+
     console.log('Available providers:', providers);
-    
+
     // Check if devin_cli is in the providers list
-    const devinProvider = providers.find((p: any) => p.name === 'devin_cli');
+    const devinProvider = providers.find((p: { name: string }) => p.name === 'devin_cli');
     expect(devinProvider).toBeDefined();
   });
 
   test('should show Devin CLI as available provider', async ({ page }) => {
     const response = await page.request.get('http://localhost:9889/agents/providers');
     const providers = await response.json();
-    
+
     console.log('All providers:', providers);
-    
-    const devinProvider = providers.find((p: any) => p.name === 'devin_cli');
+
+    const devinProvider = providers.find((p: { name: string }) => p.name === 'devin_cli');
     expect(devinProvider).toBeDefined();
-    
+
     if (devinProvider) {
       console.log('Devin CLI provider found:', devinProvider);
       expect(devinProvider.binary).toBe('devin');
@@ -93,11 +93,11 @@ test.describe('Devin CLI Provider E2E Tests', () => {
   test('should list agent profiles including Devin-compatible ones', async ({ page }) => {
     const response = await page.request.get('http://localhost:9889/agents/profiles');
     const profiles = await response.json();
-    
+
     console.log('Available profiles:', profiles);
-    
+
     // Check if analysis_supervisor profile exists (for Devin)
-    const supervisorProfile = profiles.find((p: any) => p.name === 'analysis_supervisor');
+    const supervisorProfile = profiles.find((p: { name: string }) => p.name === 'analysis_supervisor');
     expect(supervisorProfile).toBeDefined();
   });
 
@@ -126,9 +126,9 @@ test.describe('Devin CLI Provider E2E Tests', () => {
     // First, verify providers are loaded by checking API directly
     const response = await page.request.get('http://localhost:9889/agents/providers');
     const providers = await response.json();
-    console.log('Providers from API:', providers.map((p: any) => p.name));
-    
-    const devinProvider = providers.find((p: any) => p.name === 'devin_cli');
+    console.log('Providers from API:', providers.map((p: { name: string }) => p.name));
+
+    const devinProvider = providers.find((p: { name: string }) => p.name === 'devin_cli');
     console.log('Devin CLI in API response:', !!devinProvider);
     expect(devinProvider).toBeDefined();
     
