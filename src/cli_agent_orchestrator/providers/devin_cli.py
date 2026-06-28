@@ -102,6 +102,20 @@ class DevinCliProvider(BaseProvider):
 
         Returns properly escaped shell command string for tmux.
         """
+        # Clean up any existing temporary files before creating new ones
+        if self._temp_prompt_file:
+            try:
+                Path(self._temp_prompt_file).unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._temp_prompt_file = None
+        if self._temp_config_file:
+            try:
+                Path(self._temp_config_file).unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._temp_config_file = None
+
         command_parts = [
             "devin",
             "--permission-mode",
@@ -137,6 +151,8 @@ You are restricted to only use the following tools: {tools}
 
             # Devin supports --prompt-file for system prompt injection
             system_prompt = profile.system_prompt if profile.system_prompt else ""
+            # Apply skill prompt if provided
+            system_prompt = self._apply_skill_prompt(system_prompt)
             if system_prompt:
                 # If we already have a prompt-file from allowed_tools, append the system prompt AFTER security constraint
                 if self._temp_prompt_file:
@@ -242,7 +258,7 @@ You are restricted to only use the following tools: {tools}
             if not re.match(IDLE_PROMPT_PATTERN, line):
                 continue
             # Verify the closest preceding non-empty line is a horizontal rule.
-            preceding = [l for l in tail[:idx] if l.strip()]
+            preceding = [line for line in tail[:idx] if line.strip()]
             if preceding and re.match(HORIZONTAL_RULE_PATTERN, preceding[-1].strip()):
                 return True
         return False
@@ -296,7 +312,11 @@ You are restricted to only use the following tools: {tools}
 
         # 4. Initial Devin CLI welcome screen (before first # prompt)
         # Look for "Ask Devin to build features", "I'm ready to help", or "SWE-1.6"
-        if "Ask Devin to build features" in clean_output or "I'm ready to help" in clean_output or "SWE-1.6" in clean_output:
+        if (
+            "Ask Devin to build features" in clean_output
+            or "I'm ready to help" in clean_output
+            or "SWE-1.6" in clean_output
+        ):
             return TerminalStatus.IDLE
 
         # 5. Fallback: if we have substantial output (not just shell prompt) and no processing, assume IDLE
