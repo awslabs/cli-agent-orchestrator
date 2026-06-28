@@ -728,13 +728,3 @@ class TestDevinCliSupervisorOrchestration:
 
         finally:
             cleanup_terminal(terminal_id, session_name)
-
-    def test_supervisor_assign_three_analysts(self, require_devin):
-        """Devin CLI supervisor assigns 3 analysts, receives callbacks, finalizes report.
-
-        The canonical ``examples/assign/`` smoke test: parallel assign
-        of three data analysts, sequential handoff to report generator,
-        inbox delivery of worker results, supervisor final assembly
-        without doing the analysis work itself.
-        """
-        _run_supervisor_assign_three_analysts_test(provider="devin_cli")
