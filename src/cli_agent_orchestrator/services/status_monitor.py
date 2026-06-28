@@ -488,7 +488,7 @@ class StatusMonitor:
             if fresh != TerminalStatus.PROCESSING and fresh != TerminalStatus.UNKNOWN:
                 self._apply_detection(terminal_id, fresh)
                 return fresh
-        
+
         # Fallback for tmux backends when FIFO buffer is empty (e.g., WSL limitation)
         # Read pane history directly and run provider detection
         if not get_backend().supports_event_inbox() and not buffer:
@@ -501,7 +501,9 @@ class StatusMonitor:
                 if window:
                     session_name, window_name = window
                     try:
-                        history = get_backend().get_history(session_name, window_name, strip_escapes=True)
+                        history = get_backend().get_history(
+                            session_name, window_name, strip_escapes=True
+                        )
                         if history:
                             fresh = provider.get_status(history)
                             logger.debug(
@@ -513,7 +515,7 @@ class StatusMonitor:
                             return fresh
                     except Exception as e:
                         logger.debug(f"get_status [{terminal_id}]: history fallback failed: {e}")
-        
+
         return cached
 
     def get_buffer(self, terminal_id: str) -> str:

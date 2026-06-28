@@ -65,7 +65,9 @@ TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
 # FIFO directory for event-driven terminal output streaming
 # Use /tmp instead of CAO_HOME_DIR to avoid WSL2 Windows mount limitations
 # (WSL2 doesn't support FIFO pipes on /mnt/c filesystem)
-FIFO_DIR = Path("/tmp") / "cli-agent-orchestrator" / "fifos"  # Named pipes for tmux pipe-pane streaming
+FIFO_DIR = (
+    Path("/tmp") / "cli-agent-orchestrator" / "fifos"
+)  # Named pipes for tmux pipe-pane streaming
 FIFO_DIR.mkdir(parents=True, exist_ok=True)
 
 # =============================================================================

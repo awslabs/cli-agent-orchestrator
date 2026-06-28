@@ -685,7 +685,7 @@ class TestDevinCliSupervisorOrchestration:
         """Devin CLI supervisor assigns 3 analysts, receives callbacks, finalizes report.
 
         The canonical ``examples/assign/`` smoke test: parallel assign
-    """
+        """
         _run_supervisor_assign_three_analysts_test(provider="devin_cli")
 
     def test_simple_task_execution(self, require_devin):
@@ -704,8 +704,9 @@ class TestDevinCliSupervisorOrchestration:
         )
         try:
             # Wait for terminal to be ready
-            assert _wait_for_terminal_ready(terminal_id, timeout=30), \
-                f"Devin CLI did not become ready within 30s"
+            assert _wait_for_terminal_ready(
+                terminal_id, timeout=30
+            ), f"Devin CLI did not become ready within 30s"
 
             # Send a simple task
             task_message = "echo hello world"
@@ -716,8 +717,9 @@ class TestDevinCliSupervisorOrchestration:
             assert resp.status_code == 200, f"Send message failed: {resp.status_code}"
 
             # Wait for task completion
-            assert _wait_for_terminal_ready(terminal_id, timeout=30), \
-                f"Devin CLI did not complete task within 30s"
+            assert _wait_for_terminal_ready(
+                terminal_id, timeout=30
+            ), f"Devin CLI did not complete task within 30s"
 
             # Extract and verify output
             output = extract_output(terminal_id)

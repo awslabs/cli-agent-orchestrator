@@ -325,7 +325,9 @@ class TmuxClient:
         """
         # If paste-buffer is disabled, use send-keys instead (for user input)
         if not use_paste_buffer:
-            logger.info(f"send_keys (via send-keys): {session_name}:{window_name} - keys: {keys[:100]}...")
+            logger.info(
+                f"send_keys (via send-keys): {session_name}:{window_name} - keys: {keys[:100]}..."
+            )
             target = f"{session_name}:{window_name}"
             for i in range(enter_count):
                 subprocess.run(

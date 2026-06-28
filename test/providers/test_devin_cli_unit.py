@@ -37,7 +37,6 @@ class TestDevinCliProviderInitialization:
         mock_tmux.send_keys.assert_called_once()
         mock_wait_status.assert_called_once()
 
-
     def test_paste_enter_count_is_1(self):
         """Devin TUI accepts input with a single Enter after paste."""
         provider = DevinCliProvider("test1234", "test-session", "window-0")
@@ -111,12 +110,7 @@ class TestDevinCliProviderStatusDetection:
     @patch("cli_agent_orchestrator.providers.devin_cli.tmux_client")
     def test_get_status_esc_to_interrupt(self, mock_tmux):
         """PROCESSING: 'esc to interrupt' spinner is present."""
-        buffer = (
-            "> write some code\n"
-            "esc to interrupt\n"
-            "#\n"
-            "Mode: chat  Model: devin-v1\n"
-        )
+        buffer = "> write some code\n" "esc to interrupt\n" "#\n" "Mode: chat  Model: devin-v1\n"
 
         provider = DevinCliProvider("test1234", "test-session", "window-0")
         status = provider.get_status(buffer)
@@ -266,9 +260,7 @@ class TestDevinCliToolRestrictions:
 
     def test_no_prompt_file_when_unrestricted(self):
         """No prompt file is written when allowed_tools is unrestricted ('*')."""
-        provider = DevinCliProvider(
-            "test1234", "test-session", "window-0", allowed_tools=["*"]
-        )
+        provider = DevinCliProvider("test1234", "test-session", "window-0", allowed_tools=["*"])
         provider._build_command()
 
         assert provider._temp_prompt_file is None
