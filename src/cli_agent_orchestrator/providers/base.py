@@ -99,6 +99,18 @@ class BaseProvider(ABC):
         """
         return 2
 
+    @property
+    def use_paste_buffer(self) -> bool:
+        """Whether to use tmux paste-buffer for input delivery.
+
+        Most TUIs benefit from paste-buffer (instant delivery, bracketed paste).
+        Some CLIs (e.g., Devin CLI) don't support paste-buffer and require
+        send-keys instead.
+
+        Override to False for CLIs that don't support paste-buffer.
+        """
+        return True
+
     @abstractmethod
     async def initialize(self) -> bool:
         """Initialize the provider (e.g., start CLI tool, send setup commands).

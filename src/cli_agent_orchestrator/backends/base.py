@@ -147,6 +147,7 @@ class TerminalBackend(ABC):
         enter_count: int = 1,
         force_bracketed_paste: bool = False,
         submit_delay: float = 0.3,
+        use_paste_buffer: bool = True,
     ) -> None:
         """Send text input to a window.
 
