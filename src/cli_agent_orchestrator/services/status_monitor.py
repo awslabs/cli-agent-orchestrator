@@ -456,7 +456,9 @@ class StatusMonitor:
             return self._buffers.get(terminal_id, "")
         return ""
 
-    def _refresh_processing_status(self, terminal_id: str, cached: TerminalStatus, buffer: str) -> Optional[TerminalStatus]:
+    def _refresh_processing_status(
+        self, terminal_id: str, cached: TerminalStatus, buffer: str
+    ) -> Optional[TerminalStatus]:
         """Refresh PROCESSING status with fresh detection from current buffer."""
         if cached == TerminalStatus.PROCESSING and buffer:
             fresh = self._detect_status(terminal_id, buffer)
