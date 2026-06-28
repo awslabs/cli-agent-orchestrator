@@ -68,7 +68,7 @@ jobs:
           node-version: "20"
 
       - name: Install dependencies
-        run: npm install
+        run: rm -f package-lock.json && npm install
         working-directory: web
 
       - name: Type check
