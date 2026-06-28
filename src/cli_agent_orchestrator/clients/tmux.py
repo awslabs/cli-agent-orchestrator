@@ -2,6 +2,7 @@
 
 import logging
 import os
+import shlex
 import subprocess
 import time
 import uuid
@@ -328,7 +329,10 @@ class TmuxClient:
             logger.info(
                 f"send_keys (via send-keys): {session_name}:{window_name} - keys: {keys[:100]}..."
             )
-            target = f"{session_name}:{window_name}"
+            # Validate session and window names to prevent command injection
+            validated_session = validate_tmux_name(session_name, "session_name")
+            validated_window = validate_tmux_name(window_name, "window_name")
+            target = f"{validated_session}:{validated_window}"
             for i in range(enter_count):
                 subprocess.run(
                     ["tmux", "send-keys", "-t", target, keys, "C-m"],
@@ -656,7 +660,9 @@ class TmuxClient:
 
             pane = window.active_pane
             if pane:
-                pane.cmd("pipe-pane", "-o", f"cat >> {file_path}")
+                # Use shlex.quote to prevent command injection in file_path
+                safe_path = shlex.quote(file_path)
+                pane.cmd("pipe-pane", "-o", f"cat >> {safe_path}")
                 logger.info(f"Started pipe-pane for {session_name}:{window_name} to {file_path}")
         except Exception as e:
             logger.error(f"Failed to start pipe-pane for {session_name}:{window_name}: {e}")

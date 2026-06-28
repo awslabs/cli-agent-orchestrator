@@ -274,7 +274,12 @@ class ProviderManager:
         **kwargs,
     ) -> DevinCliProvider:
         return DevinCliProvider(
-            terminal_id, tmux_session, tmux_window, agent_profile, allowed_tools, skill_prompt
+            terminal_id,
+            tmux_session,
+            tmux_window,
+            agent_profile,
+            allowed_tools,
+            skill_prompt=skill_prompt,
         )
 
     def create_provider(

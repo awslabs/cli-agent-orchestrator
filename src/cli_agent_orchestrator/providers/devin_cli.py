@@ -132,6 +132,7 @@ You are restricted to only use the following tools: {tools_list}
             prefix="cao_devin_prompt_",
             suffix=".md",
             delete=False,
+            encoding="utf-8",
         ) as f:
             self._temp_prompt_file = f.name
             f.write(content)
@@ -158,7 +159,10 @@ You are restricted to only use the following tools: {tools_list}
                 existing_mcp[server_name] = dict(server_config)
             else:
                 existing_mcp[server_name] = server_config.model_dump(exclude_none=True)
-            env = existing_mcp[server_name].get("env", {})
+            # Safely handle env dict - ensure it's never None
+            env = existing_mcp[server_name].get("env") or {}
+            if not isinstance(env, dict):
+                env = {}
             if "CAO_TERMINAL_ID" not in env:
                 env["CAO_TERMINAL_ID"] = self.terminal_id
                 existing_mcp[server_name]["env"] = env
@@ -197,10 +201,10 @@ You are restricted to only use the following tools: {tools_list}
             if system_prompt:
                 # If we already have a prompt-file from allowed_tools, append the system prompt AFTER security constraint
                 if self._temp_prompt_file:
-                    with open(self._temp_prompt_file, "r") as f:
+                    with open(self._temp_prompt_file, "r", encoding="utf-8") as f:
                         existing_content = f.read()
                     combined_prompt = f"{existing_content}\n\n{system_prompt}"
-                    with open(self._temp_prompt_file, "w") as f:
+                    with open(self._temp_prompt_file, "w", encoding="utf-8") as f:
                         f.write(combined_prompt)
                 else:
                     self._write_prompt_file(system_prompt)
@@ -216,6 +220,7 @@ You are restricted to only use the following tools: {tools_list}
                     prefix="cao_devin_config_",
                     suffix=".json",
                     delete=False,
+                    encoding="utf-8",
                 ) as f:
                     self._temp_config_file = f.name
                     f.write(json.dumps(base_config, indent=2))
@@ -374,8 +379,8 @@ You are restricted to only use the following tools: {tools_list}
                 break
             if re.search(STATUS_BAR_PATTERN, line):
                 break
-            if line.strip():
-                response_lines.append(line)
+            # Preserve all lines including empty ones for paragraph formatting
+            response_lines.append(line)
 
         if not response_lines:
             raise ValueError("No response found")
