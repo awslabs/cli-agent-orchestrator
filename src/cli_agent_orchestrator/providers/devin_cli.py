@@ -156,7 +156,7 @@ You are restricted to only use the following tools: {tools_list}
         # Ensure mcpServers is a dict in base_config
         if not isinstance(base_config.get("mcpServers"), dict):
             base_config["mcpServers"] = {}
-        
+
         existing_mcp = base_config.get("mcpServers", {})
         for server_name, server_config in mcp_servers.items():
             if isinstance(server_config, dict):
