@@ -685,6 +685,52 @@ class TestDevinCliSupervisorOrchestration:
         """Devin CLI supervisor assigns 3 analysts, receives callbacks, finalizes report.
 
         The canonical ``examples/assign/`` smoke test: parallel assign
+    """
+        _run_supervisor_assign_three_analysts_test(provider="devin_cli")
+
+    def test_simple_task_execution(self, require_devin):
+        """Devin CLI executes a simple task end-to-end.
+
+        Basic smoke test:
+        1. Spawn Devin CLI with developer profile
+        2. Send a simple task (echo command)
+        3. Verify Devin CLI executes and responds
+        """
+        session_name = f"test-simple-{uuid.uuid4().hex[:8]}"
+        terminal_id, actual_session = create_terminal(
+            provider="devin_cli",
+            agent_profile="developer",
+            session_name=session_name,
+        )
+        try:
+            # Wait for terminal to be ready
+            assert _wait_for_terminal_ready(terminal_id, timeout=30), \
+                f"Devin CLI did not become ready within 30s"
+
+            # Send a simple task
+            task_message = "echo hello world"
+            resp = requests.post(
+                f"{API_BASE_URL}/terminals/{terminal_id}/input",
+                params={"message": task_message},
+            )
+            assert resp.status_code == 200, f"Send message failed: {resp.status_code}"
+
+            # Wait for task completion
+            assert _wait_for_terminal_ready(terminal_id, timeout=30), \
+                f"Devin CLI did not complete task within 30s"
+
+            # Extract and verify output
+            output = extract_output(terminal_id)
+            assert len(output.strip()) > 0, "Devin CLI output should not be empty"
+            assert "hello" in output.lower(), f"Expected 'hello' in output, got: {output[:200]}"
+
+        finally:
+            cleanup_terminal(terminal_id)
+
+    def test_supervisor_assign_three_analysts(self, require_devin):
+        """Devin CLI supervisor assigns 3 analysts, receives callbacks, finalizes report.
+
+        The canonical ``examples/assign/`` smoke test: parallel assign
         of three data analysts, sequential handoff to report generator,
         inbox delivery of worker results, supervisor final assembly
         without doing the analysis work itself.

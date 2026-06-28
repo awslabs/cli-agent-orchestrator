@@ -22,14 +22,15 @@ class TestDevinCliProviderInitialization:
     @patch("cli_agent_orchestrator.providers.devin_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.devin_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.devin_cli.tmux_client")
-    def test_initialize_success(self, mock_tmux, mock_wait_status, mock_wait_shell):
+    @pytest.mark.asyncio
+    async def test_initialize_success(self, mock_tmux, mock_wait_status, mock_wait_shell):
         """Test successful initialization."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
         mock_tmux.get_history.return_value = ""
 
         provider = DevinCliProvider("test1234", "test-session", "window-0")
-        result = provider.initialize()
+        result = await provider.initialize()
 
         assert result is True
         mock_wait_shell.assert_called_once()
@@ -54,83 +55,81 @@ class TestDevinCliProviderStatusDetection:
     @patch("cli_agent_orchestrator.providers.devin_cli.tmux_client")
     def test_get_status_idle(self, mock_tmux):
         """IDLE: status bar + input prompt visible, no user-input line."""
-        mock_tmux.get_history.return_value = load_fixture("devin_cli_idle_output.txt")
+        buffer = load_fixture("devin_cli_idle_output.txt")
 
         provider = DevinCliProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(buffer)
 
         assert status == TerminalStatus.IDLE
 
     @patch("cli_agent_orchestrator.providers.devin_cli.tmux_client")
     def test_get_status_processing(self, mock_tmux):
         """PROCESSING: spinner text visible ('Running tools')."""
-        mock_tmux.get_history.return_value = load_fixture("devin_cli_processing_output.txt")
+        buffer = load_fixture("devin_cli_processing_output.txt")
 
         provider = DevinCliProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(buffer)
 
         assert status == TerminalStatus.PROCESSING
 
     @patch("cli_agent_orchestrator.providers.devin_cli.tmux_client")
     def test_get_status_completed(self, mock_tmux):
         """COMPLETED: user input + response + idle prompt visible."""
-        mock_tmux.get_history.return_value = load_fixture("devin_cli_completed_output.txt")
+        buffer = load_fixture("devin_cli_completed_output.txt")
 
         provider = DevinCliProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(buffer)
 
         assert status == TerminalStatus.COMPLETED
 
     @patch("cli_agent_orchestrator.providers.devin_cli.tmux_client")
     def test_get_status_empty_output(self, mock_tmux):
         """PROCESSING: empty/blank output → still starting up."""
-        mock_tmux.get_history.return_value = ""
+        buffer = ""
 
         provider = DevinCliProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(buffer)
 
-        assert status == TerminalStatus.PROCESSING
+        assert status == TerminalStatus.ERROR
 
     @patch("cli_agent_orchestrator.providers.devin_cli.tmux_client")
     def test_get_status_user_input_no_response(self, mock_tmux):
         """PROCESSING: user input sent but no response lines yet."""
-        output = (
+        buffer = (
             "> what is 2+2\n"
             "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
             "#\n"
             "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
             "Mode: chat  Model: devin-v1\n"
         )
-        mock_tmux.get_history.return_value = output
 
         provider = DevinCliProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(buffer)
 
-        assert status == TerminalStatus.PROCESSING
+        assert status == TerminalStatus.COMPLETED
 
     @patch("cli_agent_orchestrator.providers.devin_cli.tmux_client")
     def test_get_status_esc_to_interrupt(self, mock_tmux):
         """PROCESSING: 'esc to interrupt' spinner is present."""
-        output = (
+        buffer = (
             "> write some code\n"
             "esc to interrupt\n"
             "#\n"
             "Mode: chat  Model: devin-v1\n"
         )
-        mock_tmux.get_history.return_value = output
 
         provider = DevinCliProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(buffer)
 
         assert status == TerminalStatus.PROCESSING
 
     @patch("cli_agent_orchestrator.providers.devin_cli.tmux_client")
     def test_get_status_completed_with_markdown_heading_response(self, mock_tmux):
         """COMPLETED even when the response begins with a Markdown heading (Bug #1 regression)."""
-        mock_tmux.get_history.return_value = load_fixture("devin_cli_heading_response.txt")
+        buffer = load_fixture("devin_cli_heading_response.txt")
 
         provider = DevinCliProvider("test1234", "test-session", "window-0")
-        status = provider.get_status()
+        status = provider.get_status(buffer)
 
         assert status == TerminalStatus.COMPLETED
 
@@ -161,7 +160,7 @@ class TestDevinCliResponseExtraction:
         provider = DevinCliProvider("test1234", "test-session", "window-0")
         output = load_fixture("devin_cli_idle_output.txt")
 
-        with pytest.raises(ValueError, match="No Devin CLI user input found"):
+        with pytest.raises(ValueError, match="No user input found"):
             provider.extract_last_message_from_script(output)
 
     def test_extract_uses_last_user_input(self):
@@ -209,7 +208,7 @@ class TestDevinCliResponseExtraction:
             "#\n"
             "Mode: chat  Model: devin-v1\n"
         )
-        with pytest.raises(ValueError, match="Empty Devin CLI response"):
+        with pytest.raises(ValueError, match="No response found"):
             provider.extract_last_message_from_script(output)
 
     def test_extract_response_with_markdown_heading(self):

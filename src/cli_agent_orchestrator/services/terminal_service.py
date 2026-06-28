@@ -501,6 +501,7 @@ def send_input(
             enter_count=enter_count,
             force_bracketed_paste=True,
             submit_delay=provider.paste_submit_delay if provider else 0.3,
+            use_paste_buffer=provider.use_paste_buffer_for_input if hasattr(provider, 'use_paste_buffer_for_input') else (provider.use_paste_buffer if provider else True),
         )
 
         # Notify the provider that external input was received.
