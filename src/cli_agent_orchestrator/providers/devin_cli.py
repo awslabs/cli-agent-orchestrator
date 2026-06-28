@@ -197,10 +197,11 @@ You are restricted to only use the following tools: {tools_list}
             if system_prompt:
                 # If we already have a prompt-file from allowed_tools, append the system prompt AFTER security constraint
                 if self._temp_prompt_file:
-                    temp_path = Path(self._temp_prompt_file)
-                    existing_content = temp_path.read_text()
+                    with open(self._temp_prompt_file, "r") as f:
+                        existing_content = f.read()
                     combined_prompt = f"{existing_content}\n\n{system_prompt}"
-                    temp_path.write_text(combined_prompt)
+                    with open(self._temp_prompt_file, "w") as f:
+                        f.write(combined_prompt)
                 else:
                     self._write_prompt_file(system_prompt)
                     command_parts.extend(["--prompt-file", self._temp_prompt_file])
