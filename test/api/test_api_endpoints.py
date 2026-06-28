@@ -134,6 +134,7 @@ class TestAgentProviders:
         assert "copilot_cli" in names
         assert "opencode_cli" in names
         assert "cursor_cli" in names
+        assert "antigravity_cli" in names
         assert "devin_cli" in names
         for p in data:
             assert p["installed"] is True

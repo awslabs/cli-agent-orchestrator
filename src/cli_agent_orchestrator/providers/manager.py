@@ -135,6 +135,16 @@ class ProviderManager:
                     model=model,
                     skill_prompt=skill_prompt,
                 )
+            elif provider_type == ProviderType.ANTIGRAVITY_CLI.value:
+                provider = AntigravityCliProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    model=model,
+                    skill_prompt=skill_prompt,
+                )
             elif provider_type == ProviderType.DEVIN_CLI.value:
                 provider = DevinCliProvider(
                     terminal_id, tmux_session, tmux_window, agent_profile, allowed_tools
