@@ -24,7 +24,7 @@ from typing import Dict, List
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import list_terminals_by_session
-from cli_agent_orchestrator.constants import SESSION_PREFIX
+from cli_agent_orchestrator.constants import DEFAULT_PROVIDER, SESSION_PREFIX
 from cli_agent_orchestrator.models.terminal import Terminal
 from cli_agent_orchestrator.plugins import (
     PluginRegistry,
@@ -55,7 +55,9 @@ async def create_session(
     in the same session inherits them. See issue #248.
     """
     if provider is None:
-        resolved_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
+        resolved_provider = resolve_provider(
+            agent_profile, fallback_provider=DEFAULT_PROVIDER, install_aware=True
+        )
     else:
         resolved_provider = provider
 

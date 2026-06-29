@@ -230,7 +230,9 @@ def send(session_name, message, terminal_id, is_async, timeout):
         )
         response.raise_for_status()
     except requests.exceptions.RequestException as e:
-        raise click.ClickException(f"Failed to connect to cao-server: {e}")
+        from cli_agent_orchestrator.utils.server_process import server_error_hint
+
+        raise click.ClickException(f"Failed to connect to cao-server: {e}\n{server_error_hint()}")
 
     if is_async:
         click.echo(f"Message sent to terminal {target_id}")

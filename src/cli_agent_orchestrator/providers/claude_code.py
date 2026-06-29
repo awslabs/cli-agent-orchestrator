@@ -99,8 +99,17 @@ GET_STATUS_COMPLETION_PATTERN = r"[✶✢✽✻✳][^\n…]*\bfor\b"
 # lines are tolerated (not arbitrary content), so a "❯ my task" echo or a
 # "⏺ response"/compaction line between separators still cannot match, and the
 # {0,2} bound keeps the match local so it cannot span two distinct separators.
+#
+# Claude Code 2.1+ renders dynamic GHOST PLACEHOLDER text on the empty input
+# line, e.g. ``❯ Try "how does projects.ts work?"``. It is shown only before any
+# input is typed/pasted, so it is present exactly when we probe for the initial
+# ready prompt. The optional ``(?:Try [^\n]*)?`` tolerates that placeholder while
+# still rejecting a real echoed task (a pasted brief does not begin with "Try "),
+# so the box stays "essentially empty". Without this the ready prompt is never
+# detected on 2.1, initialize() times out, and the first task is never delivered
+# (ISS-012).
 NEW_TUI_BOX_PATTERN = re.compile(
-    r"─{8,}[^\n]*\n(?:[ \t\xa0]*\n){0,2}[ \t]*[>❯][ \t\xa0]*\n(?:[ \t\xa0]*\n){0,2}[ \t]*─{8,}",
+    r"─{8,}[^\n]*\n(?:[ \t\xa0]*\n){0,2}[ \t]*[>❯][ \t\xa0]*(?:Try [^\n]*)?\n(?:[ \t\xa0]*\n){0,2}[ \t]*─{8,}",
     re.MULTILINE,
 )
 # Live spinner in the new TUI: spinner glyph + a gerund ("…ing") + the … ellipsis,

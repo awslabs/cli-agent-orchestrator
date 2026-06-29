@@ -44,6 +44,51 @@ def make_provider(
 
 
 # ---------------------------------------------------------------------------
+# Screen-detection opt-in: OpenCode's footer is drawn with absolute cursor
+# moves, so the idle anchor is non-contiguous in the raw byte stream and only
+# resolves to "ctrl+p commands" once a pyte viewport composites the frame.
+# The provider must route through the screen path so initialize() sees IDLE.
+# ---------------------------------------------------------------------------
+
+
+class TestScreenDetection:
+    def test_provider_opts_into_screen_detection(self):
+        # Required so the StatusMonitor renders a pyte viewport before detecting.
+        assert OpenCodeCliProvider.supports_screen_detection is True
+
+    def test_absolute_cursor_footer_fails_raw_but_passes_via_screen(self):
+        """Regression for the init-timeout bug.
+
+        Build a footer the way OpenCode does — writing "ctrl+p" and "commands"
+        at separate columns via absolute cursor-position escapes (CSI row;col H).
+        In the raw stream the two tokens are non-contiguous, so get_status()
+        cannot match IDLE_FOOTER_PATTERN. After a pyte viewport composites the
+        cursor moves, the footer reads "ctrl+p commands" on one row and the
+        screen path returns IDLE.
+        """
+        pyte = pytest.importorskip("pyte")
+        provider = make_provider()
+
+        # Splash body + a footer split across absolute cursor jumps.
+        raw = (
+            "\x1b[2J\x1b[H"  # clear + home
+            "\x1b[3;10HAsk anything...\r\n"
+            "\x1b[10;1Htab agents"
+            "\x1b[10;30Hctrl+p"  # jump right, write first token
+            "\x1b[10;40Hcommands"  # jump further right, write second token
+        )
+
+        # Raw path cannot see a contiguous idle footer.
+        assert provider.get_status(raw) != TerminalStatus.IDLE
+
+        # Composited viewport (same dimensions CAO uses) resolves the moves.
+        screen = pyte.Screen(220, 50)
+        stream = pyte.Stream(screen)
+        stream.feed(raw)
+        assert provider.get_status_from_screen(screen.display) == TerminalStatus.IDLE
+
+
+# ---------------------------------------------------------------------------
 # (g) Regex patterns individually match expected substrings
 # ---------------------------------------------------------------------------
 

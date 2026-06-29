@@ -4,6 +4,7 @@ from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
+from cli_agent_orchestrator.constants import DEFAULT_PROVIDER
 from cli_agent_orchestrator.services.session_service import (
     create_session,
     delete_session,
@@ -30,7 +31,9 @@ class TestCreateSession:
 
         await create_session(provider=None, agent_profile="my_agent")
 
-        mock_resolve.assert_called_once_with("my_agent", fallback_provider="kiro_cli")
+        mock_resolve.assert_called_once_with(
+            "my_agent", fallback_provider=DEFAULT_PROVIDER, install_aware=True
+        )
         assert mock_create_terminal.call_args.kwargs["provider"] == "claude_code"
 
     @pytest.mark.asyncio

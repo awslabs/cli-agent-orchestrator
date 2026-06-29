@@ -7,6 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from cli_agent_orchestrator.api.main import app
+from cli_agent_orchestrator.constants import DEFAULT_PROVIDER
 from cli_agent_orchestrator.models.terminal import Terminal
 
 
@@ -648,7 +649,9 @@ class TestCrossProviderResolution:
 
             assert response.status_code == 201
             # Verify resolve_provider was called with the default fallback
-            mock_resolve.assert_called_once_with("developer", fallback_provider="kiro_cli")
+            mock_resolve.assert_called_once_with(
+                "developer", fallback_provider=DEFAULT_PROVIDER, install_aware=True
+            )
             # Verify terminal_service got the resolved provider
             call_kwargs = mock_svc.create_terminal.call_args.kwargs
             assert call_kwargs["provider"] == "claude_code"

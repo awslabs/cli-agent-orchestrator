@@ -185,6 +185,79 @@ class TestResolveProvider:
         assert result == "kiro_cli"
 
 
+class TestInstallAwareFallback:
+    """Tests for the install-aware default fallback in resolve_provider."""
+
+    _BIN = "cli_agent_orchestrator.utils.providers.provider_binary_installed"
+
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
+    def test_no_downgrade_when_install_aware_false(self, mock_load):
+        """Without install_aware, the fallback is returned verbatim (inheritance)."""
+        mock_load.return_value = AgentProfile(name="reviewer", description="r")
+
+        # Even if opencode is "not installed", inheritance must not downgrade.
+        with patch(self._BIN, return_value=False):
+            result = resolve_provider("reviewer", fallback_provider="claude_code")
+
+        assert result == "claude_code"
+
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
+    def test_no_downgrade_when_default_installed(self, mock_load):
+        """install_aware keeps the default when its binary is present."""
+        mock_load.return_value = AgentProfile(name="reviewer", description="r")
+
+        with patch(self._BIN, return_value=True):
+            result = resolve_provider(
+                "reviewer", fallback_provider="opencode_cli", install_aware=True
+            )
+
+        assert result == "opencode_cli"
+
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
+    def test_downgrades_to_first_installed_preferred(self, mock_load, caplog):
+        """install_aware downgrades a missing default to the first installed preferred."""
+        mock_load.return_value = AgentProfile(name="reviewer", description="r")
+
+        # opencode missing, claude installed, codex installed.
+        def _installed(name):
+            return name in ("claude_code", "codex")
+
+        with patch(self._BIN, side_effect=_installed):
+            with caplog.at_level(logging.WARNING):
+                result = resolve_provider(
+                    "reviewer", fallback_provider="opencode_cli", install_aware=True
+                )
+
+        assert result == "claude_code"
+        assert "downgrading" in caplog.text.lower()
+
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
+    def test_keeps_default_when_nothing_installed(self, mock_load, caplog):
+        """When no preferred provider is installed, the default is kept (launch will error)."""
+        mock_load.return_value = AgentProfile(name="reviewer", description="r")
+
+        with patch(self._BIN, return_value=False):
+            with patch(
+                "cli_agent_orchestrator.utils.providers.installed_providers", return_value=[]
+            ):
+                with caplog.at_level(logging.WARNING):
+                    result = resolve_provider(
+                        "reviewer", fallback_provider="opencode_cli", install_aware=True
+                    )
+
+        assert result == "opencode_cli"
+
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
+    def test_profile_provider_never_downgrades(self, mock_load):
+        """A profile-declared provider is honoured even if uninstalled (deliberate choice)."""
+        mock_load.return_value = AgentProfile(name="dev", description="d", provider="opencode_cli")
+
+        with patch(self._BIN, return_value=False):
+            result = resolve_provider("dev", fallback_provider="claude_code", install_aware=True)
+
+        assert result == "opencode_cli"
+
+
 class TestListAgentProfiles:
     """Tests for list_agent_profiles function."""
 

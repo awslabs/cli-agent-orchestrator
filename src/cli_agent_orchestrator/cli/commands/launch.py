@@ -144,6 +144,11 @@ def _parse_env_pairs(pairs):
     "the URL. Blocked prefixes (CLAUDE/CODEX_/__MISE_) and >=2048-byte values "
     "are rejected. See issue #248.",
 )
+@click.option(
+    "--no-auto-start",
+    is_flag=True,
+    help="Do not auto-start cao-server if it is not running (fail instead).",
+)
 def launch(
     message,
     agents,
@@ -157,6 +162,7 @@ def launch(
     working_directory,
     memory,
     env_pairs,
+    no_auto_start,
 ):
     """Launch cao session with specified agent profile."""
     try:
@@ -205,7 +211,7 @@ def launch(
         if provider is None:
             from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 
-            provider = resolve_provider(agents, DEFAULT_PROVIDER)
+            provider = resolve_provider(agents, DEFAULT_PROVIDER, install_aware=True)
 
         # Validate provider
         if provider not in PROVIDERS:
@@ -267,6 +273,26 @@ def launch(
                 )
                 if not auto_approve and not click.confirm("Proceed?", default=True):
                     raise click.ClickException("Launch cancelled by user")
+
+        # Auto-start the daemon so the common path never requires a separate
+        # ``cao-server`` terminal. Opt out with --no-auto-start. See rec #1.
+        from cli_agent_orchestrator.utils.server_process import (
+            is_server_running,
+            start_server_detached,
+        )
+
+        if not is_server_running():
+            if no_auto_start:
+                raise click.ClickException(
+                    "cao-server is not running and --no-auto-start was given. "
+                    "Start it with: cao server start"
+                )
+            click.echo("cao-server not running — starting it...")
+            try:
+                start_server_detached()
+            except RuntimeError as e:
+                raise click.ClickException(f"Failed to auto-start cao-server: {e}")
+            click.echo("cao-server started.")
 
         # Call API to create session — pass working_directory only if explicitly
         # provided. When omitted, the server defaults to its own CWD.
@@ -360,8 +386,15 @@ def launch(
                 click.echo(output)
 
     except requests.exceptions.RequestException as e:
-        raise click.ClickException(f"Failed to connect to cao-server: {str(e)}")
+        raise click.ClickException(_enrich_server_error(e))
     except click.ClickException:
         raise
     except Exception as e:
         raise click.ClickException(str(e))
+
+
+def _enrich_server_error(exc: Exception) -> str:
+    """Build a launch-failure message that points at the server log."""
+    from cli_agent_orchestrator.utils.server_process import server_error_hint
+
+    return f"Failed to connect to cao-server: {exc}\n{server_error_hint()}"

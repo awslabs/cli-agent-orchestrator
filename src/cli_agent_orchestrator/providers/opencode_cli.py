@@ -74,6 +74,17 @@ class OpenCodeCliProvider(BaseProvider):
         _model: Optional model override (e.g. ``anthropic/claude-sonnet-4-6``)
     """
 
+    # Opt in to pyte-rendered status detection (gated by CAO_PYTE_STATUS).
+    # OpenCode's TUI draws its footer with absolute cursor moves, so the idle
+    # anchor renders as separate tokens in the raw byte stream ("ctrl+p" and
+    # "commands" are never contiguous there) and IDLE_FOOTER_PATTERN never
+    # matches — the agent looks like it never reaches IDLE and initialize()
+    # times out. A composited pyte viewport resolves the cursor moves so the
+    # footer reads "ctrl+p commands" on one line. The existing get_status logic
+    # already operates on a newline-joined string, so the base-class default
+    # get_status_from_screen (join rows -> get_status) is the correct detector.
+    supports_screen_detection = True
+
     def __init__(
         self,
         terminal_id: str,

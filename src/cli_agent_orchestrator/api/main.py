@@ -275,7 +275,7 @@ class CreateFlowRequest(BaseModel):
     name: str
     schedule: str
     agent_profile: str
-    provider: str = "kiro_cli"
+    provider: str = DEFAULT_PROVIDER
     prompt_template: str
 
     @field_validator("name")
@@ -518,25 +518,20 @@ async def install_agent_profile_endpoint(request: InstallAgentProfileRequest) ->
 @app.get("/agents/providers")
 async def list_providers_endpoint() -> List[Dict]:
     """List available providers with installation status."""
-    import shutil
+    from cli_agent_orchestrator.utils.providers import (
+        PROVIDER_BINARIES,
+        provider_binary_installed,
+    )
 
-    provider_binaries = {
-        "kiro_cli": "kiro-cli",
-        "claude_code": "claude",
-        "q_cli": "q",
-        "codex": "codex",
-        "gemini_cli": "gemini",
-        "hermes": "hermes",
-        "kimi_cli": "kimi",
-        "copilot_cli": "copilot",
-        "opencode_cli": "opencode",
-        "cursor_cli": "agent",
-        "antigravity_cli": "agy",
-    }
     result = []
-    for provider, binary in provider_binaries.items():
-        installed = shutil.which(binary) is not None
-        result.append({"name": provider, "binary": binary, "installed": installed})
+    for provider, binary in PROVIDER_BINARIES.items():
+        result.append(
+            {
+                "name": provider,
+                "binary": binary,
+                "installed": provider_binary_installed(provider),
+            }
+        )
     return result
 
 
@@ -800,7 +795,9 @@ async def create_terminal_in_session(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
         if provider is None:
-            resolved_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
+            resolved_provider = resolve_provider(
+                agent_profile, fallback_provider=DEFAULT_PROVIDER, install_aware=True
+            )
         else:
             resolved_provider = provider
 

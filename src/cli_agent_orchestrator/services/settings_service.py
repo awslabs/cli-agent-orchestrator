@@ -69,9 +69,9 @@ def set_agent_dirs(dirs: Dict[str, str]) -> Dict[str, str]:
 
 # Default server tuning values
 _SERVER_DEFAULTS = {
-    "mcp_request_timeout": 30,
+    "mcp_request_timeout": 120,
     "event_bus_max_queue_size": 1024,
-    "provider_init_timeout": 60,
+    "provider_init_timeout": 90,
     "startup_prompt_handler_timeout": 20,
 }
 
@@ -84,9 +84,9 @@ def get_server_settings() -> Dict[str, Any]:
     """Get server tuning settings (cached; re-reads only when file changes).
 
     Returns a dict with the following keys (defaults shown):
-      - mcp_request_timeout (30): Seconds to wait for MCP HTTP calls
+      - mcp_request_timeout (120): Seconds to wait for MCP HTTP calls
       - event_bus_max_queue_size (1024): Max events buffered per subscriber
-      - provider_init_timeout (60): Seconds to wait for a CLI agent to reach IDLE
+      - provider_init_timeout (90): Seconds to wait for a CLI agent to reach IDLE
       - startup_prompt_handler_timeout (20): Seconds to handle startup prompts
         (e.g., workspace trust dialogs) before giving up
 
@@ -95,9 +95,9 @@ def get_server_settings() -> Dict[str, Any]:
 
         {
           "server": {
-            "mcp_request_timeout": 120,
+            "mcp_request_timeout": 180,
             "event_bus_max_queue_size": 8192,
-            "provider_init_timeout": 90,
+            "provider_init_timeout": 120,
             "startup_prompt_handler_timeout": 5
           }
         }

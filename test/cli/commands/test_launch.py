@@ -7,6 +7,28 @@ import pytest
 from click.testing import CliRunner
 
 from cli_agent_orchestrator.cli.commands.launch import _parse_env_pairs, launch
+from cli_agent_orchestrator.constants import DEFAULT_PROVIDER
+
+
+@pytest.fixture(autouse=True)
+def _server_already_running():
+    """Treat cao-server as already up for all launch tests.
+
+    ``cao launch`` auto-starts the daemon when ``is_server_running()`` is False.
+    Stubbing it True keeps tests hermetic — they neither probe localhost nor
+    spawn a real ``cao-server`` — and leaves the mocked ``requests.get`` side
+    effects for the assertions that actually exercise them. Tests covering the
+    auto-start path itself override this locally.
+    """
+    with (
+        patch(
+            "cli_agent_orchestrator.utils.server_process.is_server_running",
+            return_value=True,
+        ),
+        patch("cli_agent_orchestrator.utils.server_process.start_server_detached"),
+    ):
+        yield
+
 
 # ── Backend auto-detection (issue #308) ──────────────────────────────
 
@@ -408,7 +430,7 @@ def test_launch_workspace_confirmation_skipped_with_yolo_flag():
 
 
 def test_launch_workspace_confirmation_for_default_provider():
-    """Test that default provider (kiro_cli) also triggers workspace confirmation."""
+    """Test that the default provider also triggers workspace confirmation."""
     runner = CliRunner()
 
     with (
@@ -421,11 +443,11 @@ def test_launch_workspace_confirmation_for_default_provider():
         }
         mock_post.return_value.raise_for_status.return_value = None
 
-        # Default provider is kiro_cli, which requires workspace confirmation
+        # Default provider requires workspace confirmation
         result = runner.invoke(launch, ["--agents", "test-agent", "--headless"], input="y\n")
 
         assert result.exit_code == 0
-        assert "launching on kiro_cli" in result.output
+        assert f"launching on {DEFAULT_PROVIDER}" in result.output
         assert "Proceed?" in result.output
 
 
@@ -694,7 +716,7 @@ def test_launch_yolo_still_resolves_profile_provider():
 
         assert result.exit_code == 0
         # Provider resolution must run even on the --yolo branch.
-        mock_resolve.assert_called_once_with("codex_panelist", "kiro_cli")
+        mock_resolve.assert_called_once_with("codex_panelist", DEFAULT_PROVIDER, install_aware=True)
         # The kiro_cli-specific yolo warning text must NOT appear, because
         # the profile's provider ("claude_code") was honoured.
         assert "kiro_cli will launch in --legacy-ui mode" not in result.output
@@ -731,7 +753,9 @@ def test_launch_allowed_tools_still_resolves_profile_provider():
         )
 
         assert result.exit_code == 0
-        mock_resolve.assert_called_once_with("gemini_panelist", "kiro_cli")
+        mock_resolve.assert_called_once_with(
+            "gemini_panelist", DEFAULT_PROVIDER, install_aware=True
+        )
         # Local prompts must reflect the resolved provider, not the default.
         assert "launching on gemini_cli" in result.output
 
@@ -799,6 +823,62 @@ def test_launch_yolo_falls_back_to_default_when_profile_lacks_provider():
         # The kiro_cli-specific yolo warning IS expected here because the
         # profile didn't override and the fallback is kiro_cli.
         assert "kiro_cli will launch in --legacy-ui mode" in result.output
+
+
+# ── Auto-start cao-server (rec #1) ───────────────────────────────────
+
+
+def test_launch_auto_starts_server_when_down():
+    """When the server is down, launch starts it before creating the session."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post") as mock_post,
+        patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
+        patch("cli_agent_orchestrator.cli.commands.launch.wait_until_terminal_status") as mock_wait,
+        patch(
+            "cli_agent_orchestrator.utils.server_process.is_server_running",
+            return_value=False,
+        ),
+        patch(
+            "cli_agent_orchestrator.utils.server_process.start_server_detached",
+            return_value=4321,
+        ) as mock_start,
+    ):
+        mock_post.return_value.json.return_value = {
+            "session_name": "test-session",
+            "id": "test-terminal-id",
+            "name": "test-terminal",
+        }
+        mock_post.return_value.raise_for_status.return_value = None
+        mock_wait.return_value = True
+
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
+
+        assert result.exit_code == 0
+        mock_start.assert_called_once()
+        assert "starting it" in result.output
+
+
+def test_launch_no_auto_start_fails_when_down():
+    """--no-auto-start surfaces a clear error instead of spawning the server."""
+    runner = CliRunner()
+
+    with (
+        patch("cli_agent_orchestrator.cli.commands.launch.requests.post"),
+        patch(
+            "cli_agent_orchestrator.utils.server_process.is_server_running",
+            return_value=False,
+        ),
+        patch(
+            "cli_agent_orchestrator.utils.server_process.start_server_detached",
+        ) as mock_start,
+    ):
+        result = runner.invoke(launch, ["--agents", "test-agent", "--yolo", "--no-auto-start"])
+
+        assert result.exit_code != 0
+        assert "cao server start" in result.output
+        mock_start.assert_not_called()
 
 
 # ── --env forwarded env vars (issue #248) ────────────────────────────

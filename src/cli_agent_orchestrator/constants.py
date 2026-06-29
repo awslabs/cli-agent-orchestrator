@@ -35,8 +35,15 @@ SESSION_PREFIX = "cao-"
 PROVIDERS = [p.value for p in ProviderType]
 
 # Default provider used when --provider flag is not specified
-# Kiro CLI is the recommended provider for new projects
-DEFAULT_PROVIDER = ProviderType.KIRO_CLI.value
+DEFAULT_PROVIDER = ProviderType.OPENCODE_CLI.value
+
+# Preferred provider order for CAO. Used by ``cao doctor`` as the target set to
+# health-check and by the install-aware default fallback: when no provider is
+# explicitly chosen and the resolved default's binary is missing, CAO downgrades
+# to the first *installed* provider in this list. Order is deliberate —
+# opencode_cli is the default, with claude_code and codex as the next-best
+# backstops.
+PREFERRED_PROVIDERS = ["opencode_cli", "claude_code", "codex"]
 
 # =============================================================================
 # Tmux Configuration
@@ -56,6 +63,10 @@ CAO_ENV_FILE = CAO_HOME_DIR / ".env"
 
 # SQLite database directory
 DB_DIR = CAO_HOME_DIR / "db"
+
+# Pidfile written by ``cao server start`` so ``cao server stop/status`` can find
+# the detached ``cao-server`` daemon without scanning the process table.
+SERVER_PIDFILE = CAO_HOME_DIR / "server.pid"
 
 # Log file directory structure
 LOG_DIR = CAO_HOME_DIR / "logs"
@@ -194,7 +205,10 @@ SERVER_VERSION = "0.1.0"
 API_BASE_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
 
 # Default timeout (seconds) for HTTP calls to the CAO API server.
-MCP_REQUEST_TIMEOUT = 30
+# NOTE: the live, operator-tunable value lives in settings_service._SERVER_DEFAULTS
+# ("mcp_request_timeout") and is read via get_server_settings(). This constant is
+# a static fallback kept in sync with that default.
+MCP_REQUEST_TIMEOUT = 120
 
 
 # Operators can extend network allowlists via the env vars handled below.

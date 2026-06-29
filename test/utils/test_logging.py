@@ -7,7 +7,31 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from cli_agent_orchestrator.utils.logging import setup_logging
+from cli_agent_orchestrator.utils.logging import latest_server_log_path, setup_logging
+
+
+class TestLatestServerLogPath:
+    """Tests for latest_server_log_path."""
+
+    @patch("cli_agent_orchestrator.utils.logging.LOG_DIR")
+    def test_returns_most_recent_cao_log(self, mock_log_dir, tmp_path):
+        old = tmp_path / "cao_2026-01-01.log"
+        new = tmp_path / "cao_2026-06-01.log"
+        old.write_text("old")
+        new.write_text("new")
+        # Make `new` newer than `old`.
+        import os
+
+        os.utime(old, (1, 1))
+        os.utime(new, (10_000, 10_000))
+        mock_log_dir.glob = lambda pat: list(tmp_path.glob(pat))
+
+        assert latest_server_log_path() == new
+
+    @patch("cli_agent_orchestrator.utils.logging.LOG_DIR")
+    def test_returns_none_when_no_logs(self, mock_log_dir, tmp_path):
+        mock_log_dir.glob = lambda pat: list(tmp_path.glob(pat))
+        assert latest_server_log_path() is None
 
 
 class TestSetupLogging:

@@ -286,9 +286,9 @@ class TestGetServerSettings:
 
         result = get_server_settings()
         assert result == {
-            "mcp_request_timeout": 30,
+            "mcp_request_timeout": 120,
             "event_bus_max_queue_size": 1024,
-            "provider_init_timeout": 60,
+            "provider_init_timeout": 90,
             "startup_prompt_handler_timeout": 20,
         }
 
@@ -319,7 +319,7 @@ class TestGetServerSettings:
 
         _save({"server": {"mcp_request_timeout": "not_a_number"}})
         result = get_server_settings()
-        assert result["mcp_request_timeout"] == 30
+        assert result["mcp_request_timeout"] == 120
 
     def test_negative_value_falls_back_to_default(self, settings_file):
         """Negative values fall back to defaults."""
@@ -327,4 +327,4 @@ class TestGetServerSettings:
 
         _save({"server": {"provider_init_timeout": -5}})
         result = get_server_settings()
-        assert result["provider_init_timeout"] == 60
+        assert result["provider_init_timeout"] == 90

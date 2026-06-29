@@ -229,7 +229,53 @@ def load_agent_profile(agent_name: str) -> AgentProfile:
         raise RuntimeError(f"Failed to load agent profile '{agent_name}': {e}")
 
 
-def resolve_provider(agent_profile_name: str, fallback_provider: str) -> str:
+def _install_aware_fallback(fallback_provider: str) -> str:
+    """Downgrade an uninstalled default provider to the first installed one.
+
+    This applies ONLY on the implicit-default path (no ``--provider``, no
+    profile ``provider:``). When the resolved default's CLI binary is missing,
+    a launch would fail with an opaque init error; instead we pick the first
+    *installed* provider from ``PREFERRED_PROVIDERS`` and log a clear warning.
+
+    An explicit ``--provider`` must never reach here — that path is expected to
+    error loudly if its binary is absent, so substitution stays surprising-free.
+    """
+    from cli_agent_orchestrator.constants import PREFERRED_PROVIDERS
+    from cli_agent_orchestrator.utils.providers import (
+        installed_providers,
+        provider_binary_installed,
+    )
+
+    if provider_binary_installed(fallback_provider):
+        return fallback_provider
+
+    for candidate in PREFERRED_PROVIDERS:
+        if candidate != fallback_provider and provider_binary_installed(candidate):
+            logger.warning(
+                "Default provider '%s' is not installed (binary missing); "
+                "downgrading to '%s'. Install '%s' or pass --provider to override.",
+                fallback_provider,
+                candidate,
+                fallback_provider,
+            )
+            return candidate
+
+    # Nothing installed — keep the original default; provider.initialize() will
+    # surface a clear error naming the missing binary.
+    installed = installed_providers()
+    logger.warning(
+        "Default provider '%s' is not installed and no preferred provider is "
+        "available (installed: %s). Proceeding with '%s'; the launch will likely fail.",
+        fallback_provider,
+        installed or "none",
+        fallback_provider,
+    )
+    return fallback_provider
+
+
+def resolve_provider(
+    agent_profile_name: str, fallback_provider: str, install_aware: bool = False
+) -> str:
     """Resolve the provider to use for an agent profile.
 
     Loads the agent profile from the CAO agent store and checks for a
@@ -241,19 +287,33 @@ def resolve_provider(agent_profile_name: str, fallback_provider: str) -> str:
         agent_profile_name: Name of the agent profile to look up.
         fallback_provider: Provider to use when the profile does not specify
             one or specifies an invalid value.
+        install_aware: When True, the *fallback* branch (no profile provider)
+            applies an install-aware downgrade: if the fallback's CLI binary is
+            missing, swap to the first installed provider in
+            ``PREFERRED_PROVIDERS``. Enabled only on the implicit-default path
+            (``DEFAULT_PROVIDER``); the handoff/assign inheritance path leaves
+            it False so a worker keeps the supervisor's (running, installed)
+            provider verbatim. A profile-declared provider is a deliberate
+            choice and is never downgraded.
 
     Returns:
         Resolved provider type string.
     """
+
+    def _fallback() -> str:
+        return _install_aware_fallback(fallback_provider) if install_aware else fallback_provider
+
     try:
         profile = load_agent_profile(agent_profile_name)
     except (FileNotFoundError, RuntimeError):
         # Profile not found or failed to load — provider.initialize()
         # will surface a clear error later.  Fall back for now.
-        return fallback_provider
+        return _fallback()
 
     if profile.provider:
         if profile.provider in PROVIDERS:
+            # A profile-declared provider is a deliberate choice — honour it
+            # without install-aware downgrade (like an explicit --provider).
             return profile.provider
         else:
             logger.warning(
@@ -265,4 +325,4 @@ def resolve_provider(agent_profile_name: str, fallback_provider: str) -> str:
                 fallback_provider,
             )
 
-    return fallback_provider
+    return _fallback()
