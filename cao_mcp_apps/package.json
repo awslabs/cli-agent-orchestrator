@@ -42,7 +42,7 @@
     "@types/react-dom": "^18.3.1",
     "@types/node": "^22.10.1",
     "@vitejs/plugin-react": "^4.3.4",
-    "@vitest/coverage-v8": "^2.1.8",
+    "@vitest/coverage-v8": "^4.1.9",
     "fast-check": "^3.23.1",
     "happy-dom": "^15.11.7",
     "husky": "^9.1.6",
@@ -51,6 +51,6 @@
     "typescript": "^5.6.3",
     "vite": "^5.4.11",
     "vite-plugin-singlefile": "^2.1.0",
-    "vitest": "^2.1.8"
+    "vitest": "^4.1.9"
   }
 }
