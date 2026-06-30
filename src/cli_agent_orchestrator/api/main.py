@@ -1371,7 +1371,10 @@ async def record_step_output_endpoint(
 
 
 @app.post("/workflows/runs")
-async def start_workflow_run_endpoint(body: WorkflowRunRequest) -> Dict:
+async def start_workflow_run_endpoint(
+    body: WorkflowRunRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
     """Resolve a spec, run it to completion inline, return the WorkflowRunResult."""
     import uuid
 
@@ -1418,7 +1421,10 @@ async def get_workflow_run_endpoint(run_id: str) -> Dict:
 
 
 @app.post("/workflows/runs/{run_id}/cancel")
-async def cancel_workflow_run_endpoint(run_id: str) -> Dict:
+async def cancel_workflow_run_endpoint(
+    run_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
     """Cooperatively cancel a running workflow (FR-5.4)."""
     from cli_agent_orchestrator.services import workflow_service
 
