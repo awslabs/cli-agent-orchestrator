@@ -117,9 +117,9 @@ describe("19.11 — escaped markup (no XSS)", () => {
   });
 
   it("keeps a markup message in the textarea value (controlled, never parsed as HTML)", () => {
-    const onSubmit = vi.fn(
-      async (): Promise<SubmitCommandResult> => ({ success: true }),
-    );
+    const onSubmit = vi.fn(async (): Promise<SubmitCommandResult> => ({
+      success: true,
+    }));
     const { container } = render(
       <TaskControl onSubmit={onSubmit} target="t1" />,
     );
@@ -132,9 +132,9 @@ describe("19.11 — escaped markup (no XSS)", () => {
 
 describe("scope-gated button rendering", () => {
   function renderControls(scopes?: string[]) {
-    const onSubmit = vi.fn(
-      async (): Promise<SubmitCommandResult> => ({ success: true }),
-    );
+    const onSubmit = vi.fn(async (): Promise<SubmitCommandResult> => ({
+      success: true,
+    }));
     render(<TaskControl onSubmit={onSubmit} target="t1" scopes={scopes} />);
   }
 
@@ -163,5 +163,32 @@ describe("scope-gated button rendering", () => {
     renderControls(undefined);
     expect(screen.getByTestId("btn-send_message")).toBeTruthy();
     expect(screen.getByTestId("btn-shutdown_session")).toBeTruthy();
+  });
+});
+
+describe("supervisor distinction", () => {
+  it("badges the supervisor and orders it first in the fleet grid", () => {
+    const terminals = [
+      terminal({ id: "w1", status: "idle", agent_profile: "developer" }),
+      terminal({
+        id: "sup",
+        status: "processing",
+        agent_profile: "code_supervisor",
+      }),
+      terminal({ id: "w2", status: "completed", agent_profile: "reviewer" }),
+    ];
+    render(<Dashboard initialSnapshot={snapshot(terminals)} />);
+
+    // Exactly one supervisor badge.
+    const badges = screen.getAllByTestId("role-badge");
+    expect(badges).toHaveLength(1);
+    expect(badges[0].textContent).toBe("supervisor");
+
+    // The supervisor card sorts first and carries the accent class.
+    const cards = screen.getAllByTestId("agent-card");
+    expect(cards[0].getAttribute("data-terminal-id")).toBe("sup");
+    expect(cards[0].className).toContain("cao-card-supervisor");
+    // Worker cards do not get the supervisor accent.
+    expect(cards[1].className).not.toContain("cao-card-supervisor");
   });
 });

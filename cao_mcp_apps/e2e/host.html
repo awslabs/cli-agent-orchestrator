@@ -12,11 +12,26 @@
       .frames {
         display: flex;
         gap: 8px;
+        align-items: flex-start;
       }
       iframe {
         border: 1px solid #ccc;
         width: 640px;
         height: 480px;
+      }
+      /* Match the spec preferredFrameSize per view so single-view captures
+         render at first-class dimensions (dashboard goes multi-column). */
+      iframe[data-view="dashboard"] {
+        width: 1280px;
+        height: 740px;
+      }
+      iframe[data-view="agent"] {
+        width: 1024px;
+        height: 720px;
+      }
+      iframe[data-view="event-stream"] {
+        width: 680px;
+        height: 560px;
       }
     </style>
   </head>

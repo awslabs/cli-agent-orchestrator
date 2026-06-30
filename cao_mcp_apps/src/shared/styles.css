@@ -215,6 +215,24 @@ body {
   padding: 6px 8px 0;
 }
 
+/* Supervisor (fleet coordinator) distinction. */
+.cao-card-supervisor {
+  border-color: var(--color-border-info, #4c8bf5);
+  box-shadow: inset 3px 0 0 0 var(--color-border-info, #4c8bf5);
+}
+.cao-role-badge {
+  margin-left: 8px;
+  padding: 1px 6px;
+  font-size: 0.65rem;
+  font-weight: var(--font-weight-semibold, 600);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border-radius: var(--border-radius-full, 999px);
+  color: var(--color-text-info, #1a56db);
+  background: var(--color-background-info, #e8f0fe);
+  vertical-align: middle;
+}
+
 .cao-taskcontrol-error {
   color: var(--color-text-danger);
   font-size: 0.8rem;

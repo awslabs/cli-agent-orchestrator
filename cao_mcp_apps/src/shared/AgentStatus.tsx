@@ -19,17 +19,20 @@ const KNOWN_STATUSES = new Set([
 export interface AgentStatusProps {
   terminal: TerminalView;
   onOpen?: (terminalId: string) => void;
+  /** Render a "supervisor" role badge and accent (the fleet coordinator). */
+  isSupervisor?: boolean;
 }
 
 export function AgentStatus({
   terminal,
   onOpen,
+  isSupervisor = false,
 }: AgentStatusProps): JSX.Element {
   const status = (terminal.status ?? "unknown").toLowerCase();
   const statusClass = KNOWN_STATUSES.has(status) ? status : "unknown";
   return (
     <div
-      className="cao-card"
+      className={`cao-card${isSupervisor ? " cao-card-supervisor" : ""}`}
       data-testid="agent-card"
       data-terminal-id={terminal.id}
       role={onOpen ? "button" : undefined}
@@ -39,6 +42,11 @@ export function AgentStatus({
       <div className="cao-card-head">
         <span className="cao-card-title">
           {terminal.agent_profile ?? terminal.id}
+          {isSupervisor && (
+            <span className="cao-role-badge" data-testid="role-badge">
+              supervisor
+            </span>
+          )}
         </span>
         <span
           className={`cao-status cao-status-${statusClass}`}

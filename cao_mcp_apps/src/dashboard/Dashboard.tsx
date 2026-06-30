@@ -20,6 +20,21 @@ const POLL_INTERVAL_MS = 30_000;
 // chat host when the host advertises the `openLinks` capability.
 const WEB_UI_URL = "http://127.0.0.1:9889";
 
+/** Heuristic: a terminal whose profile marks it as the fleet coordinator. */
+function isSupervisorTerminal(t: { agent_profile: string | null }): boolean {
+  return (t.agent_profile ?? "").toLowerCase().includes("supervisor");
+}
+
+/** Supervisors first (stable), so the coordinator leads the fleet grid. */
+function orderFleet<T extends { agent_profile: string | null }>(
+  terminals: T[],
+): T[] {
+  return [...terminals].sort(
+    (a, b) =>
+      (isSupervisorTerminal(b) ? 1 : 0) - (isSupervisorTerminal(a) ? 1 : 0),
+  );
+}
+
 const EMPTY_SNAPSHOT: DashboardSnapshot = {
   sessions: [],
   terminals: [],
@@ -171,11 +186,12 @@ export function Dashboard({
         </div>
       ) : (
         <div className="cao-grid" data-testid="agent-grid">
-          {snapshot.terminals.map((terminal) => (
+          {orderFleet(snapshot.terminals).map((terminal) => (
             <AgentStatus
               key={terminal.id}
               terminal={terminal}
               onOpen={onOpenAgent}
+              isSupervisor={isSupervisorTerminal(terminal)}
             />
           ))}
         </div>
