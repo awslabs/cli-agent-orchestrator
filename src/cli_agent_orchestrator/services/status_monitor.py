@@ -112,7 +112,26 @@ class StatusMonitor:
           resumed) and at quiescence (output stopped) — see
           _schedule_screen_detection.
         """
-        provider = provider_manager.get_provider(terminal_id)
+        try:
+            provider = provider_manager.get_provider(terminal_id)
+        except ValueError:
+            # Terminal's DB row is gone but stray output chunks are still
+            # arriving — e.g. a crashed worker whose pane keeps emitting the
+            # shell prompt / "Resume this session" banner and tmux redraws
+            # after its record was deleted, or chunks draining out of the
+            # event bus after delete_terminal stopped the FIFO reader. Release
+            # any residual buffer/latch state once and drop the chunk. Without
+            # this, get_provider raised ValueError for every such chunk and
+            # run()'s handler logged a full traceback per chunk, spamming the
+            # log until the pane went quiet. Mirrors the defensive
+            # get_provider() handling already in get_status().
+            if terminal_id in self._buffers or terminal_id in self._last_status:
+                self.clear_terminal(terminal_id)
+            logger.debug("Dropping output for unknown/deleted terminal %s", terminal_id)
+            return
+        except Exception:
+            logger.exception("Error resolving provider for %s; dropping chunk", terminal_id)
+            return
         use_screen = (
             CAO_PYTE_STATUS
             and provider is not None

@@ -377,3 +377,37 @@ class TestRawDebounceArmedDetection:
         sm._process_chunk("t1", "● Working on task...")
 
         assert sm._last_status["t1"] == TerminalStatus.PROCESSING
+
+
+class TestProcessChunkDeletedTerminal:
+    """_process_chunk must tolerate stray output for a vanished terminal.
+
+    Regression: when a worker crashes, its DB row is deleted but the pane keeps
+    emitting (shell prompt, "Resume this session" banner, tmux redraws). Each
+    stray chunk made provider_manager.get_provider raise ValueError, which
+    run()'s handler logged as a full traceback — thousands of lines until the
+    pane went quiet. _process_chunk must instead drop the chunk and release any
+    residual buffer/latch state, mirroring get_status()'s defensive handling.
+    """
+
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_value_error_does_not_propagate_and_clears_state(self, mock_pm):
+        mock_pm.get_provider.side_effect = ValueError("Terminal t1 not found in database")
+        sm = StatusMonitor()
+        # Residual state as if the terminal had produced output before dying.
+        sm._buffers["t1"] = "prior output"
+        sm._last_status["t1"] = TerminalStatus.PROCESSING
+
+        # Must not raise, and must release the residual state.
+        sm._process_chunk("t1", "stray chunk after death\n")
+
+        assert "t1" not in sm._buffers
+        assert "t1" not in sm._last_status
+
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_repeated_stray_chunks_never_raise(self, mock_pm):
+        mock_pm.get_provider.side_effect = ValueError("Terminal t1 not found in database")
+        sm = StatusMonitor()
+        # No prior state at all (clear_terminal already ran) — still must not raise.
+        for i in range(5):
+            sm._process_chunk("t1", f"stray {i}\n")  # would have raised pre-fix
