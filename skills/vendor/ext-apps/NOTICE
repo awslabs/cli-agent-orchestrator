@@ -1,0 +1,32 @@
+ext-apps vendored MCP Apps builder skills
+=========================================
+
+The skills under this directory are vendored, unmodified, from the upstream
+Model Context Protocol "ext-apps" repository. They are reproduced here to
+support offline / air-gapped installation (see README.md for the online vs
+offline paths).
+
+Source project : Model Context Protocol — ext-apps
+Source URL     : https://github.com/modelcontextprotocol/ext-apps.git
+Source ref     : v1.7.4
+Source commit  : ca1d29894fabbd1558885a9ec8620dcb01d7457e
+Upstream path  : plugins/mcp-apps/skills
+License        : Apache License 2.0
+
+Vendored skills:
+  - create-mcp-app
+  - add-app-to-server
+  - migrate-oai-app
+  - convert-web-app
+
+These files are licensed under the Apache License, Version 2.0. You may obtain
+a copy of the License at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+The full upstream license text accompanies the source repository at the pinned
+commit above (see its top-level LICENSE file). This vendored copy is provided
+"AS IS", WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+implied. To refresh this copy to a newer upstream release, update PINNED_REF
+and PINNED_SHA in scripts/vendor_ext_apps_skills.py and re-run
+`make refresh-ext-apps-skills`.
