@@ -41,16 +41,16 @@
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@types/node": "^22.10.1",
-    "@vitejs/plugin-react": "^4.3.4",
-    "@vitest/coverage-v8": "^2.1.8",
+    "@vitejs/plugin-react": "^6.0.3",
+    "@vitest/coverage-v8": "^4.1.9",
     "fast-check": "^3.23.1",
     "happy-dom": "^20.10.6",
     "husky": "^9.1.6",
     "lint-staged": "^15.2.10",
     "prettier": "^3.3.3",
     "typescript": "^5.6.3",
-    "vite": "^5.4.11",
+    "vite": "^8.1.0",
     "vite-plugin-singlefile": "^2.1.0",
-    "vitest": "^2.1.8"
+    "vitest": "^4.1.9"
   }
 }
