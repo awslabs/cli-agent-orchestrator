@@ -604,6 +604,56 @@ def exit_terminal_cli(terminal_id: str) -> None:
         send_input(terminal_id, exit_command)
 
 
+def _persisted_output(terminal_id: str, mode: OutputMode) -> Optional[str]:
+    """Recover a torn-down terminal's output from its on-disk snapshot.
+
+    ``handoff`` always tears the worker down once it finishes (DB row deleted),
+    so a supervisor that re-reads the worker via ``get_terminal_output`` would
+    otherwise get a 404 — the in-band handoff result is the only copy. But
+    ``delete_terminal`` persists the full plain-text scrollback to
+    ``{id}.scrollback`` plus a ``{id}.snapshot.json`` recording the provider.
+    Serve that instead of failing: FULL returns the raw scrollback; LAST
+    re-extracts the final message with the recorded provider's (stateless)
+    extractor, falling back to the raw scrollback if extraction can't run.
+
+    Returns None when no snapshot exists (genuinely-unknown terminal).
+    """
+    scrollback_path = TERMINAL_LOG_DIR / f"{terminal_id}.scrollback"
+    if not scrollback_path.exists():
+        return None
+    try:
+        raw = scrollback_path.read_text(encoding="utf-8")
+    except OSError as e:
+        logger.warning("Failed to read persisted scrollback for %s: %s", terminal_id, e)
+        return None
+
+    if mode != OutputMode.LAST:
+        return raw
+
+    # LAST: try to re-extract the final message using the recorded provider.
+    try:
+        import json as _json
+
+        from cli_agent_orchestrator.providers.manager import provider_class_for
+
+        snapshot_path = TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json"
+        provider_type = _json.loads(snapshot_path.read_text(encoding="utf-8"))["provider"]
+        provider_cls = provider_class_for(provider_type)
+        if provider_cls is not None:
+            # extract_last_message_from_script reads only class-level regexes,
+            # not live terminal state, so a throwaway instance is sufficient.
+            extractor = provider_cls(terminal_id, "", "")
+            return extractor.extract_last_message_from_script(raw)
+    except Exception as e:
+        logger.debug(
+            "Could not re-extract last message for torn-down %s (%s); "
+            "returning raw scrollback",
+            terminal_id,
+            e,
+        )
+    return raw
+
+
 def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
     """Get terminal output.
 
@@ -637,6 +687,12 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
     try:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
+            # Terminal is gone (e.g. a handoff worker torn down after finishing).
+            # Recover its output from the delete-time scrollback snapshot rather
+            # than 404-ing the supervisor's re-read.
+            persisted = _persisted_output(terminal_id, mode)
+            if persisted is not None:
+                return persisted
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
         # Get output from StatusMonitor buffer (instant, no tmux call)

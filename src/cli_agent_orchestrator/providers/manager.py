@@ -53,6 +53,17 @@ def default_launch_env(provider_type: str) -> Dict[str, str]:
     return dict(getattr(cls, "DEFAULT_LAUNCH_ENV", {})) if cls is not None else {}
 
 
+def provider_class_for(provider_type: str) -> Optional[type]:
+    """Provider class for ``provider_type``, or None if unknown.
+
+    Lets callers reach a provider's stateless helpers (e.g.
+    ``extract_last_message_from_script``) without a live, registered instance —
+    used to re-extract a torn-down worker's final message from its persisted
+    scrollback snapshot.
+    """
+    return _PROVIDER_CLASS_BY_TYPE.get(provider_type)
+
+
 class ProviderManager:
     """Simplified provider manager with direct mapping."""
 

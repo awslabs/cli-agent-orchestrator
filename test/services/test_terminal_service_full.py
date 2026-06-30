@@ -1211,3 +1211,48 @@ class TestCreateTerminalLaunchEnv:
 
         extra_env = mock_tmux.create_session.call_args.kwargs["extra_env"]
         assert "BUN_JSC_useDFGJIT" not in extra_env
+
+
+class TestGetOutputPersistedFallback:
+    """get_output recovers a torn-down terminal's output from its scrollback snapshot.
+
+    handoff tears the worker down when it finishes (DB row deleted), so a
+    supervisor re-reading it via get_terminal_output used to get a 404 — the
+    in-band handoff result was the only copy. delete_terminal persists
+    {id}.scrollback + {id}.snapshot.json; get_output now serves those.
+    """
+
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
+    def test_full_mode_serves_raw_scrollback(self, mock_log_dir, mock_meta, tmp_path):
+        mock_meta.return_value = None  # terminal gone
+        mock_log_dir.__truediv__ = lambda self_, name: tmp_path / name
+        (tmp_path / "deadterm.scrollback").write_text("full session history here", encoding="utf-8")
+
+        assert get_output("deadterm", OutputMode.FULL) == "full session history here"
+
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
+    def test_last_mode_reextracts_with_recorded_provider(self, mock_log_dir, mock_meta, tmp_path):
+        mock_meta.return_value = None
+        mock_log_dir.__truediv__ = lambda self_, name: tmp_path / name
+        # A claude_code report in the raw scrollback, framed by the ● marker + prompt.
+        (tmp_path / "deadterm.scrollback").write_text(
+            "● Final report line one\nFinal report line two\n❯ ", encoding="utf-8"
+        )
+        (tmp_path / "deadterm.snapshot.json").write_text(
+            '{"terminal_id": "deadterm", "provider": "claude_code"}', encoding="utf-8"
+        )
+
+        result = get_output("deadterm", OutputMode.LAST)
+        assert "Final report line one" in result
+        assert "Final report line two" in result
+
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
+    def test_no_snapshot_still_raises_not_found(self, mock_log_dir, mock_meta, tmp_path):
+        mock_meta.return_value = None
+        mock_log_dir.__truediv__ = lambda self_, name: tmp_path / name  # empty dir
+
+        with pytest.raises(ValueError, match="not found"):
+            get_output("ghost", OutputMode.FULL)
