@@ -3,19 +3,13 @@
  * The root establishes a query container (`container-type: inline-size`) so the
  * grid responds to the iframe's own width — not the viewport — which is what an
  * MCP host actually controls. Theme colors fall back to sane defaults
- * but consume host-provided CSS variables when present (SEP-1865 theming). */
+ * but consume host-provided CSS variables when present (SEP-1865 theming).
+ *
+ * The :root fallback block is generated from the shared design-token SSOT
+ * (design-tokens/tokens.json) via `node design-tokens/gen.mjs`. Host CSS
+ * variables still override these defaults at runtime — theming is preserved. */
 
-:root {
-  --color-background-primary: light-dark(#ffffff, #171717);
-  --color-background-secondary: light-dark(#f5f5f5, #1f1f1f);
-  --color-text-primary: light-dark(#171717, #fafafa);
-  --color-text-secondary: light-dark(#525252, #a3a3a3);
-  --color-border-primary: light-dark(#e5e5e5, #333333);
-  --color-background-danger: light-dark(#fef2f2, #3f1d1d);
-  --color-text-danger: light-dark(#b91c1c, #fca5a5);
-  --font-sans: system-ui, -apple-system, sans-serif;
-  --border-radius-md: 8px;
-}
+@import "./tokens.generated.css";
 
 * {
   box-sizing: border-box;
@@ -110,20 +104,39 @@ body {
   border: 1px solid var(--color-border-primary);
 }
 
+/* Status colors map status -> semantic role -> host-overridable CSS variable
+ * (defined in tokens.generated.css). The status -> role mapping mirrors the
+ * SSOT in design-tokens/status.json. */
 .cao-status-idle {
-  color: #2563eb;
+  color: var(--cao-status-success);
 }
 .cao-status-processing {
-  color: #d97706;
+  color: var(--cao-status-info);
 }
 .cao-status-completed {
-  color: #16a34a;
+  color: var(--cao-status-accent);
+}
+.cao-status-waiting_user_answer {
+  color: var(--cao-status-warning);
 }
 .cao-status-error {
-  color: var(--color-text-danger);
+  color: var(--cao-status-danger);
 }
 .cao-status-stopped {
-  color: var(--color-text-secondary);
+  color: var(--cao-status-neutral);
+}
+.cao-status-unknown {
+  color: var(--cao-status-neutral);
+}
+
+/* Pulse affordance — driven by the `pulse` flag in status.generated.ts. */
+.cao-status-pulse {
+  animation: cao-status-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+@keyframes cao-status-pulse {
+  50% {
+    opacity: 0.5;
+  }
 }
 
 .cao-events {

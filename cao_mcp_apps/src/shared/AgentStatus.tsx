@@ -5,16 +5,11 @@
 
 import React from "react";
 import type { TerminalView } from "./types";
+import { STATUS } from "./status.generated";
 
-const KNOWN_STATUSES = new Set([
-  "idle",
-  "processing",
-  "completed",
-  "waiting_user_answer",
-  "error",
-  "stopped",
-  "unknown",
-]);
+// The known status taxonomy is generated from the shared SSOT
+// (design-tokens/status.json) via `node design-tokens/gen.mjs`.
+const KNOWN_STATUSES = new Set(Object.keys(STATUS));
 
 export interface AgentStatusProps {
   terminal: TerminalView;
@@ -30,6 +25,11 @@ export function AgentStatus({
 }: AgentStatusProps): JSX.Element {
   const status = (terminal.status ?? "unknown").toLowerCase();
   const statusClass = KNOWN_STATUSES.has(status) ? status : "unknown";
+  // Label/role/pulse are derived from the generated status SSOT; the color is
+  // applied through the cao-status-<status> class, which resolves to the
+  // role's host-overridable CSS variable in styles.css/tokens.generated.css.
+  const semantics = STATUS[statusClass];
+  const pulseClass = semantics?.pulse ? " cao-status-pulse" : "";
   return (
     <div
       className={`cao-card${isSupervisor ? " cao-card-supervisor" : ""}`}
@@ -49,8 +49,9 @@ export function AgentStatus({
           )}
         </span>
         <span
-          className={`cao-status cao-status-${statusClass}`}
+          className={`cao-status cao-status-${statusClass}${pulseClass}`}
           data-testid="status-badge"
+          title={semantics?.label}
         >
           {status}
         </span>
