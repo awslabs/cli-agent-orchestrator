@@ -9,7 +9,8 @@ alongside the ``ui://cao/*`` views:
   * ``register_widget(mcp)`` — best-effort registration on the FastMCP server as
     a ``cao://widget/topology`` resource. If the running fastmcp build does not
     expose ``@mcp.resource`` we fall back to the static mount and rely on the
-    host (Claude.ai, VS Code Insiders, Goose) to render it.
+    host (Claude / Claude Desktop, ChatGPT, VS Code GitHub Copilot, Goose,
+    Postman, MCPJam, Archestra.AI) to render it.
 
 Both entry points are **default-off**: they are no-ops unless
 ``CAO_MCP_APPS_ENABLED`` is set, matching the contract of ``register_apps`` /

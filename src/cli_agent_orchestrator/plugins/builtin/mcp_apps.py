@@ -13,8 +13,13 @@ by the companion ``event_log_publisher`` plugin; this plugin owns the
 MCP-server-facing registration.
 
 Authoritative spec (source of truth for the surface this plugin registers):
-SEP-1865 "MCP Apps" (Final) — https://modelcontextprotocol.io/seps/1865-mcp-apps-interactive-user-interfaces-for-mcp
-(PR https://github.com/modelcontextprotocol/modelcontextprotocol/pull/1865; full spec https://github.com/modelcontextprotocol/ext-apps/blob/main/specification/draft/apps.mdx); capability negotiation per SEP-2133.
+MCP Apps (SEP-1865, Status: Stable 2026-01-26).
+- Overview: https://modelcontextprotocol.io/extensions/apps/overview
+- Build guide: https://modelcontextprotocol.io/extensions/apps/build
+- Stable spec: https://github.com/modelcontextprotocol/ext-apps/blob/main/specification/2026-01-26/apps.mdx
+- Capability negotiation: https://modelcontextprotocol.io/extensions/overview#negotiation
+- SDK (reference impl, v1.7.4): https://www.npmjs.com/package/@modelcontextprotocol/ext-apps
+- Provenance / discussion: https://github.com/modelcontextprotocol/modelcontextprotocol/pull/1865
 """
 
 import logging

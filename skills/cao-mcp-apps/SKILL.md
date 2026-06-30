@@ -1,6 +1,6 @@
 ---
 name: cao-mcp-apps
-description: Enable, operate, and extend CAO's MCP Apps surface — the sandboxed host-rendered fleet UI (SEP-1865) with the ui://cao/* views, the topology widget, the submit_command mutation choke point, SEP-2133 capability advertisement, and the default-off OAuth scope layer. Use whenever the user wants to turn on the MCP Apps UI, observe/steer a CAO fleet from inside an MCP App host (Claude Desktop, Cursor, VS Code Insiders, Goose), debug why the views don't render, build the frontend bundles, or extend the surface (new view, tool, or command kind).
+description: Enable, operate, and extend CAO's MCP Apps surface — the sandboxed host-rendered fleet UI (SEP-1865) with the ui://cao/* views, the topology widget, the submit_command mutation choke point, SEP-2133 capability advertisement, and the default-off OAuth scope layer. Use whenever the user wants to turn on the MCP Apps UI, observe/steer a CAO fleet from inside an MCP App host (Claude / Claude Desktop, ChatGPT, VS Code GitHub Copilot, Microsoft 365 Copilot, Goose, Postman, MCPJam, Archestra.AI), debug why the views don't render, build the frontend bundles, or extend the surface (new view, tool, or command kind).
 ---
 
 # CAO MCP Apps
@@ -8,9 +8,17 @@ description: Enable, operate, and extend CAO's MCP Apps surface — the sandboxe
 Operator + developer playbook for CAO's host-rendered fleet UI. Reference docs:
 [`docs/mcp-apps.md`](../../docs/mcp-apps.md); example: [`examples/mcp-apps/`](../../examples/mcp-apps/).
 
-**Authoritative spec:** [SEP-1865 — MCP Apps](https://modelcontextprotocol.io/seps/1865-mcp-apps-interactive-user-interfaces-for-mcp) (Final) ·
-[PR #1865](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/1865) · [full ext-apps spec](https://github.com/modelcontextprotocol/ext-apps/blob/main/specification/draft/apps.mdx) ·
-[SEP-2133 (Extensions)](https://modelcontextprotocol.io/seps/2133-extensions).
+**Authoritative spec & sources of truth:**
+[MCP Apps Overview](https://modelcontextprotocol.io/extensions/apps/overview) ·
+[Build an MCP App](https://modelcontextprotocol.io/extensions/apps/build) ·
+[capability negotiation](https://modelcontextprotocol.io/extensions/overview#negotiation) ·
+[client matrix](https://modelcontextprotocol.io/extensions/client-matrix) ·
+stable spec [`2026-01-26/apps.mdx`](https://github.com/modelcontextprotocol/ext-apps/blob/main/specification/2026-01-26/apps.mdx)
+(SEP-1865, Status: Stable) ·
+SDK [`@modelcontextprotocol/ext-apps`](https://www.npmjs.com/package/@modelcontextprotocol/ext-apps) v1.7.4
+([API ref](https://apps.extensions.modelcontextprotocol.io/api/index.html) ·
+[repo](https://github.com/modelcontextprotocol/ext-apps)) ·
+provenance [PR #1865](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/1865).
 
 ## Turn it on
 
@@ -24,8 +32,8 @@ uv run cao-mcp-server    # registers tools/resources via the mcp_apps plugin
 
 It is packaged as the built-in `mcp_apps` plugin (`cao.plugins` entry-point). The
 plugin's `on_mcp_server` hook registers the `ui://cao/*` resources, the five app
-tools, the topology widget, and the SEP-2133 capability — best-effort and
-default-off, so nothing changes when the flag is unset.
+tools, the topology widget, and advertises the `io.modelcontextprotocol/ui`
+capability — best-effort and default-off, so nothing changes when the flag is unset.
 
 ## What the operator gets
 
@@ -37,6 +45,25 @@ default-off, so nothing changes when the flag is unset.
 All mutations flow through `submit_command(kind, payload)` — kinds:
 `send_message`, `assign`, `create_session` (standard); `interrupt`, `pause`,
 `resume` (lifecycle); `shutdown_session` (destructive).
+
+## Full capability scope (what the views use)
+
+Beyond `tools/call`, the views exercise the spec's bidirectional channel:
+
+- **Host-delegated open-link** (`ui/open-link`) — the dashboard shows
+  "Open full Web UI ↗" → `http://127.0.0.1:9889` **only when** the host
+  advertises `hostCapabilities.openLinks` (gate on `app.canOpenLinks()`; the
+  sandbox forbids `window.open`).
+- **Display modes** (`ui/request-display-mode`) — views declare
+  `availableDisplayModes: ["inline","fullscreen"]` at `ui/initialize`.
+- **Streamed tool input** (`ui/notifications/tool-input` / `-partial`) — render
+  before the result lands.
+- **Model-context notes** (`ui/update-model-context`) — body-free gesture
+  summaries keep the agent aware without leaking message contents.
+
+`preferredFrameSize` and `requiredScopes` are CAO additions, **not** spec
+`_meta.ui` fields (the spec sizes via `containerDimensions` +
+`ui/notifications/size-changed`); CAO requests **no** elevated `permissions`.
 
 ## Troubleshooting
 
@@ -61,7 +88,16 @@ All mutations flow through `submit_command(kind, payload)` — kinds:
 - **New view** → add a `ui://cao/<name>` resource in `ext_apps/apps.py` + an entry
   point under `cao_mcp_apps/`, build it, and tag the rendering tool with
   `ui_meta(...)`.
+- **New host-delegated action** → add a thin method on the `McpApp` bridge
+  (`cao_mcp_apps/src/shared/mcpApp.ts`) that issues the spec `ui/*` request
+  (e.g. `openLink` → `ui/open-link`, `requestDisplayMode` →
+  `ui/request-display-mode`); gate UI on the matching `hostCapabilities` flag and
+  cover it with a `mockHost` test.
 - **Keep the boundary** → `mcp_server/*` must reach state only over HTTP; the AST
   guard test (`test/test_http_only_boundary.py`) enforces it.
 - **Keep bundles JIT-free** → no `eval`/`new Function` (host CSP forbids it); the
   CI scan fails the build otherwise.
+- **Scaffolding a fresh MCP App?** → see the
+  [build guide](https://modelcontextprotocol.io/extensions/apps/build) and the
+  official [ext-apps Agent Skills](https://github.com/modelcontextprotocol/ext-apps)
+  (`create-mcp-app`, `migrate-oai-app`, `add-app-to-server`, `convert-web-app`).

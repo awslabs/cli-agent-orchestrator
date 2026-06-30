@@ -202,7 +202,7 @@ For hot-reload dev mode, remote access over SSH, and rebuilding the frontend fro
 
 ## MCP Apps — host-rendered fleet UI
 
-Beyond the browser dashboard, CAO can render its fleet UI **inside an MCP App-capable host** (Claude Desktop, Cursor, VS Code Insiders, Goose) using the [SEP-1865 "MCP Apps"](https://modelcontextprotocol.io/seps/1865-mcp-apps-interactive-user-interfaces-for-mcp) extension — so you observe and steer agents without leaving your chat host. It ships three single-file views (`ui://cao/dashboard`, `ui://cao/agent`, `ui://cao/event-stream`) plus a build-free topology widget, backed by an in-process event ring buffer and a single audited `submit_command` mutation path.
+Beyond the browser dashboard, CAO can render its fleet UI **inside an MCP App-capable host** (Claude / Claude Desktop, ChatGPT, VS Code GitHub Copilot, Microsoft 365 Copilot, Goose, Postman, MCPJam, Archestra.AI — see the [client matrix](https://modelcontextprotocol.io/extensions/client-matrix)) using the [MCP Apps](https://modelcontextprotocol.io/extensions/apps/overview) extension (SEP-1865) — so you observe and steer agents without leaving your chat host. It ships three single-file views (`ui://cao/dashboard`, `ui://cao/agent`, `ui://cao/event-stream`) plus a build-free topology widget, backed by an in-process event ring buffer and a single audited `submit_command` mutation path.
 
 ![CAO MCP Apps — fleet dashboard rendered in an MCP App host](docs/media/mcp-apps-dashboard.png)
 

@@ -1,11 +1,14 @@
 # `cao_mcp_apps` — MCP Apps UI surface
 
-The browser-free, JIT-free **frontend** for CAO's [SEP-1865 "MCP Apps"](https://modelcontextprotocol.io/seps/1865-mcp-apps-interactive-user-interfaces-for-mcp)
+The browser-free, JIT-free **frontend** for CAO's
+[MCP Apps](https://modelcontextprotocol.io/extensions/apps/overview) (SEP-1865)
 fleet UI. Each view is built into a **single, self-contained HTML file** (all JS
 and CSS inlined — no external assets) and shipped inside the Python wheel at
 `src/cli_agent_orchestrator/ext_apps/apps_static/`, where the built-in `mcp_apps`
-plugin serves it to an MCP App–capable host (Claude Desktop, Cursor, VS Code
-Insiders, Goose).
+plugin serves it to an MCP App–capable host (Claude / Claude Desktop, ChatGPT,
+VS Code GitHub Copilot, Microsoft 365 Copilot, Goose, Postman, MCPJam,
+Archestra.AI — see the
+[client matrix](https://modelcontextprotocol.io/extensions/client-matrix)).
 
 This package is **build-time only** — Node is not required to *run* CAO. You only
 need it to develop, test, or rebuild these views. For the feature overview and

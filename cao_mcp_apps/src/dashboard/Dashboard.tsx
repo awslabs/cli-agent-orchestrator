@@ -15,6 +15,11 @@ import type { DashboardSnapshot, SubmitCommandKind } from "../shared/types";
 
 const POLL_INTERVAL_MS = 30_000;
 
+// CAO's bundled browser Web UI. The dashboard offers a host-delegated link to
+// it (SEP-1865 `ui/open-link`) so an operator can pop the full UI out of the
+// chat host when the host advertises the `openLinks` capability.
+const WEB_UI_URL = "http://127.0.0.1:9889";
+
 const EMPTY_SNAPSHOT: DashboardSnapshot = {
   sessions: [],
   terminals: [],
@@ -37,6 +42,7 @@ export function Dashboard({
     initialSnapshot ?? EMPTY_SNAPSHOT,
   );
   const [unreachable, setUnreachable] = useState(false);
+  const [canOpenWebUi, setCanOpenWebUi] = useState(false);
   const snapshotRef = useRef(snapshot);
   snapshotRef.current = snapshot;
 
@@ -54,12 +60,13 @@ export function Dashboard({
     // Register handlers BEFORE connect (lifecycle invariant).
     app.onToolResult((result) => {
       const snap = (result?.structuredContent ?? result) as
-        | DashboardSnapshot
-        | undefined;
+        DashboardSnapshot | undefined;
       if (snap && Array.isArray(snap.terminals)) applyDelta(snap);
     });
 
     void app.connect().then(() => {
+      // Surface the host-delegated Web UI link only when the host can open links.
+      setCanOpenWebUi(app.canOpenLinks());
       stop = app.startPolling(
         "render_dashboard",
         POLL_INTERVAL_MS,
@@ -117,6 +124,20 @@ export function Dashboard({
         sessions={snapshot.counts.sessions}
         terminals={snapshot.counts.terminals}
       />
+      {canOpenWebUi && (
+        <div className="cao-toolbar" data-testid="webui-toolbar">
+          <button
+            type="button"
+            className="cao-btn"
+            data-testid="open-webui"
+            onClick={() => {
+              if (app) void app.openLink(WEB_UI_URL).catch(() => undefined);
+            }}
+          >
+            Open full Web UI ↗
+          </button>
+        </div>
+      )}
       {unreachable && (
         <div
           className="cao-taskcontrol-error"

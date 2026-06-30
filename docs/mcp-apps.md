@@ -1,8 +1,12 @@
 # MCP Apps — host-rendered fleet UI
 
-CAO can expose a **sandboxed, host-rendered UI** (the [SEP-1865 "MCP Apps"](https://modelcontextprotocol.io/seps/1865-mcp-apps-interactive-user-interfaces-for-mcp)
-extension) so an operator can **observe and steer a CAO fleet from inside any
-MCP App-capable host** — Claude Desktop, Cursor, VS Code Insiders, Goose. It
+CAO can expose a **sandboxed, host-rendered UI** (the
+[MCP Apps](https://modelcontextprotocol.io/extensions/apps/overview) extension,
+SEP-1865) so an operator can **observe and steer a CAO fleet from inside any
+MCP App-capable host** — ChatGPT, Claude / Claude Desktop, VS Code (GitHub
+Copilot), Microsoft 365 Copilot, Goose, Postman, MCPJam, Archestra.AI (see the
+[client support matrix](https://modelcontextprotocol.io/extensions/client-matrix)
+for the authoritative, up-to-date list). It
 ships three single-file HTML views plus a lightweight topology widget, driven by
 a small set of MCP tools and backed by an in-process event ring buffer.
 
@@ -61,12 +65,16 @@ build or a missing frontend build degrades gracefully (logged, never fatal).
 - `submit_command` — the **single mutation choke point**: classifies the command
   kind, applies a scope pre-check, and routes to a real Backplane HTTP endpoint.
 
-Each rendering tool carries a `_meta.ui` annotation. The **spec-standard**
-fields are `resourceUri` + `visibility` (tool `_meta.ui`) and `prefersBorder` +
-a structured `csp` (resource `_meta.ui`), with MIME `text/html;profile=mcp-app`,
-per the authoritative [SEP-1865](https://modelcontextprotocol.io/seps/1865-mcp-apps-interactive-user-interfaces-for-mcp) spec (Final). `preferredFrameSize`
-and `requiredScopes` are **CAO-specific** additions to `_meta.ui`, not part of the
-SEP-1865 schema.
+Each rendering tool carries a `_meta.ui` annotation. The **spec-standard** tool
+fields are `resourceUri` + `visibility`; the spec-standard *resource* fields are a
+structured `csp`, `permissions`, `domain`, and `prefersBorder`, with MIME
+`text/html;profile=mcp-app`, per the stable
+[2026-01-26 spec](https://github.com/modelcontextprotocol/ext-apps/blob/main/specification/2026-01-26/apps.mdx)
+(SEP-1865, Status: Stable). `preferredFrameSize` and `requiredScopes` are
+**CAO-specific** additions to `_meta.ui`, not part of the spec schema — the spec
+sizes views via the host's `containerDimensions` and the View's
+`ui/notifications/size-changed` notification instead, and CAO declares **no
+elevated `permissions`** (camera/microphone/geolocation/clipboard) by design.
 
 ## Architecture & data flow
 
@@ -98,15 +106,17 @@ lifecycle events ─▶ event_log_publisher (observer plugin)
   Cross-thread publishes are marshalled onto each subscriber's loop with
   `call_soon_threadsafe` (an `asyncio.Queue` is not thread-safe).
 
-## Capability negotiation (SEP-2133)
+## Capability negotiation
 
 When enabled, the server advertises the `io.modelcontextprotocol/ui` extension on
-the `initialize` handshake so SEP-1865 hosts discover the surface
-(`ext_apps/sep2133.py`). SEP-1865 negotiates this through the SEP-1724 extensions
-mechanism (`capabilities.extensions["io.modelcontextprotocol/ui"]` with
-`mimeTypes`); the installed MCP SDK exposes only `experimental`, so
-CAO advertises there and `client_supports_mcp_apps` accepts **either** location
-(forward-compatible). `negotiate_capabilities` offers the pull-model equivalent.
+the `initialize` handshake so MCP App hosts discover the surface
+(`ext_apps/sep2133.py`). The extension is negotiated through the standard MCP
+[extensions capability mechanism](https://modelcontextprotocol.io/extensions/overview#negotiation)
+(`capabilities.extensions["io.modelcontextprotocol/ui"]` carrying the REQUIRED
+`mimeTypes: ["text/html;profile=mcp-app"]`); the installed MCP SDK exposes only
+`experimental`, so CAO advertises there and `client_supports_mcp_apps` accepts
+**either** location (forward-compatible). `negotiate_capabilities` offers the
+pull-model equivalent.
 
 ## Security
 
@@ -221,6 +231,15 @@ recorded here because they shape how the MCP Apps surface should evolve.
 
 - `examples/mcp-apps/` — a worked enable-and-drive example.
 - `skills/cao-mcp-apps/SKILL.md` — operator playbook.
-- **Authoritative spec:** [SEP-1865 — MCP Apps](https://modelcontextprotocol.io/seps/1865-mcp-apps-interactive-user-interfaces-for-mcp) (Final) ·
-  [PR #1865](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/1865) · [full ext-apps spec](https://github.com/modelcontextprotocol/ext-apps/blob/main/specification/draft/apps.mdx) ·
-  [SEP-2133 (Extensions)](https://modelcontextprotocol.io/seps/2133-extensions).
+- **Authoritative spec & sources of truth:**
+  - [MCP Apps — Overview](https://modelcontextprotocol.io/extensions/apps/overview) ·
+    [Build an MCP App](https://modelcontextprotocol.io/extensions/apps/build)
+  - [Extensions overview](https://modelcontextprotocol.io/extensions/overview) ·
+    [capability negotiation](https://modelcontextprotocol.io/extensions/overview#negotiation) ·
+    [client support matrix](https://modelcontextprotocol.io/extensions/client-matrix)
+  - Stable spec **2026-01-26** (SEP-1865, Status: Stable):
+    [`specification/2026-01-26/apps.mdx`](https://github.com/modelcontextprotocol/ext-apps/blob/main/specification/2026-01-26/apps.mdx)
+  - SDK [`@modelcontextprotocol/ext-apps`](https://www.npmjs.com/package/@modelcontextprotocol/ext-apps)
+    (v1.7.4) · [API reference](https://apps.extensions.modelcontextprotocol.io/api/index.html) ·
+    [repo](https://github.com/modelcontextprotocol/ext-apps)
+  - Provenance / discussion: [SEP-1865 PR #1865](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/1865)

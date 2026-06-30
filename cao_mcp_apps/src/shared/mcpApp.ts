@@ -1,13 +1,14 @@
 // MCP App lifecycle bridge for the CAO views.
 //
-// DEVIATION NOTE (per the authoritative SEP-1865 spec, Final): the
+// DEVIATION NOTE (per the stable SEP-1865 spec, 2026-01-26): the
 // `@modelcontextprotocol/ext-apps` SDK exists (npm
-// v1.7.4), but the spec explicitly states "you don't need an SDK to talk MCP
+// v1.7.4), but the spec explicitly states you "don't need an SDK to 'talk MCP'
 // with the host." To keep the single-file bundles dependency-free and trivially
 // JIT-free, this bridge implements the spec's native `postMessage` JSON-RPC
 // pattern directly rather than importing the SDK. The public interface
 // (connect / submitCommand / fetchHistory / startPolling / updateModelContext /
-// silentlyNoteToModel) is preserved so the SDK can be dropped in later.
+// silentlyNoteToModel / openLink / requestDisplayMode) is preserved so the SDK
+// can be dropped in later.
 //
 // Lifecycle invariant: notification handlers are registered BEFORE
 // `connect()` sends `ui/initialize`, because the host MUST NOT send
@@ -23,8 +24,12 @@ interface PendingRequest {
   reject: (reason: Error) => void;
 }
 
-// Matches the `ui/initialize` examples in the authoritative SEP-1865 spec.
-const PROTOCOL_VERSION = "2025-06-18";
+// The MCP Apps protocol version announced in the `ui/initialize` handshake. The
+// stable SEP-1865 spec (2026-01-26) uses this exact value in both its
+// `ui/initialize` request example and `McpUiInitializeResult`. This is the MCP
+// Apps extension version negotiated View<->Host — distinct from the base MCP
+// client<->server protocol version used on the server's `initialize` handshake.
+const PROTOCOL_VERSION = "2026-01-26";
 
 export interface McpAppOptions {
   /** Window to post messages to (defaults to window.parent). */
@@ -47,6 +52,12 @@ export class McpApp {
   private connected = false;
   /** Host context (theme, container dimensions, etc.) from initialize. */
   hostContext: Record<string, unknown> = {};
+  /**
+   * Host capabilities from the `ui/initialize` result (e.g. `openLinks`,
+   * `serverTools`). The View checks these before requesting host-delegated
+   * actions (per SEP-1865 HostCapabilities).
+   */
+  hostCapabilities: Record<string, unknown> = {};
   /** The expected host origin once known; messages from elsewhere are ignored. */
   private hostOrigin: string | null = null;
 
@@ -128,6 +139,8 @@ export class McpApp {
       clientInfo: { name: "cao-mcp-app", version: "0.1.0" },
     });
     this.hostContext = (result?.hostContext as Record<string, unknown>) ?? {};
+    this.hostCapabilities =
+      (result?.hostCapabilities as Record<string, unknown>) ?? {};
     this.notify("ui/notifications/initialized", {});
   }
 
@@ -241,6 +254,36 @@ export class McpApp {
     } catch {
       // Swallow: model-context notes are best-effort.
     }
+  }
+
+  // ---- host-delegated actions (SEP-1865 ui/* requests) -------------------
+
+  /** Whether the host advertised support for opening external links. */
+  canOpenLinks(): boolean {
+    return Boolean(this.hostCapabilities.openLinks);
+  }
+
+  /**
+   * Ask the host to open an external URL (spec `ui/open-link`). This delegates
+   * to the host's capability rather than calling `window.open` (the sandbox
+   * forbids it) — e.g. opening CAO's bundled Web UI at http://127.0.0.1:9889
+   * from inside the chat host. Resolves on success; rejects if the host denies
+   * or fails. Callers SHOULD gate on `canOpenLinks()` first.
+   */
+  async openLink(url: string): Promise<void> {
+    await this.request("ui/open-link", { url });
+  }
+
+  /**
+   * Request a display-mode change (spec `ui/request-display-mode`). The host
+   * returns the *actual* resulting mode, which MAY differ from the request
+   * (e.g. the host declined). Returns the resulting mode string.
+   */
+  async requestDisplayMode(
+    mode: "inline" | "fullscreen" | "pip",
+  ): Promise<string> {
+    const result = await this.request("ui/request-display-mode", { mode });
+    return (result?.mode as string) ?? mode;
   }
 
   // ---- transport internals ----------------------------------------------
