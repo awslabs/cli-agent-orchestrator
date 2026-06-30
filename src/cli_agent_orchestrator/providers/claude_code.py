@@ -657,6 +657,32 @@ class ClaudeCodeProvider(BaseProvider):
         last_sol_response = None
         for m in re.finditer(EXTRACTION_RESPONSE_PATTERN, output):
             last_sol_response = m
+
+        # In-progress tool use looks like a finished turn here. The newest TUI
+        # renders an active tool call as a response-marker line ending in the "…"
+        # ellipsis ("⏺ Reading 1 file…", "● Running command…"): the agent emitted
+        # the marker but is still working. During a quiet think the live spinner
+        # scrolls out of the rolling buffer, so the PROCESSING checks above miss
+        # it and this falls through to COMPLETED — false-completing a handoff in
+        # ~10s and returning the preamble instead of the report. Treat a freshest
+        # response-marker line that ends in "…" as still PROCESSING. Gated on
+        # last_completion is None: a genuinely finished turn shows the
+        # "✻ Worked for Ns" summary (a separate, trustworthy signal), so this
+        # never blocks real completion. Only the single-char "…" (U+2026) the TUI
+        # emits is matched, so prose ending in ASCII "..." cannot false-trigger.
+        if last_completion is None:
+            response_marker = max(
+                (m for m in (last_sol_response, last_response) if m is not None),
+                key=lambda m: m.start(),
+                default=None,
+            )
+            if last_idle is not None and response_marker is not None:
+                line_start = output.rfind("\n", 0, response_marker.start()) + 1
+                line_end = output.find("\n", response_marker.start())
+                marker_line = output[line_start : line_end if line_end != -1 else len(output)]
+                if re.sub(ANSI_CODE_PATTERN, "", marker_line).rstrip().endswith("…"):
+                    return TerminalStatus.PROCESSING
+
         if last_idle is not None and (
             last_completion is not None
             or last_sol_response is not None

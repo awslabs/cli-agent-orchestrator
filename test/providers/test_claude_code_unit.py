@@ -1757,3 +1757,41 @@ class TestEffortFooterNotAResponse:
         provider = ClaudeCodeProvider("t", "s", "w")
         real = "❯ do recon\n● Here is the report\nLine two\n✻ Worked for 3s\n" + "─" * 60 + "\n❯ \n"
         assert provider.get_status(real) == TerminalStatus.COMPLETED
+
+
+class TestInProgressToolUseNotCompleted:
+    """An in-progress tool-use marker line ("⏺ Reading 1 file…") ending in the
+    "…" ellipsis must read as PROCESSING, not COMPLETED. Otherwise, when the
+    worker emits a preamble then thinks quietly (>10s, live spinner scrolled out
+    of the rolling buffer), get_status latches a false COMPLETED, the handoff's
+    confirm window passes, and it false-completes in ~10s returning the preamble.
+    """
+
+    BOX = "─" * 100
+
+    def test_preamble_tool_use_is_processing(self):
+        p = ClaudeCodeProvider("t", "s", "w")
+        buf = (
+            "⏺ I'll start by reading the task description.\n"
+            "⏺ Reading 1 file…\n" + self.BOX + "\n❯ \n" + self.BOX + "\n  ⏵⏵ esc to interrupt\n"
+        )
+        assert p.get_status(buf) == TerminalStatus.PROCESSING
+
+    def test_real_response_without_ellipsis_still_completes(self):
+        p = ClaudeCodeProvider("t", "s", "w")
+        buf = "❯ do the task\n⏺ Here is the completed response\n" + self.BOX + "\n❯ "
+        assert p.get_status(buf) == TerminalStatus.COMPLETED
+
+    def test_completion_summary_overrides_ellipsis_marker(self):
+        """A finished turn shows '✻ Worked for Ns'; that trustworthy signal must
+        still complete even if an earlier tool line ends in '…'."""
+        p = ClaudeCodeProvider("t", "s", "w")
+        buf = "⏺ Reading 1 file…\n✻ Worked for 3s\n" + self.BOX + "\n❯ \n"
+        assert p.get_status(buf) == TerminalStatus.COMPLETED
+
+    def test_ascii_triple_dot_does_not_false_trigger(self):
+        """Only the single-char '…' (U+2026) the TUI emits should match; a real
+        answer ending in ASCII '...' must still complete."""
+        p = ClaudeCodeProvider("t", "s", "w")
+        buf = "⏺ That's all for now...\n" + self.BOX + "\n❯ "
+        assert p.get_status(buf) == TerminalStatus.COMPLETED
