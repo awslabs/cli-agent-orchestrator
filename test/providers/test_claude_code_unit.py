@@ -1711,3 +1711,49 @@ class TestClaudeCodeScreenDetection:
 
     def test_empty_screen_is_unknown(self):
         assert self._p().get_status_from_screen(["", "", ""]) == TerminalStatus.UNKNOWN
+
+
+class TestEffortFooterNotAResponse:
+    """The TUI effort footer "● high · /effort" can render at the START of a line
+    (not only inline as "… esc to interrupt ● high · /effort"). The line-start
+    "●" must NOT be read as a response marker, or the idle launch screen (❯ box +
+    this footer) flips get_status to a false COMPLETED and a handoff completes in
+    ~10s extracting "high · /effort" as the report. Regression for that.
+    """
+
+    def _idle_footer_screen(self):
+        return (
+            "● high · /effort\n" + "─" * 100 + "\n"
+            '❯ Try "create a util logging.py that..."\n' + "─" * 100 + "\n"
+            "  ⏵⏵ bypass permissions · esc to interrupt\n"
+        )
+
+    def test_idle_footer_screen_is_not_completed(self):
+        provider = ClaudeCodeProvider("t", "s", "w")
+        assert provider.get_status(self._idle_footer_screen()) != TerminalStatus.COMPLETED
+
+    def test_idle_footer_screen_yields_no_extractable_response(self):
+        provider = ClaudeCodeProvider("t", "s", "w")
+        with pytest.raises(ValueError, match="No Claude Code response found"):
+            provider.extract_last_message_from_script(self._idle_footer_screen())
+
+    def test_sol_effort_footer_levels_all_excluded(self):
+        provider = ClaudeCodeProvider("t", "s", "w")
+        for level in ("high", "medium", "low", "xhigh", "max", "none"):
+            screen = f"● {level} · /effort\n" + "─" * 80 + "\n❯ \n"
+            with pytest.raises(ValueError, match="No Claude Code response found"):
+                provider.extract_last_message_from_script(screen)
+
+    def test_real_response_above_footer_still_extracts(self):
+        provider = ClaudeCodeProvider("t", "s", "w")
+        screen = "● Final answer here\nmore detail\n" + "─" * 60 + "\n❯ \n" "● high · /effort\n"
+        result = provider.extract_last_message_from_script(screen)
+        assert "Final answer here" in result
+        assert "more detail" in result
+        assert "/effort" not in result
+
+    def test_response_completion_still_detected(self):
+        """The fix must not suppress genuine completion."""
+        provider = ClaudeCodeProvider("t", "s", "w")
+        real = "❯ do recon\n● Here is the report\nLine two\n✻ Worked for 3s\n" + "─" * 60 + "\n❯ \n"
+        assert provider.get_status(real) == TerminalStatus.COMPLETED

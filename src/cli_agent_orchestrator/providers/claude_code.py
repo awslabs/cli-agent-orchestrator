@@ -39,7 +39,17 @@ RESPONSE_PATTERN = r"⏺(?:\x1b\[[0-9;]*m)*\s+"  # Handle any ANSI codes between
 # RESPONSE_PATTERN so get_status's legacy ⏺-COMPLETED check is unaffected (adding
 # "●" there could fire COMPLETED mid-stream while a response is still rendering).
 EXTRACTION_RESPONSE_PATTERN = re.compile(
-    r"^[ \t]*(?:\x1b\[[0-9;]*m)*[⏺●](?:\x1b\[[0-9;]*m)*\s+",
+    # Response marker at the start of a line. The trailing negative lookahead
+    # rejects the TUI effort footer "● high · /effort" (also medium/low/xhigh/…):
+    # the line-start anchor alone only excludes the footer when it renders inline
+    # ("… esc to interrupt ● high · /effort"), but the effort indicator also
+    # renders on its OWN line, where the leading "●" would otherwise read as a
+    # response marker — flipping get_status to a false COMPLETED on the idle
+    # launch screen (the ❯ box + this footer satisfy the completion heuristic)
+    # and making extraction return "high · /effort" as the message. The footer
+    # is identified by its line ending in "/effort"; real responses don't.
+    r"^[ \t]*(?:\x1b\[[0-9;]*m)*[⏺●](?:\x1b\[[0-9;]*m)*\s+"
+    r"(?![^\n]*/effort(?:\x1b\[[0-9;]*m)*[ \t]*$)",
     re.MULTILINE,
 )
 # Match Claude Code processing spinners:
