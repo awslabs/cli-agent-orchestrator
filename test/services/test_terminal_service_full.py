@@ -1096,9 +1096,17 @@ class TestCreateTerminalLaunchEnv:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
     @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
     async def test_supervisor_new_session_gets_provider_launch_env(
-        self, mock_load_profile, mock_gen_id, mock_gen_session, mock_gen_window,
-        mock_tmux, mock_db_create, mock_provider_manager, mock_fifo_dir,
-        mock_fifo_manager, mock_status_monitor,
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
     ):
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
@@ -1127,9 +1135,17 @@ class TestCreateTerminalLaunchEnv:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
     @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
     async def test_operator_env_overrides_provider_default(
-        self, mock_load_profile, mock_gen_id, mock_gen_session, mock_gen_window,
-        mock_tmux, mock_db_create, mock_provider_manager, mock_fifo_dir,
-        mock_fifo_manager, mock_status_monitor,
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
     ):
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
@@ -1142,7 +1158,9 @@ class TestCreateTerminalLaunchEnv:
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
 
         await create_terminal(
-            "claude_code", "developer", new_session=True,
+            "claude_code",
+            "developer",
+            new_session=True,
             env_vars={"BUN_JSC_useDFGJIT": "1"},
         )
 
@@ -1161,9 +1179,17 @@ class TestCreateTerminalLaunchEnv:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
     @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
     async def test_worker_window_gets_provider_launch_env(
-        self, mock_load_profile, mock_gen_id, mock_gen_session, mock_gen_window,
-        mock_tmux, mock_db_create, mock_provider_manager, mock_fifo_dir,
-        mock_fifo_manager, mock_status_monitor,
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
     ):
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"
@@ -1193,9 +1219,17 @@ class TestCreateTerminalLaunchEnv:
     @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
     @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
     async def test_provider_without_defaults_injects_nothing(
-        self, mock_load_profile, mock_gen_id, mock_gen_session, mock_gen_window,
-        mock_tmux, mock_db_create, mock_provider_manager, mock_fifo_dir,
-        mock_fifo_manager, mock_status_monitor,
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
     ):
         mock_gen_id.return_value = "test1234"
         mock_gen_session.return_value = "cao-session"

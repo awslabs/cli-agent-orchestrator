@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 # pane environment must be assembled at tmux session/window creation, which
 # happens before the provider is instantiated and initialized. Kept exhaustive
 # over ProviderType by test_default_launch_env_covers_all_provider_types.
-_PROVIDER_CLASS_BY_TYPE: Dict[str, type] = {
+_PROVIDER_CLASS_BY_TYPE: Dict[str, type[BaseProvider]] = {
     ProviderType.Q_CLI.value: QCliProvider,
     ProviderType.KIRO_CLI.value: KiroCliProvider,
     ProviderType.CLAUDE_CODE.value: ClaudeCodeProvider,
@@ -53,7 +53,7 @@ def default_launch_env(provider_type: str) -> Dict[str, str]:
     return dict(getattr(cls, "DEFAULT_LAUNCH_ENV", {})) if cls is not None else {}
 
 
-def provider_class_for(provider_type: str) -> Optional[type]:
+def provider_class_for(provider_type: str) -> Optional[type[BaseProvider]]:
     """Provider class for ``provider_type``, or None if unknown.
 
     Lets callers reach a provider's stateless helpers (e.g.

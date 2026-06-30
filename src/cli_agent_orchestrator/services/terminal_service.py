@@ -694,8 +694,7 @@ def _persisted_output(terminal_id: str, mode: OutputMode) -> Optional[str]:
             return extractor.extract_last_message_from_script(raw)
     except Exception as e:
         logger.debug(
-            "Could not re-extract last message for torn-down %s (%s); "
-            "returning raw scrollback",
+            "Could not re-extract last message for torn-down %s (%s); " "returning raw scrollback",
             terminal_id,
             e,
         )

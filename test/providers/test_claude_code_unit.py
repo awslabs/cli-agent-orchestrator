@@ -1006,11 +1006,7 @@ Map<String, List<Integer>> nested = getMap();
         input box, and excludes the footer chrome below it."""
         # Realistic layout: response, the turn separator, then the ❯ box + footer.
         output = (
-            "⏺ Response content\n"
-            + "─" * 80
-            + "\n❯ \n"
-            + "─" * 80
-            + "\n  footer chrome here\n"
+            "⏺ Response content\n" + "─" * 80 + "\n❯ \n" + "─" * 80 + "\n  footer chrome here\n"
         )
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         result = provider.extract_last_message_from_script(output)
@@ -1024,11 +1020,9 @@ Map<String, List<Integer>> nested = getMap();
         (followed by more content, not the ❯ prompt) extraction must keep going,
         not clip the rest of the message."""
         output = (
-            "● Recon complete. Here is my report.\n"
-            + "─" * 60 + "\n"  # rendered markdown '---'
+            "● Recon complete. Here is my report.\n" + "─" * 60 + "\n"  # rendered markdown '---'
             "Architecture: Next.js 16 + Postgres RLS\n"
-            "Unit tests: 427 files / 7830 passed\n"
-            + "─" * 60 + "\n"  # the real turn separator
+            "Unit tests: 427 files / 7830 passed\n" + "─" * 60 + "\n"  # the real turn separator
             "❯ \n"
         )
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
@@ -1043,8 +1037,7 @@ Map<String, List<Integer>> nested = getMap();
         must not terminate extraction mid-report."""
         output = (
             "● Results:\n"
-            "Suite        Passed\n"
-            + "─" * 30 + "\n"  # pure-dash table rule, no box chars
+            "Suite        Passed\n" + "─" * 30 + "\n"  # pure-dash table rule, no box chars
             "auth         120\n"
             "billing      88\n"
             "End of report\n"

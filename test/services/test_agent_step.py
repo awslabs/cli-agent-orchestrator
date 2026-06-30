@@ -273,9 +273,7 @@ class TestWorkerCrashDetection:
             wait_results=(True, True),  # ready, then "completed"
             final_status=TerminalStatus.COMPLETED,
         )
-        crashed = patch(
-            f"{_MODULE}.terminal_service.worker_returned_to_shell", return_value=True
-        )
+        crashed = patch(f"{_MODULE}.terminal_service.worker_returned_to_shell", return_value=True)
         with create, send, delete, get_output as m_out, exit_cli, wait, status, crashed:
             with pytest.raises(StepExecutionError) as ei:
                 asyncio.run(run_agent_step("claude_code", "developer", "do the task"))
@@ -291,9 +289,7 @@ class TestWorkerCrashDetection:
             wait_results=(True, False),  # ready, then completion times out
             final_status=TerminalStatus.PROCESSING,  # stuck (UNKNOWN suppressed)
         )
-        crashed = patch(
-            f"{_MODULE}.terminal_service.worker_returned_to_shell", return_value=True
-        )
+        crashed = patch(f"{_MODULE}.terminal_service.worker_returned_to_shell", return_value=True)
         with create, send, delete, get_output, exit_cli, wait, status, crashed:
             with pytest.raises(StepExecutionError) as ei:
                 asyncio.run(run_agent_step("claude_code", "developer", "do the task"))
@@ -308,9 +304,7 @@ class TestWorkerCrashDetection:
             final_status=TerminalStatus.COMPLETED,
             output="the full report",
         )
-        alive = patch(
-            f"{_MODULE}.terminal_service.worker_returned_to_shell", return_value=False
-        )
+        alive = patch(f"{_MODULE}.terminal_service.worker_returned_to_shell", return_value=False)
         with create, send, delete, get_output, exit_cli, wait, status, alive:
             result = asyncio.run(run_agent_step("claude_code", "developer", "do the task"))
 
