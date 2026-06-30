@@ -1002,14 +1002,59 @@ Map<String, List<Integer>> nested = getMap();
         assert "Map<String, List<Integer>>" in result
 
     def test_extract_message_with_separator(self):
-        """Test extraction stops at Claude's full-width UI separator (20+ dashes, no box chars)."""
-        # Claude's turn separator spans the full terminal width — always 20+ dashes
-        output = "⏺ Response content\n" + "─" * 80 + "\nMore content\n> "
+        """Extraction stops at the full-width turn separator that frames the ❯
+        input box, and excludes the footer chrome below it."""
+        # Realistic layout: response, the turn separator, then the ❯ box + footer.
+        output = (
+            "⏺ Response content\n"
+            + "─" * 80
+            + "\n❯ \n"
+            + "─" * 80
+            + "\n  footer chrome here\n"
+        )
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         result = provider.extract_last_message_from_script(output)
 
         assert "Response content" in result
-        assert "More content" not in result
+        assert "footer chrome here" not in result
+
+    def test_extract_message_markdown_rule_in_report_not_truncated(self):
+        """A markdown thematic break (``---``) renders as a full-width U+2500 rule
+        identical to the turn separator. When it appears INSIDE the report
+        (followed by more content, not the ❯ prompt) extraction must keep going,
+        not clip the rest of the message."""
+        output = (
+            "● Recon complete. Here is my report.\n"
+            + "─" * 60 + "\n"  # rendered markdown '---'
+            "Architecture: Next.js 16 + Postgres RLS\n"
+            "Unit tests: 427 files / 7830 passed\n"
+            + "─" * 60 + "\n"  # the real turn separator
+            "❯ \n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        result = provider.extract_last_message_from_script(output)
+
+        assert "Recon complete" in result
+        assert "Next.js 16 + Postgres RLS" in result
+        assert "427 files / 7830 passed" in result  # the previously-clipped section
+
+    def test_extract_message_pure_dash_table_rule_in_report_not_truncated(self):
+        """A simple table whose divider is a pure U+2500 run (no corner glyphs)
+        must not terminate extraction mid-report."""
+        output = (
+            "● Results:\n"
+            "Suite        Passed\n"
+            + "─" * 30 + "\n"  # pure-dash table rule, no box chars
+            "auth         120\n"
+            "billing      88\n"
+            "End of report\n"
+            "❯ \n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        result = provider.extract_last_message_from_script(output)
+
+        assert "auth         120" in result
+        assert "End of report" in result
 
     def test_extract_message_new_tui_circle_glyph(self):
         """Newest TUI uses '●' (U+25CF) as the response marker instead of '⏺'.

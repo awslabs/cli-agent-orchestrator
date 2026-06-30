@@ -805,16 +805,29 @@ class ClaudeCodeProvider(BaseProvider):
         lines = remaining_text.split("\n")
         response_lines = []
 
-        for line in lines:
+        for i, line in enumerate(lines):
             clean_line = re.sub(ANSI_CODE_PATTERN, "", line).strip()
             if self._SOL_IDLE_RE.match(line):
                 break
-            # Match full-width Claude UI separator (20+ U+2500 dashes spanning the line).
-            # Table borders also contain ──── runs but always pair with other box-drawing
-            # chars (corners, intersections U+2501-U+257F). Claude's separator uses only
-            # U+2500 dashes plus optional text — no other box-drawing chars present.
+            # A full-width run of 20+ U+2500 dashes with no other box-drawing
+            # chars (corners/intersections U+2501-U+257F) is ambiguous: it is
+            # BOTH the TUI turn-separator that frames the ❯ input box AND how
+            # Claude's renderer draws a markdown thematic break (``---``) or a
+            # plain table rule inside the agent's own report. Only the former
+            # ends the message. Treat the run as a terminator only when it frames
+            # the input box — the next non-blank line is the ❯/> prompt, or the
+            # capture ends here. A rule followed by more report text is content,
+            # so drop the rule line and keep extracting. Without this, reports
+            # were clipped at the first ``---`` heading divider or results table —
+            # exactly the section a handoff consumer needs.
             if re.search(r"─{20,}", clean_line) and not re.search("[━-╿]", clean_line):
-                break
+                next_nonblank = next(
+                    (raw for raw in lines[i + 1 :] if re.sub(ANSI_CODE_PATTERN, "", raw).strip()),
+                    None,
+                )
+                if next_nonblank is None or self._SOL_IDLE_RE.match(next_nonblank):
+                    break
+                continue
             if re.search(COMPLETION_SUMMARY_PATTERN, clean_line):
                 break
 
