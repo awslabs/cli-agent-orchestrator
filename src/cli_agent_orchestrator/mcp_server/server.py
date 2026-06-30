@@ -681,6 +681,38 @@ async def _handoff_impl(
         # when provider == codex; otherwise returns the message unchanged).
         shaped_message = _shape_handoff_message(provider, message)
 
+        # Inherit the conductor's working directory when the caller didn't pin
+        # one, so a handed-off worker runs in the SAME project directory as the
+        # supervisor — not the cao-server process CWD. assign()/_create_terminal
+        # already resolve this; handoff omitted it, so handed-off workers
+        # launched in the daemon's directory and operated on the wrong tree.
+        if working_directory is None:
+            current_terminal_id = os.environ.get("CAO_TERMINAL_ID")
+            if current_terminal_id:
+                try:
+                    wd_resp = requests.get(
+                        f"{API_BASE_URL}/terminals/{current_terminal_id}/working-directory",
+                        timeout=_mcp_timeout(),
+                    )
+                    if wd_resp.status_code == 200:
+                        working_directory = wd_resp.json().get("working_directory")
+                        logger.info(
+                            "Handoff inherited working directory from conductor: %s",
+                            working_directory,
+                        )
+                    else:
+                        logger.warning(
+                            "Handoff could not fetch conductor working directory "
+                            "(status %s); using server default",
+                            wd_resp.status_code,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "Handoff error fetching conductor working directory: %s; "
+                        "using server default",
+                        e,
+                    )
+
         # Single combined call: create -> ready-wait -> input -> complete-wait ->
         # extract -> teardown, all server-side via run_agent_step. session_name
         # places the worker in the supervisor's session; caller_id/allowed_tools

@@ -42,7 +42,7 @@ from cli_agent_orchestrator.plugins import (
     PostKillTerminalEvent,
     PostSendMessageEvent,
 )
-from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.providers.manager import default_launch_env, provider_manager
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
 from cli_agent_orchestrator.services.memory_service import MemoryService
@@ -184,6 +184,15 @@ async def create_terminal(
 
         window_name = generate_window_name(agent_profile)
 
+        # Provider-scoped launch-env defaults (e.g. claude_code's BUN_JSC guard),
+        # resolved from the provider class before instantiation. Merged UNDER any
+        # operator-forwarded --env so an operator can still override, and applied
+        # to both the supervisor (new session) and every worker (new window).
+        # Not persisted via set_session_env: it is re-derived from the provider
+        # on every spawn, so it survives a cao-server restart that would wipe the
+        # process-local --env store.
+        provider_launch_env = default_launch_env(provider)
+
         # Step 2: Create tmux session or window
         if new_session:
             # Ensure session name has the CAO prefix for identification
@@ -204,7 +213,7 @@ async def create_terminal(
                 window_name,
                 terminal_id,
                 working_directory,
-                extra_env=env_vars,
+                extra_env={**provider_launch_env, **(env_vars or {})},
             )
             session_created = True  # only set after successful creation
 
@@ -222,7 +231,7 @@ async def create_terminal(
                 window_name,
                 terminal_id,
                 working_directory,
-                extra_env=get_session_env(session_name),
+                extra_env={**provider_launch_env, **get_session_env(session_name)},
             )
 
         # Step 3: Load the profile once for allowed tool resolution before
@@ -307,6 +316,22 @@ async def create_terminal(
             skill_prompt=skill_prompt,
             model=profile.model if profile else None,
         )
+
+        # Capture the shell's foreground command BEFORE the CLI launches, for
+        # every provider (historically kiro-only). This baseline lets us later
+        # detect a worker that crashed back to the shell — its pane foreground
+        # reverts to this value — instead of mistaking the frozen, permanently
+        # "stable" screen for a completed turn. Best-effort: providers that
+        # capture their own baseline during initialize() (kiro, after its
+        # shell-ready wait) simply re-set the same value below.
+        if not provider_instance.shell_baseline:
+            try:
+                provider_instance.shell_baseline = get_backend().get_pane_current_command(
+                    session_name, window_name
+                )
+            except Exception as e:  # noqa: BLE001 — baseline is a best-effort liveness aid
+                logger.debug("Could not capture shell baseline for %s: %s", terminal_id, e)
+
         await provider_instance.initialize()
 
         # Persist shell_command baseline if the provider captured one
@@ -595,6 +620,87 @@ def exit_terminal_cli(terminal_id: str) -> None:
         send_input(terminal_id, exit_command)
 
 
+def worker_returned_to_shell(terminal_id: str) -> bool:
+    """True if the terminal's CLI exited and the pane is back at the shell.
+
+    A live agent keeps its CLI as the pane's foreground process (e.g. ``claude``
+    / ``node``); only a crashed or exited one reverts to the shell captured as
+    ``shell_baseline`` at launch. Used to tell a genuine "completed" turn apart
+    from a frozen, permanently-silent crashed screen — death is otherwise
+    indistinguishable from completion because a dead process can never emit
+    output to break the completion heuristic's stability window.
+
+    Fail-safe: returns False on ANY uncertainty (no live provider, no captured
+    baseline, backend error), so a healthy or indeterminate worker is never
+    misreported as crashed and a legitimate long-running step is never aborted.
+    """
+    try:
+        provider = provider_manager.get_provider(terminal_id)
+    except Exception:
+        return False
+    if provider is None:
+        return False
+    baseline = provider.shell_baseline
+    if not baseline:
+        return False
+    try:
+        current = get_backend().get_pane_current_command(
+            provider.session_name, provider.window_name
+        )
+    except Exception:
+        return False
+    return bool(current) and current == baseline
+
+
+def _persisted_output(terminal_id: str, mode: OutputMode) -> Optional[str]:
+    """Recover a torn-down terminal's output from its on-disk snapshot.
+
+    ``handoff`` always tears the worker down once it finishes (DB row deleted),
+    so a supervisor that re-reads the worker via ``get_terminal_output`` would
+    otherwise get a 404 — the in-band handoff result is the only copy. But
+    ``delete_terminal`` persists the full plain-text scrollback to
+    ``{id}.scrollback`` plus a ``{id}.snapshot.json`` recording the provider.
+    Serve that instead of failing: FULL returns the raw scrollback; LAST
+    re-extracts the final message with the recorded provider's (stateless)
+    extractor, falling back to the raw scrollback if extraction can't run.
+
+    Returns None when no snapshot exists (genuinely-unknown terminal).
+    """
+    scrollback_path = TERMINAL_LOG_DIR / f"{terminal_id}.scrollback"
+    if not scrollback_path.exists():
+        return None
+    try:
+        raw = scrollback_path.read_text(encoding="utf-8")
+    except OSError as e:
+        logger.warning("Failed to read persisted scrollback for %s: %s", terminal_id, e)
+        return None
+
+    if mode != OutputMode.LAST:
+        return raw
+
+    # LAST: try to re-extract the final message using the recorded provider.
+    try:
+        import json as _json
+
+        from cli_agent_orchestrator.providers.manager import provider_class_for
+
+        snapshot_path = TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json"
+        provider_type = _json.loads(snapshot_path.read_text(encoding="utf-8"))["provider"]
+        provider_cls = provider_class_for(provider_type)
+        if provider_cls is not None:
+            # extract_last_message_from_script reads only class-level regexes,
+            # not live terminal state, so a throwaway instance is sufficient.
+            extractor = provider_cls(terminal_id, "", "")
+            return extractor.extract_last_message_from_script(raw)
+    except Exception as e:
+        logger.debug(
+            "Could not re-extract last message for torn-down %s (%s); " "returning raw scrollback",
+            terminal_id,
+            e,
+        )
+    return raw
+
+
 def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
     """Get terminal output.
 
@@ -628,6 +734,12 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
     try:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
+            # Terminal is gone (e.g. a handoff worker torn down after finishing).
+            # Recover its output from the delete-time scrollback snapshot rather
+            # than 404-ing the supervisor's re-read.
+            persisted = _persisted_output(terminal_id, mode)
+            if persisted is not None:
+                return persisted
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
         # Get output from StatusMonitor buffer (instant, no tmux call)

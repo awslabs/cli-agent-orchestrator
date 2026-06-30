@@ -39,7 +39,17 @@ RESPONSE_PATTERN = r"⏺(?:\x1b\[[0-9;]*m)*\s+"  # Handle any ANSI codes between
 # RESPONSE_PATTERN so get_status's legacy ⏺-COMPLETED check is unaffected (adding
 # "●" there could fire COMPLETED mid-stream while a response is still rendering).
 EXTRACTION_RESPONSE_PATTERN = re.compile(
-    r"^[ \t]*(?:\x1b\[[0-9;]*m)*[⏺●](?:\x1b\[[0-9;]*m)*\s+",
+    # Response marker at the start of a line. The trailing negative lookahead
+    # rejects the TUI effort footer "● high · /effort" (also medium/low/xhigh/…):
+    # the line-start anchor alone only excludes the footer when it renders inline
+    # ("… esc to interrupt ● high · /effort"), but the effort indicator also
+    # renders on its OWN line, where the leading "●" would otherwise read as a
+    # response marker — flipping get_status to a false COMPLETED on the idle
+    # launch screen (the ❯ box + this footer satisfy the completion heuristic)
+    # and making extraction return "high · /effort" as the message. The footer
+    # is identified by its line ending in "/effort"; real responses don't.
+    r"^[ \t]*(?:\x1b\[[0-9;]*m)*[⏺●](?:\x1b\[[0-9;]*m)*\s+"
+    r"(?![^\n]*/effort(?:\x1b\[[0-9;]*m)*[ \t]*$)",
     re.MULTILINE,
 )
 # Match Claude Code processing spinners:
@@ -119,6 +129,17 @@ NEW_TUI_BOX_SPINNER_PATTERN = re.compile(r"^[ \t]*[✶✢✽✻✳·*][ \t]+\w*i
 
 class ClaudeCodeProvider(BaseProvider):
     """Provider for Claude Code CLI tool integration."""
+
+    # Claude Code ships as a Bun-compiled binary. The JavaScriptCore DFG JIT
+    # tier in some bundled Bun versions can segfault on its background compile
+    # thread (speculationFromCell) when a hot function is optimized mid-task —
+    # e.g. during a long `npm test` run — taking down the whole worker and
+    # leaving the supervisor with a truncated/half-finished handoff. Disabling
+    # only the DFG tier sidesteps the crash; the baseline JIT stays on, so the
+    # runtime cost is small. Exported into every claude_code launch pane via the
+    # shared DEFAULT_LAUNCH_ENV mechanism. Remove once the bundled Bun ships a
+    # DFG fix.
+    DEFAULT_LAUNCH_ENV = {"BUN_JSC_useDFGJIT": "0"}
 
     def __init__(
         self,
@@ -636,6 +657,32 @@ class ClaudeCodeProvider(BaseProvider):
         last_sol_response = None
         for m in re.finditer(EXTRACTION_RESPONSE_PATTERN, output):
             last_sol_response = m
+
+        # In-progress tool use looks like a finished turn here. The newest TUI
+        # renders an active tool call as a response-marker line ending in the "…"
+        # ellipsis ("⏺ Reading 1 file…", "● Running command…"): the agent emitted
+        # the marker but is still working. During a quiet think the live spinner
+        # scrolls out of the rolling buffer, so the PROCESSING checks above miss
+        # it and this falls through to COMPLETED — false-completing a handoff in
+        # ~10s and returning the preamble instead of the report. Treat a freshest
+        # response-marker line that ends in "…" as still PROCESSING. Gated on
+        # last_completion is None: a genuinely finished turn shows the
+        # "✻ Worked for Ns" summary (a separate, trustworthy signal), so this
+        # never blocks real completion. Only the single-char "…" (U+2026) the TUI
+        # emits is matched, so prose ending in ASCII "..." cannot false-trigger.
+        if last_completion is None:
+            response_marker = max(
+                (m for m in (last_sol_response, last_response) if m is not None),
+                key=lambda m: m.start(),
+                default=None,
+            )
+            if last_idle is not None and response_marker is not None:
+                line_start = output.rfind("\n", 0, response_marker.start()) + 1
+                line_end = output.find("\n", response_marker.start())
+                marker_line = output[line_start : line_end if line_end != -1 else len(output)]
+                if re.sub(ANSI_CODE_PATTERN, "", marker_line).rstrip().endswith("…"):
+                    return TerminalStatus.PROCESSING
+
         if last_idle is not None and (
             last_completion is not None
             or last_sol_response is not None
@@ -794,16 +841,29 @@ class ClaudeCodeProvider(BaseProvider):
         lines = remaining_text.split("\n")
         response_lines = []
 
-        for line in lines:
+        for i, line in enumerate(lines):
             clean_line = re.sub(ANSI_CODE_PATTERN, "", line).strip()
             if self._SOL_IDLE_RE.match(line):
                 break
-            # Match full-width Claude UI separator (20+ U+2500 dashes spanning the line).
-            # Table borders also contain ──── runs but always pair with other box-drawing
-            # chars (corners, intersections U+2501-U+257F). Claude's separator uses only
-            # U+2500 dashes plus optional text — no other box-drawing chars present.
+            # A full-width run of 20+ U+2500 dashes with no other box-drawing
+            # chars (corners/intersections U+2501-U+257F) is ambiguous: it is
+            # BOTH the TUI turn-separator that frames the ❯ input box AND how
+            # Claude's renderer draws a markdown thematic break (``---``) or a
+            # plain table rule inside the agent's own report. Only the former
+            # ends the message. Treat the run as a terminator only when it frames
+            # the input box — the next non-blank line is the ❯/> prompt, or the
+            # capture ends here. A rule followed by more report text is content,
+            # so drop the rule line and keep extracting. Without this, reports
+            # were clipped at the first ``---`` heading divider or results table —
+            # exactly the section a handoff consumer needs.
             if re.search(r"─{20,}", clean_line) and not re.search("[━-╿]", clean_line):
-                break
+                next_nonblank = next(
+                    (raw for raw in lines[i + 1 :] if re.sub(ANSI_CODE_PATTERN, "", raw).strip()),
+                    None,
+                )
+                if next_nonblank is None or self._SOL_IDLE_RE.match(next_nonblank):
+                    break
+                continue
             if re.search(COMPLETION_SUMMARY_PATTERN, clean_line):
                 break
 

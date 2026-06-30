@@ -1002,14 +1002,52 @@ Map<String, List<Integer>> nested = getMap();
         assert "Map<String, List<Integer>>" in result
 
     def test_extract_message_with_separator(self):
-        """Test extraction stops at Claude's full-width UI separator (20+ dashes, no box chars)."""
-        # Claude's turn separator spans the full terminal width — always 20+ dashes
-        output = "⏺ Response content\n" + "─" * 80 + "\nMore content\n> "
+        """Extraction stops at the full-width turn separator that frames the ❯
+        input box, and excludes the footer chrome below it."""
+        # Realistic layout: response, the turn separator, then the ❯ box + footer.
+        output = (
+            "⏺ Response content\n" + "─" * 80 + "\n❯ \n" + "─" * 80 + "\n  footer chrome here\n"
+        )
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         result = provider.extract_last_message_from_script(output)
 
         assert "Response content" in result
-        assert "More content" not in result
+        assert "footer chrome here" not in result
+
+    def test_extract_message_markdown_rule_in_report_not_truncated(self):
+        """A markdown thematic break (``---``) renders as a full-width U+2500 rule
+        identical to the turn separator. When it appears INSIDE the report
+        (followed by more content, not the ❯ prompt) extraction must keep going,
+        not clip the rest of the message."""
+        output = (
+            "● Recon complete. Here is my report.\n" + "─" * 60 + "\n"  # rendered markdown '---'
+            "Architecture: Next.js 16 + Postgres RLS\n"
+            "Unit tests: 427 files / 7830 passed\n" + "─" * 60 + "\n"  # the real turn separator
+            "❯ \n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        result = provider.extract_last_message_from_script(output)
+
+        assert "Recon complete" in result
+        assert "Next.js 16 + Postgres RLS" in result
+        assert "427 files / 7830 passed" in result  # the previously-clipped section
+
+    def test_extract_message_pure_dash_table_rule_in_report_not_truncated(self):
+        """A simple table whose divider is a pure U+2500 run (no corner glyphs)
+        must not terminate extraction mid-report."""
+        output = (
+            "● Results:\n"
+            "Suite        Passed\n" + "─" * 30 + "\n"  # pure-dash table rule, no box chars
+            "auth         120\n"
+            "billing      88\n"
+            "End of report\n"
+            "❯ \n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        result = provider.extract_last_message_from_script(output)
+
+        assert "auth         120" in result
+        assert "End of report" in result
 
     def test_extract_message_new_tui_circle_glyph(self):
         """Newest TUI uses '●' (U+25CF) as the response marker instead of '⏺'.
@@ -1673,3 +1711,87 @@ class TestClaudeCodeScreenDetection:
 
     def test_empty_screen_is_unknown(self):
         assert self._p().get_status_from_screen(["", "", ""]) == TerminalStatus.UNKNOWN
+
+
+class TestEffortFooterNotAResponse:
+    """The TUI effort footer "● high · /effort" can render at the START of a line
+    (not only inline as "… esc to interrupt ● high · /effort"). The line-start
+    "●" must NOT be read as a response marker, or the idle launch screen (❯ box +
+    this footer) flips get_status to a false COMPLETED and a handoff completes in
+    ~10s extracting "high · /effort" as the report. Regression for that.
+    """
+
+    def _idle_footer_screen(self):
+        return (
+            "● high · /effort\n" + "─" * 100 + "\n"
+            '❯ Try "create a util logging.py that..."\n' + "─" * 100 + "\n"
+            "  ⏵⏵ bypass permissions · esc to interrupt\n"
+        )
+
+    def test_idle_footer_screen_is_not_completed(self):
+        provider = ClaudeCodeProvider("t", "s", "w")
+        assert provider.get_status(self._idle_footer_screen()) != TerminalStatus.COMPLETED
+
+    def test_idle_footer_screen_yields_no_extractable_response(self):
+        provider = ClaudeCodeProvider("t", "s", "w")
+        with pytest.raises(ValueError, match="No Claude Code response found"):
+            provider.extract_last_message_from_script(self._idle_footer_screen())
+
+    def test_sol_effort_footer_levels_all_excluded(self):
+        provider = ClaudeCodeProvider("t", "s", "w")
+        for level in ("high", "medium", "low", "xhigh", "max", "none"):
+            screen = f"● {level} · /effort\n" + "─" * 80 + "\n❯ \n"
+            with pytest.raises(ValueError, match="No Claude Code response found"):
+                provider.extract_last_message_from_script(screen)
+
+    def test_real_response_above_footer_still_extracts(self):
+        provider = ClaudeCodeProvider("t", "s", "w")
+        screen = "● Final answer here\nmore detail\n" + "─" * 60 + "\n❯ \n" "● high · /effort\n"
+        result = provider.extract_last_message_from_script(screen)
+        assert "Final answer here" in result
+        assert "more detail" in result
+        assert "/effort" not in result
+
+    def test_response_completion_still_detected(self):
+        """The fix must not suppress genuine completion."""
+        provider = ClaudeCodeProvider("t", "s", "w")
+        real = "❯ do recon\n● Here is the report\nLine two\n✻ Worked for 3s\n" + "─" * 60 + "\n❯ \n"
+        assert provider.get_status(real) == TerminalStatus.COMPLETED
+
+
+class TestInProgressToolUseNotCompleted:
+    """An in-progress tool-use marker line ("⏺ Reading 1 file…") ending in the
+    "…" ellipsis must read as PROCESSING, not COMPLETED. Otherwise, when the
+    worker emits a preamble then thinks quietly (>10s, live spinner scrolled out
+    of the rolling buffer), get_status latches a false COMPLETED, the handoff's
+    confirm window passes, and it false-completes in ~10s returning the preamble.
+    """
+
+    BOX = "─" * 100
+
+    def test_preamble_tool_use_is_processing(self):
+        p = ClaudeCodeProvider("t", "s", "w")
+        buf = (
+            "⏺ I'll start by reading the task description.\n"
+            "⏺ Reading 1 file…\n" + self.BOX + "\n❯ \n" + self.BOX + "\n  ⏵⏵ esc to interrupt\n"
+        )
+        assert p.get_status(buf) == TerminalStatus.PROCESSING
+
+    def test_real_response_without_ellipsis_still_completes(self):
+        p = ClaudeCodeProvider("t", "s", "w")
+        buf = "❯ do the task\n⏺ Here is the completed response\n" + self.BOX + "\n❯ "
+        assert p.get_status(buf) == TerminalStatus.COMPLETED
+
+    def test_completion_summary_overrides_ellipsis_marker(self):
+        """A finished turn shows '✻ Worked for Ns'; that trustworthy signal must
+        still complete even if an earlier tool line ends in '…'."""
+        p = ClaudeCodeProvider("t", "s", "w")
+        buf = "⏺ Reading 1 file…\n✻ Worked for 3s\n" + self.BOX + "\n❯ \n"
+        assert p.get_status(buf) == TerminalStatus.COMPLETED
+
+    def test_ascii_triple_dot_does_not_false_trigger(self):
+        """Only the single-char '…' (U+2026) the TUI emits should match; a real
+        answer ending in ASCII '...' must still complete."""
+        p = ClaudeCodeProvider("t", "s", "w")
+        buf = "⏺ That's all for now...\n" + self.BOX + "\n❯ "
+        assert p.get_status(buf) == TerminalStatus.COMPLETED

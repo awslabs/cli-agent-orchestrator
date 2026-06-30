@@ -42,6 +42,16 @@ class BaseProvider(ABC):
         _allowed_tools: CAO-vocabulary tool names this agent is allowed to use
     """
 
+    # Environment variables exported into the launch pane for every terminal
+    # of this provider. Declarative replacement for hand-rolled inline command
+    # prefixes (e.g. ``FOO=bar claude ...``): the service layer merges this into
+    # the tmux pane environment at terminal creation, so the launched CLI
+    # inherits it. Provider-scoped (only this provider's panes get it) and
+    # restart-safe by construction — re-derived from the class on every spawn,
+    # unlike operator ``--env`` vars which live in a process-local store.
+    # Subclasses override with provider-specific defaults.
+    DEFAULT_LAUNCH_ENV: Dict[str, str] = {}
+
     def __init__(
         self,
         terminal_id: str,

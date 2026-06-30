@@ -1072,3 +1072,274 @@ class TestDeleteTerminal:
         result = delete_terminal("test1234")
 
         assert result is True
+
+
+class TestCreateTerminalLaunchEnv:
+    """Provider DEFAULT_LAUNCH_ENV is merged into the tmux pane environment.
+
+    Regression: the claude_code BUN_JSC DFG-JIT guard used to be a hand-rolled
+    inline command prefix in the provider. It is now declarative class data
+    injected at pane creation, so it reaches both the supervisor (new session)
+    and every worker (new window), is provider-scoped, and survives a
+    cao-server restart (re-derived per spawn, unlike the --env store).
+    """
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_supervisor_new_session_gets_provider_launch_env(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+    ):
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = False
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        mock_provider = AsyncMock()
+        mock_provider.initialize.return_value = True
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+
+        await create_terminal("claude_code", "developer", new_session=True)
+
+        extra_env = mock_tmux.create_session.call_args.kwargs["extra_env"]
+        assert extra_env["BUN_JSC_useDFGJIT"] == "0"
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_operator_env_overrides_provider_default(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+    ):
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = False
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        mock_provider = AsyncMock()
+        mock_provider.initialize.return_value = True
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+
+        await create_terminal(
+            "claude_code",
+            "developer",
+            new_session=True,
+            env_vars={"BUN_JSC_useDFGJIT": "1"},
+        )
+
+        extra_env = mock_tmux.create_session.call_args.kwargs["extra_env"]
+        assert extra_env["BUN_JSC_useDFGJIT"] == "1"  # operator --env wins
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_worker_window_gets_provider_launch_env(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+    ):
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = True
+        mock_tmux.create_window.return_value = "developer-abcd"
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        mock_provider = AsyncMock()
+        mock_provider.initialize.return_value = True
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+
+        await create_terminal("claude_code", "developer", session_name="cao-existing")
+
+        extra_env = mock_tmux.create_window.call_args.kwargs["extra_env"]
+        assert extra_env["BUN_JSC_useDFGJIT"] == "0"
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_provider_without_defaults_injects_nothing(
+        self,
+        mock_load_profile,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+    ):
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = False
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        mock_provider = AsyncMock()
+        mock_provider.initialize.return_value = True
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+
+        await create_terminal("kiro_cli", "developer", new_session=True)
+
+        extra_env = mock_tmux.create_session.call_args.kwargs["extra_env"]
+        assert "BUN_JSC_useDFGJIT" not in extra_env
+
+
+class TestGetOutputPersistedFallback:
+    """get_output recovers a torn-down terminal's output from its scrollback snapshot.
+
+    handoff tears the worker down when it finishes (DB row deleted), so a
+    supervisor re-reading it via get_terminal_output used to get a 404 — the
+    in-band handoff result was the only copy. delete_terminal persists
+    {id}.scrollback + {id}.snapshot.json; get_output now serves those.
+    """
+
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
+    def test_full_mode_serves_raw_scrollback(self, mock_log_dir, mock_meta, tmp_path):
+        mock_meta.return_value = None  # terminal gone
+        mock_log_dir.__truediv__ = lambda self_, name: tmp_path / name
+        (tmp_path / "deadterm.scrollback").write_text("full session history here", encoding="utf-8")
+
+        assert get_output("deadterm", OutputMode.FULL) == "full session history here"
+
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
+    def test_last_mode_reextracts_with_recorded_provider(self, mock_log_dir, mock_meta, tmp_path):
+        mock_meta.return_value = None
+        mock_log_dir.__truediv__ = lambda self_, name: tmp_path / name
+        # A claude_code report in the raw scrollback, framed by the ● marker + prompt.
+        (tmp_path / "deadterm.scrollback").write_text(
+            "● Final report line one\nFinal report line two\n❯ ", encoding="utf-8"
+        )
+        (tmp_path / "deadterm.snapshot.json").write_text(
+            '{"terminal_id": "deadterm", "provider": "claude_code"}', encoding="utf-8"
+        )
+
+        result = get_output("deadterm", OutputMode.LAST)
+        assert "Final report line one" in result
+        assert "Final report line two" in result
+
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
+    def test_no_snapshot_still_raises_not_found(self, mock_log_dir, mock_meta, tmp_path):
+        mock_meta.return_value = None
+        mock_log_dir.__truediv__ = lambda self_, name: tmp_path / name  # empty dir
+
+        with pytest.raises(ValueError, match="not found"):
+            get_output("ghost", OutputMode.FULL)
+
+
+class TestWorkerReturnedToShell:
+    """Liveness probe behind crash detection. Fail-safe: any uncertainty -> False
+    so a healthy/indeterminate worker is never misreported as crashed."""
+
+    def _provider(self, *, baseline):
+        p = MagicMock()
+        p.shell_baseline = baseline
+        p.session_name = "cao-s"
+        p.window_name = "w"
+        return p
+
+    @patch("cli_agent_orchestrator.services.terminal_service.get_backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    def test_true_when_foreground_reverts_to_shell(self, mock_pm, mock_backend):
+        from cli_agent_orchestrator.services.terminal_service import worker_returned_to_shell
+
+        mock_pm.get_provider.return_value = self._provider(baseline="zsh")
+        mock_backend.return_value.get_pane_current_command.return_value = "zsh"
+        assert worker_returned_to_shell("t1") is True
+
+    @patch("cli_agent_orchestrator.services.terminal_service.get_backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    def test_false_when_cli_still_foreground(self, mock_pm, mock_backend):
+        from cli_agent_orchestrator.services.terminal_service import worker_returned_to_shell
+
+        mock_pm.get_provider.return_value = self._provider(baseline="zsh")
+        mock_backend.return_value.get_pane_current_command.return_value = "claude"
+        assert worker_returned_to_shell("t1") is False
+
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    def test_false_when_no_baseline_captured(self, mock_pm):
+        from cli_agent_orchestrator.services.terminal_service import worker_returned_to_shell
+
+        mock_pm.get_provider.return_value = self._provider(baseline=None)
+        assert worker_returned_to_shell("t1") is False
+
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    def test_false_when_provider_lookup_raises(self, mock_pm):
+        from cli_agent_orchestrator.services.terminal_service import worker_returned_to_shell
+
+        mock_pm.get_provider.side_effect = ValueError("not in db")
+        assert worker_returned_to_shell("t1") is False
+
+    @patch("cli_agent_orchestrator.services.terminal_service.get_backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    def test_false_when_backend_errors(self, mock_pm, mock_backend):
+        from cli_agent_orchestrator.services.terminal_service import worker_returned_to_shell
+
+        mock_pm.get_provider.return_value = self._provider(baseline="zsh")
+        mock_backend.return_value.get_pane_current_command.side_effect = RuntimeError("tmux gone")
+        assert worker_returned_to_shell("t1") is False

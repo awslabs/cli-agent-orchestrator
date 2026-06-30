@@ -203,3 +203,56 @@ class TestEngineHandoffEquivalence:
         # worker is identical across paths. Identical kinds alone could not catch
         # a divergent prompt/timeout — this does.
         assert engine.send_prompts() == handoff.send_prompts() == ["do the task"]
+
+
+class TestHandoffInheritsConductorWorkingDirectory:
+    """handoff() must place the worker in the supervisor's working directory,
+    not the cao-server process CWD. assign()/_create_terminal already inherit
+    the conductor's directory; handoff omitted it, so handed-off workers ran in
+    the wrong tree (e.g. ~/dev/personal/cao instead of the project repo)."""
+
+    def test_handoff_payload_carries_conductor_working_directory(self):
+        import asyncio
+        import os
+        from unittest.mock import MagicMock, patch
+
+        from cli_agent_orchestrator.mcp_server.server import HandoffContext, _handoff_impl
+
+        captured = {}
+
+        def fake_get(url, timeout=None):
+            r = MagicMock()
+            r.status_code = 200
+            r.json.return_value = {"working_directory": "/Users/cdisalle/dev/personal/riskprep"}
+            return r
+
+        def fake_post(url, json=None, timeout=None):
+            captured["payload"] = json
+            r = MagicMock()
+            r.status_code = 200
+            r.json.return_value = {
+                "last_message": "done",
+                "status": "completed",
+                "terminal_id": "deadbeef",
+            }
+            return r
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "supervis1"}):
+            with patch(
+                "cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider",
+                return_value=HandoffContext("claude_code", "cao-sess", "supervis1", None),
+            ):
+                with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+                    mock_requests.get.side_effect = fake_get
+                    mock_requests.post.side_effect = fake_post
+                    mock_requests.Timeout = Exception
+                    result = asyncio.run(_handoff_impl("developer", "do the recon"))
+
+        assert result.success is True
+        # The worker is created in the supervisor's project directory.
+        assert captured["payload"]["working_directory"] == "/Users/cdisalle/dev/personal/riskprep"
+        # And it queried the conductor's working-directory endpoint to get it.
+        assert any(
+            "/terminals/supervis1/working-directory" in str(c.args[0])
+            for c in mock_requests.get.call_args_list
+        )

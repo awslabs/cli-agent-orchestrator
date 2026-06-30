@@ -279,3 +279,38 @@ def test_get_provider_no_shell_baseline_when_metadata_missing_shell_command():
         provider = manager.get_provider("t1")
 
     assert provider.shell_baseline is None
+
+
+class TestDefaultLaunchEnv:
+    """default_launch_env() resolves class-level launch-env defaults by provider type."""
+
+    def test_claude_code_carries_bun_jit_guard(self):
+        from cli_agent_orchestrator.providers.manager import default_launch_env
+
+        assert default_launch_env(ProviderType.CLAUDE_CODE.value) == {"BUN_JSC_useDFGJIT": "0"}
+
+    def test_provider_without_defaults_returns_empty(self):
+        from cli_agent_orchestrator.providers.manager import default_launch_env
+
+        assert default_launch_env(ProviderType.CODEX.value) == {}
+
+    def test_unknown_provider_returns_empty_not_raises(self):
+        from cli_agent_orchestrator.providers.manager import default_launch_env
+
+        assert default_launch_env("does-not-exist") == {}
+
+    def test_returns_a_fresh_copy_each_call(self):
+        """Mutating the result must not corrupt the class-level default."""
+        from cli_agent_orchestrator.providers.manager import default_launch_env
+
+        first = default_launch_env(ProviderType.CLAUDE_CODE.value)
+        first["BUN_JSC_useDFGJIT"] = "tampered"
+        assert default_launch_env(ProviderType.CLAUDE_CODE.value) == {"BUN_JSC_useDFGJIT": "0"}
+
+    def test_default_launch_env_covers_all_provider_types(self):
+        """Every ProviderType must be resolvable so launch-env injection can't
+        silently skip a provider as new ones are added."""
+        from cli_agent_orchestrator.providers.manager import _PROVIDER_CLASS_BY_TYPE
+
+        uncovered = [p.value for p in ProviderType if p.value not in _PROVIDER_CLASS_BY_TYPE]
+        assert uncovered == []
