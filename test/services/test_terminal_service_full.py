@@ -1072,3 +1072,142 @@ class TestDeleteTerminal:
         result = delete_terminal("test1234")
 
         assert result is True
+
+
+class TestCreateTerminalLaunchEnv:
+    """Provider DEFAULT_LAUNCH_ENV is merged into the tmux pane environment.
+
+    Regression: the claude_code BUN_JSC DFG-JIT guard used to be a hand-rolled
+    inline command prefix in the provider. It is now declarative class data
+    injected at pane creation, so it reaches both the supervisor (new session)
+    and every worker (new window), is provider-scoped, and survives a
+    cao-server restart (re-derived per spawn, unlike the --env store).
+    """
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_supervisor_new_session_gets_provider_launch_env(
+        self, mock_load_profile, mock_gen_id, mock_gen_session, mock_gen_window,
+        mock_tmux, mock_db_create, mock_provider_manager, mock_fifo_dir,
+        mock_fifo_manager, mock_status_monitor,
+    ):
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = False
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        mock_provider = AsyncMock()
+        mock_provider.initialize.return_value = True
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+
+        await create_terminal("claude_code", "developer", new_session=True)
+
+        extra_env = mock_tmux.create_session.call_args.kwargs["extra_env"]
+        assert extra_env["BUN_JSC_useDFGJIT"] == "0"
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_operator_env_overrides_provider_default(
+        self, mock_load_profile, mock_gen_id, mock_gen_session, mock_gen_window,
+        mock_tmux, mock_db_create, mock_provider_manager, mock_fifo_dir,
+        mock_fifo_manager, mock_status_monitor,
+    ):
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = False
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        mock_provider = AsyncMock()
+        mock_provider.initialize.return_value = True
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+
+        await create_terminal(
+            "claude_code", "developer", new_session=True,
+            env_vars={"BUN_JSC_useDFGJIT": "1"},
+        )
+
+        extra_env = mock_tmux.create_session.call_args.kwargs["extra_env"]
+        assert extra_env["BUN_JSC_useDFGJIT"] == "1"  # operator --env wins
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_worker_window_gets_provider_launch_env(
+        self, mock_load_profile, mock_gen_id, mock_gen_session, mock_gen_window,
+        mock_tmux, mock_db_create, mock_provider_manager, mock_fifo_dir,
+        mock_fifo_manager, mock_status_monitor,
+    ):
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = True
+        mock_tmux.create_window.return_value = "developer-abcd"
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        mock_provider = AsyncMock()
+        mock_provider.initialize.return_value = True
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+
+        await create_terminal("claude_code", "developer", session_name="cao-existing")
+
+        extra_env = mock_tmux.create_window.call_args.kwargs["extra_env"]
+        assert extra_env["BUN_JSC_useDFGJIT"] == "0"
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_provider_without_defaults_injects_nothing(
+        self, mock_load_profile, mock_gen_id, mock_gen_session, mock_gen_window,
+        mock_tmux, mock_db_create, mock_provider_manager, mock_fifo_dir,
+        mock_fifo_manager, mock_status_monitor,
+    ):
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = False
+        mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
+        mock_provider = AsyncMock()
+        mock_provider.initialize.return_value = True
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+
+        await create_terminal("kiro_cli", "developer", new_session=True)
+
+        extra_env = mock_tmux.create_session.call_args.kwargs["extra_env"]
+        assert "BUN_JSC_useDFGJIT" not in extra_env

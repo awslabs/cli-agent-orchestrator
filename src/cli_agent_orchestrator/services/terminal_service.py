@@ -42,7 +42,7 @@ from cli_agent_orchestrator.plugins import (
     PostKillTerminalEvent,
     PostSendMessageEvent,
 )
-from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.providers.manager import default_launch_env, provider_manager
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.herdr_inbox_registry import get_herdr_inbox_service
 from cli_agent_orchestrator.services.memory_service import MemoryService
@@ -184,6 +184,15 @@ async def create_terminal(
 
         window_name = generate_window_name(agent_profile)
 
+        # Provider-scoped launch-env defaults (e.g. claude_code's BUN_JSC guard),
+        # resolved from the provider class before instantiation. Merged UNDER any
+        # operator-forwarded --env so an operator can still override, and applied
+        # to both the supervisor (new session) and every worker (new window).
+        # Not persisted via set_session_env: it is re-derived from the provider
+        # on every spawn, so it survives a cao-server restart that would wipe the
+        # process-local --env store.
+        provider_launch_env = default_launch_env(provider)
+
         # Step 2: Create tmux session or window
         if new_session:
             # Ensure session name has the CAO prefix for identification
@@ -204,7 +213,7 @@ async def create_terminal(
                 window_name,
                 terminal_id,
                 working_directory,
-                extra_env=env_vars,
+                extra_env={**provider_launch_env, **(env_vars or {})},
             )
             session_created = True  # only set after successful creation
 
@@ -222,7 +231,7 @@ async def create_terminal(
                 window_name,
                 terminal_id,
                 working_directory,
-                extra_env=get_session_env(session_name),
+                extra_env={**provider_launch_env, **get_session_env(session_name)},
             )
 
         # Step 3: Load the profile once for allowed tool resolution before

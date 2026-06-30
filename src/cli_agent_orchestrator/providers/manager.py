@@ -21,6 +21,38 @@ from cli_agent_orchestrator.providers.q_cli import QCliProvider
 logger = logging.getLogger(__name__)
 
 
+# Provider type string -> provider class. Used to resolve class-level data
+# (e.g. DEFAULT_LAUNCH_ENV) BEFORE a provider instance exists — the launch
+# pane environment must be assembled at tmux session/window creation, which
+# happens before the provider is instantiated and initialized. Kept exhaustive
+# over ProviderType by test_default_launch_env_covers_all_provider_types.
+_PROVIDER_CLASS_BY_TYPE: Dict[str, type] = {
+    ProviderType.Q_CLI.value: QCliProvider,
+    ProviderType.KIRO_CLI.value: KiroCliProvider,
+    ProviderType.CLAUDE_CODE.value: ClaudeCodeProvider,
+    ProviderType.CODEX.value: CodexProvider,
+    ProviderType.KIMI_CLI.value: KimiCliProvider,
+    ProviderType.GEMINI_CLI.value: GeminiCliProvider,
+    ProviderType.COPILOT_CLI.value: CopilotCliProvider,
+    ProviderType.OPENCODE_CLI.value: OpenCodeCliProvider,
+    ProviderType.HERMES.value: HermesProvider,
+    ProviderType.CURSOR_CLI.value: CursorCliProvider,
+    ProviderType.ANTIGRAVITY_CLI.value: AntigravityCliProvider,
+}
+
+
+def default_launch_env(provider_type: str) -> Dict[str, str]:
+    """Class-level launch-env defaults for ``provider_type`` (a fresh copy).
+
+    Returns the provider's ``DEFAULT_LAUNCH_ENV`` so the service layer can merge
+    it into the tmux pane environment at terminal creation. Unknown provider
+    types yield ``{}`` (no defaults) rather than raising — provider validation
+    happens at instantiation.
+    """
+    cls = _PROVIDER_CLASS_BY_TYPE.get(provider_type)
+    return dict(getattr(cls, "DEFAULT_LAUNCH_ENV", {})) if cls is not None else {}
+
+
 class ProviderManager:
     """Simplified provider manager with direct mapping."""
 

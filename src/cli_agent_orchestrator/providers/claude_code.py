@@ -120,6 +120,17 @@ NEW_TUI_BOX_SPINNER_PATTERN = re.compile(r"^[ \t]*[✶✢✽✻✳·*][ \t]+\w*i
 class ClaudeCodeProvider(BaseProvider):
     """Provider for Claude Code CLI tool integration."""
 
+    # Claude Code ships as a Bun-compiled binary. The JavaScriptCore DFG JIT
+    # tier in some bundled Bun versions can segfault on its background compile
+    # thread (speculationFromCell) when a hot function is optimized mid-task —
+    # e.g. during a long `npm test` run — taking down the whole worker and
+    # leaving the supervisor with a truncated/half-finished handoff. Disabling
+    # only the DFG tier sidesteps the crash; the baseline JIT stays on, so the
+    # runtime cost is small. Exported into every claude_code launch pane via the
+    # shared DEFAULT_LAUNCH_ENV mechanism. Remove once the bundled Bun ships a
+    # DFG fix.
+    DEFAULT_LAUNCH_ENV = {"BUN_JSC_useDFGJIT": "0"}
+
     def __init__(
         self,
         terminal_id: str,
