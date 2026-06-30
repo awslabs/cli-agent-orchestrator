@@ -199,6 +199,16 @@ async def run_agent_step(
                 kind="error",
                 terminal_id=terminal_id,
             )
+        # A crashed CLI pins status at PROCESSING/UNKNOWN (a dead pane emits no
+        # output to advance it), so the wait times out. Probe pane liveness to
+        # report the crash as kind="error" rather than mislabeling a 5s crash as
+        # a full-timeout run.
+        if terminal_service.worker_returned_to_shell(terminal_id):
+            raise StepExecutionError(
+                f"terminal {terminal_id} worker process exited before completing",
+                kind="error",
+                terminal_id=terminal_id,
+            )
         raise StepExecutionError(
             f"step on terminal {terminal_id} did not complete within {timeout}s",
             kind="timeout",
@@ -211,6 +221,19 @@ async def run_agent_step(
     if final_status == TerminalStatus.ERROR:
         raise StepExecutionError(
             f"terminal {terminal_id} reached ERROR status",
+            kind="error",
+            terminal_id=terminal_id,
+        )
+
+    # Crash-vs-completion guard: a segfaulted CLI freezes the pane, and a frozen
+    # screen with a leftover response marker can satisfy the COMPLETED heuristic
+    # trivially — death is permanent stability, so the confirm-stable window
+    # passes BECAUSE the process is dead. Before claiming success and extracting
+    # a (necessarily truncated) message, verify the CLI is still running; if it
+    # has dropped back to the shell, report a crash instead of a false success.
+    if terminal_service.worker_returned_to_shell(terminal_id):
+        raise StepExecutionError(
+            f"terminal {terminal_id} worker process exited before completing",
             kind="error",
             terminal_id=terminal_id,
         )

@@ -316,6 +316,22 @@ async def create_terminal(
             skill_prompt=skill_prompt,
             model=profile.model if profile else None,
         )
+
+        # Capture the shell's foreground command BEFORE the CLI launches, for
+        # every provider (historically kiro-only). This baseline lets us later
+        # detect a worker that crashed back to the shell — its pane foreground
+        # reverts to this value — instead of mistaking the frozen, permanently
+        # "stable" screen for a completed turn. Best-effort: providers that
+        # capture their own baseline during initialize() (kiro, after its
+        # shell-ready wait) simply re-set the same value below.
+        if not provider_instance.shell_baseline:
+            try:
+                provider_instance.shell_baseline = get_backend().get_pane_current_command(
+                    session_name, window_name
+                )
+            except Exception as e:  # noqa: BLE001 — baseline is a best-effort liveness aid
+                logger.debug("Could not capture shell baseline for %s: %s", terminal_id, e)
+
         await provider_instance.initialize()
 
         # Persist shell_command baseline if the provider captured one
@@ -602,6 +618,38 @@ def exit_terminal_cli(terminal_id: str) -> None:
         send_special_key(terminal_id, exit_command)
     else:
         send_input(terminal_id, exit_command)
+
+
+def worker_returned_to_shell(terminal_id: str) -> bool:
+    """True if the terminal's CLI exited and the pane is back at the shell.
+
+    A live agent keeps its CLI as the pane's foreground process (e.g. ``claude``
+    / ``node``); only a crashed or exited one reverts to the shell captured as
+    ``shell_baseline`` at launch. Used to tell a genuine "completed" turn apart
+    from a frozen, permanently-silent crashed screen — death is otherwise
+    indistinguishable from completion because a dead process can never emit
+    output to break the completion heuristic's stability window.
+
+    Fail-safe: returns False on ANY uncertainty (no live provider, no captured
+    baseline, backend error), so a healthy or indeterminate worker is never
+    misreported as crashed and a legitimate long-running step is never aborted.
+    """
+    try:
+        provider = provider_manager.get_provider(terminal_id)
+    except Exception:
+        return False
+    if provider is None:
+        return False
+    baseline = provider.shell_baseline
+    if not baseline:
+        return False
+    try:
+        current = get_backend().get_pane_current_command(
+            provider.session_name, provider.window_name
+        )
+    except Exception:
+        return False
+    return bool(current) and current == baseline
 
 
 def _persisted_output(terminal_id: str, mode: OutputMode) -> Optional[str]:

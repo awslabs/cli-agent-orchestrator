@@ -256,3 +256,63 @@ class TestTeardownIsBestEffort:
         assert result.status == TerminalStatus.COMPLETED
         # Exit failed but delete still ran.
         m_delete.assert_called_once_with("abc12345", registry=None)
+
+
+class TestWorkerCrashDetection:
+    """A crashed CLI freezes the pane; the frozen screen can satisfy the
+    COMPLETED heuristic (death == permanent stability) or pin status so the wait
+    times out. A pane-liveness probe must convert both into kind="error" so the
+    handoff reports success=False instead of a false success / mislabeled
+    timeout. The probe is fail-safe: a healthy worker (probe False) is unaffected.
+    """
+
+    def test_completed_but_worker_exited_raises_error_not_success(self):
+        """False-success: wait sees COMPLETED but the CLI has dropped to the
+        shell — must raise kind="error", never return a (truncated) result."""
+        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer(
+            wait_results=(True, True),  # ready, then "completed"
+            final_status=TerminalStatus.COMPLETED,
+        )
+        crashed = patch(
+            f"{_MODULE}.terminal_service.worker_returned_to_shell", return_value=True
+        )
+        with create, send, delete, get_output as m_out, exit_cli, wait, status, crashed:
+            with pytest.raises(StepExecutionError) as ei:
+                asyncio.run(run_agent_step("claude_code", "developer", "do the task"))
+
+        assert ei.value.kind == "error"
+        assert "exited before completing" in str(ei.value)
+        m_out.assert_not_called()  # never extract a truncated message from a dead pane
+
+    def test_timeout_with_exited_worker_is_error_not_timeout(self):
+        """False-timeout: completion wait times out and the CLI is back at the
+        shell — report kind="error" (crash), not kind="timeout" (ran long)."""
+        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer(
+            wait_results=(True, False),  # ready, then completion times out
+            final_status=TerminalStatus.PROCESSING,  # stuck (UNKNOWN suppressed)
+        )
+        crashed = patch(
+            f"{_MODULE}.terminal_service.worker_returned_to_shell", return_value=True
+        )
+        with create, send, delete, get_output, exit_cli, wait, status, crashed:
+            with pytest.raises(StepExecutionError) as ei:
+                asyncio.run(run_agent_step("claude_code", "developer", "do the task"))
+
+        assert ei.value.kind == "error"
+        assert "exited before completing" in str(ei.value)
+
+    def test_healthy_completed_worker_still_succeeds(self):
+        """Probe False (CLI still running) — the happy path is unchanged."""
+        create, send, delete, get_output, exit_cli, wait, status = _patch_terminal_layer(
+            wait_results=(True, True),
+            final_status=TerminalStatus.COMPLETED,
+            output="the full report",
+        )
+        alive = patch(
+            f"{_MODULE}.terminal_service.worker_returned_to_shell", return_value=False
+        )
+        with create, send, delete, get_output, exit_cli, wait, status, alive:
+            result = asyncio.run(run_agent_step("claude_code", "developer", "do the task"))
+
+        assert result.last_message == "the full report"
+        assert result.status == TerminalStatus.COMPLETED

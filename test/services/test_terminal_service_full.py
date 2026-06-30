@@ -1256,3 +1256,56 @@ class TestGetOutputPersistedFallback:
 
         with pytest.raises(ValueError, match="not found"):
             get_output("ghost", OutputMode.FULL)
+
+
+class TestWorkerReturnedToShell:
+    """Liveness probe behind crash detection. Fail-safe: any uncertainty -> False
+    so a healthy/indeterminate worker is never misreported as crashed."""
+
+    def _provider(self, *, baseline):
+        p = MagicMock()
+        p.shell_baseline = baseline
+        p.session_name = "cao-s"
+        p.window_name = "w"
+        return p
+
+    @patch("cli_agent_orchestrator.services.terminal_service.get_backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    def test_true_when_foreground_reverts_to_shell(self, mock_pm, mock_backend):
+        from cli_agent_orchestrator.services.terminal_service import worker_returned_to_shell
+
+        mock_pm.get_provider.return_value = self._provider(baseline="zsh")
+        mock_backend.return_value.get_pane_current_command.return_value = "zsh"
+        assert worker_returned_to_shell("t1") is True
+
+    @patch("cli_agent_orchestrator.services.terminal_service.get_backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    def test_false_when_cli_still_foreground(self, mock_pm, mock_backend):
+        from cli_agent_orchestrator.services.terminal_service import worker_returned_to_shell
+
+        mock_pm.get_provider.return_value = self._provider(baseline="zsh")
+        mock_backend.return_value.get_pane_current_command.return_value = "claude"
+        assert worker_returned_to_shell("t1") is False
+
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    def test_false_when_no_baseline_captured(self, mock_pm):
+        from cli_agent_orchestrator.services.terminal_service import worker_returned_to_shell
+
+        mock_pm.get_provider.return_value = self._provider(baseline=None)
+        assert worker_returned_to_shell("t1") is False
+
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    def test_false_when_provider_lookup_raises(self, mock_pm):
+        from cli_agent_orchestrator.services.terminal_service import worker_returned_to_shell
+
+        mock_pm.get_provider.side_effect = ValueError("not in db")
+        assert worker_returned_to_shell("t1") is False
+
+    @patch("cli_agent_orchestrator.services.terminal_service.get_backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    def test_false_when_backend_errors(self, mock_pm, mock_backend):
+        from cli_agent_orchestrator.services.terminal_service import worker_returned_to_shell
+
+        mock_pm.get_provider.return_value = self._provider(baseline="zsh")
+        mock_backend.return_value.get_pane_current_command.side_effect = RuntimeError("tmux gone")
+        assert worker_returned_to_shell("t1") is False
