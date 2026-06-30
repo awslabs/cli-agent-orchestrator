@@ -4,7 +4,7 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/cli-agent-orchestrator.svg)](https://pypi.org/project/cli-agent-orchestrator/)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/awslabs/cli-agent-orchestrator)
 
-**CLI Agent Orchestrator (CAO)** is an open-source multi-agent orchestration framework for AI coding CLIs — Claude Code, Kiro CLI, Codex CLI, Gemini CLI, Hermes Agent, Kimi CLI, GitHub Copilot CLI, OpenCode, and Amazon Q Developer CLI. CAO runs each agent in an isolated tmux session and coordinates them with a supervisor–worker pattern over the Model Context Protocol (MCP), so one supervisor agent can delegate tasks to multiple specialist agents in parallel, sequentially, or as a swarm.
+**CLI Agent Orchestrator (CAO)** is an open-source multi-agent orchestration framework for AI coding CLIs — Claude Code, Kiro CLI, Codex CLI, Gemini CLI, Antigravity CLI, Hermes Agent, Kimi CLI, GitHub Copilot CLI, OpenCode, and Amazon Q Developer CLI. CAO runs each agent in an isolated tmux session and coordinates them with a supervisor–worker pattern over the Model Context Protocol (MCP), so one supervisor agent can delegate tasks to multiple specialist agents in parallel, sequentially, or as a swarm.
 
 ## What is CAO?
 
@@ -128,6 +128,7 @@ CAO drives existing CLI agent tools — it does not replace them. Before using C
 | **GitHub Copilot CLI** | [Provider docs](docs/copilot-cli.md) · [Installation](https://github.com/features/copilot/cli) | GitHub auth |
 | **OpenCode CLI** *(experimental — temporary inbox polling fallback for multi-agent callbacks, [#203](https://github.com/awslabs/cli-agent-orchestrator/issues/203))* | [Provider docs](docs/opencode-cli.md) · [Installation](https://opencode.ai) | Per-model API key |
 | **Cursor CLI** | [Provider docs](docs/cursor-cli.md) · [Installation](https://cursor.com/cli) | Cursor subscription / API key |
+| **Antigravity CLI** | [Provider docs](docs/antigravity-cli.md) · [Installation](https://antigravity.google) | Google account (shared with the Antigravity IDE login) |
 | **Q CLI** | [Installation](https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/command-line.html) | AWS credentials |
 
 ## Quick Start
@@ -164,7 +165,7 @@ cao launch --agents code_supervisor
 
 # Or specify a provider
 cao launch --agents code_supervisor --provider claude_code
-# Valid: kiro_cli | claude_code | codex | q_cli | gemini_cli | hermes | kimi_cli | copilot_cli | opencode_cli | cursor_cli
+# Valid: kiro_cli | claude_code | codex | q_cli | gemini_cli | antigravity_cli | hermes | kimi_cli | copilot_cli | opencode_cli | cursor_cli
 
 # Unrestricted access, skip confirmation (DANGEROUS)
 cao launch --agents code_supervisor --yolo
@@ -198,6 +199,24 @@ Then open http://localhost:9889.
 ![CAO Web UI](https://github.com/user-attachments/assets/e7db9261-62b1-4422-b9f5-6fe5f65bdea4)
 
 For hot-reload dev mode, remote access over SSH, and rebuilding the frontend from source (only these require Node.js), see [docs/web-ui.md](docs/web-ui.md). For frontend architecture, see [web/README.md](web/README.md).
+
+## MCP Apps — host-rendered fleet UI
+
+Beyond the browser dashboard, CAO can render its fleet UI **inside an MCP App-capable host** (Claude Desktop, Cursor, VS Code Insiders, Goose) using the [SEP-1865 "MCP Apps"](https://modelcontextprotocol.io/seps/1865-mcp-apps-interactive-user-interfaces-for-mcp) extension — so you observe and steer agents without leaving your chat host. It ships three single-file views (`ui://cao/dashboard`, `ui://cao/agent`, `ui://cao/event-stream`) plus a build-free topology widget, backed by an in-process event ring buffer and a single audited `submit_command` mutation path.
+
+![CAO MCP Apps — fleet dashboard rendered in an MCP App host](docs/media/mcp-apps-dashboard.png)
+
+*The fleet dashboard rendered from the built `ui://cao/dashboard` bundle. Full motion walk-through (dashboard → agent detail → live event stream): [`docs/media/mcp-apps-demo.webm`](docs/media/mcp-apps-demo.webm). Regenerate via `cd cao_mcp_apps && npm run build:all && node scripts/record-demo.mjs`.*
+
+It is **default-off and behavior-preserving** — packaged as the built-in `mcp_apps` plugin and registered only when enabled:
+
+```bash
+export CAO_MCP_APPS_ENABLED=true
+cao-server        # REST + SSE /events on :9889
+cao-mcp-server    # registers the MCP App tools/resources for your host
+```
+
+New in this area: `src/cli_agent_orchestrator/ext_apps/` (resources + topology widget), `cao_mcp_apps/` (JIT-free React views), `src/cli_agent_orchestrator/plugins/builtin/mcp_apps.py` (the plugin), with docs in [docs/mcp-apps.md](docs/mcp-apps.md), a worked example in [examples/mcp-apps/](examples/mcp-apps/), and the [skills/cao-mcp-apps](skills/cao-mcp-apps/SKILL.md) operator playbook. Optional default-off OAuth 2.1 scopes (`cao:read`/`cao:write`/`cao:admin`) gate mutations when an IdP is configured.
 
 ## Multi-Agent Orchestration
 
@@ -254,7 +273,7 @@ provider: claude_code
 ---
 ```
 
-Valid values: `kiro_cli`, `claude_code`, `codex`, `q_cli`, `gemini_cli`, `hermes`, `kimi_cli`, `copilot_cli`, `opencode_cli`, `cursor_cli`. The `cao launch --provider` flag always takes precedence for the initial session. See [`examples/cross-provider/`](examples/cross-provider/).
+Valid values: `kiro_cli`, `claude_code`, `codex`, `q_cli`, `gemini_cli`, `antigravity_cli`, `hermes`, `kimi_cli`, `copilot_cli`, `opencode_cli`, `cursor_cli`. The `cao launch --provider` flag always takes precedence for the initial session. See [`examples/cross-provider/`](examples/cross-provider/).
 
 ### Tool Restrictions
 

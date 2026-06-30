@@ -1,0 +1,35 @@
+#!/usr/bin/env sh
+# Pre-push gate: full local test sweep before publishing a branch
+# Runs the Python unit suite and, once the frontend exists
+# (Phase II), the JIT-free scan, bundle-size budget, and vitest run.
+#
+# The hook enforces tests wherever the toolchain is present, but degrades
+# gracefully (warns + skips that step) instead of crashing when a required
+# runner binary is missing from PATH. It never weakens checks where the
+# toolchain exists.
+cd "$(dirname "$0")/.."
+
+echo "[pre-push] Python unit tests"
+if command -v uv >/dev/null 2>&1; then
+  uv run --project .. pytest ../test -m "not e2e" -q || exit 1
+elif command -v python >/dev/null 2>&1 && python -c "import pytest" >/dev/null 2>&1; then
+  python -m pytest ../test -m "not e2e" -q || exit 1
+elif command -v python3 >/dev/null 2>&1 && python3 -c "import pytest" >/dev/null 2>&1; then
+  python3 -m pytest ../test -m "not e2e" -q || exit 1
+else
+  echo "[pre-push] skipping python tests: no uv/pytest runner on PATH"
+fi
+
+echo "[pre-push] JIT-free scan"
+if command -v npm >/dev/null 2>&1 && command -v node >/dev/null 2>&1; then
+  npm run scan:jit || exit 1
+else
+  echo "[pre-push] skipping JIT-free scan: no npm/node runner on PATH"
+fi
+
+echo "[pre-push] bundle-size budget"
+if command -v npm >/dev/null 2>&1 && command -v node >/dev/null 2>&1; then
+  npm run check:size || exit 1
+else
+  echo "[pre-push] skipping bundle-size budget: no npm/node runner on PATH"
+fi

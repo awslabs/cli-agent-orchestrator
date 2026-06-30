@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import re
 import shlex
 import time
@@ -165,9 +166,20 @@ class ClaudeCodeProvider(BaseProvider):
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
-        # Determine permission mode for the base command
-        if profile and profile.permissionMode and not yolo:
+        # Determine permission mode for the base command.
+        # Priority: explicit permissionMode > yolo/root detection > default yolo.
+        #
+        # Root/sudo guard: Claude Code rejects --dangerously-skip-permissions when
+        # running as root. We only omit it for yolo+root; non-root yolo still needs
+        # the flag so Claude won't prompt for tool approval inside a headless tmux
+        # pane and silently block handoff/assign flows.
+        is_root = getattr(os, "geteuid", lambda: -1)() == 0
+
+        if profile and profile.permissionMode:
             command_parts = ["claude", "--permission-mode", profile.permissionMode]
+        elif yolo and is_root:
+            # Root users cannot use --dangerously-skip-permissions; omit it entirely.
+            command_parts = ["claude"]
         else:
             command_parts = ["claude", "--dangerously-skip-permissions"]
 
@@ -228,7 +240,7 @@ class ClaudeCodeProvider(BaseProvider):
                     mcp_file.chmod(0o600)
                 except OSError:
                     pass
-                command_parts.extend(["--mcp-config", str(mcp_file)])
+                command_parts.extend(["--mcp-config", str(mcp_file), "--strict-mcp-config"])
 
         # Apply tool restrictions via --disallowedTools flags.
         # --dangerously-skip-permissions bypasses prompts but --disallowedTools
@@ -338,12 +350,21 @@ class ClaudeCodeProvider(BaseProvider):
                 get_backend().send_special_key(self.session_name, self.window_name, "Enter")
                 return
 
-            # 3) Claude Code fully started — no prompts needed
+            # 3) Claude Code fully started — no prompts needed.
+            #    The version banner is the ONLY reliable "ready" signal here: it
+            #    renders only once the REPL is up and cannot appear in the echoed
+            #    launch command. The old bare IDLE_PROMPT_PATTERN ("> "/"❯ ") check
+            #    was removed: the injected --append-system-prompt text contains
+            #    "> `memory_store`" (start of a line), which the echoed command
+            #    surfaces in the capture buffer within ~300ms and false-matches as
+            #    "idle". The handler then returned BEFORE the workspace-trust dialog
+            #    rendered, leaving it unaccepted; initialize() then blocked on
+            #    {IDLE, COMPLETED} for 30s and the session was killed. Trust/bypass
+            #    dialogs are handled explicitly above; if no banner ever appears the
+            #    loop just waits out its timeout and the downstream
+            #    wait_until_status() remains the real readiness gate.
             if re.search(r"Welcome to|Claude Code v\d+", clean_output):
                 logger.info("Claude Code started without prompts")
-                return
-            if re.search(IDLE_PROMPT_PATTERN, clean_output):
-                logger.info("Claude Code idle prompt detected, no prompts needed")
                 return
 
             time.sleep(1.0)

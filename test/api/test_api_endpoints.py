@@ -122,7 +122,7 @@ class TestAgentProviders:
 
         assert response.status_code == 200
         data = response.json()
-        assert len(data) == 10
+        assert len(data) == 11
         names = [p["name"] for p in data]
         assert "kiro_cli" in names
         assert "claude_code" in names
@@ -134,6 +134,7 @@ class TestAgentProviders:
         assert "copilot_cli" in names
         assert "opencode_cli" in names
         assert "cursor_cli" in names
+        assert "antigravity_cli" in names
         for p in data:
             assert p["installed"] is True
 
@@ -183,6 +184,7 @@ class TestAgentProviders:
         assert providers_dict["kimi_cli"]["binary"] == "kimi"
         assert providers_dict["copilot_cli"]["binary"] == "copilot"
         assert providers_dict["opencode_cli"]["binary"] == "opencode"
+        assert providers_dict["antigravity_cli"]["binary"] == "agy"
 
 
 # ── Skills endpoint ──────────────────────────────────────────────────

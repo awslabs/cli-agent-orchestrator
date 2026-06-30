@@ -14,3 +14,4 @@ class ProviderType(str, Enum):
     OPENCODE_CLI = "opencode_cli"
     HERMES = "hermes"
     CURSOR_CLI = "cursor_cli"
+    ANTIGRAVITY_CLI = "antigravity_cli"

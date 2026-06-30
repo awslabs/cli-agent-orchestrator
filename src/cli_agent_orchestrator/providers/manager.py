@@ -5,6 +5,7 @@ from typing import Dict, List, Optional
 
 from cli_agent_orchestrator.clients.database import get_terminal_metadata
 from cli_agent_orchestrator.models.provider import ProviderType
+from cli_agent_orchestrator.providers.antigravity_cli import AntigravityCliProvider
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
 from cli_agent_orchestrator.providers.codex import CodexProvider
@@ -125,6 +126,16 @@ class ProviderManager:
                 )
             elif provider_type == ProviderType.CURSOR_CLI.value:
                 provider = CursorCliProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    model=model,
+                    skill_prompt=skill_prompt,
+                )
+            elif provider_type == ProviderType.ANTIGRAVITY_CLI.value:
+                provider = AntigravityCliProvider(
                     terminal_id,
                     tmux_session,
                     tmux_window,

@@ -651,3 +651,21 @@ class TestCursorCliSupervisorOrchestration:
         without doing the analysis work itself.
         """
         _run_supervisor_assign_three_analysts_test(provider="cursor_cli")
+
+
+# ---------------------------------------------------------------------------
+# Antigravity CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestAntigravityCliSupervisorOrchestration:
+    """E2E supervisor orchestration tests for the Antigravity CLI provider."""
+
+    def test_supervisor_handoff(self, require_antigravity):
+        """Supervisor uses handoff MCP tool to delegate to report_generator."""
+        _run_supervisor_handoff_test(provider="antigravity_cli")
+
+    def test_supervisor_assign_and_handoff(self, require_antigravity):
+        """Supervisor uses assign + handoff to orchestrate multi-agent workflow."""
+        _run_supervisor_assign_test(provider="antigravity_cli")

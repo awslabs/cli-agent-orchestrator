@@ -11,6 +11,7 @@ Usage:
     CAO_TEST_WATCH=1 pytest test/providers/test_kiro_cli_integration.py -v -o "addopts="
 """
 
+import asyncio
 import json
 import os
 import re
@@ -165,23 +166,28 @@ def _clean(terminal_id):
     return ANSI_RE.sub("", _get_output(terminal_id))
 
 
-def _wait_for_permission(terminal_id, timeout=15):
+async def _wait_for_permission(terminal_id, timeout=15):
     elapsed = 0
     while elapsed < timeout:
         if PERM_RE.search(_clean(terminal_id)):
             return True
-        time.sleep(1)
+        # await (not time.sleep) so the asyncio StatusMonitor task on this same
+        # event loop keeps draining the FIFO and updating the buffer. A blocking
+        # sleep starves the monitor, leaving the buffer empty and status latched.
+        await asyncio.sleep(1)
         elapsed += 1
     return False
 
 
-def _wait_for_status(terminal_id, target, timeout=30):
+async def _wait_for_status(terminal_id, target, timeout=30):
     elapsed = 0
     while elapsed < timeout:
         s = status_monitor.get_status(terminal_id)
         if s == target:
             return s
-        time.sleep(1)
+        # await (not time.sleep) — see _wait_for_permission: yielding lets the
+        # StatusMonitor coroutine run so get_status() reflects fresh output.
+        await asyncio.sleep(1)
         elapsed += 1
     return status_monitor.get_status(terminal_id)
 
@@ -214,7 +220,7 @@ class TestKiroCliProviderIntegration:
         _log("QUERY", "Sending: Say 'Hello, integration test!'")
         _send(terminal.id, "Say 'Hello, integration test!'")
         _log("QUERY", "Waiting for COMPLETED...")
-        status = _wait_for_status(terminal.id, TerminalStatus.COMPLETED)
+        status = await _wait_for_status(terminal.id, TerminalStatus.COMPLETED)
         _log("QUERY", f"Status: {status}")
         assert status == TerminalStatus.COMPLETED
 
@@ -235,7 +241,7 @@ class TestKiroCliPermissionPromptIntegration:
         _log("P1", "Sending: Run this command: echo 'test'")
         _send(terminal.id, "Run this command: echo 'test'")
         _log("P1", "Waiting for permission prompt...")
-        if not _wait_for_permission(terminal.id, timeout=30):
+        if not await _wait_for_permission(terminal.id, timeout=30):
             pytest.skip("Permission prompt not triggered (tool may be pre-approved)")
         status = status_monitor.get_status(terminal.id)
         _log("P1", f"Status: {status}")
@@ -246,13 +252,13 @@ class TestKiroCliPermissionPromptIntegration:
         """P3/P4: Invalid answer submitted during active prompt."""
         _log("P3", "Sending: Run: whoami")
         _send(terminal.id, "Run: whoami")
-        if not _wait_for_permission(terminal.id):
+        if not await _wait_for_permission(terminal.id):
             pytest.skip("Permission prompt not triggered")
         status = status_monitor.get_status(terminal.id)
         _log("P3", f"Status before injection: {status}")
         assert status == TerminalStatus.WAITING_USER_ANSWER
         _send(terminal.id, "[Test injection]")
-        time.sleep(1)
+        await asyncio.sleep(1)
         status = status_monitor.get_status(terminal.id)
         _log("P3", f"Status after injection: {status}")
         assert status == TerminalStatus.WAITING_USER_ANSWER
@@ -261,10 +267,10 @@ class TestKiroCliPermissionPromptIntegration:
     async def test_p5_p6_stale_permission_after_answer(self, terminal):
         """P5/P6: Answered prompt — must NOT be WAITING_USER_ANSWER."""
         _send(terminal.id, "Run this bash command: echo 'stale test'")
-        if not _wait_for_permission(terminal.id):
+        if not await _wait_for_permission(terminal.id):
             pytest.skip("Permission prompt not triggered")
         _send(terminal.id, "y")
-        status = _wait_for_status(terminal.id, TerminalStatus.COMPLETED)
+        status = await _wait_for_status(terminal.id, TerminalStatus.COMPLETED)
         _log("P5", f"Status after answer: {status}")
         assert status != TerminalStatus.WAITING_USER_ANSWER
         assert PERM_RE.search(_clean(terminal.id))
@@ -273,10 +279,10 @@ class TestKiroCliPermissionPromptIntegration:
     async def test_p7_multiple_permission_prompts(self, terminal):
         """P7: Second unanswered prompt after first answered."""
         _send(terminal.id, "Run: echo 'first'")
-        if not _wait_for_permission(terminal.id):
+        if not await _wait_for_permission(terminal.id):
             pytest.skip("Permission prompt not triggered")
         _send(terminal.id, "y")
-        status = _wait_for_status(terminal.id, TerminalStatus.COMPLETED, timeout=30)
+        status = await _wait_for_status(terminal.id, TerminalStatus.COMPLETED, timeout=30)
         assert status == TerminalStatus.COMPLETED, f"First command didn't complete ({status})"
         before_count = len(PERM_RE.findall(_clean(terminal.id)))
         _send(terminal.id, "Run: echo 'second'")
@@ -287,7 +293,7 @@ class TestKiroCliPermissionPromptIntegration:
             if after_count > before_count:
                 found_new = True
                 break
-            time.sleep(1)
+            await asyncio.sleep(1)
             elapsed += 1
         if not found_new:
             pytest.skip("Second permission prompt not triggered (tool may be session-approved)")
@@ -301,7 +307,7 @@ class TestKiroCliPermissionPromptIntegration:
         elapsed = 0
         status = status_monitor.get_status(terminal.id)
         while status == TerminalStatus.IDLE and elapsed < 10:
-            time.sleep(0.5)
+            await asyncio.sleep(0.5)
             elapsed += 0.5
             status = status_monitor.get_status(terminal.id)
         _log("N4", f"Status after {elapsed}s: {status}")
