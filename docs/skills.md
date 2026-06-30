@@ -112,9 +112,39 @@ Each registered directory is scanned one level deep — every immediate subfolde
 
 ## How Agents Discover Skills
 
-All installed skills are available to all CAO agents — there is no per-profile skill declaration. When an agent is launched, CAO appends a catalog block to the prompt listing every installed skill's name and description, along with instructions to use the `load_skill` MCP tool to retrieve full content. The agent then decides when and whether to load each skill based on the task at hand.
+By default, every installed skill is available to every CAO agent. When an agent is launched, CAO appends a catalog block to the prompt listing each available skill's name and description, along with instructions to use the `load_skill` MCP tool to retrieve full content. The agent then decides when and whether to load each skill based on the task at hand.
 
-You can explicitly instruct the agent to load specific skills eagerly in the agent profile body:
+### Scoping the catalog per agent (`skills`)
+
+To advertise only a subset of skills to a given agent, set the `skills` field in its profile frontmatter — a list of skill-name patterns, each an exact name or a case-sensitive [`fnmatch`](https://docs.python.org/3/library/fnmatch.html) glob. Only matching skills appear in that agent's catalog; the rest stay hidden (an agent cannot `load_skill` what it cannot see). A pattern that matches no installed skill is logged as a warning, to catch typos and stale names.
+
+This applies only to the runtime-prompt providers that receive the injected catalog (Claude Code, Codex, Gemini CLI, Kimi CLI, Antigravity). Providers that deliver skills natively (Kiro CLI, OpenCode, GitHub Copilot CLI, Amazon Q) ignore the field.
+
+```yaml
+---
+name: ads-backend-developer
+role: developer
+skills: ["ads-db", "ads-query-logs"]   # exact names
+---
+```
+
+```yaml
+---
+name: ads-cto
+role: developer
+skills: ["ads-*", "cao-*"]              # globs: this project's skills + CAO built-ins
+---
+```
+
+Semantics:
+
+- **field omitted** → the full catalog (backward-compatible default).
+- **list of patterns** → only skills matching at least one pattern.
+- **empty list `[]`** → no skill catalog is injected for this agent.
+
+This keeps each agent's catalog focused — for example so one project's agents don't see another project's skills when both register their `skills/` directories under a shared `extra_skill_dirs`.
+
+You can also explicitly instruct the agent to load specific skills eagerly in the agent profile body:
 
 ```markdown
 Before starting any task, load the python-testing and code-style skills.
