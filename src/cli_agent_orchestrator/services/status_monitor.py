@@ -220,9 +220,30 @@ class StatusMonitor:
 
     def _detect_screen(self, terminal_id: str, provider) -> TerminalStatus:
         """Detect status from the terminal's composited pyte screen."""
+        fallback_buffer: Optional[str] = None
         with self._lock:
             scr = self._screens.get(terminal_id)
-            lines: List[str] = list(scr[0].display) if scr is not None else []
+            buffer = self._buffers.get(terminal_id, "")
+            try:
+                lines: List[str] = list(scr[0].display) if scr is not None else []
+            except Exception:
+                # pyte can transiently hold zero-length cell data while rendering
+                # complex TUI redraws. Fall back to raw-buffer detection instead of
+                # letting the quiescence callback tear down status monitoring.
+                logger.exception(
+                    "Error rendering screen status for %s; falling back to raw buffer",
+                    terminal_id,
+                )
+                fallback_buffer = buffer
+                lines = []
+        if fallback_buffer is not None:
+            if provider is None:
+                return TerminalStatus.UNKNOWN
+            try:
+                return provider.get_status(fallback_buffer)
+            except Exception:
+                logger.exception("Error detecting fallback status for %s", terminal_id)
+                return TerminalStatus.UNKNOWN
         if not lines or provider is None:
             return TerminalStatus.UNKNOWN
         try:
@@ -439,7 +460,28 @@ class StatusMonitor:
                     return TerminalStatus.UNKNOWN
 
         with self._lock:
-            return self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
+            cached = self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
+            # When cached status is PROCESSING, the debounced detection may be
+            # stuck: TUI providers (kiro-cli) can send escape sequences
+            # continuously after becoming idle, preventing the 200ms quiescence
+            # timer from ever firing. Do a fresh detection from the current
+            # buffer so poll-based callers (wait_until_status) catch the
+            # PROCESSING→ready transition without waiting for stream silence.
+            if cached == TerminalStatus.PROCESSING:
+                buffer = self._buffers.get(terminal_id, "")
+            else:
+                buffer = ""
+
+        if cached == TerminalStatus.PROCESSING and buffer:
+            fresh = self._detect_status(terminal_id, buffer)
+            logger.debug(
+                f"get_status [{terminal_id}]: cached=PROCESSING, "
+                f"fresh={fresh.value}, buffer_len={len(buffer)}"
+            )
+            if fresh != TerminalStatus.PROCESSING and fresh != TerminalStatus.UNKNOWN:
+                self._apply_detection(terminal_id, fresh)
+                return fresh
+        return cached
 
     def get_buffer(self, terminal_id: str) -> str:
         """Get accumulated output buffer for a terminal."""

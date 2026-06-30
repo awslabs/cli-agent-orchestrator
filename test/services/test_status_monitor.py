@@ -85,6 +85,29 @@ class TestGetStatusEventInbox:
         assert sm.get_status("t1") == TerminalStatus.UNKNOWN
 
 
+class TestScreenDetection:
+    """Rendered-screen detection should fail soft and keep monitoring alive."""
+
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    def test_render_error_falls_back_to_raw_buffer_detection(self, mock_pm):
+        class BrokenScreen:
+            @property
+            def display(self):
+                raise RuntimeError("torn pyte frame")
+
+        provider = MagicMock()
+        provider.get_status.return_value = TerminalStatus.IDLE
+        mock_pm.get_provider.side_effect = AssertionError("provider should not be refetched")
+
+        sm = StatusMonitor()
+        sm._screens["t1"] = (BrokenScreen(), MagicMock())
+        sm._buffers["t1"] = "raw buffer with idle footer"
+
+        assert sm._detect_screen("t1", provider) == TerminalStatus.IDLE
+        provider.get_status.assert_called_once_with("raw buffer with idle footer")
+        mock_pm.get_provider.assert_not_called()
+
+
 class _SequencedMonitor:
     """Drive _process_chunk with a scripted sequence of detected statuses.
 
