@@ -1,0 +1,8 @@
+{
+  "port": 9889,
+  "machines": [
+    { "name": "node-a", "host": "100.64.0.11", "label": "coordinator",  "os": "linux", "role": "central" },
+    { "name": "node-b", "host": "100.64.0.12", "label": "worker-linux",  "os": "linux", "role": "agent" },
+    { "name": "node-c", "host": "100.64.0.13", "label": "worker-macos",  "os": "macos", "role": "agent" }
+  ]
+}
