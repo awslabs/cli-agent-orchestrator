@@ -348,11 +348,9 @@ You are restricted to only use the following tools: {tools_list}
         ):
             return TerminalStatus.IDLE
 
-        # 4. Fallback: if we have substantial output (not just shell prompt) and no processing, assume IDLE
-        # This handles cases where Devin CLI shows prompts without the exact pattern
-        if len(clean_output) > 100:  # More than 100 chars means we have real output
-            return TerminalStatus.IDLE
-
+        # 4. Fallback: if we have substantial output (not just shell prompt) and no processing, still return ERROR
+        # to be conservative. We don't want to incorrectly classify error states as ready.
+        # Let the status monitor's history fallback handle ambiguous cases.
         return TerminalStatus.ERROR
 
     def get_idle_pattern_for_log(self) -> str:

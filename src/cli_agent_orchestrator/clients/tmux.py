@@ -333,11 +333,16 @@ class TmuxClient:
             validated_session = validate_tmux_name(session_name, "session_name")
             validated_window = validate_tmux_name(window_name, "window_name")
             target = f"{validated_session}:{validated_window}"
-            # Send the text once, then send Enter separately enter_count times
-            subprocess.run(
-                ["tmux", "send-keys", "-l", "-t", target, keys],
-                check=True,
-            )
+            # Split long messages into chunks to avoid OS argument-length limits
+            # tmux send-keys has practical limits around 10KB per invocation
+            CHUNK_SIZE = 8192
+            for i in range(0, len(keys), CHUNK_SIZE):
+                chunk = keys[i:i + CHUNK_SIZE]
+                subprocess.run(
+                    ["tmux", "send-keys", "-l", "-t", target, chunk],
+                    check=True,
+                )
+            # Send Enter separately enter_count times
             for i in range(enter_count):
                 subprocess.run(
                     ["tmux", "send-keys", "-t", target, "C-m"],
