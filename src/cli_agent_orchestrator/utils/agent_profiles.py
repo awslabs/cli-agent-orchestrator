@@ -1,6 +1,7 @@
 """Agent profile utilities."""
 
 import logging
+import os
 from importlib import resources
 from pathlib import Path
 from typing import Dict, List
@@ -12,6 +13,17 @@ from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.utils.env import resolve_env_vars
 
 logger = logging.getLogger(__name__)
+
+
+def _normalized_path(path) -> str:
+    """Canonical form for comparing configured directory paths (GH #280/#281).
+
+    Disabled dirs are stored as the exact strings the UI sends, but the same
+    directory can be reached via a slightly different spelling (e.g. the local
+    agent-store is also a provider default). Normalising both sides keeps the
+    disable check robust across those.
+    """
+    return os.path.normpath(os.path.expanduser(str(path)))
 
 
 def _validate_agent_name(agent_name: str) -> None:
@@ -43,8 +55,19 @@ def _safe_join(root: Path, *parts: str) -> Path | None:
     return candidate
 
 
-def _scan_directory(directory: Path, source_label: str, profiles: Dict[str, Dict]) -> None:
-    """Scan a directory for agent profiles (.md files, .json files, or subdirectories)."""
+def _scan_directory(
+    directory: Path,
+    source_label: str,
+    profiles: Dict[str, Dict],
+    name_sources: Dict[str, List[str]] | None = None,
+) -> None:
+    """Scan a directory for agent profiles (.md files, .json files, or subdirectories).
+
+    ``profiles`` keeps the first-found profile per name (scan order decides the
+    winner). ``name_sources``, when given, records EVERY directory a name was
+    found in (winner first), so callers can surface same-named profiles defined
+    in more than one enabled directory (GH #280).
+    """
     if not directory.exists():
         return
     for item in directory.iterdir():
@@ -59,6 +82,8 @@ def _scan_directory(directory: Path, source_label: str, profiles: Dict[str, Dict
                     desc = data.metadata.get("description", "")
                 except Exception:
                     pass
+            if name_sources is not None:
+                name_sources.setdefault(profile_name, []).append(source_label)
             if profile_name not in profiles:
                 profiles[profile_name] = {
                     "name": profile_name,
@@ -73,6 +98,8 @@ def _scan_directory(directory: Path, source_label: str, profiles: Dict[str, Dict
                 desc = data.metadata.get("description", "")
             except Exception:
                 pass
+            if name_sources is not None:
+                name_sources.setdefault(profile_name, []).append(source_label)
             if profile_name not in profiles:
                 profiles[profile_name] = {
                     "name": profile_name,
@@ -89,10 +116,15 @@ def list_agent_profiles() -> List[Dict]:
     """
     from cli_agent_orchestrator.services.settings_service import (
         get_agent_dirs,
+        get_disabled_agent_dirs,
         get_extra_agent_dirs,
     )
 
     profiles: Dict[str, Dict] = {}
+    # name -> every enabled directory the name was found in (winner first), used
+    # to flag same-named profiles defined in more than one dir (GH #280).
+    name_sources: Dict[str, List[str]] = {}
+    disabled = {_normalized_path(d) for d in get_disabled_agent_dirs()}
 
     # 1. Built-in agent store
     try:
@@ -101,6 +133,9 @@ def list_agent_profiles() -> List[Dict]:
             name = item.name
             if name.endswith(".md"):
                 profile_name = name[:-3]
+                name_sources.setdefault(profile_name, []).append("built-in")
+                if profile_name in profiles:
+                    continue
                 try:
                     data = frontmatter.loads(item.read_text())
                     profiles[profile_name] = {
@@ -117,8 +152,12 @@ def list_agent_profiles() -> List[Dict]:
     except Exception as e:
         logger.debug(f"Could not scan built-in agent store: {e}")
 
-    # 2. Local agent store (~/.aws/cli-agent-orchestrator/agent-store/)
-    _scan_directory(LOCAL_AGENT_STORE_DIR, "local", profiles)
+    # 2. Local agent store (~/.aws/cli-agent-orchestrator/agent-store/).
+    # It shares a path with the claude_code/codex default, so honour the
+    # disable toggle here too — otherwise disabling that default wouldn't hide
+    # its profiles.
+    if _normalized_path(LOCAL_AGENT_STORE_DIR) not in disabled:
+        _scan_directory(LOCAL_AGENT_STORE_DIR, "local", profiles, name_sources)
 
     # 3. Provider-specific directories (from settings)
     agent_dirs = get_agent_dirs()
@@ -129,16 +168,27 @@ def list_agent_profiles() -> List[Dict]:
         "cao_installed": "installed",
     }
     for provider, dir_path in agent_dirs.items():
+        if _normalized_path(dir_path) in disabled:
+            continue
         label = provider_source_labels.get(provider, provider)
         path = Path(dir_path)
         # Skip if it's the same as local store (already scanned)
         if path.resolve() == LOCAL_AGENT_STORE_DIR.resolve():
             continue
-        _scan_directory(path, label, profiles)
+        _scan_directory(path, label, profiles, name_sources)
 
     # 4. Extra user-added directories
     for extra_dir in get_extra_agent_dirs():
-        _scan_directory(Path(extra_dir), "custom", profiles)
+        if _normalized_path(extra_dir) in disabled:
+            continue
+        _scan_directory(Path(extra_dir), "custom", profiles, name_sources)
+
+    # Flag conflicts: a name found in more than one enabled directory. The
+    # winner (first scanned) is what loads; ``duplicated_in`` lists the shadowed
+    # sources so the UI can show "also defined in …" (GH #280 nice-to-have).
+    for profile_name, profile in profiles.items():
+        srcs = name_sources.get(profile_name, [])
+        profile["duplicated_in"] = srcs[1:] if len(srcs) > 1 else []
 
     return sorted(profiles.values(), key=lambda p: p["name"])
 
@@ -173,17 +223,24 @@ def _read_agent_profile_source(agent_name: str) -> str:
 
     from cli_agent_orchestrator.services.settings_service import (
         get_agent_dirs,
+        get_disabled_agent_dirs,
         get_extra_agent_dirs,
     )
+
+    # Honour the disable toggle on the load path too, so disabling a directory
+    # actually swaps which same-named profile wins (GH #280), not just what the
+    # Settings list shows.
+    disabled = {_normalized_path(d) for d in get_disabled_agent_dirs()}
 
     # Every filesystem read below goes through _safe_join so the path is
     # normalised and verified to stay inside its configured root. This is
     # belt-and-braces on top of _validate_agent_name above — the name check
     # rejects obvious traversal inputs, and _safe_join additionally blocks
     # anything that sneaks past (e.g. symlinks resolving outside the root).
-    local_profile = _safe_join(LOCAL_AGENT_STORE_DIR, f"{agent_name}.md")
-    if local_profile is not None and local_profile.exists():
-        return local_profile.read_text(encoding="utf-8")
+    if _normalized_path(LOCAL_AGENT_STORE_DIR) not in disabled:
+        local_profile = _safe_join(LOCAL_AGENT_STORE_DIR, f"{agent_name}.md")
+        if local_profile is not None and local_profile.exists():
+            return local_profile.read_text(encoding="utf-8")
 
     def _lookup_in_directory(directory: Path) -> str | None:
         if not directory.exists():
@@ -197,11 +254,15 @@ def _read_agent_profile_source(agent_name: str) -> str:
         return None
 
     for dir_path in get_agent_dirs().values():
+        if _normalized_path(dir_path) in disabled:
+            continue
         found = _lookup_in_directory(Path(dir_path))
         if found is not None:
             return found
 
     for extra_dir in get_extra_agent_dirs():
+        if _normalized_path(extra_dir) in disabled:
+            continue
         found = _lookup_in_directory(Path(extra_dir))
         if found is not None:
             return found

@@ -690,15 +690,21 @@ async def get_agent_dirs_endpoint() -> Dict:
     """Get configured agent directories per provider."""
     from cli_agent_orchestrator.services.settings_service import (
         get_agent_dirs,
+        get_disabled_agent_dirs,
         get_extra_agent_dirs,
     )
 
-    return {"agent_dirs": get_agent_dirs(), "extra_dirs": get_extra_agent_dirs()}
+    return {
+        "agent_dirs": get_agent_dirs(),
+        "extra_dirs": get_extra_agent_dirs(),
+        "disabled_dirs": get_disabled_agent_dirs(),
+    }
 
 
 class AgentDirsUpdate(BaseModel):
     agent_dirs: Optional[Dict[str, str]] = None
     extra_dirs: Optional[List[str]] = None
+    disabled_dirs: Optional[List[str]] = None
 
 
 @app.get("/settings/memory")
@@ -714,22 +720,28 @@ async def set_agent_dirs_endpoint(
     body: AgentDirsUpdate,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
-    """Update agent directories per provider."""
+    """Update agent directories per provider (paths, extras, and disabled set)."""
     from cli_agent_orchestrator.services.settings_service import (
+        get_agent_dirs,
+        get_disabled_agent_dirs,
         get_extra_agent_dirs,
         set_agent_dirs,
+        set_disabled_agent_dirs,
         set_extra_agent_dirs,
     )
 
-    result_dirs = {}
-    result_extra = []
     if body.agent_dirs:
-        result_dirs = set_agent_dirs(body.agent_dirs)
+        set_agent_dirs(body.agent_dirs)
     if body.extra_dirs is not None:
-        result_extra = set_extra_agent_dirs(body.extra_dirs)
+        set_extra_agent_dirs(body.extra_dirs)
+    # After extras are persisted, so a just-added extra can be disabled in the
+    # same request; set_disabled validates against the current known dirs.
+    if body.disabled_dirs is not None:
+        set_disabled_agent_dirs(body.disabled_dirs)
     return {
-        "agent_dirs": result_dirs or {},
-        "extra_dirs": result_extra or get_extra_agent_dirs(),
+        "agent_dirs": get_agent_dirs(),
+        "extra_dirs": get_extra_agent_dirs(),
+        "disabled_dirs": get_disabled_agent_dirs(),
     }
 
 

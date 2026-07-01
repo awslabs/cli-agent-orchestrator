@@ -218,7 +218,7 @@ class TestListAgentProfiles:
             "kiro_cli": "/home/user/.kiro/agents",
         }
 
-        def fake_scan(directory, source_label, profiles):
+        def fake_scan(directory, source_label, profiles, name_sources=None):
             if source_label == "local":
                 profiles["local-agent"] = {
                     "name": "local-agent",
@@ -269,7 +269,7 @@ class TestListAgentProfiles:
             "/home/user/.aws/cli-agent-orchestrator/agent-store"
         )
 
-        def fake_scan(directory, source_label, profiles):
+        def fake_scan(directory, source_label, profiles, name_sources=None):
             if source_label == "local":
                 # _scan_directory respects dedup: only adds if not present
                 if "developer" not in profiles:
@@ -378,7 +378,7 @@ class TestListAgentProfiles:
 
         scan_calls = []
 
-        def track_scan(directory, source_label, profiles):
+        def track_scan(directory, source_label, profiles, name_sources=None):
             scan_calls.append((str(directory), source_label))
             if str(directory) == "/custom/agents/dir1":
                 profiles["custom-agent1"] = {

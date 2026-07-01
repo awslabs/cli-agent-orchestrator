@@ -54,11 +54,17 @@ export interface AgentProfileInfo {
   name: string
   description: string
   source: AgentProfileSource
+  // Other enabled directories that also define this profile name (the winner
+  // above is what loads). Empty/absent when the name is unique. (GH #280)
+  duplicated_in?: string[]
 }
 
 export interface AgentDirsSettings {
   agent_dirs: Record<string, string>
   extra_dirs: string[]
+  // Directory paths toggled OFF: kept in the list but skipped when scanning
+  // for agent profiles. (GH #280/#281)
+  disabled_dirs?: string[]
 }
 
 export interface InboxMessage {
@@ -114,7 +120,7 @@ export const api = {
 
   // Settings
   getAgentDirs: () => fetchJSON<AgentDirsSettings>('/settings/agent-dirs'),
-  setAgentDirs: (data: { agent_dirs?: Record<string, string>; extra_dirs?: string[] }) =>
+  setAgentDirs: (data: { agent_dirs?: Record<string, string>; extra_dirs?: string[]; disabled_dirs?: string[] }) =>
     fetchJSON<AgentDirsSettings>('/settings/agent-dirs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
