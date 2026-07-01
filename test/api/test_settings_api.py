@@ -14,7 +14,7 @@ class TestGetAgentDirsEndpoint:
         """GET /settings/agent-dirs returns both agent_dirs and extra_dirs."""
         mock_agent_dirs = {
             "kiro_cli": "/home/user/.kiro/agents",
-            "q_cli": "/home/user/.aws/amazonq/cli-agents",
+            "cao_installed": "/home/user/.aws/cli-agent-orchestrator/installed-agents",
             "claude_code": "/custom/claude",
             "codex": "/custom/codex",
         }
@@ -43,7 +43,7 @@ class TestGetAgentDirsEndpoint:
         """GET /settings/agent-dirs returns empty extra_dirs when none configured."""
         mock_agent_dirs = {
             "kiro_cli": "/path",
-            "q_cli": "/path2",
+            "cao_installed": "/path2",
             "claude_code": "/p3",
             "codex": "/p4",
         }
@@ -72,7 +72,7 @@ class TestSetAgentDirsEndpoint:
         """POST /settings/agent-dirs updates agent_dirs and returns new settings."""
         updated_dirs = {
             "kiro_cli": "/new/kiro",
-            "q_cli": "/default/q",
+            "cao_installed": "/default/cao",
             "claude_code": "/default/claude",
             "codex": "/default/codex",
         }
@@ -122,7 +122,7 @@ class TestSetAgentDirsEndpoint:
         """POST /settings/agent-dirs can update both in one request."""
         updated_dirs = {
             "kiro_cli": "/updated",
-            "q_cli": "/default/q",
+            "cao_installed": "/default/cao",
             "claude_code": "/default/claude",
             "codex": "/default/codex",
         }

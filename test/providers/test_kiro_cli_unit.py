@@ -261,7 +261,7 @@ class TestKiroCliProviderStatusDetection:
 
     def test_get_status_idle(self):
         """Test IDLE status detection."""
-        output = load_fixture("q_cli_idle_output.txt")
+        output = load_fixture("kiro_cli_idle_output.txt")
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         status = provider.get_status(output)

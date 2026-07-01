@@ -36,18 +36,8 @@ List available providers with installation status.
     "installed": true
   },
   {
-    "name": "q_cli",
-    "binary": "q",
-    "installed": false
-  },
-  {
     "name": "codex",
     "binary": "codex",
-    "installed": true
-  },
-  {
-    "name": "gemini_cli",
-    "binary": "gemini",
     "installed": true
   },
   {
@@ -78,7 +68,7 @@ List available providers with installation status.
 Create a new session with one terminal.
 
 **Parameters:**
-- `provider` (string, required): Provider type ("kiro_cli", "claude_code", "codex", "gemini_cli", "hermes", "kimi_cli", "copilot_cli", or "q_cli")
+- `provider` (string, required): Provider type ("kiro_cli", "claude_code", "codex", "antigravity_cli", "hermes", "kimi_cli", "copilot_cli", "opencode_cli", or "cursor_cli")
 - `agent_profile` (string, required): Agent profile name
 - `session_name` (string, optional): Custom session name
 - `working_directory` (string, optional): Working directory for the agent session
@@ -135,7 +125,7 @@ Get terminal details.
 {
   "id": "string",
   "name": "string",
-  "provider": "kiro_cli|claude_code|codex|gemini_cli|hermes|kimi_cli|copilot_cli|q_cli",
+  "provider": "kiro_cli|claude_code|codex|antigravity_cli|hermes|kimi_cli|copilot_cli|opencode_cli|cursor_cli",
   "session_name": "string",
   "agent_profile": "string",
   "caller_id": "string|null",
@@ -217,11 +207,10 @@ Send provider-specific exit command to terminal.
 | kiro_cli | `/exit` | Text |
 | claude_code | `/exit` | Text |
 | codex | `/exit` | Text |
-| gemini_cli | `/exit` | Text |
+| antigravity_cli | `/exit` | Text |
 | hermes | `/exit` | Text |
 | kimi_cli | `/exit` | Text |
 | copilot_cli | `/exit` | Text |
-| q_cli | `/exit` | Text |
 
 **Response:**
 ```json

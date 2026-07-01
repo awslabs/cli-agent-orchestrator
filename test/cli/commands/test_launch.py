@@ -709,7 +709,7 @@ def test_launch_allowed_tools_still_resolves_profile_provider():
         patch("cli_agent_orchestrator.cli.commands.launch.get_backend"),
         patch(
             "cli_agent_orchestrator.utils.agent_profiles.resolve_provider",
-            return_value="gemini_cli",
+            return_value="copilot_cli",
         ) as mock_resolve,
     ):
         mock_post.return_value.json.return_value = {
@@ -722,7 +722,7 @@ def test_launch_allowed_tools_still_resolves_profile_provider():
             launch,
             [
                 "--agents",
-                "gemini_panelist",
+                "copilot_panelist",
                 "--allowed-tools",
                 "fs_read",
                 "--headless",
@@ -731,9 +731,9 @@ def test_launch_allowed_tools_still_resolves_profile_provider():
         )
 
         assert result.exit_code == 0
-        mock_resolve.assert_called_once_with("gemini_panelist", "kiro_cli")
+        mock_resolve.assert_called_once_with("copilot_panelist", "kiro_cli")
         # Local prompts must reflect the resolved provider, not the default.
-        assert "launching on gemini_cli" in result.output
+        assert "launching on copilot_cli" in result.output
 
 
 def test_launch_explicit_provider_skips_profile_resolution():

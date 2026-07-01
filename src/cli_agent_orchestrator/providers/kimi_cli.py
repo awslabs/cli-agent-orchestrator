@@ -885,8 +885,8 @@ class KimiCliProvider(BaseProvider):
     async def extract_session_context(self) -> Dict[str, Any]:
         """Tmux-primary session extraction for Kimi.
 
-        Mirrors the universal pattern used by the other 5 providers
-        (Claude Code / Codex / Kiro / Q / Gemini). Returns the locked
+        Mirrors the universal pattern used by the other providers
+        (Claude Code / Codex / Kiro / Copilot). Returns the locked
         6-field shape from ``_build_context_dict``. Empty tmux history
         returns the LITERAL empty dict ``{}``. All
         emitted strings flow through ``_sanitize_for_log`` at this

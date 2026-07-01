@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 # in the seconds following completion. Without stickiness, both
 # wait_until_status (server-side) and the e2e tests' HTTP polling miss the
 # brief "ready" windows and time out (PR #273 codex 60s init timeouts,
-# gemini 240s init timeouts, completion-timeout failures).
+# completion-timeout failures).
 _STICKY_READY_STATUSES = frozenset(
     {
         TerminalStatus.IDLE,

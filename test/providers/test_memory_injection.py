@@ -154,57 +154,6 @@ class TestKiroInjection:
         assert injected.index("<cao-memory>") < injected.index(ORIGINAL_MESSAGE)
 
 
-class TestGeminiInjection:
-    """U8.4: Gemini CLI first message contains <cao-memory> block, GEMINI.md not modified."""
-
-    def setup_method(self):
-        _memory_injected_terminals.clear()
-
-    @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
-    def test_gemini_injection(self, mock_svc_cls):
-        """First message to Gemini terminal should include <cao-memory> block."""
-        mock_svc_cls.return_value.get_curated_memory_context.return_value = SAMPLE_MEMORY_CONTEXT
-
-        injected = inject_memory_context(ORIGINAL_MESSAGE, "term-gemini-001")
-
-        assert "<cao-memory>" in injected
-        assert "</cao-memory>" in injected
-        assert ORIGINAL_MESSAGE in injected
-
-    def test_gemini_md_not_modified(self, tmp_path: Path):
-        """GEMINI.md should not be mutated during memory injection."""
-        gemini_md = tmp_path / "project" / "GEMINI.md"
-        gemini_md.parent.mkdir(parents=True, exist_ok=True)
-        original = "# Gemini Config\nDo not touch."
-        gemini_md.write_text(original)
-
-        # Simulate injection — memory context generation should not touch GEMINI.md
-        svc = MemoryService(base_dir=tmp_path / "memory")
-        ctx = {
-            "terminal_id": "term-gemini-001",
-            "session_name": "test-session",
-            "provider": "gemini_cli",
-            "agent_profile": "developer",
-            "cwd": str(tmp_path / "project"),
-        }
-
-        asyncio.run(
-            svc.store(
-                content="Test memory",
-                scope="global",
-                memory_type="project",
-                key="test-mem",
-                terminal_context=ctx,
-            )
-        )
-
-        svc._get_terminal_context = lambda terminal_id: ctx
-        context = svc.get_memory_context_for_terminal("term-gemini-001")
-        # Just verify context exists and file wasn't touched
-        assert context  # non-empty
-        assert gemini_md.read_text() == original
-
-
 class TestNoInjectionWhenEmpty:
     """U8.4: no memories → no <cao-memory> block."""
 
@@ -248,18 +197,6 @@ class TestConfigFilesNotMutated:
 
         svc._get_terminal_context = lambda terminal_id: ctx
         return svc.get_memory_context_for_terminal("term-001")
-
-    def test_gemini_md_not_mutated(self, tmp_path: Path):
-        """GEMINI.md must not be modified during memory context generation."""
-        gemini_md = tmp_path / "project" / "GEMINI.md"
-        gemini_md.parent.mkdir(parents=True, exist_ok=True)
-        original = "# Gemini Config\nDo not touch."
-        gemini_md.write_text(original)
-
-        context = self._store_and_get_context(tmp_path)
-
-        assert "<cao-memory>" in context
-        assert gemini_md.read_text() == original
 
     def test_claude_md_not_mutated(self, tmp_path: Path):
         """CLAUDE.md must not be modified during memory context generation."""

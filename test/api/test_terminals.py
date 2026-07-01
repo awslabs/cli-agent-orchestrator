@@ -77,7 +77,7 @@ class TestSessionCreationWithWorkingDirectory:
                     id="abcd1234",
                     name="test-window",
                     session_name="test-session",
-                    provider="q_cli",
+                    provider="kiro_cli",
                     agent_profile="developer",
                 )
             )
@@ -85,7 +85,7 @@ class TestSessionCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions",
                 params={
-                    "provider": "q_cli",
+                    "provider": "kiro_cli",
                     "agent_profile": "developer",
                     "working_directory": str(tmp_path),
                 },
@@ -105,7 +105,7 @@ class TestSessionCreationWithWorkingDirectory:
                     id="abcd1234",
                     name="test-window",
                     session_name="test-session",
-                    provider="q_cli",
+                    provider="kiro_cli",
                     agent_profile="developer",
                 )
             )
@@ -113,7 +113,7 @@ class TestSessionCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions",
                 params={
-                    "provider": "q_cli",
+                    "provider": "kiro_cli",
                     "agent_profile": "developer",
                     "working_directory": "/custom/path",
                 },
@@ -141,7 +141,7 @@ class TestTerminalCreationWithWorkingDirectory:
                     id="abcd5678",
                     name="test-window",
                     session_name="test-session",
-                    provider="q_cli",
+                    provider="kiro_cli",
                     agent_profile="analyst",
                 )
             )
@@ -149,7 +149,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
-                    "provider": "q_cli",
+                    "provider": "kiro_cli",
                     "agent_profile": "analyst",
                     "working_directory": str(tmp_path),
                 },
@@ -173,7 +173,7 @@ class TestTerminalCreationWithWorkingDirectory:
                     id="abcd5678",
                     name="test-window",
                     session_name="test-session",
-                    provider="q_cli",
+                    provider="kiro_cli",
                     agent_profile="analyst",
                     caller_id="dcba8765",
                 )
@@ -182,7 +182,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
-                    "provider": "q_cli",
+                    "provider": "kiro_cli",
                     "agent_profile": "analyst",
                     "caller_id": "dcba8765",
                 },
@@ -206,7 +206,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
-                    "provider": "q_cli",
+                    "provider": "kiro_cli",
                     "agent_profile": "analyst",
                     "caller_id": "not-a-terminal-id!",
                 },
@@ -229,7 +229,7 @@ class TestTerminalCreationWithWorkingDirectory:
                     id="abcd5678",
                     name="test-window",
                     session_name="test-session",
-                    provider="q_cli",
+                    provider="kiro_cli",
                     agent_profile="analyst",
                 )
             )
@@ -237,7 +237,7 @@ class TestTerminalCreationWithWorkingDirectory:
             response = client.post(
                 "/sessions/test-session/terminals",
                 params={
-                    "provider": "q_cli",
+                    "provider": "kiro_cli",
                     "agent_profile": "analyst",
                     "working_directory": "/session/path",
                 },

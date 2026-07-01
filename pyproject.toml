@@ -8,7 +8,7 @@ license = "Apache-2.0"
 authors = [
     { name = "AWS Labs" },
 ]
-keywords = ["ai", "agents", "orchestration", "multi-agent", "tmux", "mcp", "cli", "codex", "claude-code", "kiro", "kimi", "gemini"]
+keywords = ["ai", "agents", "orchestration", "multi-agent", "tmux", "mcp", "cli", "codex", "claude-code", "kiro", "kimi"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",

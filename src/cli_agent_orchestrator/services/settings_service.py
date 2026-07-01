@@ -15,7 +15,6 @@ SETTINGS_FILE = CAO_HOME_DIR / "settings.json"
 # Default agent directories per provider
 _DEFAULTS = {
     "kiro_cli": str(Path.home() / ".kiro" / "agents"),
-    "q_cli": str(Path.home() / ".aws" / "amazonq" / "cli-agents"),
     "claude_code": str(Path.home() / ".aws" / "cli-agent-orchestrator" / "agent-store"),
     "codex": str(Path.home() / ".aws" / "cli-agent-orchestrator" / "agent-store"),
     "cao_installed": str(Path.home() / ".aws" / "cli-agent-orchestrator" / "agent-context"),
@@ -44,7 +43,7 @@ def get_agent_dirs() -> Dict[str, str]:
     """Get configured agent directories per provider.
 
     Returns dict like:
-      {"kiro_cli": "/home/user/.kiro/agents", "q_cli": "...", ...}
+      {"kiro_cli": "/home/user/.kiro/agents", "claude_code": "...", ...}
     """
     settings = _load()
     saved = settings.get("agent_dirs", {})

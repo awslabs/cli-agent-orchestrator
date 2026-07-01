@@ -670,9 +670,7 @@ async def list_providers_endpoint() -> List[Dict]:
     provider_binaries = {
         "kiro_cli": "kiro-cli",
         "claude_code": "claude",
-        "q_cli": "q",
         "codex": "codex",
-        "gemini_cli": "gemini",
         "hermes": "hermes",
         "kimi_cli": "kimi",
         "copilot_cli": "copilot",

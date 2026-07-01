@@ -35,10 +35,10 @@
            ├─────────┤               ├──────────┤
            │ • tmux  │               │ • kiro   │
            │ • db    │               │   _cli   │
-           └────┬────┘               │ • q_cli  │
-                │                    │ • claude │
-         ┌──────┴──────┐             │   _code  │
-         │             │             │ • codex  │
+           └────┬────┘               │ • claude │
+                │                    │   _code  │
+         ┌──────┴──────┐             │ • codex  │
+         │             │             │          │
     ┌────▼────┐  ┌─────▼─────┐      │          │
     │  Tmux   │  │  SQLite   │      │          │
     │ Sessions│  │  Database │      │          │
@@ -84,7 +84,6 @@ src/cli_agent_orchestrator/
 │   ├── base.py            # Abstract provider interface (mark_input_received hook)
 │   ├── manager.py         # Maps terminal_id → provider
 │   ├── kiro_cli.py        # Kiro CLI provider (kiro_cli) - default
-│   ├── q_cli.py           # Amazon Q CLI provider (q_cli)
 │   ├── claude_code.py     # Claude Code provider (claude_code, ❯ prompt, trust prompt handling)
 │   └── codex.py           # Codex/ChatGPT CLI provider (codex, developer_instructions, › prompt + • bullet detection, trust prompt handling)
 ├── models/                # Data models

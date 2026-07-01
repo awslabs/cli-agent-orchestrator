@@ -32,7 +32,7 @@ Each worker profile has a `provider` override. CAO automatically launches the wo
 | Profile | Provider |
 |---------|----------|
 | `data_analyst_claude_code` | Claude Code |
-| `data_analyst_gemini_cli` | Gemini CLI |
+| `data_analyst_kimi_cli` | Kimi CLI |
 | `data_analyst_kiro_cli` | Kiro CLI |
 
 ### Report Generator (use with handoff)
@@ -53,7 +53,7 @@ After you call assign(), workers will send results back via send_message(). Mess
 1. Get your terminal ID: `echo $CAO_TERMINAL_ID`
 
 2. For each dataset, call assign with a cross-provider worker:
-   - agent_profile: "data_analyst_claude_code" (or gemini_cli / kiro_cli variant)
+   - agent_profile: "data_analyst_claude_code" (or kimi_cli / kiro_cli variant)
    - message: "Analyze [dataset]. Send results to terminal [your_id] using send_message."
 
 3. Call handoff for the report template:
@@ -73,7 +73,7 @@ You do:
 ```
 1. my_id = $CAO_TERMINAL_ID
 2. assign(agent_profile="data_analyst_claude_code", message="Analyze Dataset A: [1, 2, 3, 4, 5]. Calculate mean, median, std dev. Send results to terminal {my_id} using send_message.")
-3. assign(agent_profile="data_analyst_gemini_cli", message="Analyze Dataset B: [10, 20, 30, 40, 50]. Calculate mean, median, std dev. Send results to terminal {my_id} using send_message.")
+3. assign(agent_profile="data_analyst_kimi_cli", message="Analyze Dataset B: [10, 20, 30, 40, 50]. Calculate mean, median, std dev. Send results to terminal {my_id} using send_message.")
 4. assign(agent_profile="data_analyst_kiro_cli", message="Analyze Dataset C: [2, 4, 6, 8, 10]. Calculate mean, median, std dev. Send results to terminal {my_id} using send_message.")
 5. handoff(agent_profile="report_generator_codex", message="Create report template with sections: Summary of 3 datasets, Statistical analysis results, Conclusions.")
 6. Finish turn — say "Dispatched 3 analysts and got report template. Waiting for analyst results."

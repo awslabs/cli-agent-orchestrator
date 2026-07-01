@@ -2,7 +2,7 @@
 
 This module defines the abstract base class that all CLI providers must implement.
 A "provider" is an adapter that enables CAO to interact with a specific CLI-based
-AI agent (e.g., Kiro CLI, Claude Code, Codex, Q CLI).
+AI agent (e.g., Kiro CLI, Claude Code, Codex).
 
 Provider Responsibilities:
 - Initialize the CLI tool in a tmux window (run startup commands)
@@ -14,7 +14,6 @@ Implemented Providers:
 - KiroCliProvider: For Kiro CLI (kiro-cli chat)
 - ClaudeCodeProvider: For Claude Code (claude)
 - CodexProvider: For Codex CLI (codex)
-- QCliProvider: For Amazon Q Developer CLI (q chat)
 
 Each provider must implement pattern matching for its specific CLI's prompt
 and output format to reliably detect status changes.
@@ -202,7 +201,7 @@ class BaseProvider(ABC):
     def extraction_retries(self) -> int:
         """Number of extraction retries for transient TUI rendering issues.
 
-        TUI-based providers (e.g. Gemini CLI's Ink renderer) may show
+        TUI-based providers (e.g. Antigravity CLI's renderer) may show
         notification spinners that temporarily obscure response text in
         the tmux capture buffer.  Override this to enable automatic retries
         with re-capture between attempts.  Default is 0 (no retries).

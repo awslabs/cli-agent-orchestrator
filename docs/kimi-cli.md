@@ -98,7 +98,7 @@ kimi --yolo --mcp-config '{"server-name": {"command": "npx", "args": ["-y", "cao
 
 Kimi CLI defaults to a 60-second MCP tool call timeout (`tool_call_timeout_ms=60000` in `~/.kimi/config.toml`). This is too short for `handoff` operations, which create a worker terminal, wait for completion, and extract output — routinely exceeding 60 seconds.
 
-The provider automatically modifies `~/.kimi/config.toml` to set `tool_call_timeout_ms=600000` when MCP servers are configured, increasing the timeout to 600 seconds (10 minutes) to match CAO's default handoff timeout. The original value is restored during `cleanup()`. This is the same direct-config-write pattern used by the Gemini CLI provider (`~/.gemini/settings.json`).
+The provider automatically modifies `~/.kimi/config.toml` to set `tool_call_timeout_ms=600000` when MCP servers are configured, increasing the timeout to 600 seconds (10 minutes) to match CAO's default handoff timeout. The original value is restored during `cleanup()`. This is the same direct-config-write pattern used by the Antigravity CLI provider (`~/.gemini/config/mcp_config.json`).
 
 **Why not `--config` flag?** Kimi CLI's `--config` flag causes it to bypass the default config file (`~/.kimi/config.toml`), which breaks OAuth authentication — the CLI shows "model: not set" and `/login` refuses to work. Modifying the config file directly avoids this issue.
 

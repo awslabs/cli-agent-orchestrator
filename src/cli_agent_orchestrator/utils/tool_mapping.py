@@ -48,21 +48,6 @@ TOOL_MAPPING: Dict[str, Dict[str, List[str]]] = {
         "fs_list": ["list", "grep"],
         "fs_*": ["read", "write", "list", "grep"],
     },
-    "gemini_cli": {
-        "execute_bash": ["run_shell_command"],
-        "fs_read": ["read_file", "list_directory", "search_file_content", "glob"],
-        "fs_write": ["write_file", "replace"],
-        "fs_list": ["list_directory", "glob", "search_file_content"],
-        "fs_*": [
-            "read_file",
-            "write_file",
-            "replace",
-            "list_directory",
-            "search_file_content",
-            "glob",
-        ],
-        "web_fetch": ["web_fetch", "google_web_search"],
-    },
     # Antigravity CLI (agy) shares Google's gemini-style tool vocabulary
     # (write_file/read_file/run_shell_command/...). Restrictions are enforced
     # softly via the injected security prompt (see SOFT_ENFORCEMENT_PROVIDERS).
@@ -158,7 +143,7 @@ def get_disallowed_tools(provider: str, allowed: List[str]) -> List[str]:
     """Given CAO allowedTools, return provider-native tool names to BLOCK.
 
     Args:
-        provider: Provider name (e.g., "claude_code", "copilot_cli", "gemini_cli")
+        provider: Provider name (e.g., "claude_code", "copilot_cli", "kiro_cli")
         allowed: List of CAO tool names that are ALLOWED
 
     Returns:

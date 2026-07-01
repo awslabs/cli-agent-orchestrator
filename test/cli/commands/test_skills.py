@@ -1,14 +1,11 @@
 """Tests for the skills CLI command group."""
 
-import json
 from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 
 from cli_agent_orchestrator.cli.commands.skills import skills
-from cli_agent_orchestrator.models.agent_profile import AgentProfile
-from cli_agent_orchestrator.utils.skill_injection import refresh_agent_json_prompt
 
 
 @pytest.fixture(autouse=True)
@@ -99,13 +96,12 @@ class TestSkillsAddCommand:
         assert (skill_store / "python-testing" / "examples.txt").read_text() == "example data"
 
     def test_add_refreshes_cao_managed_agent_prompt(self, runner, tmp_path, monkeypatch):
-        """Adding a skill should refresh CAO-managed installed agent JSONs."""
+        """Adding a skill should refresh CAO-managed installed Copilot agents."""
         skill_store = tmp_path / "skill-store"
         local_store = tmp_path / "agent-store"
         context_dir = tmp_path / "agent-context"
-        q_dir = tmp_path / "q"
         copilot_dir = tmp_path / "copilot"
-        for path in (skill_store, local_store, context_dir, q_dir):
+        for path in (skill_store, local_store, context_dir, copilot_dir):
             path.mkdir(parents=True, exist_ok=True)
 
         monkeypatch.setattr("cli_agent_orchestrator.cli.commands.skills.SKILLS_DIR", skill_store)
@@ -113,7 +109,6 @@ class TestSkillsAddCommand:
         monkeypatch.setattr(
             "cli_agent_orchestrator.utils.skill_injection.AGENT_CONTEXT_DIR", context_dir
         )
-        monkeypatch.setattr("cli_agent_orchestrator.utils.skill_injection.Q_AGENTS_DIR", q_dir)
         monkeypatch.setattr(
             "cli_agent_orchestrator.utils.skill_injection.COPILOT_AGENTS_DIR", copilot_dir
         )
@@ -131,18 +126,11 @@ class TestSkillsAddCommand:
             "---\nname: developer\ndescription: Developer\nprompt: Base prompt\n---\nBody\n",
             encoding="utf-8",
         )
-        context_file = context_dir / "developer.md"
-        context_file.write_text("context", encoding="utf-8")
-        agent_json = q_dir / "developer.json"
-        agent_json.write_text(
-            json.dumps(
-                {
-                    "name": "developer",
-                    "description": "Developer",
-                    "resources": [f"file://{context_file}"],
-                },
-                indent=2,
-            ),
+        # A matching context file marks this Copilot agent as CAO-managed.
+        (context_dir / "developer.md").write_text("context", encoding="utf-8")
+        agent_md = copilot_dir / "developer.agent.md"
+        agent_md.write_text(
+            "---\nname: developer\ndescription: Developer\n---\nBase prompt\n",
             encoding="utf-8",
         )
 
@@ -152,8 +140,7 @@ class TestSkillsAddCommand:
         result = runner.invoke(skills, ["add", str(source_dir)])
 
         assert result.exit_code == 0
-        refreshed_json = json.loads(agent_json.read_text())
-        assert "python-testing" in refreshed_json["prompt"]
+        assert "python-testing" in agent_md.read_text()
         assert "Refreshed 1 installed agent(s)" in result.output
 
     def test_add_rejects_duplicate_without_force(self, runner, tmp_path, monkeypatch):
@@ -226,9 +213,6 @@ class TestSkillsAddCommand:
         monkeypatch.setattr("cli_agent_orchestrator.cli.commands.skills.SKILLS_DIR", skill_store)
         monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", skill_store)
         monkeypatch.setattr(
-            "cli_agent_orchestrator.utils.skill_injection.Q_AGENTS_DIR", tmp_path / "q"
-        )
-        monkeypatch.setattr(
             "cli_agent_orchestrator.utils.skill_injection.COPILOT_AGENTS_DIR", tmp_path / "copilot"
         )
 
@@ -259,34 +243,30 @@ class TestSkillsAddCommand:
         assert (skill_store / "python-testing" / "SKILL.md").exists()
         assert "Warning: failed to refresh installed agent prompts: refresh boom" in result.output
 
-    def test_add_leaves_non_cao_managed_json_unchanged(self, runner, tmp_path, monkeypatch):
-        """Non-CAO-managed installed JSONs should be untouched by skill add."""
+    def test_add_leaves_non_cao_managed_agent_unchanged(self, runner, tmp_path, monkeypatch):
+        """Non-CAO-managed installed Copilot agents should be untouched by skill add."""
         skill_store = tmp_path / "skill-store"
-        q_dir = tmp_path / "q"
-        for path in (skill_store, q_dir):
+        copilot_dir = tmp_path / "copilot"
+        context_dir = tmp_path / "context"
+        for path in (skill_store, copilot_dir, context_dir):
             path.mkdir(parents=True, exist_ok=True)
 
         monkeypatch.setattr("cli_agent_orchestrator.cli.commands.skills.SKILLS_DIR", skill_store)
         monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", skill_store)
-        monkeypatch.setattr("cli_agent_orchestrator.utils.skill_injection.Q_AGENTS_DIR", q_dir)
         monkeypatch.setattr(
-            "cli_agent_orchestrator.utils.skill_injection.AGENT_CONTEXT_DIR", tmp_path / "context"
+            "cli_agent_orchestrator.utils.skill_injection.COPILOT_AGENTS_DIR", copilot_dir
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.skill_injection.AGENT_CONTEXT_DIR", context_dir
         )
 
-        unmanaged_json = q_dir / "developer.json"
-        unmanaged_json.write_text(
-            json.dumps(
-                {
-                    "name": "developer",
-                    "description": "Developer",
-                    "resources": ["file:///tmp/not-cao.md"],
-                    "prompt": "Manual prompt",
-                },
-                indent=2,
-            ),
+        # No matching context file => not CAO-managed => must be left alone.
+        unmanaged_md = copilot_dir / "developer.agent.md"
+        unmanaged_md.write_text(
+            "---\nname: developer\ndescription: Developer\n---\nManual prompt\n",
             encoding="utf-8",
         )
-        before = unmanaged_json.read_bytes()
+        before = unmanaged_md.read_bytes()
 
         source_dir = tmp_path / "python-testing"
         _create_skill(source_dir, "python-testing", "Pytest conventions")
@@ -294,7 +274,7 @@ class TestSkillsAddCommand:
         result = runner.invoke(skills, ["add", str(source_dir)])
 
         assert result.exit_code == 0
-        assert unmanaged_json.read_bytes() == before
+        assert unmanaged_md.read_bytes() == before
 
 
 class TestSkillsRemoveCommand:
@@ -340,13 +320,12 @@ class TestSkillsRemoveCommand:
         assert "does not exist" in result.output
 
     def test_remove_refreshes_cao_managed_agent_prompt(self, runner, tmp_path, monkeypatch):
-        """Removing a skill should refresh CAO-managed installed agent JSONs."""
+        """Removing a skill should refresh CAO-managed installed Copilot agents."""
         skill_store = tmp_path / "skill-store"
         local_store = tmp_path / "agent-store"
         context_dir = tmp_path / "agent-context"
-        q_dir = tmp_path / "q"
         copilot_dir = tmp_path / "copilot"
-        for path in (skill_store, local_store, context_dir, q_dir):
+        for path in (skill_store, local_store, context_dir, copilot_dir):
             path.mkdir(parents=True, exist_ok=True)
 
         monkeypatch.setattr("cli_agent_orchestrator.cli.commands.skills.SKILLS_DIR", skill_store)
@@ -354,7 +333,6 @@ class TestSkillsRemoveCommand:
         monkeypatch.setattr(
             "cli_agent_orchestrator.utils.skill_injection.AGENT_CONTEXT_DIR", context_dir
         )
-        monkeypatch.setattr("cli_agent_orchestrator.utils.skill_injection.Q_AGENTS_DIR", q_dir)
         monkeypatch.setattr(
             "cli_agent_orchestrator.utils.skill_injection.COPILOT_AGENTS_DIR", copilot_dir
         )
@@ -373,66 +351,54 @@ class TestSkillsRemoveCommand:
             encoding="utf-8",
         )
         _create_skill(skill_store / "python-testing", "python-testing", "Pytest conventions")
-        context_file = context_dir / "developer.md"
-        context_file.write_text("context", encoding="utf-8")
-        agent_json = q_dir / "developer.json"
-        agent_json.write_text(
-            json.dumps(
-                {
-                    "name": "developer",
-                    "description": "Developer",
-                    "resources": [f"file://{context_file}"],
-                },
-                indent=2,
-            ),
+        (context_dir / "developer.md").write_text("context", encoding="utf-8")
+        # Installed agent body still carries the about-to-be-removed skill in its
+        # baked catalog; the refresh should drop it. The composed body uses the
+        # profile's effective prompt (system_prompt/body "Body" here).
+        agent_md = copilot_dir / "developer.agent.md"
+        agent_md.write_text(
+            "---\nname: developer\ndescription: Developer\n---\n"
+            "Body\n\n## Available Skills\n\n- python-testing: Pytest conventions\n",
             encoding="utf-8",
-        )
-        refresh_agent_json_prompt(
-            agent_json,
-            AgentProfile(name="developer", description="Developer", prompt="Base prompt"),
         )
 
         result = runner.invoke(skills, ["remove", "python-testing"])
 
         assert result.exit_code == 0
-        refreshed_json = json.loads(agent_json.read_text())
-        assert refreshed_json["prompt"] == "Base prompt"
+        assert "python-testing" not in agent_md.read_text()
+        assert "Body" in agent_md.read_text()
         assert "Refreshed 1 installed agent(s)" in result.output
 
-    def test_remove_leaves_non_cao_managed_json_unchanged(self, runner, tmp_path, monkeypatch):
-        """Non-CAO-managed installed JSONs should be untouched by skill remove."""
+    def test_remove_leaves_non_cao_managed_agent_unchanged(self, runner, tmp_path, monkeypatch):
+        """Non-CAO-managed installed Copilot agents should be untouched by skill remove."""
         skill_store = tmp_path / "skill-store"
-        q_dir = tmp_path / "q"
-        for path in (skill_store, q_dir):
+        copilot_dir = tmp_path / "copilot"
+        context_dir = tmp_path / "context"
+        for path in (skill_store, copilot_dir, context_dir):
             path.mkdir(parents=True, exist_ok=True)
 
         monkeypatch.setattr("cli_agent_orchestrator.cli.commands.skills.SKILLS_DIR", skill_store)
         monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", skill_store)
-        monkeypatch.setattr("cli_agent_orchestrator.utils.skill_injection.Q_AGENTS_DIR", q_dir)
         monkeypatch.setattr(
-            "cli_agent_orchestrator.utils.skill_injection.AGENT_CONTEXT_DIR", tmp_path / "context"
+            "cli_agent_orchestrator.utils.skill_injection.COPILOT_AGENTS_DIR", copilot_dir
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.skill_injection.AGENT_CONTEXT_DIR", context_dir
         )
 
         _create_skill(skill_store / "python-testing", "python-testing", "Pytest conventions")
-        unmanaged_json = q_dir / "developer.json"
-        unmanaged_json.write_text(
-            json.dumps(
-                {
-                    "name": "developer",
-                    "description": "Developer",
-                    "resources": ["file:///tmp/not-cao.md"],
-                    "prompt": "Manual prompt",
-                },
-                indent=2,
-            ),
+        # No matching context file => not CAO-managed => must be left alone.
+        unmanaged_md = copilot_dir / "developer.agent.md"
+        unmanaged_md.write_text(
+            "---\nname: developer\ndescription: Developer\n---\nManual prompt\n",
             encoding="utf-8",
         )
-        before = unmanaged_json.read_bytes()
+        before = unmanaged_md.read_bytes()
 
         result = runner.invoke(skills, ["remove", "python-testing"])
 
         assert result.exit_code == 0
-        assert unmanaged_json.read_bytes() == before
+        assert unmanaged_md.read_bytes() == before
 
 
 class TestSkillsListCommand:

@@ -128,12 +128,12 @@ Skills are delivered to agents differently depending on the provider. The table 
 |----------|-----------------|---------------------|-----------------|
 | Claude Code | Runtime prompt | Every terminal creation | `load_skill` MCP tool |
 | Codex | Runtime prompt | Every terminal creation | `load_skill` MCP tool |
-| Gemini CLI | Runtime prompt | Every terminal creation | `load_skill` MCP tool |
+| Antigravity CLI | Runtime prompt | Every terminal creation | `load_skill` MCP tool |
 | Kimi CLI | Runtime prompt | Every terminal creation | `load_skill` MCP tool |
 | Kiro CLI | Native `skill://` resources | Every terminal creation | Kiro progressive loading |
 | Copilot CLI | Baked into `.agent.md` at install | On `cao skills add/remove` | `load_skill` MCP tool |
 
-### Runtime Prompt Providers (Claude Code, Codex, Gemini CLI, Kimi CLI)
+### Runtime Prompt Providers (Claude Code, Codex, Antigravity CLI, Kimi CLI)
 
 For these providers, the skill catalog is built fresh each time a terminal is created. The catalog — a list of skill names and descriptions — is appended to the system prompt via the provider's native CLI flags.
 
