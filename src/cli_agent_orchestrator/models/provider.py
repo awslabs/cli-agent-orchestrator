@@ -13,3 +13,4 @@ class ProviderType(str, Enum):
     HERMES = "hermes"
     CURSOR_CLI = "cursor_cli"
     ANTIGRAVITY_CLI = "antigravity_cli"
+    DEVIN_CLI = "devin_cli"

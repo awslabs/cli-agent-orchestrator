@@ -106,6 +106,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
+          cache: "npm"
+          cache-dependency-path: cao_mcp_apps/package-lock.json
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4
@@ -181,6 +183,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
+          cache: "npm"
+          cache-dependency-path: cao_mcp_apps/package-lock.json
 
       - name: Install MCP-apps deps
         run: npm install

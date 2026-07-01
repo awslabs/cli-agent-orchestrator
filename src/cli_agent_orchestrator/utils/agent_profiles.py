@@ -126,6 +126,7 @@ def list_agent_profiles() -> List[Dict]:
         "kiro_cli": "kiro",
         "claude_code": "claude_code",
         "codex": "codex",
+        "devin_cli": "devin",
         "cao_installed": "installed",
     }
     for provider, dir_path in agent_dirs.items():

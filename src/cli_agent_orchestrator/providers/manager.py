@@ -11,6 +11,7 @@ from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
 from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
 from cli_agent_orchestrator.providers.cursor_cli import CursorCliProvider
+from cli_agent_orchestrator.providers.devin_cli import DevinCliProvider
 from cli_agent_orchestrator.providers.hermes import HermesProvider
 from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
@@ -25,6 +26,220 @@ class ProviderManager:
     def __init__(self) -> None:
         self._providers: Dict[str, BaseProvider] = {}
 
+    def _get_provider_factory(self, provider_type: str):
+        """Get provider factory function for given type."""
+        factories = {
+            ProviderType.KIRO_CLI.value: self._create_kiro_cli_provider,
+            ProviderType.CLAUDE_CODE.value: self._create_claude_code_provider,
+            ProviderType.CODEX.value: self._create_codex_provider,
+            ProviderType.COPILOT_CLI.value: self._create_copilot_cli_provider,
+            ProviderType.KIMI_CLI.value: self._create_kimi_cli_provider,
+            ProviderType.OPENCODE_CLI.value: self._create_opencode_cli_provider,
+            ProviderType.HERMES.value: self._create_hermes_provider,
+            ProviderType.CURSOR_CLI.value: self._create_cursor_cli_provider,
+            ProviderType.ANTIGRAVITY_CLI.value: self._create_antigravity_cli_provider,
+            ProviderType.DEVIN_CLI.value: self._create_devin_cli_provider,
+        }
+
+        if provider_type not in factories:
+            raise ValueError(f"Unknown provider type: {provider_type}")
+
+        return factories[provider_type]
+
+    def _create_kiro_cli_provider(
+        self,
+        terminal_id: str,
+        tmux_session: str,
+        tmux_window: str,
+        agent_profile: Optional[str],
+        allowed_tools: Optional[List[str]],
+        **kwargs,
+    ) -> KiroCliProvider:
+        if not agent_profile:
+            raise ValueError("Kiro CLI provider requires agent_profile parameter")
+        return KiroCliProvider(
+            terminal_id,
+            tmux_session,
+            tmux_window,
+            agent_profile,
+            allowed_tools,
+        )
+
+    def _create_claude_code_provider(
+        self,
+        terminal_id: str,
+        tmux_session: str,
+        tmux_window: str,
+        agent_profile: Optional[str],
+        allowed_tools: Optional[List[str]],
+        skill_prompt: Optional[str],
+        **kwargs,
+    ) -> ClaudeCodeProvider:
+        return ClaudeCodeProvider(
+            terminal_id,
+            tmux_session,
+            tmux_window,
+            agent_profile,
+            allowed_tools,
+            skill_prompt=skill_prompt,
+        )
+
+    def _create_codex_provider(
+        self,
+        terminal_id: str,
+        tmux_session: str,
+        tmux_window: str,
+        agent_profile: Optional[str],
+        allowed_tools: Optional[List[str]],
+        skill_prompt: Optional[str],
+        **kwargs,
+    ) -> CodexProvider:
+        return CodexProvider(
+            terminal_id,
+            tmux_session,
+            tmux_window,
+            agent_profile,
+            allowed_tools,
+            skill_prompt=skill_prompt,
+        )
+
+    def _create_copilot_cli_provider(
+        self,
+        terminal_id: str,
+        tmux_session: str,
+        tmux_window: str,
+        agent_profile: Optional[str],
+        allowed_tools: Optional[List[str]],
+        model: Optional[str],
+        **kwargs,
+    ) -> CopilotCliProvider:
+        return CopilotCliProvider(
+            terminal_id,
+            tmux_session,
+            tmux_window,
+            agent_profile,
+            allowed_tools,
+            model=model,
+        )
+
+    def _create_kimi_cli_provider(
+        self,
+        terminal_id: str,
+        tmux_session: str,
+        tmux_window: str,
+        agent_profile: Optional[str],
+        allowed_tools: Optional[List[str]],
+        skill_prompt: Optional[str],
+        **kwargs,
+    ) -> KimiCliProvider:
+        return KimiCliProvider(
+            terminal_id,
+            tmux_session,
+            tmux_window,
+            agent_profile,
+            allowed_tools,
+            skill_prompt=skill_prompt,
+        )
+
+    def _create_opencode_cli_provider(
+        self,
+        terminal_id: str,
+        tmux_session: str,
+        tmux_window: str,
+        agent_profile: Optional[str],
+        allowed_tools: Optional[List[str]],
+        model: Optional[str],
+        **kwargs,
+    ) -> OpenCodeCliProvider:
+        return OpenCodeCliProvider(
+            terminal_id,
+            tmux_session,
+            tmux_window,
+            agent_profile,
+            allowed_tools,
+            model=model,
+        )
+
+    def _create_hermes_provider(
+        self,
+        terminal_id: str,
+        tmux_session: str,
+        tmux_window: str,
+        agent_profile: Optional[str],
+        allowed_tools: Optional[List[str]],
+        skill_prompt: Optional[str],
+        **kwargs,
+    ) -> HermesProvider:
+        return HermesProvider(
+            terminal_id,
+            tmux_session,
+            tmux_window,
+            agent_profile,
+            allowed_tools,
+            skill_prompt=skill_prompt,
+        )
+
+    def _create_cursor_cli_provider(
+        self,
+        terminal_id: str,
+        tmux_session: str,
+        tmux_window: str,
+        agent_profile: Optional[str],
+        allowed_tools: Optional[List[str]],
+        model: Optional[str],
+        skill_prompt: Optional[str],
+        **kwargs,
+    ) -> CursorCliProvider:
+        return CursorCliProvider(
+            terminal_id,
+            tmux_session,
+            tmux_window,
+            agent_profile,
+            allowed_tools,
+            model=model,
+            skill_prompt=skill_prompt,
+        )
+
+    def _create_antigravity_cli_provider(
+        self,
+        terminal_id: str,
+        tmux_session: str,
+        tmux_window: str,
+        agent_profile: Optional[str],
+        allowed_tools: Optional[List[str]],
+        model: Optional[str],
+        skill_prompt: Optional[str],
+        **kwargs,
+    ) -> AntigravityCliProvider:
+        return AntigravityCliProvider(
+            terminal_id,
+            tmux_session,
+            tmux_window,
+            agent_profile,
+            allowed_tools,
+            model=model,
+            skill_prompt=skill_prompt,
+        )
+
+    def _create_devin_cli_provider(
+        self,
+        terminal_id: str,
+        tmux_session: str,
+        tmux_window: str,
+        agent_profile: Optional[str],
+        allowed_tools: Optional[List[str]],
+        skill_prompt: Optional[str],
+        **kwargs,
+    ) -> DevinCliProvider:
+        return DevinCliProvider(
+            terminal_id,
+            tmux_session,
+            tmux_window,
+            agent_profile,
+            allowed_tools,
+            skill_prompt=skill_prompt,
+        )
+
     def create_provider(
         self,
         provider_type: str,
@@ -38,93 +253,16 @@ class ProviderManager:
     ) -> BaseProvider:
         """Create and store provider instance."""
         try:
-            provider: BaseProvider
-            if provider_type == ProviderType.KIRO_CLI.value:
-                if not agent_profile:
-                    raise ValueError("Kiro CLI provider requires agent_profile parameter")
-                provider = KiroCliProvider(
-                    terminal_id,
-                    tmux_session,
-                    tmux_window,
-                    agent_profile,
-                    allowed_tools,
-                )
-            elif provider_type == ProviderType.CLAUDE_CODE.value:
-                provider = ClaudeCodeProvider(
-                    terminal_id,
-                    tmux_session,
-                    tmux_window,
-                    agent_profile,
-                    allowed_tools,
-                    skill_prompt=skill_prompt,
-                )
-            elif provider_type == ProviderType.CODEX.value:
-                provider = CodexProvider(
-                    terminal_id,
-                    tmux_session,
-                    tmux_window,
-                    agent_profile,
-                    allowed_tools,
-                    skill_prompt=skill_prompt,
-                )
-            elif provider_type == ProviderType.COPILOT_CLI.value:
-                provider = CopilotCliProvider(
-                    terminal_id,
-                    tmux_session,
-                    tmux_window,
-                    agent_profile,
-                    allowed_tools,
-                    model=model,
-                )
-            elif provider_type == ProviderType.KIMI_CLI.value:
-                provider = KimiCliProvider(
-                    terminal_id,
-                    tmux_session,
-                    tmux_window,
-                    agent_profile,
-                    allowed_tools,
-                    skill_prompt=skill_prompt,
-                )
-            elif provider_type == ProviderType.OPENCODE_CLI.value:
-                provider = OpenCodeCliProvider(
-                    terminal_id,
-                    tmux_session,
-                    tmux_window,
-                    agent_profile,
-                    allowed_tools,
-                    model=model,
-                )
-            elif provider_type == ProviderType.HERMES.value:
-                provider = HermesProvider(
-                    terminal_id,
-                    tmux_session,
-                    tmux_window,
-                    agent_profile,
-                    allowed_tools,
-                    skill_prompt=skill_prompt,
-                )
-            elif provider_type == ProviderType.CURSOR_CLI.value:
-                provider = CursorCliProvider(
-                    terminal_id,
-                    tmux_session,
-                    tmux_window,
-                    agent_profile,
-                    allowed_tools,
-                    model=model,
-                    skill_prompt=skill_prompt,
-                )
-            elif provider_type == ProviderType.ANTIGRAVITY_CLI.value:
-                provider = AntigravityCliProvider(
-                    terminal_id,
-                    tmux_session,
-                    tmux_window,
-                    agent_profile,
-                    allowed_tools,
-                    model=model,
-                    skill_prompt=skill_prompt,
-                )
-            else:
-                raise ValueError(f"Unknown provider type: {provider_type}")
+            factory = self._get_provider_factory(provider_type)
+            provider = factory(
+                terminal_id=terminal_id,
+                tmux_session=tmux_session,
+                tmux_window=tmux_window,
+                agent_profile=agent_profile,
+                allowed_tools=allowed_tools,
+                skill_prompt=skill_prompt,
+                model=model,
+            )
 
             # Store in direct mapping
             self._providers[terminal_id] = provider

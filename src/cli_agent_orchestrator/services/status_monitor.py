@@ -20,6 +20,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
+from cli_agent_orchestrator.utils.terminal import _resolve_window
 
 logger = logging.getLogger(__name__)
 
@@ -427,6 +428,77 @@ class StatusMonitor:
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 
+    def _get_event_inbox_status(self, terminal_id: str) -> Optional[TerminalStatus]:
+        """Get status for event-inbox backends (herdr) by calling provider.get_status()."""
+        try:
+            provider = provider_manager.get_provider(terminal_id)
+        except Exception:
+            provider = None
+
+        if provider is not None:
+            with self._lock:
+                buffer = self._buffers.get(terminal_id, "")
+            try:
+                # The native (herdr) path ignores the buffer arg; pass the
+                # rolling buffer (empty for herdr) so the rare
+                # get_native_status()==None fallback still gets what we have.
+                # provider.get_status may shell out to the herdr CLI — call
+                # it outside the lock.
+                return provider.get_status(buffer)
+            except Exception as e:
+                logger.error(f"Error deriving native status for {terminal_id}: {e}")
+                return TerminalStatus.UNKNOWN
+        return None
+
+    def _get_buffer_for_processing_check(self, terminal_id: str, cached: TerminalStatus) -> str:
+        """Get buffer for fresh detection when cached status is PROCESSING."""
+        return self._buffers.get(terminal_id, "")
+
+    def _refresh_processing_status(
+        self, terminal_id: str, cached: TerminalStatus, buffer: str
+    ) -> Optional[TerminalStatus]:
+        """Refresh PROCESSING status with fresh detection from current buffer."""
+        if cached == TerminalStatus.PROCESSING and buffer:
+            fresh = self._detect_status(terminal_id, buffer)
+            logger.debug(
+                f"get_status [{terminal_id}]: cached=PROCESSING, "
+                f"fresh={fresh.value}, buffer_len={len(buffer)}"
+            )
+            if fresh != TerminalStatus.PROCESSING and fresh != TerminalStatus.UNKNOWN:
+                self._apply_detection(terminal_id, fresh)
+                return fresh
+        return None
+
+    def _get_fallback_from_history(self, terminal_id: str) -> Optional[TerminalStatus]:
+        """Fallback for tmux backends when FIFO buffer is empty (WSL limitation)."""
+        from cli_agent_orchestrator.backends.registry import get_backend
+
+        try:
+            provider = provider_manager.get_provider(terminal_id)
+        except Exception:
+            provider = None
+
+        if provider is not None:
+            window = _resolve_window(terminal_id)
+            if window:
+                session_name, window_name = window
+                try:
+                    history = get_backend().get_history(
+                        session_name, window_name, strip_escapes=True
+                    )
+                    if history:
+                        fresh = provider.get_status(history)
+                        logger.debug(
+                            f"get_status [{terminal_id}]: fallback from history, "
+                            f"status={fresh.value}, history_len={len(history)}"
+                        )
+                        # Update the cached status so subsequent calls don't re-read history
+                        self._apply_detection(terminal_id, fresh)
+                        return fresh
+                except Exception as e:
+                    logger.debug(f"get_status [{terminal_id}]: history fallback failed: {e}")
+        return None
+
     def get_status(self, terminal_id: str) -> TerminalStatus:
         """Get current terminal status — the single source of truth for both backends.
 
@@ -437,50 +509,36 @@ class StatusMonitor:
         provider, whose get_status() consults backend.get_native_status(). Doing
         it here means every caller (API status, init waits, busy checks, curator
         liveness) works on herdr without each having to special-case the backend.
+
+        For tmux backends, if the FIFO buffer is empty (e.g., due to WSL FIFO
+        limitations), fall back to reading pane history directly and running
+        provider detection on it. This provides WSL compatibility without
+        affecting the normal FIFO-based path.
         """
         from cli_agent_orchestrator.backends.registry import get_backend
 
+        # Event-inbox backends (herdr) derive status from provider.get_status()
         if get_backend().supports_event_inbox():
-            try:
-                provider = provider_manager.get_provider(terminal_id)
-            except Exception:
-                provider = None
-            if provider is not None:
-                with self._lock:
-                    buffer = self._buffers.get(terminal_id, "")
-                try:
-                    # The native (herdr) path ignores the buffer arg; pass the
-                    # rolling buffer (empty for herdr) so the rare
-                    # get_native_status()==None fallback still gets what we have.
-                    # provider.get_status may shell out to the herdr CLI — call
-                    # it outside the lock.
-                    return provider.get_status(buffer)
-                except Exception as e:
-                    logger.error(f"Error deriving native status for {terminal_id}: {e}")
-                    return TerminalStatus.UNKNOWN
+            status = self._get_event_inbox_status(terminal_id)
+            if status is not None:
+                return status
 
+        # Get cached status and buffer for pipe-pane backends
         with self._lock:
             cached = self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
-            # When cached status is PROCESSING, the debounced detection may be
-            # stuck: TUI providers (kiro-cli) can send escape sequences
-            # continuously after becoming idle, preventing the 200ms quiescence
-            # timer from ever firing. Do a fresh detection from the current
-            # buffer so poll-based callers (wait_until_status) catch the
-            # PROCESSING→ready transition without waiting for stream silence.
-            if cached == TerminalStatus.PROCESSING:
-                buffer = self._buffers.get(terminal_id, "")
-            else:
-                buffer = ""
+            buffer = self._get_buffer_for_processing_check(terminal_id, cached)
 
-        if cached == TerminalStatus.PROCESSING and buffer:
-            fresh = self._detect_status(terminal_id, buffer)
-            logger.debug(
-                f"get_status [{terminal_id}]: cached=PROCESSING, "
-                f"fresh={fresh.value}, buffer_len={len(buffer)}"
-            )
-            if fresh != TerminalStatus.PROCESSING and fresh != TerminalStatus.UNKNOWN:
-                self._apply_detection(terminal_id, fresh)
-                return fresh
+        # Refresh PROCESSING status with fresh detection
+        fresh = self._refresh_processing_status(terminal_id, cached, buffer)
+        if fresh is not None:
+            return fresh
+
+        # Fallback for tmux backends when FIFO buffer is empty (e.g., WSL limitation)
+        if not get_backend().supports_event_inbox() and not buffer:
+            fallback_status = self._get_fallback_from_history(terminal_id)
+            if fallback_status is not None:
+                return fallback_status
+
         return cached
 
     def get_buffer(self, terminal_id: str) -> str:

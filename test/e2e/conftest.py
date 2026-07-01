@@ -131,6 +131,13 @@ def require_cursor():
     pytest.skip("Cursor CLI (agent / cursor-agent) not installed")
 
 
+@pytest.fixture()
+def require_devin():
+    """Skip test if devin CLI is not available."""
+    if not _cli_available("devin"):
+        pytest.skip("devin CLI not installed")
+
+
 def create_terminal(
     provider: str,
     agent_profile: str,

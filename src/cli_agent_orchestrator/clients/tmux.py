@@ -2,6 +2,7 @@
 
 import logging
 import os
+import shlex
 import subprocess
 import time
 import uuid
@@ -296,6 +297,7 @@ class TmuxClient:
         enter_count: int = 1,
         force_bracketed_paste: bool = False,
         submit_delay: float = 0.3,
+        use_paste_buffer: bool = True,
     ) -> None:
         """Send keys to window using tmux paste-buffer for instant delivery.
 
@@ -317,13 +319,37 @@ class TmuxClient:
                 Do NOT use for shell commands sent to bash during initialization
                 (bash 4.x does not support bracketed paste and will inject the
                 escape sequences literally into the command line).
+            submit_delay: Seconds to wait after pasting before sending Enter.
+                Some TUIs need time to process bracketed-paste end sequences.
+            use_paste_buffer: If False, use send-keys instead of paste-buffer.
+                Some CLIs (e.g., Devin CLI) don't support paste-buffer for user input.
         """
+        # If paste-buffer is disabled, use send-keys instead (for user input)
+        if not use_paste_buffer:
+            logger.info(
+                f"send_keys (via send-keys): {session_name}:{window_name} - keys: {keys[:100]}..."
+            )
+            # Validate session and window names to prevent command injection
+            validated_session = validate_tmux_name(session_name, "session_name")
+            validated_window = validate_tmux_name(window_name, "window_name")
+            target = f"{validated_session}:{validated_window}"
+            # Send the text literally once, then emit C-m separately for each Enter
+            subprocess.run(
+                ["tmux", "send-keys", "-l", "-t", target, keys],
+                check=True,
+            )
+            for i in range(enter_count):
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", target, "C-m"],
+                    check=True,
+                )
+                if i < enter_count - 1:
+                    time.sleep(0.1)
+            return
+
         # Defence-in-depth: re-validate at the sink even though callers
-        # validate at the API/MCP boundary. Both halves flow into a
-        # tmux subprocess argument (-t target), and tmux itself parses
-        # ':' / '.' as target delimiters, so any leak past upstream
-        # validation could pivot to a different pane. Validating here
-        # also clears the CodeQL py/command-line-injection data flow.
+        # should have validated. Prevents malformed UTF-8 or embedded
+        # control characters from corrupting tmux state.
         validated_session = validate_tmux_name(session_name, "session_name")
         validated_window = validate_tmux_name(window_name, "window_name")
         target = f"{validated_session}:{validated_window}"
@@ -639,7 +665,9 @@ class TmuxClient:
 
             pane = window.active_pane
             if pane:
-                pane.cmd("pipe-pane", "-o", f"cat >> {file_path}")
+                # Use shlex.quote to prevent command injection in file_path
+                safe_path = shlex.quote(file_path)
+                pane.cmd("pipe-pane", "-o", f"cat >> {safe_path}")
                 logger.info(f"Started pipe-pane for {session_name}:{window_name} to {file_path}")
         except Exception as e:
             logger.error(f"Failed to start pipe-pane for {session_name}:{window_name}: {e}")

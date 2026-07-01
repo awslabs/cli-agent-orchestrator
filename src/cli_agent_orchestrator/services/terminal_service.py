@@ -68,6 +68,13 @@ _memory_injected_terminals: set = set()
 _memory_injected_lock = threading.Lock()
 
 
+def _get_use_paste_buffer(provider) -> bool:
+    """Determine if paste buffer should be used for the provider."""
+    if provider is None:
+        return True
+    return provider.use_paste_buffer
+
+
 class TerminalInputBlockedError(Exception):
     """Raised when orchestrated input would answer an active interactive prompt."""
 
@@ -501,6 +508,7 @@ def send_input(
             enter_count=enter_count,
             force_bracketed_paste=True,
             submit_delay=provider.paste_submit_delay if provider else 0.3,
+            use_paste_buffer=_get_use_paste_buffer(provider),
         )
 
         # Notify the provider that external input was received.

@@ -10,7 +10,7 @@ import { TerminalMeta } from '../api'
 import { StatusBadge } from './StatusBadge'
 import { OutputViewer } from './OutputViewer'
 
-export const FALLBACK_PROVIDERS = ['kiro_cli', 'claude_code', 'q_cli', 'codex', 'gemini_cli', 'hermes', 'kimi_cli', 'copilot_cli', 'opencode_cli', 'cursor_cli']
+export const FALLBACK_PROVIDERS = ['kiro_cli', 'claude_code', 'q_cli', 'codex', 'hermes', 'kimi_cli', 'copilot_cli', 'opencode_cli', 'cursor_cli', 'antigravity_cli', 'devin_cli']
 
 const SOURCE_LABELS: Record<string, string> = {
   'built-in': 'Built-in',
@@ -18,6 +18,7 @@ const SOURCE_LABELS: Record<string, string> = {
   'kiro': 'Kiro',
   'q_cli': 'Q CLI',
   'opencode_cli': 'OpenCode',
+  'devin': 'Devin',
 }
 
 export function AgentPanel() {

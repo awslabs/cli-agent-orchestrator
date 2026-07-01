@@ -8,7 +8,9 @@ Codex, Kimi CLI, Q CLI) through tmux sessions, providing a unified interface
 for agent management.
 """
 
+import getpass
 import os
+import tempfile
 from pathlib import Path
 
 from cli_agent_orchestrator.models.provider import ProviderType
@@ -63,8 +65,18 @@ TERMINAL_LOG_DIR = LOG_DIR / "terminal"  # Per-terminal log files for pipe-pane 
 TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # FIFO directory for event-driven terminal output streaming
-FIFO_DIR = CAO_HOME_DIR / "fifos"  # Named pipes for tmux pipe-pane streaming
-FIFO_DIR.mkdir(parents=True, exist_ok=True)
+# Try system temp directory first, fall back to CAO_HOME_DIR for restricted environments
+# (containers, read-only filesystems, etc.)
+# Security: use mode=0o700 for owner-only access
+try:
+    TEMP_BASE = Path(tempfile.gettempdir())
+    FIFO_DIR = TEMP_BASE / "cli-agent-orchestrator" / "fifos"
+    FIFO_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
+except (OSError, PermissionError):
+    # Fallback to CAO_HOME_DIR if temp directory is not accessible
+    # (e.g., restricted containers, read-only filesystems)
+    FIFO_DIR = CAO_HOME_DIR / "fifos"
+    FIFO_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
 
 # =============================================================================
 # Event-Driven State Detection Configuration
