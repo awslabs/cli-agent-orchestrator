@@ -514,5 +514,7 @@ class TestBuildSkillCatalogFilter:
 
         assert "**ads-db**" in catalog  # the matching pattern still resolves
         messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-        assert any("missing-skill" in m for m in messages)
+        # The unmatched pattern is rendered with repr() so a hostile / newline-y
+        # name cannot garble the log line.
+        assert any("'missing-skill'" in m for m in messages)
         assert not any("ads-*" in m for m in messages)

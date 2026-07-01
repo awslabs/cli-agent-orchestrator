@@ -116,7 +116,9 @@ By default, every installed skill is available to every CAO agent. When an agent
 
 ### Scoping the catalog per agent (`skills`)
 
-To advertise only a subset of skills to a given agent, set the `skills` field in its profile frontmatter — a list of skill-name patterns, each an exact name or a case-sensitive [`fnmatch`](https://docs.python.org/3/library/fnmatch.html) glob. Only matching skills appear in that agent's catalog; the rest stay hidden (an agent cannot `load_skill` what it cannot see). A pattern that matches no installed skill is logged as a warning, to catch typos and stale names.
+To advertise only a subset of skills to a given agent, set the `skills` field in its profile frontmatter — a list of skill-name patterns, each an exact name or a case-sensitive [`fnmatch`](https://docs.python.org/3/library/fnmatch.html) glob. Only matching skills appear in that agent's catalog; the rest are simply not advertised to it. A pattern that matches no installed skill is logged as a warning, to catch typos and stale names.
+
+This scopes the injected **catalog** only — it controls what an agent *sees* advertised, not what it can *load*. Skill resolution is unchanged: `load_skill` still resolves any installed skill by name, so this is a prompt-relevance / noise-reduction control, not an access boundary. (If you need a hard per-agent allowlist, that would have to be enforced in the `load_skill` path — out of scope here.)
 
 This applies only to the runtime-prompt providers that receive the injected catalog (Claude Code, Codex, Gemini CLI, Kimi CLI, Antigravity). Providers that deliver skills natively (Kiro CLI, OpenCode, GitHub Copilot CLI, Amazon Q) ignore the field.
 

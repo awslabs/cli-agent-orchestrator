@@ -190,7 +190,7 @@ def build_skill_catalog(skill_filter: Optional[List[str]] = None) -> str:
         if unmatched:
             logger.warning(
                 "Skill-catalog filter matched no installed skill for pattern(s): %s",
-                ", ".join(unmatched),
+                ", ".join(repr(pattern) for pattern in unmatched),
             )
         skills = selected
     if not skills:
