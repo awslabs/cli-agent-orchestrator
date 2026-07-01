@@ -113,8 +113,18 @@ class StatusMonitor:
           _schedule_screen_detection.
         """
         provider = provider_manager.get_provider(terminal_id)
+        # Resolve pyte per-provider: a provider may pin itself on/off via
+        # ``screen_detection_default`` (None = follow the global CAO_PYTE_STATUS).
+        # This lets claude_code use the raw path (its pyte detector regresses on
+        # Claude 2.1.x) while opencode_cli uses the screen path (its footer only
+        # composites under pyte) in the SAME deployment — previously impossible
+        # with a single global flag.
+        prov_default = (
+            getattr(provider, "screen_detection_default", None) if provider is not None else None
+        )
+        pyte_on = CAO_PYTE_STATUS if prov_default is None else prov_default
         use_screen = (
-            CAO_PYTE_STATUS
+            pyte_on
             and provider is not None
             and getattr(provider, "supports_screen_detection", False)
         )

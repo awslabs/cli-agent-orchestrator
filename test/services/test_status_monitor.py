@@ -141,6 +141,47 @@ class _SequencedMonitor:
         return self.sm._last_status.get("t1")
 
 
+class TestPerProviderPyteRouting:
+    """A provider's ``screen_detection_default`` overrides the global
+    CAO_PYTE_STATUS so claude_code (raw) and opencode_cli (pyte) can coexist."""
+
+    def _route(self, *, global_pyte, supports, prov_default):
+        sm = StatusMonitor()
+        provider = MagicMock()
+        provider.supports_screen_detection = supports
+        provider.screen_detection_default = prov_default
+        calls = []
+        with (
+            patch("cli_agent_orchestrator.services.status_monitor.provider_manager") as mock_pm,
+            patch("cli_agent_orchestrator.services.status_monitor.CAO_PYTE_STATUS", global_pyte),
+            patch.object(
+                sm, "_schedule_screen_detection", side_effect=lambda *a, **k: calls.append("screen")
+            ),
+            patch.object(
+                sm, "_schedule_raw_detection", side_effect=lambda *a, **k: calls.append("raw")
+            ),
+            patch.object(sm, "_feed_screen_locked"),
+        ):
+            mock_pm.get_provider.return_value = provider
+            sm._process_chunk("t1", "x")
+        return calls[0] if calls else None
+
+    def test_pinned_off_uses_raw_despite_global_on(self):  # claude_code case
+        assert self._route(global_pyte=True, supports=True, prov_default=False) == "raw"
+
+    def test_pinned_on_uses_screen_despite_global_off(self):
+        assert self._route(global_pyte=False, supports=True, prov_default=True) == "screen"
+
+    def test_none_follows_global_on(self):  # opencode_cli case (default)
+        assert self._route(global_pyte=True, supports=True, prov_default=None) == "screen"
+
+    def test_none_follows_global_off(self):
+        assert self._route(global_pyte=False, supports=True, prov_default=None) == "raw"
+
+    def test_no_screen_support_always_raw(self):
+        assert self._route(global_pyte=True, supports=False, prov_default=None) == "raw"
+
+
 class TestStickyLatching:
     """Pin the sticky ready-status latch + notify_input_sent state machine."""
 
