@@ -133,10 +133,8 @@ class ClaudeCodeProvider(BaseProvider):
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
-        self._task_dispatched = False
-        self._last_dispatch_time: float = 0.0  # set by mark_input_received()
-        self._done_first_detected: float = 0.0  # first time herdr reported "done" this cycle
-        self._idle_first_detected: float = 0.0  # first time herdr reported "idle" post-dispatch
+        # Native-status dispatch tracking (_task_dispatched + flush-wait timers)
+        # lives on BaseProvider and is consumed by _resolve_native_status().
 
     def _build_claude_command(self) -> str:
         """Build Claude Code command with agent profile if provided.
@@ -435,80 +433,10 @@ class ClaudeCodeProvider(BaseProvider):
 
         See: https://github.com/awslabs/cli-agent-orchestrator/issues/104
         """
-        # Native status: herdr knows agent state without pane content parsing.
-        # When the backend returns non-None, trust it and skip buffer reads.
-        # The only ambiguous case is IDLE: herdr "idle" fires both when no task
-        # has been dispatched yet AND when a task completed but the user focused
-        # the tab (resetting "done" -> "idle"). _task_dispatched disambiguates.
-        # Tmux backend always returns None -- falls through to buffer analysis.
-        native = get_backend().get_native_status(self.session_name, self.window_name)
-        logger.debug(
-            "[get_status] terminal=%s native=%s",
-            self.terminal_id,
-            native.value if native is not None else None,
-        )
+        # Native status (herdr): when the backend knows agent state, trust it and
+        # skip buffer reads. Tmux returns None -- falls through to buffer analysis.
+        native = self._resolve_native_status()
         if native is not None:
-            if native == TerminalStatus.PROCESSING:
-                # Reset flush-wait timers — herdr is actively working, so any
-                # previously stamped idle/done timestamp is from a pre-work gap
-                # and must not be counted toward the post-completion flush wait.
-                self._done_first_detected = 0.0
-                self._idle_first_detected = 0.0
-                logger.debug("[get_status] terminal=%s -> PROCESSING (native)", self.terminal_id)
-                return TerminalStatus.PROCESSING
-            if native == TerminalStatus.COMPLETED and self._task_dispatched:
-                # herdr "done": wait 10s from first detection for buffer to flush.
-                if self._done_first_detected == 0.0:
-                    self._done_first_detected = time.time()
-                waited = time.time() - self._done_first_detected
-                if waited >= 10.0:
-                    logger.debug(
-                        "[get_status] terminal=%s -> COMPLETED (native done, %.1fs flush wait elapsed)",
-                        self.terminal_id,
-                        waited,
-                    )
-                    return TerminalStatus.COMPLETED
-                logger.debug(
-                    "[get_status] terminal=%s -> PROCESSING (native done, flush wait %.1fs/10s)",
-                    self.terminal_id,
-                    waited,
-                )
-                return TerminalStatus.PROCESSING
-            if native == TerminalStatus.IDLE and self._task_dispatched:
-                # herdr "idle" post-dispatch: wait 10s from first detection, then
-                # keep returning PROCESSING until 5 min from dispatch (give up).
-                if self._idle_first_detected == 0.0:
-                    self._idle_first_detected = time.time()
-                waited = time.time() - self._idle_first_detected
-                elapsed = time.time() - self._last_dispatch_time
-                if waited >= 10.0:
-                    if elapsed >= 300.0:
-                        logger.warning(
-                            "[get_status] terminal=%s -> COMPLETED (native idle, %.0fs since dispatch, giving up)",
-                            self.terminal_id,
-                            elapsed,
-                        )
-                        return TerminalStatus.COMPLETED
-                    logger.debug(
-                        "[get_status] terminal=%s -> COMPLETED (native idle, %.1fs flush wait elapsed)",
-                        self.terminal_id,
-                        waited,
-                    )
-                    return TerminalStatus.COMPLETED
-                logger.debug(
-                    "[get_status] terminal=%s -> PROCESSING (native idle, flush wait %.1fs/10s)",
-                    self.terminal_id,
-                    waited,
-                )
-                return TerminalStatus.PROCESSING
-            if native == TerminalStatus.IDLE:
-                logger.debug(
-                    "[get_status] terminal=%s -> IDLE (native idle, no task dispatched)",
-                    self.terminal_id,
-                )
-                return TerminalStatus.IDLE
-            # COMPLETED (no task dispatched), WAITING_USER_ANSWER, ERROR -- return directly
-            logger.debug("[get_status] terminal=%s -> %s (native)", self.terminal_id, native.value)
             return native
 
         if not output:
@@ -747,18 +675,6 @@ class ClaudeCodeProvider(BaseProvider):
         isn't ready to accept input even though get_status() sees PROCESSING.
         """
         return self._initialized
-
-    def mark_input_received(self) -> None:
-        """Record that a task was dispatched to this terminal.
-
-        Called by the terminal service after send_input() delivers a message.
-        Sets _task_dispatched=True so get_status() can distinguish herdr 'idle'
-        after task completion from 'idle' before any task was dispatched.
-        """
-        self._task_dispatched = True
-        self._last_dispatch_time = time.time()
-        self._done_first_detected = 0.0
-        self._idle_first_detected = 0.0
 
     def get_idle_pattern_for_log(self) -> str:
         """Return Claude Code IDLE prompt pattern for log files."""

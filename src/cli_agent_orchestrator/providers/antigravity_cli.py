@@ -408,6 +408,12 @@ class AntigravityCliProvider(BaseProvider):
           5. ERROR — matched error pattern
           6. UNKNOWN — nothing matched
         """
+        # Native status (herdr): trust the backend's agent state when available;
+        # on herdr the buffer is never fed, so buffer parsing can't leave UNKNOWN.
+        native = self._resolve_native_status()
+        if native is not None:
+            return native
+
         if not output:
             return TerminalStatus.UNKNOWN
 
@@ -606,4 +612,5 @@ class AntigravityCliProvider(BaseProvider):
 
     def mark_input_received(self) -> None:
         """Record that a turn was delivered (IDLE → COMPLETED on next status)."""
+        super().mark_input_received()
         self._turns += 1
