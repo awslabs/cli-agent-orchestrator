@@ -27,14 +27,9 @@ test.describe('Devin CLI Provider E2E Tests', () => {
     const modal = page.locator('dialog, [role="dialog"], .fixed').first();
     await expect(modal).toBeVisible({ timeout: 5000 });
 
-    // Look for provider selector
-    const content = await page.content();
-    console.log('Modal content:', content.substring(0, 1000));
-
-    // Check if Devin CLI is mentioned
-    const hasDevin = content.includes('devin') || content.includes('Devin');
-    console.log('Devin CLI mentioned:', hasDevin);
-    expect(hasDevin).toBe(true);
+    // Look for provider selector - assert visible Devin option in modal
+    const devinOption = page.locator('text=devin').or(page.locator('text=Devin')).first();
+    await expect(devinOption).toBeVisible();
   });
 
   test('should show Devin CLI as available provider', async ({ page }) => {

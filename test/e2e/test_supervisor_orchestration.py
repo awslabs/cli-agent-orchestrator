@@ -697,12 +697,14 @@ class TestDevinCliSupervisorOrchestration:
         3. Verify Devin CLI executes and responds
         """
         session_name = f"test-simple-{uuid.uuid4().hex[:8]}"
-        terminal_id, actual_session = create_terminal(
-            provider="devin_cli",
-            agent_profile="developer",
-            session_name=session_name,
-        )
+        terminal_id = None
+        actual_session = None
         try:
+            terminal_id, actual_session = create_terminal(
+                provider="devin_cli",
+                agent_profile="developer",
+                session_name=session_name,
+            )
             # Wait for terminal to be ready
             assert _wait_for_ready(
                 terminal_id, timeout=30
@@ -727,4 +729,5 @@ class TestDevinCliSupervisorOrchestration:
             assert "hello" in output.lower(), f"Expected 'hello' in output, got: {output[:200]}"
 
         finally:
-            cleanup_terminal(terminal_id, actual_session)
+            if terminal_id is not None:
+                cleanup_terminal(terminal_id, actual_session)

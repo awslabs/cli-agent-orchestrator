@@ -254,7 +254,8 @@ class TestDevinCliToolRestrictions:
 
         # Verify the temp file contains the security constraint and tool list.
         assert provider._temp_prompt_file is not None
-        content = open(provider._temp_prompt_file).read()
+        with open(provider._temp_prompt_file, encoding="utf-8") as f:
+            content = f.read()
         assert "fs_read" in content
         assert "execute_bash" in content
         assert "SECURITY CONSTRAINTS" in content
@@ -298,7 +299,8 @@ class TestDevinCliToolRestrictions:
             provider._build_command()
 
         assert provider._temp_prompt_file is not None
-        content = open(provider._temp_prompt_file).read()
+        with open(provider._temp_prompt_file, encoding="utf-8") as f:
+            content = f.read()
         # Security constraint must come BEFORE the profile system prompt.
         security_pos = content.find("SECURITY CONSTRAINTS")
         profile_pos = content.find("You are a helpful assistant.")
