@@ -254,19 +254,10 @@ Each provider has a dedicated workflow that runs only when its files change:
 | `test-codex-provider.yml` | `test_codex_provider_unit.py` | `providers/codex.py`, `test/providers/**` |
 | `test-claude-code-provider.yml` | `test_claude_code_unit.py` | `providers/claude_code.py`, `test/providers/**` |
 | `test-kiro-cli-provider.yml` | `test_kiro_cli_unit.py` | `providers/kiro_cli.py`, `test/providers/**` |
-| `test-q-cli-provider.yml` | `test_q_cli_unit.py` | `providers/q_cli.py`, `test/providers/**` |
 
 Each includes unit tests (Python 3.10/3.11/3.12) and code quality checks (black, isort, mypy).
 
 ## Working with Providers
-
-### Regenerate Test Fixtures
-
-If a provider's CLI output format changes, regenerate the captured fixtures:
-
-```bash
-uv run python test/providers/fixtures/generate_fixtures.py
-```
 
 ### Test Against a Real Provider CLI
 
@@ -284,8 +275,6 @@ uv run pytest test/providers/test_kiro_cli_integration.py -v
 ```
 
 The same pattern applies to every provider that ships an `<provider>_integration.py` file — substitute the binary and the test filename.
-
-> **Note:** Q CLI is slated for deprecation. Do not build new development workflows around Q CLI; prefer Kiro CLI, Claude Code, or Codex CLI as your default provider while contributing.
 
 ## Troubleshooting
 
@@ -371,7 +360,7 @@ cli-agent-orchestrator/
 │       ├── clients/                # Database and tmux clients
 │       ├── mcp_server/             # MCP server implementation
 │       ├── models/                 # Data models
-│       ├── providers/              # Agent providers (Kiro CLI, Claude Code, Codex, Gemini, Kimi, Copilot, OpenCode, Q CLI [deprecated])
+│       ├── providers/              # Agent providers (Kiro CLI, Claude Code, Codex, Antigravity, Kimi, Copilot, OpenCode, Cursor)
 │       ├── services/               # Business logic services
 │       └── utils/                  # Utility functions
 ├── test/                           # Test suite (511 tests, 84% coverage)

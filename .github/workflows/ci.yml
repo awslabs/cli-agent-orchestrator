@@ -37,7 +37,6 @@ jobs:
       - name: Run unit tests with coverage
         run: |
           uv run pytest test/ \
-            --ignore=test/providers/test_q_cli_integration.py \
             --ignore=test/providers/test_kiro_cli_integration.py \
             --ignore=test/e2e \
             -m "not e2e" \
@@ -154,7 +153,6 @@ jobs:
         # Produces coverage.json (python floor) consumed by coverage:ratchet.
         run: |
           uv run pytest test/ \
-            --ignore=test/providers/test_q_cli_integration.py \
             --ignore=test/providers/test_kiro_cli_integration.py \
             --ignore=test/e2e \
             -m "not e2e" \

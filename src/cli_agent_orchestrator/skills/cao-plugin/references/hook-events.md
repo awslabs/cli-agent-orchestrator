@@ -74,7 +74,7 @@ class PostCreateTerminalEvent(CaoEvent):
     event_type: str = "post_create_terminal"
     terminal_id: str = ""
     agent_name: str | None = None  # Agent profile name, if one was supplied
-    provider: str = ""             # e.g. "claude_code", "kiro_cli", "codex", "q_cli"
+    provider: str = ""             # e.g. "claude_code", "kiro_cli", "codex", "antigravity_cli"
 ```
 
 Use cases: per-agent observability, provider-specific setup, external inventory of running agents.

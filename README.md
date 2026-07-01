@@ -4,11 +4,11 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/cli-agent-orchestrator.svg)](https://pypi.org/project/cli-agent-orchestrator/)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/awslabs/cli-agent-orchestrator)
 
-**CLI Agent Orchestrator (CAO)** is an open-source multi-agent orchestration framework for AI coding CLIs — Claude Code, Kiro CLI, Codex CLI, Gemini CLI, Antigravity CLI, Hermes Agent, Kimi CLI, GitHub Copilot CLI, OpenCode, and Amazon Q Developer CLI. CAO runs each agent in an isolated tmux session and coordinates them with a supervisor–worker pattern over the Model Context Protocol (MCP), so one supervisor agent can delegate tasks to multiple specialist agents in parallel, sequentially, or as a swarm.
+**CLI Agent Orchestrator (CAO)** is an open-source multi-agent orchestration framework for AI coding CLIs — Claude Code, Kiro CLI, Codex CLI, Antigravity CLI, Hermes Agent, Kimi CLI, GitHub Copilot CLI, OpenCode, and Cursor CLI. CAO runs each agent in an isolated tmux session and coordinates them with a supervisor–worker pattern over the Model Context Protocol (MCP), so one supervisor agent can delegate tasks to multiple specialist agents in parallel, sequentially, or as a swarm.
 
 ## What is CAO?
 
-CAO (pronounced "kay-oh") is a lightweight local orchestrator that sits between you and the CLI coding agents you already use. Instead of running a single agent at a time, CAO lets a supervisor agent launch, message, and coordinate multiple worker agents — each one a real CLI tool (Claude Code, Kiro, Codex, etc.) running in its own tmux terminal. Agents communicate through MCP-exposed primitives (**handoff**, **assign**, and **send_message**) and are managed via a CLI, a bundled Web UI, or an MCP management server. Because every agent is a full CLI process, CAO preserves tool behaviour, auth, and advanced features (Claude Code sub-agents, Q CLI custom agents, etc.) that a raw API wrapper cannot.
+CAO (pronounced "kay-oh") is a lightweight local orchestrator that sits between you and the CLI coding agents you already use. Instead of running a single agent at a time, CAO lets a supervisor agent launch, message, and coordinate multiple worker agents — each one a real CLI tool (Claude Code, Kiro, Codex, etc.) running in its own tmux terminal. Agents communicate through MCP-exposed primitives (**handoff**, **assign**, and **send_message**) and are managed via a CLI, a bundled Web UI, or an MCP management server. Because every agent is a full CLI process, CAO preserves tool behaviour, auth, and advanced features (Claude Code sub-agents, Kiro CLI custom agents, etc.) that a raw API wrapper cannot.
 
 ## Common use cases
 
@@ -36,7 +36,7 @@ CAO implements a hierarchical multi-agent system — one supervisor agent delega
 - **Tool restrictions per agent** — `role` + `allowedTools` in the profile, translated to each provider's native enforcement where available. See [docs/tool-restrictions.md](docs/tool-restrictions.md).
 - **Persistent agent memory** — agents store and recall knowledge across sessions using `memory_store` and `memory_recall` MCP tools. CAO automatically injects relevant memories as context at session start. See [docs/memory.md](docs/memory.md).
 - **Direct worker steering** — unlike traditional "sub-agent" features, you can attach to a running worker and intervene mid-task.
-- **Full CLI feature access** — agents keep native CLI features: Claude Code [sub-agents](https://docs.claude.com/en/docs/claude-code/sub-agents), Amazon Q Developer [Custom Agent](https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/command-line-custom-agents.html), provider-native auth, etc.
+- **Full CLI feature access** — agents keep native CLI features: Claude Code [sub-agents](https://docs.claude.com/en/docs/claude-code/sub-agents), Kiro CLI custom agents, provider-native auth, etc.
 - **Plugin system for outbound events** — forward inter-agent messages to Discord, Slack, Telegram, or any webhook target. See [Plugins](#plugins).
 
 For detailed project structure and architecture, see [CODEBASE.md](CODEBASE.md).
@@ -122,14 +122,12 @@ CAO drives existing CLI agent tools — it does not replace them. Before using C
 | **Kiro CLI** (default) | [Provider docs](docs/kiro-cli.md) · [Installation](https://kiro.dev/docs/kiro-cli) | AWS credentials |
 | **Claude Code** | [Provider docs](docs/claude-code.md) · [Installation](https://docs.anthropic.com/en/docs/claude-code/getting-started) | Anthropic API key |
 | **Codex CLI** | [Provider docs](docs/codex-cli.md) · [Installation](https://github.com/openai/codex) | OpenAI API key |
-| **Gemini CLI** | [Provider docs](docs/gemini-cli.md) · [Installation](https://github.com/google-gemini/gemini-cli) | Google AI API key |
 | **Hermes Agent** | [Provider docs](docs/hermes.md) | Hermes auth; optional `hermesProfile` wrapper; configure `cao-mcp-server` in the selected Hermes profile for orchestration tools |
 | **Kimi CLI** | [Provider docs](docs/kimi-cli.md) · [Installation](https://platform.moonshot.cn/docs/kimi-cli) | Moonshot API key |
 | **GitHub Copilot CLI** | [Provider docs](docs/copilot-cli.md) · [Installation](https://github.com/features/copilot/cli) | GitHub auth |
 | **OpenCode CLI** *(experimental — temporary inbox polling fallback for multi-agent callbacks, [#203](https://github.com/awslabs/cli-agent-orchestrator/issues/203))* | [Provider docs](docs/opencode-cli.md) · [Installation](https://opencode.ai) | Per-model API key |
 | **Cursor CLI** | [Provider docs](docs/cursor-cli.md) · [Installation](https://cursor.com/cli) | Cursor subscription / API key |
 | **Antigravity CLI** | [Provider docs](docs/antigravity-cli.md) · [Installation](https://antigravity.google) | Google account (shared with the Antigravity IDE login) |
-| **Q CLI** | [Installation](https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/command-line.html) | AWS credentials |
 
 ## Quick Start
 
@@ -165,7 +163,7 @@ cao launch --agents code_supervisor
 
 # Or specify a provider
 cao launch --agents code_supervisor --provider claude_code
-# Valid: kiro_cli | claude_code | codex | q_cli | gemini_cli | antigravity_cli | hermes | kimi_cli | copilot_cli | opencode_cli | cursor_cli
+# Valid: kiro_cli | claude_code | codex | antigravity_cli | hermes | kimi_cli | copilot_cli | opencode_cli | cursor_cli
 
 # Unrestricted access, skip confirmation (DANGEROUS)
 cao launch --agents code_supervisor --yolo
@@ -275,7 +273,7 @@ provider: claude_code
 ---
 ```
 
-Valid values: `kiro_cli`, `claude_code`, `codex`, `q_cli`, `gemini_cli`, `antigravity_cli`, `hermes`, `kimi_cli`, `copilot_cli`, `opencode_cli`, `cursor_cli`. The `cao launch --provider` flag always takes precedence for the initial session. See [`examples/cross-provider/`](examples/cross-provider/).
+Valid values: `kiro_cli`, `claude_code`, `codex`, `antigravity_cli`, `hermes`, `kimi_cli`, `copilot_cli`, `opencode_cli`, `cursor_cli`. The `cao launch --provider` flag always takes precedence for the initial session. See [`examples/cross-provider/`](examples/cross-provider/).
 
 ### Tool Restrictions
 
@@ -371,7 +369,7 @@ For the full guide — flow file format, the conditional-execution pattern, and 
 
 ### Skills
 
-Skills are portable, structured guides (following the universal [SKILL.md](https://github.com/anthropics/skills) format) that encode domain knowledge for agents. They work across coding assistants (Claude Code, Kiro CLI, Gemini CLI, Codex CLI, Kimi CLI, GitHub Copilot, Cursor, OpenCode, LobeHub) and frameworks ([Strands Agents SDK](https://strandsagents.com/docs/user-guide/concepts/plugins/skills/), [Microsoft Agent Framework](https://devblogs.microsoft.com/agent-framework/give-your-agents-domain-expertise-with-agent-skills-in-microsoft-agent-framework/)).
+Skills are portable, structured guides (following the universal [SKILL.md](https://github.com/anthropics/skills) format) that encode domain knowledge for agents. They work across coding assistants (Claude Code, Kiro CLI, Codex CLI, Kimi CLI, GitHub Copilot, Cursor, OpenCode, LobeHub) and frameworks ([Strands Agents SDK](https://strandsagents.com/docs/user-guide/concepts/plugins/skills/), [Microsoft Agent Framework](https://devblogs.microsoft.com/agent-framework/give-your-agents-domain-expertise-with-agent-skills-in-microsoft-agent-framework/)).
 
 CAO ships built-in skills and also manages "managed skills" shared across all agent sessions. Built-ins (`cao-supervisor-protocols`, `cao-worker-protocols`) are auto-seeded at server startup. You can add your own:
 
@@ -382,7 +380,7 @@ cao skills add ./my-coding-standards --force   # overwrite
 cao skills remove my-coding-standards
 ```
 
-Skills are delivered to providers automatically (native `skill://` resources for Kiro CLI; runtime prompt injection for Claude Code / Codex / Gemini / Kimi; baked-in `.agent.md` for Copilot).
+Skills are delivered to providers automatically (native `skill://` resources for Kiro CLI; runtime prompt injection for Claude Code / Codex / Kimi; baked-in `.agent.md` for Copilot).
 
 For the full reference — authoring, loading, delivery mechanics — see [docs/skills.md](docs/skills.md). For integrating with OpenClaw or other external tools, see [docs/external-tool-integration.md](docs/external-tool-integration.md).
 

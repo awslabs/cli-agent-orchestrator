@@ -112,19 +112,6 @@ def test_cleanup_provider_calls_cleanup_and_removes():
     assert manager._providers.get("t1") is None
 
 
-def test_create_provider_q_cli_without_agent_profile_raises():
-    """Test Q CLI provider requires agent_profile."""
-    manager = ProviderManager()
-    with pytest.raises(ValueError, match="Q CLI provider requires agent_profile parameter"):
-        manager.create_provider(
-            ProviderType.Q_CLI.value,
-            terminal_id="t1",
-            tmux_session="s1",
-            tmux_window="w1",
-            agent_profile=None,
-        )
-
-
 def test_create_provider_kiro_cli_without_agent_profile_raises():
     """Test Kiro CLI provider requires agent_profile."""
     manager = ProviderManager()

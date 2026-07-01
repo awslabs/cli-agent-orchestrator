@@ -127,11 +127,9 @@ CAO translates `allowedTools` into each provider's native restriction mechanism:
 
 | Provider | Enforcement | Mechanism |
 |----------|------------|-----------|
-| Q CLI | Hard | `allowedTools` in agent JSON (at install time) |
 | Kiro CLI | Hard | `allowedTools` in agent JSON (at install time) |
 | Claude Code | Hard | `--disallowedTools` flags block specific tools |
 | Copilot CLI | Hard | `--deny-tool` flags override `--allow-all` |
-| Gemini CLI | Hard | Policy Engine TOML deny rules in `~/.gemini/policies/` |
 | Kimi CLI | Soft | Security system prompt (no native mechanism) |
 | Codex | Soft | Security system prompt (no native mechanism) |
 
@@ -200,7 +198,7 @@ When using CLI Agent Orchestrator:
 
 8. **Review tool summaries.** The confirmation prompt shows exactly what tools are allowed and blocked — read it before confirming.
 
-9. **Prefer hard-enforcement providers** (Q CLI, Kiro CLI, Claude Code, Copilot CLI, Gemini CLI) for sensitive workloads.
+9. **Prefer hard-enforcement providers** (Kiro CLI, Claude Code, Copilot CLI) for sensitive workloads.
 
 ## Dependency Management
 

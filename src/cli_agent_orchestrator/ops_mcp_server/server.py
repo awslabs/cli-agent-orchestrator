@@ -218,7 +218,7 @@ async def install_profile(
 
     ## Provider Config
 
-    - q_cli, kiro_cli: JSON config written to the provider's agents directory
+    - kiro_cli: JSON config written to the provider's agents directory
     - copilot_cli: frontmatter markdown written to the Copilot agents directory
     - claude_code, codex: context file only, no provider-specific config
 

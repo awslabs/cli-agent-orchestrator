@@ -69,8 +69,8 @@ clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
 **Problem:** Adding a `TOOL_MAPPING` entry for providers that accept CAO vocabulary directly (like Kiro CLI). This is unnecessary and was causing the launch prompt to show misleading `Blocked: (none)`.
 
 **Fix:** Only add `TOOL_MAPPING` entries for providers whose native tool names differ from CAO's vocabulary:
-- **Need TOOL_MAPPING:** Claude Code (`execute_bash` → `Bash`), Copilot CLI (`execute_bash` → `shell`), Gemini CLI
-- **Don't need TOOL_MAPPING:** Kiro CLI, Q CLI (accept `allowedTools` in agent JSON), Kimi CLI, Codex (system prompt enforcement)
+- **Need TOOL_MAPPING:** Claude Code (`execute_bash` → `Bash`), Copilot CLI (`execute_bash` → `shell`)
+- **Don't need TOOL_MAPPING:** Kiro CLI (accepts `allowedTools` in agent JSON), Kimi CLI, Codex (system prompt enforcement)
 
 ## 7. Confirmation Prompt Blocks Automation
 
@@ -140,14 +140,14 @@ When writing handoff/assign logic, never flatten `["*"]` to `None` before passin
 
 **The three approaches:**
 - **Hard via CLI flags** (Claude Code `--disallowedTools`, Copilot CLI `--deny-tool`): Add provider to `TOOL_MAPPING` in `tool_mapping.py` to translate CAO vocabulary → native tool names. `get_disallowed_tools()` computes which native tools to block.
-- **Hard via agent JSON** (Kiro CLI, Q CLI): The CLI reads `allowedTools` from the agent profile at install time. No `TOOL_MAPPING` entry needed — pass CAO vocabulary directly.
+- **Hard via agent JSON** (Kiro CLI): The CLI reads `allowedTools` from the agent profile at install time. No `TOOL_MAPPING` entry needed — pass CAO vocabulary directly.
 - **Soft via system prompt** (Kimi CLI, Codex): No native restriction mechanism. CAO prepends `SECURITY_PROMPT` from `constants.py` to the system prompt. This is advisory only — the CLI can still use any tool.
 
 **Limitation:** Soft enforcement is not a security boundary. If a provider doesn't support native tool blocking, document this in the provider's docs under "Known Limitations".
 
 ## 14. Shell Warm-up Before CLI Launch
 
-**Problem:** `wait_for_shell()` detects a stable shell prompt, but shell initialization scripts (.zshrc, brew shellenv, nvm) may still be running in the background. Launching a CLI immediately causes it to silently exit or hang (e.g., Gemini CLI exits without error).
+**Problem:** `wait_for_shell()` detects a stable shell prompt, but shell initialization scripts (.zshrc, brew shellenv, nvm) may still be running in the background. Launching a CLI immediately causes it to silently exit or hang (e.g., a TUI CLI exits without error).
 
 **Fix:** After `wait_for_shell()`, send an echo round-trip with a unique marker to verify the shell is fully initialized:
 ```python
@@ -169,7 +169,7 @@ Test your provider both inside and outside tmux to catch this.
 
 ## 16. Alt-Screen vs Scrollback — A Fundamental Design Decision
 
-**Problem:** CLIs operate in one of two modes: alt-screen (full-screen TUI, e.g., Gemini, Kimi) or scrollback (output in normal terminal buffer, e.g., Codex with `--no-alt-screen`). Detection logic differs significantly between the two.
+**Problem:** CLIs operate in one of two modes: alt-screen (full-screen TUI, e.g., Kimi) or scrollback (output in normal terminal buffer, e.g., Codex with `--no-alt-screen`). Detection logic differs significantly between the two.
 
 **Key differences:**
 - **Alt-screen:** Idle prompt is at a fixed position near the bottom. Use `tail_lines` to check bottom N lines (typically 50). Pattern matching anchors to bottom-of-screen, not end-of-output.

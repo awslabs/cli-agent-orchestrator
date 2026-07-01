@@ -7,144 +7,69 @@ This directory contains comprehensive test suites for provider implementations.
 ### Kiro CLI Provider (Default)
 Tests for Kiro CLI integration (`kiro_cli`) - the default provider.
 
-### Q CLI Provider
-Tests for Amazon Q CLI integration (`q_cli`)
-
-Since Kiro CLI has identical output format to Q CLI, the test fixtures are reused with renamed files.
-
 ## Test Structure
 
 ```
 test/providers/
 ├── test_kiro_cli_unit.py       # Kiro CLI unit tests (fast, mocked) - default provider
-├── test_q_cli_unit.py          # Q CLI unit tests (fast, mocked)
 ├── test_claude_code_unit.py    # Claude Code unit tests (fast, mocked)
 ├── test_codex_provider_unit.py # Codex CLI unit tests (fast, mocked)
-├── test_gemini_cli_unit.py    # Gemini CLI unit tests (fast, mocked)
+├── test_antigravity_cli_unit.py # Antigravity CLI unit tests (fast, mocked)
+├── test_kimi_cli_unit.py       # Kimi CLI unit tests (fast, mocked)
+├── test_copilot_cli_unit.py    # Copilot CLI unit tests (fast, mocked)
+├── test_cursor_cli_unit.py     # Cursor CLI unit tests (fast, mocked)
+├── test_opencode_cli_unit.py   # OpenCode CLI unit tests (fast, mocked)
 ├── test_base_provider.py       # Base provider abstract interface tests
 ├── test_tmux_working_directory.py # TmuxClient working directory tests
-├── test_q_cli_integration.py   # Q CLI integration tests (slow, real Q CLI)
+├── test_kiro_cli_integration.py # Kiro CLI integration tests (slow, real Kiro CLI)
 ├── fixtures/                    # Test fixture files
 │   ├── kiro_cli_*.txt          # Kiro CLI fixtures (default provider)
-│   ├── q_cli_*.txt             # Q CLI fixtures
 │   ├── codex_*.txt             # Codex CLI fixtures
-│   ├── gemini_cli_*.txt        # Gemini CLI fixtures
-│   └── generate_fixtures.py    # Script to regenerate fixtures
+│   └── ...                      # Per-provider fixtures
 └── README.md
 ```
 
 ## Test Coverage
 
-### Unit Tests (`test_q_cli_unit.py`)
+### Integration Tests (`test_kiro_cli_integration.py`)
 
-**34 tests covering:**
+Integration tests exercise a real Kiro CLI binary against tmux:
 
-1. **Initialization (4 tests)**
-   - Successful initialization
-   - Shell timeout handling
-   - Q CLI timeout handling
-   - Different agent profiles
-
-2. **Status Detection (7 tests)**
-   - IDLE status
-   - COMPLETED status
-   - PROCESSING status
-   - WAITING_USER_ANSWER status
-   - ERROR status
-   - Empty output handling
-   - tail_lines parameter
-
-3. **Message Extraction (6 tests)**
-   - Successful extraction
-   - Complex messages with code blocks
-   - Missing green arrow error
-   - Missing final prompt error
-   - Empty response error
-   - Multiple responses (uses last)
-
-4. **Regex Patterns (5 tests)**
-   - Green arrow pattern
-   - Idle prompt pattern
-   - Prompt with percentage
-   - Permission prompt pattern
-   - ANSI code cleaning
-
-5. **Prompt Patterns (3 tests)**
-   - Basic prompt
-   - Prompt with usage percentage
-   - Prompt with special characters
-
-6. **Edge Cases (9 tests)**
-   - Exit command
-   - Idle pattern for logs
-   - Cleanup
-   - Long profile names
-   - Unicode characters
-   - Control characters
-   - Multiple error indicators
-   - Terminal attributes
-   - Whitespace variations
-
-**Coverage:** 100% of q_cli.py
-
-### Integration Tests (`test_q_cli_integration.py`)
-
-**9 tests covering:**
-
-1. **Real Q CLI Operations (5 tests)**
+1. **Real Kiro CLI Operations**
    - Initialization flow
    - Simple query execution
    - Status detection
    - Exit command
    - Different agent profiles
 
-2. **Handoff Scenarios (2 tests)**
+2. **Handoff Scenarios**
    - Status transitions during handoff
    - Message integrity verification
 
-3. **Error Handling (2 tests)**
+3. **Error Handling**
    - Invalid session handling
    - Non-existent session status
 
-**Requirements:** 
-- Q CLI must be installed (`q` command available)
-- Q CLI must be authenticated (AWS credentials configured)
+**Requirements:**
+- Kiro CLI must be installed (`kiro` command available)
+- Kiro CLI must be authenticated (AWS credentials configured)
 - tmux 3.3+ must be installed
-
-**Agent Setup:**
-The integration tests automatically create a test agent named `agent-q-cli-integration-test` if it doesn't exist. The agent is created at:
-- `~/.aws/amazonq/cli-agents/agent-q-cli-integration-test.json`
-
-If you want to create the agent manually before running tests:
-```bash
-mkdir -p ~/.aws/amazonq/cli-agents
-cat > ~/.aws/amazonq/cli-agents/agent-q-cli-integration-test.json << 'EOF'
-{
-  "name": "agent-q-cli-integration-test",
-  "description": "Test agent for integration tests",
-  "instructions": "You are a helpful developer assistant for testing purposes.",
-  "tools": []
-}
-EOF
-```
-
-For more information on custom agents, see: https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/command-line-custom-agents.html
 
 ## Running Tests
 
 ### Run All Unit Tests (Recommended)
 ```bash
-uv run pytest test/providers/test_q_cli_unit.py -v
+uv run pytest test/providers/test_kiro_cli_unit.py -v
 ```
 
 ### Run Unit Tests with Coverage
 ```bash
-uv run pytest test/providers/test_q_cli_unit.py --cov=src/cli_agent_orchestrator/providers/q_cli.py --cov-report=term-missing -v
+uv run pytest test/providers/test_kiro_cli_unit.py --cov=src/cli_agent_orchestrator/providers/kiro_cli.py --cov-report=term-missing -v
 ```
 
-### Run Integration Tests (Requires Q CLI)
+### Run Integration Tests (Requires Kiro CLI)
 ```bash
-uv run pytest test/providers/test_q_cli_integration.py -v
+uv run pytest test/providers/test_kiro_cli_integration.py -v
 ```
 
 ### Run All Tests
@@ -166,40 +91,36 @@ uv run pytest test/providers/ -m slow -v
 
 ### Run Specific Test Class
 ```bash
-uv run pytest test/providers/test_q_cli_unit.py::TestQCliProviderStatusDetection -v
+uv run pytest test/providers/test_kiro_cli_unit.py::TestKiroCliProviderStatusDetection -v
 ```
 
 ### Run Specific Test
 ```bash
-uv run pytest test/providers/test_q_cli_unit.py::TestQCliProviderStatusDetection::test_get_status_idle -v
+uv run pytest test/providers/test_kiro_cli_unit.py::TestKiroCliProviderStatusDetection::test_get_status_idle -v
 ```
 
 ## Test Fixtures
 
-Test fixtures contain realistic Q CLI terminal output with proper ANSI escape sequences. To regenerate fixtures:
-
-```bash
-uv run python test/providers/fixtures/generate_fixtures.py
-```
+Test fixtures contain realistic Kiro CLI terminal output with proper ANSI escape sequences.
 
 ### Fixture Contents
 
-- **q_cli_idle_output.txt** - Agent prompt without response
-- **q_cli_completed_output.txt** - Complete response with green arrow
-- **q_cli_processing_output.txt** - Partial output during processing
-- **q_cli_permission_output.txt** - Permission request prompt
-- **q_cli_error_output.txt** - Error message output
-- **q_cli_complex_response.txt** - Multi-line response with code blocks
-- **q_cli_handoff_successful.txt** - Successful handoff between agents
-- **q_cli_handoff_error.txt** - Failed handoff with error message
-- **q_cli_handoff_with_permission.txt** - Handoff requiring user permission
+- **kiro_cli_idle_output.txt** - Agent prompt without response
+- **kiro_cli_completed_output.txt** - Complete response with green arrow
+- **kiro_cli_processing_output.txt** - Partial output during processing
+- **kiro_cli_permission_output.txt** - Permission request prompt
+- **kiro_cli_error_output.txt** - Error message output
+- **kiro_cli_complex_response.txt** - Multi-line response with code blocks
+- **kiro_cli_handoff_successful.txt** - Successful handoff between agents
+- **kiro_cli_handoff_error.txt** - Failed handoff with error message
+- **kiro_cli_handoff_with_permission.txt** - Handoff requiring user permission
 
 ## CI/CD Integration
 
 The project includes multiple GitHub Actions workflows that run on pull requests and pushes:
 
 ### Comprehensive Workflow (`ci.yml`)
-Runs **all tests** in `test/` (excluding Q CLI integration), plus security scanning:
+Runs **all tests** in `test/` (excluding provider integration tests), plus security scanning:
 - **Unit tests**: Python 3.10, 3.11, 3.12 matrix with coverage
 - **Code quality**: black, isort, mypy
 - **Security scan**: Trivy vulnerability scanner (CRITICAL/HIGH)
@@ -213,8 +134,6 @@ Each provider has a dedicated workflow that runs only when its files change:
 | `test-codex-provider.yml` | `test_codex_provider_unit.py` | `providers/codex.py`, `test/providers/**` |
 | `test-claude-code-provider.yml` | `test_claude_code_unit.py` | `providers/claude_code.py`, `test/providers/**` |
 | `test-kiro-cli-provider.yml` | `test_kiro_cli_unit.py` | `providers/kiro_cli.py`, `test/providers/**` |
-| `test-q-cli-provider.yml` | `test_q_cli_unit.py` | `providers/q_cli.py`, `test/providers/**` |
-| `test-gemini-cli-provider.yml` | `test_gemini_cli_unit.py` | `providers/gemini_cli.py`, `test/providers/**` |
 
 Each includes unit tests (Python 3.10/3.11/3.12) and code quality checks (black, isort, mypy).
 
@@ -223,14 +142,14 @@ Each includes unit tests (Python 3.10/3.11/3.12) and code quality checks (black,
 ### Unit Test Template
 
 ```python
-@patch("cli_agent_orchestrator.providers.q_cli.tmux_client")
+@patch("cli_agent_orchestrator.providers.kiro_cli.tmux_client")
 def test_new_feature(self, mock_tmux):
     """Test description."""
     # Setup mock
     mock_tmux.get_history.return_value = "test output"
     
     # Create provider
-    provider = QCliProvider("test1234", "test-session", "window-0", "developer")
+    provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
     
     # Execute test
     result = provider.some_method()
@@ -242,7 +161,7 @@ def test_new_feature(self, mock_tmux):
 ### Integration Test Template
 
 ```python
-def test_new_integration(self, q_cli_available, test_session_name, cleanup_session):
+def test_new_integration(self, kiro_cli_available, test_session_name, cleanup_session):
     """Test description."""
     # Create session
     tmux_client.create_session(test_session_name, detached=True)
@@ -250,7 +169,7 @@ def test_new_integration(self, q_cli_available, test_session_name, cleanup_sessi
     
     try:
         # Test logic
-        provider = QCliProvider("test1234", test_session_name, window_name, "developer")
+        provider = KiroCliProvider("test1234", test_session_name, window_name, "developer")
         # ... perform test operations
         
         assert result == expected
@@ -267,36 +186,29 @@ def test_new_integration(self, q_cli_available, test_session_name, cleanup_sessi
 uv sync
 ```
 
-### Fixture Files Have Wrong Encoding
-```bash
-# Regenerate fixtures
-uv run python test/providers/fixtures/generate_fixtures.py
-```
-
 ### Integration Tests Skip
-- Ensure Q CLI is installed: `which q`
-- Ensure Q CLI is authenticated: `q status`
+- Ensure Kiro CLI is installed: `which kiro`
+- Ensure Kiro CLI is authenticated (AWS credentials configured)
 - Check that tmux is installed: `which tmux`
 
 ### Coverage Not 100%
 Run with missing lines report:
 ```bash
-uv run pytest test/providers/test_q_cli_unit.py --cov=src/cli_agent_orchestrator/providers/q_cli.py --cov-report=term-missing
+uv run pytest test/providers/test_kiro_cli_unit.py --cov=src/cli_agent_orchestrator/providers/kiro_cli.py --cov-report=term-missing
 ```
 
 ## Maintenance
 
-### When Q CLI Output Format Changes
+### When Kiro CLI Output Format Changes
 
-1. Update fixture files in `fixtures/generate_fixtures.py`
-2. Regenerate: `uv run python test/providers/fixtures/generate_fixtures.py`
-3. Run tests to verify: `uv run pytest test/providers/test_q_cli_unit.py -v`
-4. Update integration tests if behavior changes
+1. Update the relevant fixture files in `fixtures/`
+2. Run tests to verify: `uv run pytest test/providers/test_kiro_cli_unit.py -v`
+3. Update integration tests if behavior changes
 
-### Adding New Q CLI Features
+### Adding New Kiro CLI Features
 
 1. Add unit tests first (TDD approach)
-2. Implement feature in q_cli.py
+2. Implement feature in kiro_cli.py
 3. Add integration test for end-to-end validation
 4. Update this README with new test info
 
@@ -304,7 +216,7 @@ uv run pytest test/providers/test_q_cli_unit.py --cov=src/cli_agent_orchestrator
 
 ### Understanding the Index Problem
 
-The Q CLI provider uses index-based extraction for parsing terminal output. This is critical to understand when testing handoff scenarios:
+The Kiro CLI provider uses index-based extraction for parsing terminal output. This is critical to understand when testing handoff scenarios:
 
 **How it works:**
 1. Regex finds match positions (indices) in the ORIGINAL string WITH ANSI codes
@@ -336,13 +248,13 @@ The Q CLI provider uses index-based extraction for parsing terminal output. This
 
 ```bash
 # Run all handoff unit tests
-uv run pytest test/providers/test_q_cli_unit.py::TestQCliProviderHandoffScenarios -v
+uv run pytest test/providers/test_kiro_cli_unit.py::TestKiroCliProviderHandoffScenarios -v
 
 # Run handoff integration tests
-uv run pytest test/providers/test_q_cli_integration.py::TestQCliProviderHandoffIntegration -v
+uv run pytest test/providers/test_kiro_cli_integration.py::TestKiroCliProviderHandoffIntegration -v
 
 # Run specific handoff test
-uv run pytest test/providers/test_q_cli_unit.py::TestQCliProviderHandoffScenarios::test_handoff_indices_not_corrupted -v
+uv run pytest test/providers/test_kiro_cli_unit.py::TestKiroCliProviderHandoffScenarios::test_handoff_indices_not_corrupted -v
 ```
 
 ## Claude Code Provider Tests
@@ -479,85 +391,6 @@ uv run pytest test/providers/test_codex_provider_unit.py --cov=src/cli_agent_orc
 uv run pytest test/providers/test_codex_provider_unit.py::TestCodexBuildCommand -v
 ```
 
-## Gemini CLI Provider Tests
-
-### Test Coverage (`test_gemini_cli_unit.py`)
-
-**72 tests covering:**
-
-1. **Initialization (4 tests)**
-   - Successful initialization (GEMINI.md system prompt injection, `-i` flag)
-   - Shell timeout handling
-   - Gemini CLI timeout handling
-   - Initialization with agent profile
-
-2. **Command Building (8 tests)**
-   - Base command without agent profile
-   - Command with agent profile (GEMINI.md injection)
-   - MCP server configuration (`~/.gemini/settings.json`)
-   - MCP server with environment variables
-   - Empty/None system prompt handling
-   - Agent profile load failure
-   - Sandbox mode flags
-
-3. **Status Detection (16 tests)**
-   - IDLE status (input box visible, no response)
-   - COMPLETED status (response with input box)
-   - PROCESSING status (partial output, no input box)
-   - ERROR status (error messages)
-   - Empty output handling
-   - tail_lines parameter
-   - Notification spinner detection (background spinners)
-   - Ink TUI chrome filtering
-
-4. **Message Extraction (14 tests)**
-   - Single-line `✦` response extraction
-   - Multi-line response with multiple `✦` bullets
-   - Tool call box extraction
-   - Multi-line query box parsing (wrapped queries)
-   - Missing response pattern fallback
-   - Empty response error
-   - Multiple responses (uses last)
-   - TUI chrome filtering (horizontal rules, footer info, shortcut hints)
-
-5. **Cleanup (4 tests)**
-   - GEMINI.md file cleanup
-   - MCP server config cleanup (`~/.gemini/settings.json`)
-   - Cleanup when files don't exist
-   - Error handling during cleanup
-
-6. **Edge Cases (26 tests)**
-   - Unicode characters in responses
-   - ANSI escape sequence cleaning
-   - Notification spinner text filtering
-   - Model info line detection
-   - YOLO mode toggle line filtering
-   - Complex multi-turn conversations
-   - Code blocks within responses
-
-**Coverage:** 96% of gemini_cli.py
-
-### Fixture Files
-
-- **gemini_cli_idle_output.txt** - Gemini CLI waiting for input
-- **gemini_cli_completed_output.txt** - Complete response with `✦` prefix
-- **gemini_cli_processing_output.txt** - Partial output during processing
-- **gemini_cli_error_output.txt** - Error message output
-- **gemini_cli_complex_response.txt** - Multi-line response with tool calls
-
-### Running Gemini CLI Tests
-
-```bash
-# Run all Gemini CLI unit tests
-uv run pytest test/providers/test_gemini_cli_unit.py -v
-
-# Run with coverage
-uv run pytest test/providers/test_gemini_cli_unit.py --cov=src/cli_agent_orchestrator/providers/gemini_cli.py --cov-report=term-missing -v
-
-# Run specific test class
-uv run pytest test/providers/test_gemini_cli_unit.py::TestGeminiCliProviderStatusDetection -v
-```
-
 ## Kiro CLI Provider Tests
 
 ### Running Kiro CLI Tests
@@ -573,7 +406,7 @@ uv run pytest test/providers/test_kiro_cli_unit.py --cov=src/cli_agent_orchestra
 uv run pytest test/providers/test_kiro_cli_unit.py::TestKiroCliProviderStatusDetection -v
 ```
 
-Note: Kiro CLI has identical output format to Q CLI, so the test structure and fixtures mirror the Q CLI tests.
+Note: Kiro CLI uses its own captured fixtures (`kiro_cli_*.txt`) for unit tests, mirroring the index-based extraction approach described under [Handoff Testing](#handoff-testing).
 
 ### Key Test Validations
 

@@ -110,7 +110,6 @@ class TestGetAgentDirs:
         # The overridden key should have the custom value
         assert result["kiro_cli"] == "/my/custom/kiro"
         # Other defaults should be preserved
-        assert result["q_cli"] == _DEFAULTS["q_cli"]
         assert result["claude_code"] == _DEFAULTS["claude_code"]
         assert result["codex"] == _DEFAULTS["codex"]
 
@@ -126,8 +125,8 @@ class TestSetAgentDirs:
 
     def test_updates_known_provider(self, settings_file):
         """set_agent_dirs updates a known provider and returns merged result."""
-        result = set_agent_dirs({"q_cli": "/new/q/path"})
-        assert result["q_cli"] == "/new/q/path"
+        result = set_agent_dirs({"codex": "/new/codex/path"})
+        assert result["codex"] == "/new/codex/path"
         # Other defaults preserved
         assert result["kiro_cli"] == _DEFAULTS["kiro_cli"]
 
@@ -147,10 +146,10 @@ class TestSetAgentDirs:
     def test_multiple_updates_accumulate(self, settings_file):
         """Successive set_agent_dirs calls accumulate overrides."""
         set_agent_dirs({"kiro_cli": "/first"})
-        set_agent_dirs({"q_cli": "/second"})
+        set_agent_dirs({"codex": "/second"})
         result = get_agent_dirs()
         assert result["kiro_cli"] == "/first"
-        assert result["q_cli"] == "/second"
+        assert result["codex"] == "/second"
 
     def test_mixed_known_and_unknown_providers(self, settings_file):
         """set_agent_dirs stores known and ignores unknown in a single call."""
