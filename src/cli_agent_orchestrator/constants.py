@@ -65,13 +65,10 @@ TERMINAL_LOG_DIR = LOG_DIR / "terminal"  # Per-terminal log files for pipe-pane 
 TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # FIFO directory for event-driven terminal output streaming
-# Use /tmp instead of CAO_HOME_DIR to avoid WSL2 Windows mount limitations
+# Use system temp directory to avoid WSL2 Windows mount limitations
 # (WSL2 doesn't support FIFO pipes on /mnt/c filesystem)
-# Falls back to system temp directory if /tmp doesn't exist (e.g., Windows-native)
 # Security: use a fixed subdirectory to avoid tempdir security issues
-# sonarqube:S5307 - Using /tmp is safe here because we create a subdirectory with mode=0o700 (owner-only)
-# The FIFO_DIR is created with restricted permissions to prevent unauthorized access
-TEMP_BASE = Path("/tmp") if Path("/tmp").exists() else Path(tempfile.gettempdir())
+TEMP_BASE = Path(tempfile.gettempdir())
 FIFO_DIR = (
     TEMP_BASE / "cli-agent-orchestrator" / "fifos"
 )  # Named pipes for tmux pipe-pane streaming
