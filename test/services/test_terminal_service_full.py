@@ -360,7 +360,8 @@ class TestCreateTerminal:
 
         skill_prompt = mock_provider_manager.create_provider.call_args.kwargs["skill_prompt"]
         assert skill_prompt == ""
-        mock_build_skill_catalog.assert_called_once_with()
+        # No `skills` field on the profile → catalog built with no filter (None).
+        mock_build_skill_catalog.assert_called_once_with(None)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("provider_name", ["kiro_cli", "copilot_cli"])
@@ -455,7 +456,10 @@ class TestCreateTerminal:
         mock_gen_window.return_value = "developer-abcd"
         mock_tmux.session_exists.return_value = False
         mock_load_profile.return_value = AgentProfile(
-            name="developer", description="Developer", system_prompt="You are the developer."
+            name="developer",
+            description="Developer",
+            system_prompt="You are the developer.",
+            skills=["ads-*"],
         )
         mock_build_skill_catalog.return_value = "## Available Skills\n\n- skill-a"
         mock_provider = AsyncMock()
@@ -466,7 +470,8 @@ class TestCreateTerminal:
 
         await create_terminal("claude_code", "developer", new_session=True)
 
-        mock_build_skill_catalog.assert_called_once_with()
+        # The profile's `skills` allowlist is threaded into the catalog builder.
+        mock_build_skill_catalog.assert_called_once_with(["ads-*"])
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("provider_name", ["opencode_cli", "kiro_cli", "copilot_cli"])

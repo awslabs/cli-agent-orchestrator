@@ -1,8 +1,9 @@
 """Skill loading and validation utilities."""
 
+import fnmatch
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import frontmatter
 from pydantic import ValidationError
@@ -161,9 +162,37 @@ def list_skills() -> List[SkillMetadata]:
     return sorted(skills_by_name.values(), key=lambda skill: skill.name)
 
 
-def build_skill_catalog() -> str:
-    """Build the injected skill catalog block for all installed skills."""
+def build_skill_catalog(skill_filter: Optional[List[str]] = None) -> str:
+    """Build the injected skill catalog block.
+
+    Args:
+        skill_filter: Optional allowlist of skill-name patterns — exact names or
+            case-sensitive fnmatch globs such as ``"ads-*"``. When ``None`` (the
+            default) every installed skill is listed, preserving the original
+            behaviour. When a list is given, only skills whose name matches at
+            least one pattern are listed; an empty list advertises no skills at
+            all. Patterns that match no installed skill are logged (usually a
+            typo or a stale skill name).
+    """
     skills = list_skills()
+    if skill_filter is not None:
+        matched_patterns: Set[str] = set()
+        selected: List[SkillMetadata] = []
+        for skill in skills:
+            keep = False
+            for pattern in skill_filter:
+                if fnmatch.fnmatchcase(skill.name, pattern):
+                    matched_patterns.add(pattern)
+                    keep = True
+            if keep:
+                selected.append(skill)
+        unmatched = [pattern for pattern in skill_filter if pattern not in matched_patterns]
+        if unmatched:
+            logger.warning(
+                "Skill-catalog filter matched no installed skill for pattern(s): %s",
+                ", ".join(repr(pattern) for pattern in unmatched),
+            )
+        skills = selected
     if not skills:
         return ""
 
