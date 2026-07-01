@@ -298,11 +298,14 @@ export function RunBoard() {
     return () => clearInterval(interval)
   }, [fetchAll])
 
-  // A flow event = a worker just joined an existing session; refresh NOW so
-  // the node (and the pulse heading to it) appears immediately.
+  // A delegation pulse (handoff/assign) = a worker just joined; refresh NOW so
+  // the node (and the pulse heading to it) appears immediately. Plain message
+  // pulses don't change the roster, so they ride the 10s reconcile instead of
+  // forcing a full per-session sweep on every reply.
+  const lastPulse = flowPulses[flowPulses.length - 1]
   useEffect(() => {
-    if (flowPulses.length) fetchAll()
-  }, [flowPulses.length])
+    if (lastPulse && (lastPulse.kind === 'handoff' || lastPulse.kind === 'assign')) fetchAll()
+  }, [lastPulse?.id])
 
   const runs = details
     .map(d => deriveRun(d, terminalStatuses))

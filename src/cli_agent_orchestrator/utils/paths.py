@@ -48,7 +48,7 @@ def normalize_working_directory(
         drive_mount = mnt_root / drive
         if not drive_mount.is_dir():
             raise ValueError(
-                f"'{working_directory}' is a Windows path, but drive {drive.upper()}: "
+                f"{working_directory!r} is a Windows path, but drive {drive.upper()}: "
                 f"is not mounted at {drive_mount}. Use the Linux path instead."
             )
         translated = drive_mount / rest
@@ -57,9 +57,9 @@ def normalize_working_directory(
 
     path = Path(cleaned).expanduser()
     if not path.is_absolute():
-        raise ValueError(f"Working directory must be an absolute path, got '{working_directory}'")
+        raise ValueError(f"Working directory must be an absolute path, got {working_directory!r}")
     if path.is_file():
-        raise ValueError(f"'{path}' is a file, not a folder")
+        raise ValueError(f"{str(path)!r} is a file, not a folder")
     if not path.exists():
         if not create_missing:
             raise ValueError(f"Folder does not exist: {path}")

@@ -471,7 +471,9 @@ async def add_server_time_header(request: Request, call_next):
     unaffected. (GH #292)
     """
     response = await call_next(request)
-    response.headers["X-Server-Time"] = datetime.now().isoformat()
+    # Offset-aware so a browser in a different timezone parses it unambiguously
+    # (a naive ISO string is read as browser-local time and skews the estimate).
+    response.headers["X-Server-Time"] = datetime.now().astimezone().isoformat()
     return response
 
 

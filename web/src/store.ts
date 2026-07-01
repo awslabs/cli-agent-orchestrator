@@ -133,10 +133,12 @@ export const useStore = create<Store>((set, get) => ({
       try {
         const { sender_id, receiver_id, kind } = JSON.parse(e.data)
         if (sender_id && receiver_id) {
-          get().pushFlowPulse({ sender: sender_id, receiver: receiver_id, kind: kind || 'message' })
-          // A flow event often means the roster just changed (a handoff
-          // spawned a worker) — refresh sooner than the slow reconcile.
-          get().fetchSessions()
+          const k = kind || 'message'
+          get().pushFlowPulse({ sender: sender_id, receiver: receiver_id, kind: k })
+          // Only delegation (handoff/assign) can add a worker to the roster, so
+          // refresh sooner only for those; plain message pulses are UI-only and
+          // ride the 10s reconcile, to avoid a /sessions burst on chatty runs.
+          if (k === 'handoff' || k === 'assign') get().fetchSessions()
         }
       } catch {
         // Malformed frame — ignore.
