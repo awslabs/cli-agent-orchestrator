@@ -1,0 +1,12 @@
+{
+  "$comment": "SINGLE SOURCE OF TRUTH for CAO agent/terminal status semantics. Unifies web StatusBadge.STATUS_CONFIG (UPPERCASE keys, Tailwind classes) and cao_mcp_apps AgentStatus (lowercase keys, host-CSS-variable classes). Each status maps to one label, one semanticRole (resolved to a color token in color.role), and a pulse flag. Order is significant: it is the canonical render/sort order. Run `node design-tokens/gen.mjs` to regenerate consumers.",
+  "statuses": {
+    "idle": { "label": "Idle", "semanticRole": "success", "pulse": false },
+    "processing": { "label": "Processing", "semanticRole": "info", "pulse": true },
+    "completed": { "label": "Completed", "semanticRole": "accent", "pulse": false },
+    "waiting_user_answer": { "label": "Awaiting Input", "semanticRole": "warning", "pulse": false },
+    "error": { "label": "Error", "semanticRole": "danger", "pulse": false },
+    "stopped": { "label": "Stopped", "semanticRole": "neutral", "pulse": false },
+    "unknown": { "label": "Unknown", "semanticRole": "neutral", "pulse": false }
+  }
+}

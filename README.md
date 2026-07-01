@@ -200,7 +200,7 @@ For hot-reload dev mode, remote access over SSH, and rebuilding the frontend fro
 
 ## MCP Apps — host-rendered fleet UI
 
-Beyond the browser dashboard, CAO can render its fleet UI **inside an MCP App-capable host** (Claude Desktop, Cursor, VS Code Insiders, Goose) using the [SEP-1865 "MCP Apps"](https://modelcontextprotocol.io/seps/1865-mcp-apps-interactive-user-interfaces-for-mcp) extension — so you observe and steer agents without leaving your chat host. It ships three single-file views (`ui://cao/dashboard`, `ui://cao/agent`, `ui://cao/event-stream`) plus a build-free topology widget, backed by an in-process event ring buffer and a single audited `submit_command` mutation path.
+Beyond the browser dashboard, CAO can render its fleet UI **inside an MCP App-capable host** (Claude / Claude Desktop, ChatGPT, VS Code GitHub Copilot, Microsoft 365 Copilot, Goose, Postman, MCPJam, Archestra.AI — see the [client matrix](https://modelcontextprotocol.io/extensions/client-matrix)) using the [MCP Apps](https://modelcontextprotocol.io/extensions/apps/overview) extension (SEP-1865) — so you observe and steer agents without leaving your chat host. It ships three single-file views (`ui://cao/dashboard`, `ui://cao/agent`, `ui://cao/event-stream`) plus a build-free topology widget, backed by an in-process event ring buffer and a single audited `submit_command` mutation path.
 
 ![CAO MCP Apps — fleet dashboard rendered in an MCP App host](docs/media/mcp-apps-dashboard.png)
 
@@ -215,6 +215,8 @@ cao-mcp-server    # registers the MCP App tools/resources for your host
 ```
 
 New in this area: `src/cli_agent_orchestrator/ext_apps/` (resources + topology widget), `cao_mcp_apps/` (JIT-free React views), `src/cli_agent_orchestrator/plugins/builtin/mcp_apps.py` (the plugin), with docs in [docs/mcp-apps.md](docs/mcp-apps.md), a worked example in [examples/mcp-apps/](examples/mcp-apps/), and the [skills/cao-mcp-apps](skills/cao-mcp-apps/SKILL.md) operator playbook. Optional default-off OAuth 2.1 scopes (`cao:read`/`cao:write`/`cao:admin`) gate mutations when an IdP is configured.
+
+The single-file views are built from source under `cao_mcp_apps/` — see [cao_mcp_apps/README.md](cao_mcp_apps/README.md) for the dev workflow (build, test, and the CI coverage/JIT/bundle-size gates). Node.js is only needed to rebuild them, not to run CAO.
 
 ## Multi-Agent Orchestration
 

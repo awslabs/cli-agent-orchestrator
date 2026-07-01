@@ -41,16 +41,25 @@ SCOPE_PRECEDENCE: dict = {
     "project": 1,
     "global": 2,
     "agent": 3,
+    "federated": 4,
 }
 
 # Cross-scope write authorisation table. Caller may write a target
-# scope iff ``SCOPE_RANK[caller] >= SCOPE_RANK[target]``. ``agent`` and
-# ``project`` share rank 1 — siblings; cross-sibling writes are rejected.
+# scope iff ``caller == target`` OR ``SCOPE_RANK[caller] > SCOPE_RANK[target]``
+# (strict). ``agent`` and ``project`` share rank 1 — siblings; cross-sibling
+# writes are rejected.
+#
+# ``federated`` is intentionally asymmetric: it has the LOWEST recall
+# precedence (4 in SCOPE_PRECEDENCE — last on recall) yet write-rank 0,
+# so it is writable by every caller except ``session`` (rank 0 can only
+# write its own scope). This mirrors how ``session`` is write-rank 0 but
+# has the HIGHEST recall precedence (0) — the two tables are independent.
 SCOPE_RANK: dict = {
     "session": 0,
     "project": 1,
     "agent": 1,
     "global": 2,
+    "federated": 0,
 }
 
 
@@ -118,8 +127,12 @@ def scope_write_allowed(caller: str, target: str) -> bool:
     """Store-time scope guard.
 
     Returns True iff a caller running at ``caller`` scope is permitted to
-    write a memory at ``target`` scope. ``agent`` and ``project`` are
-    siblings at rank 1; cross-sibling writes are rejected.
+    write a memory at ``target`` scope. The rule is: ``caller == target`` OR
+    ``SCOPE_RANK[caller] > SCOPE_RANK[target]`` (strict). ``agent`` and
+    ``project`` are siblings at rank 1; cross-sibling writes are rejected.
+    Strictness matters for ``federated`` (rank 0): ``session`` (also rank 0)
+    cannot write it because ``0 > 0`` is False, while any higher-rank caller
+    can — i.e. writable by every caller except session.
 
     Unknown scopes (not in ``SCOPE_RANK``) deny by default — fail closed.
     """

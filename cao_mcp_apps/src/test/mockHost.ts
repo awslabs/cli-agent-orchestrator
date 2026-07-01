@@ -53,6 +53,10 @@ export interface MockHostOptions {
   origin?: string;
   /** hostContext returned from `ui/initialize` (model a no-UI-surface host here). */
   hostContext?: Record<string, unknown>;
+  /** hostCapabilities returned from `ui/initialize` (e.g. `{ openLinks: {} }`). */
+  hostCapabilities?: Record<string, unknown>;
+  /** When true, the host denies `ui/open-link` requests (models user/policy denial). */
+  denyOpenLink?: boolean;
   /** Wrap tool results as a CallToolResult with a plain-text content block too. */
   includePlainText?: boolean;
 }
@@ -75,16 +79,24 @@ export class MockHost {
     structuredContent?: unknown;
   }> = [];
   readonly toolCalls: ToolCallRecord[] = [];
+  /** URLs the View asked the host to open via `ui/open-link`. */
+  readonly openedLinks: string[] = [];
+  /** Display modes the View requested via `ui/request-display-mode`. */
+  readonly displayModeRequests: string[] = [];
   initialized = false;
 
   private tools: Record<string, ToolImpl>;
   private hostContext: Record<string, unknown>;
+  private hostCapabilities: Record<string, unknown>;
+  private denyOpenLink: boolean;
   private includePlainText: boolean;
 
   constructor(options: MockHostOptions = {}) {
     this.tools = options.tools ?? {};
     this.origin = options.origin ?? "https://host.example";
     this.hostContext = options.hostContext ?? {};
+    this.hostCapabilities = options.hostCapabilities ?? {};
+    this.denyOpenLink = options.denyOpenLink ?? false;
     this.includePlainText = options.includePlainText ?? true;
     this.hostWindow.addEventListener("message", (event) =>
       this.handle(event.data),
@@ -132,11 +144,31 @@ export class MockHost {
     const { id, method, params } = frame;
 
     if (method === "ui/initialize") {
-      this.reply(id, { hostContext: this.hostContext });
+      this.reply(id, {
+        hostContext: this.hostContext,
+        hostCapabilities: this.hostCapabilities,
+      });
       return;
     }
     if (method === "ui/notifications/initialized") {
       this.initialized = true;
+      return;
+    }
+    if (method === "ui/open-link") {
+      const url = params?.url as string;
+      if (this.denyOpenLink) {
+        this.replyError(id, "Link opening denied by user");
+        return;
+      }
+      this.openedLinks.push(url);
+      this.reply(id, {});
+      return;
+    }
+    if (method === "ui/request-display-mode") {
+      const mode = params?.mode as string;
+      this.displayModeRequests.push(mode);
+      // Echo the requested mode as the resulting mode (host accepted it).
+      this.reply(id, { mode });
       return;
     }
     if (method === "ui/update-model-context") {

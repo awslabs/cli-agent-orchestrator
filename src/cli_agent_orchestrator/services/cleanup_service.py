@@ -85,6 +85,7 @@ SCOPE_RETENTION_DAYS: dict[str, int | None] = {
     "agent": None,
     "project": 90,
     "session": 14,
+    "federated": None,
 }
 PERMANENT_MEMORY_TYPES: frozenset[str] = frozenset({"user", "feedback"})
 
@@ -124,9 +125,10 @@ async def cleanup_expired_memories() -> None:
                 continue
 
             # Extract scope_id from path: .../memory/{scope_id}/wiki/index.md
-            # "global" dir → scope_id=None, project hash dirs → scope_id=hash
+            # "global"/"federated" dirs → scope_id=None (flat, machine-wide),
+            # project hash dirs → scope_id=hash
             project_dir_name = index_path.parent.parent.name
-            scope_id = None if project_dir_name == "global" else project_dir_name
+            scope_id = None if project_dir_name in ("global", "federated") else project_dir_name
 
             for entry in expired_entries:
                 try:
@@ -190,7 +192,7 @@ def _find_expired_entries(index_path: Path, now: datetime) -> list[dict]:
         # Detect scope section headers: ## global, ## session, etc.
         if line.startswith("## "):
             section = line[3:].strip()
-            if section in ("global", "project", "session", "agent"):
+            if section in ("global", "project", "session", "agent", "federated"):
                 current_scope = section
             continue
 

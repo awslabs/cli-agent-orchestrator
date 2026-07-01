@@ -18,6 +18,7 @@ from cli_agent_orchestrator.ext_apps import (
     register_apps,
     ui_meta,
 )
+from cli_agent_orchestrator.ext_apps.apps import RESOURCE_MIME_TYPE
 
 
 class TestUiMeta:
@@ -31,6 +32,8 @@ class TestUiMeta:
         assert "resourceUri" not in ui
         assert "preferredFrameSize" not in ui
         assert "domain" not in ui
+        # CAO declares no elevated browser permissions by design.
+        assert "permissions" not in ui
 
     def test_enriched_shape_with_resource(self) -> None:
         meta = ui_meta(visibility=["model", "app"], resource_uri=DASHBOARD_RESOURCE_URI)
@@ -40,6 +43,28 @@ class TestUiMeta:
         assert ui["preferredFrameSize"] == PREFERRED_FRAMES[DASHBOARD_RESOURCE_URI]
         assert ui["prefersBorder"] is True
         assert ui["domain"] == "cao-dashboard"
+        # No elevated permissions requested for the read-only fleet views.
+        assert "permissions" not in ui
+
+    def test_permissions_omitted_by_default(self) -> None:
+        # The spec `permissions` field is an OBJECT keyed by capability
+        # (camera/microphone/geolocation/clipboardWrite). CAO needs none, so the
+        # field is omitted (== no permissions requested, per the spec default).
+        assert "permissions" not in ui_meta()["ui"]
+        assert "permissions" not in ui_meta(resource_uri=AGENT_RESOURCE_URI)["ui"]
+
+    def test_permissions_emitted_as_object_when_requested(self) -> None:
+        # Fidelity: when a caller declares permissions, they pass through as the
+        # spec's object shape (each capability is an empty object `{}`).
+        meta = ui_meta(
+            resource_uri=DASHBOARD_RESOURCE_URI,
+            permissions={"clipboardWrite": {}},
+        )
+        assert meta["ui"]["permissions"] == {"clipboardWrite": {}}
+
+    def test_resource_mime_type_is_spec_literal(self) -> None:
+        # SEP-1865 (stable 2026-01-26): HTML UI resources MUST use this MIME.
+        assert RESOURCE_MIME_TYPE == "text/html;profile=mcp-app"
 
     def test_default_frame_for_unknown_resource(self) -> None:
         meta = ui_meta(resource_uri="ui://cao/unknown")

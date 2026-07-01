@@ -20,7 +20,13 @@
 // Env overrides: CHROMIUM_BIN, FFMPEG_BIN, DEMO_PORT.
 
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, renameSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+} from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -34,8 +40,9 @@ const BASE = `http://127.0.0.1:${PORT}`;
 const OUT_DIR = resolve(REPO, "docs/media");
 const TMP_DIR = resolve(ROOT, ".demo-tmp");
 const CHROMIUM_BIN = process.env.CHROMIUM_BIN || "/opt/pw-browsers/chromium";
-const FFMPEG_BIN = process.env.FFMPEG_BIN || "/opt/pw-browsers/ffmpeg-1011/ffmpeg-linux";
-const VIEWPORT = { width: 1280, height: 800 };
+const FFMPEG_BIN =
+  process.env.FFMPEG_BIN || "/opt/pw-browsers/ffmpeg-1011/ffmpeg-linux";
+const VIEWPORT = { width: 1320, height: 820 };
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -62,7 +69,9 @@ async function emit(event) {
 
 function ffmpegHasGif(bin) {
   try {
-    const r = spawnSync(bin, ["-hide_banner", "-encoders"], { encoding: "utf8" });
+    const r = spawnSync(bin, ["-hide_banner", "-encoders"], {
+      encoding: "utf8",
+    });
     return r.status === 0 && /\bgif\b/.test(r.stdout || "");
   } catch {
     return false;
@@ -72,13 +81,16 @@ function ffmpegHasGif(bin) {
 function run(bin, args) {
   return new Promise((res, rej) => {
     const p = spawn(bin, args, { stdio: "inherit" });
-    p.on("exit", (code) => (code === 0 ? res() : rej(new Error(`${bin} exited ${code}`))));
+    p.on("exit", (code) =>
+      code === 0 ? res() : rej(new Error(`${bin} exited ${code}`)),
+    );
     p.on("error", rej);
   });
 }
 
 async function main() {
-  if (!existsSync(CHROMIUM_BIN)) throw new Error(`chromium not found at ${CHROMIUM_BIN}`);
+  if (!existsSync(CHROMIUM_BIN))
+    throw new Error(`chromium not found at ${CHROMIUM_BIN}`);
   rmSync(TMP_DIR, { recursive: true, force: true });
   mkdirSync(TMP_DIR, { recursive: true });
   mkdirSync(OUT_DIR, { recursive: true });
@@ -93,7 +105,11 @@ async function main() {
     const browser = await chromium.launch({
       executablePath: CHROMIUM_BIN,
       headless: true,
-      args: ["--no-sandbox", "--disable-dev-shm-usage", "--force-color-profile=srgb"],
+      args: [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--force-color-profile=srgb",
+      ],
     });
     const context = await browser.newContext({
       viewport: VIEWPORT,
@@ -101,28 +117,86 @@ async function main() {
       deviceScaleFactor: 1,
     });
     const page = await context.newPage();
-    const shot = (name) => page.screenshot({ path: resolve(OUT_DIR, `mcp-apps-${name}.png`) });
+    const shot = (name) =>
+      page.screenshot({ path: resolve(OUT_DIR, `mcp-apps-${name}.png`) });
 
-    // 1) Operator dashboard — sessions, terminals, provider status.
-    await page.goto(`${BASE}/host.html?view=dashboard`, { waitUntil: "domcontentloaded" });
-    await sleep(3500);
+    // 1) Operator dashboard — supervisor + workers, providers, live statuses.
+    await page.goto(`${BASE}/host.html?view=dashboard&fleet=rich`, {
+      waitUntil: "domcontentloaded",
+    });
+    await sleep(4000);
     await shot("dashboard");
 
-    // 2) Drill into one agent.
-    await page.goto(`${BASE}/host.html?view=agent`, { waitUntil: "domcontentloaded" });
+    // 2) Drill into the supervisor (agent detail shows its delegation log).
+    await page.goto(`${BASE}/host.html?view=agent&fleet=rich`, {
+      waitUntil: "domcontentloaded",
+    });
     await sleep(3500);
     await shot("agent");
 
     // 3) Live event stream — push governance events and watch it update.
-    await page.goto(`${BASE}/host.html?view=event-stream`, { waitUntil: "domcontentloaded" });
-    await sleep(800);
+    await page.goto(`${BASE}/host.html?view=event-stream&fleet=rich`, {
+      waitUntil: "domcontentloaded",
+    });
+    await sleep(900);
     const now = 1750000000000;
     const events = [
-      { id: "e1", kind: "launch", terminal_id: "t1", session: "cao-demo", ts: now },
-      { id: "e2", kind: "handoff", terminal_id: "t1", session: "cao-demo", ts: now + 1 },
-      { id: "e3", kind: "a2a_delegation", terminal_id: "t2", session: "cao-demo", ts: now + 2 },
-      { id: "e4", kind: "file_mod", terminal_id: "t2", session: "cao-demo", ts: now + 3 },
-      { id: "e5", kind: "completion", terminal_id: "t1", session: "cao-demo", ts: now + 4 },
+      {
+        id: "L1",
+        kind: "launch",
+        terminal_id: "sup-1",
+        session: "cao-feature-build",
+        ts: now,
+      },
+      {
+        id: "L2",
+        kind: "a2a_delegation",
+        terminal_id: "sup-1",
+        session: "cao-feature-build",
+        ts: now + 1,
+      },
+      {
+        id: "L3",
+        kind: "launch",
+        terminal_id: "dev-1",
+        session: "cao-feature-build",
+        ts: now + 2,
+      },
+      {
+        id: "L4",
+        kind: "file_mod",
+        terminal_id: "dev-1",
+        session: "cao-feature-build",
+        ts: now + 3,
+      },
+      {
+        id: "L5",
+        kind: "handoff",
+        terminal_id: "sup-1",
+        session: "cao-review",
+        ts: now + 4,
+      },
+      {
+        id: "L6",
+        kind: "a2a_delegation",
+        terminal_id: "sup-1",
+        session: "cao-review",
+        ts: now + 5,
+      },
+      {
+        id: "L7",
+        kind: "completion",
+        terminal_id: "test-1",
+        session: "cao-feature-build",
+        ts: now + 6,
+      },
+      {
+        id: "L8",
+        kind: "error",
+        terminal_id: "doc-1",
+        session: "cao-review",
+        ts: now + 7,
+      },
     ];
     for (const ev of events) {
       await emit(ev);
@@ -140,7 +214,9 @@ async function main() {
     const outWebm = resolve(OUT_DIR, "mcp-apps-demo.webm");
     renameSync(resolve(TMP_DIR, webm), outWebm);
     console.log(`[demo] wrote ${outWebm}`);
-    console.log(`[demo] wrote screenshots: mcp-apps-{dashboard,agent,event-stream}.png`);
+    console.log(
+      `[demo] wrote screenshots: mcp-apps-{dashboard,agent,event-stream}.png`,
+    );
 
     // Optional GIF — only when a gif-capable encoder is available. Playwright's
     // bundled ffmpeg is a webm-only build (no gif encoder), so this is skipped
@@ -149,10 +225,23 @@ async function main() {
     if (ffmpegHasGif(FFMPEG_BIN)) {
       const palette = resolve(TMP_DIR, "palette.png");
       const vf = "fps=10,scale=900:-1:flags=lanczos";
-      await run(FFMPEG_BIN, ["-y", "-i", outWebm, "-vf", `${vf},palettegen`, palette]);
       await run(FFMPEG_BIN, [
-        "-y", "-i", outWebm, "-i", palette,
-        "-filter_complex", `${vf}[x];[x][1:v]paletteuse`, outGif,
+        "-y",
+        "-i",
+        outWebm,
+        "-vf",
+        `${vf},palettegen`,
+        palette,
+      ]);
+      await run(FFMPEG_BIN, [
+        "-y",
+        "-i",
+        outWebm,
+        "-i",
+        palette,
+        "-filter_complex",
+        `${vf}[x];[x][1:v]paletteuse`,
+        outGif,
       ]);
       console.log(`[demo] wrote ${outGif}`);
     } else {

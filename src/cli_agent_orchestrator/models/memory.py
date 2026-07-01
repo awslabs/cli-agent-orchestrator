@@ -54,6 +54,7 @@ class MemoryScope(str, Enum):
     PROJECT = "project"
     SESSION = "session"
     AGENT = "agent"
+    FEDERATED = "federated"
 
 
 class MemoryType(str, Enum):
@@ -71,7 +72,7 @@ class Memory(BaseModel):
     id: str = Field(..., description="Unique memory identifier")
     key: str = Field(..., description="Slug identifier, e.g. 'prefer-pytest'")
     memory_type: str = Field(..., description="One of: user, feedback, project, reference")
-    scope: str = Field(..., description="One of: global, project, session, agent")
+    scope: str = Field(..., description="One of: global, project, session, agent, federated")
     scope_id: Optional[str] = Field(None, description="Auto-resolved scope identifier")
     file_path: str = Field(..., description="Path to wiki topic file")
     tags: str = Field(default="", description="Comma-separated tags")

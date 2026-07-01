@@ -51,8 +51,11 @@ _RESOURCE_FILES = {
     EVENT_STREAM_RESOURCE_URI: "event-stream.html",
 }
 
-# Preferred iframe sizes per resource. Hosts treat these as SEP-1865 layout
-# hints, not hard caps; ``ui_meta`` attaches the matching entry as
+# Preferred iframe sizes per resource. NOTE: `preferredFrameSize` is a
+# **CAO-specific** hint, NOT part of the SEP-1865 `_meta.ui` schema — the spec
+# sizes views via the host's `HostContext.containerDimensions` and the View's
+# `ui/notifications/size-changed` notification. CAO attaches it as an additive
+# hint hosts MAY ignore; ``ui_meta`` writes the matching entry as
 # ``_meta.ui.preferredFrameSize``. The dashboard is widest (fleet table), the
 # agent view is medium (single-agent detail), and the event ticker is compact.
 _DEFAULT_FRAME: Dict[str, int] = {"width": 1280, "height": 800}
@@ -100,13 +103,17 @@ def ui_meta(
     required_scopes: Optional[List[str]] = None,
     visibility: Optional[List[str]] = None,
     resource_uri: Optional[str] = None,
+    permissions: Optional[dict] = None,
 ) -> dict:
     """Build the ``_meta.ui`` annotation attached to an MCP App tool/resource.
 
     Returns the SEP-1865 ``_meta.ui`` object. ``visibility`` and ``resourceUri``
-    are the spec-defined keys (nested under ``ui``); ``csp`` is the structured
-    domain object the host composes a CSP from; ``requiredScopes`` is a CAO
-    extension the choke point reads for its scope pre-check.
+    are the spec-defined tool keys; ``csp``, ``permissions``, ``domain`` and
+    ``prefersBorder`` are the spec-defined resource keys; ``requiredScopes`` and
+    ``preferredFrameSize`` are CAO extensions (the choke point reads
+    ``requiredScopes`` for its scope pre-check; ``preferredFrameSize`` is an
+    additive sizing hint — the spec itself sizes via ``containerDimensions`` /
+    ``ui/notifications/size-changed``).
 
     Args:
         csp: Structured CSP domains (``connectDomains`` / ``resourceDomains`` /
@@ -116,6 +123,11 @@ def ui_meta(
         visibility: ``["model", "app"]`` or ``["app"]`` per SEP-1865. Omitted for
             resources (which are not tools).
         resource_uri: The ``ui://cao/*`` resource the tool result renders in.
+        permissions: Spec ``_meta.ui.permissions`` object keyed by capability
+            (``camera`` / ``microphone`` / ``geolocation`` / ``clipboardWrite``,
+            each an empty object ``{}``). Omitted by default: CAO's read-only
+            fleet views request **no elevated browser permissions**. Supported
+            here for full spec fidelity / downstream reuse.
 
     Returns:
         ``{"ui": {...}}`` suitable to pass as a tool's ``_meta``.
@@ -125,14 +137,20 @@ def ui_meta(
         "csp": csp or dict(DEFAULT_CSP),
         "requiredScopes": list(required_scopes) if required_scopes else [],
     }
+    # Spec `_meta.ui.permissions` is an OBJECT keyed by capability, NOT an array.
+    # Emit only when explicitly requested; an omitted field == no permissions
+    # requested (the spec's secure default), which is CAO's posture.
+    if permissions:
+        ui["permissions"] = dict(permissions)
     if visibility is not None:
         ui["visibility"] = list(visibility)
     if resource_uri is not None:
         ui["resourceUri"] = resource_uri
-        # SEP-1865 layout hints, attached only for resource-rendering tools. A
-        # per-resource preferred frame size, a border preference, and a stable
-        # per-resource sandbox ``domain`` key. Hosts that don't understand these
-        # keys ignore them; hosts that do use them to size and isolate the iframe.
+        # Spec resource keys (prefersBorder, domain) plus the CAO-specific
+        # preferredFrameSize sizing hint, attached only for resource-rendering
+        # tools. Hosts that don't understand a key ignore it; the spec sizes via
+        # containerDimensions / size-changed, with preferredFrameSize as an
+        # additive CAO hint.
         ui["preferredFrameSize"] = dict(PREFERRED_FRAMES.get(resource_uri, _DEFAULT_FRAME))
         ui["prefersBorder"] = True
         ui["domain"] = resource_uri.split("//", 1)[-1].replace("/", "-")

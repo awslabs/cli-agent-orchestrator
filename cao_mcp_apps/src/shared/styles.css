@@ -3,19 +3,13 @@
  * The root establishes a query container (`container-type: inline-size`) so the
  * grid responds to the iframe's own width — not the viewport — which is what an
  * MCP host actually controls. Theme colors fall back to sane defaults
- * but consume host-provided CSS variables when present (SEP-1865 theming). */
+ * but consume host-provided CSS variables when present (SEP-1865 theming).
+ *
+ * The :root fallback block is generated from the shared design-token SSOT
+ * (design-tokens/tokens.json) via `node design-tokens/gen.mjs`. Host CSS
+ * variables still override these defaults at runtime — theming is preserved. */
 
-:root {
-  --color-background-primary: light-dark(#ffffff, #171717);
-  --color-background-secondary: light-dark(#f5f5f5, #1f1f1f);
-  --color-text-primary: light-dark(#171717, #fafafa);
-  --color-text-secondary: light-dark(#525252, #a3a3a3);
-  --color-border-primary: light-dark(#e5e5e5, #333333);
-  --color-background-danger: light-dark(#fef2f2, #3f1d1d);
-  --color-text-danger: light-dark(#b91c1c, #fca5a5);
-  --font-sans: system-ui, -apple-system, sans-serif;
-  --border-radius-md: 8px;
-}
+@import "./tokens.generated.css";
 
 * {
   box-sizing: border-box;
@@ -110,11 +104,40 @@ body {
   border: 1px solid var(--color-border-primary);
 }
 
-.cao-status-idle { color: #2563eb; }
-.cao-status-processing { color: #d97706; }
-.cao-status-completed { color: #16a34a; }
-.cao-status-error { color: var(--color-text-danger); }
-.cao-status-stopped { color: var(--color-text-secondary); }
+/* Status colors map status -> semantic role -> host-overridable CSS variable
+ * (defined in tokens.generated.css). The status -> role mapping mirrors the
+ * SSOT in design-tokens/status.json. */
+.cao-status-idle {
+  color: var(--cao-status-success);
+}
+.cao-status-processing {
+  color: var(--cao-status-info);
+}
+.cao-status-completed {
+  color: var(--cao-status-accent);
+}
+.cao-status-waiting_user_answer {
+  color: var(--cao-status-warning);
+}
+.cao-status-error {
+  color: var(--cao-status-danger);
+}
+.cao-status-stopped {
+  color: var(--cao-status-neutral);
+}
+.cao-status-unknown {
+  color: var(--cao-status-neutral);
+}
+
+/* Pulse affordance — driven by the `pulse` flag in status.generated.ts. */
+.cao-status-pulse {
+  animation: cao-status-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+@keyframes cao-status-pulse {
+  50% {
+    opacity: 0.5;
+  }
+}
 
 .cao-events {
   list-style: none;
@@ -135,12 +158,24 @@ body {
   overflow-wrap: anywhere;
 }
 
-.cao-event-launch { border-left-color: #2563eb; }
-.cao-event-handoff { border-left-color: #7c3aed; }
-.cao-event-a2a_delegation { border-left-color: #0891b2; }
-.cao-event-file_mod { border-left-color: #ca8a04; }
-.cao-event-completion { border-left-color: #16a34a; }
-.cao-event-error { border-left-color: #dc2626; }
+.cao-event-launch {
+  border-left-color: #2563eb;
+}
+.cao-event-handoff {
+  border-left-color: #7c3aed;
+}
+.cao-event-a2a_delegation {
+  border-left-color: #0891b2;
+}
+.cao-event-file_mod {
+  border-left-color: #ca8a04;
+}
+.cao-event-completion {
+  border-left-color: #16a34a;
+}
+.cao-event-error {
+  border-left-color: #dc2626;
+}
 
 .cao-event-time {
   color: var(--color-text-secondary);
@@ -184,6 +219,31 @@ body {
 .cao-btn-danger {
   color: var(--color-text-danger);
   background: var(--color-background-danger);
+}
+
+.cao-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 6px 8px 0;
+}
+
+/* Supervisor (fleet coordinator) distinction. */
+.cao-card-supervisor {
+  border-color: var(--color-border-info, #4c8bf5);
+  box-shadow: inset 3px 0 0 0 var(--color-border-info, #4c8bf5);
+}
+.cao-role-badge {
+  margin-left: 8px;
+  padding: 1px 6px;
+  font-size: 0.65rem;
+  font-weight: var(--font-weight-semibold, 600);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border-radius: var(--border-radius-full, 999px);
+  color: var(--color-text-info, #1a56db);
+  background: var(--color-background-info, #e8f0fe);
+  vertical-align: middle;
 }
 
 .cao-taskcontrol-error {

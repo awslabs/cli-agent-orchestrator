@@ -27,9 +27,172 @@
 (function () {
   const params = new URLSearchParams(location.search);
   const view = params.get("view") || "dashboard";
+  // `fleet=rich` selects the multi-agent demo fleet (used by the demo recorder).
+  // The default single-terminal fleet keeps the deterministic state the e2e
+  // specs assert against.
+  const fleet = params.get("fleet") || "default";
+  const useRich = fleet === "rich";
 
   // --- canned, mutable fleet state ----------------------------------------
-  const state = {
+  // A robust multi-agent fleet: one supervisor coordinating five workers across
+  // two sessions, with varied live statuses (processing / idle /
+  // waiting_user_answer / completed / error) so the dashboard reads as a real,
+  // first-class orchestration console. The supervisor is listed first.
+  const nowIso = () => new Date().toISOString();
+  const RICH = {
+    terminals: [
+      {
+        id: "sup-1",
+        session_name: "cao-feature-build",
+        provider: "kiro_cli",
+        agent_profile: "code_supervisor",
+        status: "processing",
+        window: "w0",
+        last_active: nowIso(),
+      },
+      {
+        id: "dev-1",
+        session_name: "cao-feature-build",
+        provider: "kiro_cli",
+        agent_profile: "developer",
+        status: "processing",
+        window: "w1",
+        last_active: nowIso(),
+      },
+      {
+        id: "dev-2",
+        session_name: "cao-feature-build",
+        provider: "claude_code",
+        agent_profile: "developer",
+        status: "idle",
+        window: "w2",
+        last_active: nowIso(),
+      },
+      {
+        id: "test-1",
+        session_name: "cao-feature-build",
+        provider: "codex",
+        agent_profile: "test-engineer",
+        status: "completed",
+        window: "w3",
+        last_active: nowIso(),
+      },
+      {
+        id: "rev-1",
+        session_name: "cao-review",
+        provider: "kiro_cli",
+        agent_profile: "reviewer",
+        status: "waiting_user_answer",
+        window: "w0",
+        last_active: nowIso(),
+      },
+      {
+        id: "doc-1",
+        session_name: "cao-review",
+        provider: "gemini_cli",
+        agent_profile: "documentation-curator",
+        status: "error",
+        window: "w1",
+        last_active: nowIso(),
+      },
+    ],
+    events: [
+      {
+        id: "s1",
+        kind: "launch",
+        terminal_id: "sup-1",
+        session_name: "cao-feature-build",
+        timestamp: nowIso(),
+        detail: { agent_name: "code_supervisor" },
+      },
+      {
+        id: "s2",
+        kind: "a2a_delegation",
+        terminal_id: "sup-1",
+        session_name: "cao-feature-build",
+        timestamp: nowIso(),
+        detail: { to: "developer" },
+      },
+      {
+        id: "s3",
+        kind: "launch",
+        terminal_id: "dev-1",
+        session_name: "cao-feature-build",
+        timestamp: nowIso(),
+        detail: { agent_name: "developer" },
+      },
+      {
+        id: "s4",
+        kind: "launch",
+        terminal_id: "dev-2",
+        session_name: "cao-feature-build",
+        timestamp: nowIso(),
+        detail: { agent_name: "developer" },
+      },
+      {
+        id: "s5",
+        kind: "handoff",
+        terminal_id: "sup-1",
+        session_name: "cao-feature-build",
+        timestamp: nowIso(),
+        detail: { to: "test-engineer" },
+      },
+      {
+        id: "s6",
+        kind: "file_mod",
+        terminal_id: "dev-1",
+        session_name: "cao-feature-build",
+        timestamp: nowIso(),
+        detail: { path: "ext_apps/apps.py" },
+      },
+      {
+        id: "s7",
+        kind: "launch",
+        terminal_id: "test-1",
+        session_name: "cao-feature-build",
+        timestamp: nowIso(),
+        detail: { agent_name: "test-engineer" },
+      },
+      {
+        id: "s8",
+        kind: "completion",
+        terminal_id: "test-1",
+        session_name: "cao-feature-build",
+        timestamp: nowIso(),
+        detail: { result: "tests green" },
+      },
+      {
+        id: "s9",
+        kind: "a2a_delegation",
+        terminal_id: "sup-1",
+        session_name: "cao-review",
+        timestamp: nowIso(),
+        detail: { to: "reviewer" },
+      },
+      {
+        id: "s10",
+        kind: "file_mod",
+        terminal_id: "dev-2",
+        session_name: "cao-feature-build",
+        timestamp: nowIso(),
+        detail: { path: "shared/mcpApp.ts" },
+      },
+      {
+        id: "s11",
+        kind: "error",
+        terminal_id: "doc-1",
+        session_name: "cao-review",
+        timestamp: nowIso(),
+        detail: { error: "link check failed" },
+      },
+    ],
+    toolCalls: {},
+    submits: 0,
+    modelNotes: [],
+  };
+
+  // Default deterministic fleet — the state the e2e specs assert against.
+  const DEFAULT = {
     terminals: [
       {
         id: "t1",
@@ -47,20 +210,65 @@
         kind: "launch",
         terminal_id: "t1",
         session_name: "cao-main",
-        timestamp: new Date().toISOString(),
+        timestamp: nowIso(),
         detail: {},
       },
     ],
+  };
+
+  const chosen = useRich ? RICH : DEFAULT;
+  const state = {
+    terminals: chosen.terminals.map((t) => ({ ...t })),
+    events: chosen.events.map((e) => ({ ...e })),
     toolCalls: {},
     submits: 0,
     modelNotes: [],
   };
+  // Which terminal the agent-detail view hydrates with on open.
+  const AGENT_VIEW_ID = useRich ? "sup-1" : "t1";
+
+  // Per-role output tails so the agent-detail view reads like a real terminal.
+  const OUTPUT_TAILS = {
+    "sup-1":
+      "--- code_supervisor (cao-feature-build) ---\n" +
+      "[plan] MCP Apps fleet UI — 4 tracks\n" +
+      "→ assign developer: implement ui_meta permissions  (dev-1)\n" +
+      "→ assign developer: host-delegated open-link        (dev-2)\n" +
+      "→ handoff test-engineer: coverage + JIT gates        (test-1)\n" +
+      "→ assign reviewer: canonical-source audit            (rev-1)\n" +
+      "waiting on rev-1 (review) and doc-1 (docs)…",
+    "dev-1":
+      "--- developer (dev-1) ---\n" +
+      "edit ext_apps/apps.py: add _meta.ui.permissions (object)\n" +
+      "run: pytest test/ext_apps -q … 13 passed\n" +
+      "processing: reconcile preferredFrameSize comment",
+    "dev-2":
+      "--- developer (dev-2 · claude_code) ---\n" +
+      "edit shared/mcpApp.ts: openLink() → ui/open-link\n" +
+      "idle: awaiting supervisor review",
+    "test-1":
+      "--- test-engineer (test-1 · codex) ---\n" +
+      "vitest run … 63 passed\ncoverage 92.16% ≥ 90% floor\ncompleted ✓",
+    "rev-1":
+      "--- reviewer (rev-1) ---\n" +
+      "audit: references → canonical sources\n" +
+      "WAITING: approve protocolVersion 2026-01-26 change? [y/N]",
+    "doc-1":
+      "--- documentation-curator (doc-1 · gemini_cli) ---\n" +
+      "ERROR: link check failed for draft/apps.mdx (stale)\nretrying with 2026-01-26…",
+  };
 
   function dashboardSnapshot() {
+    const sessionNames = Array.from(
+      new Set(state.terminals.map((t) => t.session_name)),
+    );
     return {
-      sessions: [{ id: "cao-main", name: "cao-main", status: "active" }],
+      sessions: sessionNames.map((n) => ({ id: n, name: n, status: "active" })),
       terminals: state.terminals.map((t) => ({ ...t })),
-      counts: { sessions: 1, terminals: state.terminals.length },
+      counts: {
+        sessions: sessionNames.length,
+        terminals: state.terminals.length,
+      },
       scopes: ["cao:read", "cao:write", "cao:admin"],
     };
   }
@@ -75,7 +283,7 @@
       agent_profile: t.agent_profile,
       status: t.status,
       last_active: t.last_active,
-      output_tail: `--- terminal ${t.id} ---\nready.`,
+      output_tail: OUTPUT_TAILS[t.id] || `--- terminal ${t.id} ---\nready.`,
       scopes: ["cao:read", "cao:write", "cao:admin"],
     };
   }
@@ -175,6 +383,9 @@
     if (method === "ui/initialize") {
       replyTo(winInfo, id, {
         hostContext: { theme: "light", uiSurface: true },
+        // Advertise host-delegated capabilities so the views surface them
+        // (e.g. the dashboard's "Open full Web UI" → ui/open-link).
+        hostCapabilities: { openLinks: {} },
       });
       return;
     }
@@ -184,7 +395,7 @@
       // initial payload (the agent view needs a terminal_id) hydrate.
       if (winInfo.view === "agent") {
         pushTo(winInfo, "ui/notifications/tool-result", {
-          structuredContent: agentSnapshot("t1"),
+          structuredContent: agentSnapshot(AGENT_VIEW_ID),
         });
       }
       if (winInfo.resolve) winInfo.resolve();
