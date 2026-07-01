@@ -1,11 +1,34 @@
 const BASE = ''  // Vite proxy handles routing to backend
 
+// Server/browser clock skew (WSL2 drift was observed at 5.5 HOURS; remote
+// backends differ too). Measured from the optional X-Server-Time response
+// header and used wherever relative times are computed from server timestamps.
+// Stays 0 (serverNow == Date.now) when the backend does not send the header.
+let serverClockSkewMs = 0
+export function serverNow(): number {
+  return Date.now() + serverClockSkewMs
+}
+
 async function fetchJSON<T>(url: string, opts?: RequestInit & { timeoutMs?: number }): Promise<T> {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), opts?.timeoutMs ?? 10000)
   try {
     const res = await fetch(`${BASE}${url}`, { ...opts, signal: controller.signal })
-    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
+    const serverTime = res.headers?.get?.('X-Server-Time')
+    if (serverTime) {
+      const t = new Date(serverTime).getTime()
+      if (!isNaN(t)) serverClockSkewMs = t - Date.now()
+    }
+    if (!res.ok) {
+      // Surface the API's human-readable detail ("Folder does not exist: ...")
+      // instead of an opaque "500 Internal Server Error".
+      let detail = ''
+      try {
+        const body = await res.json()
+        if (typeof body?.detail === 'string') detail = body.detail
+      } catch { /* non-JSON error body */ }
+      throw new Error(detail || `${res.status} ${res.statusText}`)
+    }
     return res.json()
   } finally {
     clearTimeout(timeout)
@@ -16,6 +39,7 @@ export interface Session {
   id: string
   name: string
   status: string
+  label?: string | null
 }
 
 export interface Terminal {
@@ -39,6 +63,7 @@ export interface TerminalMeta {
   tmux_window: string
   provider: string
   agent_profile: string | null
+  model?: string | null
   created_at: string | null
   last_active: string | null
 }
@@ -114,6 +139,11 @@ export const api = {
 
   // Settings
   getAgentDirs: () => fetchJSON<AgentDirsSettings>('/settings/agent-dirs'),
+  // Runs UI folder browser (GH #282): list server-side subdirectories only.
+  listDirs: (path?: string) =>
+    fetchJSON<{ path: string; parent: string | null; dirs: string[] }>(
+      `/fs/dirs${path ? `?path=${encodeURIComponent(path)}` : ''}`
+    ),
   setAgentDirs: (data: { agent_dirs?: Record<string, string>; extra_dirs?: string[] }) =>
     fetchJSON<AgentDirsSettings>('/settings/agent-dirs', {
       method: 'POST',
@@ -127,6 +157,13 @@ export const api = {
   createSession: (provider: string, agentProfile: string, sessionName?: string, workingDirectory?: string) =>
     fetchJSON<Terminal>(`/sessions?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${sessionName ? `&session_name=${encodeURIComponent(sessionName)}` : ''}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}`, { method: 'POST', timeoutMs: 90000 }),
   deleteSession: (name: string) => fetchJSON<{ success: boolean; deleted: string[]; errors: any[] }>(`/sessions/${name}`, { method: 'DELETE' }),
+  // Runs UI: rename a run (friendly label shown on the board).
+  setSessionLabel: (name: string, label: string) =>
+    fetchJSON<{ session_name: string; label: string | null }>(`/sessions/${name}/label`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label }),
+    }),
 
   // Terminals
   getTerminalStatus: (id: string) =>

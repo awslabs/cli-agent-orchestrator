@@ -32,6 +32,10 @@ dependencies = [
     "apscheduler>=3.10.4",
     "sqlalchemy>=2.0.0",
     "uvicorn[standard]>=0.24.0",
+    # SSE transport for the Runs dashboard /events/runs stream (heartbeats +
+    # client-disconnect cancellation). Distinct from the mcp-apps fleet /events
+    # stream, which uses a raw StreamingResponse. (GH #292)
+    "sse-starlette>=2.1.0",
     "websockets>=12.0",
     "libtmux>=0.51.0",
     "click>=8.0.0",

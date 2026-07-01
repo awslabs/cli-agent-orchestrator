@@ -7,12 +7,16 @@ import { AgentPanel } from './components/AgentPanel'
 import { FlowsPanel } from './components/FlowsPanel'
 import { MemoryPanel } from './components/MemoryPanel'
 import { SettingsPanel } from './components/SettingsPanel'
-import { Bot, Home, Clock, Settings, Brain, CheckCircle, XCircle, Info, Wifi, WifiOff } from 'lucide-react'
+import { RunBoard } from './runs/RunBoard'
+import { Bot, Home, Clock, Settings, Brain, LayoutDashboard, CheckCircle, XCircle, Info, Wifi, WifiOff } from 'lucide-react'
 
-type TabKey = 'home' | 'agents' | 'flows' | 'settings' | 'memory'
+type TabKey = 'runs' | 'home' | 'agents' | 'flows' | 'settings' | 'memory'
 
-// Memory appended last so Alt+N numbering of existing tabs never shifts
+// "Runs" is the plain-language front-door (issue #292); the rest is the
+// existing developer/fleet UI. Memory stays appended last so its Alt+N index
+// only appears when enabled.
 const TABS: { key: TabKey; label: string; icon: React.ReactNode }[] = [
+  { key: 'runs', label: 'Runs', icon: <LayoutDashboard size={16} /> },
   { key: 'home', label: 'Home', icon: <Home size={16} /> },
   { key: 'agents', label: 'Agents', icon: <Bot size={16} /> },
   { key: 'flows', label: 'Flows', icon: <Clock size={16} /> },
@@ -52,10 +56,10 @@ function Snackbar() {
 }
 
 export default function App() {
-  const [tab, setTab] = useState<TabKey>('home')
+  const [tab, setTab] = useState<TabKey>('runs')
   // Default false (fail-closed): a dead backend hides the tab rather than showing a broken panel
   const [memoryEnabled, setMemoryEnabled] = useState(false)
-  const { sessions, connected, fetchSessions } = useStore()
+  const { sessions, connected, fetchSessions, connectStatusStream } = useStore()
 
   const visibleTabs = TABS.filter(t => t.key !== 'memory' || memoryEnabled)
 
@@ -64,8 +68,14 @@ export default function App() {
     api.getMemoryStatus()
       .then(s => setMemoryEnabled(s.enabled))
       .catch(() => {})
+    // Live status + flow pulses via one SSE connection (the Runs board's own
+    // /events/runs stream). Falls back to the 10s reconcile below if it drops.
+    const es = connectStatusStream()
     const interval = setInterval(fetchSessions, 10000)
-    return () => clearInterval(interval)
+    return () => {
+      es.close()
+      clearInterval(interval)
+    }
   }, [])
 
   // Keyboard shortcuts: Alt+1-N over the visible tabs
@@ -141,6 +151,7 @@ export default function App() {
       <main className="max-w-7xl mx-auto px-6 py-6">
         <ErrorBoundary>
           <Suspense fallback={<div className="text-gray-500 text-sm py-12 text-center">Loading...</div>}>
+            {tab === 'runs' && <RunBoard />}
             {tab === 'home' && <DashboardHome onNavigate={(t) => setTab(t as TabKey)} />}
             {tab === 'agents' && <AgentPanel />}
             {tab === 'flows' && <FlowsPanel />}

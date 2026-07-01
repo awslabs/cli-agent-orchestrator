@@ -2,17 +2,82 @@
 @tailwind components;
 @tailwind utilities;
 
-body {
-  background: #0f0f14;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+/* ── Design tokens (Build Spec §1.1) ─────────────────────────────────── */
+:root {
+  /* surfaces */
+  --page:   #0f0f14;
+  --card:   #16161e;
+  --border: #1f2937;
+  --hover:  rgba(31, 41, 55, 0.6);
+
+  /* text */
+  --t1: #e5e7eb;
+  --t2: #9ca3af;
+  --t3: #6b7280;
+  --t4: #4b5563;
+
+  /* status — sacred mappings, never repurpose (§1.3) */
+  --blue:    #60a5fa;
+  --emerald: #34d399;
+  --amber:   #fbbf24;
+  --purple:  #c084fc;
+  --red:     #f87171;
+  --gray:    #6b7280;
+
+  /* brand */
+  --brand:      #10b981;
+  --brand-deep: #059669;
+
+  --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
-::-webkit-scrollbar { width: 6px; }
+body {
+  background: var(--page);
+  color: var(--t1);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+code, pre, .font-mono { font-family: var(--mono); }
+
+/* micro-label: column headers, group labels (§1.2) */
+.microlabel {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 600;
+  color: var(--t3);
+}
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: #374151; border-radius: 3px; }
 
 *:focus-visible {
-  outline: 2px solid #059669;
+  outline: 2px solid var(--brand-deep);
   outline-offset: 2px;
 }
 
+/* ── Motion (meaning only — §1.3) ────────────────────────────────────── */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.3; }
+}
+.pulse-dot { animation: pulse-dot 1.4s ease-in-out infinite; }
+
+@keyframes ring-pulse {
+  0%   { box-shadow: 0 0 0 0 var(--ring-color, rgba(96, 165, 250, 0.45)); }
+  70%  { box-shadow: 0 0 0 7px rgba(0, 0, 0, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(0, 0, 0, 0); }
+}
+.ring-pulse { animation: ring-pulse 1.5s ease-out infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001s !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001s !important;
+  }
+}

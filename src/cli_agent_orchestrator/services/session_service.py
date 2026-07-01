@@ -83,8 +83,14 @@ async def create_session(
 def list_sessions() -> List[Dict]:
     """List all sessions from tmux."""
     try:
+        from cli_agent_orchestrator.services.settings_service import get_session_labels
+
+        labels = get_session_labels()
         tmux_sessions = get_backend().list_sessions()
-        return [s for s in tmux_sessions if s["id"].startswith(SESSION_PREFIX)]
+        sessions = [s for s in tmux_sessions if s["id"].startswith(SESSION_PREFIX)]
+        for s in sessions:
+            s["label"] = labels.get(s["id"])  # friendly Runs-board name, or None
+        return sessions
     except Exception as e:
         logger.error(f"Failed to list sessions: {e}")
         return []
