@@ -12,12 +12,10 @@ from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
 from cli_agent_orchestrator.providers.cursor_cli import CursorCliProvider
 from cli_agent_orchestrator.providers.devin_cli import DevinCliProvider
-from cli_agent_orchestrator.providers.gemini_cli import GeminiCliProvider
 from cli_agent_orchestrator.providers.hermes import HermesProvider
 from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
 from cli_agent_orchestrator.providers.opencode_cli import OpenCodeCliProvider
-from cli_agent_orchestrator.providers.q_cli import QCliProvider
 
 logger = logging.getLogger(__name__)
 
@@ -31,12 +29,10 @@ class ProviderManager:
     def _get_provider_factory(self, provider_type: str):
         """Get provider factory function for given type."""
         factories = {
-            ProviderType.Q_CLI.value: self._create_q_cli_provider,
             ProviderType.KIRO_CLI.value: self._create_kiro_cli_provider,
             ProviderType.CLAUDE_CODE.value: self._create_claude_code_provider,
             ProviderType.CODEX.value: self._create_codex_provider,
             ProviderType.COPILOT_CLI.value: self._create_copilot_cli_provider,
-            ProviderType.GEMINI_CLI.value: self._create_gemini_cli_provider,
             ProviderType.KIMI_CLI.value: self._create_kimi_cli_provider,
             ProviderType.OPENCODE_CLI.value: self._create_opencode_cli_provider,
             ProviderType.HERMES.value: self._create_hermes_provider,
@@ -49,25 +45,6 @@ class ProviderManager:
             raise ValueError(f"Unknown provider type: {provider_type}")
 
         return factories[provider_type]
-
-    def _create_q_cli_provider(
-        self,
-        terminal_id: str,
-        tmux_session: str,
-        tmux_window: str,
-        agent_profile: Optional[str],
-        allowed_tools: Optional[List[str]],
-        **kwargs,
-    ) -> QCliProvider:
-        if not agent_profile:
-            raise ValueError("Q CLI provider requires agent_profile parameter")
-        return QCliProvider(
-            terminal_id,
-            tmux_session,
-            tmux_window,
-            agent_profile,
-            allowed_tools,
-        )
 
     def _create_kiro_cli_provider(
         self,
@@ -143,25 +120,6 @@ class ProviderManager:
             agent_profile,
             allowed_tools,
             model=model,
-        )
-
-    def _create_gemini_cli_provider(
-        self,
-        terminal_id: str,
-        tmux_session: str,
-        tmux_window: str,
-        agent_profile: Optional[str],
-        allowed_tools: Optional[List[str]],
-        skill_prompt: Optional[str],
-        **kwargs,
-    ) -> GeminiCliProvider:
-        return GeminiCliProvider(
-            terminal_id,
-            tmux_session,
-            tmux_window,
-            agent_profile,
-            allowed_tools,
-            skill_prompt=skill_prompt,
         )
 
     def _create_kimi_cli_provider(
