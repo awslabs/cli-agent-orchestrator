@@ -51,7 +51,9 @@ class TestDevinCliProviderInitialization:
 class TestDevinCliProviderStatusDetection:
     """Test status detection from terminal output."""
 
-    @patch("cli_agent_orchestrator.providers.devin_cli.tmux_client")  # Kept for backward compatibility
+    @patch(
+        "cli_agent_orchestrator.providers.devin_cli.tmux_client"
+    )  # Kept for backward compatibility
     def test_get_status_idle(self, mock_tmux):
         """IDLE: status bar + input prompt visible, no user-input line."""
         buffer = load_fixture("devin_cli_idle_output.txt")
@@ -61,7 +63,9 @@ class TestDevinCliProviderStatusDetection:
 
         assert status == TerminalStatus.IDLE
 
-    @patch("cli_agent_orchestrator.providers.devin_cli.tmux_client")  # Kept for backward compatibility
+    @patch(
+        "cli_agent_orchestrator.providers.devin_cli.tmux_client"
+    )  # Kept for backward compatibility
     def test_get_status_processing(self, mock_tmux):
         """PROCESSING: spinner text visible ('Running tools')."""
         buffer = load_fixture("devin_cli_processing_output.txt")
@@ -71,7 +75,9 @@ class TestDevinCliProviderStatusDetection:
 
         assert status == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.devin_cli.tmux_client")  # Kept for backward compatibility
+    @patch(
+        "cli_agent_orchestrator.providers.devin_cli.tmux_client"
+    )  # Kept for backward compatibility
     def test_get_status_completed(self, mock_tmux):
         """COMPLETED: user input + response + idle prompt visible."""
         buffer = load_fixture("devin_cli_completed_output.txt")
@@ -81,7 +87,9 @@ class TestDevinCliProviderStatusDetection:
 
         assert status == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.devin_cli.tmux_client")  # Kept for backward compatibility
+    @patch(
+        "cli_agent_orchestrator.providers.devin_cli.tmux_client"
+    )  # Kept for backward compatibility
     def test_get_status_empty_output(self, mock_tmux):
         """ERROR: empty/blank output → CLI failed to start."""
         buffer = ""
@@ -91,7 +99,9 @@ class TestDevinCliProviderStatusDetection:
 
         assert status == TerminalStatus.ERROR
 
-    @patch("cli_agent_orchestrator.providers.devin_cli.tmux_client")  # Kept for backward compatibility
+    @patch(
+        "cli_agent_orchestrator.providers.devin_cli.tmux_client"
+    )  # Kept for backward compatibility
     def test_get_status_user_input_no_response(self, mock_tmux):
         """COMPLETED: user input sent, prompt returned (ready for next input)."""
         buffer = (
@@ -107,7 +117,9 @@ class TestDevinCliProviderStatusDetection:
 
         assert status == TerminalStatus.COMPLETED
 
-    @patch("cli_agent_orchestrator.providers.devin_cli.tmux_client")  # Kept for backward compatibility
+    @patch(
+        "cli_agent_orchestrator.providers.devin_cli.tmux_client"
+    )  # Kept for backward compatibility
     def test_get_status_esc_to_interrupt(self, mock_tmux):
         """PROCESSING: 'esc to interrupt' spinner is present."""
         buffer = "> write some code\nesc to interrupt\n#\nMode: chat  Model: devin-v1\n"
@@ -117,7 +129,9 @@ class TestDevinCliProviderStatusDetection:
 
         assert status == TerminalStatus.PROCESSING
 
-    @patch("cli_agent_orchestrator.providers.devin_cli.tmux_client")  # Kept for backward compatibility
+    @patch(
+        "cli_agent_orchestrator.providers.devin_cli.tmux_client"
+    )  # Kept for backward compatibility
     def test_get_status_completed_with_markdown_heading_response(self, mock_tmux):
         """COMPLETED even when the response begins with a Markdown heading (Bug #1 regression)."""
         buffer = load_fixture("devin_cli_heading_response.txt")

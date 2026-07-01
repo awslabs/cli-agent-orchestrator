@@ -240,6 +240,7 @@ You are restricted to only use the following tools: {tools_list}
 
         command = self._build_command()
         from cli_agent_orchestrator.backends.registry import get_backend
+
         get_backend().send_keys(
             self.session_name,
             self.window_name,

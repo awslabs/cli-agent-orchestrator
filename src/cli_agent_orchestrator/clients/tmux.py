@@ -337,7 +337,7 @@ class TmuxClient:
             # tmux send-keys has practical limits around 10KB per invocation
             CHUNK_SIZE = 8192
             for i in range(0, len(keys), CHUNK_SIZE):
-                chunk = keys[i:i + CHUNK_SIZE]
+                chunk = keys[i : i + CHUNK_SIZE]
                 subprocess.run(
                     ["tmux", "send-keys", "-l", "-t", target, chunk],
                     check=True,
