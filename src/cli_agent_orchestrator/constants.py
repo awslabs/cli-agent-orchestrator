@@ -69,12 +69,15 @@ TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
 # (WSL2 doesn't support FIFO pipes on /mnt/c filesystem)
 # Falls back to system temp directory if /tmp doesn't exist (e.g., Windows-native)
 # Scoped per-user for security isolation
-username = re.sub(r"[^a-zA-Z0-9_-]", "_", getpass.getuser())
-TEMP_BASE = Path(tempfile.gettempdir())
-FIFO_DIR = (
-    TEMP_BASE / "cli-agent-orchestrator" / username / "fifos"
-)  # Named pipes for tmux pipe-pane streaming
-FIFO_DIR.mkdir(parents=True, exist_ok=True)
+def _get_fifo_dir() -> Path:
+    """Get the FIFO directory with sanitized username for security."""
+    username = re.sub(r"[^a-zA-Z0-9_-]", "_", getpass.getuser())
+    TEMP_BASE = Path(tempfile.gettempdir())
+    FIFO_DIR = TEMP_BASE / "cli-agent-orchestrator" / username / "fifos"
+    FIFO_DIR.mkdir(parents=True, exist_ok=True)
+    return FIFO_DIR
+
+FIFO_DIR = _get_fifo_dir()
 
 # =============================================================================
 # Event-Driven State Detection Configuration
