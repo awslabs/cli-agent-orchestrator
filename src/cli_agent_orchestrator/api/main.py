@@ -31,6 +31,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field, field_validator
+from sse_starlette.sse import EventSourceResponse
 
 from cli_agent_orchestrator.backends import TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
@@ -52,6 +53,7 @@ from cli_agent_orchestrator.constants import (
     SERVER_HOST,
     SERVER_PORT,
     SERVER_VERSION,
+    SSE_HEARTBEAT_INTERVAL,
     TERMINALS_RUN_STEP_ROUTE,
     TRUSTED_FORWARDER_IPS,
     WS_ALLOWED_CLIENTS,
@@ -99,7 +101,9 @@ from cli_agent_orchestrator.services.log_writer import log_writer
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.terminal_service import OutputMode, TerminalInputBlockedError
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
+from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 from cli_agent_orchestrator.utils.logging import setup_logging
+from cli_agent_orchestrator.utils.paths import normalize_working_directory
 from cli_agent_orchestrator.utils.skills import (
     SkillNameError,
     load_skill_content,
@@ -457,6 +461,20 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def add_server_time_header(request: Request, call_next):
+    """Stamp every response with the server's wall clock (ISO-8601).
+
+    The Runs dashboard uses this to correct browser/server clock skew when it
+    renders relative times ("2 minutes ago") — WSL2 hosts have been observed
+    hours out of sync. Purely informational; clients that ignore it are
+    unaffected. (GH #292)
+    """
+    response = await call_next(request)
+    response.headers["X-Server-Time"] = datetime.now().isoformat()
+    return response
+
+
 @app.get("/.well-known/oauth-protected-resource")
 async def oauth_protected_resource_metadata():
     """RFC 9728 Protected Resource Metadata.
@@ -603,6 +621,81 @@ async def events_history(
     return {"events": events}
 
 
+async def _runs_event_stream():
+    """Yield SSE events for the non-technical Runs dashboard (issue #292).
+
+    ``status`` frames carry per-terminal StatusMonitor transitions; ``flow``
+    frames carry sender->receiver message announcements (handoff/assign
+    deliveries and inbox sends) that the flow graph animates. Both ride the
+    existing topic ``event_bus`` (``terminal.*.status`` is already published by
+    StatusMonitor; ``flow.message`` is published by the inbox endpoint and
+    terminal_service.send_input).
+
+    The ``finally`` unsubscribe is mandatory: without it a disconnected client
+    leaves dead queues that the dispatcher keeps filling until QueueFull. sse-
+    starlette cancels this generator when the client goes away, routing through
+    the ``finally``.
+    """
+    status_queue = bus.subscribe("terminal.*.status")
+    flow_queue = bus.subscribe("flow.message")
+    merged: asyncio.Queue = asyncio.Queue(maxsize=2048)
+
+    async def _pump(queue: asyncio.Queue, kind: str) -> None:
+        while True:
+            item = await queue.get()
+            await merged.put((kind, item))
+
+    pumps = [
+        asyncio.create_task(_pump(status_queue, "status")),
+        asyncio.create_task(_pump(flow_queue, "flow")),
+    ]
+    try:
+        while True:
+            kind, event = await merged.get()
+            if kind == "status":
+                yield {
+                    "event": "status",
+                    "data": json.dumps(
+                        {
+                            "terminal_id": terminal_id_from_topic(event["topic"]),
+                            "status": event["data"].get("status"),
+                        }
+                    ),
+                }
+            else:
+                yield {"event": "flow", "data": json.dumps(event["data"])}
+    finally:
+        for pump in pumps:
+            pump.cancel()
+        bus.unsubscribe("terminal.*.status", status_queue)
+        bus.unsubscribe("flow.message", flow_queue)
+
+
+@app.get("/events/runs")
+async def runs_events(request: Request) -> EventSourceResponse:
+    """Server-Sent Events for the Runs dashboard: live status + flow pulses.
+
+    Distinct from the mcp-apps fleet ``/events`` stream (raw SseBus, gated by
+    ``CAO_MCP_APPS_ENABLED``): this one rides the topic ``event_bus`` via
+    sse-starlette and powers the plain-language Runs board (issue #292). The two
+    coexist so neither UI direction blocks the other.
+
+    Contract: deltas-only and lossy on reconnect — consumers fetch current state
+    via REST on every (re)connect and treat this purely as a change signal.
+    Event-inbox backends (herdr) never publish status events, so the stream is
+    silent for their terminals (the board's 10s REST reconcile is the fallback).
+    """
+    # Same client gating as the terminal WebSocket: this stream exposes every
+    # terminal's live status, so restrict it to the same allowlist.
+    client_host = request.client.host if request.client else None
+    if client_host is not None and client_host not in WS_ALLOWED_CLIENTS:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Event stream access is restricted to allowed clients",
+        )
+    return EventSourceResponse(_runs_event_stream(), ping=SSE_HEARTBEAT_INTERVAL, send_timeout=30.0)
+
+
 # Topology widget static bundle at /widgets/topology/ — the vanilla SSE-driven
 # view consumed alongside the /events stream above. The mount is default-off
 # (no-op unless CAO_MCP_APPS_ENABLED is set) and idempotent, so re-importing this
@@ -735,6 +828,46 @@ async def set_agent_dirs_endpoint(
     }
 
 
+@app.get("/fs/dirs")
+async def list_directories(path: Optional[str] = None) -> Dict:
+    """List subdirectories of a server-side folder (Runs folder browser, GH #282).
+
+    Directories only — never file names or contents. Accepts Windows paths
+    (translated to the WSL mount like working directories are). Same
+    localhost-only posture as the rest of the API; documents nothing the
+    /sessions working_directory parameter couldn't already reach.
+    """
+    try:
+        if path:
+            resolved = Path(
+                normalize_working_directory(path, create_missing=False)  # type: ignore[arg-type]
+            )
+        else:
+            resolved = Path.home()
+        resolved = resolved.resolve()
+        if not resolved.is_dir():
+            raise ValueError(f"Not a folder: {resolved}")
+        visible, hidden = [], []
+        for entry in sorted(resolved.iterdir(), key=lambda e: e.name.lower()):
+            try:
+                if not entry.is_dir():
+                    continue
+            except OSError:
+                continue
+            (hidden if entry.name.startswith(".") else visible).append(entry.name)
+        # Hidden folders matter here (profile dirs live under ~/.kiro, ~/.aws)
+        # but list after the visible ones.
+        parent = str(resolved.parent) if resolved.parent != resolved else None
+        return {"path": str(resolved), "parent": parent, "dirs": visible + hidden}
+    except PermissionError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No permission to read that folder",
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
 @app.get("/settings/skill-dirs")
 async def get_skill_dirs_endpoint() -> Dict:
     """Get the global skill store path and user-added extra skill directories."""
@@ -826,6 +959,11 @@ async def create_session(
     cao-server's HTTP access log. See issue #248.
     """
     try:
+        # Accept Windows/WSL paths and quoted "Copy as path" values from the
+        # Runs wizard's folder field; a bad path raises ValueError -> clear 400
+        # below instead of a 500 deep in tmux. (GH #292)
+        if working_directory:
+            working_directory = normalize_working_directory(working_directory)
         if session_name is not None:
             # terminal_service.create_terminal prepends SESSION_PREFIX
             # ("cao-") if missing, so an API caller's 64-char valid name
@@ -894,6 +1032,32 @@ async def list_sessions() -> List[Dict]:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to list sessions: {str(e)}",
         )
+
+
+class SessionLabelUpdate(BaseModel):
+    label: str
+
+
+@app.post("/sessions/{session_name}/label")
+async def set_session_label_endpoint(
+    session_name: str,
+    body: SessionLabelUpdate,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Set (or clear, with an empty string) a friendly label for a session.
+
+    Stored separately from the tmux session name so nothing that references the
+    real name (terminals, DB rows, the backend) is disturbed — a pure display
+    alias for the Runs board (GH #292).
+    """
+    try:
+        validate_tmux_name(session_name, "session_name")
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    from cli_agent_orchestrator.services.settings_service import set_session_label
+
+    labels = set_session_label(session_name, body.label)
+    return {"session_name": session_name, "label": labels.get(session_name)}
 
 
 @app.get("/sessions/{session_name}")
@@ -1393,6 +1557,13 @@ async def create_inbox_message_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create inbox message: {str(e)}",
         )
+
+    # Announce the agent-to-agent send for the Runs flow graph (worker ->
+    # supervisor replies travel through the inbox).
+    bus.publish(
+        "flow.message",
+        {"sender_id": sender_id, "receiver_id": receiver_id, "kind": "message"},
+    )
 
     # Attempt immediate delivery if terminal is already IDLE.
     # If not, InboxService will deliver on next IDLE status event.

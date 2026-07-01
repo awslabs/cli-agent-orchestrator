@@ -123,6 +123,11 @@ EAGER_INBOX_DELIVERY = os.environ.get("CAO_EAGER_INBOX_DELIVERY", "false").lower
 # other providers.
 INBOX_POLLING_INTERVAL = 5
 
+# Heartbeat (SSE comment ping) interval for the Runs dashboard /events/runs
+# stream, in seconds. Keeps proxies from idling out a quiet connection and lets
+# sse-starlette notice client disconnects promptly.
+SSE_HEARTBEAT_INTERVAL = 15
+
 # Reconciliation sweep for orphaned inbox messages.
 # The fast delivery paths — the immediate attempt on POST and the event-driven
 # StatusMonitor pipeline — can both miss a message when the receiving terminal

@@ -67,6 +67,34 @@ def set_agent_dirs(dirs: Dict[str, str]) -> Dict[str, str]:
     return get_agent_dirs()
 
 
+def get_session_labels() -> Dict[str, str]:
+    """User-assigned friendly names for sessions (session_name -> label)."""
+    settings = _load()
+    labels = settings.get("session_labels", {})
+    return labels if isinstance(labels, dict) else {}
+
+
+def set_session_label(session_name: str, label: str) -> Dict[str, str]:
+    """Set or clear a session's friendly label (empty label removes it).
+
+    Stored separately from the tmux session name so nothing that references the
+    real name (terminals, DB rows, the backend) is disturbed — a pure display
+    alias for the Runs board (GH #292).
+    """
+    settings = _load()
+    labels = settings.get("session_labels", {})
+    if not isinstance(labels, dict):
+        labels = {}
+    clean = label.strip()[:60]
+    if clean:
+        labels[session_name] = clean
+    else:
+        labels.pop(session_name, None)
+    settings["session_labels"] = labels
+    _save(settings)
+    return labels
+
+
 # Default server tuning values
 _SERVER_DEFAULTS = {
     "mcp_request_timeout": 30,

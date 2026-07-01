@@ -97,7 +97,7 @@ class TestSessionCreationWithWorkingDirectory:
             assert call_kwargs.get("working_directory") == str(tmp_path)
             assert call_kwargs.get("registry") is not None
 
-    def test_create_session_with_working_directory(self, client):
+    def test_create_session_with_working_directory(self, client, tmp_path):
         """Test POST /sessions with working_directory parameter."""
         with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
             mock_svc.create_session = AsyncMock(
@@ -110,18 +110,63 @@ class TestSessionCreationWithWorkingDirectory:
                 )
             )
 
+            # A real directory: the endpoint now normalizes/validates
+            # working_directory (GH #292), so a non-existent literal path would
+            # be rejected with a clear 400 instead of reaching the service.
             response = client.post(
                 "/sessions",
                 params={
                     "provider": "q_cli",
                     "agent_profile": "developer",
-                    "working_directory": "/custom/path",
+                    "working_directory": str(tmp_path),
                 },
             )
 
             assert response.status_code == 201
             call_kwargs = mock_svc.create_session.call_args.kwargs
-            assert call_kwargs.get("working_directory") == "/custom/path"
+            assert call_kwargs.get("working_directory") == str(tmp_path)
+
+    def test_create_session_rejects_bad_working_directory(self, client):
+        """A malformed working_directory is a clear 400, never a 500 (GH #292).
+
+        Exercises the endpoint->normalize_working_directory wiring end to end: a
+        relative path is rejected before session_service is ever reached.
+        """
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock()
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "q_cli",
+                    "agent_profile": "developer",
+                    "working_directory": "relative/not/absolute",
+                },
+            )
+
+        assert response.status_code == 400
+        assert "absolute" in response.json()["detail"].lower()
+        mock_svc.create_session.assert_not_called()
+
+
+class TestSessionLabel:
+    """GH #292: friendly run names are a pure display alias, stored server-side."""
+
+    def test_label_roundtrip_and_clear(self, client, tmp_path, monkeypatch):
+        from cli_agent_orchestrator.services import settings_service as svc
+
+        # Isolate the settings file so the test never touches real config.
+        monkeypatch.setattr(svc, "SETTINGS_FILE", tmp_path / "settings.json")
+
+        resp = client.post("/sessions/cao-demo/label", json={"label": "  My Run  "})
+        assert resp.status_code == 200
+        assert resp.json() == {"session_name": "cao-demo", "label": "My Run"}
+        assert svc.get_session_labels() == {"cao-demo": "My Run"}
+
+        # Empty label clears the alias.
+        resp2 = client.post("/sessions/cao-demo/label", json={"label": ""})
+        assert resp2.status_code == 200
+        assert resp2.json()["label"] is None
+        assert svc.get_session_labels() == {}
 
 
 class TestTerminalCreationWithWorkingDirectory:
