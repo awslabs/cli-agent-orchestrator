@@ -234,12 +234,13 @@ class KimiCliProvider(BaseProvider):
         """Record a dispatched task (called by terminal_service after send_input).
 
         Latches ``_has_received_input`` (the buffer-evidence latch can miss it
-        when a long paste scrolls the echo out of the rolling window) and
-        stamps ``_last_dispatch_time`` for the newest-TUI dispatch-grace check
-        in get_status().
+        when a long paste scrolls the echo out of the rolling window). The
+        ``_last_dispatch_time`` stamp (used by the newest-TUI dispatch-grace
+        check in get_status()) and the shared native-status tracking come from
+        ``super().mark_input_received()``.
         """
+        super().mark_input_received()
         self._has_received_input = True
-        self._last_dispatch_time = time.time()
 
     def _build_kimi_command(self) -> str:
         """Build Kimi CLI command with agent profile and MCP config if provided.
@@ -464,6 +465,12 @@ class KimiCliProvider(BaseProvider):
         Returns:
             TerminalStatus indicating current state
         """
+        # Native status (herdr): trust the backend's agent state when available;
+        # on herdr the buffer is never fed, so buffer parsing can't leave UNKNOWN.
+        native = self._resolve_native_status()
+        if native is not None:
+            return native
+
         if not output:
             return TerminalStatus.UNKNOWN
 

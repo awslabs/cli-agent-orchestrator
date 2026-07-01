@@ -420,6 +420,12 @@ class CopilotCliProvider(BaseProvider):
         return trimmed
 
     def get_status(self, output: str) -> TerminalStatus:
+        # Native status (herdr): trust the backend's agent state when available,
+        # before the tmux capture-pane fallback below (which is a tmux-only path).
+        native = self._resolve_native_status()
+        if native is not None:
+            return native
+
         # For TUI apps, the raw FIFO buffer may contain only ANSI escapes.
         # Fall back to tmux capture-pane when the buffer has no visible text.
         cleaned = self._clean(output) if output else ""
