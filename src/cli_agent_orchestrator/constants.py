@@ -8,6 +8,7 @@ Codex, Kimi CLI, Q CLI) through tmux sessions, providing a unified interface
 for agent management.
 """
 
+import getpass
 import os
 import tempfile
 from pathlib import Path
@@ -67,9 +68,10 @@ TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
 # Use /tmp instead of CAO_HOME_DIR to avoid WSL2 Windows mount limitations
 # (WSL2 doesn't support FIFO pipes on /mnt/c filesystem)
 # Falls back to system temp directory if /tmp doesn't exist (e.g., Windows-native)
+# Scoped per-user for security isolation
 TEMP_BASE = Path(os.environ.get("TMPDIR", tempfile.gettempdir()))
 FIFO_DIR = (
-    TEMP_BASE / "cli-agent-orchestrator" / "fifos"
+    TEMP_BASE / "cli-agent-orchestrator" / getpass.getuser() / "fifos"
 )  # Named pipes for tmux pipe-pane streaming
 FIFO_DIR.mkdir(parents=True, exist_ok=True)
 
