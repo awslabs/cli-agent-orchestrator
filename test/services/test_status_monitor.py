@@ -400,7 +400,9 @@ class TestUntestedMethods:
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
     @patch("cli_agent_orchestrator.services.status_monitor._resolve_window")
-    def test_get_fallback_from_history_success(self, mock_resolve_window, mock_get_backend, mock_pm):
+    def test_get_fallback_from_history_success(
+        self, mock_resolve_window, mock_get_backend, mock_pm
+    ):
         """Returns provider status when history is available."""
         mock_get_backend.return_value = _backend(event_inbox=False)
         provider = MagicMock()
@@ -429,7 +431,9 @@ class TestUntestedMethods:
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
     @patch("cli_agent_orchestrator.services.status_monitor._resolve_window")
-    def test_get_fallback_from_history_no_window(self, mock_resolve_window, mock_get_backend, mock_pm):
+    def test_get_fallback_from_history_no_window(
+        self, mock_resolve_window, mock_get_backend, mock_pm
+    ):
         """Returns None when window not resolved."""
         mock_get_backend.return_value = _backend(event_inbox=False)
         provider = MagicMock()
@@ -444,7 +448,9 @@ class TestUntestedMethods:
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
     @patch("cli_agent_orchestrator.services.status_monitor._resolve_window")
-    def test_get_fallback_from_history_no_history(self, mock_resolve_window, mock_get_backend, mock_pm):
+    def test_get_fallback_from_history_no_history(
+        self, mock_resolve_window, mock_get_backend, mock_pm
+    ):
         """Returns None when history is empty."""
         mock_get_backend.return_value = _backend(event_inbox=False)
         provider = MagicMock()
@@ -460,16 +466,16 @@ class TestUntestedMethods:
     def test_refresh_processing_status_when_not_processing(self):
         """Returns None when cached status is not PROCESSING."""
         sm = StatusMonitor()
-        result = sm._refresh_processing_status(
-            "t1", TerminalStatus.IDLE, "buffer"
-        )
+        result = sm._refresh_processing_status("t1", TerminalStatus.IDLE, "buffer")
 
         assert result is None
 
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
     @patch("cli_agent_orchestrator.services.status_monitor._resolve_window")
-    def test_refresh_processing_status_fresh_status_applied(self, mock_resolve_window, mock_get_backend, mock_pm):
+    def test_refresh_processing_status_fresh_status_applied(
+        self, mock_resolve_window, mock_get_backend, mock_pm
+    ):
         """Applies fresh status when it changes from PROCESSING."""
         mock_get_backend.return_value = _backend(event_inbox=False)
         provider = MagicMock()
@@ -479,9 +485,7 @@ class TestUntestedMethods:
         mock_get_backend.return_value.get_history.return_value = "output"
 
         sm = StatusMonitor()
-        result = sm._refresh_processing_status(
-            "t1", TerminalStatus.PROCESSING, "buffer"
-        )
+        result = sm._refresh_processing_status("t1", TerminalStatus.PROCESSING, "buffer")
 
         assert result == TerminalStatus.IDLE
         assert sm._last_status["t1"] == TerminalStatus.IDLE
