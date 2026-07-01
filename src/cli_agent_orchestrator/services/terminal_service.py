@@ -72,8 +72,6 @@ def _get_use_paste_buffer(provider) -> bool:
     """Determine if paste buffer should be used for the provider."""
     if provider is None:
         return True
-    if hasattr(provider, "use_paste_buffer_for_input"):
-        return provider.use_paste_buffer_for_input
     return provider.use_paste_buffer
 
 

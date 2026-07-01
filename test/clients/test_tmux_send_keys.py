@@ -145,3 +145,22 @@ class TestSendKeys:
         assert mock_subprocess.run.call_count == 4
         load_call = mock_subprocess.run.call_args_list[0]
         assert len(load_call[1]["input"]) == 50000
+
+    def test_send_keys_without_paste_buffer(self, client, mock_subprocess):
+        """When use_paste_buffer=False, uses send-keys -l instead of paste-buffer."""
+        client.send_keys("sess", "win", "hello", use_paste_buffer=False)
+
+        # Should call: send-keys -l, send-keys Enter (once)
+        assert mock_subprocess.run.call_count == 2
+        calls = mock_subprocess.run.call_args_list
+
+        # send-keys -l (literal send)
+        assert calls[0] == call(
+            ["tmux", "send-keys", "-l", "-t", "sess:win", "hello"],
+            check=True,
+        )
+        # send-keys Enter
+        assert calls[1] == call(
+            ["tmux", "send-keys", "-t", "sess:win", "C-m"],
+            check=True,
+        )

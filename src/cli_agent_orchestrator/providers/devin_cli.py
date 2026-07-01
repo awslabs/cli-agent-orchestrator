@@ -79,12 +79,7 @@ class DevinCliProvider(BaseProvider):
 
     @property
     def use_paste_buffer(self) -> bool:
-        """Devin CLI doesn't support paste-buffer for user input, but OK for shell commands."""
-        return True  # Use paste-buffer for shell commands in initialize()
-
-    @property
-    def use_paste_buffer_for_input(self) -> bool:
-        """Devin CLI doesn't support paste-buffer for user input - use send-keys."""
+        """Devin CLI doesn't support paste-buffer - use send-keys instead."""
         return False
 
     @staticmethod
