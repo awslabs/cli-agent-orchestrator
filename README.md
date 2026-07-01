@@ -128,6 +128,7 @@ CAO drives existing CLI agent tools — it does not replace them. Before using C
 | **OpenCode CLI** *(experimental — temporary inbox polling fallback for multi-agent callbacks, [#203](https://github.com/awslabs/cli-agent-orchestrator/issues/203))* | [Provider docs](docs/opencode-cli.md) · [Installation](https://opencode.ai) | Per-model API key |
 | **Cursor CLI** | [Provider docs](docs/cursor-cli.md) · [Installation](https://cursor.com/cli) | Cursor subscription / API key |
 | **Antigravity CLI** | [Provider docs](docs/antigravity-cli.md) · [Installation](https://antigravity.google) | Google account (shared with the Antigravity IDE login) |
+| **Devin CLI** | [Provider docs](docs/devin-cli.md) · [Installation](https://devin.ai) | Devin CLI auth |
 
 ## Quick Start
 
@@ -163,7 +164,7 @@ cao launch --agents code_supervisor
 
 # Or specify a provider
 cao launch --agents code_supervisor --provider claude_code
-# Valid: kiro_cli | claude_code | codex | antigravity_cli | hermes | kimi_cli | copilot_cli | opencode_cli | cursor_cli
+# Valid: kiro_cli | claude_code | codex | antigravity_cli | devin_cli | hermes | kimi_cli | copilot_cli | opencode_cli | cursor_cli
 
 # Unrestricted access, skip confirmation (DANGEROUS)
 cao launch --agents code_supervisor --yolo
@@ -273,7 +274,7 @@ provider: claude_code
 ---
 ```
 
-Valid values: `kiro_cli`, `claude_code`, `codex`, `antigravity_cli`, `hermes`, `kimi_cli`, `copilot_cli`, `opencode_cli`, `cursor_cli`. The `cao launch --provider` flag always takes precedence for the initial session. See [`examples/cross-provider/`](examples/cross-provider/).
+Valid values: `kiro_cli`, `claude_code`, `codex`, `antigravity_cli`, `devin_cli`, `hermes`, `kimi_cli`, `copilot_cli`, `opencode_cli`, `cursor_cli`. The `cao launch --provider` flag always takes precedence for the initial session. See [`examples/cross-provider/`](examples/cross-provider/).
 
 ### Tool Restrictions
 

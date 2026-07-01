@@ -6,7 +6,6 @@ import json
 import logging
 import re
 import shlex
-import sys
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -179,13 +178,19 @@ You are restricted to only use the following tools: {tools_list}
         """
         self._cleanup_temp_files()
 
-        command_parts = [
-            "devin",
-            "--permission-mode",
-            "dangerous",
-            "--respect-workspace-trust",
-            "false",
-        ]
+        command_parts = ["devin"]
+
+        # Only use dangerous permission mode when allowed_tools is unrestricted
+        # This follows the pattern of other providers (e.g., kiro_cli.py:250)
+        if self._allowed_tools is not None and "*" in self._allowed_tools:
+            command_parts.extend(
+                [
+                    "--permission-mode",
+                    "dangerous",
+                    "--respect-workspace-trust",
+                    "false",
+                ]
+            )
 
         # Handle allowed_tools restrictions
         if self._allowed_tools is not None and "*" not in self._allowed_tools:
@@ -298,15 +303,6 @@ You are restricted to only use the following tools: {tools_list}
             if re.match(USER_INPUT_PATTERN, line):
                 return True
         return False
-
-    @staticmethod
-    def _detect_prompt_with_fallback(clean_output: str) -> bool:
-        """Detect prompt with relaxed pattern when status bar is visible."""
-        has_prompt = re.search(r"^[\s]*#[\s]*$", clean_output, re.MULTILINE)
-        if not has_prompt and re.search(STATUS_BAR_PATTERN, clean_output):
-            last_lines = "\n".join(clean_output.split("\n")[-6:])
-            has_prompt = re.search(r"^[\s]*#", last_lines, re.MULTILINE)
-        return bool(has_prompt)
 
     def get_status(self, buffer: str) -> TerminalStatus:
         """Detect Devin CLI state from terminal output.
