@@ -66,6 +66,41 @@ def set_agent_dirs(dirs: Dict[str, str]) -> Dict[str, str]:
     return get_agent_dirs()
 
 
+def get_disabled_agent_dirs() -> List[str]:
+    """Directory paths the user has toggled OFF.
+
+    A disabled directory stays listed in Settings but is skipped when scanning
+    for (and loading) agent profiles, so its profiles disappear from the active
+    set without editing paths. Covers both provider defaults (fixes GH #281 —
+    a removed default used to silently reappear) and user extras (GH #280).
+    """
+    settings = _load()
+    dirs = settings.get("disabled_agent_dirs", [])
+    return dirs if isinstance(dirs, list) else []
+
+
+def set_disabled_agent_dirs(dirs: List[str]) -> List[str]:
+    """Persist which configured directories are disabled.
+
+    Only paths that are actually configured (a provider default from
+    ``get_agent_dirs`` or a user extra) are accepted — an arbitrary path would
+    silently match nothing during scanning, so rejecting it keeps the stored
+    state honest and the UI truthful. Order and duplicates are normalised away.
+    """
+    valid = set(get_agent_dirs().values()) | set(get_extra_agent_dirs())
+    seen: set = set()
+    cleaned: List[str] = []
+    for d in dirs:
+        if isinstance(d, str) and d.strip() and d in valid and d not in seen:
+            seen.add(d)
+            cleaned.append(d)
+    settings = _load()
+    settings["disabled_agent_dirs"] = cleaned
+    _save(settings)
+    logger.info(f"Disabled agent dirs: {cleaned}")
+    return cleaned
+
+
 # Default server tuning values
 _SERVER_DEFAULTS = {
     "mcp_request_timeout": 30,
