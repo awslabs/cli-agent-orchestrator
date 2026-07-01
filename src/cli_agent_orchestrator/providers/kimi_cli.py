@@ -84,6 +84,14 @@ IDLE_PROMPT_PATTERN_LOG = r"[✨💫]"
 # Used to detect successful initialization without needing to wait for prompt.
 WELCOME_BANNER_PATTERN = r"Welcome to Kimi Code CLI!"
 
+# Startup upgrade-reminder dialog. When a newer kimi-cli is available, kimi
+# renders an interactive menu ("[Enter] Upgrade now  [q] Not now  [s] Skip
+# reminders for version X") BEFORE the REPL and blocks on a keypress. Left
+# unanswered, kimi never reaches its ready prompt and init times out (the boot
+# gate holds it PROCESSING). We answer 's' to skip reminders for this version
+# (persisted, so it does not recur until the next release).
+UPGRADE_PROMPT_PATTERN = r"Skip reminders for version|Upgrade now"
+
 # User input box boundaries (pre-v1.20.0). Kimi displayed user messages in a bordered box:
 #   ╭──────────────────────────────╮
 #   │ user message text             │
@@ -397,6 +405,38 @@ class KimiCliProvider(BaseProvider):
 
         cls._mcp_timeout_configured = True
 
+    def _handle_startup_dialog(self, timeout: Optional[float] = None) -> None:
+        """Dismiss kimi's startup upgrade-reminder dialog if it appears.
+
+        Mirrors ClaudeCodeProvider._handle_startup_prompts: polls the pane for
+        the interactive "[s] Skip reminders for version X" menu and answers 's'
+        so kimi can proceed to its ready prompt. Exits early if kimi is already
+        ready (no newer version → no dialog), so a no-update start isn't delayed.
+        """
+        if timeout is None:
+            timeout = get_server_settings()["startup_prompt_handler_timeout"]
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            output = get_backend().get_history(self.session_name, self.window_name)
+            if output:
+                clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
+                if re.search(UPGRADE_PROMPT_PATTERN, clean_output):
+                    from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+                    logger.info("Kimi upgrade-reminder dialog detected, skipping reminders")
+                    status_monitor.notify_input_sent(self.terminal_id)
+                    # 's' = "Skip reminders for version X"; single-key menu, no Enter.
+                    get_backend().send_keys(self.session_name, self.window_name, "s", enter_count=0)
+                    time.sleep(1.0)
+                    return
+                # Already at a ready prompt → no dialog to handle, stop early.
+                if self.get_status(output) in (
+                    TerminalStatus.IDLE,
+                    TerminalStatus.COMPLETED,
+                ):
+                    return
+            time.sleep(1.0)
+
     async def initialize(self) -> bool:
         """Initialize Kimi CLI provider by starting the kimi command.
 
@@ -421,6 +461,10 @@ class KimiCliProvider(BaseProvider):
 
         # Send Kimi command to the tmux window
         get_backend().send_keys(self.session_name, self.window_name, command)
+
+        # Dismiss the startup upgrade-reminder dialog before waiting for ready:
+        # unanswered it blocks kimi from reaching its prompt (init would time out).
+        self._handle_startup_dialog()
 
         # Wait for Kimi CLI to reach IDLE or COMPLETED state (prompt visible).
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
