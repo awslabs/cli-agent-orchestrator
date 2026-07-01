@@ -649,9 +649,15 @@ class ClaudeCodeProvider(BaseProvider):
 
         return TerminalStatus.UNKNOWN
 
-    # Opt in to pyte rendered-screen detection (gated by CAO_PYTE_STATUS). The
-    # detector below is tuned for a COMPOSITED viewport, not the raw stream.
+    # The pyte screen path is implemented (get_status_from_screen below) but is
+    # pinned OFF by default: on Claude Code 2.1.x the rendered-screen path
+    # quiescence-gaps and init times out, whereas the RAW detector
+    # (NEW_TUI_BOX_PATTERN, verified against 2.1.197's stream) is reliable. Pin
+    # to raw here rather than globally so pyte-dependent providers (opencode_cli)
+    # still get the screen path in the same deployment. Flip to True (or clear
+    # screen_detection_default) if a future Claude release fixes the pyte path.
     supports_screen_detection = True
+    screen_detection_default = False
 
     def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
         """Detect status from a pyte-composited viewport (escape-free rows).

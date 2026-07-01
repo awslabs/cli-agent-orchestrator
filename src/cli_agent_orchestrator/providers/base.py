@@ -142,6 +142,15 @@ class BaseProvider(ABC):
     # depends on raw \r) whose detectors are tuned for the raw stream.
     supports_screen_detection: bool = False
 
+    # Per-provider override of the global ``CAO_PYTE_STATUS`` flag. When None
+    # (default), this provider follows the global setting. When True/False, it
+    # forces pyte on/off for THIS provider regardless of the global — so a
+    # provider whose raw detector is reliable but whose pyte path regresses on a
+    # given CLI version (e.g. claude_code on Claude 2.1.x) can pin itself to raw
+    # while pyte-dependent providers (opencode_cli) still use the screen path in
+    # the same deployment. Resolved in StatusMonitor._process_chunk.
+    screen_detection_default: Optional[bool] = None
+
     def get_status_from_screen(self, screen_lines: List[str]) -> TerminalStatus:
         """Detect status from a pyte-rendered screen (composited viewport).
 
