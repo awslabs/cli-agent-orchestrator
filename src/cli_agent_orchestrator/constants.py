@@ -69,6 +69,8 @@ TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
 # (WSL2 doesn't support FIFO pipes on /mnt/c filesystem)
 # Falls back to system temp directory if /tmp doesn't exist (e.g., Windows-native)
 # Security: use a fixed subdirectory to avoid tempdir security issues
+# sonarqube:S5307 - Using /tmp is safe here because we create a subdirectory with mode=0o700 (owner-only)
+# The FIFO_DIR is created with restricted permissions to prevent unauthorized access
 TEMP_BASE = Path("/tmp") if Path("/tmp").exists() else Path(tempfile.gettempdir())
 FIFO_DIR = (
     TEMP_BASE / "cli-agent-orchestrator" / "fifos"
