@@ -83,7 +83,7 @@ class TestDevinCliProviderStatusDetection:
 
     @patch("cli_agent_orchestrator.providers.devin_cli.tmux_client")
     def test_get_status_empty_output(self, mock_tmux):
-        """PROCESSING: empty/blank output → still starting up."""
+        """ERROR: empty/blank output → CLI failed to start."""
         buffer = ""
 
         provider = DevinCliProvider("test1234", "test-session", "window-0")
@@ -93,7 +93,7 @@ class TestDevinCliProviderStatusDetection:
 
     @patch("cli_agent_orchestrator.providers.devin_cli.tmux_client")
     def test_get_status_user_input_no_response(self, mock_tmux):
-        """PROCESSING: user input sent but no response lines yet."""
+        """COMPLETED: user input sent, prompt returned (ready for next input)."""
         buffer = (
             "> what is 2+2\n"
             "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"

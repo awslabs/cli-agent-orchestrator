@@ -452,9 +452,7 @@ class StatusMonitor:
 
     def _get_buffer_for_processing_check(self, terminal_id: str, cached: TerminalStatus) -> str:
         """Get buffer for fresh detection when cached status is PROCESSING."""
-        if cached == TerminalStatus.PROCESSING:
-            return self._buffers.get(terminal_id, "")
-        return ""
+        return self._buffers.get(terminal_id, "")
 
     def _refresh_processing_status(
         self, terminal_id: str, cached: TerminalStatus, buffer: str

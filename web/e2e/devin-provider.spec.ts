@@ -3,7 +3,7 @@ import { test, expect } from '@playwright/test';
 test.describe('Devin CLI Provider E2E Tests', () => {
   test.beforeEach(async ({ page }) => {
     // Navigate to CAO web interface
-    await page.goto('http://localhost:9889');
+    await page.goto('/');
     await page.waitForLoadState('networkidle');
   });
 
@@ -119,10 +119,9 @@ test.describe('Devin CLI Provider E2E Tests', () => {
       console.log('Modal open attempt failed:', error);
     }
 
-    // If modal still not opened, skip the rest of the test
+    // If modal still not opened, fail the test - this is a regression test
     if (!modalOpened) {
-      console.log('Modal could not be opened, skipping UI interaction test');
-      return;
+      throw new Error('Modal could not be opened - UI interaction test failed');
     }
 
     // Now proceed with checking modal content
