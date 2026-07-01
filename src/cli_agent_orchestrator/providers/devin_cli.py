@@ -11,7 +11,6 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
@@ -239,7 +238,8 @@ You are restricted to only use the following tools: {tools_list}
             raise TimeoutError("Shell initialization timed out after 10 seconds")
 
         command = self._build_command()
-        tmux_client.send_keys(
+        from cli_agent_orchestrator.backends.registry import get_backend
+        get_backend().send_keys(
             self.session_name,
             self.window_name,
             command,
@@ -247,7 +247,7 @@ You are restricted to only use the following tools: {tools_list}
         )
 
         if not await wait_until_status(
-            self, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=60.0
+            self.terminal_id, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=60.0
         ):
             raise TimeoutError("Devin CLI initialization timed out after 60 seconds")
 
