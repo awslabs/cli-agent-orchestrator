@@ -25,20 +25,26 @@ BIND_HOST="${CAO_BIND_HOST:-}"
 if [ -z "$BIND_HOST" ] && command -v tailscale >/dev/null 2>&1; then
   BIND_HOST="$(tailscale ip -4 2>/dev/null | head -1 || true)"
 fi
+if [ -z "$BIND_HOST" ] && [ "$(uname -s)" = "Darwin" ]; then
+  # macOS: `ip`/`hostname -I` don't exist here — use the BSD tools.
+  DEF_IF="$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')"
+  [ -n "$DEF_IF" ] && BIND_HOST="$(ipconfig getifaddr "$DEF_IF" 2>/dev/null || true)"
+  [ -n "$BIND_HOST" ] || BIND_HOST="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
+fi
 if [ -z "$BIND_HOST" ]; then
-  # primary outbound interface IP (works on Linux; harmless elsewhere)
+  # primary outbound interface IP (Linux/GNU: `ip`)
   BIND_HOST="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
 fi
 if [ -z "$BIND_HOST" ]; then
   BIND_HOST="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
 fi
-[ -n "$BIND_HOST" ] || { echo "could not determine a bind address — set CAO_BIND_HOST=<ip-or-hostname>"; exit 1; }
+[ -n "$BIND_HOST" ] || { echo "could not determine a bind address — set CAO_BIND_HOST=<ip-or-hostname> and re-run"; exit 1; }
 HOSTSHORT="$(hostname -s 2>/dev/null || hostname)"
 log "bind address: $BIND_HOST  host: $HOSTSHORT  port: $CAO_PORT"
 
-# 2. uv
+# 2. uv (pre-install uv yourself to skip this curl|sh step)
 if ! command -v uv >/dev/null 2>&1; then
-  log "installing uv"
+  log "installing uv (from astral.sh; pre-install uv to skip this)"
   curl -LsSf https://astral.sh/uv/install.sh | sh
 fi
 export PATH="$HOME/.local/bin:$PATH"
@@ -102,8 +108,14 @@ elif [ "$OS" = "Linux" ]; then
   mkdir -p "$HOME/.config/systemd/user"
   write_systemd_unit "$HOME/.config/systemd/user/cao-server.service" user
   loginctl enable-linger "$(id -un)" 2>/dev/null || warn "enable-linger failed (run: sudo loginctl enable-linger $(id -un))"
-  systemctl --user daemon-reload
-  systemctl --user enable --now cao-server.service
+  # In a fresh non-login SSH session the per-user systemd bus may not be up yet
+  # ("Failed to connect to bus"). Don't let that abort the whole bootstrap under
+  # set -e — warn and tell the operator how to finish by hand.
+  if ! systemctl --user daemon-reload 2>/dev/null || ! systemctl --user enable --now cao-server.service 2>/dev/null; then
+    warn "systemctl --user not ready (no user bus in this session)."
+    warn "finish after a fresh login with:  systemctl --user enable --now cao-server.service"
+    warn "or run bootstrap as root for a system service:  sudo bash $0"
+  fi
 elif [ "$OS" = "Darwin" ]; then
   log "installing launchd agent"
   PLIST="$HOME/Library/LaunchAgents/dev.cao.server.plist"
@@ -132,7 +144,14 @@ fi
 
 sleep 3
 log "verifying local health"
-curl -s "http://${BIND_HOST}:${CAO_PORT}/health" || { echo "server not answering on ${BIND_HOST}:${CAO_PORT}"; exit 1; }
+curl -fsS --max-time 5 "http://${BIND_HOST}:${CAO_PORT}/health" \
+  || { echo "server not answering on ${BIND_HOST}:${CAO_PORT}"; exit 1; }
 echo
 log "DONE. This node is reachable at http://${BIND_HOST}:${CAO_PORT} over your private network."
 log "Add it to the coordinator's fleet.json:  { \"name\": \"...\", \"host\": \"${BIND_HOST}\" }"
+echo
+warn "SECURITY: this cao-server is bound to ${BIND_HOST} with NO API authentication."
+warn "Anyone who can reach ${BIND_HOST}:${CAO_PORT} can launch/attach agents (full command"
+warn "execution) on this node. CAO_ALLOWED_HOSTS is a Host-header allowlist, not auth."
+warn "(This also enables CAO_MCP_APPS_ENABLED, which widens the API surface.)"
+warn "Keep the port on your private network only — do NOT expose it to the public internet."

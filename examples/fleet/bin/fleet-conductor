@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # fleet-conductor — start an AI "conductor" (Claude Code) wired to every fleet
-# node's cao-ops-mcp server, so one AI can observe and command agents across nodes.
+# node's cao-ops-mcp-server, so one AI can observe and command agents across nodes.
 #   fleet-conductor                 # interactive chat you drive
 #   fleet-conductor "<prompt>"      # one-shot, non-interactive (scriptable)
 #

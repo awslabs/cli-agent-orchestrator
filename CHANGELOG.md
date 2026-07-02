@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - add built-in Hermes provider support through profile-configured `hermesProfile` wrappers
 
+- add `examples/fleet` — a cross-node fleet coordinator that manages many CAO nodes from one place: one-command node bootstrap, a `fleet` control helper (list/show/exec against any node), and an AI conductor wired to one `cao-ops-mcp-server` per node. Purely additive under `examples/`; each node stays a stateless client of the existing `cao-server` API (#349)
+
 ### Changed
 
 - rename `cao flow` → `cao schedule` to avoid confusion with the new `cao workflow` feature. `cao flow` remains as a hidden deprecated alias that prints a warning to stderr; flow files, `~/.cao/flows`, stored schedules, and the `/flows` REST API are unchanged, and the web UI only updates its CLI hint string (#378)

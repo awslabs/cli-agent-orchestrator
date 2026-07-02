@@ -2,6 +2,16 @@
 # `bash bootstrap.sh` writes this for you automatically; this file is here so you
 # can install/customize it by hand if you prefer.
 #
+# SECURITY: this binds cao-server to a non-loopback address with NO API auth in
+# the default config. Anyone who can reach YOUR_BIND_HOST:9889 can launch/attach
+# agents (arbitrary command execution) on this node. CAO_ALLOWED_HOSTS below is a
+# Host-header allowlist (DNS-rebinding mitigation), NOT authentication. Keep this
+# port on your private network only — do NOT expose it to the public internet.
+# For defense-in-depth you can put CAO's OAuth layer in front of it (see
+# AUTH0_DOMAIN / CAO_AUTH_JWKS_URI in the CAO docs).
+# This example also sets CAO_MCP_APPS_ENABLED=true (the conductor/panel use it),
+# which widens the API surface — drop it if you don't need MCP Apps on the node.
+#
 #   1. Replace the placeholders below.
 #   2. Install:  sudo cp cao-server.service.example /etc/systemd/system/cao-server.service
 #   3. sudo systemctl daemon-reload && sudo systemctl enable --now cao-server.service
