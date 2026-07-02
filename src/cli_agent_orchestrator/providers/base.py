@@ -321,8 +321,8 @@ class BaseProvider(ABC):
             )
             return TerminalStatus.PROCESSING
         if native == TerminalStatus.IDLE and self._task_dispatched:
-            # herdr "idle" post-dispatch: wait 10s from first detection, then
-            # keep returning PROCESSING until 5 min from dispatch (give up).
+            # herdr "idle" post-dispatch: wait 10s from first detection for buffer to flush,
+            # then report COMPLETED (warn if still idle 5 min after dispatch).
             if self._idle_first_detected == 0.0:
                 self._idle_first_detected = time.time()
             waited = time.time() - self._idle_first_detected
