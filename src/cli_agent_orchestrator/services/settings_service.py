@@ -87,11 +87,18 @@ def set_disabled_agent_dirs(dirs: List[str]) -> List[str]:
     silently match nothing during scanning, so rejecting it keeps the stored
     state honest and the UI truthful. Order and duplicates are normalised away.
     """
-    valid = set(get_agent_dirs().values()) | set(get_extra_agent_dirs())
-    seen: set = set()
+    valid = {
+        v
+        for v in list(get_agent_dirs().values()) + list(get_extra_agent_dirs())
+        if isinstance(v, str)
+    }
+    seen: Set[str] = set()
     cleaned: List[str] = []
     for d in dirs:
-        if isinstance(d, str) and d.strip() and d in valid and d not in seen:
+        if not isinstance(d, str):
+            continue
+        d = d.strip()
+        if d and d in valid and d not in seen:
             seen.add(d)
             cleaned.append(d)
     settings = _load()

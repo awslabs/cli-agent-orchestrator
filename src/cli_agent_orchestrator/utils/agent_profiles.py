@@ -125,8 +125,42 @@ def list_agent_profiles() -> List[Dict]:
     # to flag same-named profiles defined in more than one dir (GH #280).
     name_sources: Dict[str, List[str]] = {}
     disabled = {_normalized_path(d) for d in get_disabled_agent_dirs()}
+    scanned_paths: set[str] = set()
 
-    # 1. Built-in agent store
+    # 2. Local agent store (~/.aws/cli-agent-orchestrator/agent-store/).
+    # It shares a path with the claude_code/codex default, so honour the
+    # disable toggle here too — otherwise disabling that default wouldn't hide
+    # its profiles.
+    local_norm = _normalized_path(LOCAL_AGENT_STORE_DIR)
+    if local_norm not in disabled:
+        _scan_directory(LOCAL_AGENT_STORE_DIR, "local", profiles, name_sources)
+        scanned_paths.add(local_norm)
+
+    # 3. Provider-specific directories (from settings)
+    agent_dirs = get_agent_dirs()
+    provider_source_labels = {
+        "kiro_cli": "kiro",
+        "claude_code": "claude_code",
+        "codex": "codex",
+        "cao_installed": "installed",
+    }
+    for provider, dir_path in agent_dirs.items():
+        norm = _normalized_path(dir_path)
+        if norm in disabled or norm in scanned_paths:
+            continue
+        label = provider_source_labels.get(provider, provider)
+        _scan_directory(Path(dir_path), label, profiles, name_sources)
+        scanned_paths.add(norm)
+
+    # 4. Extra user-added directories
+    for extra_dir in get_extra_agent_dirs():
+        norm = _normalized_path(extra_dir)
+        if norm in disabled or norm in scanned_paths:
+            continue
+        _scan_directory(Path(extra_dir), "custom", profiles, name_sources)
+        scanned_paths.add(norm)
+
+    # Built-in agent store — scanned LAST so on-disk copies win (matches _read_agent_profile_source).
     try:
         agent_store = resources.files("cli_agent_orchestrator.agent_store")
         for item in agent_store.iterdir():
@@ -151,37 +185,6 @@ def list_agent_profiles() -> List[Dict]:
                     }
     except Exception as e:
         logger.debug(f"Could not scan built-in agent store: {e}")
-
-    # 2. Local agent store (~/.aws/cli-agent-orchestrator/agent-store/).
-    # It shares a path with the claude_code/codex default, so honour the
-    # disable toggle here too — otherwise disabling that default wouldn't hide
-    # its profiles.
-    if _normalized_path(LOCAL_AGENT_STORE_DIR) not in disabled:
-        _scan_directory(LOCAL_AGENT_STORE_DIR, "local", profiles, name_sources)
-
-    # 3. Provider-specific directories (from settings)
-    agent_dirs = get_agent_dirs()
-    provider_source_labels = {
-        "kiro_cli": "kiro",
-        "claude_code": "claude_code",
-        "codex": "codex",
-        "cao_installed": "installed",
-    }
-    for provider, dir_path in agent_dirs.items():
-        if _normalized_path(dir_path) in disabled:
-            continue
-        label = provider_source_labels.get(provider, provider)
-        path = Path(dir_path)
-        # Skip if it's the same as local store (already scanned)
-        if path.resolve() == LOCAL_AGENT_STORE_DIR.resolve():
-            continue
-        _scan_directory(path, label, profiles, name_sources)
-
-    # 4. Extra user-added directories
-    for extra_dir in get_extra_agent_dirs():
-        if _normalized_path(extra_dir) in disabled:
-            continue
-        _scan_directory(Path(extra_dir), "custom", profiles, name_sources)
 
     # Flag conflicts: a name found in more than one enabled directory. The
     # winner (first scanned) is what loads; ``duplicated_in`` lists the shadowed

@@ -74,7 +74,7 @@ export function SettingsPanel() {
       refreshProfiles()
     } catch (e: any) {
       showSnackbar({ type: 'error', message: e.message || 'Failed to update' })
-      load()
+      await load()
     } finally {
       setBusy(false)
     }

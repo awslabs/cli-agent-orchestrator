@@ -105,3 +105,28 @@ class TestDefaultRemovalRegression:
         # ...but its profiles are gone from the active set.
         names = {p["name"] for p in agent_profiles.list_agent_profiles()}
         assert "zzkirodefault" not in names
+
+
+class TestNormalizedPathMatching:
+    """The disable check normalizes paths (GH #280/#281), so a directory is still
+    skipped when the disabled entry is spelled differently from the scanned path."""
+
+    def test_differing_spelling_still_skips(self, isolated_settings, monkeypatch):
+        d = isolated_settings / "extra"
+        d.mkdir()
+        _profile(d, "zzspelling", "s")
+        svc.set_extra_agent_dirs([str(d)])  # configured WITHOUT a trailing slash
+
+        # Sanity: visible while enabled.
+        names = {p["name"] for p in agent_profiles.list_agent_profiles()}
+        assert "zzspelling" in names
+
+        # Disable it with a DIFFERENT spelling (trailing slash). set_disabled_agent_dirs
+        # validates raw strings, so we bypass it here to isolate the scan-side
+        # normalization we actually want to prove — this is the part the UI relies on.
+        monkeypatch.setattr(svc, "get_disabled_agent_dirs", lambda: [str(d) + "/"])
+
+        names = {p["name"] for p in agent_profiles.list_agent_profiles()}
+        assert "zzspelling" not in names  # normalization matched despite the slash
+        with pytest.raises(FileNotFoundError):
+            agent_profiles._read_agent_profile_source("zzspelling")

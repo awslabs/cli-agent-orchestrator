@@ -335,6 +335,9 @@ class TestListAgentProfilesEdgeCases:
         resolved_path = Path(__file__).resolve().parent
         mock_local_dir.exists.return_value = True
         mock_local_dir.resolve.return_value = resolved_path
+        # Dedup now keys on _normalized_path(str(dir)) rather than .resolve(),
+        # so give the mocked local store a real string form to match against.
+        mock_local_dir.__str__.return_value = str(resolved_path)
 
         # Provider dir resolves to same as local
         mock_get_dirs.return_value = {"kiro_cli": str(resolved_path)}
