@@ -5,10 +5,9 @@ thin HTTP client against the ``/workflows`` endpoints on the running cao-server
 (single integration seam, B2-BR-10). This module NEVER imports
 ``workflow_spec_service`` or ``database`` directly (project Forbidden rule).
 
-Scope discipline (Q1 / B2-BR-11): ``run`` / ``status`` / ``cancel`` are NOT
-registered here — they land in Bolt 3 with the run engine. Invoking
-``cao workflow run`` yields click's standard "no such command"; nothing here
-stubs or depicts a run.
+The Bolt-3 run verbs — ``run`` / ``status`` / ``cancel`` — are thin HTTP clients
+over the ``/workflows/runs`` engine endpoints (N5), mirroring the authoring-verb
+style. They never import ``workflow_service`` directly (project Forbidden rule).
 """
 
 import json as _json
@@ -16,7 +15,11 @@ import json as _json
 import click
 import requests
 
-from cli_agent_orchestrator.constants import API_BASE_URL, MCP_REQUEST_TIMEOUT
+from cli_agent_orchestrator.constants import (
+    API_BASE_URL,
+    MCP_REQUEST_TIMEOUT,
+    WORKFLOW_RUN_REQUEST_TIMEOUT,
+)
 
 
 def _extract_detail(response: requests.Response, fallback: str) -> str:
@@ -164,3 +167,131 @@ def delete_cmd(name, yes):
     if response.status_code not in (200, 204):
         raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
     click.echo(f"deleted '{name}'")
+
+
+def _parse_inputs(pairs):
+    """Parse ``--input k=v`` pairs into an inputs dict with light type coercion.
+
+    Each value is coerced from its string form: ``true``/``false`` -> bool,
+    a bare integer -> int, everything else stays a string. This keeps the CLI
+    ergonomic while the engine still validates every value against the spec's
+    declared ``InputDecl`` types (a coercion that disagrees with the declared
+    type surfaces as a 400 from the engine).
+    """
+    inputs = {}
+    for pair in pairs:
+        if "=" not in pair:
+            raise click.ClickException(f"--input must be k=v (got '{pair}')")
+        key, _, raw = pair.partition("=")
+        key = key.strip()
+        if not key:
+            raise click.ClickException(f"--input key is empty (got '{pair}')")
+        inputs[key] = _coerce(raw)
+    return inputs
+
+
+def _coerce(raw):
+    """Coerce a raw ``--input`` value string to bool / int / str."""
+    low = raw.strip().lower()
+    if low in ("true", "false"):
+        return low == "true"
+    try:
+        return int(raw)
+    except ValueError:
+        return raw
+
+
+@workflow.command(name="run")
+@click.argument("name_or_path")
+@click.option("--input", "inputs", multiple=True, help="Run input as k=v (repeatable).")
+@click.option("--run-id", "run_id", default=None, help="Optional explicit run id.")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
+def run_cmd(name_or_path, inputs, run_id, as_json):
+    """Run a workflow to completion (blocks until the run finishes).
+
+    Exit codes:
+      0  run reached COMPLETED
+      1  run reached FAILED / CANCELLED, or the request errored
+    """
+    parsed = _parse_inputs(inputs)
+    payload = {"name_or_path": name_or_path, "inputs": parsed}
+    if run_id is not None:
+        payload["run_id"] = run_id
+    try:
+        # ``run`` blocks until the whole workflow finishes (the server awaits the run
+        # inline, Q1=A), so use the worst-case-covering run timeout, NOT the flat 30s
+        # MCP_REQUEST_TIMEOUT (which would report a still-running run as a failure).
+        response = requests.post(
+            f"{API_BASE_URL}/workflows/runs",
+            json=payload,
+            timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
+        )
+    except requests.exceptions.RequestException as e:
+        raise click.ClickException(f"could not reach cao-server: {e}")
+
+    if response.status_code == 404:
+        raise click.ClickException(_extract_detail(response, f"unknown workflow '{name_or_path}'"))
+    if response.status_code in (400, 409, 500, 501):
+        raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
+    if response.status_code != 200:
+        raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
+
+    result = response.json()
+    if as_json:
+        click.echo(_json.dumps(result, indent=2))
+    else:
+        click.echo(f"Run:   {result.get('run_id')}")
+        click.echo(f"State: {result.get('state')}")
+        for step in result.get("steps", []):
+            click.echo(f"  - {step['id']}: {step['state']} (attempts={step.get('attempts')})")
+
+    if result.get("state") != "completed":
+        raise click.exceptions.Exit(1)
+
+
+@workflow.command(name="status")
+@click.argument("run_id")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit the snapshot as JSON.")
+def status_cmd(run_id, as_json):
+    """Show a point-in-time status snapshot for a run."""
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/workflows/runs/{run_id}", timeout=MCP_REQUEST_TIMEOUT
+        )
+    except requests.exceptions.RequestException as e:
+        raise click.ClickException(f"could not reach cao-server: {e}")
+
+    if response.status_code == 404:
+        raise click.ClickException(f"unknown run '{run_id}'")
+    if response.status_code != 200:
+        raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
+
+    snapshot = response.json()
+    if as_json:
+        click.echo(_json.dumps(snapshot, indent=2))
+        return
+    click.echo(f"Run:     {snapshot.get('run_id')}")
+    click.echo(f"State:   {snapshot.get('state')}")
+    click.echo(f"Current: {snapshot.get('current_step_id') or '(none)'}")
+    for step in snapshot.get("steps", []):
+        click.echo(f"  - {step['id']}: {step['state']} (attempts={step.get('attempts')})")
+
+
+@workflow.command(name="cancel")
+@click.argument("run_id")
+def cancel_cmd(run_id):
+    """Cooperatively cancel a running workflow."""
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/workflows/runs/{run_id}/cancel", timeout=MCP_REQUEST_TIMEOUT
+        )
+    except requests.exceptions.RequestException as e:
+        raise click.ClickException(f"could not reach cao-server: {e}")
+
+    if response.status_code == 404:
+        raise click.ClickException(f"unknown run '{run_id}'")
+    if response.status_code == 409:
+        raise click.ClickException(_extract_detail(response, "run is already finished"))
+    if response.status_code != 200:
+        raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
+    click.echo(f"cancelling '{run_id}'")

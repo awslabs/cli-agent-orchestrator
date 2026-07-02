@@ -10,7 +10,11 @@ import requests
 from fastmcp import FastMCP
 from pydantic import Field
 
-from cli_agent_orchestrator.constants import API_BASE_URL, DEFAULT_PROVIDER
+from cli_agent_orchestrator.constants import (
+    API_BASE_URL,
+    DEFAULT_PROVIDER,
+    WORKFLOW_RUN_REQUEST_TIMEOUT,
+)
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -1483,6 +1487,74 @@ async def workflow_return(
         validated=bool(data.get("validated", False)),
         errors=list(data.get("errors", [])),
     ).model_dump()
+
+
+@mcp.tool()
+async def workflow_run(
+    name_or_path: str = Field(description="Workflow name (indexed) or path to a spec YAML file"),
+    inputs: Optional[Dict[str, Any]] = Field(
+        default=None, description="Run inputs, validated against the spec's declared inputs"
+    ),
+) -> Dict[str, Any]:
+    """Run a workflow to completion and return the aggregated result (issue #312, N5).
+
+    A thin HTTP client over ``POST /workflows/runs`` (single seam, B3-BR-15): the
+    engine runs the spec in-process in the server and this tool blocks on the HTTP
+    request until the run finishes (Q1=A, mirrors handoff). Returns a structured
+    envelope on EVERY path — it never raises into the agent loop. ``ok=False``
+    carries the server error detail (unknown workflow, invalid inputs, a reserved
+    mode that is not built yet, etc.).
+    """
+    payload: Dict[str, Any] = {"name_or_path": name_or_path, "inputs": inputs or {}}
+    try:
+        # The server awaits the WHOLE run inline (Q1=A), so this blocks for the full
+        # run duration — use the worst-case-covering run timeout, NOT the short
+        # per-call _mcp_timeout() (mirrors handoff's timeout + 180.0 reasoning).
+        response = requests.post(
+            f"{API_BASE_URL}/workflows/runs",
+            json=payload,
+            timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
+        )
+    except requests.RequestException as e:
+        return {"ok": False, "error": f"could not reach cao-server: {e}"}
+
+    if response.status_code != 200:
+        detail = _extract_error_detail(response, f"status {response.status_code}")
+        return {"ok": False, "error": detail}
+
+    data = response.json()
+    return {
+        "ok": True,
+        "run_id": data.get("run_id"),
+        "state": data.get("state"),
+        "steps": data.get("steps", []),
+    }
+
+
+@mcp.tool()
+async def workflow_cancel(
+    run_id: str = Field(description="The run id to cancel (from a prior workflow_run)"),
+) -> Dict[str, Any]:
+    """Cooperatively cancel a running workflow (issue #312, N5).
+
+    A thin HTTP client over ``POST /workflows/runs/{run_id}/cancel``. Returns a
+    structured envelope on every path — never raises into the agent loop. The
+    cancel is cooperative: the in-flight step runs to natural completion before the
+    run settles to CANCELLED.
+    """
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/workflows/runs/{run_id}/cancel",
+            timeout=_mcp_timeout(),
+        )
+    except requests.RequestException as e:
+        return {"ok": False, "error": f"could not reach cao-server: {e}"}
+
+    if response.status_code != 200:
+        detail = _extract_error_detail(response, f"status {response.status_code}")
+        return {"ok": False, "error": detail}
+
+    return {"ok": True, "run_id": run_id}
 
 
 # The MCP Apps surface — tools (render_dashboard / render_agent_view /

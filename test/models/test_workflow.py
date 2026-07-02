@@ -403,3 +403,76 @@ class TestNotBuiltYetError:
         """N1 only DEFINES NotBuiltYetError; the engine (N5) raises it. Confirm
         it exists and is an Exception subclass — nothing in Bolt 1 raises it."""
         assert issubclass(NotBuiltYetError, Exception)
+
+
+class TestBolt3AdditiveModelChanges:
+    """B3-BR-3/B3-BR-12/B3-BR-13: the retries field + CANCELLED enum are additive
+    and regression-safe — a spec without retries behaves exactly as before."""
+
+    def test_spec_without_retries_unchanged(self):
+        """A spec that omits ``retries`` parses exactly as before (retries None)."""
+        spec = WorkflowSpec(**_spec_kwargs())
+        assert spec.steps[0].retries is None
+        # validate_only still classifies a plain sequential spec as pass.
+        assert validate_only(_SEQ_YAML).status == "pass"
+
+    def test_retries_in_range_accepted(self):
+        for n in (0, 1, 10):
+            spec = WorkflowSpec(
+                **_spec_kwargs(
+                    steps=[
+                        {
+                            "id": "s1",
+                            "provider": "kiro_cli",
+                            "agent": "dev",
+                            "prompt": "go",
+                            "retries": n,
+                        }
+                    ]
+                )
+            )
+            assert spec.steps[0].retries == n
+
+    def test_retries_out_of_range_aggregated_error(self):
+        with pytest.raises(ValueError, match="out of range"):
+            WorkflowSpec(
+                **_spec_kwargs(
+                    steps=[
+                        {
+                            "id": "s1",
+                            "provider": "kiro_cli",
+                            "agent": "dev",
+                            "prompt": "go",
+                            "retries": 11,
+                        }
+                    ]
+                )
+            )
+
+    def test_retries_out_of_range_float_or_huge_rejected(self):
+        """A retries value above the cap is an aggregated grammar error even when
+        well-typed (guards the B3-PERF-4 worst-case ceiling)."""
+        with pytest.raises(ValueError, match="out of range"):
+            WorkflowSpec(
+                **_spec_kwargs(
+                    steps=[
+                        {
+                            "id": "s1",
+                            "provider": "kiro_cli",
+                            "agent": "dev",
+                            "prompt": "go",
+                            "retries": 100,
+                        }
+                    ]
+                )
+            )
+
+    def test_run_state_cancelled_is_purely_additive(self):
+        from cli_agent_orchestrator.models.workflow import RunState
+
+        # Existing values are unchanged; CANCELLED is the only new member.
+        assert RunState.RUNNING.value == "running"
+        assert RunState.COMPLETED.value == "completed"
+        assert RunState.FAILED.value == "failed"
+        assert RunState.CANCELLED.value == "cancelled"
+        assert {s.value for s in RunState} == {"running", "completed", "failed", "cancelled"}

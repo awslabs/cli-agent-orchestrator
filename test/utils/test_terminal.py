@@ -54,8 +54,18 @@ class TestGenerateFunctions:
         assert len(name) == 14  # developer- (10) + uuid (4)
 
     def test_generate_window_name_unique(self):
-        """Test window names are mostly unique (4 hex chars = 65536 values, collisions possible)."""
-        names = [generate_window_name("test") for _ in range(10)]
+        """Distinct uuid suffixes yield distinct window names.
+
+        The real suffix is only 4 hex chars (65536 values), so asserting that N
+        live random draws never collide is a birthday-paradox flake. Pin the
+        randomness instead: distinct uuids must map to distinct names, which is
+        what the suffix is actually there to guarantee.
+        """
+        # generate_window_name slices .hex[:4], so vary the FIRST 4 hex chars.
+        suffixes = [f"{i:04x}cafe" for i in range(10)]
+        with patch("cli_agent_orchestrator.utils.terminal.uuid.uuid4") as mock_uuid4:
+            mock_uuid4.side_effect = [MagicMock(hex=s) for s in suffixes]
+            names = [generate_window_name("test") for _ in range(10)]
 
         assert len(set(names)) == 10
 

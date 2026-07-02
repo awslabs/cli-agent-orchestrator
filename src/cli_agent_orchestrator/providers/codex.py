@@ -396,6 +396,12 @@ class CodexProvider(BaseProvider):
         return True
 
     def get_status(self, output: str) -> TerminalStatus:
+        # Native status (herdr): trust the backend's agent state when available;
+        # on herdr the buffer is never fed, so buffer parsing can't leave UNKNOWN.
+        native = self._resolve_native_status()
+        if native is not None:
+            return native
+
         if not output:
             return TerminalStatus.UNKNOWN
 
