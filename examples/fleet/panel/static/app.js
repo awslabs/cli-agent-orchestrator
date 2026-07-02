@@ -3,6 +3,20 @@ import { openConsole } from "./console.js";
 import { dampFleet } from "./fleet.js";
 
 const $ = (s, r = document) => r.querySelector(s);
+
+// Build an <option> with textContent (never innerHTML): value/label may come from
+// a remote node's providers/profiles or the registry, so treat them as untrusted.
+function opt(value, label) {
+  const o = document.createElement("option");
+  o.value = value;
+  o.textContent = label == null ? value : label;
+  return o;
+}
+// Replace a <select>'s options from [{value,label}] without parsing HTML.
+function setOptions(sel, items) {
+  sel.replaceChildren(...items.map((i) => opt(i.value, i.label)));
+}
+
 const wallEl = $("#wall");
 const statusLine = $("#status-line");
 const tileMap = new Map(); // `${machine}::${session}` -> tile { el, poller, update }
@@ -56,7 +70,7 @@ async function refresh() {
   let changed = false;
   // remove tiles whose session is gone
   for (const [key, tile] of tileMap) {
-    if (!desired.has(key)) { tile.poller.stop(); tile.el.remove(); tileMap.delete(key); changed = true; }
+    if (!desired.has(key)) { tile.poller.stop(); tile.poller.forget(); tile.el.remove(); tileMap.delete(key); changed = true; }
   }
   // remove empty cards no longer needed
   for (const [name, el] of emptyMap) {
@@ -77,7 +91,18 @@ async function refresh() {
     if (!emptyMap.has(name)) {
       const el = document.createElement("div");
       el.className = "tile empty";
-      el.innerHTML = `<div class="tile-head"><span class="dot"></span><span class="tile-title">${name}</span></div><div class="tile-screen muted">no sessions</div>`;
+      const head = document.createElement("div");
+      head.className = "tile-head";
+      const dot = document.createElement("span");
+      dot.className = "dot";
+      const t = document.createElement("span");
+      t.className = "tile-title";
+      t.textContent = name; // machine name from the registry — set as text, never HTML
+      head.append(dot, t);
+      const scr = document.createElement("div");
+      scr.className = "tile-screen muted";
+      scr.textContent = "no sessions";
+      el.append(head, scr);
       emptyMap.set(name, el);
       changed = true;
     }
@@ -110,8 +135,7 @@ async function openLaunch() {
   const nodeSel = $("#launch-node");
   const online = lastFleet.machines.filter((m) => m.online);
   if (!online.length) { alert("No online nodes to launch on."); return; }
-  nodeSel.innerHTML = online
-    .map((m) => `<option value="${m.name}">${m.name} (${m.label || m.host})</option>`).join("");
+  setOptions(nodeSel, online.map((m) => ({ value: m.name, label: `${m.name} (${m.label || m.host})` })));
   launchForm.reset();
   launchMsg.textContent = "";
   await loadNodeOptions(online[0].name);
@@ -124,8 +148,8 @@ $("#launch-node").addEventListener("change", (e) => loadNodeOptions(e.target.val
 async function loadNodeOptions(node) {
   const provSel = $("#launch-provider");
   const profSel = $("#launch-profile");
-  provSel.innerHTML = "<option>loading…</option>";
-  profSel.innerHTML = "<option>loading…</option>";
+  setOptions(provSel, [{ value: "", label: "loading…" }]);
+  setOptions(profSel, [{ value: "", label: "loading…" }]);
   try {
     const [provs, profs] = await Promise.all([
       api(`/api/machines/${node}/providers`),
@@ -133,15 +157,16 @@ async function loadNodeOptions(node) {
     ]);
     const installed = provs.filter((p) => p.installed);
     const provList = installed.length ? installed : provs;
-    provSel.innerHTML = provList
-      .map((p) => `<option value="${p.name}">${p.name}${p.installed ? "" : " (not installed)"}</option>`)
-      .join("");
-    profSel.innerHTML = profs
-      .map((p) => { const n = typeof p === "string" ? p : p.name; return `<option value="${n}">${n}</option>`; })
-      .join("");
+    setOptions(provSel, provList.map((p) => ({
+      value: p.name, label: `${p.name}${p.installed ? "" : " (not installed)"}`,
+    })));
+    setOptions(profSel, profs.map((p) => {
+      const n = typeof p === "string" ? p : p.name;
+      return { value: n, label: n };
+    }));
   } catch (e) {
-    provSel.innerHTML = `<option value="claude_code">claude_code</option>`;
-    profSel.innerHTML = `<option value="developer">developer</option>`;
+    setOptions(provSel, [{ value: "claude_code", label: "claude_code" }]);
+    setOptions(profSel, [{ value: "developer", label: "developer" }]);
   }
 }
 

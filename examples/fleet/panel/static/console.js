@@ -22,12 +22,15 @@ async function post(path, body) {
 export function openConsole({ machine, session, onClosed }) {
   const overlay = document.createElement("div");
   overlay.className = "console-overlay";
+  // NOTE: machine comes from the registry and session from a remote node's
+  // /sessions — both are untrusted, so keep them OUT of the innerHTML template
+  // and set them via textContent/setAttribute below to avoid DOM injection.
   overlay.innerHTML = `
-    <div class="console" role="dialog" aria-label="Console for ${session} on ${machine}">
+    <div class="console" role="dialog">
       <div class="console-head">
         <button class="back" aria-label="Back to wall">‹ wall</button>
         <span class="dot"></span>
-        <span class="console-title">${machine} · ${session}</span>
+        <span class="console-title"></span>
         <span class="console-status"></span>
         <span class="console-meta muted"></span>
         <span class="spacer"></span>
@@ -49,6 +52,9 @@ export function openConsole({ machine, session, onClosed }) {
         <button type="submit" class="primary send">Send</button>
       </form>
       <div class="hint">Enter sends a message · ^C interrupts the CLI</div>`;
+
+  overlay.querySelector(".console").setAttribute("aria-label", `Console for ${session} on ${machine}`);
+  overlay.querySelector(".console-title").textContent = `${machine} · ${session}`;
 
   const screenEl = overlay.querySelector(".console-screen");
   const statusEl = overlay.querySelector(".console-status");

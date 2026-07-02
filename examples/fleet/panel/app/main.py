@@ -45,7 +45,7 @@ async def fleet():
 
 
 @app.post("/api/machines/{name}/launch")
-async def launch(name: str, body: dict = Body(default={})):
+async def launch(name: str, body: dict = Body(default_factory=dict)):
     m = _machine_or_404(name)
     base = config.base_url(m)
     agent = body.get("agent_profile") or "developer"
@@ -84,7 +84,7 @@ async def session_detail(name: str, session_name: str):
 
 
 @app.post("/api/machines/{name}/sessions/{session_name}/send")
-async def send(name: str, session_name: str, body: dict = Body(default={})):
+async def send(name: str, session_name: str, body: dict = Body(default_factory=dict)):
     msg = body.get("message")
     if not msg:
         raise HTTPException(status_code=400, detail="message required")
@@ -146,7 +146,7 @@ async def terminal_screen(name: str, terminal_id: str, ansi: bool = True):
 
 
 @app.post("/api/machines/{name}/terminals/{terminal_id}/key")
-async def terminal_key(name: str, terminal_id: str, body: dict = Body(default={})):
+async def terminal_key(name: str, terminal_id: str, body: dict = Body(default_factory=dict)):
     key = body.get("key")
     if not key:
         raise HTTPException(status_code=400, detail="key required")
@@ -160,7 +160,7 @@ async def terminal_key(name: str, terminal_id: str, body: dict = Body(default={}
 
 
 @app.post("/api/machines/{name}/terminals/{terminal_id}/input")
-async def terminal_input(name: str, terminal_id: str, body: dict = Body(default={})):
+async def terminal_input(name: str, terminal_id: str, body: dict = Body(default_factory=dict)):
     text = body.get("text")
     if not text:
         raise HTTPException(status_code=400, detail="text required")

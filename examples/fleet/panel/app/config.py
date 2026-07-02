@@ -28,7 +28,8 @@ PANEL_PORT = int(os.environ.get("CAO_PANEL_PORT", "9888"))
 
 def load_machines():
     """Return the fleet nodes, each with a concrete int `port`."""
-    cfg = json.load(open(FLEET_CONFIG))
+    with open(FLEET_CONFIG, encoding="utf-8") as f:
+        cfg = json.load(f)
     default_port = int(cfg.get("port", 9889))
     machines = []
     for m in cfg["machines"]:
