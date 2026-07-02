@@ -32,7 +32,7 @@ Define the agent's role, responsibilities, and behavior here.
 - `toolAliases` (object): Map tool names to aliases
 - `toolsSettings` (object): Tool-specific configuration
 - `model` (string): AI model to use
-- `permissionMode` (string, `claude_code` only): One of `"default"`, `"acceptEdits"`, `"plan"`, `"auto"`, `"bypassPermissions"`. When set, the `claude_code` provider passes `--permission-mode <value>` instead of `--dangerously-skip-permissions`. `cao launch --yolo` overrides this and forces bypass. See [Claude Code permission modes](https://code.claude.com/docs/en/permission-modes).
+- `permissionMode` (string, `claude_code` only): One of `"default"`, `"acceptEdits"`, `"plan"`, `"auto"`, `"bypassPermissions"`. When set, the `claude_code` provider passes `--permission-mode <value>` instead of `--dangerously-skip-permissions`. `permissionMode` takes priority over `--yolo`; the provider always uses `--permission-mode <value>` when the field is set. See [Claude Code permission modes](https://code.claude.com/docs/en/permission-modes).
 - `native_agent` (string, `claude_code` only): Name of a native Claude Code agent (`~/.claude/agents/`). When set, the provider passes `--agent <name>` directly and skips system prompt / MCP config decomposition (thin-wrapper mode). See [Claude Code native agent routing](claude-code.md#native-agent-routing).
 - `codexProfile` (string, `codex` only): Names a `[profiles.<name>]` block in `~/.codex/config.toml`. When set, the provider drops `--yolo` and passes `--profile <name>` instead. See [Custom Codex Profile](codex-cli.md#custom-codex-profile).
 - `codexConfig` (object, `codex` only): Inline Codex config overrides passed as `-c key=value` at launch (e.g. `model_reasoning_effort`, `service_tier`, `features.fast_mode`). Keys may be dotted config paths; values become TOML scalars. See [Inline Codex Config Overrides](codex-cli.md#inline-codex-config-overrides).
@@ -100,7 +100,7 @@ Agent profiles can declare which provider they should run on via the `provider` 
 
 When the supervisor calls `assign` or `handoff`, CAO reads the worker's agent profile and uses the declared `provider` if it is a valid value. If the key is missing or the value is not recognized, the worker inherits the supervisor's provider.
 
-Valid values: `q_cli`, `kiro_cli`, `claude_code`, `codex`, `gemini_cli`, `hermes`, `kimi_cli`, `copilot_cli`, `opencode_cli`.
+Valid values: `kiro_cli`, `claude_code`, `codex`, `antigravity_cli`, `hermes`, `kimi_cli`, `copilot_cli`, `opencode_cli`, `cursor_cli`.
 
 ### Example
 

@@ -1,0 +1,56 @@
+{
+  "name": "cao-mcp-apps",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "MCP Apps (SEP-1865) UI surface for CLI Agent Orchestrator. Bundles to single-file HTML resources served via cao-mcp-server.",
+  "scripts": {
+    "prepare": "cd .. && husky cao_mcp_apps/.husky || true",
+    "scan:jit": "node scripts/scan-jit.mjs",
+    "check:size": "node scripts/check-bundle-size.mjs",
+    "coverage:ratchet": "node scripts/coverage-ratchet.mjs ..",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "playwright test",
+    "test:e2e:install": "playwright install --with-deps chromium",
+    "build:dashboard": "vite build -c vite.config.dashboard.ts",
+    "build:agent": "vite build -c vite.config.agent.ts",
+    "build:events": "vite build -c vite.config.events.ts",
+    "build:all": "npm run build:dashboard && npm run build:agent && npm run build:events",
+    "demo": "node scripts/record-demo.mjs",
+    "lint-staged": "lint-staged"
+  },
+  "lint-staged": {
+    "*.py": [
+      "uv run --project .. black --check",
+      "uv run --project .. isort --check-only"
+    ],
+    "*.{ts,tsx,js,jsx,mjs}": [
+      "prettier --check"
+    ]
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.48.0",
+    "@testing-library/dom": "^10.4.0",
+    "@testing-library/react": "^16.0.1",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@types/node": "^22.10.1",
+    "@vitejs/plugin-react": "^6.0.3",
+    "@vitest/coverage-v8": "^4.1.9",
+    "fast-check": "^3.23.1",
+    "happy-dom": "^20.10.6",
+    "husky": "^9.1.6",
+    "lint-staged": "^15.2.10",
+    "prettier": "^3.3.3",
+    "typescript": "^5.6.3",
+    "vite": "^8.1.0",
+    "vite-plugin-singlefile": "^2.1.0",
+    "vitest": "^4.1.9"
+  }
+}

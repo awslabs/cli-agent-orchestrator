@@ -37,7 +37,6 @@ jobs:
       - name: Run unit tests with coverage
         run: |
           uv run pytest test/ \
-            --ignore=test/providers/test_q_cli_integration.py \
             --ignore=test/providers/test_kiro_cli_integration.py \
             --ignore=test/e2e \
             -m "not e2e" \
@@ -59,7 +58,6 @@ jobs:
   web-build:
     name: Web UI Build
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -86,6 +84,117 @@ jobs:
       - name: Build
         run: npm run build
         working-directory: web
+
+  cao-mcp-apps:
+    name: CAO MCP Apps
+    runs-on: ubuntu-latest
+
+    # Per-tier test timing budgets (Requirement 20.3), surfaced as env so the
+    # vitest tiers (Phase II+) and CI can enforce them:
+    #   Unit < 5s, Component < 8s, Integration < 15s, E2E < 60s.
+    env:
+      CAO_TIER_TIMEOUT_UNIT_MS: "5000"
+      CAO_TIER_TIMEOUT_COMPONENT_MS: "8000"
+      CAO_TIER_TIMEOUT_INTEGRATION_MS: "15000"
+      CAO_TIER_TIMEOUT_E2E_MS: "60000"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install Python deps (for the HTTP-only guard + coverage ratchet)
+        run: uv sync --all-extras --dev
+
+      - name: Install MCP-apps deps
+        run: npm install
+        working-directory: cao_mcp_apps
+
+      - name: Type check
+        working-directory: cao_mcp_apps
+        run: |
+          if ls src/**/*.ts src/**/*.tsx >/dev/null 2>&1; then
+            npm run typecheck
+          else
+            echo "no TypeScript sources yet (Phase 0) — skipping tsc"
+          fi
+
+      - name: Unit tests
+        working-directory: cao_mcp_apps
+        # --coverage emits coverage/coverage-summary.json for the ratchet floor.
+        run: npx vitest run --coverage --passWithNoTests
+
+      - name: Build single-file bundles
+        working-directory: cao_mcp_apps
+        run: npm run build:all
+
+      - name: JIT-free deny-list scan
+        working-directory: cao_mcp_apps
+        run: npm run scan:jit
+
+      - name: Bundle-size budget
+        working-directory: cao_mcp_apps
+        run: npm run check:size
+
+      - name: HTTP-only MCP boundary guard
+        run: uv run pytest test/test_http_only_boundary.py -q
+
+      - name: Backend coverage (for the ratchet floor)
+        # Produces coverage.json (python floor) consumed by coverage:ratchet.
+        run: |
+          uv run pytest test/ \
+            --ignore=test/providers/test_kiro_cli_integration.py \
+            --ignore=test/e2e \
+            -m "not e2e" \
+            --cov=src/cli_agent_orchestrator \
+            --cov-report=json \
+            -q
+
+      - name: Coverage ratchet
+        working-directory: cao_mcp_apps
+        run: npm run coverage:ratchet
+
+  cao-mcp-apps-e2e:
+    name: CAO MCP Apps E2E (Playwright)
+    runs-on: ubuntu-latest
+
+    # E2E tier budget (Requirement 20.3): 60s per test (enforced in
+    # playwright.config.ts via `timeout: 60_000`).
+    env:
+      CAO_TIER_TIMEOUT_E2E_MS: "60000"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install MCP-apps deps
+        run: npm install
+        working-directory: cao_mcp_apps
+
+      - name: Install Playwright browser (chromium)
+        run: npm run test:e2e:install
+        working-directory: cao_mcp_apps
+
+      - name: Run Playwright E2E
+        # playwright.config.ts builds the single-file bundles and starts the
+        # harness server (e2e/server.mjs) on 127.0.0.1:9889 before the run.
+        run: npm run test:e2e
+        working-directory: cao_mcp_apps
 
   lint:
     name: Code Quality
@@ -151,7 +260,7 @@ jobs:
   dependency-review:
     name: Dependency Review
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && github.repository == 'awslabs/cli-agent-orchestrator'
 
     steps:
       - name: Checkout code

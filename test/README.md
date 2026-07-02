@@ -70,7 +70,7 @@ pytest test/providers/test_kiro_cli_unit.py::TestKiroCliProvider::test_init -v
 Integration tests require actual CLI tools to be installed. To skip them:
 
 ```bash
-pytest test/ -v --ignore=test/providers/test_q_cli_integration.py
+pytest test/ -v --ignore=test/providers/test_kiro_cli_integration.py
 ```
 
 ## Test Organization
@@ -108,10 +108,12 @@ test/
 │   ├── test_base_provider.py
 │   ├── test_claude_code_unit.py
 │   ├── test_codex_provider_unit.py
-│   ├── test_gemini_cli_unit.py
+│   ├── test_antigravity_cli_unit.py
+│   ├── test_kimi_cli_unit.py
+│   ├── test_copilot_cli_unit.py
 │   ├── test_kiro_cli_unit.py
 │   ├── test_provider_manager_unit.py
-│   └── test_q_cli_unit.py
+│   └── test_cursor_cli_unit.py
 ├── services/                 # Service tests
 │   ├── test_cleanup_service.py
 │   ├── test_flow_service.py
@@ -136,7 +138,7 @@ The project aims for >90% test coverage for core modules.
 - `constants.py` - Configuration constants
 - `mcp_server/models.py`, `mcp_server/utils.py` - MCP models and utilities
 - `models/` - All Pydantic models
-- `providers/` - All provider implementations (claude_code, codex, gemini_cli, kiro_cli, q_cli)
+- `providers/` - All provider implementations (claude_code, codex, antigravity_cli, kiro_cli, kimi_cli, copilot_cli, opencode_cli, cursor_cli)
 - `services/inbox_service.py`, `services/session_service.py` - Core services
 - `utils/` - All utility modules (agent_profiles, logging, template, terminal)
 
@@ -207,10 +209,10 @@ pip install -e .
 pip install pytest-cov
 ```
 
-### Q CLI Integration Tests Failing
+### Provider Integration Tests Failing
 
-Q CLI integration tests require the Q CLI tool to be installed and authenticated. These tests are expected to fail if Q CLI is not available. Skip them with:
+Integration tests require the provider CLI tool to be installed and authenticated. These tests are expected to fail if the CLI is not available. Skip them with (Kiro CLI example):
 
 ```bash
-pytest test/ --ignore=test/providers/test_q_cli_integration.py
+pytest test/ --ignore=test/providers/test_kiro_cli_integration.py
 ```

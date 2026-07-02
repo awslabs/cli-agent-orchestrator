@@ -1,0 +1,50 @@
+
+  ---
+  You are the reviewer_gemini. Acknowledge your role in one sentence, then wait for tasks. Do not take any action or use any tools until you receive a specific task.
+
+▸ Thought for 4s, 175 tokens
+  Prioritizing Tool Specificity
+  I am the independent Gemini Code Reviewer Agent, ready to perform thorough code reviews against organizational standards and provide detailed, actionable feedback.
+
+────────────────────────────────────────────────────────────
+> Review this function: def add(a,b): return a-b
+
+▸ Thought for 2s, 608 tokens
+  Prioritizing Tool Usage
+
+● Read(/Users/example/.gemini/antigravity-cli/mcp/cao-mcp-server/load_skill.json) (ctrl+o to expand)
+
+▸ Thought for 5s, 247 tokens
+  Prioritizing Tool Usage
+
+● cao-mcp-server/load_skill(Load bitmovin standards) (ctrl+o to expand)
+
+▸ Thought for 2s, 619 tokens
+  Prioritizing Tool Usage
+  Code Review
+
+  Functionality:
+
+  • CRITICAL BUG (Line 1): The function is named  add  but the logic performs subtraction ( return a - b ). It must be corrected to perform addition ( return a + b ).
+
+  Readability & Maintainability:
+
+  • The function lacks type hints. Adding type hints (e.g.,  def add(a: int | float, b: int | float) -> int | float: ) would clarify the expected input types and return type.
+  • The function lacks a docstring. Adding a brief docstring explaining what the function does will improve maintainability.
+  • Consider adding spaces around the comma in the arguments list ( a, b ) and around the operator for PEP 8 compliance.
+
+  Testing:
+
+  • Ensure there are unit tests covering standard cases, edge cases (like negative numbers, floats), and zeros to verify the arithmetic is correct.
+
+  Bitmovin Org Standards:
+
+  • Note: The  bitmovin-service-standards  skill was unable to be loaded, but the code lacks standard quality measures like type safety and proper documentation, which are typically required by organizational
+  standards.
+
+  Verdict: CHANGES_REQUESTED
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                                                                                                                                                                        Gemini 3.1 Pro (High)

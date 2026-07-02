@@ -16,14 +16,12 @@ from cli_agent_orchestrator.constants import (
     KIRO_AGENTS_DIR,
     LOCAL_AGENT_STORE_DIR,
     OPENCODE_AGENTS_DIR,
-    Q_AGENTS_DIR,
     SKILLS_DIR,
 )
 from cli_agent_orchestrator.models.copilot_agent import CopilotAgentConfig
 from cli_agent_orchestrator.models.kiro_agent import KiroAgentConfig
 from cli_agent_orchestrator.models.opencode_agent import OpenCodeAgentConfig
 from cli_agent_orchestrator.models.provider import ProviderType
-from cli_agent_orchestrator.models.q_agent import QAgentConfig
 from cli_agent_orchestrator.utils.agent_profiles import (
     _read_agent_profile_source,
     parse_agent_profile_text,
@@ -243,28 +241,7 @@ def install_agent(
         agent_file: Optional[Path] = None
         safe_filename = profile.name.replace("/", "__")
 
-        if provider == ProviderType.Q_CLI.value:
-            Q_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
-            q_agent_config = QAgentConfig(
-                name=profile.name,
-                description=profile.description,
-                tools=profile.tools if profile.tools is not None else ["*"],
-                allowedTools=allowed_tools,
-                resources=[f"file://{context_file.absolute()}"],
-                prompt=compose_agent_prompt(profile),
-                mcpServers=profile.mcpServers,
-                toolAliases=profile.toolAliases,
-                toolsSettings=profile.toolsSettings,
-                hooks=profile.hooks,
-                model=profile.model,
-            )
-            agent_file = Q_AGENTS_DIR / f"{safe_filename}.json"
-            agent_file.write_text(
-                q_agent_config.model_dump_json(indent=2, exclude_none=True),
-                encoding="utf-8",
-            )
-
-        elif provider == ProviderType.KIRO_CLI.value:
+        if provider == ProviderType.KIRO_CLI.value:
             KIRO_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
             # Kiro natively supports skill:// resources with progressive loading
             # (metadata at startup, full content on demand).

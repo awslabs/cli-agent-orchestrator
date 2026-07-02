@@ -23,7 +23,7 @@ For real supervisor→worker delegation tests, see test_supervisor_orchestration
 
 Requires:
 - Running CAO server
-- Authenticated CLI tools (codex, claude, kiro-cli, gemini, copilot)
+- Authenticated CLI tools (codex, claude, kiro-cli, copilot)
 - tmux
 - Agent profiles installed: data_analyst, report_generator
   (install with: cao install examples/assign/data_analyst.md)
@@ -33,7 +33,6 @@ Run:
     uv run pytest -m e2e test/e2e/test_assign.py -v -k codex
     uv run pytest -m e2e test/e2e/test_assign.py -v -k claude_code
     uv run pytest -m e2e test/e2e/test_assign.py -v -k kiro_cli
-    uv run pytest -m e2e test/e2e/test_assign.py -v -k gemini_cli
     uv run pytest -m e2e test/e2e/test_assign.py -v -k copilot
 """
 
@@ -121,8 +120,8 @@ def _run_assign_test(provider: str, agent_profile: str, task_message: str, conte
         assert terminal_id, "Terminal ID should not be empty"
 
         # Step 2: Wait for ready (idle or completed).
-        # Providers with initial prompts (Gemini CLI -i) reach 'completed'
-        # after processing the system prompt; others reach 'idle'.
+        # Providers with initial prompts reach 'completed' after processing
+        # the system prompt; others reach 'idle'.
         start = time.time()
         while time.time() - start < 90.0:
             s = get_terminal_status(terminal_id)
@@ -145,9 +144,9 @@ def _run_assign_test(provider: str, agent_profile: str, task_message: str, conte
         assert resp.status_code == 200, f"Send message failed: {resp.status_code}"
 
         # Step 4: Poll for COMPLETED with stabilization.
-        # Some providers (Gemini CLI) report premature COMPLETED between the
-        # initial text response and MCP tool execution. After detecting
-        # COMPLETED, wait briefly and re-verify to catch this case.
+        # Some providers report premature COMPLETED between the initial text
+        # response and MCP tool execution. After detecting COMPLETED, wait
+        # briefly and re-verify to catch this case.
         assert wait_for_status(
             terminal_id, "completed", timeout=COMPLETION_TIMEOUT
         ), f"Worker did not reach COMPLETED within {COMPLETION_TIMEOUT}s (provider={provider})"
@@ -267,7 +266,7 @@ def _run_assign_with_callback_test(provider: str):
 
         # Step 6: Extract worker output and send it to supervisor's inbox
         # (simulates the worker calling send_message MCP tool).
-        # Gemini CLI's Ink TUI may still be showing notification spinners
+        # Some providers' TUIs may still be showing notification spinners
         # after COMPLETED; retry extraction to wait for spinners to clear.
         worker_output = ""
         for extraction_attempt in range(4):
@@ -456,49 +455,6 @@ class TestKimiCliAssign:
 
 
 # ---------------------------------------------------------------------------
-# Gemini CLI provider
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.e2e
-class TestGeminiCliAssign:
-    """E2E assign tests for the Gemini CLI provider using examples/assign/ profiles."""
-
-    def test_assign_data_analyst(self, require_gemini):
-        """Gemini CLI data_analyst receives dataset, performs statistical analysis.
-
-        Gemini CLI's data_analyst profile heavily prioritises calling send_message
-        over printing results directly. The response often contains tool-call
-        references (e.g. ``CAO_TERMINAL_ID``, ``send_message``) rather than raw
-        statistical numbers, so we accept broader keywords.
-        """
-        _run_assign_test(
-            provider="gemini_cli",
-            agent_profile="data_analyst",
-            task_message=DATA_ANALYST_TASK,
-            content_keywords=DATA_ANALYST_KEYWORDS
-            + [
-                "analysis",
-                "send_message",
-                "CAO_TERMINAL_ID",
-            ],
-        )
-
-    def test_assign_report_generator(self, require_gemini):
-        """Gemini CLI report_generator creates a report template."""
-        _run_assign_test(
-            provider="gemini_cli",
-            agent_profile="report_generator",
-            task_message=REPORT_GENERATOR_TASK,
-            content_keywords=REPORT_GENERATOR_KEYWORDS,
-        )
-
-    def test_assign_with_callback(self, require_gemini):
-        """Gemini CLI full round-trip: worker completes → sends result → supervisor receives."""
-        _run_assign_with_callback_test(provider="gemini_cli")
-
-
-# ---------------------------------------------------------------------------
 # Copilot CLI provider
 # ---------------------------------------------------------------------------
 
@@ -639,3 +595,59 @@ class TestCursorCliAssign:
         - handoff (blocking): inbox delivery triggers supervisor state transition
         """
         _run_assign_with_callback_test(provider="cursor_cli")
+
+
+# ---------------------------------------------------------------------------
+# Antigravity CLI provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestAntigravityCliAssign:
+    """E2E assign tests for the Antigravity CLI provider using examples/assign/ profiles.
+
+    Requires:
+    - ``agy`` binary on PATH (skip otherwise via ``require_antigravity`` fixture).
+    - Running CAO server.
+    - Agent profiles installed for antigravity_cli::
+
+        cao install examples/assign/data_analyst.md --provider antigravity_cli
+        cao install examples/assign/report_generator.md --provider antigravity_cli
+        cao install developer --provider antigravity_cli  # for callback test
+
+    Run::
+
+        uv run pytest -m e2e test/e2e/test_assign.py -k Antigravity -v
+    """
+
+    def test_assign_data_analyst(self, require_antigravity):
+        """Antigravity CLI data_analyst receives dataset, performs statistical analysis.
+
+        Like Gemini CLI, agy's data_analyst profile tends to call send_message
+        rather than print raw results, so we accept the broader orchestration
+        keywords in addition to the statistical ones.
+        """
+        _run_assign_test(
+            provider="antigravity_cli",
+            agent_profile="data_analyst",
+            task_message=DATA_ANALYST_TASK,
+            content_keywords=DATA_ANALYST_KEYWORDS
+            + [
+                "analysis",
+                "send_message",
+                "CAO_TERMINAL_ID",
+            ],
+        )
+
+    def test_assign_report_generator(self, require_antigravity):
+        """Antigravity CLI report_generator creates a report template."""
+        _run_assign_test(
+            provider="antigravity_cli",
+            agent_profile="report_generator",
+            task_message=REPORT_GENERATOR_TASK,
+            content_keywords=REPORT_GENERATOR_KEYWORDS,
+        )
+
+    def test_assign_with_callback(self, require_antigravity):
+        """Antigravity CLI full round-trip: worker completes → sends result → supervisor receives."""
+        _run_assign_with_callback_test(provider="antigravity_cli")

@@ -85,3 +85,33 @@ class PluginRegistry:
                     type(plugin).__name__,
                     exc_info=True,
                 )
+
+
+def register_mcp_server_surfaces(mcp: Any) -> None:
+    """Let every discovered ``cao.plugins`` plugin register MCP-server surfaces.
+
+    Discovers the entry-point group and calls ``on_mcp_server(mcp)`` on each
+    plugin **synchronously** — independent of the async event-dispatch lifecycle
+    (``setup``/``teardown``), which belongs to the HTTP API. Best-effort: a
+    failing or non-conforming entry point is logged and skipped, so one broken
+    plugin never blocks MCP server startup.
+
+    Called once from the MCP server module at import/startup. The built-in
+    ``mcp_apps`` plugin uses this hook to register the MCP Apps tools, the
+    ``ui://cao/*`` resources, the topology widget, and the SEP-2133 capability —
+    all default-off unless ``CAO_MCP_APPS_ENABLED`` is set.
+    """
+
+    entry_points = importlib.metadata.entry_points(group=ENTRY_POINT_GROUP)
+    for entry_point in entry_points:
+        try:
+            plugin_class = entry_point.load()
+            if not (isinstance(plugin_class, type) and issubclass(plugin_class, CaoPlugin)):
+                continue
+            plugin_class().on_mcp_server(mcp)
+        except Exception:
+            logger.warning(
+                "Plugin '%s' on_mcp_server registration failed",
+                entry_point.name,
+                exc_info=True,
+            )

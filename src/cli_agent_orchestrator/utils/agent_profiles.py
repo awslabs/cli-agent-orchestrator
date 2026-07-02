@@ -124,7 +124,6 @@ def list_agent_profiles() -> List[Dict]:
     agent_dirs = get_agent_dirs()
     provider_source_labels = {
         "kiro_cli": "kiro",
-        "q_cli": "q_cli",
         "claude_code": "claude_code",
         "codex": "codex",
         "cao_installed": "installed",

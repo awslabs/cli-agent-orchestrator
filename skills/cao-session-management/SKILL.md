@@ -47,7 +47,7 @@ If unsure which profile to use, ask the user rather than guessing.
 
 ## Quick Example
 
-A complete, copy-pasteable supervisor launch. The default provider is `kiro_cli`; pass `--provider <name>` to use another (`claude_code`, `codex`, `gemini_cli`, `kimi_cli`, `copilot_cli`, `opencode_cli`, `q_cli`).
+A complete, copy-pasteable supervisor launch. The default provider is `kiro_cli`; pass `--provider <name>` to use another (`claude_code`, `codex`, `antigravity_cli`, `kimi_cli`, `copilot_cli`, `opencode_cli`, `cursor_cli`).
 
 This example assumes a configured CAO setup (server running, profiles installed). On an already-configured host you can skip straight to `cao launch`. The `cao install` lines below are only for first-time setup; remove them if your CAO is already configured.
 

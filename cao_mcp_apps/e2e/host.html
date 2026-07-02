@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CAO MCP App — E2E Host Harness</title>
+    <style>
+      body {
+        margin: 0;
+        font-family: system-ui, sans-serif;
+      }
+      .frames {
+        display: flex;
+        gap: 8px;
+        align-items: flex-start;
+      }
+      iframe {
+        border: 1px solid #ccc;
+        width: 640px;
+        height: 480px;
+      }
+      /* Match the spec preferredFrameSize per view so single-view captures
+         render at first-class dimensions (dashboard goes multi-column). */
+      iframe[data-view="dashboard"] {
+        width: 1280px;
+        height: 740px;
+      }
+      iframe[data-view="agent"] {
+        width: 1024px;
+        height: 720px;
+      }
+      iframe[data-view="event-stream"] {
+        width: 680px;
+        height: 560px;
+      }
+    </style>
+  </head>
+  <body>
+    <!--
+      The host harness embeds the built single-file bundle(s) chosen by the
+      ?view= query param and runs the MCP host JSON-RPC peer (host.js) that
+      answers each iframe's postMessage requests. Playwright drives the harness
+      via window.__host (see host.js) and asserts on the iframe content.
+    -->
+    <div id="frames" class="frames"></div>
+    <script src="/host.js"></script>
+  </body>
+</html>

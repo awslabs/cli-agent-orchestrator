@@ -1,7 +1,8 @@
 """Additional tests for ClaudeCodeProvider to cover uncovered branches.
 
 Covers: McpServer model_dump path, bypass permissions prompt handling,
-and idle prompt early return in _handle_startup_prompts.
+and the workspace-trust handling in _handle_startup_prompts (including the
+regression where the echoed launch command false-matched the idle prompt).
 """
 
 import re
@@ -66,16 +67,39 @@ class TestHandleStartupPromptsBranches:
             provider.session_name, provider.window_name, "Enter"
         )
 
+    @patch("cli_agent_orchestrator.providers.claude_code.time.sleep", lambda *a, **k: None)
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_idle_prompt_detected_early_return(self, mock_backend, provider):
-        """When idle prompt is visible, returns immediately without sending keys."""
-        from cli_agent_orchestrator.providers.claude_code import IDLE_PROMPT_PATTERN
+    def test_echoed_prompt_does_not_short_circuit_trust(self, mock_backend, provider):
+        """Regression: the injected --append-system-prompt contains a line that
+        starts with "> `memory_store`". The shell echoes the launch command into
+        the capture buffer ~300ms before the workspace-trust dialog renders, so
+        that "> " must NOT be treated as the idle prompt and end startup handling
+        early — otherwise the trust dialog is left unaccepted and initialize()
+        blocks on {IDLE, COMPLETED} until it times out and the session is killed.
 
-        mock_backend.get_history.return_value = "❯ "
+        First poll returns the echoed command (with the "> memory_store" marker
+        but no dialog yet); second poll returns the trust dialog. The handler must
+        accept the trust dialog (Enter) rather than returning on the first frame.
+        """
+        echoed_launch_cmd = (
+            "user@host:/tmp/proj$ claude --dangerously-skip-permissions "
+            "--append-system-prompt '## Memory\n"
+            "> `memory_store` and `memory_recall` are CAO's memory tools'"
+        )
+        trust_frame = (
+            "Quick safety check: Is this a project you created or one you trust?\n"
+            "❯ 1. Yes, I trust this folder\n"
+            "  2. No, exit\n"
+        )
+        mock_backend.get_history.side_effect = [echoed_launch_cmd, trust_frame]
 
-        provider._handle_startup_prompts(timeout=1.0)
+        provider._handle_startup_prompts(timeout=5.0)
 
-        # No exception means early return worked
+        # Trust dialog accepted via Enter — proves we did not early-return on the
+        # echoed "> memory_store" marker.
+        mock_backend.send_special_key.assert_called_once_with(
+            provider.session_name, provider.window_name, "Enter"
+        )
 
     @patch("cli_agent_orchestrator.backends.registry._backend")
     def test_welcome_banner_detected_early_return(self, mock_backend, provider):

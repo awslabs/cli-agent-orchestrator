@@ -363,7 +363,7 @@ class TestCreateTerminal:
         mock_build_skill_catalog.assert_called_once_with()
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("provider_name", ["kiro_cli", "q_cli", "copilot_cli"])
+    @pytest.mark.parametrize("provider_name", ["kiro_cli", "copilot_cli"])
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
@@ -469,7 +469,7 @@ class TestCreateTerminal:
         mock_build_skill_catalog.assert_called_once_with()
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("provider_name", ["opencode_cli", "kiro_cli", "q_cli", "copilot_cli"])
+    @pytest.mark.parametrize("provider_name", ["opencode_cli", "kiro_cli", "copilot_cli"])
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")

@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import re
 import shlex
 import time
@@ -9,8 +10,10 @@ from pathlib import Path
 from typing import List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
@@ -130,10 +133,8 @@ class ClaudeCodeProvider(BaseProvider):
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
-        self._task_dispatched = False
-        self._last_dispatch_time: float = 0.0  # set by mark_input_received()
-        self._done_first_detected: float = 0.0  # first time herdr reported "done" this cycle
-        self._idle_first_detected: float = 0.0  # first time herdr reported "idle" post-dispatch
+        # Native-status dispatch tracking (_task_dispatched + flush-wait timers)
+        # lives on BaseProvider and is consumed by _resolve_native_status().
 
     def _build_claude_command(self) -> str:
         """Build Claude Code command with agent profile if provided.
@@ -163,9 +164,20 @@ class ClaudeCodeProvider(BaseProvider):
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
-        # Determine permission mode for the base command
-        if profile and profile.permissionMode and not yolo:
+        # Determine permission mode for the base command.
+        # Priority: explicit permissionMode > yolo/root detection > default yolo.
+        #
+        # Root/sudo guard: Claude Code rejects --dangerously-skip-permissions when
+        # running as root. We only omit it for yolo+root; non-root yolo still needs
+        # the flag so Claude won't prompt for tool approval inside a headless tmux
+        # pane and silently block handoff/assign flows.
+        is_root = getattr(os, "geteuid", lambda: -1)() == 0
+
+        if profile and profile.permissionMode:
             command_parts = ["claude", "--permission-mode", profile.permissionMode]
+        elif yolo and is_root:
+            # Root users cannot use --dangerously-skip-permissions; omit it entirely.
+            command_parts = ["claude"]
         else:
             command_parts = ["claude", "--dangerously-skip-permissions"]
 
@@ -190,8 +202,15 @@ class ClaudeCodeProvider(BaseProvider):
             system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
             system_prompt = self._apply_skill_prompt(system_prompt)
             if system_prompt:
-                escaped_prompt = system_prompt.replace("\\", "\\\\").replace("\n", "\\n")
-                command_parts.extend(["--append-system-prompt", escaped_prompt])
+                tmp_dir = CAO_HOME_DIR / "tmp"
+                tmp_dir.mkdir(parents=True, exist_ok=True)
+                prompt_file = tmp_dir / f"{self.terminal_id}.prompt"
+                prompt_file.write_text(system_prompt, encoding="utf-8")
+                try:
+                    prompt_file.chmod(0o600)
+                except OSError:
+                    pass
+                command_parts.extend(["--append-system-prompt-file", str(prompt_file)])
 
             # Add MCP config if present.
             # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
@@ -211,8 +230,15 @@ class ClaudeCodeProvider(BaseProvider):
                         env["CAO_TERMINAL_ID"] = self.terminal_id
                         mcp_config[server_name]["env"] = env
 
-                mcp_json = json.dumps({"mcpServers": mcp_config})
-                command_parts.extend(["--mcp-config", mcp_json])
+                tmp_dir = CAO_HOME_DIR / "tmp"
+                tmp_dir.mkdir(parents=True, exist_ok=True)
+                mcp_file = tmp_dir / f"{self.terminal_id}.mcp.json"
+                mcp_file.write_text(json.dumps({"mcpServers": mcp_config}), encoding="utf-8")
+                try:
+                    mcp_file.chmod(0o600)
+                except OSError:
+                    pass
+                command_parts.extend(["--mcp-config", str(mcp_file), "--strict-mcp-config"])
 
         # Apply tool restrictions via --disallowedTools flags.
         # --dangerously-skip-permissions bypasses prompts but --disallowedTools
@@ -271,7 +297,7 @@ class ClaudeCodeProvider(BaseProvider):
             json.dump(settings, f, indent=2)
         logger.info("Set skipDangerousModePermissionPrompt in ~/.claude/settings.json")
 
-    def _handle_startup_prompts(self, timeout: float = 20.0) -> None:
+    def _handle_startup_prompts(self, timeout: Optional[float] = None) -> None:
         """Auto-accept startup prompts that may appear before the REPL is ready.
 
         Claude Code may show up to two prompts during startup:
@@ -283,6 +309,8 @@ class ClaudeCodeProvider(BaseProvider):
         2. **Workspace trust dialog** – shows "Yes, I trust this folder";
            requires ``Enter``.
         """
+        if timeout is None:
+            timeout = get_server_settings()["startup_prompt_handler_timeout"]
         start_time = time.time()
         bypass_accepted = False
         while time.time() - start_time < timeout:
@@ -320,12 +348,21 @@ class ClaudeCodeProvider(BaseProvider):
                 get_backend().send_special_key(self.session_name, self.window_name, "Enter")
                 return
 
-            # 3) Claude Code fully started — no prompts needed
+            # 3) Claude Code fully started — no prompts needed.
+            #    The version banner is the ONLY reliable "ready" signal here: it
+            #    renders only once the REPL is up and cannot appear in the echoed
+            #    launch command. The old bare IDLE_PROMPT_PATTERN ("> "/"❯ ") check
+            #    was removed: the injected --append-system-prompt text contains
+            #    "> `memory_store`" (start of a line), which the echoed command
+            #    surfaces in the capture buffer within ~300ms and false-matches as
+            #    "idle". The handler then returned BEFORE the workspace-trust dialog
+            #    rendered, leaving it unaccepted; initialize() then blocked on
+            #    {IDLE, COMPLETED} for 30s and the session was killed. Trust/bypass
+            #    dialogs are handled explicitly above; if no banner ever appears the
+            #    loop just waits out its timeout and the downstream
+            #    wait_until_status() remains the real readiness gate.
             if re.search(r"Welcome to|Claude Code v\d+", clean_output):
                 logger.info("Claude Code started without prompts")
-                return
-            if re.search(IDLE_PROMPT_PATTERN, clean_output):
-                logger.info("Claude Code idle prompt detected, no prompts needed")
                 return
 
             time.sleep(1.0)
@@ -336,8 +373,9 @@ class ClaudeCodeProvider(BaseProvider):
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
         # Wait for shell prompt to appear in the tmux window
-        if not await wait_for_shell(self.terminal_id, timeout=10.0):
-            raise TimeoutError("Shell initialization timed out after 10 seconds")
+        init_timeout = get_server_settings()["provider_init_timeout"]
+        if not await wait_for_shell(self.terminal_id, timeout=init_timeout):
+            raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
 
         # Prevent bypass permissions dialog from appearing (settings-based fix).
         self._ensure_skip_bypass_prompt_setting()
@@ -352,7 +390,7 @@ class ClaudeCodeProvider(BaseProvider):
         get_backend().send_keys(self.session_name, self.window_name, command)
 
         # Handle startup prompts (bypass permissions + workspace trust)
-        self._handle_startup_prompts(timeout=20.0)
+        self._handle_startup_prompts()
 
         # Wait for Claude Code prompt to be ready.
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
@@ -361,13 +399,14 @@ class ClaudeCodeProvider(BaseProvider):
         # drives wait_until_status; it only fires once the provider's own
         # get_status returns IDLE/COMPLETED on Claude-rendered content, so the
         # old stale-zsh-prompt false-IDLE guard is no longer needed.
+        init_timeout = get_server_settings()["provider_init_timeout"]
         if not await wait_until_status(
             self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-            timeout=30.0,
+            timeout=init_timeout,
             polling_interval=1.0,
         ):
-            raise TimeoutError("Claude Code initialization timed out after 30 seconds")
+            raise TimeoutError(f"Claude Code initialization timed out after {init_timeout}s")
 
         self._initialized = True
         return True
@@ -394,80 +433,10 @@ class ClaudeCodeProvider(BaseProvider):
 
         See: https://github.com/awslabs/cli-agent-orchestrator/issues/104
         """
-        # Native status: herdr knows agent state without pane content parsing.
-        # When the backend returns non-None, trust it and skip buffer reads.
-        # The only ambiguous case is IDLE: herdr "idle" fires both when no task
-        # has been dispatched yet AND when a task completed but the user focused
-        # the tab (resetting "done" -> "idle"). _task_dispatched disambiguates.
-        # Tmux backend always returns None -- falls through to buffer analysis.
-        native = get_backend().get_native_status(self.session_name, self.window_name)
-        logger.debug(
-            "[get_status] terminal=%s native=%s",
-            self.terminal_id,
-            native.value if native is not None else None,
-        )
+        # Native status (herdr): when the backend knows agent state, trust it and
+        # skip buffer reads. Tmux returns None -- falls through to buffer analysis.
+        native = self._resolve_native_status()
         if native is not None:
-            if native == TerminalStatus.PROCESSING:
-                # Reset flush-wait timers — herdr is actively working, so any
-                # previously stamped idle/done timestamp is from a pre-work gap
-                # and must not be counted toward the post-completion flush wait.
-                self._done_first_detected = 0.0
-                self._idle_first_detected = 0.0
-                logger.debug("[get_status] terminal=%s -> PROCESSING (native)", self.terminal_id)
-                return TerminalStatus.PROCESSING
-            if native == TerminalStatus.COMPLETED and self._task_dispatched:
-                # herdr "done": wait 10s from first detection for buffer to flush.
-                if self._done_first_detected == 0.0:
-                    self._done_first_detected = time.time()
-                waited = time.time() - self._done_first_detected
-                if waited >= 10.0:
-                    logger.debug(
-                        "[get_status] terminal=%s -> COMPLETED (native done, %.1fs flush wait elapsed)",
-                        self.terminal_id,
-                        waited,
-                    )
-                    return TerminalStatus.COMPLETED
-                logger.debug(
-                    "[get_status] terminal=%s -> PROCESSING (native done, flush wait %.1fs/10s)",
-                    self.terminal_id,
-                    waited,
-                )
-                return TerminalStatus.PROCESSING
-            if native == TerminalStatus.IDLE and self._task_dispatched:
-                # herdr "idle" post-dispatch: wait 10s from first detection, then
-                # keep returning PROCESSING until 5 min from dispatch (give up).
-                if self._idle_first_detected == 0.0:
-                    self._idle_first_detected = time.time()
-                waited = time.time() - self._idle_first_detected
-                elapsed = time.time() - self._last_dispatch_time
-                if waited >= 10.0:
-                    if elapsed >= 300.0:
-                        logger.warning(
-                            "[get_status] terminal=%s -> COMPLETED (native idle, %.0fs since dispatch, giving up)",
-                            self.terminal_id,
-                            elapsed,
-                        )
-                        return TerminalStatus.COMPLETED
-                    logger.debug(
-                        "[get_status] terminal=%s -> COMPLETED (native idle, %.1fs flush wait elapsed)",
-                        self.terminal_id,
-                        waited,
-                    )
-                    return TerminalStatus.COMPLETED
-                logger.debug(
-                    "[get_status] terminal=%s -> PROCESSING (native idle, flush wait %.1fs/10s)",
-                    self.terminal_id,
-                    waited,
-                )
-                return TerminalStatus.PROCESSING
-            if native == TerminalStatus.IDLE:
-                logger.debug(
-                    "[get_status] terminal=%s -> IDLE (native idle, no task dispatched)",
-                    self.terminal_id,
-                )
-                return TerminalStatus.IDLE
-            # COMPLETED (no task dispatched), WAITING_USER_ANSWER, ERROR -- return directly
-            logger.debug("[get_status] terminal=%s -> %s (native)", self.terminal_id, native.value)
             return native
 
         if not output:
@@ -707,18 +676,6 @@ class ClaudeCodeProvider(BaseProvider):
         """
         return self._initialized
 
-    def mark_input_received(self) -> None:
-        """Record that a task was dispatched to this terminal.
-
-        Called by the terminal service after send_input() delivers a message.
-        Sets _task_dispatched=True so get_status() can distinguish herdr 'idle'
-        after task completion from 'idle' before any task was dispatched.
-        """
-        self._task_dispatched = True
-        self._last_dispatch_time = time.time()
-        self._done_first_detected = 0.0
-        self._idle_first_detected = 0.0
-
     def get_idle_pattern_for_log(self) -> str:
         """Return Claude Code IDLE prompt pattern for log files."""
         return IDLE_PROMPT_PATTERN_LOG
@@ -784,3 +741,11 @@ class ClaudeCodeProvider(BaseProvider):
     def cleanup(self) -> None:
         """Clean up Claude Code provider."""
         self._initialized = False
+        # Remove temp files created during initialization
+        tmp_dir = CAO_HOME_DIR / "tmp"
+        for suffix in (".prompt", ".mcp.json"):
+            tmp_file = tmp_dir / f"{self.terminal_id}{suffix}"
+            try:
+                tmp_file.unlink(missing_ok=True)
+            except OSError:
+                pass

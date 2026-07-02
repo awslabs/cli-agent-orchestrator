@@ -261,7 +261,7 @@ class TestKiroCliProviderStatusDetection:
 
     def test_get_status_idle(self):
         """Test IDLE status detection."""
-        output = load_fixture("q_cli_idle_output.txt")
+        output = load_fixture("kiro_cli_idle_output.txt")
 
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         status = provider.get_status(output)
@@ -1387,14 +1387,26 @@ class TestKiroCliTuiMode:
         assert not re.search(TUI_PROCESSING_PATTERN, "Kiro is idle")
 
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
-    def test_tui_initializing_yields_processing_despite_idle_placeholder(self, mock_tmux):
-        """Test PROCESSING while Kiro TUI is initializing.
+    def test_tui_initializing_without_idle_yields_processing(self, mock_backend):
+        """Spinner visible without idle prompt means still initializing."""
+        output = (
+            "● Initializing...\n"
+            "────────────────────────────────────────────────────\n"
+            "agent-ops · auto · ◔ 0%\n"
+        )
 
-        The new TUI renders the idle-prompt placeholder ("Ask a question or
-        describe a task") before the "● Initializing..." phase completes.
-        Without the TUI_INITIALIZING_PATTERN check, get_status() would return
-        IDLE ~1s after launch and the first user message would be sent before
-        Kiro can accept input (issue #211).
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "agent-ops")
+        status = provider.get_status(output)
+
+        assert status == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    def test_tui_initializing_with_idle_after_yields_idle(self, mock_backend):
+        """Idle prompt appearing after init text means TUI finished booting.
+
+        In the raw FIFO stream, the idle prompt only enters the buffer after
+        the TUI redraws (spinner stops). The presence of the idle prompt after
+        the last init marker reliably indicates readiness.
         """
         output = (
             "● Initializing...\n"
@@ -1406,7 +1418,7 @@ class TestKiroCliTuiMode:
         provider = KiroCliProvider("test1234", "test-session", "window-0", "agent-ops")
         status = provider.get_status(output)
 
-        assert status == TerminalStatus.PROCESSING
+        assert status == TerminalStatus.IDLE
 
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
     def test_tui_initializing_cleared_allows_idle(self, mock_tmux):
@@ -1444,15 +1456,34 @@ class TestKiroCliTuiMode:
         )
 
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
-    def test_mcp_server_init_yields_processing(self, mock_backend):
-        """Kiro shows the idle-prompt placeholder before MCP servers finish
-        loading. A paste sent during this window is silently absorbed by
-        the boot screen, so we must report PROCESSING until init completes.
+    def test_kiro_28x_initializing_without_idle_yields_processing(self, mock_backend):
+        """kiro 2.8.x boot text without idle prompt means still loading."""
+        output = (
+            " Initializing · type to queue a message\n"
+            "────────────────────────────────────────────────────\n"
+            "developer · auto · ◔ 0%\n"
+        )
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
 
-        Fixture mirrors real Kiro boot output: while the "M of N mcp servers
-        initialized..." line is on screen, only the new-TUI placeholder
-        ("Ask a question or describe a task") is visible — the real
-        ``[agent] !>`` prompt does NOT appear until init completes.
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    def test_mcp_server_init_without_idle_yields_processing(self, mock_backend):
+        """MCP boot line visible without idle prompt means still loading."""
+        output = (
+            "0 of 1 mcp servers initialized. ctrl-c to start chatting now\n"
+            "────────────────────────────────────────────────────\n"
+            "developer · auto · ◔ 0%\n"
+        )
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    def test_mcp_server_init_with_idle_after_yields_idle(self, mock_backend):
+        """MCP boot line in buffer history with idle prompt after = ready.
+
+        In the raw FIFO stream the "ctrl-c to start chatting now" line
+        persists in the 8KB rolling buffer after MCP finishes. The idle
+        prompt arriving after it confirms the TUI has finished booting.
         """
         output = (
             "0 of 1 mcp servers initialized. ctrl-c to start chatting now\n"
@@ -1461,7 +1492,7 @@ class TestKiroCliTuiMode:
             " Ask a question or describe a task ↵\n"
         )
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
-        assert provider.get_status(output) == TerminalStatus.PROCESSING
+        assert provider.get_status(output) == TerminalStatus.IDLE
 
     @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
     def test_mcp_server_init_with_post_init_prompt_yields_idle(self, mock_backend):

@@ -122,18 +122,17 @@ class TestAgentProviders:
 
         assert response.status_code == 200
         data = response.json()
-        assert len(data) == 10
+        assert len(data) == 9
         names = [p["name"] for p in data]
         assert "kiro_cli" in names
         assert "claude_code" in names
-        assert "q_cli" in names
         assert "codex" in names
-        assert "gemini_cli" in names
         assert "hermes" in names
         assert "kimi_cli" in names
         assert "copilot_cli" in names
         assert "opencode_cli" in names
         assert "cursor_cli" in names
+        assert "antigravity_cli" in names
         for p in data:
             assert p["installed"] is True
 
@@ -161,9 +160,7 @@ class TestAgentProviders:
         providers_dict = {p["name"]: p for p in data}
         assert providers_dict["kiro_cli"]["installed"] is True
         assert providers_dict["claude_code"]["installed"] is False
-        assert providers_dict["q_cli"]["installed"] is False
         assert providers_dict["codex"]["installed"] is False
-        assert providers_dict["gemini_cli"]["installed"] is False
         assert providers_dict["kimi_cli"]["installed"] is False
         assert providers_dict["copilot_cli"]["installed"] is False
         assert providers_dict["opencode_cli"]["installed"] is False
@@ -177,12 +174,11 @@ class TestAgentProviders:
         providers_dict = {p["name"]: p for p in data}
         assert providers_dict["kiro_cli"]["binary"] == "kiro-cli"
         assert providers_dict["claude_code"]["binary"] == "claude"
-        assert providers_dict["q_cli"]["binary"] == "q"
         assert providers_dict["codex"]["binary"] == "codex"
-        assert providers_dict["gemini_cli"]["binary"] == "gemini"
         assert providers_dict["kimi_cli"]["binary"] == "kimi"
         assert providers_dict["copilot_cli"]["binary"] == "copilot"
         assert providers_dict["opencode_cli"]["binary"] == "opencode"
+        assert providers_dict["antigravity_cli"]["binary"] == "agy"
 
 
 # ── Skills endpoint ──────────────────────────────────────────────────
@@ -303,7 +299,7 @@ class TestCreateSession:
             id="abcd1234",
             name="test-window",
             session_name="my-custom-session",
-            provider="q_cli",
+            provider="kiro_cli",
             agent_profile="developer",
         )
         with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
@@ -314,7 +310,7 @@ class TestCreateSession:
             response = client.post(
                 "/sessions",
                 params={
-                    "provider": "q_cli",
+                    "provider": "kiro_cli",
                     "agent_profile": "developer",
                     "session_name": "my-custom-session",
                 },

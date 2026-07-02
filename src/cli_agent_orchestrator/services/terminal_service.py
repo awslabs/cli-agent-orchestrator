@@ -111,13 +111,13 @@ class OutputMode(str, Enum):
 # Providers that accept a runtime skill_prompt kwarg and append it to the
 # system prompt at launch time.  Other providers deliver skills differently:
 # Kiro (skill:// resources) and OpenCode (OPENCODE_CONFIG_DIR/skills symlink)
-# discover skills natively; Q and Copilot receive a baked catalog at install
+# discover skills natively; Copilot receives a baked catalog at install
 # time.
 RUNTIME_SKILL_PROMPT_PROVIDERS = {
     ProviderType.CLAUDE_CODE.value,
     ProviderType.CODEX.value,
-    ProviderType.GEMINI_CLI.value,
     ProviderType.KIMI_CLI.value,
+    ProviderType.ANTIGRAVITY_CLI.value,
 }
 
 # Providers whose tool restrictions are prompt-level text only (no native
@@ -125,6 +125,7 @@ RUNTIME_SKILL_PROMPT_PROVIDERS = {
 SOFT_ENFORCEMENT_PROVIDERS = {
     ProviderType.KIMI_CLI.value,
     ProviderType.CODEX.value,
+    ProviderType.ANTIGRAVITY_CLI.value,
 }
 
 
@@ -251,7 +252,7 @@ async def create_terminal(
                 f"Terminal {terminal_id}: provider '{provider}' cannot enforce tool "
                 f"restrictions (soft/prompt-level only) but profile '{agent_profile}' "
                 f"requests {allowed_tools}. Treat this worker as unrestricted; for "
-                f"enforced restrictions use claude_code, kiro_cli, gemini_cli, or "
+                f"enforced restrictions use claude_code, kiro_cli, or "
                 f"copilot_cli."
             )
 
@@ -291,10 +292,10 @@ async def create_terminal(
 
         # Step 6: Create and initialize the CLI provider
         # This starts the agent (e.g., runs "kiro-cli chat --agent developer").
-        # Only runtime-prompt providers (Claude Code, Codex, Gemini, Kimi) receive
+        # Only runtime-prompt providers (Claude Code, Codex, Kimi) receive
         # the skill catalog here; Kiro (skill:// resources) and OpenCode
-        # (OPENCODE_CONFIG_DIR/skills symlink) discover skills natively; Q and
-        # Copilot get the catalog baked at install time.
+        # (OPENCODE_CONFIG_DIR/skills symlink) discover skills natively;
+        # Copilot gets the catalog baked at install time.
         provider_instance = provider_manager.create_provider(
             provider,
             terminal_id,
@@ -607,7 +608,7 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
 
     For ``LAST`` mode, if the provider declares ``extraction_retries > 0``,
     retries extraction with 10 s delays between attempts.  This handles
-    TUI-based providers (e.g. Gemini CLI's Ink renderer) whose notification
+    TUI-based providers (e.g. Antigravity CLI's renderer) whose notification
     spinners can temporarily obscure response text in the tmux capture buffer.
 
     If the provider exposes an ``extraction_tail_lines`` attribute, that

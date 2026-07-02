@@ -105,9 +105,9 @@ class TestGetDisallowedTools:
         assert "read" in result
         assert "write" in result
 
-    def test_gemini_cli_reviewer(self):
-        """Gemini reviewer blocks write tools."""
-        result = get_disallowed_tools("gemini_cli", ["@builtin", "fs_read", "fs_list"])
+    def test_antigravity_cli_reviewer(self):
+        """Antigravity reviewer blocks write tools."""
+        result = get_disallowed_tools("antigravity_cli", ["@builtin", "fs_read", "fs_list"])
         assert "run_shell_command" in result
         assert "write_file" in result
         assert "replace" in result
@@ -158,13 +158,13 @@ class TestClaudeCodeWebFetch:
         assert "WebFetch" in disallowed
         assert "WebSearch" in disallowed
 
-    def test_gemini_web_fetch_mapping(self):
-        """Gemini has the equivalent network category (web_fetch, google_web_search)."""
-        disallowed = get_disallowed_tools("gemini_cli", ["fs_read"])
+    def test_antigravity_web_fetch_mapping(self):
+        """Antigravity has the equivalent network category (web_fetch, google_web_search)."""
+        disallowed = get_disallowed_tools("antigravity_cli", ["fs_read"])
         assert "web_fetch" in disallowed
         assert "google_web_search" in disallowed
         # Granting it unblocks both.
-        granted = get_disallowed_tools("gemini_cli", ["fs_read", "web_fetch"])
+        granted = get_disallowed_tools("antigravity_cli", ["fs_read", "web_fetch"])
         assert "web_fetch" not in granted
         assert "google_web_search" not in granted
 
@@ -202,7 +202,10 @@ class TestClaudeCodeSubagentEscape:
 
     def test_restricted_supervisor_blocks_task(self):
         disallowed = get_disallowed_tools("claude_code", ["@cao-mcp-server"])
+        # Both the legacy (`Task`) and current (`Agent`) subagent tool names
+        # must be blocked — current Claude Code exposes only `Agent`.
         assert "Task" in disallowed
+        assert "Agent" in disallowed
         assert "Bash" in disallowed
         assert "Monitor" in disallowed
         assert "NotebookEdit" in disallowed
@@ -210,6 +213,7 @@ class TestClaudeCodeSubagentEscape:
     def test_reviewer_blocks_task_and_notebook_write(self):
         disallowed = get_disallowed_tools("claude_code", ["fs_read", "fs_list"])
         assert "Task" in disallowed
+        assert "Agent" in disallowed
         assert "Monitor" in disallowed
         assert "NotebookEdit" in disallowed
         assert "Write" in disallowed
@@ -219,6 +223,7 @@ class TestClaudeCodeSubagentEscape:
             "claude_code", ["@builtin", "fs_*", "execute_bash", "web_fetch", "@cao-mcp-server"]
         )
         assert "Task" not in disallowed
+        assert "Agent" not in disallowed
         assert disallowed == []
 
     def test_unrestricted_star_keeps_everything(self):

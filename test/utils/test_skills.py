@@ -421,9 +421,9 @@ class TestBuildSkillCatalog:
         assert build_skill_catalog() == (
             "## Available Skills\n\n"
             "The following skills are available exclusively in this CAO orchestration context. "
-            "To load a skill's full content, use the `load_skill` MCP tool provided by the "
-            "CAO MCP server. These skills are not accessible through provider-native skill "
-            "commands or directories.\n\n"
+            "To load a skill's full content, use the `mcp__cao-mcp-server__load_skill` "
+            "tool (NOT the Skill command). These skills are not accessible through "
+            "provider-native skill commands or directories.\n\n"
             "- **cao-worker-protocols**: Worker communication\n"
             "- **python-testing**: Pytest conventions"
         )

@@ -1,0 +1,283 @@
+/* Container-query layout for the CAO MCP App views.
+ *
+ * The root establishes a query container (`container-type: inline-size`) so the
+ * grid responds to the iframe's own width — not the viewport — which is what an
+ * MCP host actually controls. Theme colors fall back to sane defaults
+ * but consume host-provided CSS variables when present (SEP-1865 theming).
+ *
+ * The :root fallback block is generated from the shared design-token SSOT
+ * (design-tokens/tokens.json) via `node design-tokens/gen.mjs`. Host CSS
+ * variables still override these defaults at runtime — theming is preserved. */
+
+@import "./tokens.generated.css";
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  color: var(--color-text-primary);
+  background: var(--color-background-primary);
+}
+
+/* The query container. Everything below sizes relative to .cao-root's width. */
+.cao-root {
+  container-type: inline-size;
+  container-name: cao;
+  padding: 12px;
+  /* Never produce a horizontal scrollbar in the narrow sidebar case. */
+  overflow-x: hidden;
+}
+
+.cao-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px 12px;
+  margin-bottom: 12px;
+}
+
+.cao-header-title {
+  font-size: 1rem;
+  margin: 0;
+}
+
+.cao-badge {
+  font-size: 0.75rem;
+  color: var(--color-text-secondary);
+}
+
+/* Default (and narrow): a single column. */
+.cao-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 10px;
+}
+
+.cao-card {
+  border: 1px solid var(--color-border-primary);
+  border-radius: var(--border-radius-md);
+  padding: 10px;
+  background: var(--color-background-secondary);
+  /* Long values wrap instead of forcing horizontal overflow. */
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.cao-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.cao-card-title {
+  font-weight: 600;
+}
+
+.cao-card-meta {
+  margin: 8px 0 0;
+  display: grid;
+  gap: 2px;
+  font-size: 0.8rem;
+  color: var(--color-text-secondary);
+}
+
+.cao-card-meta dt {
+  display: inline;
+  font-weight: 600;
+  margin-right: 4px;
+}
+
+.cao-card-meta dd {
+  display: inline;
+  margin: 0;
+}
+
+.cao-status {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  padding: 2px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--color-border-primary);
+}
+
+/* Status colors map status -> semantic role -> host-overridable CSS variable
+ * (defined in tokens.generated.css). The status -> role mapping mirrors the
+ * SSOT in design-tokens/status.json. */
+.cao-status-idle {
+  color: var(--cao-status-success);
+}
+.cao-status-processing {
+  color: var(--cao-status-info);
+}
+.cao-status-completed {
+  color: var(--cao-status-accent);
+}
+.cao-status-waiting_user_answer {
+  color: var(--cao-status-warning);
+}
+.cao-status-error {
+  color: var(--cao-status-danger);
+}
+.cao-status-stopped {
+  color: var(--cao-status-neutral);
+}
+.cao-status-unknown {
+  color: var(--cao-status-neutral);
+}
+
+/* Pulse affordance — driven by the `pulse` flag in status.generated.ts. */
+.cao-status-pulse {
+  animation: cao-status-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+@keyframes cao-status-pulse {
+  50% {
+    opacity: 0.5;
+  }
+}
+
+.cao-events {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.cao-event {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 0.8rem;
+  padding: 4px 6px;
+  border-left: 3px solid var(--color-border-primary);
+  overflow-wrap: anywhere;
+}
+
+.cao-event-launch {
+  border-left-color: #2563eb;
+}
+.cao-event-handoff {
+  border-left-color: #7c3aed;
+}
+.cao-event-a2a_delegation {
+  border-left-color: #0891b2;
+}
+.cao-event-file_mod {
+  border-left-color: #ca8a04;
+}
+.cao-event-completion {
+  border-left-color: #16a34a;
+}
+.cao-event-error {
+  border-left-color: #dc2626;
+}
+
+.cao-event-time {
+  color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.cao-taskcontrol {
+  display: grid;
+  gap: 6px;
+  margin-top: 12px;
+}
+
+.cao-taskcontrol-input {
+  width: 100%;
+  font: inherit;
+  padding: 6px;
+  border: 1px solid var(--color-border-primary);
+  border-radius: var(--border-radius-md);
+  background: var(--color-background-primary);
+  color: var(--color-text-primary);
+  resize: vertical;
+}
+
+.cao-taskcontrol-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.cao-btn {
+  font: inherit;
+  font-size: 0.8rem;
+  padding: 4px 10px;
+  border: 1px solid var(--color-border-primary);
+  border-radius: var(--border-radius-md);
+  background: var(--color-background-primary);
+  color: var(--color-text-primary);
+  cursor: pointer;
+}
+
+.cao-btn-danger {
+  color: var(--color-text-danger);
+  background: var(--color-background-danger);
+}
+
+.cao-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 6px 8px 0;
+}
+
+/* Supervisor (fleet coordinator) distinction. */
+.cao-card-supervisor {
+  border-color: var(--color-border-info, #4c8bf5);
+  box-shadow: inset 3px 0 0 0 var(--color-border-info, #4c8bf5);
+}
+.cao-role-badge {
+  margin-left: 8px;
+  padding: 1px 6px;
+  font-size: 0.65rem;
+  font-weight: var(--font-weight-semibold, 600);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border-radius: var(--border-radius-full, 999px);
+  color: var(--color-text-info, #1a56db);
+  background: var(--color-background-info, #e8f0fe);
+  vertical-align: middle;
+}
+
+.cao-taskcontrol-error {
+  color: var(--color-text-danger);
+  font-size: 0.8rem;
+  margin: 0;
+}
+
+.cao-events-empty {
+  color: var(--color-text-secondary);
+  font-size: 0.85rem;
+  padding: 8px 0;
+}
+
+/* Narrow container (<= 350px): force a single column, no truncation. */
+@container cao (max-width: 350px) {
+  .cao-grid {
+    grid-template-columns: 1fr;
+  }
+  .cao-event {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Wide container (>= 1280px): multi-column grid. */
+@container cao (min-width: 1280px) {
+  .cao-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+/* Mid-width hosts (>= 1000px) also stretch to multi-column. */
+@container cao (min-width: 1000px) and (max-width: 1279.98px) {
+  .cao-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

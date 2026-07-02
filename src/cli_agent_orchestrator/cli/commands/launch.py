@@ -10,12 +10,12 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import (
     API_BASE_URL,
     DEFAULT_PROVIDER,
-    MCP_REQUEST_TIMEOUT,
     PROVIDERS,
     SERVER_HOST,
     SERVER_PORT,
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.terminal import (
     poll_until_done,
     sync_backend_from_server,
@@ -24,11 +24,11 @@ from cli_agent_orchestrator.utils.terminal import (
 
 # Providers that require workspace folder access
 PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
+    "antigravity_cli",
     "claude_code",
     "codex",
     "copilot_cli",
     "cursor_cli",
-    "gemini_cli",
     "hermes",
     "kimi_cli",
     "kiro_cli",
@@ -287,7 +287,8 @@ def launch(
         # Forwarded env vars travel in the JSON body so values (which may
         # contain secrets) don't end up in cao-server's HTTP access log.
         # See issue #248.
-        post_kwargs: dict = {"params": params, "timeout": MCP_REQUEST_TIMEOUT}
+        request_timeout = get_server_settings()["mcp_request_timeout"]
+        post_kwargs: dict = {"params": params, "timeout": request_timeout}
         if forwarded_env:
             post_kwargs["json"] = {"env_vars": forwarded_env}
 
@@ -334,10 +335,11 @@ def launch(
                 raise click.ClickException(
                     f"Conductor {terminal['id']} did not become ready within 120s"
                 )
+            request_timeout = get_server_settings()["mcp_request_timeout"]
             response = requests.post(
                 f"{API_BASE_URL}/terminals/{terminal['id']}/input",
                 params={"message": message},
-                timeout=MCP_REQUEST_TIMEOUT,
+                timeout=request_timeout,
             )
             response.raise_for_status()
             time.sleep(3)
@@ -345,10 +347,11 @@ def launch(
                 click.echo(f"Message sent to {terminal['name']}. Running in background.")
                 return
             poll_until_done(terminal["id"], timeout=300)
+            request_timeout = get_server_settings()["mcp_request_timeout"]
             output_resp = requests.get(
                 f"{API_BASE_URL}/terminals/{terminal['id']}/output",
                 params={"mode": "last"},
-                timeout=MCP_REQUEST_TIMEOUT,
+                timeout=request_timeout,
             )
             output_resp.raise_for_status()
             output = output_resp.json().get("output", "")

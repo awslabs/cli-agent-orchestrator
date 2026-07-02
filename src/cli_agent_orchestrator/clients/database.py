@@ -35,7 +35,7 @@ class TerminalModel(Base):
     id = Column(String, primary_key=True)  # "abc123ef"
     tmux_session = Column(String, nullable=False)  # "cao-session-name"
     tmux_window = Column(String, nullable=False)  # "window-name"
-    provider = Column(String, nullable=False)  # "q_cli", "claude_code"
+    provider = Column(String, nullable=False)  # "kiro_cli", "claude_code"
     agent_profile = Column(String)  # "developer", "reviewer" (optional)
     allowed_tools = Column(String, nullable=True)  # JSON-encoded list of CAO tool names
     shell_command = Column(String, nullable=True)  # shell process name captured before kiro launch

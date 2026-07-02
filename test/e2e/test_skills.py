@@ -28,7 +28,7 @@ import pytest
 import requests
 
 from cli_agent_orchestrator.cli.commands.init import seed_default_skills
-from cli_agent_orchestrator.constants import API_BASE_URL, GEMINI_WORKSPACES_DIR
+from cli_agent_orchestrator.constants import API_BASE_URL
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -73,10 +73,6 @@ def _run_skill_injection_test(provider: str, agent_profile: str):
 
     For most providers the catalog is embedded in the CLI command string
     sent via tmux send-keys and is therefore visible in tmux scrollback.
-    Gemini CLI is an exception: its system prompt is written to
-    ``GEMINI.md`` in the working directory because passing the catalog via
-    ``-i`` causes Gemini to treat it as a task to execute. For Gemini we
-    assert against the on-disk ``GEMINI.md`` instead.
 
     This is a deterministic assertion — it checks the injected payload,
     not LLM output.
@@ -107,15 +103,7 @@ def _run_skill_injection_test(provider: str, agent_profile: str):
 
         # Step 3: Assert skill catalog markers are present in the injection payload.
         # The catalog is global in Phase 1, so any installed skill should appear.
-        if provider == "gemini_cli":
-            # Gemini writes the full system prompt (including the skill catalog)
-            # to GEMINI.md inside a per-terminal workspace under
-            # GEMINI_WORKSPACES_DIR / <terminal_id>/. The CLI command carries
-            # only a short role-acknowledge prompt via -i. Read the workspace
-            # GEMINI.md directly.
-            payload = _read_gemini_md(terminal_id)
-            source = "GEMINI.md"
-        elif provider == "kimi_cli":
+        if provider == "kimi_cli":
             # Kimi writes the system prompt (including the skill catalog) to
             # <temp_dir>/system.md, referenced by the agent.yaml passed via
             # --agent-file. The launch command in scrollback carries only the
@@ -161,23 +149,6 @@ def _run_skill_injection_test(provider: str, agent_profile: str):
             cleanup_terminal(terminal_id, actual_session)
 
 
-def _read_gemini_md(terminal_id: str) -> str:
-    """Read GEMINI.md from the per-terminal Gemini workspace.
-
-    The Gemini CLI provider writes its system prompt (including the injected
-    skill catalog) into an isolated per-terminal workspace under
-    ``GEMINI_WORKSPACES_DIR / <terminal_id>/GEMINI.md`` to avoid races with
-    parallel gemini sessions sharing the project cwd. Returns an empty string
-    if the file does not exist so the caller can produce a useful assertion
-    error.
-    """
-    path = GEMINI_WORKSPACES_DIR / terminal_id / "GEMINI.md"
-    try:
-        return path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return ""
-
-
 # ---------------------------------------------------------------------------
 # Skill catalog injection tests (deterministic — checks tmux command string)
 # ---------------------------------------------------------------------------
@@ -210,12 +181,12 @@ class TestKimiCliSkills:
 
 
 @pytest.mark.e2e
-class TestGeminiCliSkills:
-    """E2E skill injection tests for the Gemini CLI provider."""
+class TestAntigravityCliSkills:
+    """E2E skill injection tests for the Antigravity CLI provider."""
 
-    def test_skill_catalog_injected(self, require_gemini):
-        """Gemini CLI terminal command contains the injected skill catalog."""
-        _run_skill_injection_test(provider="gemini_cli", agent_profile="developer")
+    def test_skill_catalog_injected(self, require_antigravity):
+        """Antigravity CLI terminal command contains the injected skill catalog."""
+        _run_skill_injection_test(provider="antigravity_cli", agent_profile="developer")
 
 
 # ---------------------------------------------------------------------------

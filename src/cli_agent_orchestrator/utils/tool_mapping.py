@@ -17,15 +17,18 @@ TOOL_MAPPING: Dict[str, Dict[str, List[str]]] = {
     "claude_code": {
         # Everything execution-capable gates with execute_bash — a restricted
         # agent escapes otherwise (observed live in the allowed-tools e2e):
-        # - Task spawns a subagent with its own full toolset ("the file was
-        #   created via a delegated subagent that ran the write through a
-        #   shell command");
+        # - the native subagent tool spawns a subagent with its own full
+        #   toolset ("the file was created via a delegated subagent that ran
+        #   the write through a shell command"). Claude Code renamed this tool
+        #   `Task` -> `Agent`; both names are denied so the block holds across
+        #   CLI versions (current builds expose only `Agent`, so denying just
+        #   `Task` is a silent no-op);
         # - Monitor runs arbitrary shell scripts in the background ("I used
         #   the Monitor tool" to write the forbidden file);
         # - BashOutput/KillShell are the Bash family's companions.
         # Privilege-equivalence: anything these can do, Bash can too, so
         # profiles allowed execute_bash lose nothing by keeping them.
-        "execute_bash": ["Bash", "BashOutput", "KillShell", "Task", "Monitor"],
+        "execute_bash": ["Bash", "BashOutput", "KillShell", "Task", "Agent", "Monitor"],
         "fs_read": ["Read"],
         # NotebookEdit writes .ipynb files — it must gate with fs_write or a
         # write-restricted agent keeps a file-modification path.
@@ -34,11 +37,11 @@ TOOL_MAPPING: Dict[str, Dict[str, List[str]]] = {
         "fs_*": ["Read", "Edit", "Write", "NotebookEdit", "Glob", "Grep"],
         # Network access. WebSearch gates here too: both reach the network and
         # are the agent's exfiltration/SSRF surface, so a profile without
-        # web_fetch loses both. Note: the subagent tool (Task) is deliberately
-        # NOT a separate category — it folds into execute_bash above, because a
-        # Task subagent spawns with its own full toolset and can run shell;
-        # exposing it standalone would let a profile grant subagent without
-        # execute_bash and re-open that escape.
+        # web_fetch loses both. Note: the subagent tool (`Task`/`Agent`) is
+        # deliberately NOT a separate category — it folds into execute_bash
+        # above, because a subagent spawns with its own full toolset and can run
+        # shell; exposing it standalone would let a profile grant subagent
+        # without execute_bash and re-open that escape.
         "web_fetch": ["WebFetch", "WebSearch"],
     },
     "copilot_cli": {
@@ -48,7 +51,10 @@ TOOL_MAPPING: Dict[str, Dict[str, List[str]]] = {
         "fs_list": ["list", "grep"],
         "fs_*": ["read", "write", "list", "grep"],
     },
-    "gemini_cli": {
+    # Antigravity CLI (agy) shares Google's gemini-style tool vocabulary
+    # (write_file/read_file/run_shell_command/...). Restrictions are enforced
+    # softly via the injected security prompt (see SOFT_ENFORCEMENT_PROVIDERS).
+    "antigravity_cli": {
         "execute_bash": ["run_shell_command"],
         "fs_read": ["read_file", "list_directory", "search_file_content", "glob"],
         "fs_write": ["write_file", "replace"],
@@ -140,7 +146,7 @@ def get_disallowed_tools(provider: str, allowed: List[str]) -> List[str]:
     """Given CAO allowedTools, return provider-native tool names to BLOCK.
 
     Args:
-        provider: Provider name (e.g., "claude_code", "copilot_cli", "gemini_cli")
+        provider: Provider name (e.g., "claude_code", "copilot_cli", "kiro_cli")
         allowed: List of CAO tool names that are ALLOWED
 
     Returns:

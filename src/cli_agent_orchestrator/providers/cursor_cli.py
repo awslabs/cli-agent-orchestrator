@@ -73,6 +73,7 @@ from typing import Optional
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
@@ -567,8 +568,9 @@ class CursorCliProvider(BaseProvider):
         Raises:
             TimeoutError: If shell or Cursor CLI initialization times out.
         """
-        if not await wait_for_shell(self.terminal_id, timeout=10.0):
-            raise TimeoutError("Shell initialization timed out after 10 seconds")
+        init_timeout = get_server_settings()["provider_init_timeout"]
+        if not await wait_for_shell(self.terminal_id, timeout=init_timeout):
+            raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
 
         command = self._build_cursor_command()
         # Arm the StatusMonitor stickiness gate so the launching
@@ -590,7 +592,7 @@ class CursorCliProvider(BaseProvider):
         if not await wait_until_status(
             self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-            timeout=30.0,
+            timeout=float(get_server_settings()["provider_init_timeout"]),
         ):
             raise TimeoutError("Cursor CLI initialization timed out after 30 seconds")
 
@@ -625,6 +627,12 @@ class CursorCliProvider(BaseProvider):
         Returns:
             Current TerminalStatus.
         """
+        # Native status (herdr): trust the backend's agent state when available;
+        # on herdr the buffer is never fed, so buffer parsing can't leave UNKNOWN.
+        native = self._resolve_native_status()
+        if native is not None:
+            return native
+
         if not output:
             return TerminalStatus.UNKNOWN
 
@@ -969,4 +977,5 @@ class CursorCliProvider(BaseProvider):
         turn, not before — which is what the StatusMonitor's
         stickiness gate expects.
         """
+        super().mark_input_received()
         self._turns += 1

@@ -8,7 +8,7 @@ license = "Apache-2.0"
 authors = [
     { name = "AWS Labs" },
 ]
-keywords = ["ai", "agents", "orchestration", "multi-agent", "tmux", "mcp", "cli", "codex", "claude-code", "kiro", "kimi", "gemini"]
+keywords = ["ai", "agents", "orchestration", "multi-agent", "tmux", "mcp", "cli", "codex", "claude-code", "kiro", "kimi"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -23,7 +23,10 @@ classifiers = [
 ]
 dependencies = [
     "fastapi>=0.104.0",
-    "fastmcp>=2.14.0",
+    # Upper bound: ext_apps/sep2133.advertise_capability monkey-patches a FastMCP
+    # internal (create_initialization_options); cap the major to avoid silent
+    # breakage on a new major release. Tested against 3.x.
+    "fastmcp>=2.14.0,<4.0.0",
     "mcp>=1.23.0",
     "pydantic>=2.10.6",
     "apscheduler>=3.10.4",
@@ -37,6 +40,10 @@ dependencies = [
     "requests>=2.32.0",
     "rank-bm25>=0.2.2",
     "pyte>=0.8.2",
+    # JWT/JWKS verification for the default-off OAuth 2.1 auth layer (RS256 via
+    # JWKS). The [crypto] extra pulls in `cryptography` for RSA signature
+    # verification and provides `jwt.PyJWKClient`. See spec task 9.1 research note.
+    "pyjwt[crypto]>=2.8.0",
     "jsonschema>=4.25",
 ]
 
@@ -50,6 +57,8 @@ dependencies = [
 claude_code_memory = "cli_agent_orchestrator.plugins.builtin.claude_code_memory:ClaudeCodeMemoryPlugin"
 kiro_cli_memory = "cli_agent_orchestrator.plugins.builtin.kiro_cli_memory:KiroCliMemoryPlugin"
 codex_memory = "cli_agent_orchestrator.plugins.builtin.codex_memory:CodexMemoryPlugin"
+event_log_publisher = "cli_agent_orchestrator.plugins.builtin.event_log_publisher:EventLogPublisher"
+mcp_apps = "cli_agent_orchestrator.plugins.builtin.mcp_apps:McpAppsPlugin"
 
 [project.urls]
 Homepage = "https://github.com/awslabs/cli-agent-orchestrator"
@@ -67,6 +76,12 @@ packages = ["src/cli_agent_orchestrator"]
 [tool.hatch.build]
 artifacts = [
     "src/cli_agent_orchestrator/web_ui/**",
+    # Single-file MCP App bundles emitted by `cao_mcp_apps` (npm run build:all).
+    # Shipped so cao-mcp-server can serve the ui://cao/* resources from the wheel.
+    "src/cli_agent_orchestrator/ext_apps/apps_static/**",
+    # Vanilla topology widget bundle (committed; no build step) served at
+    # /widgets/topology/ and as the cao://widget/topology MCP resource.
+    "src/cli_agent_orchestrator/ext_apps/static/**",
 ]
 
 [dependency-groups]
@@ -79,6 +94,7 @@ dev = [
     "isort>=5.12.0",
     "mypy>=1.5.0",
     "pytest-xdist>=3.8.0",
+    "hypothesis>=6.0",
     "tomli>=2.0.0; python_version < '3.11'",
 ]
 

@@ -39,6 +39,7 @@ from typing import Any, Dict, List, Optional
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
@@ -82,6 +83,14 @@ IDLE_PROMPT_PATTERN_LOG = r"[✨💫]"
 # Kimi welcome banner, shown once during startup inside a bordered box.
 # Used to detect successful initialization without needing to wait for prompt.
 WELCOME_BANNER_PATTERN = r"Welcome to Kimi Code CLI!"
+
+# Startup upgrade-reminder dialog. When a newer kimi-cli is available, kimi
+# renders an interactive menu ("[Enter] Upgrade now  [q] Not now  [s] Skip
+# reminders for version X") BEFORE the REPL and blocks on a keypress. Left
+# unanswered, kimi never reaches its ready prompt and init times out (the boot
+# gate holds it PROCESSING). We answer 's' to skip reminders for this version
+# (persisted, so it does not recur until the next release).
+UPGRADE_PROMPT_PATTERN = r"Skip reminders for version|Upgrade now"
 
 # User input box boundaries (pre-v1.20.0). Kimi displayed user messages in a bordered box:
 #   ╭──────────────────────────────╮
@@ -233,12 +242,13 @@ class KimiCliProvider(BaseProvider):
         """Record a dispatched task (called by terminal_service after send_input).
 
         Latches ``_has_received_input`` (the buffer-evidence latch can miss it
-        when a long paste scrolls the echo out of the rolling window) and
-        stamps ``_last_dispatch_time`` for the newest-TUI dispatch-grace check
-        in get_status().
+        when a long paste scrolls the echo out of the rolling window). The
+        ``_last_dispatch_time`` stamp (used by the newest-TUI dispatch-grace
+        check in get_status()) and the shared native-status tracking come from
+        ``super().mark_input_received()``.
         """
+        super().mark_input_received()
         self._has_received_input = True
-        self._last_dispatch_time = time.time()
 
     def _build_kimi_command(self) -> str:
         """Build Kimi CLI command with agent profile and MCP config if provided.
@@ -396,6 +406,38 @@ class KimiCliProvider(BaseProvider):
 
         cls._mcp_timeout_configured = True
 
+    def _handle_startup_dialog(self, timeout: Optional[float] = None) -> None:
+        """Dismiss kimi's startup upgrade-reminder dialog if it appears.
+
+        Mirrors ClaudeCodeProvider._handle_startup_prompts: polls the pane for
+        the interactive "[s] Skip reminders for version X" menu and answers 's'
+        so kimi can proceed to its ready prompt. Exits early if kimi is already
+        ready (no newer version → no dialog), so a no-update start isn't delayed.
+        """
+        if timeout is None:
+            timeout = get_server_settings()["startup_prompt_handler_timeout"]
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            output = get_backend().get_history(self.session_name, self.window_name)
+            if output:
+                clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
+                if re.search(UPGRADE_PROMPT_PATTERN, clean_output):
+                    from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+                    logger.info("Kimi upgrade-reminder dialog detected, skipping reminders")
+                    status_monitor.notify_input_sent(self.terminal_id)
+                    # 's' = "Skip reminders for version X"; single-key menu, no Enter.
+                    get_backend().send_keys(self.session_name, self.window_name, "s", enter_count=0)
+                    time.sleep(1.0)
+                    return
+                # Already at a ready prompt → no dialog to handle, stop early.
+                if self.get_status(output) in (
+                    TerminalStatus.IDLE,
+                    TerminalStatus.COMPLETED,
+                ):
+                    return
+            time.sleep(1.0)
+
     async def initialize(self) -> bool:
         """Initialize Kimi CLI provider by starting the kimi command.
 
@@ -411,14 +453,19 @@ class KimiCliProvider(BaseProvider):
             TimeoutError: If shell or Kimi CLI doesn't start within timeout
         """
         # Wait for shell prompt to appear in the tmux window
-        if not await wait_for_shell(self.terminal_id, timeout=10.0):
-            raise TimeoutError("Shell initialization timed out after 10 seconds")
+        init_timeout = get_server_settings()["provider_init_timeout"]
+        if not await wait_for_shell(self.terminal_id, timeout=init_timeout):
+            raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
 
         # Build properly escaped command string
         command = self._build_kimi_command()
 
         # Send Kimi command to the tmux window
         get_backend().send_keys(self.session_name, self.window_name, command)
+
+        # Dismiss the startup upgrade-reminder dialog before waiting for ready:
+        # unanswered it blocks kimi from reaching its prompt (init would time out).
+        self._handle_startup_dialog()
 
         # Wait for Kimi CLI to reach IDLE or COMPLETED state (prompt visible).
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
@@ -462,6 +509,12 @@ class KimiCliProvider(BaseProvider):
         Returns:
             TerminalStatus indicating current state
         """
+        # Native status (herdr): trust the backend's agent state when available;
+        # on herdr the buffer is never fed, so buffer parsing can't leave UNKNOWN.
+        native = self._resolve_native_status()
+        if native is not None:
+            return native
+
         if not output:
             return TerminalStatus.UNKNOWN
 
@@ -883,8 +936,8 @@ class KimiCliProvider(BaseProvider):
     async def extract_session_context(self) -> Dict[str, Any]:
         """Tmux-primary session extraction for Kimi.
 
-        Mirrors the universal pattern used by the other 5 providers
-        (Claude Code / Codex / Kiro / Q / Gemini). Returns the locked
+        Mirrors the universal pattern used by the other providers
+        (Claude Code / Codex / Kiro / Copilot). Returns the locked
         6-field shape from ``_build_context_dict``. Empty tmux history
         returns the LITERAL empty dict ``{}``. All
         emitted strings flow through ``_sanitize_for_log`` at this

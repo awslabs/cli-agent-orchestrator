@@ -26,7 +26,6 @@ Bolt 3) when sequencing reaches a reserved construct. Bolt 1 never raises it.
 from __future__ import annotations
 
 import logging
-import os
 import re
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional, Union
@@ -391,38 +390,26 @@ def _reserved_note(construct: str) -> str:
     return f"construct '{construct}' is reserved (not built yet; implemented by unit {unit})"
 
 
-def validate_only(path_or_text: str) -> ValidationResult:
+def validate_only(text: str) -> ValidationResult:
     """Validate a workflow spec WITHOUT running it (FR-1.3). NEVER raises.
 
-    Accepts either a filesystem path to a YAML spec or the raw YAML text. The
-    byte-cap is enforced BEFORE parsing so an oversized spec fails fast without
-    constructing a giant object graph. On any parse/grammar failure returns
-    ``status="fail"`` with split reasons (BR-7). On success, reserved constructs
-    (per TIER_REGISTRY + WORKFLOW_SHIPPED_UNITS) yield ``pass_reserved`` with
+    Accepts the raw YAML **text** of a spec (NOT a path). The byte-cap is
+    enforced BEFORE parsing so an oversized spec fails fast without constructing
+    a giant object graph. On any parse/grammar failure returns ``status="fail"``
+    with split reasons (BR-7). On success, reserved constructs (per
+    TIER_REGISTRY + WORKFLOW_SHIPPED_UNITS) yield ``pass_reserved`` with
     honesty-worded notes; a fully-shipped (sequential-only) spec yields ``pass``.
 
-    ``path``-typed inputs are NOT touched here (SD-1.2): no filesystem access at
-    authoring time. The shared path validator runs at run start (N5).
+    This function does NO filesystem access (SD-1.2): it never opens a path, so
+    no user-controlled value reaches a file API here. File reading lives behind
+    the shared path validator in ``workflow_spec_service`` (``_safe_spec_path``),
+    which decodes the bytes and passes the resulting text down to us. Keeping the
+    model text-only removes the path-injection sink at the source rather than
+    relying on the scanner to recognize a sanitizer across a call boundary.
     """
-    # Resolve text: treat as a path if it points at an existing file, else as
-    # raw YAML. A path is read as bytes so the byte-cap precedes parsing.
-    text = path_or_text
-    try:
-        if os.path.isfile(path_or_text):
-            with open(path_or_text, "rb") as fh:
-                raw = fh.read()
-            if len(raw) > WORKFLOW_MAX_SPEC_BYTES:
-                logger.debug("validate_only: spec exceeds byte cap (%d bytes)", len(raw))
-                return ValidationResult(
-                    status="fail",
-                    errors=[f"spec is {len(raw)} bytes (max {WORKFLOW_MAX_SPEC_BYTES})"],
-                )
-            text = raw.decode("utf-8")
-    except (OSError, ValueError) as exc:
-        logger.debug("validate_only: could not read spec source: %s", exc)
-        return ValidationResult(status="fail", errors=[f"could not read spec: {exc}"])
-
-    # Byte cap for raw-text input too (the path branch already checked + returned).
+    # Byte cap on the supplied text. The service enforces the same cap on raw
+    # bytes before decoding; this guards direct text callers (e.g. the API
+    # validate endpoint and unit tests) and any oversized post-decode content.
     if len(text.encode("utf-8")) > WORKFLOW_MAX_SPEC_BYTES:
         return ValidationResult(
             status="fail",

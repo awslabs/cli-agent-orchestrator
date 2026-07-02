@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 # in the seconds following completion. Without stickiness, both
 # wait_until_status (server-side) and the e2e tests' HTTP polling miss the
 # brief "ready" windows and time out (PR #273 codex 60s init timeouts,
-# gemini 240s init timeouts, completion-timeout failures).
+# completion-timeout failures).
 _STICKY_READY_STATUSES = frozenset(
     {
         TerminalStatus.IDLE,
@@ -128,8 +128,12 @@ class StatusMonitor:
                 self._feed_screen_locked(terminal_id, chunk)
 
         if not use_screen:
-            # Provider regex analysis can be slow — run it outside the lock.
-            self._apply_detection(terminal_id, self._detect_status(terminal_id, buffer))
+            # Debounced raw detection: same rising-edge + quiescence pattern as
+            # the pyte path.  Detects immediately on the first chunk after quiet
+            # (catches PROCESSING transition), then waits for output to settle
+            # before re-detecting (catches IDLE/COMPLETED without running costly
+            # regex on every single chunk during bursts).
+            self._schedule_raw_detection(terminal_id, buffer)
             return
 
         self._schedule_screen_detection(terminal_id, provider)
@@ -216,9 +220,30 @@ class StatusMonitor:
 
     def _detect_screen(self, terminal_id: str, provider) -> TerminalStatus:
         """Detect status from the terminal's composited pyte screen."""
+        fallback_buffer: Optional[str] = None
         with self._lock:
             scr = self._screens.get(terminal_id)
-            lines: List[str] = list(scr[0].display) if scr is not None else []
+            buffer = self._buffers.get(terminal_id, "")
+            try:
+                lines: List[str] = list(scr[0].display) if scr is not None else []
+            except Exception:
+                # pyte can transiently hold zero-length cell data while rendering
+                # complex TUI redraws. Fall back to raw-buffer detection instead of
+                # letting the quiescence callback tear down status monitoring.
+                logger.exception(
+                    "Error rendering screen status for %s; falling back to raw buffer",
+                    terminal_id,
+                )
+                fallback_buffer = buffer
+                lines = []
+        if fallback_buffer is not None:
+            if provider is None:
+                return TerminalStatus.UNKNOWN
+            try:
+                return provider.get_status(fallback_buffer)
+            except Exception:
+                logger.exception("Error detecting fallback status for %s", terminal_id)
+                return TerminalStatus.UNKNOWN
         if not lines or provider is None:
             return TerminalStatus.UNKNOWN
         try:
@@ -270,6 +295,48 @@ class StatusMonitor:
             self._bursting[terminal_id] = False
             self._quiesce_handle.pop(terminal_id, None)
         self._apply_detection(terminal_id, self._detect_screen(terminal_id, provider))
+
+    def _schedule_raw_detection(self, terminal_id: str, buffer: str) -> None:
+        """Edge-debounce detection on the raw rolling buffer.
+
+        Detects on every chunk while the terminal is in a ready/armed state
+        (to catch the IDLE→PROCESSING transition immediately). Once PROCESSING
+        is observed, switches to quiescence-only detection (the busy→ready
+        transition only matters after output settles). This prevents queue
+        overflow during sustained output while ensuring InboxService never
+        pastes into a busy terminal.
+        """
+        loop = self._running_loop()
+        if loop is None:
+            self._apply_detection(terminal_id, self._detect_status(terminal_id, buffer))
+            return
+        self._loop = loop
+
+        with self._lock:
+            was_bursting = self._bursting.get(terminal_id, False)
+            self._bursting[terminal_id] = True
+            handle = self._quiesce_handle.pop(terminal_id, None)
+            last_status = self._last_status.get(terminal_id)
+        self._cancel_quiesce_handle(handle)
+
+        # While terminal is ready/armed, detect on every chunk so the
+        # IDLE→PROCESSING transition is never missed (prevents stale-IDLE
+        # delivery by InboxService). Once PROCESSING is observed, debounce.
+        if not was_bursting or last_status in _STICKY_READY_STATUSES or last_status is None:
+            detected = self._detect_status(terminal_id, buffer)
+            self._apply_detection(terminal_id, detected)
+
+        new_handle = loop.call_later(PYTE_QUIESCENCE_DELAY_S, self._on_raw_quiescent, terminal_id)
+        with self._lock:
+            self._quiesce_handle[terminal_id] = new_handle
+
+    def _on_raw_quiescent(self, terminal_id: str) -> None:
+        """Quiescence timer fired for raw path: re-detect from current buffer."""
+        with self._lock:
+            self._bursting[terminal_id] = False
+            self._quiesce_handle.pop(terminal_id, None)
+            buffer = self._buffers.get(terminal_id, "")
+        self._apply_detection(terminal_id, self._detect_status(terminal_id, buffer))
 
     @staticmethod
     def _running_loop() -> Optional[asyncio.AbstractEventLoop]:
@@ -393,7 +460,28 @@ class StatusMonitor:
                     return TerminalStatus.UNKNOWN
 
         with self._lock:
-            return self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
+            cached = self._last_status.get(terminal_id, TerminalStatus.UNKNOWN)
+            # When cached status is PROCESSING, the debounced detection may be
+            # stuck: TUI providers (kiro-cli) can send escape sequences
+            # continuously after becoming idle, preventing the 200ms quiescence
+            # timer from ever firing. Do a fresh detection from the current
+            # buffer so poll-based callers (wait_until_status) catch the
+            # PROCESSING→ready transition without waiting for stream silence.
+            if cached == TerminalStatus.PROCESSING:
+                buffer = self._buffers.get(terminal_id, "")
+            else:
+                buffer = ""
+
+        if cached == TerminalStatus.PROCESSING and buffer:
+            fresh = self._detect_status(terminal_id, buffer)
+            logger.debug(
+                f"get_status [{terminal_id}]: cached=PROCESSING, "
+                f"fresh={fresh.value}, buffer_len={len(buffer)}"
+            )
+            if fresh != TerminalStatus.PROCESSING and fresh != TerminalStatus.UNKNOWN:
+                self._apply_detection(terminal_id, fresh)
+                return fresh
+        return cached
 
     def get_buffer(self, terminal_id: str) -> str:
         """Get accumulated output buffer for a terminal."""

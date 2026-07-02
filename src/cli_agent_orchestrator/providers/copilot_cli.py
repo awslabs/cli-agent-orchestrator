@@ -20,6 +20,7 @@ from libtmux.exc import LibTmuxException
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.terminal import wait_for_shell
 
 logger = logging.getLogger(__name__)
@@ -269,7 +270,8 @@ class CopilotCliProvider(BaseProvider):
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
         try:
-            shell_ready = await wait_for_shell(self.terminal_id, timeout=30.0)
+            init_timeout = get_server_settings()["provider_init_timeout"]
+            shell_ready = await wait_for_shell(self.terminal_id, timeout=init_timeout)
         except Exception as exc:
             logger.warning(
                 "wait_for_shell failed for %s:%s, retrying with provider history: %s",
@@ -277,10 +279,11 @@ class CopilotCliProvider(BaseProvider):
                 self.window_name,
                 exc,
             )
-            shell_ready = self._wait_for_shell_ready(timeout=30.0)
+            init_timeout = get_server_settings()["provider_init_timeout"]
+            shell_ready = self._wait_for_shell_ready(timeout=init_timeout)
 
         if not shell_ready:
-            raise TimeoutError("Shell initialization timed out after 30 seconds")
+            raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
 
         get_backend().send_keys(self.session_name, self.window_name, self._command())
 
@@ -417,6 +420,20 @@ class CopilotCliProvider(BaseProvider):
         return trimmed
 
     def get_status(self, output: str) -> TerminalStatus:
+        # Native status (herdr): trust the backend's agent state when available,
+        # before the tmux capture-pane fallback below (which is a tmux-only path).
+        native = self._resolve_native_status()
+        if native is not None:
+            return native
+
+        # For TUI apps, the raw FIFO buffer may contain only ANSI escapes.
+        # Fall back to tmux capture-pane when the buffer has no visible text.
+        cleaned = self._clean(output) if output else ""
+        if not cleaned.strip():
+            try:
+                output = self._history()
+            except Exception:
+                pass
         if not output or not output.strip():
             return TerminalStatus.UNKNOWN
 

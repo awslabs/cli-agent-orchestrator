@@ -1,6 +1,7 @@
 """Unit tests for Claude Code provider."""
 
 import json
+import shlex
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, mock_open, patch
@@ -10,9 +11,36 @@ import pytest
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider, ProviderError
 
+
+@pytest.fixture(autouse=True)
+def cleanup_tmp_files():
+    """Remove temp prompt/mcp files created by _build_claude_command during tests."""
+    yield
+    tmp_dir = Path.home() / ".aws" / "cli-agent-orchestrator" / "tmp"
+    if tmp_dir.exists():
+        for f in tmp_dir.glob("test*.prompt"):
+            f.unlink(missing_ok=True)
+        for f in tmp_dir.glob("test*.mcp.json"):
+            f.unlink(missing_ok=True)
+        for f in tmp_dir.glob("term-*.prompt"):
+            f.unlink(missing_ok=True)
+        for f in tmp_dir.glob("term-*.mcp.json"):
+            f.unlink(missing_ok=True)
+
+
 # All initialization tests need to patch _ensure_skip_bypass_prompt_setting
 # to avoid writing to the real ~/.claude/settings.json.
 _PATCH_SETTINGS = patch.object(ClaudeCodeProvider, "_ensure_skip_bypass_prompt_setting")
+
+
+def _extract_mcp_config(command: str) -> dict:
+    args = shlex.split(command)
+    assert "--strict-mcp-config" in args
+    mcp_file = Path(args[args.index("--mcp-config") + 1])
+    try:
+        return json.loads(mcp_file.read_text())
+    finally:
+        mcp_file.unlink(missing_ok=True)
 
 
 class TestClaudeCodeProviderInitialization:
@@ -170,7 +198,7 @@ class TestClaudeCodeProviderInitialization:
         command = provider._build_claude_command()
 
         assert "--agent my-claude-agent" in command
-        assert "--append-system-prompt" not in command
+        assert "--append-system-prompt-file" not in command
         assert "--mcp-config" not in command
 
     @pytest.mark.asyncio
@@ -1094,7 +1122,7 @@ class TestClaudeCodeProviderMisc:
         command = provider._build_claude_command()
 
         assert "claude" in command
-        assert "--append-system-prompt" in command
+        assert "--append-system-prompt-file" in command
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     def test_build_command_mcp_injects_terminal_id(self, mock_load):
@@ -1112,13 +1140,7 @@ class TestClaudeCodeProviderMisc:
         command = provider._build_claude_command()
 
         assert "--mcp-config" in command
-        # Extract the JSON arg after --mcp-config
-        parts = command.split("--mcp-config ")
-        mcp_json_str = parts[1].strip()
-        # shlex.join wraps the JSON in single quotes; strip them
-        if mcp_json_str.startswith("'") and mcp_json_str.endswith("'"):
-            mcp_json_str = mcp_json_str[1:-1]
-        mcp_data = json.loads(mcp_json_str)
+        mcp_data = _extract_mcp_config(command)
         server_env = mcp_data["mcpServers"]["cao-mcp-server"]["env"]
         assert server_env["CAO_TERMINAL_ID"] == "term-42"
 
@@ -1140,11 +1162,7 @@ class TestClaudeCodeProviderMisc:
         provider = ClaudeCodeProvider("term-99", "test-session", "window-0", "test-agent")
         command = provider._build_claude_command()
 
-        parts = command.split("--mcp-config ")
-        mcp_json_str = parts[1].strip()
-        if mcp_json_str.startswith("'") and mcp_json_str.endswith("'"):
-            mcp_json_str = mcp_json_str[1:-1]
-        mcp_data = json.loads(mcp_json_str)
+        mcp_data = _extract_mcp_config(command)
         server_env = mcp_data["mcpServers"]["my-server"]["env"]
         # Original vars preserved
         assert server_env["MY_VAR"] == "my_value"
@@ -1170,11 +1188,7 @@ class TestClaudeCodeProviderMisc:
         provider = ClaudeCodeProvider("term-99", "test-session", "window-0", "test-agent")
         command = provider._build_claude_command()
 
-        parts = command.split("--mcp-config ")
-        mcp_json_str = parts[1].strip()
-        if mcp_json_str.startswith("'") and mcp_json_str.endswith("'"):
-            mcp_json_str = mcp_json_str[1:-1]
-        mcp_data = json.loads(mcp_json_str)
+        mcp_data = _extract_mcp_config(command)
         server_env = mcp_data["mcpServers"]["my-server"]["env"]
         # Should keep the user-provided value, NOT overwrite with term-99
         assert server_env["CAO_TERMINAL_ID"] == "user-provided-id"
@@ -1230,7 +1244,7 @@ class TestClaudeCodeProviderPermissionMode:
         assert "--dangerously-skip-permissions" not in command
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
-    def test_yolo_overrides_permission_mode(self, mock_load):
+    def test_permission_mode_takes_priority_over_yolo(self, mock_load):
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.system_prompt = None
@@ -1241,8 +1255,8 @@ class TestClaudeCodeProviderPermissionMode:
         provider = ClaudeCodeProvider("tid", "sess", "win", "agent", allowed_tools=["*"])
         command = provider._build_claude_command()
 
-        assert "--dangerously-skip-permissions" in command
-        assert "--permission-mode" not in command
+        assert "--permission-mode auto" in command
+        assert "--dangerously-skip-permissions" not in command
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     def test_legacy_profile_without_permission_mode(self, mock_load):
@@ -1258,6 +1272,68 @@ class TestClaudeCodeProviderPermissionMode:
 
         assert "--dangerously-skip-permissions" in command
         assert "--permission-mode" not in command
+
+
+class TestClaudeCodeProviderYoloRootRegression:
+    """Regression tests for yolo + root/non-root --dangerously-skip-permissions logic.
+
+    Ensures that the root-user guard (PR #322) only omits --dangerously-skip-permissions
+    when running as root, and does not break normal non-root yolo launches.
+    """
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.os")
+    def test_yolo_non_root_includes_dangerously_skip_permissions(self, mock_os, mock_load):
+        """yolo + no permissionMode + non-root => includes --dangerously-skip-permissions."""
+        mock_os.geteuid.return_value = 1000  # non-root
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", allowed_tools=["*"])
+        command = provider._build_claude_command()
+
+        assert "--dangerously-skip-permissions" in command
+        assert "--permission-mode" not in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.os")
+    def test_yolo_root_omits_dangerously_skip_permissions(self, mock_os, mock_load):
+        """yolo + no permissionMode + root => omits --dangerously-skip-permissions."""
+        mock_os.geteuid.return_value = 0  # root
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", allowed_tools=["*"])
+        command = provider._build_claude_command()
+
+        assert "--dangerously-skip-permissions" not in command
+        assert "--permission-mode" not in command
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    @patch("cli_agent_orchestrator.providers.claude_code.os")
+    def test_yolo_with_permission_mode_uses_permission_mode_flag(self, mock_os, mock_load):
+        """yolo + permissionMode => uses --permission-mode <value>, omits --dangerously-skip-permissions."""
+        mock_os.geteuid.return_value = 1000  # non-root; permissionMode should still win
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = "auto"
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("tid", "sess", "win", "agent", allowed_tools=["*"])
+        command = provider._build_claude_command()
+
+        assert "--permission-mode auto" in command
+        assert "--dangerously-skip-permissions" not in command
 
 
 class TestClaudeCodeProviderStartupPrompts:

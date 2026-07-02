@@ -53,7 +53,7 @@ def memory():
     "--scope",
     type=click.Choice([s.value for s in MemoryScope], case_sensitive=False),
     default=None,
-    help="Filter by scope (global, project, session, agent).",
+    help="Filter by scope (global, project, session, agent, federated).",
 )
 @click.option(
     "--type",
@@ -179,7 +179,7 @@ def delete(key, scope, yes):
     "--scope",
     type=click.Choice([s.value for s in MemoryScope], case_sensitive=False),
     required=True,
-    help="Scope to clear (required). One of: global, project, session, agent.",
+    help="Scope to clear (required). One of: global, project, session, agent, federated.",
 )
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt.")
 def clear(scope, yes):
@@ -359,3 +359,133 @@ def compact_cmd(scope, key):
     for topic_key, status in sorted(results.items()):
         click.echo(f"{status:<22} {topic_key}")
     click.echo(f"\nSummary: {summary}")
+
+
+@memory.command(name="heal")
+@click.option(
+    "--scope",
+    # Only global/project are resolvable from cwd context here; session/agent
+    # need a session_name/agent_profile that this CLI path cannot derive, so
+    # offering them would only ever raise "could not resolve scope_id".
+    type=click.Choice([MemoryScope.GLOBAL.value, MemoryScope.PROJECT.value], case_sensitive=False),
+    default="project",
+    show_default=True,
+    help="Scope to heal (global or project).",
+)
+@click.option(
+    "--apply",
+    "do_apply",
+    is_flag=True,
+    default=False,
+    help="Apply mutations. Without this flag, prints a dry-run plan only.",
+)
+@click.option(
+    "--aggressive",
+    is_flag=True,
+    default=False,
+    help="Enable destructive poison_frequency healing (requires --apply too).",
+)
+@click.option(
+    "--issue-type",
+    "issue_type",
+    type=click.Choice(
+        ["orphan_page", "contradiction", "stale_claim", "poison_frequency"],
+        case_sensitive=False,
+    ),
+    default=None,
+    help="Restrict healing to a single issue type.",
+)
+@click.option(
+    "--format",
+    "out_format",
+    type=click.Choice(["table", "json"], case_sensitive=False),
+    default="table",
+    show_default=True,
+    help="Output format.",
+)
+def heal_cmd(scope, do_apply, aggressive, issue_type, out_format):
+    """Repair wiki lint findings (orphan pages, contradictions, stale claims).
+
+    Dry-run by DEFAULT — prints what would change. Pass --apply to mutate.
+    poison_frequency healing additionally requires --aggressive.
+    graph_density is flag-only and never mutated.
+    """
+    import json as _json
+
+    from cli_agent_orchestrator.services import wiki_healer
+    from cli_agent_orchestrator.services.wiki_lint import run_lint
+
+    svc = _get_memory_service()
+    ctx = _cwd_context()
+
+    scope_id = None
+    if scope != MemoryScope.GLOBAL.value:
+        scope_id = svc.resolve_scope_id(scope, ctx)
+        if scope_id is None:
+            raise click.ClickException(f"could not resolve scope_id for scope '{scope}'")
+
+    project_hash = scope_id or "unknown"
+
+    try:
+        issues = _run_async(run_lint(project_hash, scope=scope))
+    except Exception as e:
+        raise click.ClickException(f"lint run failed: {e}")
+
+    if issue_type is not None:
+        issues = [i for i in issues if i.issue_type == issue_type]
+
+    try:
+        report = _run_async(
+            wiki_healer.heal(
+                issues,
+                scope=scope,
+                scope_id=scope_id,
+                apply=do_apply,
+                aggressive=aggressive,
+            )
+        )
+    except wiki_healer.HealConflictError as e:
+        raise click.ClickException(str(e))
+    except Exception as e:
+        raise click.ClickException(f"heal failed: {e}")
+
+    is_json = out_format.lower() == "json"
+    if is_json:
+        payload = {
+            "scope": report.scope,
+            "scope_id": report.scope_id,
+            "apply": report.apply,
+            "aggressive": report.aggressive,
+            "dry_run_summary": report.dry_run_summary,
+            "truncated_by_type": report.truncated_by_type,
+            "truncated_run_level": report.truncated_run_level,
+            "total_suppressed": report.total_suppressed,
+            "actions": [
+                {
+                    "issue_type": a.issue_type,
+                    "key": a.key,
+                    "related_key": a.related_key,
+                    "description": a.description,
+                    "status": a.status,
+                }
+                for a in report.actions
+            ],
+        }
+        click.echo(_json.dumps(payload, indent=2))
+        return
+
+    if report.dry_run_summary:
+        click.echo(report.dry_run_summary)
+    if not report.actions:
+        click.echo("Nothing to heal.")
+        return
+    header = f"{'STATUS':<10} {'TYPE':<22} {'KEY':<30} DESCRIPTION"
+    click.echo(header)
+    click.echo("-" * len(header))
+    for a in report.actions:
+        click.echo(f"{a.status:<10} {a.issue_type:<22} {a.key:<30} {a.description}")
+    if report.total_suppressed:
+        click.echo(
+            f"\n{report.total_suppressed} action(s) suppressed by caps "
+            f"(by type: {report.truncated_by_type}, run-level: {report.truncated_run_level})."
+        )

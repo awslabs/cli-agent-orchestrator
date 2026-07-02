@@ -9,6 +9,7 @@ from typing import Optional
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 
@@ -175,8 +176,9 @@ class HermesProvider(BaseProvider):
 
     async def initialize(self) -> bool:
         """Initialize Hermes by starting the configured profile chat REPL."""
-        if not await wait_for_shell(self.terminal_id, timeout=10.0):
-            raise TimeoutError("Shell initialization timed out after 10 seconds")
+        init_timeout = get_server_settings()["provider_init_timeout"]
+        if not await wait_for_shell(self.terminal_id, timeout=init_timeout):
+            raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
 
         command = self._build_hermes_command()
         tmux_client.send_keys(self.session_name, self.window_name, command)
@@ -199,6 +201,13 @@ class HermesProvider(BaseProvider):
             output: Terminal output buffer (up to ~8KB rolling buffer) supplied
                 by the StatusMonitor via the FIFO reader pipeline.
         """
+        # Native status (herdr): trust the backend's agent state when available.
+        # Must precede the empty-buffer -> ERROR default below: on herdr the
+        # buffer is always empty, so without this every status would be ERROR.
+        native = self._resolve_native_status()
+        if native is not None:
+            return native
+
         if not output:
             return TerminalStatus.ERROR
 

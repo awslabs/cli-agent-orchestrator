@@ -2,7 +2,7 @@
 
 E2E tests require:
 - A running CAO server (cao-server / uvicorn on localhost:9889)
-- The provider CLI tool installed and authenticated (codex, claude, kiro-cli, gemini, copilot)
+- The provider CLI tool installed and authenticated (codex, claude, kiro-cli, copilot)
 - tmux available on the system
 
 Run with: uv run pytest -m e2e test/e2e/ -v
@@ -96,24 +96,6 @@ def require_kimi():
 
 
 @pytest.fixture()
-def require_gemini():
-    """Skip test if gemini CLI is not available.
-
-    Includes a post-test cooldown to avoid Gemini API rate limiting (429).
-    Gemini CLI has known issues with rate limit retry logic (GitHub #6986,
-    #9248) — sequential tests can exhaust the per-minute RPM quota, causing
-    the CLI to hang during initialization or task processing.
-    """
-    if not _cli_available("gemini"):
-        pytest.skip("gemini CLI not installed")
-    yield
-    # Cool down after each Gemini CLI test to stay within API rate limits.
-    # Gemini's free-tier RPM limit is low; sequential tests exhaust the quota
-    # and cause the CLI to hang in a retry loop during initialization.
-    time.sleep(15)
-
-
-@pytest.fixture()
 def require_copilot():
     """Skip test if copilot CLI is not available."""
     if not _cli_available("copilot"):
@@ -132,6 +114,13 @@ def require_hermes():
     """Skip test if Hermes CLI is not available."""
     if not _cli_available("hermes"):
         pytest.skip("Hermes CLI not installed")
+
+
+@pytest.fixture()
+def require_antigravity():
+    """Skip test if Antigravity CLI (``agy``) is not available."""
+    if not _cli_available("agy"):
+        pytest.skip("Antigravity CLI (agy) not installed")
 
 
 @pytest.fixture()

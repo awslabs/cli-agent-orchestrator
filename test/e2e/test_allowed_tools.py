@@ -17,8 +17,6 @@ Provider coverage:
   Tests use the built-in code_supervisor profile (role=supervisor, no execute_bash).
 - Claude Code: Hard enforcement via --disallowedTools flags.
   Tests pass allowed_tools=@cao-mcp-server to trigger Bash blocking.
-- Gemini CLI: Hard enforcement via Policy Engine TOML deny rules.
-  Tests pass allowed_tools=@cao-mcp-server to trigger run_shell_command deny policy.
 - Codex: Soft enforcement via security system prompt.
   Tests verify the prompt-based restriction is present (best-effort).
 - Kimi CLI: Soft enforcement via security system prompt.
@@ -26,7 +24,7 @@ Provider coverage:
 
 Requires:
 - Running CAO server
-- Authenticated CLI tools (claude, kiro-cli, gemini, kimi)
+- Authenticated CLI tools (claude, kiro-cli, kimi)
 - tmux
 - Agent profiles installed: code_supervisor, developer
 
@@ -34,7 +32,6 @@ Run:
     uv run pytest -m e2e test/e2e/test_allowed_tools.py -v -o "addopts="
     uv run pytest -m e2e test/e2e/test_allowed_tools.py -v -o "addopts=" -k kiro
     uv run pytest -m e2e test/e2e/test_allowed_tools.py -v -o "addopts=" -k claude
-    uv run pytest -m e2e test/e2e/test_allowed_tools.py -v -o "addopts=" -k gemini
     uv run pytest -m e2e test/e2e/test_allowed_tools.py -v -o "addopts=" -k kimi
 """
 
@@ -548,51 +545,6 @@ class TestKimiCliAllowedTools:
 
 
 # ---------------------------------------------------------------------------
-# Gemini CLI provider — hard enforcement via Policy Engine TOML deny rules
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.e2e
-class TestGeminiCliAllowedTools:
-    """E2E allowedTools tests for the Gemini CLI provider.
-
-    Gemini CLI enforces restrictions via Policy Engine TOML deny rules
-    written to ~/.gemini/policies/cao-{terminal_id}.toml. Deny rules
-    completely exclude tools from the model's memory, providing hard
-    enforcement even in --yolo mode. When allowed_tools=@cao-mcp-server,
-    run_shell_command is denied via policy.
-    """
-
-    def test_restricted_supervisor_cannot_bash(self, require_gemini):
-        """Supervisor with only @cao-mcp-server should not execute bash.
-
-        Enforcement: Policy Engine TOML deny rules in ~/.gemini/policies/.
-        Deny rules completely exclude tools from the model's memory, providing
-        hard enforcement even in --yolo mode.
-        """
-        _run_restricted_tool_test(
-            provider="gemini_cli",
-            agent_profile="code_supervisor",
-            allowed_tools="@cao-mcp-server",
-        )
-
-    def test_unrestricted_developer_can_bash(self, require_gemini):
-        """Developer with wildcard allowedTools can execute bash."""
-        _run_unrestricted_tool_test(
-            provider="gemini_cli",
-            agent_profile="developer",
-        )
-
-    def test_allowed_tools_stored_in_metadata(self, require_gemini):
-        """allowed_tools is persisted and returned by GET /terminals."""
-        _run_allowed_tools_stored_test(
-            provider="gemini_cli",
-            agent_profile="developer",
-            allowed_tools="@builtin,fs_read,@cao-mcp-server",
-        )
-
-
-# ---------------------------------------------------------------------------
 # Cursor CLI provider — soft enforcement via SECURITY_PROMPT
 # ---------------------------------------------------------------------------
 
@@ -642,6 +594,48 @@ class TestCursorCliAllowedTools:
         """allowed_tools is persisted and returned by GET /terminals."""
         _run_allowed_tools_stored_test(
             provider="cursor_cli",
+            agent_profile="developer",
+            allowed_tools="@builtin,fs_read,@cao-mcp-server",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Antigravity CLI provider — soft enforcement via SECURITY_PROMPT
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestAntigravityCliAllowedTools:
+    """E2E allowedTools tests for the Antigravity CLI provider.
+
+    Antigravity CLI does not expose a native --disallowedTools flag;
+    restrictions are enforced softly via the SECURITY_PROMPT appended
+    to the system prompt. This is advisory only.
+    """
+
+    @pytest.mark.xfail(
+        reason="Antigravity CLI lacks native --disallowedTools; soft enforcement is advisory only",
+        strict=False,
+    )
+    def test_restricted_supervisor_cannot_bash(self, require_antigravity):
+        """Supervisor with only @cao-mcp-server should not execute bash."""
+        _run_restricted_tool_test(
+            provider="antigravity_cli",
+            agent_profile="code_supervisor",
+            allowed_tools="@cao-mcp-server",
+        )
+
+    def test_unrestricted_developer_can_bash(self, require_antigravity):
+        """Developer with wildcard allowedTools can execute bash."""
+        _run_unrestricted_tool_test(
+            provider="antigravity_cli",
+            agent_profile="developer",
+        )
+
+    def test_allowed_tools_stored_in_metadata(self, require_antigravity):
+        """allowed_tools is persisted and returned by GET /terminals."""
+        _run_allowed_tools_stored_test(
+            provider="antigravity_cli",
             agent_profile="developer",
             allowed_tools="@builtin,fs_read,@cao-mcp-server",
         )

@@ -16,7 +16,6 @@ CAO discovers agent profiles by scanning multiple directories. When loading or l
 | Key | Provider | Default Path |
 |-----|----------|-------------|
 | `kiro_cli` | Kiro CLI | `~/.kiro/agents` |
-| `q_cli` | Q CLI | `~/.aws/amazonq/cli-agents` |
 | `claude_code` | Claude Code | `~/.aws/cli-agent-orchestrator/agent-store` |
 | `codex` | Codex | `~/.aws/cli-agent-orchestrator/agent-store` |
 | `cao_installed` | CAO Installed | `~/.aws/cli-agent-orchestrator/agent-context` |
@@ -83,7 +82,6 @@ This mirrors agent-profile resolution: a skill in the global store is not shadow
 {
   "agent_dirs": {
     "kiro_cli": "~/.kiro/agents",
-    "q_cli": "~/.aws/amazonq/cli-agents",
     "claude_code": "~/.aws/cli-agent-orchestrator/agent-store",
     "codex": "~/.aws/cli-agent-orchestrator/agent-store",
     "cao_installed": "~/.aws/cli-agent-orchestrator/agent-context"
@@ -103,6 +101,28 @@ This mirrors agent-profile resolution: a skill in the global store is not shadow
 | `POST` | `/settings/skill-dirs` | Set extra custom skill directories |
 
 See [api.md](api.md) for the full API reference.
+
+## Server Tuning Settings
+
+The `server` key in `settings.json` controls timeouts and buffer sizes used by the CAO runtime. All values have safe defaults — only override if you experience timeouts or queue overflows.
+
+```json
+{
+  "server": {
+    "mcp_request_timeout": 30,
+    "event_bus_max_queue_size": 1024,
+    "provider_init_timeout": 60,
+    "startup_prompt_handler_timeout": 20
+  }
+}
+```
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `mcp_request_timeout` | `30` | Seconds to wait for HTTP calls between the MCP server process and the CAO API. Increase if you see timeout errors during `handoff` or `assign` operations. |
+| `event_bus_max_queue_size` | `1024` | Maximum events buffered per subscriber queue in the internal event bus. Increase if you see "Queue full, dropping event" errors with many active workers. |
+| `provider_init_timeout` | `60` | Seconds to wait for the initial shell prompt before launching a CLI provider. Some providers apply additional provider-specific initialization timeouts after launch. Increase if you see shell startup timeouts on slow machines. |
+| `startup_prompt_handler_timeout` | `20` | Seconds the Claude Code startup prompt handler waits for workspace trust / bypass dialogs before giving up. Rarely needs changing. |
 
 ## Server Network Settings
 

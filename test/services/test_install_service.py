@@ -10,7 +10,7 @@ import requests  # type: ignore[import-untyped]
 
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.services.install_service import InstallResult, install_agent
-from cli_agent_orchestrator.utils.skill_injection import refresh_agent_json_prompt
+from cli_agent_orchestrator.utils.skill_injection import refresh_agent_md_prompt
 
 
 def _profile_text(*, name: str, include_prompt: bool = True) -> str:
@@ -39,7 +39,6 @@ def install_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, 
     local_store_dir = tmp_path / "agent-store"
     context_dir = tmp_path / "agent-context"
     kiro_dir = tmp_path / "kiro"
-    q_dir = tmp_path / "q"
     copilot_dir = tmp_path / "copilot"
     provider_dir = tmp_path / "provider"
     extra_dir = tmp_path / "extra"
@@ -49,7 +48,6 @@ def install_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, 
         local_store_dir,
         context_dir,
         kiro_dir,
-        q_dir,
         copilot_dir,
         provider_dir,
         extra_dir,
@@ -69,7 +67,6 @@ def install_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, 
         context_dir,
     )
     monkeypatch.setattr("cli_agent_orchestrator.services.install_service.KIRO_AGENTS_DIR", kiro_dir)
-    monkeypatch.setattr("cli_agent_orchestrator.services.install_service.Q_AGENTS_DIR", q_dir)
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.install_service.COPILOT_AGENTS_DIR",
         copilot_dir,
@@ -88,7 +85,6 @@ def install_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, 
         "local_store_dir": local_store_dir,
         "context_dir": context_dir,
         "kiro_dir": kiro_dir,
-        "q_dir": q_dir,
         "copilot_dir": copilot_dir,
         "provider_dir": provider_dir,
         "extra_dir": extra_dir,
@@ -152,10 +148,10 @@ class TestInstallAgent:
         assert result.success is True
         assert result.agent_name == "nested-agent"
 
-    def test_install_from_url_downloads_and_writes_q_config(
+    def test_install_from_url_downloads_and_writes_kiro_config(
         self, install_paths: dict[str, Path]
     ) -> None:
-        """URL sources should be downloaded into the local store and installed for Q CLI."""
+        """URL sources should be downloaded into the local store and installed for Kiro CLI."""
         mock_response = MagicMock()
         mock_response.text = _profile_text(name="downloaded-agent")
         mock_response.is_redirect = False
@@ -167,7 +163,7 @@ class TestInstallAgent:
         ) as mock_get:
             result = install_agent(
                 "https://raw.githubusercontent.com/org/repo/main/downloaded-agent.md",
-                "q_cli",
+                "kiro_cli",
                 {"API_TOKEN": "secret-token"},
             )
 
@@ -182,9 +178,9 @@ class TestInstallAgent:
         )
         assert (install_paths["local_store_dir"] / "downloaded-agent.md").exists()
 
-        q_config = json.loads((install_paths["q_dir"] / "downloaded-agent.json").read_text())
-        assert q_config["mcpServers"]["service"]["env"]["API_TOKEN"] == "secret-token"
-        assert q_config["mcpServers"]["service"]["env"]["BASE_URL"] == "${BASE_URL}"
+        kiro_config = json.loads((install_paths["kiro_dir"] / "downloaded-agent.json").read_text())
+        assert kiro_config["mcpServers"]["service"]["env"]["API_TOKEN"] == "secret-token"
+        assert kiro_config["mcpServers"]["service"]["env"]["BASE_URL"] == "${BASE_URL}"
 
     def test_install_from_local_store_writes_copilot_config(
         self, install_paths: dict[str, Path]
@@ -294,7 +290,7 @@ class TestInstallAgent:
         ):
             result = install_agent(
                 "https://raw.githubusercontent.com/org/repo/main/missing-agent.md",
-                "q_cli",
+                "kiro_cli",
             )
 
         assert result.success is False
@@ -471,10 +467,10 @@ class TestInstallSkillCatalogBaking:
         local_store_dir = tmp_path / "agent-store"
         context_dir = tmp_path / "agent-context"
         kiro_dir = tmp_path / "kiro"
-        q_dir = tmp_path / "q"
+        copilot_dir = tmp_path / "copilot"
         skills_dir = tmp_path / "skills"
 
-        for d in (local_store_dir, context_dir, kiro_dir, q_dir, skills_dir):
+        for d in (local_store_dir, context_dir, kiro_dir, copilot_dir, skills_dir):
             d.mkdir()
 
         monkeypatch.setattr(
@@ -491,7 +487,9 @@ class TestInstallSkillCatalogBaking:
         monkeypatch.setattr(
             "cli_agent_orchestrator.services.install_service.KIRO_AGENTS_DIR", kiro_dir
         )
-        monkeypatch.setattr("cli_agent_orchestrator.services.install_service.Q_AGENTS_DIR", q_dir)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.install_service.COPILOT_AGENTS_DIR", copilot_dir
+        )
         monkeypatch.setattr(
             "cli_agent_orchestrator.services.install_service.SKILLS_DIR", skills_dir
         )
@@ -507,7 +505,7 @@ class TestInstallSkillCatalogBaking:
             "local_store_dir": local_store_dir,
             "context_dir": context_dir,
             "kiro_dir": kiro_dir,
-            "q_dir": q_dir,
+            "copilot_dir": copilot_dir,
             "skills_dir": skills_dir,
         }
 
@@ -540,8 +538,10 @@ class TestInstallSkillCatalogBaking:
         assert len(skill_resources) == 1
         assert skill_resources[0].endswith("/**/SKILL.md")
 
-    def test_install_q_bakes_catalog_into_prompt(self, install_workspace: dict) -> None:
-        """Q installs should bake the global skill catalog into the JSON prompt."""
+    def test_install_kiro_keeps_prompt_clean_with_skill_resources(
+        self, install_workspace: dict
+    ) -> None:
+        """Kiro installs keep the profile prompt clean and expose skills via resources."""
         _create_skill(
             install_workspace["skills_dir"] / "python-testing",
             "python-testing",
@@ -553,12 +553,14 @@ class TestInstallSkillCatalogBaking:
             "System prompt",
         )
 
-        result = install_agent("test-agent", "q_cli")
+        result = install_agent("test-agent", "kiro_cli")
 
         assert result.success is True
-        agent_json = json.loads((install_workspace["q_dir"] / "test-agent.json").read_text())
-        assert agent_json["prompt"].startswith("Build things\n\n## Available Skills")
-        assert "python-testing" in agent_json["prompt"]
+        agent_json = json.loads((install_workspace["kiro_dir"] / "test-agent.json").read_text())
+        assert agent_json["prompt"] == "Build things"
+        assert "Available Skills" not in agent_json["prompt"]
+        skill_resources = [r for r in agent_json["resources"] if r.startswith("skill://")]
+        assert len(skill_resources) == 1
 
     def test_install_kiro_omits_prompt_field_when_profile_prompt_is_empty(
         self, install_workspace: dict
@@ -582,7 +584,7 @@ class TestInstallSkillCatalogBaking:
     def test_install_non_ascii_prompt_round_trips_through_refresh_without_byte_drift(
         self, install_workspace: dict
     ) -> None:
-        """Non-ASCII prompt content should survive install and refresh with byte-identical JSON."""
+        """Non-ASCII prompt content should survive install and refresh with byte-identical output."""
         _create_skill(
             install_workspace["skills_dir"] / "unicode-skill",
             "unicode-skill",
@@ -591,16 +593,16 @@ class TestInstallSkillCatalogBaking:
         self._write_profile(
             install_workspace["local_store_dir"] / "unicode-agent.md",
             "name: unicode-agent\ndescription: Test agent\nprompt: こんにちは 🚀\n",
-            "System prompt",
+            "こんにちは 🚀",
         )
 
-        result = install_agent("unicode-agent", "q_cli")
+        result = install_agent("unicode-agent", "copilot_cli")
 
         assert result.success is True
-        agent_path = install_workspace["q_dir"] / "unicode-agent.json"
+        agent_path = install_workspace["copilot_dir"] / "unicode-agent.agent.md"
         before_refresh = agent_path.read_bytes()
 
-        refreshed = refresh_agent_json_prompt(
+        refreshed = refresh_agent_md_prompt(
             agent_path,
             AgentProfile(name="unicode-agent", description="Test agent", prompt="こんにちは 🚀"),
         )
@@ -681,11 +683,11 @@ class TestInstallAgentEnvBehaviour:
         """The first '=' splits the assignment; subsequent '=' chars remain in the value."""
         self._write_profile(install_paths["local_store_dir"] / "test-agent.md", body="URL: ${URL}")
 
-        result = install_agent("test-agent", "q_cli", {"URL": "http://host?a=b"})
+        result = install_agent("test-agent", "kiro_cli", {"URL": "http://host?a=b"})
 
         assert result.success is True
-        q_config = json.loads((install_paths["q_dir"] / "test-agent.json").read_text())
-        assert q_config["mcpServers"]["service"]["env"]["URL"] == "http://host?a=b"
+        kiro_config = json.loads((install_paths["kiro_dir"] / "test-agent.json").read_text())
+        assert kiro_config["mcpServers"]["service"]["env"]["URL"] == "http://host?a=b"
 
     def test_install_without_env_does_not_create_env_file(
         self, install_paths: dict[str, Path]
