@@ -135,6 +135,7 @@ class TestSharedNativeStatus:
         hermes) — never a native status leaking through.
         """
         mock_backend.get_native_status.return_value = None
+        mock_backend.get_history.return_value = ""
         provider = _make(provider_cls)
         result = provider.get_status("")
         assert result in (TerminalStatus.UNKNOWN, TerminalStatus.ERROR)
