@@ -44,6 +44,7 @@ import logging
 import re
 import shlex
 import shutil
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -51,6 +52,7 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import SECURITY_PROMPT
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
@@ -93,6 +95,15 @@ IDLE_PROMPT_PATTERN = r"^\s*>\s*$"
 # Full-width horizontal rule (U+2500) delimiting the input box / transcript
 # sections. Anchored to a full line; tolerates surrounding whitespace.
 SEPARATOR_PATTERN = r"^\s*─{20,}\s*$"
+
+# Workspace-trust dialog shown on the FIRST launch in an untrusted directory:
+# "Antigravity CLI requires permission to read, edit, and execute files here."
+# with a "> Yes, I trust this folder / No, exit" picker (Yes pre-selected).
+# --dangerously-skip-permissions covers tool approvals, NOT this workspace-trust
+# gate, so CAO (which launches agy in a fresh session cwd) hits it and init
+# hangs — the picker matches WAITING_USER_ANSWER and never reads IDLE. Dismissed
+# in initialize() by sending Enter (accepts the pre-selected "Yes").
+TRUST_PROMPT_PATTERN = r"Yes, I trust this folder|requires permission to read, edit"
 
 # Interactive prompts that block on user input (approval dialogs, pickers).
 # With --dangerously-skip-permissions these are rare, but we still classify
@@ -356,6 +367,34 @@ class AntigravityCliProvider(BaseProvider):
             # names behind and block terminal teardown.
             self._mcp_server_names = []
 
+    def _handle_startup_dialog(self, timeout: Optional[float] = None) -> None:
+        """Accept agy's workspace-trust dialog if it appears at startup.
+
+        Mirrors ClaudeCodeProvider._handle_startup_prompts / KimiCliProvider.
+        Polls the pane for the trust picker and sends Enter (the "Yes, I trust
+        this folder" option is pre-selected). Exits early once agy is at its
+        ready footer, so an already-trusted cwd isn't delayed.
+        """
+        if timeout is None:
+            timeout = get_server_settings()["startup_prompt_handler_timeout"]
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            output = get_backend().get_history(self.session_name, self.window_name)
+            if output:
+                clean = strip_terminal_escapes(output)
+                if re.search(TRUST_PROMPT_PATTERN, clean):
+                    from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+                    logger.info("Antigravity workspace-trust dialog detected, accepting")
+                    status_monitor.notify_input_sent(self.terminal_id)
+                    get_backend().send_special_key(self.session_name, self.window_name, "Enter")
+                    time.sleep(1.0)
+                    return
+                # Already at the ready footer → no dialog to handle, stop early.
+                if re.search(IDLE_FOOTER_PATTERN, clean):
+                    return
+            time.sleep(1.0)
+
     async def initialize(self) -> bool:
         """Initialize the Antigravity CLI provider by starting ``agy``.
 
@@ -378,6 +417,10 @@ class AntigravityCliProvider(BaseProvider):
 
         status_monitor.notify_input_sent(self.terminal_id)
         get_backend().send_keys(self.session_name, self.window_name, command)
+
+        # Accept the workspace-trust dialog if agy shows one (first launch in an
+        # untrusted cwd). Unanswered it blocks init — the picker never reads IDLE.
+        self._handle_startup_dialog()
 
         # agy startup + first MCP connection (cao-mcp-server is fetched via uvx
         # from git on first use) + the -i acknowledgment can take a while.
