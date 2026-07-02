@@ -6,6 +6,15 @@ The runnable code lives in [`examples/fleet/`](../examples/fleet/); this documen
 the "why and how." It is the reference for issue
 [#349](https://github.com/awslabs/cli-agent-orchestrator/issues/349).
 
+> **Depends on the fleet example PRs.** This guide documents the code added in
+> **PR #365** (coordinator foundation) and **PR #366** (web panel), so read it
+> alongside them — `examples/fleet/` is only present once those merge.
+
+> **"Fleet" here means multiple _CAO nodes_ (machines).** CAO's
+> [MCP Apps](mcp-apps.md) also uses "fleet" for the set of agents on **one**
+> `cao-server` (its Fleet UI). This guide is about coordinating **across machines**
+> and neither changes nor depends on that single-node Fleet UI.
+
 - [What it is](#what-it-is)
 - [Architecture](#architecture)
 - [Execution flows](#execution-flows)
@@ -23,7 +32,7 @@ CAO already coordinates many agents on **one** machine (a supervisor delegating 
 tmux-isolated workers). This layer coordinates many **CAO nodes**: each machine runs
 its own `cao-server`, and a coordinator observes and commands all of them — node
 health, installed providers, active sessions, and task delegation — without you
-SSH-ing into every host.
+SSHing into every host.
 
 Nothing about a node's local behavior changes. The coordinator is a thin, **stateless
 client** of each node's existing HTTP API; there is no new database, no agent state on
@@ -129,11 +138,17 @@ sequenceDiagram
 
 ### 3. Live console screen mirror
 
-Click a tile and the console mirrors that agent's **rendered CLI screen** (colors,
-spinners, boxes), like glancing at a `tmux attach`. The browser polls only visible
-tiles, at a cadence tied to their state, through the stateless panel proxy — no SSE
-multiplexer. Nodes that expose the `/screen` primitive return a colored ANSI frame;
-older nodes fall back to the plain-text `/output` tail, so no tile is ever blank.
+Click a tile and the console mirrors that agent's CLI, like glancing at a
+`tmux attach`. The browser polls only visible tiles, at a cadence tied to their
+state, through the stateless panel proxy — no SSE multiplexer.
+
+Today this reads each terminal's existing **`GET /terminals/{id}/output?mode=full`**
+tail (which can carry the CLI's own ANSI escapes, so the renderer still shows colors
+and spinners). CAO's current server has no dedicated rendered-screen endpoint, so the
+panel is designed to *prefer* a `GET /terminals/{id}/screen` primitive **if a future
+server exposes one**, and otherwise fall back to the `/output` tail — so no tile is
+ever blank on today's nodes. `/screen` is an optional/future server extension, not a
+requirement of this example.
 
 ```mermaid
 stateDiagram-v2
@@ -153,7 +168,9 @@ stateDiagram-v2
     note right of Offline: polling stops
 ```
 
-The screen poll itself is a two-hop proxy with graceful degradation:
+The screen poll itself is a two-hop proxy with graceful degradation. On today's
+servers the `/screen` probe 404s and the panel serves the `/output` tail; the
+`/screen` branch is there only for a future server that adds the endpoint:
 
 ```mermaid
 sequenceDiagram
@@ -162,14 +179,14 @@ sequenceDiagram
     participant N as node cao-server
 
     B->>P: GET /api/machines/{node}/terminals/{id}/screen
-    P->>N: GET /terminals/{id}/screen?ansi=1
-    alt node exposes /screen
+    P->>N: GET /terminals/{id}/screen?ansi=1  (optional/future endpoint)
+    alt future server exposes /screen
         N-->>P: { screen: <ANSI frame>, ansi: true }
-    else older node (404)
+    else today's server (404)
         P->>N: GET /terminals/{id}/output?mode=full
-        N-->>P: plain-text tail
+        N-->>P: text tail (may include ANSI)
     end
-    P-->>B: frame (colored, or plain-text fallback)
+    P-->>B: frame (from /screen, or the /output tail)
 ```
 
 ### 4. AI conductor
@@ -219,7 +236,8 @@ sequenceDiagram
   WireGuard IP, a VPN or LAN IP, or a DNS name. (The example values are placeholders
   in the reserved `100.64.0.0/10` CGNAT range; replace them with your own.)
 - **`port`** defaults to `9889` (CAO's server port) and can be overridden per node.
-- **`name`** is how you refer to the node in `caoctl`, the panel, and the conductor.
+- **`name`** is how you refer to the node in `cao-fleet`, the panel, and the conductor.
+- **`label`** / **`role`** are optional and used by the panel for display.
 
 ## Transport and security
 
@@ -227,9 +245,13 @@ sequenceDiagram
   `host:port`. Tailscale, WireGuard, a VPN, an SSH tunnel, or a trusted LAN are all
   fine — the transport is your choice, not a requirement of this example.
 - **The network is the trust boundary.** Each node's `cao-server` is bound to its
-  private-network address and its `CAO_ALLOWED_HOSTS`. **Do not expose a node's port
-  to the public internet.** There is no per-request auth in this example; anyone who
-  can reach the port can command the node.
+  private-network address. **There is no per-request API auth in this example** —
+  anyone who can reach the port can launch/attach agents (full command execution) on
+  the node. **Do not expose a node's port to the public internet.**
+- **`CAO_ALLOWED_HOSTS` is not authentication.** It is a `Host`-header allowlist
+  enforced by `TrustedHostMiddleware` (a DNS-rebinding mitigation), not a
+  network/port exposure control and not peer auth. For real authentication in front
+  of a node, use CAO's OAuth layer (`AUTH0_DOMAIN` / `CAO_AUTH_JWKS_URI`).
 - **Least privilege.** Run `cao-server` as a user that has only the agent access you
   intend. The raw PTY-attach WebSocket stays loopback-only by CAO's design; the
   coordinator uses the higher-level REST surface (message + a fixed set of control
@@ -256,6 +278,6 @@ cd panel && uv sync && uv run cao-fleet-panel            # http://127.0.0.1:9888
 Ad-hoc, from the shell:
 
 ```bash
-examples/fleet/bin/caoctl --list
-examples/fleet/bin/caoctl node-b session list
+examples/fleet/bin/cao-fleet list
+examples/fleet/bin/cao-fleet exec node-b session list
 ```
