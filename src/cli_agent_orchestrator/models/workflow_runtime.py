@@ -16,7 +16,7 @@ existing ``from ...models.workflow import StepState`` call sites are unaffected.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -30,6 +30,21 @@ class StepState(str, Enum):
     FAILED = "failed"
     SKIPPED = "skipped"
     COMPLETED_UNVALIDATED = "completed_unvalidated"
+
+
+class RunState(str, Enum):
+    """Whole-run state. Defined in Bolt 1; instantiated by the engine (N5).
+
+    Lives in this light module (re-exported by ``models/workflow.py``) so the MCP
+    seam can name a run state without pulling the jsonschema/yaml grammar module.
+    Bolt 3 adds ``CANCELLED`` (B3-BR-12) so a user-cancelled run is distinguishable
+    from an engine-``FAILED`` run. Additive enum change — no existing value altered.
+    """
+
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 # ---------------------------------------------------------------------------
@@ -83,3 +98,68 @@ class ReturnAck(BaseModel):
     ok: bool = Field(description="Whether the endpoint accepted and stored the output")
     validated: bool = Field(description="Whether output passed the step output_schema")
     errors: List[str] = Field(default_factory=list, description="Schema-violation reasons, if any")
+
+
+# ---------------------------------------------------------------------------
+# Bolt 3 (N5) — run-engine seam DTOs
+# ---------------------------------------------------------------------------
+# These are the LIGHT, seam-facing value objects the run engine returns and the
+# MCP server consumes (B3-BR-15: the MCP seam consumes only these DTOs, never the
+# jsonschema/yaml grammar module). The engine-internal aggregate (``RunRecord`` /
+# ``StepRunState``) lives in ``services/workflow_service.py`` because it holds the
+# heavy ``WorkflowSpec`` and never crosses the HTTP seam.
+class StepStatus(BaseModel):
+    """One step's point-in-time status inside a ``RunStatus`` snapshot (B3-BR-8).
+
+    Carries only the per-step floor (FR-6.4): id, state, attempt count. It does
+    NOT carry the step's output or prompt (B3-SD-3 — status leaks no payload).
+    """
+
+    id: str
+    state: StepState
+    attempts: int
+
+
+class RunStatus(BaseModel):
+    """Point-in-time snapshot of a run (``get_run_status``, B3-BR-8 / Q3=A).
+
+    A COPY of the registry record's observable state — never a live reference.
+    Loop fields (``which_guard_fired``/``iterations_run``) are omitted in the MVP
+    (B3-BR-11). Carries no per-step output or prompt (B3-SD-3).
+    """
+
+    run_id: str
+    state: RunState
+    current_step_id: Optional[str] = None
+    steps: List[StepStatus] = Field(default_factory=list)
+
+
+class StepResult(BaseModel):
+    """Aggregated per-step result inside a ``WorkflowRunResult``.
+
+    Unlike ``StepStatus`` this is the FINAL (run-complete) per-step record and may
+    carry the collected structured output (the run owner already drove the run, so
+    there is no status-leak concern here — this is the run's own result envelope).
+    """
+
+    id: str
+    state: StepState
+    attempts: int
+    output: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+
+
+class WorkflowRunResult(BaseModel):
+    """Aggregated result returned by ``start_run`` / ``workflow_run`` (FR-5.2).
+
+    The SINGLE run return type (supersedes C3's ``RunHandle`` name): the final
+    ``RunState`` plus every step's terminal state, attempt count, and collected
+    output.
+    """
+
+    run_id: str
+    workflow_name: str
+    state: RunState
+    steps: List[StepResult] = Field(default_factory=list)
+    started_at: str
+    finished_at: Optional[str] = None
