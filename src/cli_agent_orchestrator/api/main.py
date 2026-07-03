@@ -1965,6 +1965,84 @@ async def list_memories_endpoint(
         )
 
 
+@app.get("/memory/export")
+async def export_memories_endpoint(
+    scope: MemoryScope,
+    format: str = Query(default="okf"),
+    scope_id: Optional[MemoryScopeId] = None,
+    include_history: bool = False,
+    redact: bool = False,
+):
+    """Stream one scope as an archive tarball (#345 D6, read-only mirror).
+
+    Declared BEFORE /memory/{key} so "export" is not captured as a key.
+    Private scopes (session/agent) are refused outright — there is no
+    include-private escape hatch over HTTP (D5). The bundle is built by
+    the same directory writer into a temp dir, tar'd, and streamed.
+    """
+    from fastapi.responses import FileResponse
+    from starlette.background import BackgroundTask
+
+    _require_memory_enabled()
+    # Private-scope gate: the CLI's --include-private is a local-operator
+    # affordance; the API surface never exports private tiers.
+    if scope in (MemoryScope.SESSION, MemoryScope.AGENT):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"scope '{scope.value}' is private and cannot be exported via the API",
+        )
+    if scope == MemoryScope.PROJECT and scope_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="scope 'project' requires scope_id",
+        )
+
+    import tempfile
+
+    from cli_agent_orchestrator.services.memory_archive import get_backend
+    from cli_agent_orchestrator.services.memory_archive.okf import export_bundle_to_tar
+
+    svc = _get_memory_service()
+    try:
+        backend = get_backend(format)(svc)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    tmp_dir = tempfile.mkdtemp(prefix="cao-memory-export-")
+    tar_path = Path(tmp_dir) / f"cao-memory-{scope.value}.tar.gz"
+
+    def _cleanup() -> None:
+        import shutil
+
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    try:
+        export_bundle_to_tar(
+            backend,
+            scope.value,
+            scope_id,
+            tar_path,
+            include_history=include_history,
+            redact=redact,
+        )
+    except ValueError as e:
+        _cleanup()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        _cleanup()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to export memories: {str(e)}",
+        )
+
+    return FileResponse(
+        path=str(tar_path),
+        media_type="application/gzip",
+        filename=tar_path.name,
+        background=BackgroundTask(_cleanup),
+    )
+
+
 @app.get("/memory/{key}", response_model=MemoryDetail)
 async def get_memory_endpoint(
     key: MemoryKey,
