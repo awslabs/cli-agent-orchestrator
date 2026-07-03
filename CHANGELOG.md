@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- rename `cao flow` → `cao schedule` to avoid confusion with the new `cao workflow` feature. `cao flow` remains as a hidden deprecated alias that prints a warning to stderr; flow files, `~/.cao/flows`, stored schedules, the `/flows` REST API, and the web UI are unchanged (#378)
+- rename `cao flow` → `cao schedule` to avoid confusion with the new `cao workflow` feature. `cao flow` remains as a hidden deprecated alias that prints a warning to stderr; flow files, `~/.cao/flows`, stored schedules, and the `/flows` REST API are unchanged, and the web UI only updates its CLI hint string (#378)
 
 ### Deprecated
 
