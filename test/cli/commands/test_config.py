@@ -113,10 +113,16 @@ class TestConfigSet:
         out-of-range value must surface as a CLI error, not succeed silently."""
         result = runner.invoke(config, ["set", "memory.flush_threshold", "5.0"])
         assert result.exit_code != 0
+        # Clean ClickException, not a leaked ValueError traceback (issue #357).
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert "flush_threshold must be between 0.0 and 1.0" in result.output
 
     def test_set_unknown_memory_key_errors(self, runner, _isolated_settings):
         result = runner.invoke(config, ["set", "memory.not_a_real_key", "1"])
         assert result.exit_code != 0
+        # Clean ClickException, not a leaked ValueError traceback (issue #357).
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert "Unknown memory setting" in result.output
 
     def test_set_network_key_succeeds_persists_and_warns(self, runner, _isolated_settings):
         """network.* is schema-only (no runtime effect yet) — set() still

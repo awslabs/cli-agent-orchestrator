@@ -48,7 +48,13 @@ _ENV_ONLY_SECTIONS = ("network.", "auth.")
 @click.argument("value")
 def set_cmd(key, value):
     """Set config KEY to VALUE, persisting it to settings.json."""
-    result = ConfigService.set(key, _coerce(value))
+    try:
+        result = ConfigService.set(key, _coerce(value))
+    except (ValueError, KeyError) as exc:
+        # settings_service setters raise ValueError/KeyError for invalid keys
+        # or out-of-range values (e.g. memory.flush_threshold). Surface a clean
+        # CLI error instead of an unhandled Python traceback.
+        raise click.ClickException(str(exc))
     click.echo(json.dumps(result))
     if key.startswith(_ENV_ONLY_SECTIONS):
         click.echo(
