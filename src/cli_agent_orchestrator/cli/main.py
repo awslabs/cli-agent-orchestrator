@@ -1,5 +1,7 @@
 """Main CLI entry point for CLI Agent Orchestrator."""
 
+from importlib.metadata import PackageNotFoundError, version
+
 import click
 
 from cli_agent_orchestrator.cli.commands.env import env
@@ -16,8 +18,14 @@ from cli_agent_orchestrator.cli.commands.skills import skills
 from cli_agent_orchestrator.cli.commands.terminal import terminal
 from cli_agent_orchestrator.cli.commands.workflow import workflow
 
+try:
+    __version__ = version("cli-agent-orchestrator")
+except PackageNotFoundError:
+    __version__ = "unknown"
+
 
 @click.group()
+@click.version_option(__version__, "-V", "--version", prog_name="cao")
 def cli():
     """CLI Agent Orchestrator."""
 
