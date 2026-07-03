@@ -26,9 +26,7 @@ def _isolated_settings(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.settings_service.SETTINGS_FILE", fake_settings
     )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.settings_service.CAO_HOME_DIR", tmp_path
-    )
+    monkeypatch.setattr("cli_agent_orchestrator.services.settings_service.CAO_HOME_DIR", tmp_path)
     monkeypatch.setattr(cs, "LEGACY_CONFIG_FILE", fake_legacy)
     for env_name in cs.ENV_REGISTRY:
         monkeypatch.delenv(env_name, raising=False)
@@ -42,15 +40,11 @@ class TestPrecedence:
         assert ConfigService.get("terminal.backend") == "tmux"
 
     def test_file_value_beats_default(self, _isolated_settings):
-        _isolated_settings["settings"].write_text(
-            json.dumps({"terminal": {"backend": "herdr"}})
-        )
+        _isolated_settings["settings"].write_text(json.dumps({"terminal": {"backend": "herdr"}}))
         assert ConfigService.get("terminal.backend") == "herdr"
 
     def test_env_var_beats_file_value(self, _isolated_settings, monkeypatch):
-        _isolated_settings["settings"].write_text(
-            json.dumps({"terminal": {"backend": "herdr"}})
-        )
+        _isolated_settings["settings"].write_text(json.dumps({"terminal": {"backend": "herdr"}}))
         monkeypatch.setenv("CAO_TERMINAL_BACKEND", "tmux")
         assert ConfigService.get("terminal.backend") == "tmux"
 
@@ -86,13 +80,9 @@ class TestLegacyMigration:
         on_disk = json.loads(_isolated_settings["settings"].read_text())
         assert on_disk["terminal"] == {"backend": "herdr", "herdr_session": "my-sess"}
 
-    def test_no_migration_when_settings_json_already_has_terminal_section(
-        self, _isolated_settings
-    ):
+    def test_no_migration_when_settings_json_already_has_terminal_section(self, _isolated_settings):
         """Once migrated (or hand-configured), the legacy file is not re-read."""
-        _isolated_settings["settings"].write_text(
-            json.dumps({"terminal": {"backend": "tmux"}})
-        )
+        _isolated_settings["settings"].write_text(json.dumps({"terminal": {"backend": "tmux"}}))
         _isolated_settings["legacy"].write_text(json.dumps({"terminal_backend": "herdr"}))
         assert ConfigService.get("terminal.backend") == "tmux"
 
@@ -109,9 +99,7 @@ class TestMemoryCompileModeConflict:
     """CAO_MEMORY_COMPILE_MODE must win over a conflicting settings.json value."""
 
     def test_env_var_wins_over_file_value(self, _isolated_settings, monkeypatch):
-        _isolated_settings["settings"].write_text(
-            json.dumps({"memory": {"compile_mode": "llm"}})
-        )
+        _isolated_settings["settings"].write_text(json.dumps({"memory": {"compile_mode": "llm"}}))
         monkeypatch.setenv("CAO_MEMORY_COMPILE_MODE", "append")
         assert ConfigService.get("memory.compile_mode") == "append"
 

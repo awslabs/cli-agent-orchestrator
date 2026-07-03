@@ -351,7 +351,9 @@ def _get_value(path: str, default: Any = None, override: Optional[Any] = None) -
             try:
                 return _coerce_env_value(raw, kind)
             except ValueError:
-                logger.warning(f"Ignoring invalid {env_name}={raw!r} for {path}; using file/default")
+                logger.warning(
+                    f"Ignoring invalid {env_name}={raw!r} for {path}; using file/default"
+                )
 
     section = path.split(".", 1)[0]
     if section in _OWNED_SECTIONS:

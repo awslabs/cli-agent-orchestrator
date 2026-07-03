@@ -21,9 +21,7 @@ def _isolated_settings(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.settings_service.SETTINGS_FILE", fake_settings
     )
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.settings_service.CAO_HOME_DIR", tmp_path
-    )
+    monkeypatch.setattr("cli_agent_orchestrator.services.settings_service.CAO_HOME_DIR", tmp_path)
     monkeypatch.setattr(cs, "LEGACY_CONFIG_FILE", fake_legacy)
     for env_name in cs.ENV_REGISTRY:
         monkeypatch.delenv(env_name, raising=False)
@@ -131,7 +129,9 @@ class TestConfigSet:
         assert "network.allowed_hosts" in result.stderr
 
     def test_set_auth_key_warns_but_terminal_key_does_not(self, runner, _isolated_settings):
-        auth_result = runner.invoke(config, ["set", "auth.jwks_uri", "https://idp.example/jwks.json"])
+        auth_result = runner.invoke(
+            config, ["set", "auth.jwks_uri", "https://idp.example/jwks.json"]
+        )
         assert "no runtime effect yet" in auth_result.stderr
 
         terminal_result = runner.invoke(config, ["set", "terminal.backend", "herdr"])
