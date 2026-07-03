@@ -4,6 +4,13 @@ Asserts ``_migrate_workflow_run`` and ``_migrate_workflow_run_step`` are zero-ar
 self-connecting, create the durable tables with the agreed E1/E2 columns, and are
 idempotent (running twice is a no-op that preserves existing rows). NO loop columns
 ship (Q4=B / B4-BR-12).
+
+U3 (issue #312, script-tier journal extension, C3) additively appends
+``tier``/``generation`` to ``workflow_run`` and ``call_fingerprint`` to
+``workflow_run_step`` (domain-entities E1/E2). The column-set assertions below
+are updated to include them; the defaults (``tier='yaml'``, ``generation='1'``,
+``call_fingerprint=NULL``) preserve a pre-U3/YAML row's observable shape
+(INV-1/INV-2).
 """
 
 import sqlite3
@@ -42,6 +49,8 @@ def test_workflow_run_columns(patched_db):
         "current_step_id",
         "started_at",
         "finished_at",
+        "tier",
+        "generation",
     }
     # run_id is the primary key; the nullable columns are current_step_id/finished_at.
     assert cols["run_id"][5] == 1
@@ -49,6 +58,9 @@ def test_workflow_run_columns(patched_db):
     assert cols["spec_snapshot"][3] == 1
     assert cols["current_step_id"][3] == 0
     assert cols["finished_at"][3] == 0
+    # U3 additive columns (E1): tier/generation default to the YAML-preserving values.
+    assert cols["tier"][4] == "'yaml'"
+    assert cols["generation"][4] == "'1'"
 
 
 def test_workflow_run_no_loop_columns(patched_db):
@@ -71,6 +83,7 @@ def test_workflow_run_step_columns(patched_db):
         "output_json",
         "error",
         "updated_at",
+        "call_fingerprint",
     }
     # Composite PRIMARY KEY (run_id, step_id): both carry pk>0.
     assert cols["run_id"][5] > 0
@@ -78,6 +91,9 @@ def test_workflow_run_step_columns(patched_db):
     # reprompted / terminal_id are deliberately NOT journaled (F3).
     assert "reprompted" not in cols
     assert "terminal_id" not in cols
+    # U3 additive column (E2): defaults to NULL (INV-2). PRAGMA table_info reports
+    # the literal default expression as the string "NULL", not Python None.
+    assert cols["call_fingerprint"][4] == "NULL"
 
 
 def test_migrations_are_idempotent(patched_db):

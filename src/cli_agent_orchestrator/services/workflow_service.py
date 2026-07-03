@@ -89,6 +89,32 @@ class ResumeCorruptError(ValueError):
     """
 
 
+class StaleGenerationError(ValueError):
+    """A script ``run-step`` call carried an old generation (A3, ADR-9 -> 409).
+
+    U3 addition (issue #312, script-tier journal extension, C3). A ``ValueError``
+    subclass so a broad ``except ValueError`` at the API boundary still maps it,
+    but the route should catch this type BEFORE any bare ``ValueError`` to map it
+    to 409 specifically (business-rules DR-5, same precedent as
+    ``ResumeNotAllowedError``). Raised by ``check_generation`` when the caller's
+    generation does not match the run's current journaled generation — this is
+    what fences an orphaned/reparented predecessor subprocess out after a resume
+    or cancel bumps the generation (INV-6).
+    """
+
+
+class ReplayDivergenceError(Exception):
+    """A resumed script call's fingerprint diverged from its journaled row (A2, DR-4).
+
+    U3 addition (issue #312, script-tier journal extension, C3). NOT a
+    ``ValueError`` / NOT mapped to an HTTP status at the resume route boundary
+    (business-rules "Error-to-status mapping" table) — the script changed between
+    runs at the same ``(run_id, step_id)`` key, so resume cannot honor the replay
+    determinism contract (ADR-5). The run is failed loudly (state -> FAILED,
+    surfaced in the run result), never silently re-executed.
+    """
+
+
 # ---------------------------------------------------------------------------
 # In-memory run aggregate (engine-internal; never crosses the HTTP seam)
 # ---------------------------------------------------------------------------
@@ -782,6 +808,94 @@ def _rebuild_record_from_journal(run_id: str) -> Optional[RunRecord]:
             error=srow.error,
         )
     return record
+
+
+# ---------------------------------------------------------------------------
+# U3 additions (issue #312, script-tier journal extension, C3) — additive only,
+# INV-1: no function above this block is modified by U3.
+# ---------------------------------------------------------------------------
+def check_generation(run_id: str, generation: str) -> None:
+    """Reject a stale-generation script call (A3, the ADR-9 anti-double-drive).
+
+    Every script ``run-step`` call carries ``CAO_WORKFLOW_GENERATION`` (forwarded
+    by U2); the run-step handler calls this BEFORE doing any work (VR-3). Resume
+    bumps the run's generation BEFORE spawning (A4), so a reparented predecessor
+    subprocess that survived a crash still carries the OLD generation — its late
+    calls land here and are fenced out (DR-5 -> ``StaleGenerationError`` -> 409).
+
+    Raises ``KeyError`` (-> 404 at the boundary, same precedent as
+    ``get_run_status``) when ``run_id`` is unknown to the journal — that is a
+    different failure mode than a stale generation and must not be conflated
+    with it (DR-5 requires the *matching-run* generation to differ, not "no run
+    at all"). Raises ``StaleGenerationError`` on a generation mismatch (DR-5);
+    returns ``None`` on a match (DR-6, proceed).
+    """
+    row = workflow_journal.get_run(run_id)
+    if row is None:
+        raise KeyError(f"unknown run_id '{run_id}'")
+    if generation != row.generation:
+        raise StaleGenerationError(
+            f"run '{run_id}': call carried generation '{generation}' but the run's "
+            f"current generation is '{row.generation}'"
+        )
+
+
+def update_run_generation(run_id: str, generation: str) -> None:
+    """Persist a run's bumped generation (A4 write-side helper).
+
+    A thin additive write helper alongside the base's
+    ``update_run_current_step``/``update_run_state`` family. Per A4, the resume
+    (and DR-11 cancel) drive sequence is bump-then-persist-then-spawn: the
+    generation is bumped and persisted here BEFORE the resumed/cancelled run's
+    process (re)spawns, so any older-generation orphan is fenced by
+    ``check_generation`` from the moment it is stale, not from whenever it
+    happens to make its next call. Best-effort is deliberately NOT applied here
+    (unlike the ``_journal_*`` write-through helpers above): a failed generation
+    persist must be visible to the caller, since a silently-unpersisted bump
+    would let an orphan's old-generation calls through — this raises
+    ``sqlite3.Error`` on a DB failure, matching ``workflow_journal``'s documented
+    write-helper contract (module docstring), and the caller (U4/U5, out of
+    scope for U3) decides whether to retry or abort the resume/cancel.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        conn.execute(
+            "UPDATE workflow_run SET generation = ? WHERE run_id = ?",
+            (generation, run_id),
+        )
+
+
+def _is_resumable_for_tier(row: workflow_journal.RunRow) -> bool:
+    """Tier-aware resumability predicate (DR-7/DR-8, code-generation-plan precision fix).
+
+    **U3 supplies this journal primitive only — wiring it into the actual resume
+    ROUTE (replacing the inline check in ``resume_from_last_completed`` below) is
+    OUT OF SCOPE for U3; that is U4/U5's job.** ``resume_from_last_completed``'s
+    own inline check is untouched by this addition (INV-1): a YAML run's resume
+    behavior is byte-identical to before U3.
+
+    The pinned base tip's inline rule (verified at code-gen against
+    ``resume_from_last_completed``, not a function literally named
+    ``_is_resumable``) is: ``state in (COMPLETED, CANCELLED)`` -> not resumable;
+    everything else (``FAILED``, or a crash-remnant ``RUNNING`` row with no live
+    registry entry) -> resumable. Q3=A / DR-8 extends this for the SCRIPT tier
+    only: a ``CANCELLED`` script run IS resumable (a cancel-then-resume workflow,
+    US-C2) — but a ``CANCELLED`` YAML run stays non-resumable, matching the base
+    exactly. This function carves CANCELLED out of the shared "terminal, not
+    resumable" bucket per-tier; it does NOT relax ``COMPLETED`` for either tier
+    (DR-7 — a successfully finished run is never resumable), and it does NOT
+    perform the liveness-registry check (DR-9, layer 1) — that is the caller's
+    job, same as the base's own two-step check (registry, then journaled state).
+    """
+    state = RunState(row.state)
+    if state == RunState.COMPLETED:
+        return False
+    if state == RunState.CANCELLED:
+        return row.tier == "script"
+    return True
 
 
 # ---------------------------------------------------------------------------

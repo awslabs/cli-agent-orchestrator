@@ -20,6 +20,17 @@ These helpers raise ``sqlite3.Error`` on a DB failure; the **caller** (the engin
 write-through, business-logic-model §1) wraps them best-effort per B4-BR-5 — a
 dropped write never raises into the engine drive loop. The read helpers
 (``get_run``/``get_steps``) are used by the rebuild + resume read path.
+
+U3 (issue #312, script-tier journal extension, C3) additively extends this
+module: ``RunRow.tier``/``RunRow.generation`` and ``StepRow.call_fingerprint``
+surface the U3 columns (domain-entities E1/E2/E3) — additive fields only, no
+existing field removed/renamed (INV-1). ``append_step``/``lookup_replay``/
+``get_step`` are NEW functions; the existing ``insert_run``/``insert_steps``/
+``update_step``/``update_run_current_step``/``update_run_state``/``get_run``/
+``get_steps`` are otherwise unchanged in behavior (INV-1) — their SELECT lists
+grow to surface the additive columns, but a pre-U3/YAML row reads back with the
+INV-2 defaults (``tier='yaml'``, ``generation='1'``, ``call_fingerprint=None``),
+which is observably identical to the pre-extension shape.
 """
 
 from __future__ import annotations
@@ -41,6 +52,8 @@ class RunRow:
     current_step_id: Optional[str]
     started_at: str
     finished_at: Optional[str]
+    tier: str = "yaml"
+    generation: str = "1"
 
 
 @dataclass
@@ -54,6 +67,7 @@ class StepRow:
     output_json: Optional[str]
     error: Optional[str]
     updated_at: str
+    call_fingerprint: Optional[str] = None
 
 
 def _connect() -> sqlite3.Connection:
@@ -159,7 +173,7 @@ def get_run(run_id: str) -> Optional[RunRow]:
     with _connect() as conn:
         row = conn.execute(
             "SELECT run_id, workflow_name, spec_snapshot, inputs_json, state, "
-            "current_step_id, started_at, finished_at "
+            "current_step_id, started_at, finished_at, tier, generation "
             "FROM workflow_run WHERE run_id = ?",
             (run_id,),
         ).fetchone()
@@ -174,6 +188,8 @@ def get_run(run_id: str) -> Optional[RunRow]:
         current_step_id=row[5],
         started_at=row[6],
         finished_at=row[7],
+        tier=row[8],
+        generation=row[9],
     )
 
 
@@ -181,7 +197,8 @@ def get_steps(run_id: str) -> List[StepRow]:
     """Return all ``workflow_run_step`` rows for ``run_id`` (E2)."""
     with _connect() as conn:
         rows = conn.execute(
-            "SELECT run_id, step_id, state, attempts, output_json, error, updated_at "
+            "SELECT run_id, step_id, state, attempts, output_json, error, updated_at, "
+            "call_fingerprint "
             "FROM workflow_run_step WHERE run_id = ?",
             (run_id,),
         ).fetchall()
@@ -194,6 +211,104 @@ def get_steps(run_id: str) -> List[StepRow]:
             output_json=r[4],
             error=r[5],
             updated_at=r[6],
+            call_fingerprint=r[7],
         )
         for r in rows
     ]
+
+
+def get_step(run_id: str, step_id: str) -> Optional[StepRow]:
+    """Return the single ``workflow_run_step`` row for ``(run_id, step_id)`` (E2).
+
+    U3 addition: the read primitive ``lookup_replay`` (A2) is built on. Returns
+    ``None`` when the row is absent — a script call that has never arrived.
+    """
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT run_id, step_id, state, attempts, output_json, error, updated_at, "
+            "call_fingerprint "
+            "FROM workflow_run_step WHERE run_id = ? AND step_id = ?",
+            (run_id, step_id),
+        ).fetchone()
+    if row is None:
+        return None
+    return StepRow(
+        run_id=row[0],
+        step_id=row[1],
+        state=row[2],
+        attempts=row[3],
+        output_json=row[4],
+        error=row[5],
+        updated_at=row[6],
+        call_fingerprint=row[7],
+    )
+
+
+# ---------------------------------------------------------------------------
+# U3 additions (issue #312, script-tier journal extension, C3) — additive only,
+# INV-1: no existing helper above is modified.
+# ---------------------------------------------------------------------------
+def append_step(
+    run_id: str,
+    step_id: str,
+    state: str,
+    updated_at: str,
+    call_fingerprint: str,
+) -> None:
+    """Write-through append for a script call (A1, business-logic-model §A1).
+
+    Called at the RUNNING insert for a script call — ``call_fingerprint`` is
+    known BEFORE execution (``sha256(provider || agent || prompt)``, ADR-5) so a
+    later resume's ``lookup_replay`` (A2) has something to compare against. The
+    completion transition (RUNNING -> COMPLETED/FAILED) reuses the base
+    ``update_step`` UNCHANGED (INV-1); this function is the sole write path for
+    ``call_fingerprint`` (VR-4).
+
+    ``ON CONFLICT ... DO UPDATE`` upserts ``state``/``updated_at`` only — a
+    re-executed tail step (e.g. a second resume attempt over the same call)
+    already has a prior-attempt row; this is NOT a swallowed IntegrityError, it
+    is the documented A1 upsert. ``call_fingerprint`` is deliberately excluded
+    from the ``DO UPDATE`` clause so it stays stable across attempts (VR-4) —
+    the fingerprint recorded at the FIRST arrival of this ``(run_id, step_id)``
+    is the one ``lookup_replay`` compares against on every subsequent attempt.
+    """
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO workflow_run_step "
+            "(run_id, step_id, state, attempts, output_json, error, updated_at, "
+            " call_fingerprint) "
+            "VALUES (?, ?, ?, 0, NULL, NULL, ?, ?) "
+            "ON CONFLICT(run_id, step_id) DO UPDATE SET "
+            "state = excluded.state, updated_at = excluded.updated_at",
+            (run_id, step_id, state, updated_at, call_fingerprint),
+        )
+
+
+def lookup_replay(run_id: str, step_id: str, call_fingerprint: str) -> Optional[StepRow]:
+    """Decide replay-from-journal vs execute-fresh for a script call (A2, the M3 core).
+
+    Three-way outcome (DR-1/DR-2/DR-3/DR-4, business-rules.md):
+
+    - row absent -> ``None`` (never ran; execute fresh)
+    - row present but ``state`` != ``COMPLETED`` -> ``None`` (partial; re-execute)
+    - row ``COMPLETED`` and fingerprint matches -> the row (replay; do not execute)
+    - row ``COMPLETED`` and fingerprint MISMATCH -> raises ``ReplayDivergenceError``
+      (the script changed between runs at the same key; resume cannot honor the
+      replay contract, so it fails loudly rather than silently re-executing)
+
+    Imported lazily from ``workflow_service`` to avoid a circular import
+    (``workflow_service`` already imports this module).
+    """
+    from cli_agent_orchestrator.services.workflow_service import ReplayDivergenceError
+
+    row = get_step(run_id, step_id)
+    if row is None:
+        return None
+    if row.state != "completed":
+        return None
+    if row.call_fingerprint != call_fingerprint:
+        raise ReplayDivergenceError(
+            f"run '{run_id}' step '{step_id}': call fingerprint diverged on replay "
+            "(the script changed between runs at the same key)"
+        )
+    return row

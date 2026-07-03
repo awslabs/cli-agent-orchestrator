@@ -340,6 +340,15 @@ def _migrate_workflow_run() -> None:
     mirrors ``_migrate_workflow_index`` (B2, B4-BR-1). Failure is logged at debug
     and never propagated: a missing table is recoverable, the next write retries
     the path and the live run completes on the in-memory floor (B4-RD-4).
+
+    U3 (issue #312, script-tier journal extension) additively appends two
+    columns — ``tier`` and ``generation`` (E1, domain-entities) — via the same
+    idempotent ``PRAGMA table_info`` gate used by ``_migrate_add_access_count`` /
+    ``_migrate_add_related_keys``. Both default to values that make a pre-U3 /
+    YAML row read identically to its pre-extension form (INV-1/INV-2): existing
+    rows back-fill to ``tier='yaml'``, ``generation='1'``. ``generation`` is TEXT,
+    not INTEGER, so it compares byte-identically against the env-var-transported
+    string generation value (domain-entities B4 fix).
     """
     import sqlite3
 
@@ -359,6 +368,17 @@ def _migrate_workflow_run() -> None:
                 "finished_at TEXT"
                 ")"
             )
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(workflow_run)")}
+            if "tier" not in columns:
+                conn.execute(
+                    "ALTER TABLE workflow_run ADD COLUMN tier TEXT NOT NULL DEFAULT 'yaml'"
+                )
+                logger.info("Migration: added tier column to workflow_run")
+            if "generation" not in columns:
+                conn.execute(
+                    "ALTER TABLE workflow_run ADD COLUMN generation TEXT NOT NULL DEFAULT '1'"
+                )
+                logger.info("Migration: added generation column to workflow_run")
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
         logger.debug(f"workflow_run migration skipped: {e}")
 
@@ -374,6 +394,13 @@ def _migrate_workflow_run_step() -> None:
 
     Idempotent, zero-arg, self-connecting; failure logged at debug and never
     propagated (B4-BR-1 / B4-RD-4), same precedent as ``_migrate_workflow_index``.
+
+    U3 (issue #312, script-tier journal extension) additively appends
+    ``call_fingerprint`` (E2, domain-entities) via the same idempotent
+    ``PRAGMA table_info`` gate. Defaults to ``NULL`` so a pre-U3 / YAML row is
+    indistinguishable from its pre-extension form (INV-1/INV-2); ``append_step``
+    is the sole write path for the column (``update_step`` stays untouched — the
+    fingerprint is set once, at the RUNNING insert).
     """
     import sqlite3
 
@@ -393,6 +420,12 @@ def _migrate_workflow_run_step() -> None:
                 "PRIMARY KEY (run_id, step_id)"
                 ")"
             )
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(workflow_run_step)")}
+            if "call_fingerprint" not in columns:
+                conn.execute(
+                    "ALTER TABLE workflow_run_step ADD COLUMN call_fingerprint TEXT DEFAULT NULL"
+                )
+                logger.info("Migration: added call_fingerprint column to workflow_run_step")
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
         logger.debug(f"workflow_run_step migration skipped: {e}")
 
