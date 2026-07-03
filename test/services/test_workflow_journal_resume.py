@@ -220,6 +220,51 @@ def test_rebuild_returns_none_on_absent(_patched_journal):
     assert ws._rebuild_record_from_journal("ghost") is None
 
 
+def test_get_run_status_corrupt_run_row_degrades_to_keyerror(_patched_journal):
+    # A corrupt spec_snapshot / inputs_json must degrade to "absent" (B4-RD-4):
+    # get_run_status raises KeyError -> 404, never ValidationError/JSONDecodeError.
+    workflow_journal.insert_run(
+        "runCorrupt",
+        "wf",
+        "{not a valid spec",  # corrupt spec_snapshot
+        "also not json",  # corrupt inputs_json
+        RunState.FAILED.value,
+        "2026-01-01T00:00:00Z",
+    )
+    with pytest.raises(KeyError):
+        ws.get_run_status("runCorrupt")
+
+
+def test_rebuild_skips_bad_state_and_ghost_step_rows(_patched_journal):
+    # One bad step row must never abort the rebuild: a bogus ``state`` leaves the
+    # seeded PENDING default in place; a step_id absent from the spec is dropped.
+    spec = _spec(step_ids=("s1", "s2"))
+    workflow_journal.insert_run(
+        "runRows",
+        spec.name,
+        spec.model_dump_json(),
+        "{}",
+        RunState.RUNNING.value,
+        "2026-01-01T00:00:00Z",
+    )
+    workflow_journal.insert_steps(
+        "runRows",
+        [("s1", StepState.COMPLETED.value), ("s2", StepState.PENDING.value)],
+        "2026-01-01T00:00:00Z",
+    )
+    # s2 gets an invalid state value; a ghost step not in the spec also exists.
+    workflow_journal.update_step("runRows", "s2", "BOGUS", 1, "2026-01-01T00:00:01Z")
+    workflow_journal.insert_steps(
+        "runRows", [("ghost", StepState.COMPLETED.value)], "2026-01-01T00:00:02Z"
+    )
+
+    record = ws._rebuild_record_from_journal("runRows")
+    assert record is not None
+    assert set(record.step_states) == {"s1", "s2"}  # ghost dropped
+    assert record.step_states["s1"].state == StepState.COMPLETED
+    assert record.step_states["s2"].state == StepState.PENDING  # seeded default kept
+
+
 # ---------------------------------------------------------------------------
 # §3/§4 — resume
 # ---------------------------------------------------------------------------
@@ -304,6 +349,36 @@ async def test_resume_failed_run_reruns_failed_step(monkeypatch, _patched_journa
     res = await ws.resume_from_last_completed("runFa")
     assert ran == ["s2"]  # s1 kept, s2 (failed) re-run
     assert res.state == RunState.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_resume_reopen_persists_cleared_current_step(monkeypatch, _patched_journal):
+    # The reopen block clears current_step_id in memory AND persists it — the
+    # durable row must not stay stale until the first resumed step journals.
+    spec = _spec(step_ids=("s1", "s2"))
+    workflow_journal.insert_run(
+        "runCur",
+        spec.name,
+        spec.model_dump_json(),
+        "{}",
+        RunState.FAILED.value,
+        "2026-01-01T00:00:00Z",
+    )
+    workflow_journal.insert_steps(
+        "runCur", [(s.id, StepState.PENDING.value) for s in spec.steps], "2026-01-01T00:00:00Z"
+    )
+    workflow_journal.update_step("runCur", "s1", StepState.COMPLETED.value, 1, "t")
+    workflow_journal.update_step("runCur", "s2", StepState.FAILED.value, 4, "t", error="boom")
+    workflow_journal.update_run_current_step("runCur", "s2")  # stale pointer
+    workflow_journal.update_run_state("runCur", RunState.FAILED.value, "2026-01-01T00:00:05Z")
+    assert workflow_journal.get_run("runCur").current_step_id == "s2"
+
+    # Stub the drive so the journal row is observed right after the reopen block,
+    # before any step executes.
+    monkeypatch.setattr(ws, "_drive_resume", AsyncMock(return_value=None))
+    await ws.resume_from_last_completed("runCur")
+
+    assert workflow_journal.get_run("runCur").current_step_id is None
 
 
 @pytest.mark.asyncio

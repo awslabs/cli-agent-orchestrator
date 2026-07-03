@@ -752,17 +752,24 @@ def _rebuild_record_from_journal(run_id: str) -> Optional[RunRecord]:
     if row is None:
         return None
 
-    spec = WorkflowSpec.model_validate_json(row.spec_snapshot)
-    record = RunRecord(
-        run_id=row.run_id,
-        workflow_name=row.workflow_name,
-        spec=spec,
-        inputs=json.loads(row.inputs_json),
-        state=RunState(row.state),
-        current_step_id=row.current_step_id,
-        started_at=row.started_at,
-        finished_at=row.finished_at,
-    )
+    try:
+        spec = WorkflowSpec.model_validate_json(row.spec_snapshot)
+        record = RunRecord(
+            run_id=row.run_id,
+            workflow_name=row.workflow_name,
+            spec=spec,
+            inputs=json.loads(row.inputs_json),
+            state=RunState(row.state),
+            current_step_id=row.current_step_id,
+            started_at=row.started_at,
+            finished_at=row.finished_at,
+        )
+    except (ValidationError, ValueError, TypeError) as e:
+        # ValidationError subclasses ValueError (pydantic v2) but is named for clarity;
+        # ValueError also covers json.JSONDecodeError and RunState coercion. Corrupt
+        # journal data degrades to "absent" (B4-RD-4) -> caller raises KeyError -> 404.
+        logger.debug("journal: run '%s' row is corrupt; treating as absent: %s", run_id, e)
+        return None
     # F8: seed EVERY spec step PENDING first, then overlay durable rows.
     for step in spec.steps:
         record.step_states[step.id] = StepRunState(step_id=step.id, state=StepState.PENDING)
@@ -774,13 +781,32 @@ def _rebuild_record_from_journal(run_id: str) -> Optional[RunRecord]:
         logger.debug("journal: get_steps('%s') failed; using seeded PENDING: %s", run_id, e)
         step_rows = []
     for srow in step_rows:
-        record.step_states[srow.step_id] = StepRunState(
-            step_id=srow.step_id,
-            state=StepState(srow.state),
-            attempts=srow.attempts,
-            output=_record_from_json(srow.output_json),
-            error=srow.error,
-        )
+        if srow.step_id not in record.step_states:
+            # A persisted step no longer present in the snapshotted spec — skip it
+            # rather than resurrecting a ghost step into the rebuilt record.
+            logger.debug(
+                "journal: run '%s' step row '%s' not in spec snapshot; skipping",
+                run_id,
+                srow.step_id,
+            )
+            continue
+        try:
+            record.step_states[srow.step_id] = StepRunState(
+                step_id=srow.step_id,
+                state=StepState(srow.state),
+                attempts=srow.attempts,
+                output=_record_from_json(srow.output_json),
+                error=srow.error,
+            )
+        except ValueError as e:
+            # Unknown ``state`` value etc. — one bad row must never abort the
+            # rebuild; the seeded PENDING default stands for this step (B4-RD-3).
+            logger.debug(
+                "journal: run '%s' step row '%s' is corrupt; keeping seeded PENDING: %s",
+                run_id,
+                srow.step_id,
+                e,
+            )
     return record
 
 
@@ -890,6 +916,9 @@ async def resume_from_last_completed(run_id: str) -> WorkflowRunResult:
         Exception
     ) as e:  # noqa: BLE001 — journal write is best-effort; in-memory floor still serves live reads
         logger.warning("journal: resume reopen state write for '%s' failed: %s", run_id, e)
+    # Persist the cleared current_step_id too — otherwise the durable row stays
+    # stale until the first resumed step journals (best-effort, B4-BR-5).
+    _journal_current_step(record)
 
     # 7. Re-enter the SAME B3 drive over the snapshotted spec's topo order (B4-RD-5).
     return await _drive_resume(record, _topological_order(spec))
