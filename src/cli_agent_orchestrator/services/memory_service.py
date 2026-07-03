@@ -707,13 +707,11 @@ class MemoryService:
         now = datetime.now(timezone.utc)
         timestamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        # Normalize occurred_at to UTC-aware for the ordering comparisons
-        # below. A future value is clamped for new topics AND merges (D5);
-        # the older-than-latest-section check needs the existing file and
-        # runs inside the topic lock.
-        if occurred_at is not None and occurred_at.tzinfo is None:
-            occurred_at = occurred_at.replace(tzinfo=timezone.utc)
-        timestamp_clamped = False
+        if occurred_at is not None:
+            if occurred_at.tzinfo is None:
+                occurred_at = occurred_at.replace(tzinfo=timezone.utc)
+            else:
+                occurred_at = occurred_at.astimezone(timezone.utc)
 
         wiki_path = self.get_wiki_path(scope, scope_id, key)
         wiki_path.parent.mkdir(parents=True, exist_ok=True)
