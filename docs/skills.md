@@ -162,10 +162,11 @@ Skills are delivered to agents differently depending on the provider. The table 
 | Codex | Runtime prompt | Every terminal creation | `load_skill` MCP tool |
 | Gemini CLI | Runtime prompt | Every terminal creation | `load_skill` MCP tool |
 | Kimi CLI | Runtime prompt | Every terminal creation | `load_skill` MCP tool |
+| Antigravity CLI | Runtime prompt | Every terminal creation | `load_skill` MCP tool |
 | Kiro CLI | Native `skill://` resources | Every terminal creation | Kiro progressive loading |
 | Copilot CLI | Baked into `.agent.md` at install | On `cao skills add/remove` | `load_skill` MCP tool |
 
-### Runtime Prompt Providers (Claude Code, Codex, Gemini CLI, Kimi CLI)
+### Runtime Prompt Providers (Claude Code, Codex, Gemini CLI, Kimi CLI, Antigravity CLI)
 
 For these providers, the skill catalog is built fresh each time a terminal is created. The catalog — a list of skill names and descriptions — is appended to the system prompt via the provider's native CLI flags.
 
@@ -245,4 +246,4 @@ Running `cao skills add --force` refreshes Copilot CLI agent files immediately. 
 ## Known Limitations
 
 - **No nested skill directories.** Skills must be immediate subdirectories of the skill store. Nested paths (e.g., `skills/team/python-testing/`) are not discovered by CAO's skill catalog. Kiro's `skill://` glob handles nested paths natively, but other providers do not.
-- **No per-profile skill scoping.** All installed skills are available to all agents. There is currently no way to restrict which skills a specific agent profile can see. A `skills` field in agent profile frontmatter for declaring allowed skills is a planned future addition.
+- **Catalog scoping is advertise-only.** The per-agent [`skills`](#scoping-the-catalog-per-agent-skills) field filters which skills appear in an agent's injected catalog, but it does not restrict resolution — `load_skill` still resolves any installed skill by name. It is a prompt-relevance control, not an access boundary; a hard per-agent allowlist would need enforcement in the `load_skill` path.

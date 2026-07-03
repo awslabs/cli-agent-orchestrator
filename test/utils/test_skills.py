@@ -518,3 +518,18 @@ class TestBuildSkillCatalogFilter:
         # name cannot garble the log line.
         assert any("'missing-skill'" in m for m in messages)
         assert not any("ads-*" in m for m in messages)
+
+    @patch("cli_agent_orchestrator.utils.skills.list_skills")
+    def test_overlapping_patterns_emit_no_warning(self, mock_list_skills, caplog):
+        """Redundant/overlapping patterns (a glob plus an exact name it already
+        covers) are all counted as matched — no spurious unmatched warning. Guards
+        against a future 'break on first match' optimisation regressing this."""
+        mock_list_skills.return_value = self._skills()
+
+        with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.utils.skills"):
+            catalog = build_skill_catalog(["ads-*", "ads-db"])
+
+        assert "**ads-db**" in catalog
+        assert "**ads-task**" in catalog
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings == []
