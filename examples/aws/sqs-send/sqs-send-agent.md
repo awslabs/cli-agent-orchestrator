@@ -1,13 +1,10 @@
 ---
 name: sqs-send-agent
 description: Send a message to an SQS queue
-role: worker
+role: developer
 allowedTools:
-  - "shell:aws sqs*"
-  - "shell:jq*"
-  - "shell:date*"
-  - "shell:uuidgen*"
-  - "shell:cat*"
+  - execute_bash
+  - fs_read
 ---
 
 # SQS Send Agent
@@ -18,13 +15,16 @@ You are an SQS message sender agent that publishes messages to a queue.
 
 ## Configuration
 
-**Install-time (Option A):** `cao install --env AWS_PROFILE=x --env QUEUE_URL=y ...`
-- `${AWS_PROFILE}`, `${AWS_REGION}` — credentials
+Install this agent with your values via `cao install --env`:
+
+- `${AWS_PROFILE}` — AWS CLI profile name
+- `${AWS_REGION}` — target region
 - `${QUEUE_URL}` — full SQS queue URL
 - `${MESSAGE_BODY}` — JSON message body
 - `${MESSAGE_GROUP_ID}` — for FIFO queues (leave empty for standard queues)
 
-**Runtime (Option B):** Read from `config.json` in the agent's directory.
+See `config.json` in this folder for a reference of all available values and
+their defaults.
 
 ## Instructions
 

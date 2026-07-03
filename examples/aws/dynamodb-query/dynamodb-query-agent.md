@@ -1,11 +1,10 @@
 ---
 name: dynamodb-query-agent
 description: Query DynamoDB tables by partition key
-role: worker
+role: developer
 allowedTools:
-  - "shell:aws dynamodb*"
-  - "shell:jq*"
-  - "shell:cat*"
+  - execute_bash
+  - fs_read
 ---
 
 # DynamoDB Query Agent
@@ -17,15 +16,18 @@ partition key. Returns the most recent item (sorted descending by sort key).
 
 ## Configuration
 
-**Install-time (Option A):** `cao install --env AWS_PROFILE=x --env TABLE_NAME=y ...`
-- `${AWS_PROFILE}`, `${AWS_REGION}` — credentials
+Install this agent with your values via `cao install --env`:
+
+- `${AWS_PROFILE}` — AWS CLI profile name
+- `${AWS_REGION}` — target region
 - `${TABLE_NAME}` — DynamoDB table name
 - `${PARTITION_KEY_NAME}` — partition key attribute (e.g., `pk`)
 - `${PARTITION_KEY_VALUE}` — value to query
 - `${PARTITION_KEY_TYPE}` — DynamoDB type: `S`, `N`, or `B`
-- `${LIMIT}` — max items to return
+- `${LIMIT}` — max items to return (default: 1)
 
-**Runtime (Option B):** Read from `config.json` in the agent's directory.
+See `config.json` in this folder for a reference of all available values and
+their defaults.
 
 ## Instructions
 

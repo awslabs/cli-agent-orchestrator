@@ -1,7 +1,7 @@
 # AWS Cloud-Ops Agent Examples
 
 Ready-to-use agent profiles for common AWS operational tasks. Each agent lives
-in its own folder with a profile (`.md`) and a configuration file (`config.json`).
+in its own folder with a profile (`.md`) and a configuration reference (`config.json`).
 
 ## Agents
 
@@ -22,38 +22,12 @@ in its own folder with a profile (`.md`) and a configuration file (`config.json`
 - `jq` installed (used for JSON parsing)
 - IAM permissions scoped to the specific service (see each agent's profile)
 
-## Two Ways to Use
+## How to Use
 
-### Option A: CAO install-time substitution (recommended)
+### 1. Check config.json for the values you need
 
-Edit `config.json` to set your values, then install with `--env` flags:
-
-```bash
-cao install examples/aws/sqs-monitor/sqs-monitor-agent.md \
-  --env AWS_PROFILE=my-profile \
-  --env AWS_REGION=us-west-2 \
-  --env QUEUE_URL=https://sqs.us-west-2.amazonaws.com/111111111111/my-queue
-```
-
-The `${VAR}` placeholders in the `.md` are resolved at install time. The
-installed agent is fully baked with your values.
-
-### Option B: Runtime config (self-contained)
-
-The agent reads `config.json` from its folder at execution time via `jq`.
-Edit `config.json` directly. No reinstall needed when values change.
-
-```bash
-# Edit the config
-vim examples/aws/sqs-monitor/config.json
-
-# Install the agent (placeholders remain as-is, agent reads config at runtime)
-cao install examples/aws/sqs-monitor/sqs-monitor-agent.md
-```
-
-## Configuration
-
-Each `config.json` uses a **flat key structure** for easy editing:
+Each folder has a `config.json` that documents every configurable value with
+example defaults:
 
 ```json
 {
@@ -63,12 +37,55 @@ Each `config.json` uses a **flat key structure** for easy editing:
 }
 ```
 
-The same keys map 1:1 to `${VAR}` placeholders in the `.md` (uppercased):
-`profile` → `${AWS_PROFILE}`, `region` → `${AWS_REGION}`, etc.
+### 2. Install with your values
+
+Pass your values via `--env` flags. The `${VAR}` placeholders in the `.md`
+profile are resolved at install time:
+
+```bash
+cao install examples/aws/sqs-monitor/sqs-monitor-agent.md \
+  --env AWS_PROFILE=my-profile \
+  --env AWS_REGION=us-west-2 \
+  --env QUEUE_URL=https://sqs.us-west-2.amazonaws.com/111111111111/my-queue \
+  --env POLL_INTERVAL_SECONDS=5 \
+  --env TIMEOUT_SECONDS=60
+```
+
+### 3. Run it
+
+```bash
+cao run sqs-monitor-agent
+```
+
+## Configuration Reference
+
+The `config.json` in each folder is **not** read at runtime. It exists as a
+reference for what `--env` values to pass during install. The mapping from
+config keys to env var names:
+
+| config.json key | `--env` variable |
+|-----------------|------------------|
+| `profile` | `AWS_PROFILE` |
+| `region` | `AWS_REGION` |
+| `queue_url` | `QUEUE_URL` |
+| `table_name` | `TABLE_NAME` |
+| `state_machine_arn` | `STATE_MACHINE_ARN` |
+| `dlq_url` | `DLQ_URL` |
+| `log_group` | `LOG_GROUP` |
+
+Service-specific keys (e.g., `poll_interval_seconds`, `max_messages`) map to
+their uppercased equivalents (`POLL_INTERVAL_SECONDS`, `MAX_MESSAGES`).
 
 ## Security Notes
 
 - All agents use explicit `--profile` flags, never default credentials
 - Use IAM roles with least-privilege permissions
 - The `dynamodb-delete` agent performs destructive operations: test in dev first
-- Never store real credentials in agent profile files or config.json
+- Never store real credentials in agent profile files
+
+## Multi-Agent Orchestration
+
+These agents are designed to work standalone or as workers in a multi-agent
+system. To orchestrate them together, create a supervisor agent that delegates
+tasks to these workers. See the [orchestration examples](../orchestration/) for
+patterns.

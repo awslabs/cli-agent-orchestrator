@@ -1,11 +1,10 @@
 ---
 name: sqs-dlq-check-agent
 description: Inspect a Dead Letter Queue for failed messages
-role: worker
+role: developer
 allowedTools:
-  - "shell:aws sqs*"
-  - "shell:jq*"
-  - "shell:cat*"
+  - execute_bash
+  - fs_read
 ---
 
 # SQS DLQ Check Agent
@@ -18,13 +17,16 @@ processing failures occurred after a workflow run.
 
 ## Configuration
 
-**Install-time (Option A):** `cao install --env AWS_PROFILE=x --env DLQ_URL=y ...`
-- `${AWS_PROFILE}`, `${AWS_REGION}` — credentials
+Install this agent with your values via `cao install --env`:
+
+- `${AWS_PROFILE}` — AWS CLI profile name
+- `${AWS_REGION}` — target region
 - `${DLQ_URL}` — full DLQ queue URL
 - `${MESSAGE_GROUP_ID}` — filter by group (FIFO queues, leave empty to skip)
 - `${MAX_MESSAGES}` — max messages to peek (default: 10)
 
-**Runtime (Option B):** Read from `config.json` in the agent's directory.
+See `config.json` in this folder for a reference of all available values and
+their defaults.
 
 ## Instructions
 
@@ -34,6 +36,7 @@ processing failures occurred after a workflow run.
 PROFILE="${AWS_PROFILE}"
 REGION="${AWS_REGION}"
 DLQ_URL="${DLQ_URL}"
+MAX_MESSAGES=${MAX_MESSAGES}
 
 COUNT=$(aws sqs get-queue-attributes \
     --profile "$PROFILE" \
@@ -59,7 +62,7 @@ MESSAGES=$(aws sqs receive-message \
     --profile "$PROFILE" \
     --region "$REGION" \
     --queue-url "$DLQ_URL" \
-    --max-number-of-messages ${MAX_MESSAGES} \
+    --max-number-of-messages $MAX_MESSAGES \
     --visibility-timeout 0 \
     --attribute-names MessageGroupId \
     --output json)

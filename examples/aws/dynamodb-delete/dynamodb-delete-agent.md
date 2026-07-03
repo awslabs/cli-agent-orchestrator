@@ -1,11 +1,10 @@
 ---
 name: dynamodb-delete-agent
 description: Delete all items matching a partition key from a DynamoDB table
-role: worker
+role: developer
 allowedTools:
-  - "shell:aws dynamodb*"
-  - "shell:jq*"
-  - "shell:cat*"
+  - execute_bash
+  - fs_read
 ---
 
 # DynamoDB Delete Agent
@@ -19,18 +18,21 @@ You query first, then delete each item individually.
 
 ## Configuration
 
-**Install-time (Option A):** `cao install --env AWS_PROFILE=x --env TABLE_NAME=y ...`
-- `${AWS_PROFILE}`, `${AWS_REGION}` — credentials
+Install this agent with your values via `cao install --env`:
+
+- `${AWS_PROFILE}` — AWS CLI profile name
+- `${AWS_REGION}` — target region
 - `${TABLE_NAME}` — DynamoDB table name
 - `${PARTITION_KEY_NAME}` / `${PARTITION_KEY_VALUE}` / `${PARTITION_KEY_TYPE}`
 - `${SORT_KEY_NAME}` / `${SORT_KEY_TYPE}` — sort key schema
 
-**Runtime (Option B):** Read from `config.json` in the agent's directory.
+See `config.json` in this folder for a reference of all available values and
+their defaults.
 
 ## Message Input
 
 The partition key value to delete can come from either:
-- **config.json** — when you always delete the same key (e.g., test cleanup)
+- **config** — when you always delete the same key (e.g., test cleanup)
 - **runtime message** — when a supervisor tells you which key to remove
 
 Example messages from a supervisor:
@@ -41,7 +43,7 @@ Clean up partition key user-session-expired-abc
 ```
 
 If the message contains a key value, use it. Otherwise fall back to
-`partition_key_value` from config.
+`${PARTITION_KEY_VALUE}` from config.
 
 ## Instructions
 
@@ -77,7 +79,7 @@ if [ "$COUNT" = "0" ]; then echo "✓ Nothing to delete"; exit 0; fi
 
 ```bash
 DELETED=0
-for row in $(echo "$RESULT" | jq -c '.Items[]'); do
+echo "$RESULT" | jq -c '.Items[]' | while IFS= read -r row; do
     PK_VAL=$(echo "$row" | jq -r ".$PK_NAME.$PK_TYPE")
     SK_VAL=$(echo "$row" | jq -r ".$SK_NAME.$SK_TYPE")
 
@@ -94,7 +96,7 @@ for row in $(echo "$RESULT" | jq -c '.Items[]'); do
         echo "  ✗ Failed to delete $SK_NAME=$SK_VAL"
     fi
 done
-echo "Deleted $DELETED of $COUNT item(s)"
+echo "Delete operation completed"
 ```
 
 ## Required IAM Permissions

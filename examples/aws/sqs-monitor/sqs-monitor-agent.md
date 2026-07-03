@@ -1,12 +1,10 @@
 ---
 name: sqs-monitor-agent
 description: Poll an SQS queue until all messages are consumed
-role: worker
+role: developer
 allowedTools:
-  - "shell:aws sqs*"
-  - "shell:sleep*"
-  - "shell:cat*"
-  - "shell:jq*"
+  - execute_bash
+  - fs_read
 ---
 
 # SQS Monitor Agent
@@ -18,13 +16,16 @@ Useful for verifying downstream consumers have processed all messages.
 
 ## Configuration
 
-**Install-time (Option A):** `cao install --env AWS_PROFILE=x --env QUEUE_URL=y ...`
-- `${AWS_PROFILE}`, `${AWS_REGION}` — credentials
+Install this agent with your values via `cao install --env`:
+
+- `${AWS_PROFILE}` — AWS CLI profile name
+- `${AWS_REGION}` — target region
 - `${QUEUE_URL}` — full SQS queue URL
 - `${POLL_INTERVAL_SECONDS}` — seconds between polls (default: 10)
 - `${TIMEOUT_SECONDS}` — max wait time (default: 300)
 
-**Runtime (Option B):** Read from `config.json` in the agent's directory.
+See `config.json` in this folder for a reference of all available values and
+their defaults.
 
 ## Instructions
 

@@ -1,13 +1,10 @@
 ---
 name: cloudwatch-logs-agent
 description: Search CloudWatch Logs for execution traces and error patterns
-role: worker
+role: developer
 allowedTools:
-  - "shell:aws logs*"
-  - "shell:jq*"
-  - "shell:date*"
-  - "shell:grep*"
-  - "shell:cat*"
+  - execute_bash
+  - fs_read
 ---
 
 # CloudWatch Logs Agent
@@ -19,14 +16,16 @@ specific execution IDs and analyzes messages for success or error patterns.
 
 ## Configuration
 
-**Install-time (Option A):** `cao install --env AWS_PROFILE=x --env AWS_REGION=y ...`
+Install this agent with your values via `cao install --env`:
+
 - `${AWS_PROFILE}` — AWS CLI profile name
 - `${AWS_REGION}` — target region
 - `${LOG_GROUP}` — log group name to search
 - `${SEARCH_TIME_WINDOW_MINUTES}` — how far back to search (default: 60)
 - `${MAX_EVENTS}` — max events to return (default: 50)
 
-**Runtime (Option B):** Read from `config.json` in the agent's directory.
+See `config.json` in this folder for a reference of all available values and
+their defaults.
 
 ## Message Input
 
@@ -55,13 +54,14 @@ keyword the caller wants you to find in the logs.
 SEARCH_TARGET="<extracted-from-message>"
 ```
 
-### Step 2: Load config and search
+### Step 2: Search logs
 
 ```bash
 PROFILE="${AWS_PROFILE}"
 REGION="${AWS_REGION}"
 LOG_GROUP="${LOG_GROUP}"
 TIME_WINDOW=${SEARCH_TIME_WINDOW_MINUTES}
+MAX_EVENTS=${MAX_EVENTS}
 START_TIME=$(( $(date +%s) - (TIME_WINDOW * 60) ))000
 END_TIME=$(date +%s)000
 
@@ -72,7 +72,7 @@ aws logs filter-log-events \
     --start-time "$START_TIME" \
     --end-time "$END_TIME" \
     --filter-pattern "$SEARCH_TARGET" \
-    --max-items ${MAX_EVENTS} \
+    --max-items $MAX_EVENTS \
     --output json | jq '.events[] | {timestamp: .timestamp, message: .message}'
 ```
 

@@ -1,14 +1,10 @@
 ---
 name: stepfunction-agent
 description: Trigger and monitor AWS Step Functions executions
-role: worker
+role: developer
 allowedTools:
-  - "shell:aws stepfunctions*"
-  - "shell:jq*"
-  - "shell:sleep*"
-  - "shell:uuidgen*"
-  - "shell:date*"
-  - "shell:cat*"
+  - execute_bash
+  - fs_read
 ---
 
 # Step Functions Agent
@@ -21,24 +17,18 @@ executions. You support two operations: **trigger** (start an execution) and
 
 ## Configuration
 
-This agent supports two configuration modes:
+Install this agent with your values via `cao install --env`:
 
-**Install-time (Option A):** Values are baked in via `cao install --env`:
 - `${AWS_PROFILE}` — AWS CLI profile name
 - `${AWS_REGION}` — target region
 - `${STATE_MACHINE_ARN}` — state machine ARN
 - `${EXECUTION_NAME_PREFIX}` — prefix for generated execution names
 - `${INPUT_PAYLOAD}` — JSON input to the state machine
-- `${POLL_INTERVAL_SECONDS}` — seconds between status checks
-- `${TIMEOUT_SECONDS}` — max seconds to wait
+- `${POLL_INTERVAL_SECONDS}` — seconds between status checks (default: 15)
+- `${TIMEOUT_SECONDS}` — max seconds to wait (default: 600)
 
-**Runtime (Option B):** Read from `config.json` in the same directory:
-```bash
-CONFIG="$(dirname "$0")/config.json"
-PROFILE=$(jq -r '.profile' "$CONFIG")
-REGION=$(jq -r '.region' "$CONFIG")
-STATE_MACHINE_ARN=$(jq -r '.state_machine_arn' "$CONFIG")
-```
+See `config.json` in this folder for a reference of all available values and
+their defaults.
 
 ## Message Input
 
@@ -96,6 +86,8 @@ from the message and poll until completion:
 ```bash
 # EXECUTION_ARN is extracted from the runtime message — not from config
 EXECUTION_ARN="<extracted-from-message>"
+PROFILE="${AWS_PROFILE}"
+REGION="${AWS_REGION}"
 TIMEOUT=${TIMEOUT_SECONDS}
 POLL_INTERVAL=${POLL_INTERVAL_SECONDS}
 ELAPSED=0
