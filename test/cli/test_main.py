@@ -45,8 +45,15 @@ class TestCliMain:
 
         assert result.exit_code == 0
 
-    def test_cli_has_flow_command(self):
-        """Test CLI has flow command group."""
+    def test_cli_has_schedule_command(self):
+        """Test CLI has schedule command group."""
+        runner = CliRunner()
+        result = runner.invoke(cli, ["schedule", "--help"])
+
+        assert result.exit_code == 0
+
+    def test_cli_flow_alias_still_works(self):
+        """Test deprecated 'flow' alias still resolves (issue #378)."""
         runner = CliRunner()
         result = runner.invoke(cli, ["flow", "--help"])
 

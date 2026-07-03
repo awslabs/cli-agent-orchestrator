@@ -186,7 +186,7 @@ export function FlowsPanel() {
             <Clock size={32} className="mx-auto text-gray-600 mb-3" />
             <p className="text-gray-500 text-sm">No flows configured.</p>
             <p className="text-gray-600 text-xs mt-1">
-              Click "Create Flow" above or use the CLI: <code className="text-emerald-400">cao flow add &lt;file.md&gt;</code>
+              Click "Create Flow" above or use the CLI: <code className="text-emerald-400">cao schedule add &lt;file.md&gt;</code>
             </p>
           </div>
         ) : (
