@@ -322,7 +322,7 @@ class OkfArchiveBackend(MemoryArchiveBackend):
         if target_scope == MemoryScope.FEDERATED.value:
             hit = scan_for_secrets(body)
             if hit:
-                logger.warning("okf_import_secret_rejected key=%s pattern=%s", key, hit)
+                logger.warning("okf_import_secret_rejected key=%s", key)
                 self._reject(report, rel, f"matched credential pattern {hit!r}")
                 return
 
