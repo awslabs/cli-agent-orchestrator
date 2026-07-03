@@ -311,7 +311,13 @@ def _get_owned_section(path: str, default: Any) -> Any:
     if path == "agents.extra_dirs":
         return settings_service.get_extra_agent_dirs()
     if path == "agents.roles":
-        return settings_service._load().get("roles", {})
+        data = settings_service._load()
+        # Nested format: {"agents": {"roles": {...}}}
+        nested = data.get("agents", {})
+        if isinstance(nested, dict) and "roles" in nested and isinstance(nested["roles"], dict):
+            return nested["roles"]
+        # Legacy flat format: {"roles": {...}}
+        return data.get("roles", {})
     if path == "skills.extra_dirs":
         return settings_service.get_extra_skill_dirs()
     if section == "server":
@@ -385,6 +391,27 @@ def _set_value(path: str, value: Any) -> Any:
     if path.startswith("agents.dirs."):
         provider = path.split(".", 2)[2]
         return settings_service.set_agent_dirs({provider: value})
+    if path == "agents.roles" or path.startswith("agents.roles."):
+        # Write both nested and flat for backward compat
+        data = _load_raw()
+        if path == "agents.roles":
+            roles = value
+        else:
+            role_name = path.split(".", 2)[2]
+            roles = data.get("roles", {})
+            if not isinstance(roles, dict):
+                roles = {}
+            roles[role_name] = value
+        # Nested format
+        agents_section = data.get("agents", {})
+        if not isinstance(agents_section, dict):
+            agents_section = {}
+        agents_section["roles"] = roles
+        data["agents"] = agents_section
+        # Flat format
+        data["roles"] = roles
+        _save_raw(data)
+        return roles
     if path.startswith("memory."):
         key = path.split(".", 1)[1]
         return settings_service.set_memory_setting(key, value)
