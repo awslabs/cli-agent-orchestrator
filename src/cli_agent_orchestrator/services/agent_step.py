@@ -84,6 +84,7 @@ async def run_agent_step(
     caller_id: Optional[str] = None,
     allowed_tools: Optional[list[str]] = None,
     registry: Optional[PluginRegistry] = None,
+    env_vars: Optional[dict[str, str]] = None,
 ) -> AgentStepResult:
     """Run one agent step and return its result (success only).
 
@@ -128,6 +129,14 @@ async def run_agent_step(
             ``post_kill_terminal`` plugin hooks fire (parity with the DELETE
             endpoint). None (the in-process engine path today) means no hooks
             dispatch — behavior unchanged.
+        env_vars: Optional per-step environment variables to inject into a freshly
+            created terminal (ignored when reusing a terminal). The run engine (N5)
+            uses this to set ``CAO_WORKFLOW_RUN_ID`` / ``CAO_WORKFLOW_STEP_ID`` so
+            the worker's ``workflow_return`` tool routes its structured output to
+            the correct ``(run_id, step_id)`` store key. With ``session_name=None``
+            the substrate creates a fresh session per step, so the per-step env is
+            injected cleanly (no stale step_id from a shared session). Default None
+            = behavior unchanged (the handoff caller passes nothing).
 
     Returns:
         ``AgentStepResult`` with status COMPLETED — ONLY on success.
@@ -162,6 +171,7 @@ async def run_agent_step(
             working_directory=working_directory,
             allowed_tools=allowed_tools,
             caller_id=caller_id,
+            env_vars=env_vars,
         )
         terminal_id = terminal.id
 

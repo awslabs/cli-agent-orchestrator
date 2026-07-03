@@ -44,6 +44,7 @@ import logging
 import re
 import shlex
 import shutil
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -51,6 +52,7 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import SECURITY_PROMPT
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
@@ -93,6 +95,22 @@ IDLE_PROMPT_PATTERN = r"^\s*>\s*$"
 # Full-width horizontal rule (U+2500) delimiting the input box / transcript
 # sections. Anchored to a full line; tolerates surrounding whitespace.
 SEPARATOR_PATTERN = r"^\s*─{20,}\s*$"
+
+# Workspace-trust dialog shown on the FIRST launch in an untrusted directory:
+# "Antigravity CLI requires permission to read, edit, and execute files here."
+# with a "> Yes, I trust this folder / No, exit" picker (Yes pre-selected).
+# --dangerously-skip-permissions covers tool approvals, NOT this workspace-trust
+# gate, so CAO (which launches agy in a fresh session cwd) hits it and init
+# hangs — the picker matches WAITING_USER_ANSWER and never reads IDLE. Dismissed
+# in initialize() by sending Enter (accepts the pre-selected "Yes").
+TRUST_PROMPT_PATTERN = r"Yes, I trust this folder|requires permission to read, edit"
+
+# Feedback-survey dialog agy occasionally shows right after startup ("How's
+# the CLI experience so far? [1] Good [2] Fine [3] Bad [0] Skip"). Like the
+# trust picker it blocks IDLE until answered — dismissed by sending "0"
+# (Skip) + Enter. Note the ready footer ("? for shortcuts") stays visible
+# UNDER this dialog, so it must be checked before any idle-footer early-exit.
+SURVEY_PROMPT_PATTERN = r"How'?s the CLI experience so far"
 
 # Interactive prompts that block on user input (approval dialogs, pickers).
 # With --dangerously-skip-permissions these are rare, but we still classify
@@ -356,6 +374,49 @@ class AntigravityCliProvider(BaseProvider):
             # names behind and block terminal teardown.
             self._mcp_server_names = []
 
+    def _handle_startup_dialog(self, timeout: Optional[float] = None) -> None:
+        """Dismiss agy's blocking startup dialogs (workspace-trust, survey).
+
+        Mirrors ClaudeCodeProvider._handle_startup_prompts / KimiCliProvider.
+        Polls the pane and answers, in whatever order they appear:
+        - workspace-trust picker → Enter (accepts the pre-selected "Yes")
+        - feedback survey → "0" + Enter (Skip)
+        Both can appear in ONE startup (trust first, survey after), so a
+        dismissal continues the loop rather than returning. Exits once agy is
+        at its ready footer with no dialog on screen — the survey renders ON
+        TOP of the footer, so the survey check must run before the idle exit.
+        """
+        if timeout is None:
+            timeout = get_server_settings()["startup_prompt_handler_timeout"]
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+        start_time = time.time()
+        trust_done = survey_done = False
+        while time.time() - start_time < timeout:
+            output = get_backend().get_history(self.session_name, self.window_name)
+            if output:
+                clean = strip_terminal_escapes(output)
+                if not trust_done and re.search(TRUST_PROMPT_PATTERN, clean):
+                    logger.info("Antigravity workspace-trust dialog detected, accepting")
+                    status_monitor.notify_input_sent(self.terminal_id)
+                    get_backend().send_special_key(self.session_name, self.window_name, "Enter")
+                    trust_done = True
+                    time.sleep(1.0)
+                    continue
+                if not survey_done and re.search(SURVEY_PROMPT_PATTERN, clean):
+                    logger.info("Antigravity feedback survey detected, skipping")
+                    status_monitor.notify_input_sent(self.terminal_id)
+                    get_backend().send_keys(self.session_name, self.window_name, "0", enter_count=0)
+                    time.sleep(0.5)
+                    get_backend().send_special_key(self.session_name, self.window_name, "Enter")
+                    survey_done = True
+                    time.sleep(1.0)
+                    continue
+                # At the ready footer with no dialog pending → done.
+                if re.search(IDLE_FOOTER_PATTERN, clean):
+                    return
+            time.sleep(1.0)
+
     async def initialize(self) -> bool:
         """Initialize the Antigravity CLI provider by starting ``agy``.
 
@@ -378,6 +439,10 @@ class AntigravityCliProvider(BaseProvider):
 
         status_monitor.notify_input_sent(self.terminal_id)
         get_backend().send_keys(self.session_name, self.window_name, command)
+
+        # Accept the workspace-trust dialog if agy shows one (first launch in an
+        # untrusted cwd). Unanswered it blocks init — the picker never reads IDLE.
+        self._handle_startup_dialog()
 
         # agy startup + first MCP connection (cao-mcp-server is fetched via uvx
         # from git on first use) + the -i acknowledgment can take a while.
@@ -408,6 +473,12 @@ class AntigravityCliProvider(BaseProvider):
           5. ERROR — matched error pattern
           6. UNKNOWN — nothing matched
         """
+        # Native status (herdr): trust the backend's agent state when available;
+        # on herdr the buffer is never fed, so buffer parsing can't leave UNKNOWN.
+        native = self._resolve_native_status()
+        if native is not None:
+            return native
+
         if not output:
             return TerminalStatus.UNKNOWN
 
@@ -606,4 +677,5 @@ class AntigravityCliProvider(BaseProvider):
 
     def mark_input_received(self) -> None:
         """Record that a turn was delivered (IDLE → COMPLETED on next status)."""
+        super().mark_input_received()
         self._turns += 1

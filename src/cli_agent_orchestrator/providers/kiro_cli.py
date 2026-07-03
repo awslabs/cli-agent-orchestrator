@@ -173,6 +173,7 @@ class KiroCliProvider(BaseProvider):
 
     def mark_input_received(self) -> None:
         """Track that input was sent, enabling separator-free completion detection."""
+        super().mark_input_received()
         self._input_received = True
 
     @property
@@ -319,7 +320,18 @@ class KiroCliProvider(BaseProvider):
         4. Permission prompt visible → WAITING_USER_ANSWER
         5. Green arrow + prompt visible → COMPLETED (response ready)
         6. Only prompt visible → IDLE (waiting for input)
+
+        Native (herdr): if the backend can report a native agent_status, trust it
+        and skip buffer parsing. On herdr the pipe-pane buffer is never fed, so
+        ``output`` is empty and the regex path below can never leave UNKNOWN —
+        which is why kiro never reached IDLE and init timed out. The shared
+        BaseProvider helper consults the backend and disambiguates herdr's
+        ambiguous "idle" via _task_dispatched (set by mark_input_received).
         """
+        native = self._resolve_native_status()
+        if native is not None:
+            return native
+
         if not output:
             return TerminalStatus.UNKNOWN
 
