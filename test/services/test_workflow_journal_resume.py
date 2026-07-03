@@ -53,9 +53,11 @@ def _patched_journal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     _migrate_workflow_run()
     _migrate_workflow_run_step()
     ws.run_registry.clear()
+    ws._active_drives.clear()
     ws.step_output_store._store.clear()
     yield db_path
     ws.run_registry.clear()
+    ws._active_drives.clear()
     ws.step_output_store._store.clear()
 
 
@@ -158,7 +160,7 @@ async def test_best_effort_write_failure_does_not_break_run(monkeypatch, _patche
 async def test_rebuild_reconstructs_record_with_field_binding(monkeypatch, _patched_journal):
     monkeypatch.setattr(ws, "run_agent_step", AsyncMock(return_value=_ok()))
     spec = _spec(name="myflow", step_ids=("s1", "s2"))
-    await ws.start_run(spec, {"k": "v"} if False else {}, "runRB")
+    await ws.start_run(spec, {}, "runRB")
 
     ws.run_registry.clear()  # simulate a cold process
     record = ws._rebuild_record_from_journal("runRB")
@@ -375,7 +377,7 @@ async def test_resume_reopen_persists_cleared_current_step(monkeypatch, _patched
 
     # Stub the drive so the journal row is observed right after the reopen block,
     # before any step executes.
-    monkeypatch.setattr(ws, "_drive_resume", AsyncMock(return_value=None))
+    monkeypatch.setattr(ws, "_drive", AsyncMock(return_value=None))
     await ws.resume_from_last_completed("runCur")
 
     assert workflow_journal.get_run("runCur").current_step_id is None
@@ -383,7 +385,8 @@ async def test_resume_reopen_persists_cleared_current_step(monkeypatch, _patched
 
 @pytest.mark.asyncio
 async def test_resume_liveness_guard_rejects_live_run(_patched_journal):
-    # B4-BR-7a: a run present + RUNNING in the live registry cannot be resumed.
+    # B4-BR-7a: a run whose drive loop is executing IN THIS PROCESS cannot be
+    # resumed. Liveness is _active_drives membership, not the cached record state.
     spec = _spec(step_ids=("s1",))
     ws.run_registry["runLive"] = ws.RunRecord(
         run_id="runLive",
@@ -392,11 +395,51 @@ async def test_resume_liveness_guard_rejects_live_run(_patched_journal):
         inputs={},
         state=RunState.RUNNING,
     )
+    ws._active_drives.add("runLive")
     workflow_journal.insert_run(
         "runLive", "wf", spec.model_dump_json(), "{}", RunState.RUNNING.value, "t"
     )
     with pytest.raises(ws.ResumeNotAllowedError):
         await ws.resume_from_last_completed("runLive")
+
+
+@pytest.mark.asyncio
+async def test_status_then_resume_of_crash_remnant_succeeds(monkeypatch, _patched_journal):
+    # Regression (reviewer BLOCKER): a status read of a crash remnant rebuilds a
+    # RUNNING record into the cache; that cached RUNNING state must NOT trip the
+    # resume liveness guard — nothing is actually executing.
+    spec = _spec(step_ids=("s1", "s2", "s3", "s4"))
+    _seed_killed_after_step2(spec, "runSR")
+    assert "runSR" not in ws.run_registry
+
+    # Status FIRST: rebuilds + caches the remnant as RUNNING.
+    snap = ws.get_run_status("runSR")
+    assert snap.state == RunState.RUNNING
+    assert "runSR" in ws.run_registry
+
+    ran: List[str] = []
+
+    async def _side(**kwargs):
+        ran.append(kwargs["env_vars"]["CAO_WORKFLOW_STEP_ID"])
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+    res = await ws.resume_from_last_completed("runSR")
+    assert ran == ["s3", "s4"]
+    assert res.state == RunState.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_active_drive_mark_cleared_after_run_and_resume(monkeypatch, _patched_journal):
+    # The liveness mark must not leak: cleared after a normal run AND a resume.
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(return_value=_ok()))
+    await ws.start_run(_spec(step_ids=("s1",)), {}, "runMark")
+    assert "runMark" not in ws._active_drives
+
+    spec = _spec(step_ids=("s1", "s2", "s3", "s4"))
+    _seed_killed_after_step2(spec, "runMark2")
+    await ws.resume_from_last_completed("runMark2")
+    assert "runMark2" not in ws._active_drives
 
 
 @pytest.mark.asyncio
@@ -440,6 +483,80 @@ async def test_resume_corrupt_snapshot_raises_corrupt(_patched_journal):
     workflow_journal.insert_steps("runBad", [("s1", StepState.FAILED.value)], "t")
     with pytest.raises(ws.ResumeCorruptError):
         await ws.resume_from_last_completed("runBad")
+
+
+@pytest.mark.asyncio
+async def test_start_run_rejects_journaled_run_id_and_keeps_row(monkeypatch, _patched_journal):
+    # A durable journal row claims the run_id even after a restart (empty
+    # registry): start_run must 409 (KeyError) and must NOT clobber the row.
+    spec = _spec(name="oldflow", step_ids=("s1",))
+    workflow_journal.insert_run(
+        "runReuse",
+        spec.name,
+        spec.model_dump_json(),
+        "{}",
+        RunState.FAILED.value,
+        "2026-01-01T00:00:00Z",
+    )
+    original_snapshot = workflow_journal.get_run("runReuse").spec_snapshot
+    assert "runReuse" not in ws.run_registry  # fresh process
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(return_value=_ok()))
+    with pytest.raises(KeyError):
+        await ws.start_run(_spec(name="newflow", step_ids=("x1",)), {}, "runReuse")
+
+    # The journal row is untouched — no INSERT OR REPLACE clobber.
+    assert workflow_journal.get_run("runReuse").spec_snapshot == original_snapshot
+
+
+@pytest.mark.asyncio
+async def test_resume_templates_from_rebuilt_kept_step_output(monkeypatch, _patched_journal):
+    # A PENDING step whose prompt references {{steps.s1.output.answer}} must be
+    # substituted from the REBUILT kept step's persisted output in a fresh process.
+    spec = WorkflowSpec(
+        name="wf",
+        mode="sequential",
+        steps=[
+            _step("s1", schema=_SCHEMA),
+            WorkflowStep(
+                id="s2",
+                provider="claude_code",
+                agent="dev",
+                prompt="use {{steps.s1.output.answer}} please",
+            ),
+        ],
+    )
+    workflow_journal.insert_run(
+        "runTpl",
+        spec.name,
+        spec.model_dump_json(),
+        "{}",
+        RunState.RUNNING.value,
+        "2026-01-01T00:00:00Z",
+    )
+    workflow_journal.insert_steps(
+        "runTpl", [(s.id, StepState.PENDING.value) for s in spec.steps], "2026-01-01T00:00:00Z"
+    )
+    workflow_journal.update_step(
+        "runTpl",
+        "s1",
+        StepState.COMPLETED.value,
+        1,
+        "2026-01-01T00:00:01Z",
+        output_json='{"answer": "42"}',
+    )
+    assert "runTpl" not in ws.run_registry  # fresh process — rebuild from journal
+
+    prompts: List[str] = []
+
+    async def _side(**kwargs):
+        prompts.append(kwargs["prompt"])
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+    res = await ws.resume_from_last_completed("runTpl")
+    assert res.state == RunState.COMPLETED
+    assert prompts == ["use 42 please"]
 
 
 @pytest.mark.asyncio

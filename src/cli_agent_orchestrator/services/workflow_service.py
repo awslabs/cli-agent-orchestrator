@@ -28,7 +28,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from pydantic import ValidationError
 
@@ -130,6 +130,14 @@ class RunRecord:
 # Process-local run registry (ADR-8, B3-LC-2 singleton). A process restart loses
 # in-flight runs — the explicit, documented pre-N6 gap (A-5).
 run_registry: Dict[str, RunRecord] = {}
+
+# run_ids whose drive loop is executing IN THIS PROCESS right now (B4-BR-7a / F4).
+# The registry alone cannot answer "is anything actually driving this run?" — a
+# status read may rebuild a crash remnant into the cache with state == RUNNING
+# even though nothing is executing. Membership here is the liveness truth: added
+# when a drive starts (start_run / _drive_resume), removed in a ``finally`` on
+# EVERY exit path (complete, fail, engine error, cancel).
+_active_drives: Set[str] = set()
 
 
 def _now() -> str:
@@ -568,6 +576,70 @@ def _build_result(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunRe
     )
 
 
+async def _drive(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunResult:
+    """Sequence ``record`` over ``order``, finalize, and aggregate (§1 steps 6-8).
+
+    THE single execution path (B4-RD-5): ``start_run`` and
+    ``resume_from_last_completed`` both drive through here, so resume cannot
+    diverge from the normal drive. A non-``PENDING`` (kept) step is skipped —
+    on a fresh run every step starts PENDING so the skip is a no-op; on a resume
+    it is exactly the B4-BR-9 keep boundary (done steps are never re-run, their
+    output stays available for templating).
+
+    An unexpected engine error mid-loop (e.g. ``_substitute`` raising
+    ``WorkflowEngineError`` on a bad template reference — raised OUTSIDE
+    ``_run_step``'s ``StepExecutionError`` guard) must NOT leave the registered
+    record stranded in RUNNING. Settle it to a terminal FAILED state (with
+    ``finished_at``) before re-raising so the boundary still maps it to 500 and
+    the registry is always left consistent (domain-entities lifecycle,
+    B3-RD-3/RD-5).
+    """
+    try:
+        for index, step in enumerate(order):
+            if record.cancelled:  # B3-BR-7 — cancel observed at a step boundary
+                _skip_remaining(record, order, from_index=index)
+                record.state = RunState.CANCELLED
+                break
+            st = record.step_states[step.id]
+            if st.state in (StepState.COMPLETED, StepState.COMPLETED_UNVALIDATED):
+                continue  # kept on resume (B4-BR-9) — do not re-run a done step
+            await _run_step(record, step)
+            if record.state == RunState.FAILED:  # halt (B3-BR-4 on_failure=halt)
+                _skip_remaining(record, order, from_index=index + 1)
+                break
+    except WorkflowEngineError:
+        # Settle the registered record into a terminal FAILED state before the
+        # error propagates to the boundary (-> 500). Mark the in-flight step FAILED
+        # too. The exception is NOT masked — it is re-raised unchanged.
+        if record.current_step_id is not None:
+            cur = record.step_states.get(record.current_step_id)
+            if cur is not None and cur.state not in (
+                StepState.COMPLETED,
+                StepState.COMPLETED_UNVALIDATED,
+            ):
+                cur.state = StepState.FAILED
+        record.state = RunState.FAILED
+        record.current_step_id = None
+        record.finished_at = _now()
+        # Persist the terminal FAILED state (best-effort) before re-raising (§1).
+        _journal_current_step(record)
+        _journal_run_state(record)
+        logger.error("drive: run '%s' failed with an engine error", record.run_id)
+        raise
+
+    # Finalize.
+    if record.state not in (RunState.FAILED, RunState.CANCELLED):
+        record.state = RunState.COMPLETED
+    record.current_step_id = None
+    record.finished_at = _now()
+    # Journal the terminal run state + cleared current step (§1, B4-BR-5).
+    _journal_current_step(record)
+    _journal_run_state(record)
+
+    # Aggregate the result.
+    return _build_result(record, order)
+
+
 # ---------------------------------------------------------------------------
 # §1 — start_run entry point
 # ---------------------------------------------------------------------------
@@ -580,13 +652,26 @@ async def start_run(spec: WorkflowSpec, inputs: Dict[str, Any], run_id: str) -> 
     (B3-BR-6); sequence them with a cancel-check + halt-handling loop; finalize.
 
     Raises ``ValueError`` (-> 400) on a bad run_id / invalid inputs, ``KeyError``
-    (-> 409) if the run_id is already registered, ``NotBuiltYetError`` (-> reserved
-    seam) for a non-sequential mode, ``WorkflowEngineError`` (-> 500) on an
-    engine-internal invariant violation (e.g. a bad template reference).
+    (-> 409) if the run_id is already registered, actively driving, or journaled
+    (a durable row must never be clobbered by a reused id), ``NotBuiltYetError``
+    (-> reserved seam) for a non-sequential mode, ``WorkflowEngineError`` (-> 500)
+    on an engine-internal invariant violation (e.g. a bad template reference).
     """
     # 1. Validate run_id via the shared key validator (B3-BR-1).
     _validate_key_part(run_id, "run_id")
-    if run_id in run_registry:
+    if run_id in run_registry or run_id in _active_drives:
+        raise KeyError(f"run_id '{run_id}' already exists")
+    # A durable journal row also claims the id: after a restart the registry is
+    # empty, but re-using an old run_id must NOT overwrite its journal history.
+    # Best-effort read only — a broken journal must never block NEW runs.
+    try:
+        existing_row = workflow_journal.get_run(run_id)
+    except (
+        Exception
+    ) as e:  # noqa: BLE001 — journal read is best-effort; a broken journal must not block new runs (B4-BR-5)
+        logger.debug("journal: start_run get_run('%s') failed; proceeding: %s", run_id, e)
+        existing_row = None
+    if existing_row is not None:
         raise KeyError(f"run_id '{run_id}' already exists")
 
     # 2. Validate inputs BEFORE any side effect (B3-BR-2 / FR-1.5, fail fast).
@@ -609,60 +694,21 @@ async def start_run(spec: WorkflowSpec, inputs: Dict[str, Any], run_id: str) -> 
         step_states={step.id: StepRunState(step_id=step.id) for step in spec.steps},
         started_at=_now(),
     )
-    # 4. Register (in-memory floor) + journal the run + seed every step (§1).
+    # 4. Register (in-memory floor) + mark the drive live + journal the run +
+    # seed every step (§1). The ``finally`` guarantees the liveness mark is
+    # cleared on EVERY exit path (complete, fail, engine error, cancel).
     run_registry[run_id] = record
-    _journal_insert_run(record)
-
-    # 5. Deterministic sequencing order.
-    order = _topological_order(spec)
-
-    # 6. Sequencing loop. An unexpected engine error mid-loop (e.g. _substitute
-    # raising WorkflowEngineError on a bad template reference — raised OUTSIDE
-    # _run_step's StepExecutionError guard) must NOT leave the already-registered
-    # record stranded in RUNNING. Settle it to a terminal FAILED state (with
-    # finished_at) before re-raising so the boundary still maps it to 500 and the
-    # registry is always left consistent (domain-entities lifecycle, B3-RD-3/RD-5).
+    _active_drives.add(run_id)
     try:
-        for index, step in enumerate(order):
-            if record.cancelled:  # B3-BR-7 — cancel observed at a step boundary
-                _skip_remaining(record, order, from_index=index)
-                record.state = RunState.CANCELLED
-                break
-            await _run_step(record, step)
-            if record.state == RunState.FAILED:  # halt (B3-BR-4 on_failure=halt)
-                _skip_remaining(record, order, from_index=index + 1)
-                break
-    except WorkflowEngineError:
-        # Settle the registered record into a terminal FAILED state before the
-        # error propagates to the boundary (-> 500). Mark the in-flight step FAILED
-        # too. The exception is NOT masked — it is re-raised unchanged.
-        if record.current_step_id is not None:
-            cur = record.step_states.get(record.current_step_id)
-            if cur is not None and cur.state not in (
-                StepState.COMPLETED,
-                StepState.COMPLETED_UNVALIDATED,
-            ):
-                cur.state = StepState.FAILED
-        record.state = RunState.FAILED
-        record.current_step_id = None
-        record.finished_at = _now()
-        # Persist the terminal FAILED state (best-effort) before re-raising (§1).
-        _journal_current_step(record)
-        _journal_run_state(record)
-        logger.error("start_run: run '%s' failed with an engine error", run_id)
-        raise
+        _journal_insert_run(record)
 
-    # 7. Finalize.
-    if record.state not in (RunState.FAILED, RunState.CANCELLED):
-        record.state = RunState.COMPLETED
-    record.current_step_id = None
-    record.finished_at = _now()
-    # Journal the terminal run state + cleared current step (§1, B4-BR-5).
-    _journal_current_step(record)
-    _journal_run_state(record)
+        # 5. Deterministic sequencing order.
+        order = _topological_order(spec)
 
-    # 8. Aggregate the result.
-    return _build_result(record, order)
+        # 6-8. Sequence, finalize, aggregate — the single shared drive (B4-RD-5).
+        return await _drive(record, order)
+    finally:
+        _active_drives.discard(run_id)
 
 
 # ---------------------------------------------------------------------------
@@ -836,10 +882,12 @@ async def resume_from_last_completed(run_id: str) -> WorkflowRunResult:
 
     1. Validate ``run_id`` via the shared key validator (B4-BR-2) -> ``ValueError``
        (-> 400) on a malformed/traversal key.
-    2. **Liveness guard** (B4-BR-7a, F4): if the run is present in the live
-       ``run_registry`` AND its in-memory ``state == RUNNING``, it is actively
-       executing in THIS process -> ``ResumeNotAllowedError`` (-> 409). Never
-       double-drive a live run.
+    2. **Liveness guard** (B4-BR-7a, F4): if the run is in ``_active_drives`` — a
+       drive loop is actually executing it IN THIS PROCESS -> a
+       ``ResumeNotAllowedError`` (-> 409). Never double-drive a live run. A cached
+       registry record with ``state == RUNNING`` is NOT enough: a status read may
+       rebuild a crash remnant into the cache as RUNNING with nothing executing,
+       and that remnant must stay resumable.
     3. Load the ``workflow_run`` row; absent -> ``KeyError`` (-> 404, F1).
     4. A ``COMPLETED``/``CANCELLED`` run is terminal and not resumable ->
        ``ResumeNotAllowedError`` (-> 409, B4-BR-7). A ``FAILED`` run, or a
@@ -861,9 +909,10 @@ async def resume_from_last_completed(run_id: str) -> WorkflowRunResult:
     # 1. Validate the run_id key via the shared validator (B4-BR-2).
     _validate_key_part(run_id, "run_id")
 
-    # 2. Liveness guard (B4-BR-7a / F4): never resume a run still executing here.
-    live = run_registry.get(run_id)
-    if live is not None and live.state == RunState.RUNNING:
+    # 2. Liveness guard (B4-BR-7a / F4): never resume a run a drive loop is
+    # actively executing in THIS process. Do NOT trust a cached record's RUNNING
+    # state — a rebuilt crash remnant is RUNNING in the cache with no live drive.
+    if run_id in _active_drives:
         raise ResumeNotAllowedError(
             f"run '{run_id}' is currently executing; cannot resume a live run"
         )
@@ -888,7 +937,7 @@ async def resume_from_last_completed(run_id: str) -> WorkflowRunResult:
     try:
         spec = WorkflowSpec.model_validate_json(row.spec_snapshot)
     except ValidationError as e:
-        raise ResumeCorruptError(f"run '{run_id}' snapshot is corrupt: {e}")
+        raise ResumeCorruptError(f"run '{run_id}' snapshot is corrupt: {e}") from e
 
     # 6. Rebuild the cache (§2) and apply the Q3=A skip/re-run boundary (B4-BR-9).
     record = _rebuild_record_from_journal(run_id)
@@ -920,54 +969,14 @@ async def resume_from_last_completed(run_id: str) -> WorkflowRunResult:
     # stale until the first resumed step journals (best-effort, B4-BR-5).
     _journal_current_step(record)
 
-    # 7. Re-enter the SAME B3 drive over the snapshotted spec's topo order (B4-RD-5).
-    return await _drive_resume(record, _topological_order(spec))
-
-
-async def _drive_resume(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunResult:
-    """Re-drive a rebuilt record over ``order`` — the SAME B3 sequencing loop (§3).
-
-    This is the resume tail of ``start_run``'s sequencing loop (steps 6–8), reused
-    verbatim so resume cannot diverge from the normal drive (single execution path,
-    B4-RD-5): a non-``PENDING`` (kept) step is skipped by ``_run_step`` not running
-    for it — the loop only calls ``_run_step`` for steps the reset left ``PENDING``.
-    """
+    # 7. Re-enter the SAME shared drive over the snapshotted spec's topo order
+    # (B4-RD-5). Mark the drive live for its whole duration; the ``finally``
+    # clears the mark on EVERY exit path (complete, fail, engine error, cancel).
+    _active_drives.add(run_id)
     try:
-        for index, step in enumerate(order):
-            if record.cancelled:  # B3-BR-7 — cancel observed at a step boundary
-                _skip_remaining(record, order, from_index=index)
-                record.state = RunState.CANCELLED
-                break
-            st = record.step_states[step.id]
-            if st.state in (StepState.COMPLETED, StepState.COMPLETED_UNVALIDATED):
-                continue  # kept on resume (B4-BR-9) — do not re-run a done step
-            await _run_step(record, step)
-            if record.state == RunState.FAILED:  # halt (B3-BR-4 on_failure=halt)
-                _skip_remaining(record, order, from_index=index + 1)
-                break
-    except WorkflowEngineError:
-        if record.current_step_id is not None:
-            cur = record.step_states.get(record.current_step_id)
-            if cur is not None and cur.state not in (
-                StepState.COMPLETED,
-                StepState.COMPLETED_UNVALIDATED,
-            ):
-                cur.state = StepState.FAILED
-        record.state = RunState.FAILED
-        record.current_step_id = None
-        record.finished_at = _now()
-        _journal_current_step(record)
-        _journal_run_state(record)
-        logger.error("resume: run '%s' failed with an engine error", record.run_id)
-        raise
-
-    if record.state not in (RunState.FAILED, RunState.CANCELLED):
-        record.state = RunState.COMPLETED
-    record.current_step_id = None
-    record.finished_at = _now()
-    _journal_current_step(record)
-    _journal_run_state(record)
-    return _build_result(record, order)
+        return await _drive(record, _topological_order(spec))
+    finally:
+        _active_drives.discard(run_id)
 
 
 def _run_parallel(record: Optional[RunRecord], steps: Any) -> None:

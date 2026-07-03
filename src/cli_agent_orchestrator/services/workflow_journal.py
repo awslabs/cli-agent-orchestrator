@@ -77,13 +77,15 @@ def insert_run(
 ) -> None:
     """INSERT the ``workflow_run`` row at ``start_run`` (lifecycle table, E1).
 
-    ``INSERT OR REPLACE`` keeps the write idempotent: a re-INSERT for the same
-    ``run_id`` (e.g. a resume that re-registers) overwrites cleanly rather than
-    raising a PK conflict.
+    A plain ``INSERT``: a re-INSERT for an already-journaled ``run_id`` raises
+    ``sqlite3.IntegrityError`` rather than silently overwriting the durable row
+    (a resume never calls this — it only UPDATEs). The engine both pre-checks the
+    journal in ``start_run`` and wraps this call best-effort, so a lost race
+    logs instead of clobbering history.
     """
     with _connect() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO workflow_run "
+            "INSERT INTO workflow_run "
             "(run_id, workflow_name, spec_snapshot, inputs_json, state, "
             " current_step_id, started_at, finished_at) "
             "VALUES (?, ?, ?, ?, ?, NULL, ?, NULL)",

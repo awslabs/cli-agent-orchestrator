@@ -231,8 +231,6 @@ def run_cmd(name_or_path, inputs, run_id, as_json):
 
     if response.status_code == 404:
         raise click.ClickException(_extract_detail(response, f"unknown workflow '{name_or_path}'"))
-    if response.status_code in (400, 409, 500, 501):
-        raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
     if response.status_code != 200:
         raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
 
@@ -299,8 +297,6 @@ def resume_cmd(run_id, as_json):
 
     if response.status_code == 404:
         raise click.ClickException(f"unknown run '{run_id}'")
-    if response.status_code in (400, 409, 422, 500, 501):
-        raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
     if response.status_code != 200:
         raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
 
