@@ -120,6 +120,23 @@ class TestConfigSet:
         result = runner.invoke(config, ["set", "memory.not_a_real_key", "1"])
         assert result.exit_code != 0
 
+    def test_set_network_key_succeeds_persists_and_warns(self, runner, _isolated_settings):
+        """network.* is schema-only (no runtime effect yet) — set() still
+        succeeds and persists, but must warn the operator on stderr."""
+        result = runner.invoke(config, ["set", "network.allowed_hosts", '["cao.internal"]'])
+        assert result.exit_code == 0
+        on_disk = json.loads(_isolated_settings["settings"].read_text())
+        assert on_disk["network"]["allowed_hosts"] == ["cao.internal"]
+        assert "no runtime effect yet" in result.stderr
+        assert "network.allowed_hosts" in result.stderr
+
+    def test_set_auth_key_warns_but_terminal_key_does_not(self, runner, _isolated_settings):
+        auth_result = runner.invoke(config, ["set", "auth.jwks_uri", "https://idp.example/jwks.json"])
+        assert "no runtime effect yet" in auth_result.stderr
+
+        terminal_result = runner.invoke(config, ["set", "terminal.backend", "herdr"])
+        assert terminal_result.stderr == ""
+
 
 class TestConfigList:
     def test_list_includes_known_keys(self, runner, _isolated_settings):
@@ -127,6 +144,19 @@ class TestConfigList:
         assert result.exit_code == 0
         assert "terminal.backend = " in result.output
         assert "memory.compile_mode = " in result.output
+
+    def test_list_surfaces_network_and_auth_values_despite_being_inert(
+        self, runner, _isolated_settings
+    ):
+        """network.*/auth.* are stored-but-inert — `list` must still surface
+        them so an operator can see what's set, even though it has no effect."""
+        runner.invoke(config, ["set", "network.cors_origins", '["http://example.test"]'])
+        runner.invoke(config, ["set", "auth.audience", "https://api.example"])
+
+        result = runner.invoke(config, ["list"])
+        assert result.exit_code == 0
+        assert 'network.cors_origins = ["http://example.test"]' in result.output
+        assert 'auth.audience = "https://api.example"' in result.output
 
 
 class TestConfigPath:

@@ -5,9 +5,14 @@ The three views are shipped as **single-file HTML** artifacts built by the
 ``register_apps`` mounts each artifact as an MCP resource under its ``ui://cao/*``
 URI so an MCP App host can load it into a sandboxed iframe.
 
+The surface is default-off, gated on ``apps.enabled`` — resolved via
+``ConfigService`` (``CAO_MCP_APPS_ENABLED`` env var, or the ``apps.enabled``
+key in ``settings.json``; see docs/configuration.md).
+
 Resolution of ``apps_static/`` tries, in order:
 
-1. the ``CAO_MCP_APPS_STATIC_DIR`` environment override,
+1. the ``apps.static_dir`` override (``CAO_MCP_APPS_STATIC_DIR`` env var, or
+   ``settings.json``), read via ``ConfigService``,
 2. the packaged location ``<package>/apps_static`` (wheel installs), then
 3. the source-tree location ``<repo-root>/apps_static`` (editable/dev installs).
 

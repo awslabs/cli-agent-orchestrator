@@ -40,6 +40,9 @@ def get_cmd(key):
     click.echo(json.dumps(value))
 
 
+_ENV_ONLY_SECTIONS = ("network.", "auth.")
+
+
 @config.command(name="set")
 @click.argument("key")
 @click.argument("value")
@@ -47,6 +50,12 @@ def set_cmd(key, value):
     """Set config KEY to VALUE, persisting it to settings.json."""
     result = ConfigService.set(key, _coerce(value))
     click.echo(json.dumps(result))
+    if key.startswith(_ENV_ONLY_SECTIONS):
+        click.echo(
+            f"warning: '{key}' is stored but has no runtime effect yet — "
+            "only its CAO_* env var is read (see docs/configuration.md).",
+            err=True,
+        )
 
 
 @config.command(name="list")
