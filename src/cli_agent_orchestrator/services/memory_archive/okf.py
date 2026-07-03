@@ -388,7 +388,7 @@ class OkfArchiveBackend(MemoryArchiveBackend):
         """Record a per-file rejection (key/filename + reason, never content)."""
         report.rejected += 1
         report.errors[rel] = reason
-        logger.warning("okf_import_rejected file=%s reason=%s", rel, reason)
+        logger.warning("okf_import_rejected file=%s", rel)
 
     @staticmethod
     def _sanitize_key_safe(key: str) -> str:
