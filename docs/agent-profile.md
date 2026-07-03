@@ -27,7 +27,7 @@ Define the agent's role, responsibilities, and behavior here.
 - `role` (string): Agent role that determines default tool access. One of `"supervisor"`, `"developer"`, `"reviewer"`, or a custom role. See [Tool Restrictions](tool-restrictions.md).
 - `provider` (string): Provider to run this agent on (e.g., `"claude_code"`, `"kiro_cli"`). See [Cross-Provider Orchestration](#cross-provider-orchestration).
 - `allowedTools` (array): CAO tool vocabulary allowlist. Overrides role-based defaults. Can be used with or without `role`. See [Tool Restrictions](tool-restrictions.md).
-- `skills` (array): Restrict this agent's injected skill catalog to skills whose name matches these patterns (exact names or case-sensitive [`fnmatch`](https://docs.python.org/3/library/fnmatch.html) globs, e.g. `"ads-*"`). Omit for the full catalog; `[]` advertises none. Applies only to runtime-prompt providers (Claude Code, Codex, Gemini, Kimi, Antigravity). See [Skills](skills.md#scoping-the-catalog-per-agent-skills).
+- `skills` (array): Restrict this agent's injected skill catalog to skills whose name matches these patterns (exact names or case-sensitive [`fnmatch`](https://docs.python.org/3/library/fnmatch.html) globs, e.g. `"ads-*"`). Omit for the full catalog; `[]` advertises none. Applies only to runtime-prompt providers (Claude Code, Codex, Antigravity, Kimi). See [Skills](skills.md#scoping-the-catalog-per-agent-skills).
 - `mcpServers` (object): MCP server configurations for additional tools
 - `tools` (array): List of allowed tools, use `["*"]` for all
 - `toolAliases` (object): Map tool names to aliases
@@ -101,7 +101,7 @@ Agent profiles can declare which provider they should run on via the `provider` 
 
 When the supervisor calls `assign` or `handoff`, CAO reads the worker's agent profile and uses the declared `provider` if it is a valid value. If the key is missing or the value is not recognized, the worker inherits the supervisor's provider.
 
-Valid values: `q_cli`, `kiro_cli`, `claude_code`, `codex`, `gemini_cli`, `hermes`, `kimi_cli`, `copilot_cli`, `opencode_cli`.
+Valid values: `kiro_cli`, `claude_code`, `codex`, `antigravity_cli`, `hermes`, `kimi_cli`, `copilot_cli`, `opencode_cli`, `cursor_cli`.
 
 ### Example
 

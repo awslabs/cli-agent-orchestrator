@@ -2,6 +2,8 @@
 
 Flows let you schedule agent sessions to run automatically using cron expressions.
 
+> **Command rename:** the command is now `cao schedule` ([#378](https://github.com/awslabs/cli-agent-orchestrator/issues/378)). `cao flow` still works as a deprecated alias and prints a warning to stderr; it will be removed in a future release. Update scripts and cron entries to `cao schedule`. Nothing else changes — flow files, `~/.cao/flows`, and stored schedules are untouched.
+
 ## Prerequisites
 
 Install the agent profile you want to use:
@@ -19,13 +21,13 @@ The example flow asks a simple world trivia question every morning at 7:30 AM.
 cao-server
 
 # 2. In another terminal, add a flow
-cao flow add examples/flow/morning-trivia.md
+cao schedule add examples/flow/morning-trivia.md
 
 # 3. List flows to see schedule and status
-cao flow list
+cao schedule list
 
 # 4. Manually run a flow (optional - for testing)
-cao flow run morning-trivia
+cao schedule run morning-trivia
 
 # 5. View flow execution (after it runs)
 tmux list-sessions
@@ -96,18 +98,18 @@ fi
 
 ```bash
 # Add a flow
-cao flow add daily-standup.md
+cao schedule add daily-standup.md
 
 # List all flows (shows schedule, next run time, enabled status)
-cao flow list
+cao schedule list
 
 # Enable/disable a flow
-cao flow enable daily-standup
-cao flow disable daily-standup
+cao schedule enable daily-standup
+cao schedule disable daily-standup
 
 # Manually run a flow (ignores schedule)
-cao flow run daily-standup
+cao schedule run daily-standup
 
 # Remove a flow
-cao flow remove daily-standup
+cao schedule remove daily-standup
 ```

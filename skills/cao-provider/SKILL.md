@@ -105,7 +105,7 @@ There are three approaches depending on the CLI's capabilities. Read `docs/tool-
 
 **Hard enforcement via CLI flags** (e.g., Claude Code, Copilot CLI): Add the provider to `TOOL_MAPPING` in `src/cli_agent_orchestrator/utils/tool_mapping.py` to translate CAO vocabulary to native tool names.
 
-**Hard enforcement via agent JSON** (e.g., Kiro CLI, Q CLI): The CLI reads `allowedTools` from the agent profile. No `TOOL_MAPPING` entry needed — CAO passes vocabulary directly.
+**Hard enforcement via agent JSON** (e.g., Kiro CLI): The CLI reads `allowedTools` from the agent profile. No `TOOL_MAPPING` entry needed — CAO passes vocabulary directly.
 
 **Soft enforcement via system prompt** (e.g., Kimi CLI, Codex): No native restriction mechanism. CAO prepends restriction instructions to the system prompt. No `TOOL_MAPPING` entry needed.
 

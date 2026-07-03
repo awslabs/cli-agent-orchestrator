@@ -229,6 +229,19 @@ class StepOutputRequest(BaseModel):
     )
 
 
+class WorkflowRunRequest(BaseModel):
+    """Request body for ``POST /workflows/runs`` (Bolt 3, N5, C5)."""
+
+    name_or_path: str = Field(description="Workflow name (indexed) or path to a spec YAML file")
+    inputs: Dict = Field(
+        default_factory=dict, description="Run inputs validated against spec.inputs"
+    )
+    run_id: Optional[str] = Field(
+        default=None,
+        description="Optional run id (matches WORKFLOW_NAME_RE); auto-generated if omitted",
+    )
+
+
 class StepOutputResponse(BaseModel):
     """Response for the structured-return endpoint — mirrors the stored record."""
 
@@ -670,9 +683,7 @@ async def list_providers_endpoint() -> List[Dict]:
     provider_binaries = {
         "kiro_cli": "kiro-cli",
         "claude_code": "claude",
-        "q_cli": "q",
         "codex": "codex",
-        "gemini_cli": "gemini",
         "hermes": "hermes",
         "kimi_cli": "kimi",
         "copilot_cli": "copilot",
@@ -1348,6 +1359,80 @@ async def record_step_output_endpoint(
         errors=record.errors,
         state=record.state.value,
     )
+
+
+# Run-engine endpoints (Bolt 3, N5). ``start_run`` is awaited INLINE (Q1=A): the
+# HTTP request is the blocking wait, matching the synchronous ``workflow_run`` MCP
+# tool. Error mapping (C5 / B3-BR-14): unknown run/spec -> 404, invalid spec/inputs
+# -> 400, cancel-of-finished -> 409, NotBuiltYetError (reserved seam) -> 501,
+# WorkflowEngineError -> 500. Narrow exceptions in the service; mapped here.
+
+
+@app.post("/workflows/runs")
+async def start_workflow_run_endpoint(
+    body: WorkflowRunRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Resolve a spec, run it to completion inline, return the WorkflowRunResult."""
+    import uuid
+
+    from cli_agent_orchestrator.models.workflow import NotBuiltYetError
+    from cli_agent_orchestrator.services import workflow_service, workflow_spec_service
+
+    try:
+        spec = workflow_spec_service.get_workflow(body.name_or_path)
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"unknown workflow '{body.name_or_path}'",
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    run_id = body.run_id or f"run-{uuid.uuid4().hex[:16]}"
+    try:
+        result = await workflow_service.start_run(spec, body.inputs, run_id)
+    except NotBuiltYetError as e:
+        raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=str(e))
+    except KeyError as e:
+        # Duplicate run_id is a conflict, not a 404.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except workflow_service.WorkflowEngineError as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    return result.model_dump()
+
+
+@app.get("/workflows/runs/{run_id}")
+async def get_workflow_run_endpoint(run_id: str) -> Dict:
+    """Return a point-in-time status snapshot for a run (FR-5.5)."""
+    from cli_agent_orchestrator.services import workflow_service
+
+    try:
+        status_snapshot = workflow_service.get_run_status(run_id)
+    except KeyError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
+    return status_snapshot.model_dump()
+
+
+@app.post("/workflows/runs/{run_id}/cancel")
+async def cancel_workflow_run_endpoint(
+    run_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Cooperatively cancel a running workflow (FR-5.4)."""
+    from cli_agent_orchestrator.services import workflow_service
+
+    try:
+        workflow_service.cancel_run(run_id)
+    except KeyError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    return {"success": True, "run_id": run_id}
 
 
 @app.delete("/terminals/{terminal_id}")

@@ -113,7 +113,7 @@ The provider forwards a model selection in the following order of precedence:
 
 Cursor CLI v2026 does not expose a `--disallowedTools` (or equivalent) flag for hard tool enforcement, and the soft-enforcement path the provider used in earlier builds (prepending `SECURITY_PROMPT` + an allowlist to the system prompt) is **not available in v2026** because the provider no longer passes `--system-prompt` (see "Agent Profile Integration" above). The recommended path for restricted tool access on Cursor v2026 is to choose a provider that supports a native enforcement mechanism:
 
-- **Hard enforcement**: prefer Claude Code, Copilot CLI, or Gemini CLI which all support `--disallowedTools`.
+- **Hard enforcement**: prefer Claude Code, Copilot CLI, or Kiro CLI which all support native tool denial.
 - **OpenCode**: the OpenCode CLI frontmatter mechanism lets the supervisor restrict per-agent capabilities.
 - **Advisory only on Cursor v2026**: if you must use `cursor_cli` with restricted tools, configure a dedicated free-tier account + workspace and use Cursor's own permission UI to scope what the agent can do. The CAO `allowed_tools` argument is currently ignored on `cursor_cli` for v2026 and is documented as such.
 

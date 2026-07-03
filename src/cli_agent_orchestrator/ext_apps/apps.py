@@ -31,9 +31,6 @@ EVENT_STREAM_RESOURCE_URI = "ui://cao/event-stream"
 # **structured** SEP-1865 ``_meta.ui.csp`` shape (NOT a raw CSP string). The host
 # composes the actual CSP header from
 # these declared domains. ``connectDomains`` allows the iframe to stream the loopback
-# Backplane ``/events`` directly; no remote origins are declared. The spec's default
-# ``script-src`` is ``'self' 'unsafe-inline'`` with **no** ``'unsafe-eval'`` — our
-# JIT-free bundle is what lets the views run under that policy.
 DEFAULT_CSP = {
     "connectDomains": ["http://127.0.0.1:9889", "http://localhost:9889"],
     "resourceDomains": [],

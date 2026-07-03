@@ -2,7 +2,7 @@
 
 This module defines the abstract base class that all CLI providers must implement.
 A "provider" is an adapter that enables CAO to interact with a specific CLI-based
-AI agent (e.g., Kiro CLI, Claude Code, Codex, Q CLI).
+AI agent (e.g., Kiro CLI, Claude Code, Codex).
 
 Provider Responsibilities:
 - Initialize the CLI tool in a tmux window (run startup commands)
@@ -14,17 +14,20 @@ Implemented Providers:
 - KiroCliProvider: For Kiro CLI (kiro-cli chat)
 - ClaudeCodeProvider: For Claude Code (claude)
 - CodexProvider: For Codex CLI (codex)
-- QCliProvider: For Amazon Q Developer CLI (q chat)
 
 Each provider must implement pattern matching for its specific CLI's prompt
 and output format to reliably detect status changes.
 """
 
+import logging
 import re
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+
+logger = logging.getLogger(__name__)
 
 
 class BaseProvider(ABC):
@@ -67,6 +70,14 @@ class BaseProvider(ABC):
         self._allowed_tools: Optional[List[str]] = allowed_tools
         self._skill_prompt: Optional[str] = skill_prompt
         self._shell_baseline: Optional[str] = None
+        # Native-status (herdr) dispatch tracking. _task_dispatched disambiguates
+        # herdr's ambiguous "idle" (pre-first-turn IDLE vs post-turn COMPLETED);
+        # the two *_first_detected stamps drive the post-completion buffer-flush
+        # wait in _resolve_native_status(). Set by mark_input_received().
+        self._task_dispatched: bool = False
+        self._last_dispatch_time: float = 0.0
+        self._done_first_detected: float = 0.0
+        self._idle_first_detected: float = 0.0
 
     @property
     def shell_baseline(self) -> Optional[str]:
@@ -202,7 +213,7 @@ class BaseProvider(ABC):
     def extraction_retries(self) -> int:
         """Number of extraction retries for transient TUI rendering issues.
 
-        TUI-based providers (e.g. Gemini CLI's Ink renderer) may show
+        TUI-based providers (e.g. Antigravity CLI's renderer) may show
         notification spinners that temporarily obscure response text in
         the tmux capture buffer.  Override this to enable automatic retries
         with re-capture between attempts.  Default is 0 (no retries).
@@ -239,9 +250,112 @@ class BaseProvider(ABC):
         """Notify the provider that external input was sent to the terminal.
 
         Called by the terminal service after send_input() delivers a message.
-        Providers can override this to adjust status detection behavior.
+        Records that a task was dispatched so the native-status path can
+        distinguish herdr "idle" after task completion (-> COMPLETED) from
+        "idle" before any task was dispatched (-> IDLE), and resets the
+        post-completion flush-wait timers.
+
+        Providers may override to also update their own buffer-detection flag,
+        but should call ``super().mark_input_received()`` to preserve the shared
+        native-status tracking.
         """
-        pass
+        self._task_dispatched = True
+        self._last_dispatch_time = time.time()
+        self._done_first_detected = 0.0
+        self._idle_first_detected = 0.0
+
+    def _resolve_native_status(self) -> Optional[TerminalStatus]:
+        """Resolve status from the backend's native agent state, if available.
+
+        On the herdr backend, ``pipe_pane`` is a no-op so the StatusMonitor
+        buffer is always empty; status must come from herdr's native pane state
+        rather than buffer parsing. Every provider calls this at the top of
+        ``get_status()``; when it returns non-None the buffer path is skipped.
+
+        The tmux backend returns None from ``get_native_status()``, so this
+        returns None and the caller falls through to its buffer analysis
+        unchanged.
+
+        The only ambiguous native state is IDLE: herdr reports "idle" both
+        before any task has been dispatched AND after a task completed (e.g. the
+        user focused the tab, resetting "done" -> "idle"). ``_task_dispatched``
+        (set by mark_input_received()) disambiguates. COMPLETED ("done") and
+        IDLE-post-dispatch both wait 10s from first detection for the pane buffer
+        to flush before reporting COMPLETED, so extract_last_message sees settled
+        output; the idle path gives up (reports COMPLETED) 300s after dispatch.
+        """
+        from cli_agent_orchestrator.backends.registry import get_backend
+
+        native = get_backend().get_native_status(self.session_name, self.window_name)
+        logger.debug(
+            "[get_status] terminal=%s native=%s",
+            self.terminal_id,
+            native.value if native is not None else None,
+        )
+        if native is None:
+            return None
+        if native == TerminalStatus.PROCESSING:
+            # Reset flush-wait timers — herdr is actively working, so any
+            # previously stamped idle/done timestamp is from a pre-work gap
+            # and must not be counted toward the post-completion flush wait.
+            self._done_first_detected = 0.0
+            self._idle_first_detected = 0.0
+            logger.debug("[get_status] terminal=%s -> PROCESSING (native)", self.terminal_id)
+            return TerminalStatus.PROCESSING
+        if native == TerminalStatus.COMPLETED and self._task_dispatched:
+            # herdr "done": wait 10s from first detection for buffer to flush.
+            if self._done_first_detected == 0.0:
+                self._done_first_detected = time.time()
+            waited = time.time() - self._done_first_detected
+            if waited >= 10.0:
+                logger.debug(
+                    "[get_status] terminal=%s -> COMPLETED (native done, %.1fs flush wait elapsed)",
+                    self.terminal_id,
+                    waited,
+                )
+                return TerminalStatus.COMPLETED
+            logger.debug(
+                "[get_status] terminal=%s -> PROCESSING (native done, flush wait %.1fs/10s)",
+                self.terminal_id,
+                waited,
+            )
+            return TerminalStatus.PROCESSING
+        if native == TerminalStatus.IDLE and self._task_dispatched:
+            # herdr "idle" post-dispatch: wait 10s from first detection for buffer to flush,
+            # then report COMPLETED (warn if still idle 5 min after dispatch).
+            if self._idle_first_detected == 0.0:
+                self._idle_first_detected = time.time()
+            waited = time.time() - self._idle_first_detected
+            elapsed = time.time() - self._last_dispatch_time
+            if waited >= 10.0:
+                if elapsed >= 300.0:
+                    logger.warning(
+                        "[get_status] terminal=%s -> COMPLETED (native idle, %.0fs since dispatch, giving up)",
+                        self.terminal_id,
+                        elapsed,
+                    )
+                    return TerminalStatus.COMPLETED
+                logger.debug(
+                    "[get_status] terminal=%s -> COMPLETED (native idle, %.1fs flush wait elapsed)",
+                    self.terminal_id,
+                    waited,
+                )
+                return TerminalStatus.COMPLETED
+            logger.debug(
+                "[get_status] terminal=%s -> PROCESSING (native idle, flush wait %.1fs/10s)",
+                self.terminal_id,
+                waited,
+            )
+            return TerminalStatus.PROCESSING
+        if native == TerminalStatus.IDLE:
+            logger.debug(
+                "[get_status] terminal=%s -> IDLE (native idle, no task dispatched)",
+                self.terminal_id,
+            )
+            return TerminalStatus.IDLE
+        # COMPLETED (no task dispatched), WAITING_USER_ANSWER, ERROR -- return directly
+        logger.debug("[get_status] terminal=%s -> %s (native)", self.terminal_id, native.value)
+        return native
 
     @staticmethod
     def _extract_questions(user_messages: List[str]) -> List[str]:

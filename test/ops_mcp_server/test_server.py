@@ -174,14 +174,14 @@ class TestProfileTools:
             "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
             return_value=_response(json_data=payload),
         ) as mock_request:
-            result = await install_profile("https://example.com/remote.md", provider="q_cli")
+            result = await install_profile("https://example.com/remote.md", provider="kiro_cli")
 
         assert result == InstallResult(**payload)
         mock_request.assert_called_once_with(
             "post",
             "http://127.0.0.1:9889/agents/profiles/install",
             params=None,
-            json={"source": "https://example.com/remote.md", "provider": "q_cli"},
+            json={"source": "https://example.com/remote.md", "provider": "kiro_cli"},
         )
 
     async def test_install_profile_forwards_env_vars(self) -> None:

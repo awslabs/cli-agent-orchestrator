@@ -16,6 +16,15 @@ from cli_agent_orchestrator.providers.antigravity_cli import (
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
+@pytest.fixture(autouse=True)
+def _skip_startup_dialog():
+    # initialize() polls the pane to accept agy's workspace-trust dialog; that
+    # path is exercised separately. Stub it so the init tests stay fast and
+    # independent of the (mocked) get_history return type.
+    with patch.object(AntigravityCliProvider, "_handle_startup_dialog", return_value=None):
+        yield
+
+
 def load_fixture(name: str) -> str:
     return (FIXTURES_DIR / name).read_text(encoding="utf-8")
 

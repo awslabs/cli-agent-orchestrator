@@ -44,6 +44,14 @@ def _read_fixture(name: str) -> str:
 class TestKimiCliProviderInitialization:
     """Tests for KimiCliProvider initialization flow."""
 
+    @pytest.fixture(autouse=True)
+    def _skip_startup_dialog(self):
+        # initialize() polls the pane to dismiss kimi's upgrade-reminder dialog;
+        # that path has its own tests. Stub it so command-send/timeout tests stay
+        # fast and independent of the (mocked) get_history return type.
+        with patch.object(KimiCliProvider, "_handle_startup_dialog", return_value=None):
+            yield
+
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.kimi_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.kimi_cli.wait_for_shell")

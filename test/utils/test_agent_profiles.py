@@ -157,9 +157,9 @@ class TestResolveProvider:
         """Missing profile should fall back without raising."""
         mock_load.side_effect = RuntimeError("Failed to load agent profile 'ghost'")
 
-        result = resolve_provider("ghost", fallback_provider="q_cli")
+        result = resolve_provider("ghost", fallback_provider="kiro_cli")
 
-        assert result == "q_cli"
+        assert result == "kiro_cli"
 
     @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
     def test_all_valid_provider_types_accepted(self, mock_load):
@@ -342,7 +342,7 @@ class TestListAgentProfiles:
         # Provider dirs point to nonexistent paths
         mock_get_agent_dirs.return_value = {
             "kiro_cli": "/nonexistent/kiro/agents",
-            "q_cli": "/nonexistent/q/agents",
+            "cao_installed": "/nonexistent/cao/agents",
         }
         mock_get_extra_dirs.return_value = ["/nonexistent/extra/dir"]
 

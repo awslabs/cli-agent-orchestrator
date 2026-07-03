@@ -120,7 +120,7 @@ To advertise only a subset of skills to a given agent, set the `skills` field in
 
 This scopes the injected **catalog** only — it controls what an agent *sees* advertised, not what it can *load*. Skill resolution is unchanged: `load_skill` still resolves any installed skill by name, so this is a prompt-relevance / noise-reduction control, not an access boundary. (If you need a hard per-agent allowlist, that would have to be enforced in the `load_skill` path — out of scope here.)
 
-This applies only to the runtime-prompt providers that receive the injected catalog (Claude Code, Codex, Gemini CLI, Kimi CLI, Antigravity). Providers that deliver skills natively (Kiro CLI, OpenCode, GitHub Copilot CLI, Amazon Q) ignore the field.
+This applies only to the runtime-prompt providers that receive the injected catalog (Claude Code, Codex, Antigravity CLI, Kimi CLI). Providers that deliver skills natively (Kiro CLI, OpenCode, GitHub Copilot CLI) ignore the field.
 
 ```yaml
 ---
@@ -160,13 +160,12 @@ Skills are delivered to agents differently depending on the provider. The table 
 |----------|-----------------|---------------------|-----------------|
 | Claude Code | Runtime prompt | Every terminal creation | `load_skill` MCP tool |
 | Codex | Runtime prompt | Every terminal creation | `load_skill` MCP tool |
-| Gemini CLI | Runtime prompt | Every terminal creation | `load_skill` MCP tool |
-| Kimi CLI | Runtime prompt | Every terminal creation | `load_skill` MCP tool |
 | Antigravity CLI | Runtime prompt | Every terminal creation | `load_skill` MCP tool |
+| Kimi CLI | Runtime prompt | Every terminal creation | `load_skill` MCP tool |
 | Kiro CLI | Native `skill://` resources | Every terminal creation | Kiro progressive loading |
 | Copilot CLI | Baked into `.agent.md` at install | On `cao skills add/remove` | `load_skill` MCP tool |
 
-### Runtime Prompt Providers (Claude Code, Codex, Gemini CLI, Kimi CLI, Antigravity CLI)
+### Runtime Prompt Providers (Claude Code, Codex, Antigravity CLI, Kimi CLI)
 
 For these providers, the skill catalog is built fresh each time a terminal is created. The catalog — a list of skill names and descriptions — is appended to the system prompt via the provider's native CLI flags.
 

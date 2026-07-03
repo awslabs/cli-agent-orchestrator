@@ -16,7 +16,6 @@ CAO discovers agent profiles by scanning multiple directories. When loading or l
 | Key | Provider | Default Path |
 |-----|----------|-------------|
 | `kiro_cli` | Kiro CLI | `~/.kiro/agents` |
-| `q_cli` | Q CLI | `~/.aws/amazonq/cli-agents` |
 | `claude_code` | Claude Code | `~/.aws/cli-agent-orchestrator/agent-store` |
 | `codex` | Codex | `~/.aws/cli-agent-orchestrator/agent-store` |
 | `cao_installed` | CAO Installed | `~/.aws/cli-agent-orchestrator/agent-context` |
@@ -83,7 +82,6 @@ This mirrors agent-profile resolution: a skill in the global store is not shadow
 {
   "agent_dirs": {
     "kiro_cli": "~/.kiro/agents",
-    "q_cli": "~/.aws/amazonq/cli-agents",
     "claude_code": "~/.aws/cli-agent-orchestrator/agent-store",
     "codex": "~/.aws/cli-agent-orchestrator/agent-store",
     "cao_installed": "~/.aws/cli-agent-orchestrator/agent-context"

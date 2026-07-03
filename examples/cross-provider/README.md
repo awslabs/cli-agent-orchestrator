@@ -24,7 +24,7 @@ regardless of which provider the supervisor is running on.
 | Profile | Provider Override |
 |---------|------------------|
 | `data_analyst_claude_code.md` | `claude_code` |
-| `data_analyst_gemini_cli.md` | `gemini_cli` |
+| `data_analyst_kimi_cli.md` | `kimi_cli` |
 | `data_analyst_kiro_cli.md` | `kiro_cli` |
 
 ### Additional Data Analysts
@@ -57,20 +57,19 @@ cao install examples/cross-provider/cross_provider_supervisor.md
 
 # Default worker profiles (used by the supervisor)
 cao install examples/cross-provider/data_analyst_claude_code.md
-cao install examples/cross-provider/data_analyst_gemini_cli.md
+cao install examples/cross-provider/data_analyst_kimi_cli.md
 cao install examples/cross-provider/data_analyst_kiro_cli.md
 cao install examples/cross-provider/report_generator_codex.md
 ```
 
 3. Launch the supervisor:
 ```bash
-# Using Kiro CLI (workers on Claude Code + Gemini CLI + Kiro CLI + Codex)
+# Using Kiro CLI (workers on Claude Code + Kimi CLI + Kiro CLI + Codex)
 cao launch --agent-profile cross_provider_supervisor --provider kiro_cli
 
 # Or specify a different provider for the supervisor
 cao launch --agent-profile cross_provider_supervisor --provider claude_code
 cao launch --agent-profile cross_provider_supervisor --provider codex
-cao launch --agent-profile cross_provider_supervisor --provider gemini_cli
 cao launch --agent-profile cross_provider_supervisor --provider kimi_cli
 cao launch --agent-profile cross_provider_supervisor --provider copilot_cli
 ```
@@ -91,7 +90,7 @@ Generate a professional report with the analysis results.
 
 ## Customizing the Supervisor
 
-The default supervisor uses `data_analyst_claude_code`, `data_analyst_gemini_cli`,
+The default supervisor uses `data_analyst_claude_code`, `data_analyst_kimi_cli`,
 and `data_analyst_kiro_cli` for data analysis, and `report_generator_codex` for
 report generation. To use different providers:
 
@@ -110,7 +109,7 @@ cp examples/cross-provider/cross_provider_supervisor.md my_supervisor.md
 
 3. In `my_supervisor.md`, update the **Worker Profiles** table and the **Example**
    section to use your preferred profiles. For example, to use Codex and Copilot CLI
-   instead of Gemini CLI and Kiro CLI:
+   instead of Kimi CLI and Kiro CLI:
 
 ```markdown
 | `data_analyst_claude_code` | Claude Code |
@@ -146,13 +145,13 @@ mcpServers:
 ---
 ```
 
-Valid provider values: `kiro_cli`, `claude_code`, `codex`, `q_cli`, `gemini_cli`,
-`kimi_cli`, `copilot_cli`.
+Valid provider values: `kiro_cli`, `claude_code`, `codex`, `antigravity_cli`,
+`kimi_cli`, `copilot_cli`, `opencode_cli`, `cursor_cli`.
 
 ## E2E Tests
 
 See `test/e2e/test_cross_provider.py` for automated tests that verify the
-cross-provider resolution works across Kiro CLI, Gemini CLI, and Claude Code.
+cross-provider resolution works across Kiro CLI, Kimi CLI, and Claude Code.
 
 ```bash
 uv run pytest -m e2e test/e2e/test_cross_provider.py -v -o "addopts="
