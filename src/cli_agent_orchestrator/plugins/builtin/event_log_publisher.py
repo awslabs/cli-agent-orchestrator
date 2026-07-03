@@ -18,7 +18,6 @@ Invariants:
 from __future__ import annotations
 
 import logging
-import os
 
 from cli_agent_orchestrator.plugins import (
     PostCreateSessionEvent,
@@ -29,6 +28,7 @@ from cli_agent_orchestrator.plugins import (
     hook,
 )
 from cli_agent_orchestrator.plugins.base import CaoPlugin
+from cli_agent_orchestrator.services.config_service import ConfigService
 from cli_agent_orchestrator.services.event_log_service import get_event_log
 from cli_agent_orchestrator.services.event_primitives import normalize_kind
 from cli_agent_orchestrator.services.sse_bus import get_bus
@@ -37,7 +37,8 @@ logger = logging.getLogger(__name__)
 
 
 def _apps_enabled() -> bool:
-    """Return whether the MCP Apps surface is enabled via ``CAO_MCP_APPS_ENABLED``.
+    """Return whether the MCP Apps surface is enabled via ``apps.enabled``
+    (``CAO_MCP_APPS_ENABLED`` env var or ``settings.json``).
 
     Mirrors the gate used by ``mcp_apps`` / ``app_tools`` / ``sep2133`` so this
     observer is genuinely default-off. The plugin is still discovered and loaded
@@ -48,7 +49,7 @@ def _apps_enabled() -> bool:
     of fleet metadata in process memory.
     """
 
-    return os.getenv("CAO_MCP_APPS_ENABLED", "false").lower() in ("1", "true", "yes")
+    return bool(ConfigService.get("apps.enabled", default=False))
 
 
 class EventLogPublisher(CaoPlugin):

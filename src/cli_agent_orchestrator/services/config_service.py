@@ -77,12 +77,33 @@ class AppsConfig(BaseModel):
 
 
 class NetworkConfig(BaseModel):
+    """env-var only; settings.json values are not yet honored.
+
+    ``constants.py`` builds ``CORS_ORIGINS``/``ALLOWED_HOSTS``/``WS_ALLOWED_CLIENTS``
+    as module-level lists at import time and Starlette's CORS/TrustedHost
+    middleware are instantiated once, holding a reference to those exact list
+    objects (``add_local_cors_origins`` relies on this — see constants.py).
+    Rewiring them through ConfigService would require either mutating those
+    lists after settings.json changes (no invalidation mechanism exists yet)
+    or restructuring the middleware wiring — out of scope for this PR. Only
+    the ``CAO_ALLOWED_HOSTS``/``CAO_CORS_ORIGINS``/``CAO_WS_ALLOWED_CLIENTS``
+    env vars are read (in ``constants.py``, not through this schema).
+    """
+
     allowed_hosts: List[str] = Field(default_factory=list)
     cors_origins: List[str] = Field(default_factory=list)
     ws_allowed_clients: List[str] = Field(default_factory=list)
 
 
 class AuthConfig(BaseModel):
+    """env-var only; settings.json values are not yet honored.
+
+    ``security/auth.py`` is the actual authentication *enforcement* boundary
+    (not a UX gate) and is kept on direct ``os.getenv`` reads to avoid
+    changing security-critical resolution behavior in this PR. See the
+    "Config note" in that module's docstring.
+    """
+
     jwks_uri: str = ""
     audience: str = ""
     issuer: str = ""
@@ -220,6 +241,13 @@ def _load_raw() -> Dict[str, Any]:
     ``herdr_session`` keys are copied into ``settings.json`` under
     ``terminal`` and the move is logged. ``config.json`` itself is left on
     disk (untouched) but is no longer read once migrated.
+
+    This is a plain read-modify-write with no file lock: it assumes a single
+    CAO process touches ``settings.json`` at a time (the same assumption
+    ``settings_service._load``/``_save`` already make). A concurrent ``set()``
+    from a second process during migration could be lost. Acceptable for a
+    single-operator local tool; would need a lock (e.g. ``filelock``) if CAO
+    ever supports multiple concurrent writers to the same settings file.
     """
     global _migration_logged
 

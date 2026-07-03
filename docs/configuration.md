@@ -6,7 +6,7 @@ CAO stores user configuration in a single file, `~/.aws/cli-agent-orchestrator/s
 CLI flag  >  CAO_* environment variable  >  settings.json  >  built-in default
 ```
 
-`ConfigService` (`services/config_service.py`) is the single reader/writer behind this precedence chain. Callers that previously read `config.json` or scattered `os.getenv("CAO_*")` calls for the values below now resolve through it.
+`ConfigService` (`services/config_service.py`) is the single reader/writer behind this precedence chain. `agents`, `skills`, `server`, `memory`, `terminal`, and `apps` are fully wired: setting any of their keys in `settings.json` (or the mapped `CAO_*` env var) has a real runtime effect. `network` and `auth` are schema-only for now — see the "env-var only" callouts in those sections below and in the env-var reference.
 
 > `.env` file handling (`utils/env.py`, forwarded provider env vars) is a separate, out-of-scope surface — unaffected by this doc.
 
@@ -158,27 +158,31 @@ Default-off. See [../src/cli_agent_orchestrator/ext_apps/apps.py](../src/cli_age
 | `enabled` | `false` | Enables the MCP Apps surface (dashboard/agent/event-stream views + app tools + topology widget). |
 | `static_dir` | `null` | Override for the built `apps_static/` directory (packaged/dev-tree locations are tried automatically otherwise). |
 
-### Network (`network`)
+### Network (`network`) — env-var only
 
-`cao-server` is a local-only service by default. These lists **extend** (not replace) the loopback-only built-in defaults, so loopback access is preserved even when set.
+> **`network.*` keys in `settings.json` are schema-only and have no runtime effect yet.** `constants.py` builds `CORS_ORIGINS` / `ALLOWED_HOSTS` / `WS_ALLOWED_CLIENTS` as module-level lists at import time, and Starlette's CORS/TrustedHost middleware are instantiated once at server startup holding a reference to those exact list objects (`add_local_cors_origins` depends on this reference semantics). Only the `CAO_ALLOWED_HOSTS` / `CAO_CORS_ORIGINS` / `CAO_WS_ALLOWED_CLIENTS` / `CAO_FORWARDED_ALLOW_IPS` env vars are read — directly in `constants.py`, not through `ConfigService`. Routing these through the unified config would require either a live-invalidation path for the middleware's list references or restructuring how the middleware is wired; both are out of scope for this PR.
 
-| Setting | Extends | Use case |
+`cao-server` is a local-only service by default. These env vars **extend** (not replace) the loopback-only built-in defaults, so loopback access is preserved even when set.
+
+| Env var | Extends | Use case |
 |---|---|---|
-| `allowed_hosts` | `ALLOWED_HOSTS` (Host header allowlist for `TrustedHostMiddleware`) | Fronting cao-server with a reverse proxy at a non-localhost hostname. |
-| `cors_origins` | `CORS_ORIGINS` (browser origins permitted by CORS) | Serving the web UI from a non-default port or origin. |
-| `ws_allowed_clients` | `WS_ALLOWED_CLIENTS` (client IPs permitted to attach to the PTY WebSocket) | Running `cao-server` inside Docker (host browser arrives via a bridge IP). |
+| `CAO_ALLOWED_HOSTS` | `ALLOWED_HOSTS` (Host header allowlist for `TrustedHostMiddleware`) | Fronting cao-server with a reverse proxy at a non-localhost hostname. |
+| `CAO_CORS_ORIGINS` | `CORS_ORIGINS` (browser origins permitted by CORS) | Serving the web UI from a non-default port or origin. |
+| `CAO_WS_ALLOWED_CLIENTS` | `WS_ALLOWED_CLIENTS` (client IPs permitted to attach to the PTY WebSocket) | Running `cao-server` inside Docker (host browser arrives via a bridge IP). |
 
-> **Security note:** the WebSocket PTY endpoint is unauthenticated. Only add client IPs you actually trust to `ws_allowed_clients` — anyone reaching the listener at one of those IPs gets full PTY access to running agent terminals.
+> **Security note:** the WebSocket PTY endpoint is unauthenticated. Only add client IPs you actually trust to `CAO_WS_ALLOWED_CLIENTS` — anyone reaching the listener at one of those IPs gets full PTY access to running agent terminals.
 
-### Auth (`auth`)
+### Auth (`auth`) — env-var only
 
-Default-off OAuth 2.1 auth core; see [security/auth.py](../src/cli_agent_orchestrator/security/auth.py). Auth activates only when `jwks_uri` (or `AUTH0_DOMAIN`) is set.
+> **`auth.*` keys in `settings.json` are schema-only and have no runtime effect yet.** `security/auth.py` is the actual authentication *enforcement* boundary (not a UX gate) and is deliberately kept on direct `os.getenv` reads in this PR, to avoid changing security-critical resolution behavior. Only the env vars below are honored.
 
-| Setting | Description |
+Default-off OAuth 2.1 auth core; see [security/auth.py](../src/cli_agent_orchestrator/security/auth.py). Auth activates only when `CAO_AUTH_JWKS_URI` (or `AUTH0_DOMAIN`) is set.
+
+| Env var | Description |
 |---------|--------------|
-| `jwks_uri` | Generic IdP JWKS endpoint. |
-| `audience` | Expected token audience. |
-| `issuer` | Issuer advertised by the RFC 9728 PRM endpoint. |
+| `CAO_AUTH_JWKS_URI` | Generic IdP JWKS endpoint. |
+| `CAO_AUTH_AUDIENCE` | Expected token audience. |
+| `CAO_AUTH_ISSUER` | Issuer advertised by the RFC 9728 PRM endpoint. |
 
 ### Logging (`logging`)
 
@@ -188,7 +192,9 @@ Default-off OAuth 2.1 auth core; see [security/auth.py](../src/cli_agent_orchest
 
 ## Environment variable reference
 
-Every `CAO_*` variable below maps 1:1 to a `settings.json` key and is resolved through the same precedence chain — an env var always beats the file, and always loses to an explicit CLI flag.
+### Wired through ConfigService
+
+Every `CAO_*` variable below maps 1:1 to a `settings.json` key and is resolved through the standard precedence chain — the env var beats the file, and both lose to an explicit CLI flag where one exists. Setting either the env var or the `settings.json` key has a real runtime effect.
 
 | Env var | Config path | Type |
 |---|---|---|
@@ -196,13 +202,7 @@ Every `CAO_*` variable below maps 1:1 to a `settings.json` key and is resolved t
 | `CAO_HERDR_SESSION` | `terminal.herdr_session` | str |
 | `CAO_MCP_APPS_ENABLED` | `apps.enabled` | bool |
 | `CAO_MCP_APPS_STATIC_DIR` | `apps.static_dir` | str |
-| `CAO_AUTH_JWKS_URI` | `auth.jwks_uri` | str |
-| `CAO_AUTH_AUDIENCE` | `auth.audience` | str |
-| `CAO_AUTH_ISSUER` | `auth.issuer` | str |
 | `CAO_LOG_LEVEL` | `logging.level` | str |
-| `CAO_ALLOWED_HOSTS` | `network.allowed_hosts` | comma-separated list |
-| `CAO_CORS_ORIGINS` | `network.cors_origins` | comma-separated list |
-| `CAO_WS_ALLOWED_CLIENTS` | `network.ws_allowed_clients` | comma-separated list |
 | `CAO_MEMORY_ENABLED` | `memory.enabled` | bool |
 | `CAO_MEMORY_COMPILE_MODE` | `memory.compile_mode` | str (`llm`/`append`) |
 | `CAO_MEMORY_FLUSH_THRESHOLD` | `memory.flush_threshold` | float |
@@ -212,6 +212,19 @@ Every `CAO_*` variable below maps 1:1 to a `settings.json` key and is resolved t
 | `CAO_STARTUP_PROMPT_HANDLER_TIMEOUT` | `server.startup_prompt_handler_timeout` | int |
 
 The full table lives in `ConfigService.ENV_REGISTRY` (`services/config_service.py`) — the source of truth this doc mirrors.
+
+### Env-var only (settings.json value not yet honored)
+
+These map to `network.*` / `auth.*` schema paths for documentation purposes, but only the env var is actually read — see the "env-var only" notes in the [Network](#network-network--env-var-only) and [Auth](#auth-auth--env-var-only) sections above for why.
+
+| Env var | Config path | Type |
+|---|---|---|
+| `CAO_AUTH_JWKS_URI` | `auth.jwks_uri` | str |
+| `CAO_AUTH_AUDIENCE` | `auth.audience` | str |
+| `CAO_AUTH_ISSUER` | `auth.issuer` | str |
+| `CAO_ALLOWED_HOSTS` | `network.allowed_hosts` | comma-separated list |
+| `CAO_CORS_ORIGINS` | `network.cors_origins` | comma-separated list |
+| `CAO_WS_ALLOWED_CLIENTS` | `network.ws_allowed_clients` | comma-separated list |
 
 ### Not yet routed through ConfigService
 

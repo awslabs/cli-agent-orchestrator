@@ -88,6 +88,7 @@ from cli_agent_orchestrator.services.cleanup_service import (
     cleanup_expired_memories,
     cleanup_old_data,
 )
+from cli_agent_orchestrator.services.config_service import ConfigService
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.event_log_service import RING_CAPACITY
 from cli_agent_orchestrator.services.event_primitives import KINDS as EVENT_KINDS
@@ -523,12 +524,13 @@ async def health_check():
 def _mcp_apps_enabled() -> bool:
     """Whether the MCP Apps HTTP surface (event stream + widget) is enabled.
 
-    Mirrors the ``CAO_MCP_APPS_ENABLED`` gate used by the ``mcp_apps`` plugin,
+    Reads ``apps.enabled`` via ConfigService (``CAO_MCP_APPS_ENABLED`` env var
+    or ``settings.json``), mirroring the gate used by the ``mcp_apps`` plugin,
     ``app_tools``, ``sep2133`` and the ``event_log_publisher`` observer so the
     whole surface is consistently default-off.
     """
 
-    return os.getenv("CAO_MCP_APPS_ENABLED", "false").lower() in ("1", "true", "yes")
+    return bool(ConfigService.get("apps.enabled", default=False))
 
 
 def _require_mcp_apps_enabled() -> None:

@@ -16,9 +16,10 @@ the boundary and only reads static files from disk.
 """
 
 import logging
-import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from cli_agent_orchestrator.services.config_service import ConfigService
 
 logger = logging.getLogger(__name__)
 
@@ -64,18 +65,20 @@ PREFERRED_FRAMES: Dict[str, Dict[str, int]] = {
 
 
 def _is_enabled() -> bool:
-    """Return whether the MCP App surface is enabled via ``CAO_MCP_APPS_ENABLED``."""
+    """Return whether the MCP App surface is enabled via ``apps.enabled``
+    (``CAO_MCP_APPS_ENABLED`` env var or ``settings.json``)."""
 
-    return os.getenv("CAO_MCP_APPS_ENABLED", "false").lower() in ("1", "true", "yes")
+    return bool(ConfigService.get("apps.enabled", default=False))
 
 
 def apps_static_dir() -> Optional[Path]:
     """Return the first existing ``apps_static`` directory, or ``None``.
 
-    Tries the env override, the packaged location, then the source-tree location.
+    Tries the ``apps.static_dir`` override (``CAO_MCP_APPS_STATIC_DIR`` env var
+    or ``settings.json``), the packaged location, then the source-tree location.
     """
 
-    override = os.getenv("CAO_MCP_APPS_STATIC_DIR")
+    override = ConfigService.get("apps.static_dir", default=None)
     candidates: List[Path] = []
     if override:
         candidates.append(Path(override))
