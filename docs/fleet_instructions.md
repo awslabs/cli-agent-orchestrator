@@ -57,7 +57,7 @@ flowchart TB
     subgraph coord["Coordinator"]
         direction TB
         UI["Browser — Fleet Console SPA"]
-        Panel["cao-fleet-panel<br/>FastAPI · stateless fan-out"]
+        Panel["fleet-panel<br/>FastAPI · stateless fan-out"]
         Cond["fleet-conductor<br/>AI agent · one MCP server per node"]
         Reg[("fleet.json<br/>node registry")]
     end
@@ -236,7 +236,7 @@ sequenceDiagram
   WireGuard IP, a VPN or LAN IP, or a DNS name. (The example values are placeholders
   in the reserved `100.64.0.0/10` CGNAT range; replace them with your own.)
 - **`port`** defaults to `9889` (CAO's server port) and can be overridden per node.
-- **`name`** is how you refer to the node in `cao-fleet`, the panel, and the conductor.
+- **`name`** is how you refer to the node in `fleet`, the panel, and the conductor.
 - **`label`** / **`role`** are optional and used by the panel for display.
 
 ## Transport and security
@@ -272,12 +272,12 @@ cd examples/fleet && cp fleet.example.json fleet.json    # then edit
 python3 bin/render-mcp-config.py && bin/fleet-conductor
 
 # 3b. …or the web panel:
-cd panel && uv sync && uv run cao-fleet-panel            # http://127.0.0.1:9888
+cd panel && uv sync && uv run fleet-panel            # http://127.0.0.1:9888
 ```
 
 Ad-hoc, from the shell:
 
 ```bash
-examples/fleet/bin/cao-fleet list
-examples/fleet/bin/cao-fleet exec node-b session list
+examples/fleet/bin/fleet list
+examples/fleet/bin/fleet exec node-b session list
 ```
