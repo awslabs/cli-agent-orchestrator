@@ -92,7 +92,13 @@ def _get_role_defaults(role: str) -> List[str] | None:
     from cli_agent_orchestrator.services.settings_service import _load
 
     settings = _load()
-    custom_roles = settings.get("roles", {})
+    # Nested format: {"agents": {"roles": {...}}}
+    nested = settings.get("agents", {})
+    if isinstance(nested, dict) and "roles" in nested and isinstance(nested["roles"], dict):
+        custom_roles = nested["roles"]
+    else:
+        # Legacy flat format: {"roles": {...}}
+        custom_roles = settings.get("roles", {})
     if role in custom_roles:
         return list(custom_roles[role])
 

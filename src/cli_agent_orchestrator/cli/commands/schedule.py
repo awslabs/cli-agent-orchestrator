@@ -1,7 +1,6 @@
-"""Flow commands for CLI Agent Orchestrator."""
+"""Schedule commands for CLI Agent Orchestrator (scheduled agent flows)."""
 
 import asyncio
-from datetime import datetime
 
 import click
 
@@ -10,27 +9,27 @@ from cli_agent_orchestrator.services import flow_service
 
 
 @click.group()
-def flow():
+def schedule():
     """Manage scheduled agent flows."""
     # Ensure database is initialized
     init_db()
 
 
-@flow.command()
+@schedule.command()
 @click.argument("file_path", type=click.Path(exists=True))
 def add(file_path):
     """Add a flow from file."""
     try:
-        flow = flow_service.add_flow(file_path)
-        click.echo(f"Flow '{flow.name}' added successfully")
-        click.echo(f"  Schedule: {flow.schedule}")
-        click.echo(f"  Agent: {flow.agent_profile}")
-        click.echo(f"  Next run: {flow.next_run}")
+        added = flow_service.add_flow(file_path)
+        click.echo(f"Flow '{added.name}' added successfully")
+        click.echo(f"  Schedule: {added.schedule}")
+        click.echo(f"  Agent: {added.agent_profile}")
+        click.echo(f"  Next run: {added.next_run}")
     except Exception as e:
         raise click.ClickException(str(e))
 
 
-@flow.command()
+@schedule.command()
 def list():
     """List all flows."""
     try:
@@ -56,7 +55,7 @@ def list():
         raise click.ClickException(str(e))
 
 
-@flow.command()
+@schedule.command()
 @click.argument("name")
 def remove(name):
     """Remove a flow."""
@@ -67,7 +66,7 @@ def remove(name):
         raise click.ClickException(str(e))
 
 
-@flow.command()
+@schedule.command()
 @click.argument("name")
 def disable(name):
     """Disable a flow."""
@@ -78,7 +77,7 @@ def disable(name):
         raise click.ClickException(str(e))
 
 
-@flow.command()
+@schedule.command()
 @click.argument("name")
 def enable(name):
     """Enable a flow."""
@@ -114,7 +113,7 @@ async def _run_flow_with_pipeline(name):
         await asyncio.gather(status_task, log_task, return_exceptions=True)
 
 
-@flow.command()
+@schedule.command()
 @click.argument("name")
 def run(name):
     """Manually run a flow."""
@@ -129,3 +128,19 @@ def run(name):
             click.echo(f"Flow '{name}' skipped (execute=false)")
     except Exception as e:
         raise click.ClickException(str(e))
+
+
+@click.group(name="flow", hidden=True)
+def flow():
+    """[Deprecated] Alias for 'cao schedule'."""
+    click.secho(
+        "Warning: 'cao flow' is deprecated; use 'cao schedule' instead.",
+        fg="yellow",
+        err=True,
+    )
+    init_db()
+
+
+# Share the same subcommand objects so alias behavior is identical (issue #378).
+for _cmd in schedule.commands.values():
+    flow.add_command(_cmd)

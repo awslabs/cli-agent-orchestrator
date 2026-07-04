@@ -30,7 +30,6 @@ enforcement point.
 
 import json
 import logging
-import os
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -51,6 +50,7 @@ from cli_agent_orchestrator.security.auth import (
     get_scopes_for_local_token,
     local_auth_misconfig_error,
 )
+from cli_agent_orchestrator.services.config_service import ConfigService
 from cli_agent_orchestrator.services.event_log_service import get_event_log
 from cli_agent_orchestrator.services.event_primitives import normalize_kind
 from cli_agent_orchestrator.services.ui_state_service import (
@@ -89,9 +89,10 @@ MAX_PAYLOAD_CHARS = 16000
 
 
 def _is_enabled() -> bool:
-    """Return whether the MCP App surface is enabled via ``CAO_MCP_APPS_ENABLED``."""
+    """Return whether the MCP App surface is enabled via ``apps.enabled``
+    (``CAO_MCP_APPS_ENABLED`` env var or ``settings.json``)."""
 
-    return os.getenv("CAO_MCP_APPS_ENABLED", "false").lower() in ("1", "true", "yes")
+    return bool(ConfigService.get("apps.enabled", default=False))
 
 
 # ---------------------------------------------------------------------------

@@ -28,7 +28,6 @@ from cli_agent_orchestrator.ext_apps.apps import (
     ui_meta,
 )
 from cli_agent_orchestrator.ext_apps.sep2133 import (
-    CAO_MCP_APPS_ENABLED,
     EXTENSION_ID,
     SERVER_EXTENSION_CAPABILITY,
     advertise_capability,
@@ -56,7 +55,6 @@ __all__ = [
     "client_supports_mcp_apps",
     "EXTENSION_ID",
     "SERVER_EXTENSION_CAPABILITY",
-    "CAO_MCP_APPS_ENABLED",
     # commit 7 topology widget
     "register_widget",
     "mount_widget_static",

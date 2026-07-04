@@ -16,6 +16,14 @@ Auth0-specific behavior is hard-depended on.
 **Boundary note:** this module must NOT import ``clients.tmux`` or
 ``clients.database`` (it is imported by ``mcp_server/app_tools.py``, which sits
 behind the HTTP-only guard). It depends only on ``constants`` and ``pyjwt``.
+
+**Config note (issue #357):** ``AUTH0_DOMAIN``/``CAO_AUTH_JWKS_URI``/
+``CAO_AUTH_AUDIENCE``/``CAO_AUTH_ISSUER`` are **env-var only** here — the
+``auth.*`` settings.json keys are not read on this path. This module is the
+actual authentication *enforcement* boundary (not a UX gate), so it is kept on
+direct ``os.getenv`` reads rather than routed through ``ConfigService`` to
+avoid changing security-critical resolution behavior in this PR. See
+docs/configuration.md for the full rationale.
 """
 
 import logging
