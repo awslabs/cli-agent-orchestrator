@@ -846,8 +846,24 @@ def export_bundle_to_tar(
     with tempfile.TemporaryDirectory(prefix="cao-okf-export-") as tmp:
         tmp_path = Path(tmp)
         report = backend.export_bundle(scope, scope_id, tmp_path, include_history, redact)
-        with tarfile.open(target, "w:gz") as tar:
-            for member in sorted(tmp_path.rglob("*")):
-                if member.is_file():
-                    tar.add(member, arcname=member.relative_to(tmp_path).as_posix())
+
+        # Deterministic tar.gz: stable member ordering/metadata and gzip mtime=0.
+        import gzip
+
+        def _filter(ti: tarfile.TarInfo) -> tarfile.TarInfo:
+            ti.uid = ti.gid = 0
+            ti.uname = ti.gname = ""
+            ti.mtime = 0
+            return ti
+
+        with open(target, "wb") as raw:
+            with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as gz:
+                with tarfile.open(fileobj=gz, mode="w") as tar:
+                    for member in sorted(tmp_path.rglob("*")):
+                        if member.is_file():
+                            tar.add(
+                                member,
+                                arcname=member.relative_to(tmp_path).as_posix(),
+                                filter=_filter,
+                            )
     return report
