@@ -487,6 +487,19 @@ def send_input(
         # Check how many Enter keys the provider needs after paste
         enter_count = provider.paste_enter_count if provider else 1
 
+        # Reset the status monitor buffer FIRST so stale idle prompts from
+        # BEFORE the input can't trigger a false COMPLETED before the agent has
+        # a chance to render its "Thinking..." indicator. Without this,
+        # kiro-cli 2.11's TUI can retain the "ask a question" placeholder in
+        # the raw buffer, which combined with input_received=True causes
+        # get_status() to return COMPLETED within seconds of send_input.
+        # NOTE: reset_buffer() clears _allow_processing_revert as a side effect,
+        # so notify_input_sent MUST be called AFTER this to re-arm the sticky
+        # gate; otherwise the IDLE→PROCESSING transition gets latch-blocked and
+        # the terminal reads IDLE for the entire busy turn (issue observed in
+        # test_supervisor_assign_and_handoff).
+        status_monitor.reset_buffer(terminal_id)
+
         # Arm the StatusMonitor stickiness gate so that the next provider-
         # detected PROCESSING transition is honored (overriding the latched
         # IDLE/COMPLETED). Without this, sticky ready-status would block
@@ -509,14 +522,6 @@ def send_input(
         # state and resume normal COMPLETED detection after a real task.
         if provider:
             provider.mark_input_received()
-
-        # Reset the status monitor buffer so stale idle prompts from BEFORE
-        # the input don't trigger a false COMPLETED before the agent has a
-        # chance to render its "Thinking..." indicator. Without this, kiro-cli
-        # 2.11's TUI can retain the "ask a question" placeholder in the raw
-        # buffer, which combined with input_received=True causes get_status()
-        # to return COMPLETED within seconds of send_input.
-        status_monitor.reset_buffer(terminal_id)
 
         update_last_active(terminal_id)
         logger.info(f"Sent input to terminal: {terminal_id}")

@@ -674,15 +674,21 @@ class TestSendInput:
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_send_input_resets_status_monitor_buffer(
+    def test_send_input_resets_buffer_then_arms(
         self, mock_get_metadata, mock_tmux, mock_pm, mock_update, mock_status_monitor
     ):
-        """send_input must reset the status monitor buffer after sending.
+        """send_input must call reset_buffer BEFORE notify_input_sent.
 
-        Without this, stale idle prompts from BEFORE the input can combine with
-        input_received=True to trigger a false COMPLETED for kiro-cli 2.11+
-        (whose TUI keeps the "ask a question" placeholder visible always).
-        Regression guard for the handoff-worker-killed-in-8s bug.
+        reset_buffer clears _allow_processing_revert as a side effect. If
+        notify_input_sent is called first (as it was before this fix), the arm
+        is silently consumed and the subsequent IDLE→PROCESSING transition
+        gets latch-blocked, causing the terminal to report IDLE for the entire
+        busy turn (observed in test_supervisor_assign_and_handoff — supervisor
+        completed a real task but wait_until_status(COMPLETED) timed out).
+
+        The reset itself is still needed to prevent stale idle placeholders
+        from the pre-task buffer combining with input_received=True to trigger
+        a false COMPLETED (the handoff-worker-killed-in-8s bug).
         """
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
@@ -695,8 +701,26 @@ class TestSendInput:
 
         send_input("test1234", "hello worker")
 
+        # Both were called
         mock_provider.mark_input_received.assert_called_once()
         mock_status_monitor.reset_buffer.assert_called_once_with("test1234")
+        mock_status_monitor.notify_input_sent.assert_called_once_with("test1234")
+
+        # reset_buffer MUST come before notify_input_sent, otherwise reset
+        # wipes the arm the notify just set.
+        reset_call_idx = None
+        notify_call_idx = None
+        for i, call in enumerate(mock_status_monitor.mock_calls):
+            name = call[0]
+            if name == "reset_buffer" and reset_call_idx is None:
+                reset_call_idx = i
+            if name == "notify_input_sent" and notify_call_idx is None:
+                notify_call_idx = i
+        assert reset_call_idx is not None and notify_call_idx is not None
+        assert reset_call_idx < notify_call_idx, (
+            "reset_buffer must be called BEFORE notify_input_sent — reset "
+            "clears the arm that notify sets"
+        )
 
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
