@@ -20,9 +20,10 @@ Both entry points are **default-off**: they are no-ops unless
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 from typing import Any
+
+from cli_agent_orchestrator.services.config_service import ConfigService
 
 logger = logging.getLogger(__name__)
 
@@ -33,15 +34,16 @@ WIDGET_MOUNT_PATH = "/widgets/topology"
 
 
 def _is_enabled() -> bool:
-    """Return whether the MCP App surface is enabled via ``CAO_MCP_APPS_ENABLED``."""
+    """Return whether the MCP App surface is enabled via ``apps.enabled``
+    (``CAO_MCP_APPS_ENABLED`` env var or ``settings.json``)."""
 
-    return os.getenv("CAO_MCP_APPS_ENABLED", "false").lower() in ("1", "true", "yes")
+    return bool(ConfigService.get("apps.enabled", default=False))
 
 
 def mount_widget_static(app: Any) -> None:
     """Mount the static bundle at ``/widgets/topology/`` on a FastAPI app.
 
-    No-op unless ``CAO_MCP_APPS_ENABLED`` is set. Caller is the main FastAPI app
+    No-op unless ``apps.enabled`` is set. Caller is the main FastAPI app
     in ``api/main.py``. Idempotent — re-mounting the same path is skipped (FastAPI
     raises if the same path is mounted twice).
     """

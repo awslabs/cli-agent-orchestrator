@@ -1,5 +1,8 @@
 """Tests for CLI main entry point."""
 
+import importlib
+from importlib.metadata import PackageNotFoundError, version
+
 from click.testing import CliRunner
 
 from cli_agent_orchestrator.cli.main import cli
@@ -93,3 +96,37 @@ class TestCliMain:
         result = runner.invoke(cli, ["unknown-command"])
 
         assert result.exit_code != 0
+
+    def test_cli_version_long_flag(self):
+        """Test --version prints the installed package version and exits 0."""
+        runner = CliRunner()
+        result = runner.invoke(cli, ["--version"])
+
+        assert result.exit_code == 0
+        assert "cao" in result.output
+        assert version("cli-agent-orchestrator") in result.output
+
+    def test_cli_version_short_flag(self):
+        """Test -V prints the installed package version and exits 0."""
+        runner = CliRunner()
+        result = runner.invoke(cli, ["-V"])
+
+        assert result.exit_code == 0
+        assert "cao" in result.output
+        assert version("cli-agent-orchestrator") in result.output
+
+    def test_cli_version_fallback_when_package_not_found(self, mocker):
+        """Test that a missing package metadata falls back gracefully instead of crashing."""
+        main_module = importlib.import_module("cli_agent_orchestrator.cli.main")
+        with mocker.patch(
+            "importlib.metadata.version",
+            side_effect=PackageNotFoundError("cli-agent-orchestrator"),
+        ):
+            importlib.reload(main_module)
+            assert main_module.__version__ == "unknown"
+
+            runner = CliRunner()
+            result = runner.invoke(main_module.cli, ["--help"])
+            assert result.exit_code == 0
+
+        importlib.reload(main_module)  # patch is undone here — real version restored

@@ -87,5 +87,5 @@ Manage sessions, spawn agents, create scheduled flows, configure agent directori
 ## Related
 
 - [web/README.md](../web/README.md) — frontend architecture and component details
-- [docs/settings.md](settings.md) — agent directory configuration
+- [docs/configuration.md](configuration.md) — agent directory configuration
 - [docs/control-planes.md](control-planes.md) — where the Web UI fits alongside `cao session` and `cao-ops-mcp`

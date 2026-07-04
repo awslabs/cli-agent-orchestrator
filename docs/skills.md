@@ -108,7 +108,7 @@ Each registered directory is scanned one level deep — every immediate subfolde
 
 **Resolution order.** Directories are searched global store first, then `extra_skill_dirs` in the configured order. The first *valid* match for a given name wins, so a skill in the global store is never shadowed by a same-named skill in a later extra directory, and an invalid (unloadable) folder does not shadow a later valid one of the same name — `cao skills list` and `load_skill` resolve a name to the same skill.
 
-**Configuration.** Extra skill directories are stored under `extra_skill_dirs` in `~/.aws/cli-agent-orchestrator/settings.json` and managed through the `/settings/skill-dirs` API. See [settings.md](./settings.md#skill-directories) for the request/response format.
+**Configuration.** Extra skill directories are stored under `skills.extra_dirs` in `~/.aws/cli-agent-orchestrator/settings.json` and managed through the `/settings/skill-dirs` API. See [configuration.md](./configuration.md#skills-skills) for the request/response format.
 
 ## How Agents Discover Skills
 
