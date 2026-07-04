@@ -384,6 +384,20 @@ class StatusMonitor:
         with self._lock:
             self._allow_processing_revert[terminal_id] = True
 
+    def clear_rolling_buffer(self, terminal_id: str) -> None:
+        """Clear ONLY the rolling byte buffer for a terminal — preserves
+        ``_last_status`` and ``_allow_processing_revert``.
+
+        Used by send_input to drop stale pre-task content (e.g. kiro-cli 2.11's
+        "ask a question" idle placeholder) so it can't combine with the
+        input_received flag to trigger a false COMPLETED before the agent has
+        rendered its processing indicator. Unlike ``reset_buffer``, this does
+        NOT wipe the sticky-latch state, so the arm set by ``notify_input_sent``
+        survives and the subsequent IDLE→PROCESSING transition is honored.
+        """
+        with self._lock:
+            self._buffers[terminal_id] = ""
+
     def _detect_status(self, terminal_id: str, buffer: str) -> TerminalStatus:
         """Detect status: provider-specific patterns or UNKNOWN if no provider."""
         provider = provider_manager.get_provider(terminal_id)
