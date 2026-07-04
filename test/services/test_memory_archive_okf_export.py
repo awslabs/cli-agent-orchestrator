@@ -420,6 +420,23 @@ class TestTarHelper:
         with pytest.raises(ValueError, match="directory"):
             export_bundle_to_tar(backend, "global", None, tmp_path)
 
+    def test_tar_output_is_deterministic(self, svc, backend, tmp_path):
+        # Sorted members, zeroed uid/gid/mtime, gzip mtime=0 → exporting the
+        # same bundle twice yields byte-identical archives.
+        import hashlib
+
+        _store(svc, "topic-one", "Body one.")
+        _store(svc, "topic-two", "Body two.")
+        digests = []
+        # Same basename both times: gzip embeds the target's basename in
+        # its header, so determinism is per target name.
+        for subdir in ("first", "second"):
+            tar_path = tmp_path / subdir / "out.tar.gz"
+            tar_path.parent.mkdir()
+            export_bundle_to_tar(backend, "global", None, tar_path)
+            digests.append(hashlib.sha256(tar_path.read_bytes()).hexdigest())
+        assert digests[0] == digests[1]
+
 
 class TestImportImplemented:
     # Replaces Unit 2's NotImplementedError assertion: import_bundle now

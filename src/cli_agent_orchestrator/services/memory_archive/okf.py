@@ -226,7 +226,11 @@ class OkfArchiveBackend(MemoryArchiveBackend):
             if path.name in _RESERVED_FILES or rel.split("/", 1)[0] == _HISTORY_DIR:
                 continue
             if "/" in rel:
-                self._reject(report, rel, "nested topic paths are not supported; place topics in the bundle root")
+                self._reject(
+                    report,
+                    rel,
+                    "nested topic paths are not supported; place topics in the bundle root",
+                )
                 continue
             self._import_one_topic(
                 path,

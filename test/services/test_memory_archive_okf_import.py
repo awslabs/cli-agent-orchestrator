@@ -295,6 +295,22 @@ class TestFrontmatterHandling:
         backend.import_bundle(bundle, "global", "skip", False)
         assert _metadata_row(svc, "tagged").tags == "alpha,beta"
 
+    def test_nested_topic_path_rejected(self, svc, backend, bundle):
+        # A .md file under a non-history subdirectory is rejected per-file
+        # with the nested-path reason; import continues for root topics.
+        sub = bundle / "sub" / "dir"
+        sub.mkdir(parents=True)
+        (sub / "nested-topic.md").write_text(
+            "---\ntype: reference\n---\nnested body\n", encoding="utf-8"
+        )
+        _write_topic(bundle, "root-topic", "root body")
+        report = backend.import_bundle(bundle, "global", "skip", False)
+        assert report.rejected == 1
+        assert "nested topic paths" in report.errors["sub/dir/nested-topic.md"]
+        assert report.imported == 1
+        assert not svc.get_wiki_path("global", None, "nested-topic").exists()
+        assert svc.get_wiki_path("global", None, "root-topic").exists()
+
     def test_reserved_files_and_history_skipped(self, svc, backend, bundle):
         (bundle / "index.md").write_text("* [x](x.md)\n", encoding="utf-8")
         (bundle / "manifest.md").write_text("# manifest\n", encoding="utf-8")

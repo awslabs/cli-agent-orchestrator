@@ -100,6 +100,19 @@ class TestOccurredAtInOrder:
         assert headings == [PAST_ISO]
         assert mem.timestamp_clamped is False
 
+    def test_non_utc_tz_aware_converted_to_utc(self, svc):
+        # Same instant as PAST expressed at UTC+5: 17:00+05:00 == 12:00Z.
+        # The heading must reflect the UTC instant, and since the instant
+        # is genuinely in the past no clamp occurs.
+        plus_five = PAST.astimezone(timezone(timedelta(hours=5)))
+        assert plus_five.hour == 17
+        mem = _run(svc.store(content="note", scope="global", key="topic-tz", occurred_at=plus_five))
+        headings, content = _headings(svc, "topic-tz")
+        assert headings == [PAST_ISO]
+        assert mem.created_at == PAST
+        assert mem.timestamp_clamped is False
+        assert "_Originally recorded:" not in content
+
 
 class TestOccurredAtClamped:
     def test_future_clamps_on_new_topic(self, svc):
