@@ -1,7 +1,7 @@
 # Example systemd unit for the CAO Fleet Panel, running on the coordinator.
 # Replace the placeholders, then:
-#   sudo cp cao-fleet-panel.service.example /etc/systemd/system/cao-fleet-panel.service
-#   sudo systemctl daemon-reload && sudo systemctl enable --now cao-fleet-panel.service
+#   sudo cp fleet-panel.service.example /etc/systemd/system/fleet-panel.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now fleet-panel.service
 #
 # Placeholders:
 #   YOUR_USER            OS user that owns the checkout
@@ -23,7 +23,7 @@ Environment=HOME=/home/YOUR_USER
 Environment=CAO_PANEL_HOST=YOUR_PANEL_HOST
 Environment=CAO_PANEL_PORT=9888
 WorkingDirectory=/path/to/examples/fleet/panel
-ExecStart=/home/YOUR_USER/.local/bin/uv run cao-fleet-panel
+ExecStart=/home/YOUR_USER/.local/bin/uv run fleet-panel
 Restart=on-failure
 RestartSec=3
 

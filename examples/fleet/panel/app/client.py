@@ -10,7 +10,7 @@ TIMEOUT = httpx.Timeout(8.0, connect=4.0)
 # CAO's POST /sessions blocks until the agent CLI reaches a ready prompt
 # (it uses a 60s internal init timeout), so allow headroom beyond that.
 LAUNCH_TIMEOUT = httpx.Timeout(90.0, connect=5.0)
-SENDER_ID = "cao-fleet-panel"
+SENDER_ID = "fleet-panel"
 
 
 async def _get(c, base, path, params=None):

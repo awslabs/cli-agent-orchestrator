@@ -42,7 +42,7 @@ async def test_send_message_path_and_params():
         await client.send_message(c, "http://x", "term-1", "hello")
     assert seen["path"] == "/terminals/term-1/inbox/messages"
     assert seen["params"]["message"] == "hello"
-    assert seen["params"]["sender_id"] == "cao-fleet-panel"
+    assert seen["params"]["sender_id"] == "fleet-panel"
 
 
 async def test_http_error_raises():
@@ -88,7 +88,7 @@ async def test_send_input_path_and_params():
         await client.send_input(c, "http://x", "abcd1234", "ls -la")
     assert seen["path"] == "/terminals/abcd1234/input"
     assert seen["params"]["message"] == "ls -la"
-    assert seen["params"]["sender_id"] == "cao-fleet-panel"
+    assert seen["params"]["sender_id"] == "fleet-panel"
 
 
 async def test_list_providers_path():
