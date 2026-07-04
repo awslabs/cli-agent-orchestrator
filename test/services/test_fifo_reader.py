@@ -146,3 +146,126 @@ class TestReaderThreadLifecycle:
         assert all(not t.is_alive() for t in threads)
         leftover = [t.name for t in _threading.enumerate() if t.name.startswith("fifo-term-cycle")]
         assert leftover == []
+
+
+class TestReaderLoopCoalescing:
+    """Tests for chunk coalescing in _reader_loop.
+
+    kiro-cli's TUI animates a spinner at ~10 fps and each frame is a separate
+    FIFO write. Publishing one event per raw read floods the shared async
+    queue (1024 slots, drop-on-full) and wipes out worker state transitions
+    that assign/handoff rely on. The reader batches chunks arriving within
+    _COALESCE_WINDOW into one publish.
+    """
+
+    def test_rapid_writes_produce_fewer_publishes_than_writes(self, tmp_path, monkeypatch):
+        """10 back-to-back small writes must not produce 10 publishes.
+
+        Regression guard for the queue-overflow bug that broke assign/handoff:
+        each spinner frame was a separate publish, dropping worker completion
+        events on the floor.
+        """
+        import threading
+        import time
+        from unittest.mock import patch
+
+        monkeypatch.setattr("cli_agent_orchestrator.services.fifo_reader.FIFO_DIR", tmp_path)
+
+        fifo_path = tmp_path / "term-coalesce.fifo"
+        os.mkfifo(fifo_path)
+
+        published: list[dict] = []
+
+        def fake_publish(topic, payload):
+            published.append({"topic": topic, "data": payload["data"]})
+
+        stop_flag = threading.Event()
+        with patch(
+            "cli_agent_orchestrator.services.fifo_reader.bus.publish",
+            side_effect=fake_publish,
+        ):
+            reader = threading.Thread(
+                target=FifoManager._reader_loop,
+                args=("term-coalesce", fifo_path, stop_flag),
+                daemon=True,
+            )
+            reader.start()
+
+            # Give reader time to open its fds.
+            time.sleep(0.1)
+
+            # Simulate spinner-frame bursts: 10 tiny writes within one window,
+            # separated by short pauses that mimic ~100Hz TUI redraws.
+            wfd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
+            try:
+                for i in range(10):
+                    os.write(wfd, f"frame-{i}".encode())
+                    time.sleep(0.002)  # 2ms — well below the coalesce window
+                # Let the reader flush.
+                time.sleep(0.2)
+            finally:
+                os.close(wfd)
+                stop_flag.set()
+                reader.join(timeout=2.0)
+
+        # 10 writes must NOT produce 10 publishes.
+        assert len(published) < 10, (
+            f"Coalescing failed: got {len(published)} publishes for 10 writes. "
+            f"Expected fewer than 10 (ideally 1-3)."
+        )
+        # All the bytes must still get through, in order.
+        combined = "".join(p["data"] for p in published)
+        assert combined == "".join(f"frame-{i}" for i in range(10))
+        # All publishes are on the right topic.
+        assert all(p["topic"] == "terminal.term-coalesce.output" for p in published)
+
+    def test_pending_flushes_on_writer_idle(self, tmp_path, monkeypatch):
+        """When the writer pauses, pending data flushes within one window.
+
+        Otherwise kiro's TUI pausing between spinner frames or waiting for an
+        LLM response would strand bytes in the pending buffer, leaving the
+        status monitor with a stale view.
+        """
+        import threading
+        import time
+        from unittest.mock import patch
+
+        monkeypatch.setattr("cli_agent_orchestrator.services.fifo_reader.FIFO_DIR", tmp_path)
+
+        fifo_path = tmp_path / "term-flush.fifo"
+        os.mkfifo(fifo_path)
+
+        published: list[dict] = []
+
+        def fake_publish(topic, payload):
+            published.append({"topic": topic, "data": payload["data"]})
+
+        stop_flag = threading.Event()
+        with patch(
+            "cli_agent_orchestrator.services.fifo_reader.bus.publish",
+            side_effect=fake_publish,
+        ):
+            reader = threading.Thread(
+                target=FifoManager._reader_loop,
+                args=("term-flush", fifo_path, stop_flag),
+                daemon=True,
+            )
+            reader.start()
+
+            time.sleep(0.1)
+
+            # One write, then long silence — the coalesce timer must trigger
+            # a flush without needing a follow-up write.
+            wfd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
+            try:
+                os.write(wfd, b"lonely-chunk")
+                # Wait well beyond the coalesce window.
+                time.sleep(0.3)
+            finally:
+                os.close(wfd)
+                stop_flag.set()
+                reader.join(timeout=2.0)
+
+        assert len(published) >= 1, "Pending data was never flushed"
+        combined = "".join(p["data"] for p in published)
+        assert "lonely-chunk" in combined

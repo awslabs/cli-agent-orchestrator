@@ -111,6 +111,8 @@ Each service has a clearly defined role as a **publisher**, **consumer**, or **b
 
 Creates a named pipe (FIFO) per terminal and starts a daemon reader thread. tmux's `pipe-pane` writes terminal output to the FIFO; the reader reads 4KB chunks and publishes `terminal.{id}.output` events.
 
+Chunks are **coalesced** before publishing (`_COALESCE_WINDOW = 50ms`). TUI providers like kiro-cli animate a spinner at ~10 fps and each frame is a separate FIFO write — publishing one event per raw read would overflow the shared 1024-slot async queue and drop worker state transitions along with the animation noise. Batching every 50ms of chunks into one event reduces publish rate ~20x during bursts while staying well under StatusMonitor's 200ms quiescence debounce, so status detection is unaffected. A hard cap of 64KB per batch prevents unbounded growth during heavy sustained bursts (e.g. streaming LLM output). Pending bytes flush automatically when the writer goes idle (select returns nothing), so a paused writer never strands data.
+
 ### Status Monitor (`services/status_monitor.py`) — Publisher + Consumer
 
 Subscribes to `terminal.*.output`. Accumulates output into a rolling buffer (8KB) per terminal, detects status via the registered provider (returning `UNKNOWN` until a provider is registered for the terminal), and publishes `terminal.{id}.status` on change. Also the source of truth for current terminal status.

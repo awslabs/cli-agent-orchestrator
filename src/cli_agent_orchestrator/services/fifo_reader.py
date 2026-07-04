@@ -7,6 +7,7 @@ import logging
 import os
 import select
 import threading
+import time
 from typing import Dict
 
 from cli_agent_orchestrator.constants import FIFO_DIR
@@ -19,6 +20,23 @@ CHUNK_SIZE = 4096
 # How often a parked reader re-checks its stop flag. Bounds both shutdown
 # latency and the cost of an idle terminal (one select wakeup per interval).
 _POLL_INTERVAL = 0.5
+
+# Coalesce rapid-fire chunks into one publish per window. TUI providers (kiro-cli)
+# animate a spinner at ~10 fps; every frame is a separate FIFO write, and each
+# write would otherwise publish an event. With two subscribers (StatusMonitor,
+# LogWriter) sharing a bounded async queue (1024 slots), that fills the queue in
+# seconds and drops events wholesale — including the worker's real state
+# transitions that assign/handoff rely on. Batching every 50ms of chunks into
+# one event drops the publish rate ~20x during bursts while staying well under
+# the status monitor's 200ms quiescence debounce, so status detection is
+# unaffected. Downstream consumers concatenate the batched bytes as before.
+_COALESCE_WINDOW = 0.05
+
+# Hard cap on how much data accumulates before an early flush. Prevents a single
+# publish from growing unboundedly during a heavy sustained burst (e.g. a big
+# response streaming from an LLM). 64KB is 16x CHUNK_SIZE — one flush per burst
+# of ~16 back-to-back reads is fine.
+_COALESCE_MAX_BYTES = 64 * 1024
 
 
 class FifoManager:
@@ -119,9 +137,23 @@ class FifoManager:
           detaching its ``pipe-pane`` writer produces no EOF churn at all;
         - ``select`` uses a timeout so the stop flag is observed within
           ``_POLL_INTERVAL`` seconds regardless of traffic.
+
+        Chunks are also coalesced (``_COALESCE_WINDOW``) before publishing.
+        Kiro's TUI animates a spinner at ~10 fps and each frame is a separate
+        FIFO write — publishing one event per raw read floods the shared
+        async queue (1024 slots, drop-on-full), and the dropped events wiped
+        out worker state transitions that assign/handoff rely on. Batching
+        every 50ms of chunks into one event drops the publish rate ~20x
+        during bursts while staying well under the status monitor's 200ms
+        quiescence debounce, so detection is unaffected and consumers see
+        the same bytes in the same order.
         """
+        topic = f"terminal.{terminal_id}.output"
         read_fd = -1
         keepalive_fd = -1
+        pending = bytearray()
+        # Time at which the currently-accumulating batch started.
+        batch_start = 0.0
         try:
             # Non-blocking read open of a FIFO succeeds immediately (POSIX),
             # writer attached or not.
@@ -130,20 +162,46 @@ class FifoManager:
             keepalive_fd = os.open(str(fifo_path), os.O_WRONLY | os.O_NONBLOCK)
 
             while not stop_flag.is_set():
-                readable, _, _ = select.select([read_fd], [], [], _POLL_INTERVAL)
-                if not readable:
-                    continue
-                try:
-                    raw = os.read(read_fd, CHUNK_SIZE)
-                except BlockingIOError:
-                    continue
-                if raw:
-                    chunk = raw.decode("utf-8", errors="replace")
-                    bus.publish(f"terminal.{terminal_id}.output", {"data": chunk})
+                # Wait at most _COALESCE_WINDOW so we always flush pending data
+                # within one window even when the writer went silent mid-burst
+                # (e.g. kiro's TUI paused between spinner frames). The
+                # _POLL_INTERVAL upper bound is still honored when nothing has
+                # been received yet (pending is empty).
+                timeout = _COALESCE_WINDOW if pending else _POLL_INTERVAL
+                readable, _, _ = select.select([read_fd], [], [], timeout)
+                if readable:
+                    try:
+                        raw = os.read(read_fd, CHUNK_SIZE)
+                    except BlockingIOError:
+                        raw = b""
+                    if raw:
+                        if not pending:
+                            batch_start = time.monotonic()
+                        pending.extend(raw)
+
+                # Flush conditions: window elapsed, size cap hit, or select
+                # returned nothing (writer went idle). "Writer went idle"
+                # matters because kiro's TUI can stop emitting bytes mid-turn
+                # (waiting on an LLM response) — we must publish what we have
+                # so status detection can see the current buffer state.
+                if pending and (
+                    time.monotonic() - batch_start >= _COALESCE_WINDOW
+                    or len(pending) >= _COALESCE_MAX_BYTES
+                    or not readable
+                ):
+                    bus.publish(topic, {"data": pending.decode("utf-8", errors="replace")})
+                    pending.clear()
         except Exception as e:
             if not stop_flag.is_set():
                 logger.error(f"FIFO reader for terminal {terminal_id} exiting on error: {e}")
         finally:
+            # Flush any unpublished bytes so the last frame of a torn-down
+            # terminal isn't lost — status/log consumers may need it.
+            if pending:
+                try:
+                    bus.publish(topic, {"data": pending.decode("utf-8", errors="replace")})
+                except Exception:
+                    pass
             for fd in (read_fd, keepalive_fd):
                 if fd >= 0:
                     try:

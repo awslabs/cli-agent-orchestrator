@@ -215,6 +215,17 @@ it renders the processing indicator. CAO's kiro_cli provider handles these:
   separators + ≥2 content lines between them) before a bare idle-prompt match is
   treated as COMPLETED — otherwise the worker would be torn down within seconds
   of a task being sent.
+- **Spinner animation floods the event bus**: kiro 2.11's TUI redraws a braille
+  spinner (`⠋⠙⠹⠸⠼⠴⠦⠧`) roughly 10 times per second while an agent is thinking.
+  Each redraw is a separate FIFO write. Without coalescing, that produces
+  thousands of `terminal.{id}.output` events per turn — enough to overflow the
+  shared async queue and drop the worker's real state transitions along with
+  the animation noise. CAO's FIFO reader batches chunks arriving within a
+  50ms window into one publish (`_COALESCE_WINDOW`), reducing publish rate
+  ~20x during bursts. Consumers see the same bytes in the same order; only
+  the event boundaries change. If handoff/assign start hanging on a newer
+  kiro release, check whether the animation frame rate increased beyond what
+  50ms can absorb.
 
 If you upgrade kiro-cli and handoffs stop working (worker gets killed
 prematurely, or the task sits unsent in the input box), check whether the
