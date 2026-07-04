@@ -196,3 +196,27 @@ uv run pytest -m e2e test/e2e/test_supervisor_orchestration.py -v -k KiroCli -o 
    - CAO's `load_agent_profile()` primarily scans for `.md` files
    - If the agent is not found, CAO gracefully falls back — kiro-cli resolves `.json` profiles natively
    - As a workaround, you can create a stub `.md` file alongside the `.json` profile
+
+## kiro-cli 2.11+ Notes
+
+Starting with kiro-cli 2.11, the TUI changed how it accepts pasted input and how
+it renders the processing indicator. CAO's kiro_cli provider handles these:
+
+- **Paste submission**: kiro 2.11 needs **two** Enter keystrokes after a
+  bracketed paste to submit the message (first Enter finalizes the paste, second
+  submits). The provider sets `paste_enter_count = 2` and `paste_submit_delay =
+  1.0s`. Older kiro versions submitted on a single Enter.
+- **Processing indicator**: kiro 2.11 replaced `"Kiro is working"` with
+  `"Thinking..."` (with an optional `"(esc to cancel)"` suffix). The provider
+  matches either variant in `TUI_PROCESSING_PATTERN`.
+- **Idle placeholder always visible**: The `"ask a question or describe a task"`
+  placeholder text remains in the raw buffer even during processing. The
+  provider's Check 6 in `get_status()` requires a bordered response box (two
+  separators + ≥2 content lines between them) before a bare idle-prompt match is
+  treated as COMPLETED — otherwise the worker would be torn down within seconds
+  of a task being sent.
+
+If you upgrade kiro-cli and handoffs stop working (worker gets killed
+prematurely, or the task sits unsent in the input box), check whether the
+paste-submit behavior or processing-indicator text changed in the new version
+and update the provider constants accordingly.

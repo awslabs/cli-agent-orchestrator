@@ -510,6 +510,14 @@ def send_input(
         if provider:
             provider.mark_input_received()
 
+        # Reset the status monitor buffer so stale idle prompts from BEFORE
+        # the input don't trigger a false COMPLETED before the agent has a
+        # chance to render its "Thinking..." indicator. Without this, kiro-cli
+        # 2.11's TUI can retain the "ask a question" placeholder in the raw
+        # buffer, which combined with input_received=True causes get_status()
+        # to return COMPLETED within seconds of send_input.
+        status_monitor.reset_buffer(terminal_id)
+
         update_last_active(terminal_id)
         logger.info(f"Sent input to terminal: {terminal_id}")
         if registry is not None and sender_id is not None and orchestration_type is not None:

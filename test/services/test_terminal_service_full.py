@@ -674,6 +674,35 @@ class TestSendInput:
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_input_resets_status_monitor_buffer(
+        self, mock_get_metadata, mock_tmux, mock_pm, mock_update, mock_status_monitor
+    ):
+        """send_input must reset the status monitor buffer after sending.
+
+        Without this, stale idle prompts from BEFORE the input can combine with
+        input_received=True to trigger a false COMPLETED for kiro-cli 2.11+
+        (whose TUI keeps the "ask a question" placeholder visible always).
+        Regression guard for the handoff-worker-killed-in-8s bug.
+        """
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_provider = mock_pm.get_provider.return_value
+        mock_provider.paste_enter_count = 2
+        mock_provider.paste_submit_delay = 1.0
+        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+
+        send_input("test1234", "hello worker")
+
+        mock_provider.mark_input_received.assert_called_once()
+        mock_status_monitor.reset_buffer.assert_called_once_with("test1234")
+
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_send_input_blocks_assign_when_provider_waits_for_user_answer(
         self, mock_get_metadata, mock_tmux, mock_pm, mock_update, mock_status_monitor
     ):

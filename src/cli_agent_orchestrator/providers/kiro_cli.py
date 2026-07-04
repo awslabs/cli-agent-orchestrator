@@ -77,8 +77,10 @@ TUI_SEPARATOR_PATTERN = r"^[─]{20,}$"
 # TUI Credits line: "▸ Credits: N.NN • Time: Ns" marks response completion
 TUI_CREDITS_PATTERN = r"▸\s*Credits:\s*[\d.]+"
 
-# TUI processing indicator: ghost text shown while agent is working
-TUI_PROCESSING_PATTERN = r"Kiro is working"
+# TUI processing indicator: ghost text shown while agent is working.
+# kiro-cli 2.11+ replaced "Kiro is working" with "Thinking..." (with an
+# optional "(esc to cancel)" suffix). Match either variant.
+TUI_PROCESSING_PATTERN = r"Kiro is working|Thinking\.\.\."
 
 # TUI initialization indicator: shown during startup before chat is ready.
 # Kiro TUI renders the idle prompt placeholder ("Ask a question or describe
@@ -168,8 +170,18 @@ class KiroCliProvider(BaseProvider):
 
     @property
     def paste_enter_count(self) -> int:
-        """Kiro CLI submits on single Enter after bracketed paste."""
-        return 1
+        """Kiro CLI 2.11 needs 2 Enters after bracketed paste to submit.
+
+        The first Enter is consumed by the TUI (finalizes the paste), the
+        second submits the message. Older kiro versions only needed 1.
+        """
+        return 2
+
+    @property
+    def paste_submit_delay(self) -> float:
+        """Kiro 2.11's TUI needs a longer delay after bracketed paste before
+        the Enter key registers as submit rather than being swallowed."""
+        return 1.0
 
     def mark_input_received(self) -> None:
         """Track that input was sent, enabling separator-free completion detection."""
@@ -483,10 +495,17 @@ class KiroCliProvider(BaseProvider):
             return TerminalStatus.PROCESSING
 
         # Check 6: Kiro CLI 2.3.0+ — no Credits marker emitted. Detect completion
-        # by presence of idle prompt after input was sent. For long responses the
-        # separator may have scrolled out of the capture buffer, so we search the
-        # entire buffer. If no separator is found but input was previously received,
-        # the idle prompt alone signals completion.
+        # by finding the bordered "response box" — two separators with ≥2 lines
+        # of non-empty content between them — followed by the idle prompt.
+        #
+        # kiro-cli 2.11+ keeps the "ask a question or describe a task" placeholder
+        # visible in the raw buffer at all times (it's part of the TUI chrome),
+        # so a bare idle-prompt match does NOT mean the agent finished. Requiring
+        # a full response box (two separators + content in between) distinguishes
+        # a real completion frame from the pre-response idle state where the
+        # placeholder is visible but the agent hasn't produced output yet.
+        # A minimal completion is user query + agent response = 2 non-empty lines
+        # inside the box.
         if has_new_tui_idle:
             lines = clean_output.split("\n")
             idle_line_idx = None
@@ -495,24 +514,23 @@ class KiroCliProvider(BaseProvider):
                     idle_line_idx = i
                     break
             if idle_line_idx is not None:
-                # If input was sent, idle prompt alone means completion.
-                # The >=3 content check was blocking detection because the
-                # TUI's final frame only has the header between separator
-                # and idle prompt.
-                if self._input_received:
-                    logger.debug("get_status: returning COMPLETED (TUI idle after input)")
-                    return TerminalStatus.COMPLETED
-                # Before any input is sent, require separator + content to
-                # distinguish startup chrome from a real response.
+                # Find the last separator BEFORE the idle line.
+                last_sep_idx = None
                 for i in range(idle_line_idx - 1, -1, -1):
                     if re.search(TUI_SEPARATOR_PATTERN, lines[i].strip()):
-                        content_between = [l for l in lines[i + 1 : idle_line_idx] if l.strip()]
-                        if len(content_between) >= 3:
-                            logger.debug(
-                                "get_status: returning COMPLETED (TUI no-credits fallback)"
-                            )
-                            return TerminalStatus.COMPLETED
+                        last_sep_idx = i
                         break
+                if last_sep_idx is not None:
+                    # Find the previous separator, and require content between them.
+                    for j in range(last_sep_idx - 1, -1, -1):
+                        if re.search(TUI_SEPARATOR_PATTERN, lines[j].strip()):
+                            content = [l for l in lines[j + 1 : last_sep_idx] if l.strip()]
+                            if len(content) >= 2:
+                                logger.debug(
+                                    "get_status: returning COMPLETED (TUI no-credits fallback)"
+                                )
+                                return TerminalStatus.COMPLETED
+                            break
 
         # Default: Agent is IDLE, waiting for user input
         return TerminalStatus.IDLE
