@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# cao-fleet — run CAO control commands against one fleet node over your private network.
+# fleet — run CAO control commands against one fleet node over your private network.
 #
-#   cao-fleet list                     list node names + hosts
-#   cao-fleet show <node>              print the resolved API base URL
-#   cao-fleet exec <node> <cao args>   run a cao command against one node
-#                                        e.g. cao-fleet exec node-b session list
+#   fleet list                     list node names + hosts
+#   fleet show <node>              print the resolved API base URL
+#   fleet exec <node> <cao args>   run a cao command against one node
+#                                        e.g. fleet exec node-b session list
 #
 # This is an example helper, not part of the installed `cao` CLI: it keeps the
 # fleet coordinator entirely under examples/ with no changes to core CAO. It is a
@@ -22,15 +22,15 @@ FLEET="${CAO_FLEET_CONFIG:-$HERE/../fleet.json}"
 usage() {
   cat >&2 <<'USAGE'
 usage:
-  cao-fleet list                     list node names + hosts
-  cao-fleet show <node>              print the resolved API base URL
-  cao-fleet exec <node> <cao args>   run a cao command against one node
+  fleet list                     list node names + hosts
+  fleet show <node>              print the resolved API base URL
+  fleet exec <node> <cao args>   run a cao command against one node
 USAGE
 }
 
 require_registry() {
   if [ ! -f "$FLEET" ]; then
-    echo "cao-fleet: no fleet registry at '$FLEET'" >&2
+    echo "fleet: no fleet registry at '$FLEET'" >&2
     echo "           copy fleet.example.json -> fleet.json and edit it, or set CAO_FLEET_CONFIG." >&2
     exit 2
   fi
@@ -45,7 +45,7 @@ port = cfg.get("port", 9889)
 nodes = {x["name"]: x for x in cfg["machines"]}
 name = sys.argv[2]
 if name not in nodes:
-    sys.stderr.write(f"cao-fleet: unknown node '{name}'\n"); sys.exit(1)
+    sys.stderr.write(f"fleet: unknown node '{name}'\n"); sys.exit(1)
 print(nodes[name]["host"], nodes[name].get("port", port))
 PY
 }
@@ -81,9 +81,9 @@ case "$cmd" in
   -h|--help)
     usage; exit 0 ;;
   *)
-    echo "cao-fleet: unknown command '$cmd'" >&2
+    echo "fleet: unknown command '$cmd'" >&2
     if [ $# -ge 1 ]; then
-      echo "           did you mean:  cao-fleet exec $cmd $*" >&2
+      echo "           did you mean:  fleet exec $cmd $*" >&2
     fi
     usage; exit 2 ;;
 esac

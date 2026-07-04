@@ -100,6 +100,12 @@ UNIT
 
 if [ "$OS" = "Linux" ] && [ "$(id -u)" = "0" ]; then
   log "installing systemd system service (root)"
+  warn "running as root: the service will run cao-server AS ROOT (User=root),"
+  warn "maximizing blast radius on this network-bound, unauthenticated node —"
+  warn "anyone who reaches the port gets root-level command execution here."
+  warn "For least privilege, re-run bootstrap as an unprivileged user instead"
+  warn "(you get a --user service). Provider CLIs must be authenticated as the"
+  warn "same user the service runs as (root in this case)."
   write_systemd_unit /etc/systemd/system/cao-server.service system
   systemctl daemon-reload
   systemctl enable --now cao-server.service

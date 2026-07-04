@@ -16,7 +16,7 @@ behavior. It is the reference implementation for issue
 > **across machines**; it does not change or depend on the MCP Apps Fleet UI.
 
 > **This is PR 1 of a 3-PR series for #349.** It ships the coordinator foundation
-> (bootstrap + AI conductor + the `cao-fleet` helper + registry). The **web panel**
+> (bootstrap + AI conductor + the `fleet` helper + registry). The **web panel**
 > (`panel/`) lands in **PR #366** and the **full guide** (`docs/fleet_instructions.md`)
 > in **PR #367**. Sections below tagged _(PR #366)_ / _(PR #367)_ are not runnable from
 > this PR alone.
@@ -48,7 +48,7 @@ protection — not authentication.)
 examples/fleet/
 ├── fleet.example.json              # node registry — copy to fleet.json and edit
 ├── bin/
-│   ├── cao-fleet                   # run cao commands against one node (list/show/exec)
+│   ├── fleet                       # run cao commands against one node (list/show/exec)
 │   ├── fleet-conductor             # start the AI conductor
 │   └── render-mcp-config.py        # fleet.json -> conductor/.mcp.json
 ├── conductor/CONDUCTOR.md          # the conductor's operating guide
@@ -57,13 +57,13 @@ examples/fleet/
 │   └── cao-server.service.example  # hand-install systemd unit template
 ├── panel/                          # FastAPI web panel + live console SPA   (PR #366)
 └── test/
-    ├── test_cao_fleet.sh
+    ├── test_fleet.sh
     └── test_render_mcp_config.sh
 ```
 
 ## Requirements
 
-- **Python 3.10+** on the coordinator (for `cao-fleet` and `render-mcp-config.py`).
+- **Python 3.10+** on the coordinator (for `fleet` and `render-mcp-config.py`).
 - A CAO node reachable at `host:9889` for each machine (see step 1).
 - A private network connecting them (Tailscale, WireGuard, VPN, SSH tunnel, or LAN).
 - The web panel _(PR #366)_ additionally needs [`uv`](https://docs.astral.sh/uv/).
@@ -107,7 +107,7 @@ The `panel/` app lands in PR #366; once it's present:
 ```bash
 cd panel
 uv sync
-CAO_PANEL_HOST=127.0.0.1 uv run cao-fleet-panel   # then open http://127.0.0.1:9888
+CAO_PANEL_HOST=127.0.0.1 uv run fleet-panel   # then open http://127.0.0.1:9888
 ```
 
 Set `CAO_PANEL_HOST` to your coordinator's private-network IP to reach the panel
@@ -116,9 +116,9 @@ from other devices.
 ### Ad-hoc control from the shell
 
 ```bash
-bin/cao-fleet list                   # list nodes
-bin/cao-fleet exec node-b session list   # run any cao command against a node
-bin/cao-fleet show node-b            # print the resolved API base URL
+bin/fleet list                   # list nodes
+bin/fleet exec node-b session list   # run any cao command against a node
+bin/fleet show node-b            # print the resolved API base URL
 ```
 
 ## Tests
@@ -126,7 +126,7 @@ bin/cao-fleet show node-b            # print the resolved API base URL
 This PR ships hermetic shell tests (temp registry, stubbed `cao`, no network):
 
 ```bash
-bash examples/fleet/test/test_cao_fleet.sh           # node resolution + exec passthrough
+bash examples/fleet/test/test_fleet.sh           # node resolution + exec passthrough
 bash examples/fleet/test/test_render_mcp_config.sh   # .mcp.json rendering
 ```
 
