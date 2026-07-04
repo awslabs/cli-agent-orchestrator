@@ -72,11 +72,12 @@ def _get_inbox_messages(terminal_id: str, status_filter: str = None):
 # 2. Call handoff/assign MCP tools (which create new terminals)
 # 3. Wait for workers to initialize and complete
 # 4. Collect results and produce final output
-# 600s, not 300: a kimi worker alone takes ~3m20s on the report-template
-# handoff, and the supervisor then streams a long report response. 300s only
-# appeared sufficient while status detection reported a false early COMPLETED
-# mid-turn — with honest detection the slowest provider needs the headroom.
-SUPERVISOR_COMPLETION_TIMEOUT = 600
+# 1200s: a kimi worker alone takes ~3m20s on the report-template handoff, and
+# multi-step supervisor flows (assign + handoff, or supervisor + 2 workers with
+# Opus 4.8) commonly need ~15 min end-to-end. Earlier 600s appeared sufficient
+# while status detection reported a false early COMPLETED mid-turn — with
+# honest detection the slowest provider needs more headroom for the real turn.
+SUPERVISOR_COMPLETION_TIMEOUT = 1200
 
 
 def _list_terminals_in_session(session_name: str) -> list:
