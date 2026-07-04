@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - fifo: non-blocking FIFO reader loop and event-loop-safe session teardown — reader threads can no longer be stranded in a blocking FIFO `open()` by a stop/reopen race, and `DELETE /sessions` runs teardown in a worker thread, so repeated create/delete cycles can no longer wedge cao-server (#382)
+- kiro-cli 2.11 compatibility:
+  - bracketed paste now sends 2 Enters with a 1s submit delay so pasted task text is actually submitted (kiro 2.11's TUI swallows the single Enter used by older versions, leaving the message unsent)
+  - `TUI_PROCESSING_PATTERN` matches both `"Kiro is working"` (pre-2.11) and `"Thinking..."` (2.11+)
+  - Check 6 (no-Credits completion path) now requires a full bordered response box (two separators + ≥2 content lines) instead of any idle-prompt match after `input_received`; kiro 2.11 keeps the `"ask a question or describe a task"` placeholder in the raw buffer at all times, so the previous logic tore workers down within seconds of receiving a task
+- status monitor: `send_input` now uses `clear_rolling_buffer` (byte-only) instead of `reset_buffer` so the sticky-latch arm set by `notify_input_sent` survives. Prevents the IDLE→PROCESSING transition from being latch-blocked when kiro 2.11's TUI immediately renders a partial idle frame after `send_input` (regression seen in `test_supervisor_assign_and_handoff`: supervisor completed real work but status stayed IDLE for the whole turn)
 
 ## [2.2.0] - 2026-06-04
 

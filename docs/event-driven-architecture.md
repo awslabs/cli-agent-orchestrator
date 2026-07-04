@@ -115,6 +115,11 @@ Creates a named pipe (FIFO) per terminal and starts a daemon reader thread. tmux
 
 Subscribes to `terminal.*.output`. Accumulates output into a rolling buffer (8KB) per terminal, detects status via the registered provider (returning `UNKNOWN` until a provider is registered for the terminal), and publishes `terminal.{id}.status` on change. Also the source of truth for current terminal status.
 
+Two buffer-reset primitives with different semantics:
+
+- **`reset_buffer(terminal_id)`** — clears the rolling byte buffer AND wipes `_last_status` and the `_allow_processing_revert` arm. Used by providers that relaunch a different CLI mode on the same `terminal_id` (e.g. Kiro's TUI → `--legacy-ui` fallback), where past status is deliberately forgotten.
+- **`clear_rolling_buffer(terminal_id)`** — clears ONLY the byte buffer, preserving `_last_status` and the arm. Used by `terminal_service.send_input` to drop stale pre-task idle placeholders (kiro-cli 2.11's TUI keeps `"ask a question or describe a task"` in the raw buffer at all times) without wiping the sticky-latch arm that `notify_input_sent` just set. Without this distinction, the buffer clear would silently consume the arm and the subsequent IDLE→PROCESSING transition would be latch-blocked.
+
 ### Log Writer (`services/log_writer.py`) — Consumer
 
 Subscribes to `terminal.*.output`. Appends chunks to per-terminal log files (`~/.cao/logs/terminal/{id}.log`) for debugging.
