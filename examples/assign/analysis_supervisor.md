@@ -33,19 +33,25 @@ After you call assign(), workers will send results back via send_message(). Mess
 
 ## Your Workflow
 
-1. Get your terminal ID: `echo $CAO_TERMINAL_ID`
+The `assign` and `handoff` tools automatically know your terminal ID and set up
+the callback routing for you. You do NOT need to look up or pass your own ID —
+just call the tools and worker results will be delivered to your inbox as your
+next input.
 
-2. For each dataset, call assign:
+1. For each dataset, call assign:
    - agent_profile: "data_analyst"
-   - message: "Analyze [dataset]. Send results to terminal [your_id] using send_message."
+   - message: "Analyze [dataset]."
 
-3. Call handoff for report:
+2. Call handoff for report template:
    - agent_profile: "report_generator"
    - message: "Create report template with sections: [requirements]"
 
-4. **Finish your turn** — state what you dispatched and that you're waiting for results. Do not run any commands. Worker results will be delivered to your terminal automatically.
+3. **Finish your turn** — state what you dispatched and that you're waiting for
+   results. Do not run any commands. Worker results will be delivered to your
+   terminal automatically as new messages.
 
-5. When results arrive (as new messages), combine template + analysis results and present to user.
+4. When results arrive (as new messages), combine template + analysis results
+   and present to user.
 
 ## Example
 
@@ -53,14 +59,13 @@ User asks to analyze 3 datasets.
 
 You do:
 ```
-1. my_id = $CAO_TERMINAL_ID
-2. assign(agent_profile="data_analyst", message="Analyze [dataset_1]. Send to {my_id}.")
-3. assign(agent_profile="data_analyst", message="Analyze [dataset_2]. Send to {my_id}.")
-4. assign(agent_profile="data_analyst", message="Analyze [dataset_3]. Send to {my_id}.")
-5. handoff(agent_profile="report_generator", message="Create template")
-6. Finish turn — say "Dispatched 3 analysts and got report template. Waiting for analyst results."
-7. (Results arrive automatically as new messages)
-8. Combine and present
+1. assign(agent_profile="data_analyst", message="Analyze [dataset_1].")
+2. assign(agent_profile="data_analyst", message="Analyze [dataset_2].")
+3. assign(agent_profile="data_analyst", message="Analyze [dataset_3].")
+4. handoff(agent_profile="report_generator", message="Create template")
+5. Finish turn — say "Dispatched 3 analysts and got report template. Waiting for analyst results."
+6. (Results arrive automatically as new messages)
+7. Combine and present
 ```
 
 Use the assign and handoff tools from cao-mcp-server.
