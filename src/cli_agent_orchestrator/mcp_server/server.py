@@ -897,24 +897,29 @@ def _assign_impl(
                 ),
             }
 
-        # Create terminal
+        # Create terminal — provider.initialize() blocks until the CLI is at
+        # its ready state (IDLE/COMPLETED), so a successful return means the
+        # worker is genuinely ready to accept input.
         terminal_id, _ = _create_terminal(agent_profile, working_directory)
 
-        # Guard: wait for the terminal to be genuinely ready before sending
-        # the task message. create_terminal() calls provider.initialize() which
-        # already waits 30 s for IDLE, but that check can return a false-positive
-        # on the pre-existing shell ❯ prompt (zsh/bash) before claude starts.
-        # A secondary API-level wait (same as handoff uses) catches that race.
-        if not wait_until_terminal_status(
+        # Belt-and-suspenders: re-check status via HTTP in case the DB write
+        # from the event bus consumer lags provider.initialize()'s in-process
+        # signal. Kept short (10s) since _create_terminal already waited the
+        # full provider_init_timeout — this only covers the tiny window where
+        # the event pipeline hasn't yet persisted the ready status. On failure
+        # here, do NOT reject the assign: the initialize wait already succeeded
+        # so the worker IS ready; just log a warning and proceed.
+        recheck_ok = wait_until_terminal_status(
             terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-            timeout=float(get_server_settings()["provider_init_timeout"]),
-        ):
-            return {
-                "success": False,
-                "terminal_id": terminal_id,
-                "message": f"Terminal {terminal_id} did not reach ready status within 60 seconds — agent may not have started",
-            }
+            timeout=10.0,
+        )
+        if not recheck_ok:
+            logger.warning(
+                f"assign: HTTP recheck for {terminal_id} did not observe ready status "
+                f"within 10s, but provider.initialize() already succeeded — proceeding "
+                f"with input send"
+            )
 
         # Send message (auto-injects sender terminal ID suffix when enabled)
         _send_direct_input_assign(terminal_id, message)

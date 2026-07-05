@@ -5,7 +5,7 @@ import logging
 import re
 import time
 import uuid
-from typing import Union
+from typing import Optional, Union
 
 import requests
 
@@ -263,15 +263,34 @@ def wait_until_terminal_status(
     else:
         target_values = {s.value for s in target_status}
 
+    logger.info(
+        f"wait_until_terminal_status [{terminal_id}]: waiting for "
+        f"{{{', '.join(target_values)}}}, timeout={timeout}s"
+    )
     start_time = time.time()
+    last_seen: Optional[str] = None
+    poll_count = 0
     while time.time() - start_time < timeout:
+        poll_count += 1
         try:
             response = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
             if response.status_code == 200:
                 current_status = response.json().get("status")
+                last_seen = current_status
                 if current_status in target_values:
+                    logger.info(
+                        f"wait_until_terminal_status [{terminal_id}]: reached "
+                        f"{current_status} after {poll_count} polls "
+                        f"({time.time() - start_time:.1f}s)"
+                    )
                     return True
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(
+                f"wait_until_terminal_status [{terminal_id}] poll #{poll_count} error: {e}"
+            )
         time.sleep(polling_interval)
+    logger.warning(
+        f"wait_until_terminal_status [{terminal_id}]: timeout after {timeout}s "
+        f"(polls={poll_count}, last_seen={last_seen!r})"
+    )
     return False
