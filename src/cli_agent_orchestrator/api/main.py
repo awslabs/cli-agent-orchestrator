@@ -970,9 +970,22 @@ async def create_terminal_in_session(
     working_directory: Optional[str] = None,
     allowed_tools: Optional[str] = None,
     caller_id: Optional[TerminalId] = None,
+    defer_init: bool = False,
+    initial_message: Optional[str] = None,
+    initial_message_orchestration_type: Optional[str] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
-    """Create additional terminal in existing session."""
+    """Create additional terminal in existing session.
+
+    ``defer_init=true``: return as soon as the tmux window is created and the
+    terminal is registered in the DB, without waiting for the CLI provider to
+    reach IDLE. Provider initialization runs as a background task; when
+    ``initial_message`` is also provided it is sent to the terminal via the
+    same task once init completes. Used by the MCP `assign` tool to keep
+    tool-call latency well under kiro-cli 2.11's ~60s per-tool client
+    timeout, and to allow multiple concurrent assigns to run their init
+    phases in parallel.
+    """
     try:
         validate_tmux_name(session_name, "session_name")
     except ValueError as e:
@@ -986,6 +999,21 @@ async def create_terminal_in_session(
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
+        # Deferred init only makes sense when a message will follow — we
+        # still accept the flag alone (no message) for future non-assign uses.
+        orch_type = None
+        if initial_message_orchestration_type:
+            try:
+                orch_type = OrchestrationType(initial_message_orchestration_type)
+            except ValueError:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"invalid initial_message_orchestration_type: "
+                        f"{initial_message_orchestration_type!r}"
+                    ),
+                )
+
         result = await terminal_service.create_terminal(
             provider=resolved_provider,
             agent_profile=agent_profile,
@@ -995,6 +1023,9 @@ async def create_terminal_in_session(
             allowed_tools=allowed_tools_list,
             registry=get_plugin_registry(request),
             caller_id=caller_id,
+            defer_init=defer_init,
+            initial_message=initial_message,
+            initial_message_orchestration_type=orch_type,
         )
         return result
     except ValueError as e:

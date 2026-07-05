@@ -139,6 +139,9 @@ async def create_terminal(
     registry: PluginRegistry | None = None,
     env_vars: Optional[dict[str, str]] = None,
     caller_id: Optional[str] = None,
+    defer_init: bool = False,
+    initial_message: Optional[str] = None,
+    initial_message_orchestration_type: Optional[OrchestrationType] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -306,14 +309,32 @@ async def create_terminal(
             skill_prompt=skill_prompt,
             model=profile.model if profile else None,
         )
-        await provider_instance.initialize()
 
-        # Persist shell_command baseline if the provider captured one
-        shell_command = provider_instance.shell_baseline
-        if not isinstance(shell_command, str):
-            shell_command = None
-        if shell_command:
-            update_terminal_shell_command(terminal_id, shell_command)
+        # Deferred-init path: return fast so callers (e.g. MCP assign) do not
+        # block on `provider.initialize()`. The remaining initialize + input
+        # send runs as a background task, so two concurrent assigns can each
+        # kick off their init in parallel. Kiro-cli 2.11's per-tool client
+        # timeout (~60s) previously cancelled assign RPCs when init took long
+        # enough to push the round-trip past that cap; deferring init keeps
+        # the tool call under 2s.
+        if defer_init:
+            shell_command = None  # unknown until initialize() runs
+            _schedule_deferred_init(
+                provider_instance,
+                terminal_id,
+                initial_message,
+                initial_message_orchestration_type,
+                registry,
+            )
+        else:
+            await provider_instance.initialize()
+
+            # Persist shell_command baseline if the provider captured one
+            shell_command = provider_instance.shell_baseline
+            if not isinstance(shell_command, str):
+                shell_command = None
+            if shell_command:
+                update_terminal_shell_command(terminal_id, shell_command)
 
         # Build and return the Terminal object
         terminal = Terminal(
@@ -379,6 +400,70 @@ async def create_terminal(
             # of the same name.
             clear_session_env(session_name)
         raise
+
+
+def _schedule_deferred_init(
+    provider_instance,
+    terminal_id: str,
+    initial_message: Optional[str],
+    orchestration_type: Optional[OrchestrationType],
+    registry: PluginRegistry | None,
+) -> None:
+    """Kick off provider.initialize() in the background and, on success,
+    deliver the initial message via send_input.
+
+    Runs as an asyncio task on the running event loop so it doesn't block
+    the caller. Failures are logged and the terminal is torn down so a
+    stuck initialization doesn't leak a half-alive worker.
+
+    We don't propagate the failure back to the assign() caller — the tool
+    call has already returned success by the time this runs. Operators
+    diagnose failures via cao logs / GET /terminals/{id} status.
+    """
+    import asyncio
+
+    async def _run() -> None:
+        try:
+            await provider_instance.initialize()
+            shell_command = provider_instance.shell_baseline
+            if isinstance(shell_command, str) and shell_command:
+                update_terminal_shell_command(terminal_id, shell_command)
+            if initial_message:
+                # send_input is sync but bounded (a few tmux calls), so
+                # running it inline on the loop is fine — no long HTTP wait.
+                sender_id = None
+                # For assign/handoff the sender is the CALLER (the supervisor),
+                # not this MCP server. But the deferred path is used only via
+                # /assign, and _assign_impl on the MCP-server side already
+                # embedded the callback instructions into initial_message.
+                # We still pass sender_id=caller_id if present in DB metadata
+                # so plugin events see it.
+                metadata = get_terminal_metadata(terminal_id)
+                if metadata:
+                    sender_id = metadata.get("caller_id")
+                send_input(
+                    terminal_id,
+                    initial_message,
+                    registry=registry,
+                    sender_id=sender_id,
+                    orchestration_type=orchestration_type,
+                )
+        except Exception as e:
+            logger.error(
+                f"Deferred init for terminal {terminal_id} failed: {e}. " f"Tearing down worker."
+            )
+            # Best-effort cleanup so a failed init doesn't leak resources.
+            try:
+                delete_terminal(terminal_id)
+            except Exception:
+                pass
+
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        logger.error(f"Deferred init for {terminal_id}: no running event loop; init skipped")
+        return
+    loop.create_task(_run())
 
 
 def get_terminal(terminal_id: str) -> Dict:

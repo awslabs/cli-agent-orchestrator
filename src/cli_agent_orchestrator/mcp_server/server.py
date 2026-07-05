@@ -25,7 +25,7 @@ from cli_agent_orchestrator.services.memory_service import (
 )
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
-from cli_agent_orchestrator.utils.terminal import generate_session_name, wait_until_terminal_status
+from cli_agent_orchestrator.utils.terminal import generate_session_name
 
 logger = logging.getLogger(__name__)
 
@@ -153,13 +153,29 @@ def _resolve_child_allowed_tools(
 
 
 def _create_terminal(
-    agent_profile: str, working_directory: Optional[str] = None
+    agent_profile: str,
+    working_directory: Optional[str] = None,
+    defer_init: bool = False,
+    initial_message: Optional[str] = None,
+    initial_message_orchestration_type: Optional[OrchestrationType] = None,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
     Args:
         agent_profile: Agent profile for the terminal
         working_directory: Optional working directory for the terminal
+        defer_init: If True and creating within an existing session, tell
+            cao-server to skip the ``provider.initialize()`` wait and return
+            as soon as the tmux window and DB record exist. Provider init
+            (and, when ``initial_message`` is set, delivery of that message)
+            runs as a background task on cao-server. The tool-call round-trip
+            drops from tens of seconds to <2s, keeping it well under
+            kiro-cli 2.11's ~60s per-tool client timeout.
+        initial_message: If ``defer_init=True``, this message is delivered
+            to the newly created worker once its provider finishes
+            initializing. Ignored otherwise.
+        initial_message_orchestration_type: Passed through to send_input for
+            plugin event emission (assign/handoff).
 
     Returns:
         Tuple of (terminal_id, provider)
@@ -217,6 +233,16 @@ def _create_terminal(
             params["working_directory"] = working_directory
         if child_allowed_tools:
             params["allowed_tools"] = child_allowed_tools
+        if defer_init:
+            params["defer_init"] = "true"
+            if initial_message is not None:
+                params["initial_message"] = initial_message
+            if initial_message_orchestration_type is not None:
+                params["initial_message_orchestration_type"] = (
+                    initial_message_orchestration_type.value
+                    if isinstance(initial_message_orchestration_type, OrchestrationType)
+                    else str(initial_message_orchestration_type)
+                )
 
         response = requests.post(
             f"{API_BASE_URL}/sessions/{session_name}/terminals",
@@ -881,7 +907,16 @@ else:
 def _assign_impl(
     agent_profile: str, message: str, working_directory: Optional[str] = None
 ) -> Dict[str, Any]:
-    """Implementation of assign logic."""
+    """Implementation of assign logic.
+
+    Uses the server-side deferred-init path: cao-server creates the tmux
+    window and DB record synchronously (fast, <2s), then runs
+    ``provider.initialize()`` and delivers the initial message as a
+    background task. This keeps the assign() tool-call round-trip well
+    under kiro-cli 2.11's ~60s per-tool client timeout, and lets multiple
+    concurrent assigns from the same LLM turn run their init phases in
+    parallel instead of blocking one behind the other.
+    """
     terminal_id: Optional[str] = None
     try:
         # Fail fast before creating the worker terminal: with injection on,
@@ -897,38 +932,45 @@ def _assign_impl(
                 ),
             }
 
-        # Create terminal — provider.initialize() blocks until the CLI is at
-        # its ready state (IDLE/COMPLETED), so a successful return means the
-        # worker is genuinely ready to accept input.
-        terminal_id, _ = _create_terminal(agent_profile, working_directory)
-
-        # Belt-and-suspenders: re-check status via HTTP in case the DB write
-        # from the event bus consumer lags provider.initialize()'s in-process
-        # signal. Kept short (10s) since _create_terminal already waited the
-        # full provider_init_timeout — this only covers the tiny window where
-        # the event pipeline hasn't yet persisted the ready status. On failure
-        # here, do NOT reject the assign: the initialize wait already succeeded
-        # so the worker IS ready; just log a warning and proceed.
-        recheck_ok = wait_until_terminal_status(
-            terminal_id,
-            {TerminalStatus.IDLE, TerminalStatus.COMPLETED},
-            timeout=10.0,
-        )
-        if not recheck_ok:
-            logger.warning(
-                f"assign: HTTP recheck for {terminal_id} did not observe ready status "
-                f"within 10s, but provider.initialize() already succeeded — proceeding "
-                f"with input send"
+        # Compose the message the worker will see once it is ready. We do
+        # this here (not on the server) because the callback-instructions
+        # suffix depends on ``CAO_TERMINAL_ID``, which lives in this MCP
+        # subprocess's env (the supervisor-owned instance), not on the
+        # cao-server side.
+        if ENABLE_SENDER_ID_INJECTION:
+            sender_id = os.environ.get("CAO_TERMINAL_ID")
+            if not sender_id:
+                # Redundant with the earlier check but preserves the same
+                # error contract on the injection path.
+                raise ValueError("CAO_TERMINAL_ID not set - cannot inject callback instructions")
+            worker_message = (
+                message
+                + f"\n\n[Assigned by terminal {sender_id}. "
+                + f"When done, send results back to terminal {sender_id} using send_message]"
             )
+        else:
+            worker_message = message
 
-        # Send message (auto-injects sender terminal ID suffix when enabled)
-        _send_direct_input_assign(terminal_id, message)
+        # Create terminal in DEFERRED-INIT mode: cao-server returns as soon
+        # as the tmux window is up and the DB row is written; the actual
+        # provider.initialize() and initial-message delivery run as a
+        # background task on the server. The tool-call typically returns
+        # in under 2 seconds regardless of how long init takes.
+        terminal_id, _ = _create_terminal(
+            agent_profile,
+            working_directory,
+            defer_init=True,
+            initial_message=worker_message,
+            initial_message_orchestration_type=OrchestrationType.ASSIGN,
+        )
 
         return {
             "success": True,
             "terminal_id": terminal_id,
             "message": (
                 f"Task assigned to {agent_profile} (terminal: {terminal_id}). "
+                f"Worker is initializing in the background; your task will be "
+                f"delivered once it is ready. "
                 f"Call delete_terminal('{terminal_id}') when you no longer need this terminal."
                 + _get_cleanup_nudge()
             ),

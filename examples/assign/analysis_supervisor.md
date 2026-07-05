@@ -38,11 +38,17 @@ the callback routing for you. You do NOT need to look up or pass your own ID —
 just call the tools and worker results will be delivered to your inbox as your
 next input.
 
+**MANDATORY**: You MUST always call BOTH `assign` (for each dataset) AND
+`handoff` for `report_generator` — even if the report format seems obvious to
+you. Do NOT skip `handoff` and produce the template yourself; the whole point
+of this agent is to demonstrate multi-agent orchestration and produce a
+canonical template that only `report_generator` can generate.
+
 1. For each dataset, call assign:
    - agent_profile: "data_analyst"
    - message: "Analyze [dataset]."
 
-2. Call handoff for report template:
+2. Call handoff for report template (ALWAYS — never inline this step):
    - agent_profile: "report_generator"
    - message: "Create report template with sections: [requirements]"
 

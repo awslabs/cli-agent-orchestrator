@@ -106,7 +106,14 @@ TUI_INITIALIZING_PATTERN = (
 
 # TUI permission prompt: shown instead of legacy [y/n/t] format.
 # Requires all three options together to avoid false positives on "Yes"/"No" in agent output.
-TUI_PERMISSION_PATTERN = r"Yes\s+No\s+Always [Aa]llow"
+# Kiro 2.11 renders the same three-way choice with different wording for
+# subagent spawning: "Yes, single permission / Trust, always allow in this
+# session / No (Tab to edit)". Accept both variants.
+TUI_PERMISSION_PATTERN = (
+    r"Yes\s+No\s+Always [Aa]llow"
+    r"|Yes,\s*single permission[\s\S]{0,200}?Trust,\s*always allow[\s\S]{0,200}?No"
+    r"|subagent requires approval"
+)
 
 # =============================================================================
 # Error Detection
@@ -263,6 +270,15 @@ class KiroCliProvider(BaseProvider):
         yolo = bool(self._allowed_tools and "*" in self._allowed_tools)
         model = self._get_profile_model()
 
+        # kiro-cli 2.11 introduced a "subagent requires approval" prompt that
+        # blocks MCP tool calls that spawn subagents (e.g. cao-mcp-server's
+        # assign/handoff). Even for non-yolo profiles, CAO enforces tool
+        # scoping at its own layers (profile allowedTools + MCP allowlist),
+        # so passing --trust-all-tools is safe: it bypasses kiro's
+        # per-invocation UI prompt (there is no human at the terminal in
+        # headless orchestration to answer), while CAO still gates what
+        # tools can be called. Without this, a supervisor invoking assign()
+        # hangs indefinitely on the approval dialog.
         if yolo:
             logger.info(
                 "kiro_cli yolo mode: forcing --legacy-ui (kiro-cli 2.0.1 TUI "
@@ -270,7 +286,7 @@ class KiroCliProvider(BaseProvider):
             )
             base_args = ["kiro-cli", "chat", "--legacy-ui", "--trust-all-tools"]
         else:
-            base_args = ["kiro-cli", "chat"]
+            base_args = ["kiro-cli", "chat", "--trust-all-tools"]
         if model:
             base_args.extend(["--model", model])
         base_args.extend(["--agent", self._agent_profile])
@@ -305,7 +321,7 @@ class KiroCliProvider(BaseProvider):
             # against a clean buffer, not one still full of stale TUI marker bytes
             # from the failed first attempt (which would otherwise time out too).
             status_monitor.reset_buffer(self.terminal_id)
-            legacy_args = ["kiro-cli", "chat", "--legacy-ui"]
+            legacy_args = ["kiro-cli", "chat", "--legacy-ui", "--trust-all-tools"]
             if model:
                 legacy_args.extend(["--model", model])
             legacy_args.extend(["--agent", self._agent_profile])
