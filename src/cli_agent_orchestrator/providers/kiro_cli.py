@@ -508,6 +508,16 @@ class KiroCliProvider(BaseProvider):
         # inside the box.
         if has_new_tui_idle:
             lines = clean_output.split("\n")
+            # Strip non-SGR CSI (erase-line \x1b[2K, cursor moves, etc.) so
+            # the separator regex can see the raw ─── characters. The top-of-
+            # function strip only removes SGR codes ending in 'm' (color) —
+            # kiro's TUI prefixes many lines with \x1b[2K which would prevent
+            # the separator regex from anchoring at start-of-line.
+            _NON_SGR_CSI = re.compile(r"\x1b\[[0-9;?]*[^m]")
+
+            def _sep_line(line: str) -> str:
+                return _NON_SGR_CSI.sub("", line).strip()
+
             idle_line_idx = None
             for i in range(len(lines) - 1, -1, -1):
                 if re.search(NEW_TUI_IDLE_PATTERN, lines[i]):
@@ -517,14 +527,14 @@ class KiroCliProvider(BaseProvider):
                 # Find the last separator BEFORE the idle line.
                 last_sep_idx = None
                 for i in range(idle_line_idx - 1, -1, -1):
-                    if re.search(TUI_SEPARATOR_PATTERN, lines[i].strip()):
+                    if re.search(TUI_SEPARATOR_PATTERN, _sep_line(lines[i])):
                         last_sep_idx = i
                         break
                 if last_sep_idx is not None:
                     # Find the previous separator, and require content between them.
                     for j in range(last_sep_idx - 1, -1, -1):
-                        if re.search(TUI_SEPARATOR_PATTERN, lines[j].strip()):
-                            content = [l for l in lines[j + 1 : last_sep_idx] if l.strip()]
+                        if re.search(TUI_SEPARATOR_PATTERN, _sep_line(lines[j])):
+                            content = [l for l in lines[j + 1 : last_sep_idx] if _sep_line(l)]
                             if len(content) >= 2:
                                 logger.debug(
                                     "get_status: returning COMPLETED (TUI no-credits fallback)"
