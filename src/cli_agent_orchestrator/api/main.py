@@ -1058,7 +1058,12 @@ async def list_terminals_in_session(session_name: str) -> List[Dict]:
 @app.get("/terminals/{terminal_id}", response_model=Terminal)
 async def get_terminal(terminal_id: TerminalId) -> Terminal:
     try:
-        terminal = terminal_service.get_terminal(terminal_id)
+        # get_terminal reads status_monitor.get_status(), which for a
+        # PROCESSING terminal does a fresh detection that can shell out to
+        # tmux (blocking subprocess). This endpoint is polled heavily by
+        # wait_until_terminal_status, so run it off the loop to keep the
+        # server responsive under concurrent orchestration.
+        terminal = await asyncio.to_thread(terminal_service.get_terminal, terminal_id)
         return Terminal(**terminal)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
