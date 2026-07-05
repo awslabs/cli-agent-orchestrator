@@ -108,9 +108,13 @@ Create an additional terminal in an existing session.
 - `provider` (string, required): Provider type
 - `agent_profile` (string, required): Agent profile name
 - `working_directory` (string, optional): Working directory for the terminal
+- `allowed_tools` (string, optional): Comma-separated list of allowed CAO tools for the worker.
 - `caller_id` (string, optional): Terminal ID of the creating terminal (8-character hexadecimal). Recorded so `send_message` can default replies to the caller (issue #284).
+- `defer_init` (bool, optional, default `false`): When `true`, return as soon as the tmux window and DB record exist, without waiting for `provider.initialize()` to finish. The provider is still created and initialized — but on a background asyncio task on cao-server, so the HTTP round-trip stays under ~2s regardless of provider startup latency. Used by the MCP `assign` tool to keep tool-call latency well under kiro-cli 2.11's ~60s per-tool client timeout, and to allow multiple concurrent assigns to run their init phases in parallel.
+- `initial_message` (string, optional): When `defer_init=true`, this message is delivered to the newly created worker via `send_input` after `provider.initialize()` completes. Ignored if `defer_init=false`. Ordering: init runs first, then message delivery, both on the same background task.
+- `initial_message_orchestration_type` (string, optional): One of `assign` or `handoff`. Passed through to `send_input` for plugin event emission when `initial_message` is delivered.
 
-**Response:** Terminal object (201 Created)
+**Response:** Terminal object (201 Created). When `defer_init=true`, the returned status field reflects the terminal's optimistic post-window-creation state; poll `GET /terminals/{id}` afterwards for the live status once init completes.
 
 ### GET /sessions/{session_name}/terminals
 List all terminals in a session.
