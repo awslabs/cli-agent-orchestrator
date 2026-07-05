@@ -780,3 +780,64 @@ class TestInstallAgentEnvBehaviour:
         assert "${API_TOKEN}" in installed_text
         assert "${SERVICE_URL}" in installed_text
         assert "integration-secret" not in installed_text
+
+
+class TestInjectKiroMcpTimeout:
+    """Tests for _inject_kiro_mcp_timeout — raising kiro's per-server tool-call
+    timeout for cao-mcp-server so long handoff RPCs are not cancelled client-side.
+    """
+
+    def test_injects_timeout_on_cao_mcp_server(self):
+        from cli_agent_orchestrator.services.install_service import (
+            _KIRO_MCP_TOOL_TIMEOUT_MS,
+            _inject_kiro_mcp_timeout,
+        )
+
+        servers = {
+            "cao-mcp-server": {
+                "type": "stdio",
+                "command": "uvx",
+                "args": [
+                    "--from",
+                    "git+https://github.com/awslabs/cli-agent-orchestrator.git@main",
+                    "cao-mcp-server",
+                ],
+            }
+        }
+        out = _inject_kiro_mcp_timeout(servers)
+        assert out["cao-mcp-server"]["timeout"] == _KIRO_MCP_TOOL_TIMEOUT_MS
+        # Original dict must not be mutated
+        assert "timeout" not in servers["cao-mcp-server"]
+
+    def test_detects_cao_by_args_even_with_different_key(self):
+        from cli_agent_orchestrator.services.install_service import (
+            _KIRO_MCP_TOOL_TIMEOUT_MS,
+            _inject_kiro_mcp_timeout,
+        )
+
+        servers = {"orchestrator": {"command": "uvx", "args": ["--from", "x", "cao-mcp-server"]}}
+        out = _inject_kiro_mcp_timeout(servers)
+        assert out["orchestrator"]["timeout"] == _KIRO_MCP_TOOL_TIMEOUT_MS
+
+    def test_leaves_non_cao_servers_untouched(self):
+        from cli_agent_orchestrator.services.install_service import _inject_kiro_mcp_timeout
+
+        servers = {"tavily": {"command": "npx", "args": ["-y", "tavily-mcp@latest"]}}
+        out = _inject_kiro_mcp_timeout(servers)
+        assert "timeout" not in out["tavily"]
+
+    def test_respects_operator_set_timeout(self):
+        from cli_agent_orchestrator.services.install_service import _inject_kiro_mcp_timeout
+
+        servers = {
+            "cao-mcp-server": {"command": "uvx", "args": ["cao-mcp-server"], "timeout": 5000}
+        }
+        out = _inject_kiro_mcp_timeout(servers)
+        # Explicit operator value is never overwritten
+        assert out["cao-mcp-server"]["timeout"] == 5000
+
+    def test_none_and_empty_are_passthrough(self):
+        from cli_agent_orchestrator.services.install_service import _inject_kiro_mcp_timeout
+
+        assert _inject_kiro_mcp_timeout(None) is None
+        assert _inject_kiro_mcp_timeout({}) == {}

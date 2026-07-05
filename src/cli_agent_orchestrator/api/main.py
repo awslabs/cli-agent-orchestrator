@@ -1120,7 +1120,12 @@ async def send_terminal_input(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
     try:
-        success = terminal_service.send_input(
+        # send_input is blocking tmux I/O (bracketed paste + key sends). Run it
+        # off the event loop so a slow tmux call can't freeze every other
+        # request — including /health and concurrent assign/handoff. Same
+        # hazard class as issue #382 (only fixed for DELETE /sessions there).
+        success = await asyncio.to_thread(
+            terminal_service.send_input,
             terminal_id,
             message,
             registry=get_plugin_registry(request),
@@ -1156,7 +1161,8 @@ async def send_terminal_key(
         )
 
     try:
-        success = terminal_service.send_special_key(terminal_id, key)
+        # Blocking tmux send-keys — off the loop.
+        success = await asyncio.to_thread(terminal_service.send_special_key, terminal_id, key)
         return {"success": success}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -1172,7 +1178,10 @@ async def get_terminal_output(
     terminal_id: TerminalId, mode: OutputMode = OutputMode.FULL
 ) -> TerminalOutputResponse:
     try:
-        output = terminal_service.get_output(terminal_id, mode)
+        # get_output does a blocking tmux capture-pane plus provider regex
+        # extraction over the scrollback — run it off the loop so a large
+        # transcript can't stall the whole server.
+        output = await asyncio.to_thread(terminal_service.get_output, terminal_id, mode)
         return TerminalOutputResponse(output=output, mode=mode)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -1190,7 +1199,8 @@ async def exit_terminal(
 ) -> Dict:
     """Send provider-specific exit command to terminal."""
     try:
-        terminal_service.exit_terminal_cli(terminal_id)
+        # Blocking tmux I/O — off the loop.
+        await asyncio.to_thread(terminal_service.exit_terminal_cli, terminal_id)
         return {"success": True}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -1483,8 +1493,15 @@ async def delete_terminal(
 ) -> Dict:
     """Delete a terminal."""
     try:
-        success = terminal_service.delete_terminal(
-            terminal_id, registry=get_plugin_registry(request)
+        # delete_terminal is fully synchronous: blocking tmux kills, a
+        # full-history scrollback snapshot capture, and DB writes. Off the
+        # loop so a stalled tmux/FIFO op bounds its blast radius to this one
+        # request instead of wedging the whole server (issue #382 fixed this
+        # for DELETE /sessions; the per-terminal path had the same hazard).
+        success = await asyncio.to_thread(
+            terminal_service.delete_terminal,
+            terminal_id,
+            registry=get_plugin_registry(request),
         )
         return {"success": success}
     except ValueError as e:

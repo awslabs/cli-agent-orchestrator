@@ -429,8 +429,6 @@ def _schedule_deferred_init(
             if isinstance(shell_command, str) and shell_command:
                 update_terminal_shell_command(terminal_id, shell_command)
             if initial_message:
-                # send_input is sync but bounded (a few tmux calls), so
-                # running it inline on the loop is fine — no long HTTP wait.
                 sender_id = None
                 # For assign/handoff the sender is the CALLER (the supervisor),
                 # not this MCP server. But the deferred path is used only via
@@ -438,10 +436,13 @@ def _schedule_deferred_init(
                 # embedded the callback instructions into initial_message.
                 # We still pass sender_id=caller_id if present in DB metadata
                 # so plugin events see it.
-                metadata = get_terminal_metadata(terminal_id)
+                metadata = await asyncio.to_thread(get_terminal_metadata, terminal_id)
                 if metadata:
                     sender_id = metadata.get("caller_id")
-                send_input(
+                # send_input is blocking tmux I/O — off the loop so it can't
+                # freeze the server for concurrent requests.
+                await asyncio.to_thread(
+                    send_input,
                     terminal_id,
                     initial_message,
                     registry=registry,
@@ -454,7 +455,7 @@ def _schedule_deferred_init(
             )
             # Best-effort cleanup so a failed init doesn't leak resources.
             try:
-                delete_terminal(terminal_id)
+                await asyncio.to_thread(delete_terminal, terminal_id)
             except Exception:
                 pass
 
