@@ -1,13 +1,13 @@
 import logging
-import os
 from datetime import datetime
 
 from cli_agent_orchestrator.constants import LOG_DIR
+from cli_agent_orchestrator.services.config_service import ConfigService
 
 
 def setup_logging() -> None:
     """Setup logging configuration."""
-    log_level = os.getenv("CAO_LOG_LEVEL", "INFO").upper()
+    log_level = str(ConfigService.get("logging.level", default="INFO")).upper()
 
     # Ensure log directory exists
     LOG_DIR.mkdir(parents=True, exist_ok=True)

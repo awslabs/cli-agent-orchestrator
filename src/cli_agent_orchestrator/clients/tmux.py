@@ -10,6 +10,10 @@ from typing import Dict, List, Optional
 import libtmux
 
 from cli_agent_orchestrator.constants import TMUX_HISTORY_LINES
+from cli_agent_orchestrator.utils.path_validation import (
+    BLOCKED_SYSTEM_DIRECTORIES,
+    resolve_and_validate_path,
+)
 from cli_agent_orchestrator.utils.terminal import validate_tmux_name
 
 logger = logging.getLogger(__name__)
@@ -21,37 +25,19 @@ class TmuxClient:
     def __init__(self) -> None:
         self.server = libtmux.Server()
 
-    # Directories that should never be used as working directories.
-    # Prevents user-supplied paths from pointing at sensitive system locations.
-    # Includes /private/* variants for macOS (where /etc -> /private/etc, etc.).
-    _BLOCKED_DIRECTORIES = frozenset(
-        {
-            "/",
-            "/bin",
-            "/sbin",
-            "/usr/bin",
-            "/usr/sbin",
-            "/etc",
-            "/var",
-            "/tmp",
-            "/dev",
-            "/proc",
-            "/sys",
-            "/root",
-            "/boot",
-            "/lib",
-            "/lib64",
-            "/private/etc",
-            "/private/var",
-            "/private/tmp",
-        }
-    )
+    # Kept as an alias so existing callers/tests referencing the class
+    # attribute keep working; the canonical set lives in
+    # utils/path_validation.py (shared with archive export/import, D5).
+    _BLOCKED_DIRECTORIES = BLOCKED_SYSTEM_DIRECTORIES
 
     def _resolve_and_validate_working_directory(self, working_directory: Optional[str]) -> str:
         """Resolve and validate working directory.
 
-        Canonicalizes the path (resolves symlinks, normalizes ``..``) and
-        rejects paths that point to sensitive system directories.
+        Delegates to the shared validator
+        (``utils.path_validation.resolve_and_validate_path``) with its
+        strictest settings: the directory must already exist and file
+        targets are rejected — byte-identical to the pre-extraction
+        behavior.
 
         **Allowed directories:**
 
@@ -77,43 +63,12 @@ class TmuxClient:
         if working_directory is None:
             working_directory = os.getcwd()
 
-        # Expand ~ to the server's home directory so clients can use
-        # portable paths like ~/q/my-project without knowing the server's
-        # actual home path (e.g., /home/user vs /Users/user).
-        working_directory = os.path.expanduser(working_directory)
-
-        # Step 1: Canonicalize the path via realpath to resolve symlinks
-        # and .. sequences.  os.path.realpath is recognized by CodeQL as a
-        # PathNormalization (transitions taint to NormalizedUnchecked).
-        real_path = os.path.realpath(os.path.abspath(working_directory))
-
-        # Step 2: Path-containment guard (CodeQL SafeAccessCheck).
-        # CodeQL's py/path-injection two-state taint model requires:
-        #   1. PathNormalization (realpath above) → NormalizedUnchecked
-        #   2. SafeAccessCheck (startswith guard) → sanitized
-        # CodeQL recognizes str.startswith() as a SafeAccessCheck; when
-        # the true branch flows to filesystem ops, the path is cleared.
-        # The "/" prefix is always true after realpath(), but this
-        # explicit guard satisfies CodeQL and rejects relative paths.
-        if not real_path.startswith("/"):
-            raise ValueError(f"Working directory must be an absolute path: {working_directory}")
-
-        # Step 3: Block sensitive system directories.
-        # Only the exact listed paths are blocked — not their subdirectories.
-        # This prevents launching agents in /etc, /var, /root, etc., while
-        # still allowing legitimate paths like /Volumes/workplace or even
-        # /var/folders (macOS temp) that happen to be under a blocked prefix.
-        if real_path in self._BLOCKED_DIRECTORIES:
-            raise ValueError(
-                f"Working directory not allowed: {working_directory} "
-                f"(resolves to blocked system path {real_path})"
-            )
-
-        # Step 4: Verify the directory actually exists
-        if not os.path.isdir(real_path):
-            raise ValueError(f"Working directory does not exist: {working_directory}")
-
-        return real_path
+        return resolve_and_validate_path(
+            working_directory,
+            allow_create=False,
+            allow_file=False,
+            description="Working directory",
+        )
 
     # Provider env vars that would cause "nested session" errors when CAO
     # itself runs inside a provider (e.g. Claude Code), unless explicitly

@@ -1,12 +1,15 @@
-"""Credential pattern gate for federated memory writes.
+"""Credential pattern gate for memory writes and archive export.
 
 Pure module — no I/O, no logging, no state. ``scan_for_secrets`` matches
 the supplied content against a fixed, ordered list of named regexes and
 returns the NAME of the first matching pattern (or ``None`` if clean).
+``redact_secrets`` replaces every match of every pattern with a
+``[REDACTED:<name>]`` marker for the export ``--redact`` path (#345, D5).
 
-Used ONLY to reject credentials on ``scope="federated"`` writes — the
-machine-wide shared tier. This is a heuristic deny-list, not entropy
-scoring; it errs toward catching common credential shapes.
+``scan_for_secrets`` is used ONLY to reject credentials on
+``scope="federated"`` writes — the machine-wide shared tier. This is a
+heuristic deny-list, not entropy scoring; it errs toward catching common
+credential shapes.
 """
 
 import re
@@ -53,3 +56,26 @@ def scan_for_secrets(content: str) -> Optional[str]:
         if pattern.search(content):
             return name
     return None
+
+
+def redact_secrets(content: str) -> Tuple[str, List[str]]:
+    """Replace every match of every pattern with ``[REDACTED:<name>]``.
+
+    Returns ``(redacted_text, fired)`` where ``fired`` is the list of
+    pattern names that matched at least once, in ``_SECRET_PATTERNS``
+    order, deduplicated. The caller must not echo the original matched
+    bytes — only the redacted text and pattern names are safe to emit.
+
+    Redaction cascades: patterns run in sequence over the already-redacted
+    text, so a later pattern may re-match an earlier ``[REDACTED:<name>]``
+    marker and ``fired`` can include a pattern that only matched a marker.
+    This is fail-safe — it never leaks original bytes.
+    """
+    if not content:
+        return content, []
+    fired: List[str] = []
+    for name, pattern in _SECRET_PATTERNS:
+        content, count = pattern.subn(f"[REDACTED:{name}]", content)
+        if count:
+            fired.append(name)
+    return content, fired

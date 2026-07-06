@@ -23,18 +23,19 @@ MCP Apps (SEP-1865, Status: Stable 2026-01-26).
 """
 
 import logging
-import os
 from typing import Any
 
 from cli_agent_orchestrator.plugins.base import CaoPlugin
+from cli_agent_orchestrator.services.config_service import ConfigService
 
 logger = logging.getLogger(__name__)
 
 
 def _surface_enabled() -> bool:
-    """Return whether the MCP App surface is enabled via ``CAO_MCP_APPS_ENABLED``."""
+    """Return whether the MCP App surface is enabled via ``apps.enabled``
+    (``CAO_MCP_APPS_ENABLED`` env var or ``settings.json``)."""
 
-    return os.getenv("CAO_MCP_APPS_ENABLED", "false").lower() in ("1", "true", "yes")
+    return bool(ConfigService.get("apps.enabled", default=False))
 
 
 class McpAppsPlugin(CaoPlugin):

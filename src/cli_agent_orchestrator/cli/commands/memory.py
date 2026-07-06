@@ -3,11 +3,13 @@
 import asyncio
 import os
 import re
+from pathlib import Path
 
 import click
 
+from cli_agent_orchestrator.constants import MEMORY_ARCHIVE_DEFAULT_FORMAT
 from cli_agent_orchestrator.models.memory import MemoryScope, MemoryType
-from cli_agent_orchestrator.services.memory_service import MemoryService
+from cli_agent_orchestrator.services.memory_service import MemoryDisabledError, MemoryService
 
 
 def _get_memory_service() -> MemoryService:
@@ -489,3 +491,176 @@ def heal_cmd(scope, do_apply, aggressive, issue_type, out_format):
             f"\n{report.total_suppressed} action(s) suppressed by caps "
             f"(by type: {report.truncated_by_type}, run-level: {report.truncated_run_level})."
         )
+
+
+# ---------------------------------------------------------------------------
+# Archive export/import (#345 D6) — direct MemoryService calls like siblings
+# ---------------------------------------------------------------------------
+
+_PRIVATE_SCOPES = (MemoryScope.SESSION.value, MemoryScope.AGENT.value)
+
+
+def _resolve_export_scope_id(svc: MemoryService, scope: str) -> "str | None":
+    """Resolve scope_id for export. Project binds to the CLI's cwd (D5)."""
+    if scope == MemoryScope.PROJECT.value:
+        scope_id = svc.resolve_scope_id(scope, _cwd_context())
+        if scope_id is None:
+            raise click.ClickException(f"could not resolve scope_id for scope '{scope}'")
+        return scope_id
+    return None
+
+
+@memory.command(name="export")
+@click.option(
+    "--format",
+    "fmt",
+    default=MEMORY_ARCHIVE_DEFAULT_FORMAT,
+    show_default=True,
+    help="Archive format (registry-backed; 'okf' today).",
+)
+@click.option(
+    "--scope",
+    type=click.Choice([s.value for s in MemoryScope], case_sensitive=False),
+    required=True,
+    help="Scope to export (one bundle per scope).",
+)
+@click.option(
+    "-o",
+    "--output",
+    "output",
+    required=True,
+    help="Destination directory, or a .tar.gz file path.",
+)
+@click.option(
+    "--include-private",
+    is_flag=True,
+    default=False,
+    help="Required to export the private session/agent scopes.",
+)
+@click.option("--include-history", is_flag=True, default=False, help="Emit history/<key>.md files.")
+@click.option(
+    "--redact",
+    is_flag=True,
+    default=False,
+    help="Redact secret matches instead of skipping the topic.",
+)
+@click.option(
+    "--prune",
+    is_flag=True,
+    default=False,
+    help="Delete destination topics no longer in the scope (directory output only).",
+)
+def export_cmd(fmt, scope, output, include_private, include_history, redact, prune):
+    """Export a memory scope as an archive bundle (OKF directory by default)."""
+    # Private-scope gate (D5): whole-command error BEFORE any write.
+    if scope in _PRIVATE_SCOPES and not include_private:
+        raise click.ClickException(
+            f"scope '{scope}' holds private working state; pass --include-private to export it"
+        )
+
+    svc = _get_memory_service()
+    scope_id = _resolve_export_scope_id(svc, scope)
+
+    try:
+        if output.endswith(".tar.gz"):
+            from cli_agent_orchestrator.services.memory_archive import get_backend
+            from cli_agent_orchestrator.services.memory_archive.okf import export_bundle_to_tar
+
+            backend = get_backend(fmt)(svc)
+            report = export_bundle_to_tar(
+                backend,
+                scope,
+                scope_id,
+                Path(output),
+                include_history=include_history,
+                redact=redact,
+            )
+        else:
+            report = svc.export_memories(
+                fmt,
+                scope,
+                scope_id,
+                Path(output),
+                include_history=include_history,
+                redact=redact,
+                prune=prune,
+            )
+    except ValueError as e:
+        raise click.ClickException(str(e))
+
+    click.echo(f"Exported scope '{scope}' to {output}")
+    click.echo(
+        f"  exported: {report.exported}  unchanged: {report.unchanged}  "
+        f"skipped (secret): {report.skipped_secret}  redacted: {report.redacted}  "
+        f"pruned: {report.pruned}  links dropped: {report.links_dropped}"
+    )
+    for key, patterns in sorted(report.skip_reasons.items()):
+        click.echo(f"  skipped '{key}': matched {', '.join(patterns)}")
+
+
+@memory.command(name="import")
+@click.argument("path")
+@click.option(
+    "--format",
+    "fmt",
+    default=MEMORY_ARCHIVE_DEFAULT_FORMAT,
+    show_default=True,
+    help="Archive format (registry-backed; 'okf' today).",
+)
+@click.option(
+    "--scope",
+    # D5: global/project/federated only — agent is banned outright and
+    # session is not offered (bulk-writing a private tier is the exact
+    # cross-scope contamination store()'s guard prevents).
+    type=click.Choice(
+        [MemoryScope.GLOBAL.value, MemoryScope.PROJECT.value, MemoryScope.FEDERATED.value],
+        case_sensitive=False,
+    ),
+    required=True,
+    help="Target scope (required — bundles carry no scope).",
+)
+@click.option(
+    "--conflict",
+    type=click.Choice(["skip", "replace", "merge"], case_sensitive=False),
+    default="skip",
+    show_default=True,
+    help="Policy when a key already exists in the target scope.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Full parse/validate/secret pipeline, report only — no writes.",
+)
+def import_cmd(path, fmt, scope, conflict, dry_run):
+    """Import an archive bundle directory into a memory scope."""
+    svc = _get_memory_service()
+    try:
+        report = svc.import_memories(
+            fmt,
+            Path(path),
+            target_scope=scope,
+            conflict_policy=conflict,
+            dry_run=dry_run,
+            terminal_context=_cwd_context(),
+        )
+    except (ValueError, MemoryDisabledError, PermissionError) as e:
+        raise click.ClickException(str(e))
+
+    mode = "DRY RUN — nothing written" if report.dry_run else "Imported"
+    dest = report.target_scope + (
+        f" (scope_id: {report.target_scope_id})" if report.target_scope_id else ""
+    )
+    click.echo(f"{mode}: {path} -> scope {dest}")
+    click.echo(
+        f"  imported: {report.imported}  replaced: {report.replaced}  "
+        f"merged: {report.merged}  skipped (conflict): {report.skipped_conflict}  "
+        f"rejected: {report.rejected}"
+    )
+    click.echo(
+        f"  see-also links dropped: {report.see_also_dropped}  "
+        f"bodies escaped: {report.bodies_escaped}  "
+        f"timestamps clamped: {report.timestamps_clamped}"
+    )
+    for rel, reason in sorted(report.errors.items()):
+        click.echo(f"  rejected '{rel}': {reason}")

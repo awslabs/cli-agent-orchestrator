@@ -5,9 +5,14 @@ The three views are shipped as **single-file HTML** artifacts built by the
 ``register_apps`` mounts each artifact as an MCP resource under its ``ui://cao/*``
 URI so an MCP App host can load it into a sandboxed iframe.
 
+The surface is default-off, gated on ``apps.enabled`` — resolved via
+``ConfigService`` (``CAO_MCP_APPS_ENABLED`` env var, or the ``apps.enabled``
+key in ``settings.json``; see docs/configuration.md).
+
 Resolution of ``apps_static/`` tries, in order:
 
-1. the ``CAO_MCP_APPS_STATIC_DIR`` environment override,
+1. the ``apps.static_dir`` override (``CAO_MCP_APPS_STATIC_DIR`` env var, or
+   ``settings.json``), read via ``ConfigService``,
 2. the packaged location ``<package>/apps_static`` (wheel installs), then
 3. the source-tree location ``<repo-root>/apps_static`` (editable/dev installs).
 
@@ -16,9 +21,10 @@ the boundary and only reads static files from disk.
 """
 
 import logging
-import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from cli_agent_orchestrator.services.config_service import ConfigService
 
 logger = logging.getLogger(__name__)
 
@@ -64,18 +70,20 @@ PREFERRED_FRAMES: Dict[str, Dict[str, int]] = {
 
 
 def _is_enabled() -> bool:
-    """Return whether the MCP App surface is enabled via ``CAO_MCP_APPS_ENABLED``."""
+    """Return whether the MCP App surface is enabled via ``apps.enabled``
+    (``CAO_MCP_APPS_ENABLED`` env var or ``settings.json``)."""
 
-    return os.getenv("CAO_MCP_APPS_ENABLED", "false").lower() in ("1", "true", "yes")
+    return bool(ConfigService.get("apps.enabled", default=False))
 
 
 def apps_static_dir() -> Optional[Path]:
     """Return the first existing ``apps_static`` directory, or ``None``.
 
-    Tries the env override, the packaged location, then the source-tree location.
+    Tries the ``apps.static_dir`` override (``CAO_MCP_APPS_STATIC_DIR`` env var
+    or ``settings.json``), the packaged location, then the source-tree location.
     """
 
-    override = os.getenv("CAO_MCP_APPS_STATIC_DIR")
+    override = ConfigService.get("apps.static_dir", default=None)
     candidates: List[Path] = []
     if override:
         candidates.append(Path(override))
