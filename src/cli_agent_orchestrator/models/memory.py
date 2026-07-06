@@ -109,6 +109,15 @@ class Memory(BaseModel):
         exclude=True,
         description="Set by store() to 'created' or 'updated'; not persisted on disk.",
     )
+    timestamp_clamped: bool = Field(
+        default=False,
+        exclude=True,
+        description=(
+            "Set by store() when a supplied occurred_at was out-of-order or "
+            "in the future and the section heading was clamped to now() "
+            "(#345 D5). Never persisted or serialised."
+        ),
+    )
 
     @field_validator("scope")
     @classmethod

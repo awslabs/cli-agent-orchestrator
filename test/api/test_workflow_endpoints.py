@@ -225,6 +225,16 @@ class TestResumeEndpoint:
         resp = client.post("/workflows/runs/runX/resume")
         assert resp.status_code == 400
 
+    def test_engine_error_maps_to_500(self, client, monkeypatch):
+        from cli_agent_orchestrator.services import workflow_service as ws
+
+        async def _raise(run_id):
+            raise ws.WorkflowEngineError("bad template reference")
+
+        monkeypatch.setattr(ws, "resume_from_last_completed", _raise)
+        resp = client.post("/workflows/runs/runX/resume")
+        assert resp.status_code == 500
+
     def test_success_returns_result(self, client, monkeypatch):
         from cli_agent_orchestrator.models.workflow_runtime import (
             RunState,

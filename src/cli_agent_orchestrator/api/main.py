@@ -88,6 +88,7 @@ from cli_agent_orchestrator.services.cleanup_service import (
     cleanup_expired_memories,
     cleanup_old_data,
 )
+from cli_agent_orchestrator.services.config_service import ConfigService
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.event_log_service import RING_CAPACITY
 from cli_agent_orchestrator.services.event_primitives import KINDS as EVENT_KINDS
@@ -523,12 +524,13 @@ async def health_check():
 def _mcp_apps_enabled() -> bool:
     """Whether the MCP Apps HTTP surface (event stream + widget) is enabled.
 
-    Mirrors the ``CAO_MCP_APPS_ENABLED`` gate used by the ``mcp_apps`` plugin,
+    Reads ``apps.enabled`` via ConfigService (``CAO_MCP_APPS_ENABLED`` env var
+    or ``settings.json``), mirroring the gate used by the ``mcp_apps`` plugin,
     ``app_tools``, ``sep2133`` and the ``event_log_publisher`` observer so the
     whole surface is consistently default-off.
     """
 
-    return os.getenv("CAO_MCP_APPS_ENABLED", "false").lower() in ("1", "true", "yes")
+    return bool(ConfigService.get("apps.enabled", default=False))
 
 
 def _require_mcp_apps_enabled() -> None:
@@ -937,7 +939,14 @@ async def delete_session(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
-        result = session_service.delete_session(session_name, registry=get_plugin_registry(request))
+        # Off the event loop: teardown is fully synchronous (tmux kills, FIFO
+        # cleanup, DB writes) and has wedged the whole server — /health
+        # included — when a FIFO operation stalled in the kernel (issue #382).
+        # A worker thread bounds the blast radius of any future stall to this
+        # one request.
+        result = await asyncio.to_thread(
+            session_service.delete_session, session_name, registry=get_plugin_registry(request)
+        )
         return {"success": True, **result}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -1996,6 +2005,85 @@ async def list_memories_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to list memories: {str(e)}",
         )
+
+
+@app.get("/memory/export")
+async def export_memories_endpoint(
+    scope: MemoryScope,
+    format: str = Query(default="okf"),
+    scope_id: Optional[MemoryScopeId] = None,
+    include_history: bool = False,
+    redact: bool = False,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+):
+    """Stream one scope as an archive tarball (#345 D6, read-only mirror).
+
+    Declared BEFORE /memory/{key} so "export" is not captured as a key.
+    Private scopes (session/agent) are refused outright — there is no
+    include-private escape hatch over HTTP (D5). The bundle is built by
+    the same directory writer into a temp dir, tar'd, and streamed.
+    """
+    from fastapi.responses import FileResponse
+    from starlette.background import BackgroundTask
+
+    _require_memory_enabled()
+    # Private-scope gate: the CLI's --include-private is a local-operator
+    # affordance; the API surface never exports private tiers.
+    if scope in (MemoryScope.SESSION, MemoryScope.AGENT):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"scope '{scope.value}' is private and cannot be exported via the API",
+        )
+    if scope == MemoryScope.PROJECT and scope_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="scope 'project' requires scope_id",
+        )
+
+    import tempfile
+
+    from cli_agent_orchestrator.services.memory_archive import get_backend
+    from cli_agent_orchestrator.services.memory_archive.okf import export_bundle_to_tar
+
+    svc = _get_memory_service()
+    try:
+        backend = get_backend(format)(svc)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    tmp_dir = tempfile.mkdtemp(prefix="cao-memory-export-")
+    tar_path = Path(tmp_dir) / f"cao-memory-{scope.value}.tar.gz"
+
+    def _cleanup() -> None:
+        import shutil
+
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    try:
+        export_bundle_to_tar(
+            backend,
+            scope.value,
+            scope_id,
+            tar_path,
+            include_history=include_history,
+            redact=redact,
+        )
+    except ValueError as e:
+        _cleanup()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        _cleanup()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to export memories: {str(e)}",
+        )
+
+    return FileResponse(
+        path=str(tar_path),
+        media_type="application/gzip",
+        filename=tar_path.name,
+        background=BackgroundTask(_cleanup),
+    )
 
 
 @app.get("/memory/{key}", response_model=MemoryDetail)

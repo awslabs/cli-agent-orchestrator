@@ -32,12 +32,22 @@ _SCHEMA = {"type": "object", "properties": {"answer": {"type": "string"}}, "requ
 
 
 @pytest.fixture(autouse=True)
-def _clean_registry():
-    """Each test starts with an empty run registry + output store."""
+def _clean_registry(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """Each test starts with an empty run registry + output store.
+
+    ``DATABASE_FILE`` is pointed at an empty temp path so the engine's
+    best-effort journal write-through (and start_run's journal dup-check)
+    never touches — or reads — the developer's real database.
+    """
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.constants.DATABASE_FILE", tmp_path / "wf.db", raising=True
+    )
     ws.run_registry.clear()
+    ws._active_drives.clear()
     ws.step_output_store._store.clear()
     yield
     ws.run_registry.clear()
+    ws._active_drives.clear()
     ws.step_output_store._store.clear()
 
 
