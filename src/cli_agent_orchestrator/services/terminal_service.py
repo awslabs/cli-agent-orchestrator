@@ -347,7 +347,13 @@ async def create_terminal(
             if shell_command:
                 update_terminal_shell_command(terminal_id, shell_command)
 
-        # Build and return the Terminal object
+        # Build and return the Terminal object. In the deferred-init path the
+        # provider is still initializing on a background task, so the terminal
+        # is NOT ready for input yet — report UNKNOWN (not IDLE) so a client
+        # can't mistake it for ready and send input early. Callers poll
+        # GET /terminals/{id} for the live status once init completes. The
+        # synchronous path has already reached IDLE by here.
+        initial_status = TerminalStatus.UNKNOWN if defer_init else TerminalStatus.IDLE
         terminal = Terminal(
             id=terminal_id,
             name=window_name,
@@ -357,7 +363,7 @@ async def create_terminal(
             caller_id=caller_id,
             allowed_tools=allowed_tools,
             shell_command=shell_command,
-            status=TerminalStatus.IDLE,
+            status=initial_status,
             last_active=datetime.now(),
         )
 

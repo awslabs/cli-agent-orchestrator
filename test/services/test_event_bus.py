@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import time
 from unittest.mock import patch
 
 import pytest
@@ -91,8 +90,10 @@ class TestQueueFullRateLimit:
                 bus.publish("terminal.bbb.output", {"data": "x"})
             await asyncio.sleep(0.05)
 
-            # Force the summary window to elapse so the next drop logs a summary
-            time.sleep(1.05)
+            # Force the summary window to elapse so the next drop logs a summary.
+            # Use asyncio.sleep (not time.sleep) so the event loop keeps running
+            # the EventBus's call_soon_threadsafe dispatches during the wait.
+            await asyncio.sleep(1.05)
             for i in range(50):
                 bus.publish("terminal.bbb.output", {"data": "x"})
             await asyncio.sleep(0.05)

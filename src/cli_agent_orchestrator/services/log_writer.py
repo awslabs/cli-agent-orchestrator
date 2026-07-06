@@ -75,9 +75,16 @@ class LogWriter:
                     log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
                     grouped[log_path].append(event["data"]["data"])
 
-                # One thread hop per unique file, not per event.
-                for path, chunks in grouped.items():
-                    await asyncio.to_thread(self._write, path, "".join(chunks))
+                # One thread hop per unique file, not per event. Schedule the
+                # per-file writes concurrently (gather) so a large batch for
+                # terminal A doesn't serialize ahead of terminal B's write —
+                # each is an independent append to a distinct path.
+                await asyncio.gather(
+                    *(
+                        asyncio.to_thread(self._write, path, "".join(chunks))
+                        for path, chunks in grouped.items()
+                    )
+                )
             except Exception as e:
                 # Log-writer failure must never crash the whole loop:
                 # continue draining so back-pressure recovers.

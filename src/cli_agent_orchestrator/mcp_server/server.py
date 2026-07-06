@@ -233,12 +233,17 @@ def _create_terminal(
             params["working_directory"] = working_directory
         if child_allowed_tools:
             params["allowed_tools"] = child_allowed_tools
+        # The message payload goes in the JSON body, not the query string, so
+        # prompt content isn't exposed in HTTP access logs and isn't subject to
+        # URL-length limits. Only routing flags stay in params.
+        json_body = None
         if defer_init:
             params["defer_init"] = "true"
+            json_body = {}
             if initial_message is not None:
-                params["initial_message"] = initial_message
+                json_body["initial_message"] = initial_message
             if initial_message_orchestration_type is not None:
-                params["initial_message_orchestration_type"] = (
+                json_body["initial_message_orchestration_type"] = (
                     initial_message_orchestration_type.value
                     if isinstance(initial_message_orchestration_type, OrchestrationType)
                     else str(initial_message_orchestration_type)
@@ -247,6 +252,7 @@ def _create_terminal(
         response = requests.post(
             f"{API_BASE_URL}/sessions/{session_name}/terminals",
             params=params,
+            json=json_body,
             timeout=_mcp_timeout(),
         )
         response.raise_for_status()

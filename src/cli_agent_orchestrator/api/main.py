@@ -171,6 +171,20 @@ class TerminalOutputResponse(BaseModel):
     mode: str
 
 
+class CreateTerminalBody(BaseModel):
+    """Optional JSON body for POST /sessions/{name}/terminals.
+
+    Carries the deferred-init message payload OUT of the query string:
+    prompt content can be large (URL-length 414 risk) and sensitive (query
+    strings are routinely captured in HTTP access logs and traces). Routing
+    fields (provider, defer_init, etc.) stay as query params; only the
+    message content lives here.
+    """
+
+    initial_message: Optional[str] = None
+    initial_message_orchestration_type: Optional[str] = None
+
+
 class RunStepRequest(BaseModel):
     """Request body for the combined step-execution endpoint (N0, #312)."""
 
@@ -971,8 +985,7 @@ async def create_terminal_in_session(
     allowed_tools: Optional[str] = None,
     caller_id: Optional[TerminalId] = None,
     defer_init: bool = False,
-    initial_message: Optional[str] = None,
-    initial_message_orchestration_type: Optional[str] = None,
+    body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
     """Create additional terminal in existing session.
@@ -980,11 +993,16 @@ async def create_terminal_in_session(
     ``defer_init=true``: return as soon as the tmux window is created and the
     terminal is registered in the DB, without waiting for the CLI provider to
     reach IDLE. Provider initialization runs as a background task; when
-    ``initial_message`` is also provided it is sent to the terminal via the
-    same task once init completes. Used by the MCP `assign` tool to keep
+    ``body.initial_message`` is also provided it is sent to the terminal via
+    the same task once init completes. Used by the MCP `assign` tool to keep
     tool-call latency well under kiro-cli 2.11's ~60s per-tool client
     timeout, and to allow multiple concurrent assigns to run their init
     phases in parallel.
+
+    The message payload lives in the JSON body (``initial_message``,
+    ``initial_message_orchestration_type``) rather than query params so prompt
+    content isn't exposed in HTTP access logs and isn't subject to URL-length
+    limits.
     """
     try:
         validate_tmux_name(session_name, "session_name")
@@ -999,18 +1017,20 @@ async def create_terminal_in_session(
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
+        initial_message = body.initial_message if body else None
+
         # Deferred init only makes sense when a message will follow — we
         # still accept the flag alone (no message) for future non-assign uses.
         orch_type = None
-        if initial_message_orchestration_type:
+        if body and body.initial_message_orchestration_type:
             try:
-                orch_type = OrchestrationType(initial_message_orchestration_type)
+                orch_type = OrchestrationType(body.initial_message_orchestration_type)
             except ValueError:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=(
                         f"invalid initial_message_orchestration_type: "
-                        f"{initial_message_orchestration_type!r}"
+                        f"{body.initial_message_orchestration_type!r}"
                     ),
                 )
 

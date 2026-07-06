@@ -240,6 +240,9 @@ def poll_until_done(
     """
     import click
 
+    if idle_stable_polls < 1:
+        raise click.ClickException(f"idle_stable_polls must be >= 1, got {idle_stable_polls}")
+
     start = time.time()
     consecutive_idle = 0
     while True:

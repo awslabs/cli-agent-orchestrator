@@ -74,6 +74,13 @@ NEW_TUI_IDLE_PATTERN_LOG = r"[Aa]sk a question,? or describe a task"
 # Require 20+ chars to avoid matching short markdown separators in agent output.
 TUI_SEPARATOR_PATTERN = r"^[─]{20,}$"
 
+# Non-SGR CSI sequences (erase-line \x1b[2K, cursor moves, etc.) — everything
+# except colour codes ending in 'm'. Compiled once at module scope because
+# get_status() is on a hot path (called per output burst); recompiling per call
+# was avoidable overhead. Used in Check 6 to strip TUI chrome so the separator
+# regex can anchor on the raw ─── characters.
+_NON_SGR_CSI = re.compile(r"\x1b\[[0-9;?]*[^m]")
+
 # TUI Credits line: "▸ Credits: N.NN • Time: Ns" marks response completion
 TUI_CREDITS_PATTERN = r"▸\s*Credits:\s*[\d.]+"
 
@@ -524,13 +531,13 @@ class KiroCliProvider(BaseProvider):
         # inside the box.
         if has_new_tui_idle:
             lines = clean_output.split("\n")
+
             # Strip non-SGR CSI (erase-line \x1b[2K, cursor moves, etc.) so
             # the separator regex can see the raw ─── characters. The top-of-
             # function strip only removes SGR codes ending in 'm' (color) —
             # kiro's TUI prefixes many lines with \x1b[2K which would prevent
             # the separator regex from anchoring at start-of-line.
-            _NON_SGR_CSI = re.compile(r"\x1b\[[0-9;?]*[^m]")
-
+            # (_NON_SGR_CSI is compiled once at module scope — hot path.)
             def _sep_line(line: str) -> str:
                 return _NON_SGR_CSI.sub("", line).strip()
 
