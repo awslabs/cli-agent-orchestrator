@@ -112,9 +112,41 @@ Each registered directory is scanned one level deep — every immediate subfolde
 
 ## How Agents Discover Skills
 
-All installed skills are available to all CAO agents — there is no per-profile skill declaration. When an agent is launched, CAO appends a catalog block to the prompt listing every installed skill's name and description, along with instructions to use the `load_skill` MCP tool to retrieve full content. The agent then decides when and whether to load each skill based on the task at hand.
+By default, every installed skill is available to every CAO agent. When an agent is launched, CAO appends a catalog block to the prompt listing each available skill's name and description, along with instructions to use the `load_skill` MCP tool to retrieve full content. The agent then decides when and whether to load each skill based on the task at hand.
 
-You can explicitly instruct the agent to load specific skills eagerly in the agent profile body:
+### Scoping the catalog per agent (`skills`)
+
+To advertise only a subset of skills to a given agent, set the `skills` field in its profile frontmatter — a list of skill-name patterns, each an exact name or a case-sensitive [`fnmatch`](https://docs.python.org/3/library/fnmatch.html) glob. Only matching skills appear in that agent's catalog; the rest are simply not advertised to it. A pattern that matches no installed skill is logged as a warning, to catch typos and stale names.
+
+This scopes the injected **catalog** only — it controls what an agent *sees* advertised, not what it can *load*. Skill resolution is unchanged: `load_skill` still resolves any installed skill by name, so this is a prompt-relevance / noise-reduction control, not an access boundary. (If you need a hard per-agent allowlist, that would have to be enforced in the `load_skill` path — out of scope here.)
+
+This applies only to the runtime-prompt providers that receive the injected catalog (Claude Code, Codex, Antigravity CLI, Kimi CLI). Providers that deliver skills natively (Kiro CLI, OpenCode, GitHub Copilot CLI) ignore the field.
+
+```yaml
+---
+name: ads-backend-developer
+role: developer
+skills: ["ads-db", "ads-query-logs"]   # exact names
+---
+```
+
+```yaml
+---
+name: ads-cto
+role: developer
+skills: ["ads-*", "cao-*"]              # globs: this project's skills + CAO built-ins
+---
+```
+
+Semantics:
+
+- **field omitted** → the full catalog (backward-compatible default).
+- **list of patterns** → only skills matching at least one pattern.
+- **empty list `[]`** → no skill catalog is injected for this agent.
+
+This keeps each agent's catalog focused — for example so one project's agents don't see another project's skills when both register their `skills/` directories under a shared `extra_skill_dirs`.
+
+You can also explicitly instruct the agent to load specific skills eagerly in the agent profile body:
 
 ```markdown
 Before starting any task, load the python-testing and code-style skills.
@@ -213,4 +245,4 @@ Running `cao skills add --force` refreshes Copilot CLI agent files immediately. 
 ## Known Limitations
 
 - **No nested skill directories.** Skills must be immediate subdirectories of the skill store. Nested paths (e.g., `skills/team/python-testing/`) are not discovered by CAO's skill catalog. Kiro's `skill://` glob handles nested paths natively, but other providers do not.
-- **No per-profile skill scoping.** All installed skills are available to all agents. There is currently no way to restrict which skills a specific agent profile can see. A `skills` field in agent profile frontmatter for declaring allowed skills is a planned future addition.
+- **Catalog scoping is advertise-only.** The per-agent [`skills`](#scoping-the-catalog-per-agent-skills) field filters which skills appear in an agent's injected catalog, but it does not restrict resolution — `load_skill` still resolves any installed skill by name. It is a prompt-relevance control, not an access boundary; a hard per-agent allowlist would need enforcement in the `load_skill` path.

@@ -8,10 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- add optional `skills` field to `AgentProfile` to scope the per-agent skill catalog via an fnmatch allowlist; runtime-prompt providers only, `load_skill` resolution unchanged (#351)
+
 - add Antigravity CLI (`agy`) provider — Google's terminal-native coding agent and the successor to the Gemini CLI after the free "Login with Google" path was retired (#323)
 
 - add built-in Hermes provider support through profile-configured `hermesProfile` wrappers
 
+- add OKF memory export/import — `cao memory export`/`cao memory import` CLI commands plus a read-scoped `GET /memory/export` API endpoint streaming a scope as a tar.gz bundle (#345)
 - add `examples/fleet` — a cross-node fleet coordinator that manages many CAO nodes from one place: one-command node bootstrap, a `fleet` control helper (list/show/exec against any node), and an AI conductor wired to one `cao-ops-mcp-server` per node. Purely additive under `examples/`; each node stays a stateless client of the existing `cao-server` API (#349)
 
 ### Changed

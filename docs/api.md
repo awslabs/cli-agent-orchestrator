@@ -313,6 +313,25 @@ List stored memories across all projects (the CLI's `cao memory list --all`).
 `scope_id` is the project ID for project memories, the session/agent ID for
 those scopes, and `null` for global.
 
+### GET /memory/export
+Export one memory scope as an archive bundle (the CLI's `cao memory export`).
+Streams a gzipped tarball of the OKF bundle (topic files plus `index.md` and
+`manifest.md`).
+
+**Parameters:**
+- `scope` (string, required): Scope to export (`global`, `project`, or `federated`; `400` for the private `session`/`agent` scopes — there is no include-private escape hatch over HTTP)
+- `format` (string, optional): Archive format (default: `okf`; `400` on unknown formats)
+- `scope_id` (string): Required for `project` scope (`400` if missing)
+- `include_history` (boolean, optional): Include `history/<key>.md` files (default: `false`)
+- `redact` (boolean, optional): Redact secret matches instead of skipping the topic (default: `false`)
+
+**Response:** `200` with `Content-Type: application/gzip` — the bundle tarball
+as the response body.
+
+When API auth is enabled, this endpoint requires a token carrying at least the
+read scope (`cao:read`, `cao:write`, or `cao:admin`); requests without one are
+`403`'d.
+
 ### GET /memory/{key}
 Show a memory by key (first match wins when the same key exists in several
 scopes; narrow with `scope`/`scope_id`).
