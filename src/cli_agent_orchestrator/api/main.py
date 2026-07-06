@@ -939,7 +939,14 @@ async def delete_session(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
-        result = session_service.delete_session(session_name, registry=get_plugin_registry(request))
+        # Off the event loop: teardown is fully synchronous (tmux kills, FIFO
+        # cleanup, DB writes) and has wedged the whole server — /health
+        # included — when a FIFO operation stalled in the kernel (issue #382).
+        # A worker thread bounds the blast radius of any future stall to this
+        # one request.
+        result = await asyncio.to_thread(
+            session_service.delete_session, session_name, registry=get_plugin_registry(request)
+        )
         return {"success": True, **result}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
