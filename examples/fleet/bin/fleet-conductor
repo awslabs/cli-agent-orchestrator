@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# fleet-conductor — start an AI "conductor" (Claude Code) wired to every fleet
+# node's cao-ops-mcp-server, so one AI can observe and command agents across nodes.
+#   fleet-conductor                 # interactive chat you drive
+#   fleet-conductor "<prompt>"      # one-shot, non-interactive (scriptable)
+#
+# Requires conductor/.mcp.json, generated from your fleet.json:
+#   python3 bin/render-mcp-config.py
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(dirname "$HERE")"          # examples/fleet
+MCP="$ROOT/conductor/.mcp.json"
+
+if [ ! -f "$MCP" ]; then
+  echo "fleet-conductor: missing $MCP" >&2
+  echo "  generate it first:  python3 \"$HERE/render-mcp-config.py\"" >&2
+  exit 2
+fi
+
+cd "$ROOT/conductor"
+if [ $# -gt 0 ]; then
+  printf '%s\n' "$*" | claude --print --dangerously-skip-permissions --mcp-config "$MCP"
+else
+  exec claude --mcp-config "$MCP"
+fi
