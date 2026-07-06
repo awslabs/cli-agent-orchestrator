@@ -89,7 +89,7 @@ def _inject_kiro_mcp_timeout(
             result[name] = cfg
             continue
         args = cfg.get("args") or []
-        is_cao = "cao-mcp-server" in (name,) or any(
+        is_cao = name == "cao-mcp-server" or any(
             isinstance(a, str) and "cao-mcp-server" in a for a in args
         )
         if is_cao and "timeout" not in cfg:

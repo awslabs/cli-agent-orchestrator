@@ -86,6 +86,11 @@ class StatusMonitor:
         # so the cancel is marshaled back onto this loop. See
         # _cancel_quiesce_handle.
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # Strong references to in-flight quiescence-detection tasks. asyncio only
+        # keeps a WEAK reference to tasks created via loop.create_task, so without
+        # this a detection task can be garbage-collected mid-run and silently drop
+        # a status transition. Tasks remove themselves on completion.
+        self._detect_tasks: set = set()
 
     async def run(self) -> None:
         """Subscribe to output events and detect status changes.
@@ -317,7 +322,7 @@ class StatusMonitor:
         if loop is None:
             self._apply_detection(terminal_id, self._detect_screen(terminal_id, provider))
         else:
-            loop.create_task(_detect_and_apply())
+            self._spawn_tracked(loop, _detect_and_apply())
 
     def _schedule_raw_detection(self, terminal_id: str, buffer: str) -> None:
         """Edge-debounce detection on the raw rolling buffer.
@@ -402,7 +407,14 @@ class StatusMonitor:
         if loop is None:
             self._apply_detection(terminal_id, self._detect_status(terminal_id, buffer))
         else:
-            loop.create_task(_detect_and_apply())
+            self._spawn_tracked(loop, _detect_and_apply())
+
+    def _spawn_tracked(self, loop, coro) -> None:
+        """Create a task on ``loop`` and hold a strong reference until it
+        finishes, so asyncio's weak task references can't GC it mid-run."""
+        task = loop.create_task(coro)
+        self._detect_tasks.add(task)
+        task.add_done_callback(self._detect_tasks.discard)
 
     @staticmethod
     def _running_loop() -> Optional[asyncio.AbstractEventLoop]:

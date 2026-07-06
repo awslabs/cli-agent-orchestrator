@@ -17,6 +17,7 @@ Terminal Workflow:
 4. delete_terminal() → Cleans up provider, database record, and logging
 """
 
+import asyncio
 import logging
 import threading
 import time
@@ -66,6 +67,12 @@ logger = logging.getLogger(__name__)
 # Track terminals that have already received memory injection (first message only).
 _memory_injected_terminals: set = set()
 _memory_injected_lock = threading.Lock()
+
+# Strong references to in-flight deferred-init background tasks. asyncio keeps
+# only a WEAK reference to tasks from loop.create_task, so without this a
+# deferred provider.initialize() + input-send task could be GC'd mid-run,
+# silently leaving a worker uninitialized. Tasks drop themselves on completion.
+_deferred_init_tasks: set = set()
 
 
 class TerminalInputBlockedError(Exception):
@@ -420,7 +427,6 @@ def _schedule_deferred_init(
     call has already returned success by the time this runs. Operators
     diagnose failures via cao logs / GET /terminals/{id} status.
     """
-    import asyncio
 
     async def _run() -> None:
         try:
@@ -451,7 +457,7 @@ def _schedule_deferred_init(
                 )
         except Exception as e:
             logger.error(
-                f"Deferred init for terminal {terminal_id} failed: {e}. " f"Tearing down worker."
+                f"Deferred init for terminal {terminal_id} failed: {e}. Tearing down worker."
             )
             # Best-effort cleanup so a failed init doesn't leak resources.
             try:
@@ -460,11 +466,13 @@ def _schedule_deferred_init(
                 pass
 
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
     except RuntimeError:
         logger.error(f"Deferred init for {terminal_id}: no running event loop; init skipped")
         return
-    loop.create_task(_run())
+    task = loop.create_task(_run())
+    _deferred_init_tasks.add(task)
+    task.add_done_callback(_deferred_init_tasks.discard)
 
 
 def get_terminal(terminal_id: str) -> Dict:
