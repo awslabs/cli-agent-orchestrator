@@ -4,7 +4,7 @@ import logging
 import os
 from importlib import resources
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Set
 
 import frontmatter
 
@@ -15,15 +15,16 @@ from cli_agent_orchestrator.utils.env import resolve_env_vars
 logger = logging.getLogger(__name__)
 
 
-def _normalized_path(path) -> str:
+def _normalized_path(path: str | Path) -> str:
     """Canonical form for comparing configured directory paths (GH #280/#281).
 
     Disabled dirs are stored as the exact strings the UI sends, but the same
-    directory can be reached via a slightly different spelling (e.g. the local
-    agent-store is also a provider default). Normalising both sides keeps the
-    disable check robust across those.
+    directory can be reached via a different spelling (`~`, trailing slash, a
+    symlink; e.g. the local agent-store is also a provider default).
+    ``realpath`` + ``expanduser`` canonicalises all of those, so the disable
+    check matches whenever two spellings reach the same physical directory.
     """
-    return os.path.normpath(os.path.expanduser(str(path)))
+    return os.path.realpath(os.path.expanduser(str(path)))
 
 
 def _validate_agent_name(agent_name: str) -> None:
@@ -64,12 +65,20 @@ def _scan_directory(
     """Scan a directory for agent profiles (.md files, .json files, or subdirectories).
 
     ``profiles`` keeps the first-found profile per name (scan order decides the
-    winner). ``name_sources``, when given, records EVERY directory a name was
-    found in (winner first), so callers can surface same-named profiles defined
-    in more than one enabled directory (GH #280).
+    winner). ``name_sources``, when given, records each directory a name was
+    found in (winner first, once per directory — a dir holding both
+    ``<name>.md`` and ``<name>/`` counts once), so callers can surface
+    same-named profiles defined in more than one enabled directory (GH #280).
     """
     if not directory.exists():
         return
+    seen_here: Set[str] = set()
+
+    def _record(profile_name: str) -> None:
+        if name_sources is not None and profile_name not in seen_here:
+            seen_here.add(profile_name)
+            name_sources.setdefault(profile_name, []).append(source_label)
+
     for item in directory.iterdir():
         if item.is_dir():
             profile_name = item.name
@@ -82,8 +91,7 @@ def _scan_directory(
                     desc = data.metadata.get("description", "")
                 except Exception:
                     pass
-            if name_sources is not None:
-                name_sources.setdefault(profile_name, []).append(source_label)
+            _record(profile_name)
             if profile_name not in profiles:
                 profiles[profile_name] = {
                     "name": profile_name,
@@ -98,8 +106,7 @@ def _scan_directory(
                 desc = data.metadata.get("description", "")
             except Exception:
                 pass
-            if name_sources is not None:
-                name_sources.setdefault(profile_name, []).append(source_label)
+            _record(profile_name)
             if profile_name not in profiles:
                 profiles[profile_name] = {
                     "name": profile_name,
@@ -125,9 +132,9 @@ def list_agent_profiles() -> List[Dict]:
     # to flag same-named profiles defined in more than one dir (GH #280).
     name_sources: Dict[str, List[str]] = {}
     disabled = {_normalized_path(d) for d in get_disabled_agent_dirs()}
-    scanned_paths: set[str] = set()
+    scanned_paths: Set[str] = set()
 
-    # 2. Local agent store (~/.aws/cli-agent-orchestrator/agent-store/).
+    # 1. Local agent store (~/.aws/cli-agent-orchestrator/agent-store/).
     # It shares a path with the claude_code/codex default, so honour the
     # disable toggle here too — otherwise disabling that default wouldn't hide
     # its profiles.
@@ -136,7 +143,7 @@ def list_agent_profiles() -> List[Dict]:
         _scan_directory(LOCAL_AGENT_STORE_DIR, "local", profiles, name_sources)
         scanned_paths.add(local_norm)
 
-    # 3. Provider-specific directories (from settings)
+    # 2. Provider-specific directories (from settings)
     agent_dirs = get_agent_dirs()
     provider_source_labels = {
         "kiro_cli": "kiro",
@@ -152,7 +159,7 @@ def list_agent_profiles() -> List[Dict]:
         _scan_directory(Path(dir_path), label, profiles, name_sources)
         scanned_paths.add(norm)
 
-    # 4. Extra user-added directories
+    # 3. Extra user-added directories
     for extra_dir in get_extra_agent_dirs():
         norm = _normalized_path(extra_dir)
         if norm in disabled or norm in scanned_paths:
@@ -160,7 +167,8 @@ def list_agent_profiles() -> List[Dict]:
         _scan_directory(Path(extra_dir), "custom", profiles, name_sources)
         scanned_paths.add(norm)
 
-    # Built-in agent store — scanned LAST so on-disk copies win (matches _read_agent_profile_source).
+    # 4. Built-in agent store — scanned LAST so on-disk copies win (matches
+    # _read_agent_profile_source's lookup order).
     try:
         agent_store = resources.files("cli_agent_orchestrator.agent_store")
         for item in agent_store.iterdir():

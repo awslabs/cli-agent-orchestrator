@@ -12,6 +12,7 @@ function Toggle({ on, onClick, disabled, label }: {
 }) {
   return (
     <button
+      type="button"
       role="switch"
       aria-checked={on}
       aria-label={label}
@@ -91,7 +92,11 @@ export function SettingsPanel() {
 
   const toggle = (dir: string) => {
     const next = new Set(disabled)
-    next.has(dir) ? next.delete(dir) : next.add(dir)
+    if (next.has(dir)) {
+      next.delete(dir)
+    } else {
+      next.add(dir)
+    }
     apply(
       { disabled_dirs: Array.from(next) },
       next.has(dir) ? 'Directory disabled' : 'Directory enabled',

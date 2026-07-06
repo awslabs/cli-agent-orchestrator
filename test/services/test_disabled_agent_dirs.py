@@ -108,10 +108,11 @@ class TestDefaultRemovalRegression:
 
 
 class TestNormalizedPathMatching:
-    """The disable check normalizes paths (GH #280/#281), so a directory is still
-    skipped when the disabled entry is spelled differently from the scanned path."""
+    """SET and SCAN/LOAD share the same path normalization (GH #280/#281): a
+    valid directory sent in a different spelling is accepted by the setter
+    (persisted as the configured spelling) and skipped by scan + load."""
 
-    def test_differing_spelling_still_skips(self, isolated_settings, monkeypatch):
+    def test_differing_spelling_accepted_and_skips_end_to_end(self, isolated_settings):
         d = isolated_settings / "extra"
         d.mkdir()
         _profile(d, "zzspelling", "s")
@@ -121,12 +122,90 @@ class TestNormalizedPathMatching:
         names = {p["name"] for p in agent_profiles.list_agent_profiles()}
         assert "zzspelling" in names
 
-        # Disable it with a DIFFERENT spelling (trailing slash). set_disabled_agent_dirs
-        # validates raw strings, so we bypass it here to isolate the scan-side
-        # normalization we actually want to prove — this is the part the UI relies on.
-        monkeypatch.setattr(svc, "get_disabled_agent_dirs", lambda: [str(d) + "/"])
+        # Disable with a DIFFERENT spelling (trailing slash) through the REAL
+        # setter — validation normalizes both sides, and the configured
+        # spelling is what gets persisted (so UI exact-string matching works).
+        stored = svc.set_disabled_agent_dirs([str(d) + "/"])
+        assert stored == [str(d)]
 
         names = {p["name"] for p in agent_profiles.list_agent_profiles()}
         assert "zzspelling" not in names  # normalization matched despite the slash
         with pytest.raises(FileNotFoundError):
             agent_profiles._read_agent_profile_source("zzspelling")
+
+
+class TestSharedPathDedup:
+    """One physical directory configured under several names (claude_code and
+    codex share the agent-store by default) is scanned once — no duplicated_in
+    false positive, and disabling it via either spelling works."""
+
+    def test_two_providers_same_dir_scanned_once(self, isolated_settings):
+        d = isolated_settings / "store"
+        d.mkdir()
+        _profile(d, "zzshared", "one-copy")
+        svc.set_agent_dirs({"claude_code": str(d), "codex": str(d)})
+
+        profs = {p["name"]: p for p in agent_profiles.list_agent_profiles()}
+        assert profs["zzshared"]["duplicated_in"] == []  # scanned once, not twice
+
+    def test_md_file_and_subdir_same_name_not_flagged(self, isolated_settings):
+        """A dir holding both <name>.md and <name>/ counts once for
+        duplicated_in — cosmetic edge from review round 2."""
+        d = isolated_settings / "mixed"
+        d.mkdir()
+        _profile(d, "zzmixed", "flat")
+        (d / "zzmixed").mkdir()
+        (d / "zzmixed" / "agent.md").write_text("---\ndescription: nested\n---\nn")
+        svc.set_extra_agent_dirs([str(d)])
+
+        profs = {p["name"]: p for p in agent_profiles.list_agent_profiles()}
+        assert profs["zzmixed"]["duplicated_in"] == []
+
+
+class TestLoadPathBranches:
+    """The disable toggle is honoured on EVERY load branch, not just extras."""
+
+    def test_disabled_provider_default_skipped_at_load(self, isolated_settings):
+        d = isolated_settings / "kiro"
+        d.mkdir()
+        _profile(d, "zzloadprov", "k")
+        svc.set_agent_dirs({"kiro_cli": str(d)})
+        assert "body-k" in agent_profiles._read_agent_profile_source("zzloadprov")
+
+        svc.set_disabled_agent_dirs([str(d)])
+        with pytest.raises(FileNotFoundError):
+            agent_profiles._read_agent_profile_source("zzloadprov")
+
+    def test_disabled_local_store_skipped_at_load(self, isolated_settings, monkeypatch):
+        local = isolated_settings / "local-store"
+        local.mkdir()
+        _profile(local, "zzloadlocal", "l")
+        monkeypatch.setattr(agent_profiles, "LOCAL_AGENT_STORE_DIR", local)
+        assert "body-l" in agent_profiles._read_agent_profile_source("zzloadlocal")
+
+        # The local store is disableable via the matching provider-default path;
+        # configure it as one so the setter accepts it, then disable.
+        svc.set_agent_dirs({"claude_code": str(local)})
+        svc.set_disabled_agent_dirs([str(local)])
+        with pytest.raises(FileNotFoundError):
+            agent_profiles._read_agent_profile_source("zzloadlocal")
+
+
+class TestStaleDisabledPruning:
+    """Removing an extra dir prunes its disabled entry, so re-adding the path
+    later does not come back silently pre-disabled (review round 2)."""
+
+    def test_removed_extra_dir_prunes_disabled_entry(self, isolated_settings):
+        d = isolated_settings / "extra"
+        d.mkdir()
+        svc.set_extra_agent_dirs([str(d)])
+        svc.set_disabled_agent_dirs([str(d)])
+        assert svc.get_disabled_agent_dirs() == [str(d)]
+
+        # Remove the extra dir entirely -> its disabled entry is pruned.
+        svc.set_extra_agent_dirs([])
+        assert svc.get_disabled_agent_dirs() == []
+
+        # Re-adding the path later starts ENABLED.
+        svc.set_extra_agent_dirs([str(d)])
+        assert svc.get_disabled_agent_dirs() == []

@@ -111,22 +111,31 @@ def set_disabled_agent_dirs(dirs: List[str]) -> List[str]:
     Only paths that are actually configured (a provider default from
     ``get_agent_dirs`` or a user extra) are accepted — an arbitrary path would
     silently match nothing during scanning, so rejecting it keeps the stored
-    state honest and the UI truthful. Order and duplicates are normalised away.
+    state honest and the UI truthful. Validation uses the same path
+    normalisation as the scan/load side (``_normalized_path``), so a valid
+    directory sent in a different spelling (trailing slash, ``~``, symlink) is
+    accepted rather than silently dropped; what gets PERSISTED is always the
+    configured spelling, so the UI's exact-string matching keeps working.
+    Order and duplicates are normalised away.
     """
-    valid = {
-        v
+    # Deferred import (mirrors agent_profiles' deferred imports of this module)
+    # to keep module load order acyclic.
+    from cli_agent_orchestrator.utils.agent_profiles import _normalized_path
+
+    norm_to_configured = {
+        _normalized_path(v): v
         for v in list(get_agent_dirs().values()) + list(get_extra_agent_dirs())
         if isinstance(v, str)
     }
     seen: Set[str] = set()
     cleaned: List[str] = []
     for d in dirs:
-        if not isinstance(d, str):
+        if not isinstance(d, str) or not d.strip():
             continue
-        d = d.strip()
-        if d and d in valid and d not in seen:
-            seen.add(d)
-            cleaned.append(d)
+        configured = norm_to_configured.get(_normalized_path(d.strip()))
+        if configured is not None and configured not in seen:
+            seen.add(configured)
+            cleaned.append(configured)
     settings = _load()
     settings["disabled_agent_dirs"] = cleaned
     _save(settings)
@@ -389,6 +398,12 @@ def set_extra_agent_dirs(dirs: List[str]) -> List[str]:
     # Also write flat key for backward compat
     settings["extra_agent_dirs"] = extra_agent_dirs
     _save(settings)
+    # Prune disabled entries that no longer point at any configured directory —
+    # otherwise removing an extra dir leaves a stale disabled entry behind, and
+    # re-adding that path later would come back silently pre-disabled.
+    disabled = get_disabled_agent_dirs()
+    if disabled:
+        set_disabled_agent_dirs(disabled)
     return extra_agent_dirs
 
 
