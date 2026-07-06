@@ -64,8 +64,10 @@ def normalize_working_directory(
         if not create_missing:
             raise ValueError(f"Folder does not exist: {path}")
         try:
-            path.mkdir(parents=True)
-            logger.info(f"Created working directory {path}")
+            # exist_ok: another request may create the directory between the
+            # exists() check above and this mkdir — that's success, not an error.
+            path.mkdir(parents=True, exist_ok=True)
+            logger.info("Created working directory %s", path)
         except OSError as e:
-            raise ValueError(f"Folder '{path}' does not exist and could not be created: {e}")
+            raise ValueError(f"Folder {str(path)!r} does not exist and could not be created: {e}")
     return str(path)

@@ -660,7 +660,14 @@ async def _runs_event_stream():
     async def _pump(queue: asyncio.Queue, kind: str) -> None:
         while True:
             item = await queue.get()
-            await merged.put((kind, item))
+            try:
+                # Never block on a slow SSE client: this stream is explicitly
+                # lossy (consumers re-fetch via REST on reconnect), so drop the
+                # frame rather than back up and overflow the bus subscriber
+                # queues into "Queue full" log spam.
+                merged.put_nowait((kind, item))
+            except asyncio.QueueFull:
+                logger.debug(f"Runs SSE merged queue full; dropping a {kind} frame")
 
     pumps = [
         asyncio.create_task(_pump(status_queue, "status")),
@@ -704,8 +711,14 @@ async def runs_events(request: Request) -> EventSourceResponse:
     """
     # Same client gating as the terminal WebSocket: this stream exposes every
     # terminal's live status, so restrict it to the same allowlist.
+    # Same "*" semantics as the terminal WebSocket gate: a literal "*" in
+    # CAO_WS_ALLOWED_CLIENTS disables the IP check entirely.
     client_host = request.client.host if request.client else None
-    if client_host is not None and client_host not in WS_ALLOWED_CLIENTS:
+    if (
+        "*" not in WS_ALLOWED_CLIENTS
+        and client_host is not None
+        and client_host not in WS_ALLOWED_CLIENTS
+    ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Event stream access is restricted to allowed clients",
@@ -844,7 +857,10 @@ async def set_agent_dirs_endpoint(
 
 
 @app.get("/fs/dirs")
-async def list_directories(path: Optional[str] = None) -> Dict:
+async def list_directories(
+    path: Optional[str] = None,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
     """List subdirectories of a server-side folder (Runs folder browser, GH #282).
 
     Directories only — never file names or contents. Accepts Windows paths
