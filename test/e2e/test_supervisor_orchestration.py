@@ -107,6 +107,21 @@ def _wait_for_ready(terminal_id: str, timeout: float = 120.0, poll: float = 3.0)
     return False
 
 
+# A supervisor is "done" when it is in a ready state. Both COMPLETED and IDLE
+# count: COMPLETED is emitted by providers that print a detectable response-done
+# marker (Credits line / green arrow), but kiro-cli 2.11's TUI often finishes a
+# turn with no Credits marker and settles back to its persistent idle prompt +
+# footer chrome, so the detector reports IDLE for a genuinely finished turn.
+# InboxService and _wait_for_ready already treat IDLE and COMPLETED as
+# equivalent "ready" states, so requiring COMPLETED here would reject a kiro
+# supervisor that has actually completed its orchestration. The real "done"
+# signal is a ready status that is STABLE for ``stable_count`` polls AFTER all
+# expected workers have been observed — that combination cannot be satisfied by
+# a transient inter-turn idle (the supervisor is mid-turn spawning workers then,
+# not stably ready with every worker already seen).
+_SUPERVISOR_DONE_STATES = {"completed", "idle"}
+
+
 def _wait_for_supervisor_done(
     supervisor_id: str,
     session_name: str,
@@ -115,27 +130,32 @@ def _wait_for_supervisor_done(
     poll: float = 5.0,
     stable_count: int = 2,
 ) -> tuple:
-    """Wait for supervisor to reach COMPLETED AND spawn expected workers.
+    """Wait for the supervisor to reach a stable ready state AND spawn workers.
 
-    Some providers report COMPLETED after initial text output but before MCP
-    tool calls (handoff/assign) finish creating worker terminals. A provider
+    Some providers report a ready status after initial text output but before
+    MCP tool calls (handoff/assign) finish creating worker terminals. A provider
     whose TUI keeps the idle prompt visible at all times can make the status
-    detector see "response + idle prompt" = COMPLETED even while the model is
+    detector see "response + idle prompt" = ready even while the model is
     between text output and the first MCP tool call.
 
-    Similarly, Codex can briefly show COMPLETED between consecutive MCP tool
-    calls (e.g., after assign returns but before handoff starts). Requiring
-    ``stable_count`` consecutive COMPLETED readings avoids these false positives.
+    Similarly, Codex can briefly show ready between consecutive MCP tool calls
+    (e.g., after assign returns but before handoff starts). Requiring
+    ``stable_count`` consecutive ready readings avoids these false positives.
+
+    "Ready" means COMPLETED or IDLE (see ``_SUPERVISOR_DONE_STATES``): kiro-cli
+    2.11 finishes many turns at IDLE with no Credits marker, and the rest of the
+    system treats IDLE/COMPLETED as equivalent ready states.
 
     The ``handoff`` MCP tool auto-deletes its worker terminal as soon as the
-    worker finishes. A point-in-time session listing taken after the
-    supervisor reports COMPLETED can therefore miss workers that came and
-    went during the run. To avoid this race we accumulate the union of every
-    unique terminal id observed across all polls — once seen, a worker
-    "counts" even if it has since been cleaned up.
+    worker finishes. A point-in-time session listing taken after the supervisor
+    reports ready can therefore miss workers that came and went during the run.
+    To avoid this race we accumulate the union of every unique terminal id
+    observed across all polls — once seen, a worker "counts" even if it has
+    since been cleaned up.
 
     This function polls until BOTH conditions are true:
-    - Terminal status is 'completed' for ``stable_count`` consecutive polls
+    - Terminal status is ready (idle/completed) for ``stable_count`` consecutive
+      polls
     - At least min_terminals unique terminals have been observed in the
       session at some point during the run (supervisor + workers)
 
@@ -145,7 +165,7 @@ def _wait_for_supervisor_done(
     start = time.time()
     last_status = "unknown"
     seen_terminals: dict = {}
-    consecutive_completed = 0
+    consecutive_ready = 0
 
     while time.time() - start < timeout:
         last_status = get_terminal_status(supervisor_id)
@@ -157,12 +177,12 @@ def _wait_for_supervisor_done(
         if last_status == "error":
             return last_status, list(seen_terminals.values())
 
-        if last_status == "completed" and len(seen_terminals) >= min_terminals:
-            consecutive_completed += 1
-            if consecutive_completed >= stable_count:
+        if last_status in _SUPERVISOR_DONE_STATES and len(seen_terminals) >= min_terminals:
+            consecutive_ready += 1
+            if consecutive_ready >= stable_count:
                 return last_status, list(seen_terminals.values())
         else:
-            consecutive_completed = 0
+            consecutive_ready = 0
 
         time.sleep(poll)
 
@@ -218,9 +238,9 @@ def _run_supervisor_handoff_test(provider: str):
         status, terminals = _wait_for_supervisor_done(
             supervisor_id, actual_session, min_terminals=2
         )
-        assert status == "completed", (
-            f"Supervisor did not reach COMPLETED within {SUPERVISOR_COMPLETION_TIMEOUT}s "
-            f"(provider={provider}). Last status: {status}"
+        assert status in _SUPERVISOR_DONE_STATES, (
+            f"Supervisor did not reach a ready state (idle/completed) within "
+            f"{SUPERVISOR_COMPLETION_TIMEOUT}s (provider={provider}). Last status: {status}"
         )
         assert len(terminals) >= 2, (
             f"Expected at least 2 terminals (supervisor + worker), got {len(terminals)}. "
@@ -310,9 +330,9 @@ def _run_supervisor_assign_test(provider: str):
         status, terminals = _wait_for_supervisor_done(
             supervisor_id, actual_session, min_terminals=3
         )
-        assert status == "completed", (
-            f"Supervisor did not reach COMPLETED within {SUPERVISOR_COMPLETION_TIMEOUT}s "
-            f"(provider={provider}). Last status: {status}"
+        assert status in _SUPERVISOR_DONE_STATES, (
+            f"Supervisor did not reach a ready state (idle/completed) within "
+            f"{SUPERVISOR_COMPLETION_TIMEOUT}s (provider={provider}). Last status: {status}"
         )
         assert len(terminals) >= 3, (
             f"Expected at least 3 terminals (supervisor + data_analyst + report_generator), "
@@ -426,9 +446,9 @@ def _run_supervisor_assign_three_analysts_test(provider: str):
         status, terminals = _wait_for_supervisor_done(
             supervisor_id, actual_session, min_terminals=5, timeout=420
         )
-        assert status == "completed", (
-            f"Supervisor did not reach COMPLETED within timeout (provider={provider}). "
-            f"Last status: {status}"
+        assert status in _SUPERVISOR_DONE_STATES, (
+            f"Supervisor did not reach a ready state (idle/completed) within timeout "
+            f"(provider={provider}). Last status: {status}"
         )
         assert len(terminals) >= 5, (
             "Expected at least 5 terminals " "(supervisor + analyst A/B/C + report_generator)"
