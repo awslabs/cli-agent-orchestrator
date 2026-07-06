@@ -40,17 +40,26 @@ import pytest
 import requests
 
 from cli_agent_orchestrator.constants import API_BASE_URL
+from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 
 def _get_full_output(terminal_id: str) -> str:
-    """Get full terminal output (entire scrollback)."""
+    """Get full terminal output (entire scrollback), escape-stripped.
+
+    ``mode=full`` returns the raw StatusMonitor rolling buffer verbatim — for a
+    TUI provider (kiro, codex) that buffer is dominated by cursor-movement /
+    erase CSI sequences, so plain-text keyword checks must strip escapes first.
+    We do NOT strip at the service layer because the web UI renders ``mode=full``
+    as a live terminal and needs the escapes for colour/layout; stripping is the
+    right thing only here, where the test greps for human-readable content.
+    """
     resp = requests.get(
         f"{API_BASE_URL}/terminals/{terminal_id}/output",
         params={"mode": "full"},
     )
     if resp.status_code != 200:
         return ""
-    return resp.json().get("output", "")
+    return strip_terminal_escapes(resp.json().get("output", ""))
 
 
 def _get_inbox_messages(terminal_id: str, status_filter: str = None):
