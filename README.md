@@ -358,14 +358,14 @@ Typical workflow: `list_profiles` → `install_profile` → `launch_session` →
 Schedule agent sessions to run automatically using cron expressions:
 
 ```bash
-cao flow add daily-standup.md
-cao flow list
-cao flow run daily-standup   # manual run, ignores schedule
+cao schedule add daily-standup.md
+cao schedule list
+cao schedule run daily-standup   # manual run, ignores schedule
 ```
 
 Flows support static prompts or conditional execution via a gating script. `cao-server` must be running for scheduled execution.
 
-For the full guide — flow file format, the conditional-execution pattern, and all `cao flow` commands — see [docs/flows.md](docs/flows.md).
+For the full guide — flow file format, the conditional-execution pattern, and all `cao schedule` commands — see [docs/flows.md](docs/flows.md).
 
 ### Skills
 

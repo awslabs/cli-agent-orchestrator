@@ -88,6 +88,7 @@ from cli_agent_orchestrator.services.cleanup_service import (
     cleanup_expired_memories,
     cleanup_old_data,
 )
+from cli_agent_orchestrator.services.config_service import ConfigService
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.event_log_service import RING_CAPACITY
 from cli_agent_orchestrator.services.event_primitives import KINDS as EVENT_KINDS
@@ -226,6 +227,19 @@ class StepOutputRequest(BaseModel):
     output: Dict = Field(description="The worker-emitted JSON output for the step")
     output_schema: Optional[Dict] = Field(
         default=None, description="The step's JSON-Schema (Draft 2020-12); None = no validation"
+    )
+
+
+class WorkflowRunRequest(BaseModel):
+    """Request body for ``POST /workflows/runs`` (Bolt 3, N5, C5)."""
+
+    name_or_path: str = Field(description="Workflow name (indexed) or path to a spec YAML file")
+    inputs: Dict = Field(
+        default_factory=dict, description="Run inputs validated against spec.inputs"
+    )
+    run_id: Optional[str] = Field(
+        default=None,
+        description="Optional run id (matches WORKFLOW_NAME_RE); auto-generated if omitted",
     )
 
 
@@ -510,12 +524,13 @@ async def health_check():
 def _mcp_apps_enabled() -> bool:
     """Whether the MCP Apps HTTP surface (event stream + widget) is enabled.
 
-    Mirrors the ``CAO_MCP_APPS_ENABLED`` gate used by the ``mcp_apps`` plugin,
+    Reads ``apps.enabled`` via ConfigService (``CAO_MCP_APPS_ENABLED`` env var
+    or ``settings.json``), mirroring the gate used by the ``mcp_apps`` plugin,
     ``app_tools``, ``sep2133`` and the ``event_log_publisher`` observer so the
     whole surface is consistently default-off.
     """
 
-    return os.getenv("CAO_MCP_APPS_ENABLED", "false").lower() in ("1", "true", "yes")
+    return bool(ConfigService.get("apps.enabled", default=False))
 
 
 def _require_mcp_apps_enabled() -> None:
@@ -936,7 +951,14 @@ async def delete_session(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
-        result = session_service.delete_session(session_name, registry=get_plugin_registry(request))
+        # Off the event loop: teardown is fully synchronous (tmux kills, FIFO
+        # cleanup, DB writes) and has wedged the whole server — /health
+        # included — when a FIFO operation stalled in the kernel (issue #382).
+        # A worker thread bounds the blast radius of any future stall to this
+        # one request.
+        result = await asyncio.to_thread(
+            session_service.delete_session, session_name, registry=get_plugin_registry(request)
+        )
         return {"success": True, **result}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -1358,6 +1380,80 @@ async def record_step_output_endpoint(
         errors=record.errors,
         state=record.state.value,
     )
+
+
+# Run-engine endpoints (Bolt 3, N5). ``start_run`` is awaited INLINE (Q1=A): the
+# HTTP request is the blocking wait, matching the synchronous ``workflow_run`` MCP
+# tool. Error mapping (C5 / B3-BR-14): unknown run/spec -> 404, invalid spec/inputs
+# -> 400, cancel-of-finished -> 409, NotBuiltYetError (reserved seam) -> 501,
+# WorkflowEngineError -> 500. Narrow exceptions in the service; mapped here.
+
+
+@app.post("/workflows/runs")
+async def start_workflow_run_endpoint(
+    body: WorkflowRunRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Resolve a spec, run it to completion inline, return the WorkflowRunResult."""
+    import uuid
+
+    from cli_agent_orchestrator.models.workflow import NotBuiltYetError
+    from cli_agent_orchestrator.services import workflow_service, workflow_spec_service
+
+    try:
+        spec = workflow_spec_service.get_workflow(body.name_or_path)
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"unknown workflow '{body.name_or_path}'",
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    run_id = body.run_id or f"run-{uuid.uuid4().hex[:16]}"
+    try:
+        result = await workflow_service.start_run(spec, body.inputs, run_id)
+    except NotBuiltYetError as e:
+        raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=str(e))
+    except KeyError as e:
+        # Duplicate run_id is a conflict, not a 404.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except workflow_service.WorkflowEngineError as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    return result.model_dump()
+
+
+@app.get("/workflows/runs/{run_id}")
+async def get_workflow_run_endpoint(run_id: str) -> Dict:
+    """Return a point-in-time status snapshot for a run (FR-5.5)."""
+    from cli_agent_orchestrator.services import workflow_service
+
+    try:
+        status_snapshot = workflow_service.get_run_status(run_id)
+    except KeyError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
+    return status_snapshot.model_dump()
+
+
+@app.post("/workflows/runs/{run_id}/cancel")
+async def cancel_workflow_run_endpoint(
+    run_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Cooperatively cancel a running workflow (FR-5.4)."""
+    from cli_agent_orchestrator.services import workflow_service
+
+    try:
+        workflow_service.cancel_run(run_id)
+    except KeyError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    return {"success": True, "run_id": run_id}
 
 
 @app.delete("/terminals/{terminal_id}")
@@ -1888,6 +1984,85 @@ async def list_memories_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to list memories: {str(e)}",
         )
+
+
+@app.get("/memory/export")
+async def export_memories_endpoint(
+    scope: MemoryScope,
+    format: str = Query(default="okf"),
+    scope_id: Optional[MemoryScopeId] = None,
+    include_history: bool = False,
+    redact: bool = False,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+):
+    """Stream one scope as an archive tarball (#345 D6, read-only mirror).
+
+    Declared BEFORE /memory/{key} so "export" is not captured as a key.
+    Private scopes (session/agent) are refused outright — there is no
+    include-private escape hatch over HTTP (D5). The bundle is built by
+    the same directory writer into a temp dir, tar'd, and streamed.
+    """
+    from fastapi.responses import FileResponse
+    from starlette.background import BackgroundTask
+
+    _require_memory_enabled()
+    # Private-scope gate: the CLI's --include-private is a local-operator
+    # affordance; the API surface never exports private tiers.
+    if scope in (MemoryScope.SESSION, MemoryScope.AGENT):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"scope '{scope.value}' is private and cannot be exported via the API",
+        )
+    if scope == MemoryScope.PROJECT and scope_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="scope 'project' requires scope_id",
+        )
+
+    import tempfile
+
+    from cli_agent_orchestrator.services.memory_archive import get_backend
+    from cli_agent_orchestrator.services.memory_archive.okf import export_bundle_to_tar
+
+    svc = _get_memory_service()
+    try:
+        backend = get_backend(format)(svc)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    tmp_dir = tempfile.mkdtemp(prefix="cao-memory-export-")
+    tar_path = Path(tmp_dir) / f"cao-memory-{scope.value}.tar.gz"
+
+    def _cleanup() -> None:
+        import shutil
+
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    try:
+        export_bundle_to_tar(
+            backend,
+            scope.value,
+            scope_id,
+            tar_path,
+            include_history=include_history,
+            redact=redact,
+        )
+    except ValueError as e:
+        _cleanup()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        _cleanup()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to export memories: {str(e)}",
+        )
+
+    return FileResponse(
+        path=str(tar_path),
+        media_type="application/gzip",
+        filename=tar_path.name,
+        background=BackgroundTask(_cleanup),
+    )
 
 
 @app.get("/memory/{key}", response_model=MemoryDetail)

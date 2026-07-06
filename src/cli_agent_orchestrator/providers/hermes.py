@@ -201,6 +201,13 @@ class HermesProvider(BaseProvider):
             output: Terminal output buffer (up to ~8KB rolling buffer) supplied
                 by the StatusMonitor via the FIFO reader pipeline.
         """
+        # Native status (herdr): trust the backend's agent state when available.
+        # Must precede the empty-buffer -> ERROR default below: on herdr the
+        # buffer is always empty, so without this every status would be ERROR.
+        native = self._resolve_native_status()
+        if native is not None:
+            return native
+
         if not output:
             return TerminalStatus.ERROR
 
