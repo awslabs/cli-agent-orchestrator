@@ -20,6 +20,7 @@ create the tables in a fixture.
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from pathlib import Path
 from typing import List
@@ -404,6 +405,50 @@ async def test_resume_liveness_guard_rejects_live_run(_patched_journal):
 
 
 @pytest.mark.asyncio
+async def test_concurrent_resumes_only_one_drives(monkeypatch, _patched_journal):
+    # Regression (reviewer BLOCKER): the reopen journal writes await BEFORE the
+    # drive is marked live; a second resume arriving in that yield window used to
+    # pass the liveness guard (step 4 deliberately accepts a RUNNING crash
+    # remnant) and double-drive the run (B4-BR-7a). The liveness mark must be set
+    # before the first await in the reopen block.
+    spec = _spec(step_ids=("s1", "s2", "s3", "s4"))
+    _seed_killed_after_step2(spec, "runRace")
+    assert "runRace" not in ws.run_registry
+
+    ran: List[str] = []
+
+    async def _side(**kwargs):
+        ran.append(kwargs["env_vars"]["CAO_WORKFLOW_STEP_ID"])
+        await asyncio.sleep(0)  # yield so the concurrent resume interleaves
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+
+    # Force the reopen journal write off-loop path to yield too, widening the
+    # pre-fix race window between registration and the liveness mark.
+    async def _yielding_to_thread(fn, *args, **kwargs):
+        await asyncio.sleep(0)
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(ws.asyncio, "to_thread", _yielding_to_thread)
+
+    results = await asyncio.gather(
+        ws.resume_from_last_completed("runRace"),
+        ws.resume_from_last_completed("runRace"),
+        return_exceptions=True,
+    )
+
+    oks = [r for r in results if not isinstance(r, BaseException)]
+    errs = [r for r in results if isinstance(r, BaseException)]
+    assert len(oks) == 1, f"exactly one resume must win, got results={results}"
+    assert len(errs) == 1 and isinstance(errs[0], ws.ResumeNotAllowedError)
+    assert oks[0].state == RunState.COMPLETED
+    # The steps were driven exactly once — no double-drive.
+    assert ran == ["s3", "s4"]
+    assert "runRace" not in ws._active_drives
+
+
+@pytest.mark.asyncio
 async def test_status_then_resume_of_crash_remnant_succeeds(monkeypatch, _patched_journal):
     # Regression (reviewer BLOCKER): a status read of a crash remnant rebuilds a
     # RUNNING record into the cache; that cached RUNNING state must NOT trip the
@@ -557,6 +602,153 @@ async def test_resume_templates_from_rebuilt_kept_step_output(monkeypatch, _patc
     res = await ws.resume_from_last_completed("runTpl")
     assert res.state == RunState.COMPLETED
     assert prompts == ["use 42 please"]
+
+
+@pytest.mark.asyncio
+async def test_resume_corrupt_state_raises_corrupt_not_bare_valueerror(_patched_journal):
+    # FIX-4: a corrupt (non-enum) state string in the durable row must map to
+    # ResumeCorruptError (-> 422, consistent with corrupt-snapshot handling),
+    # never a bare ValueError that the boundary would mislabel as a 400.
+    spec = _spec(step_ids=("s1",))
+    workflow_journal.insert_run(
+        "runBadState", "wf", spec.model_dump_json(), "{}", "BOGUS_STATE", "t"
+    )
+    with pytest.raises(ws.ResumeCorruptError, match="corrupt state"):
+        await ws.resume_from_last_completed("runBadState")
+
+
+def test_get_run_status_non_dict_inputs_json_degrades_to_keyerror(_patched_journal):
+    # FIX-5: "null" parses as JSON without raising but leaves record.inputs
+    # non-dict; the rebuild must treat it as a corrupt row -> absent -> KeyError.
+    spec = _spec(step_ids=("s1",))
+    workflow_journal.insert_run(
+        "runNullIn",
+        spec.name,
+        spec.model_dump_json(),
+        "null",  # valid JSON, not an object
+        RunState.FAILED.value,
+        "2026-01-01T00:00:00Z",
+    )
+    with pytest.raises(KeyError):
+        ws.get_run_status("runNullIn")
+
+
+@pytest.mark.asyncio
+async def test_resume_non_dict_inputs_json_maps_to_keyerror(_patched_journal):
+    # The RESUME path: the row exists but the rebuild degrades the corrupt
+    # inputs_json to absent -> the defensive branch raises KeyError -> 404.
+    spec = _spec(step_ids=("s1",))
+    workflow_journal.insert_run(
+        "runArrIn",
+        spec.name,
+        spec.model_dump_json(),
+        "[1, 2]",  # valid JSON array, not an object
+        RunState.FAILED.value,
+        "2026-01-01T00:00:00Z",
+    )
+    with pytest.raises(KeyError):
+        await ws.resume_from_last_completed("runArrIn")
+
+
+@pytest.mark.asyncio
+async def test_resume_engine_error_settles_failed_and_clears_drive_mark(
+    monkeypatch, _patched_journal
+):
+    # FIX-3a: drive resume through _drive's WorkflowEngineError branch (a PENDING
+    # step whose prompt references a step that never produced output). Assert the
+    # run settles FAILED with finished_at, the journal carries the terminal state,
+    # the exception propagates, and the liveness mark is cleared.
+    spec = WorkflowSpec(
+        name="wf",
+        mode="sequential",
+        steps=[
+            _step("s1"),
+            WorkflowStep(
+                id="s2",
+                provider="claude_code",
+                agent="dev",
+                prompt="use {{steps.ghost.output.x}}",
+            ),
+        ],
+    )
+    workflow_journal.insert_run(
+        "runEngErr",
+        spec.name,
+        spec.model_dump_json(),
+        "{}",
+        RunState.FAILED.value,
+        "2026-01-01T00:00:00Z",
+    )
+    workflow_journal.insert_steps(
+        "runEngErr", [(s.id, StepState.PENDING.value) for s in spec.steps], "t"
+    )
+    workflow_journal.update_step("runEngErr", "s1", StepState.COMPLETED.value, 1, "t")
+    workflow_journal.update_step("runEngErr", "s2", StepState.FAILED.value, 4, "t", error="boom")
+    workflow_journal.update_run_state("runEngErr", RunState.FAILED.value, "t2")
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(return_value=_ok()))
+    with pytest.raises(ws.WorkflowEngineError, match="produced no output"):
+        await ws.resume_from_last_completed("runEngErr")
+
+    rec = ws.run_registry["runEngErr"]
+    assert rec.state == RunState.FAILED
+    assert rec.finished_at is not None
+    row = workflow_journal.get_run("runEngErr")
+    assert row.state == RunState.FAILED.value
+    assert row.finished_at is not None
+    assert "runEngErr" not in ws._active_drives
+
+
+@pytest.mark.asyncio
+async def test_resume_mixed_on_failure_continue_run(monkeypatch, _patched_journal):
+    # FIX-6: a mixed on_failure=continue run — COMPLETED s1 is kept, FAILED s2 and
+    # PENDING s3 re-run on resume.
+    spec = WorkflowSpec(
+        name="wf",
+        mode="sequential",
+        steps=[
+            _step("s1"),
+            WorkflowStep(
+                id="s2",
+                provider="claude_code",
+                agent="dev",
+                prompt="go",
+                on_failure="continue",
+            ),
+            _step("s3"),
+        ],
+    )
+    workflow_journal.insert_run(
+        "runMix",
+        spec.name,
+        spec.model_dump_json(),
+        "{}",
+        RunState.RUNNING.value,  # crashed mid-run
+        "2026-01-01T00:00:00Z",
+    )
+    workflow_journal.insert_steps(
+        "runMix", [(s.id, StepState.PENDING.value) for s in spec.steps], "t"
+    )
+    workflow_journal.update_step("runMix", "s1", StepState.COMPLETED.value, 1, "t")
+    workflow_journal.update_step("runMix", "s2", StepState.FAILED.value, 4, "t", error="boom")
+
+    ran: List[str] = []
+
+    async def _side(**kwargs):
+        ran.append(kwargs["env_vars"]["CAO_WORKFLOW_STEP_ID"])
+        return _ok()
+
+    monkeypatch.setattr(ws, "run_agent_step", AsyncMock(side_effect=_side))
+    res = await ws.resume_from_last_completed("runMix")
+
+    assert ran == ["s2", "s3"]  # s1 kept; failed + pending re-run
+    assert res.state == RunState.COMPLETED
+    states = {s.id: s.state for s in res.steps}
+    assert states == {
+        "s1": StepState.COMPLETED,
+        "s2": StepState.COMPLETED,
+        "s3": StepState.COMPLETED,
+    }
 
 
 @pytest.mark.asyncio

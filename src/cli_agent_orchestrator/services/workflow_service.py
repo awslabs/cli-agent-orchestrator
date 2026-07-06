@@ -23,6 +23,7 @@ _substitute, §5 cancel_run, §6 get_run_status, §7 reserved seams).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -254,6 +255,18 @@ def _journal_run_state(record: RunRecord) -> None:
             record.run_id,
             e,
         )
+
+
+async def _ajournal(fn: Any, *args: Any) -> None:
+    """Run a sync best-effort journal helper off the event loop.
+
+    The journal helpers do blocking sqlite3 I/O; from async engine code they must
+    not stall the loop. ``to_thread`` is awaited sequentially at each call site,
+    so write ordering is preserved; the no-raise promise holds because the
+    try/except lives inside the sync helper itself. Sync callers (the
+    ``get_run_status`` rebuild path) keep calling the helpers directly.
+    """
+    await asyncio.to_thread(fn, *args)
 
 
 # ---------------------------------------------------------------------------
@@ -492,8 +505,9 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
     st = record.step_states[step.id]
     st.state = StepState.RUNNING
     # Journal write-through (§1): record the step RUNNING + the live current step.
-    _journal_step(record, step.id)
-    _journal_current_step(record)
+    # Awaited sequentially off the loop (blocking sqlite must not stall the engine).
+    await _ajournal(_journal_step, record, step.id)
+    await _ajournal(_journal_current_step, record)
 
     # OUTER: run-failure retry loop. attempts range 1..n_retries+1.
     for attempt in range(1, n_retries + 2):
@@ -526,19 +540,21 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
             continue  # consume an attempt, retry the same prompt
         # Settled (COMPLETED or COMPLETED_UNVALIDATED) — neither is a run-failure.
         st.state = outcome
-        _journal_step(record, step.id)  # §1: persist settled state + output + attempts
+        # §1: persist settled state + output + attempts
+        await _ajournal(_journal_step, record, step.id)
         return
 
     # Attempts exhausted: every attempt raised StepExecutionError.
     st.state = StepState.FAILED
-    _journal_step(record, step.id)  # §1: persist FAILED state + last error + attempts
+    # §1: persist FAILED state + last error + attempts
+    await _ajournal(_journal_step, record, step.id)
     if (step.on_failure or "halt") == "halt":
         # Engine halts; start_run skips the remaining steps (§1). on_failure ==
         # "continue" leaves the run RUNNING and sequencing continues.
         record.state = RunState.FAILED
 
 
-def _skip_remaining(record: RunRecord, order: List[WorkflowStep], from_index: int) -> None:
+async def _skip_remaining(record: RunRecord, order: List[WorkflowStep], from_index: int) -> None:
     """Mark every still-PENDING step at/after ``from_index`` SKIPPED (§1).
 
     The SINGLE producer of ``SKIPPED`` — reached on a halt (successors of the
@@ -549,7 +565,7 @@ def _skip_remaining(record: RunRecord, order: List[WorkflowStep], from_index: in
         st = record.step_states[step.id]
         if st.state == StepState.PENDING:
             st.state = StepState.SKIPPED
-            _journal_step(record, step.id)  # §1: persist the skip
+            await _ajournal(_journal_step, record, step.id)  # §1: persist the skip
 
 
 def _build_result(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunResult:
@@ -597,7 +613,7 @@ async def _drive(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunRes
     try:
         for index, step in enumerate(order):
             if record.cancelled:  # B3-BR-7 — cancel observed at a step boundary
-                _skip_remaining(record, order, from_index=index)
+                await _skip_remaining(record, order, from_index=index)
                 record.state = RunState.CANCELLED
                 break
             st = record.step_states[step.id]
@@ -605,7 +621,7 @@ async def _drive(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunRes
                 continue  # kept on resume (B4-BR-9) — do not re-run a done step
             await _run_step(record, step)
             if record.state == RunState.FAILED:  # halt (B3-BR-4 on_failure=halt)
-                _skip_remaining(record, order, from_index=index + 1)
+                await _skip_remaining(record, order, from_index=index + 1)
                 break
     except WorkflowEngineError:
         # Settle the registered record into a terminal FAILED state before the
@@ -622,8 +638,8 @@ async def _drive(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunRes
         record.current_step_id = None
         record.finished_at = _now()
         # Persist the terminal FAILED state (best-effort) before re-raising (§1).
-        _journal_current_step(record)
-        _journal_run_state(record)
+        await _ajournal(_journal_current_step, record)
+        await _ajournal(_journal_run_state, record)
         logger.error("drive: run '%s' failed with an engine error", record.run_id)
         raise
 
@@ -633,8 +649,8 @@ async def _drive(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunRes
     record.current_step_id = None
     record.finished_at = _now()
     # Journal the terminal run state + cleared current step (§1, B4-BR-5).
-    _journal_current_step(record)
-    _journal_run_state(record)
+    await _ajournal(_journal_current_step, record)
+    await _ajournal(_journal_run_state, record)
 
     # Aggregate the result.
     return _build_result(record, order)
@@ -664,6 +680,8 @@ async def start_run(spec: WorkflowSpec, inputs: Dict[str, Any], run_id: str) -> 
     # A durable journal row also claims the id: after a restart the registry is
     # empty, but re-using an old run_id must NOT overwrite its journal history.
     # Best-effort read only — a broken journal must never block NEW runs.
+    # Read stays on-loop deliberately: a small point read via the sync helper
+    # shared with the sync status path.
     try:
         existing_row = workflow_journal.get_run(run_id)
     except (
@@ -700,7 +718,7 @@ async def start_run(spec: WorkflowSpec, inputs: Dict[str, Any], run_id: str) -> 
     run_registry[run_id] = record
     _active_drives.add(run_id)
     try:
-        _journal_insert_run(record)
+        await _ajournal(_journal_insert_run, record)
 
         # 5. Deterministic sequencing order.
         order = _topological_order(spec)
@@ -800,11 +818,16 @@ def _rebuild_record_from_journal(run_id: str) -> Optional[RunRecord]:
 
     try:
         spec = WorkflowSpec.model_validate_json(row.spec_snapshot)
+        inputs = json.loads(row.inputs_json)
+        if not isinstance(inputs, dict):
+            # "null" / arrays parse fine but leave record.inputs non-dict, which
+            # would later escape _drive as an unmapped TypeError. Corrupt -> absent.
+            raise ValueError(f"inputs_json is not a JSON object: {row.inputs_json!r}")
         record = RunRecord(
             run_id=row.run_id,
             workflow_name=row.workflow_name,
             spec=spec,
-            inputs=json.loads(row.inputs_json),
+            inputs=inputs,
             state=RunState(row.state),
             current_step_id=row.current_step_id,
             started_at=row.started_at,
@@ -918,6 +941,8 @@ async def resume_from_last_completed(run_id: str) -> WorkflowRunResult:
         )
 
     # 3. Load the durable row; absent (or an unreadable journal) -> KeyError -> 404 (F1).
+    # Read stays on-loop deliberately: a small point read via the sync helper
+    # shared with the sync status path.
     try:
         row = workflow_journal.get_run(run_id)
     except (
@@ -928,8 +953,13 @@ async def resume_from_last_completed(run_id: str) -> WorkflowRunResult:
     if row is None:
         raise KeyError(f"unknown run_id '{run_id}'")
 
-    # 4. Terminal runs are not resumable (B4-BR-7).
-    state = RunState(row.state)
+    # 4. Terminal runs are not resumable (B4-BR-7). A corrupt (non-enum) state
+    # string is corrupt journal data -> 422, consistent with a corrupt snapshot —
+    # never a bare ValueError that would mislead as a 400 "bad request".
+    try:
+        state = RunState(row.state)
+    except ValueError as e:
+        raise ResumeCorruptError(f"run '{run_id}' has corrupt state '{row.state}'") from e
     if state in (RunState.COMPLETED, RunState.CANCELLED):
         raise ResumeNotAllowedError(f"run '{run_id}' is {state.value}; not resumable")
 
@@ -940,8 +970,12 @@ async def resume_from_last_completed(run_id: str) -> WorkflowRunResult:
         raise ResumeCorruptError(f"run '{run_id}' snapshot is corrupt: {e}") from e
 
     # 6. Rebuild the cache (§2) and apply the Q3=A skip/re-run boundary (B4-BR-9).
+    # Rebuild reads stay on-loop deliberately: small point reads via the sync
+    # helpers shared with the sync status path.
     record = _rebuild_record_from_journal(run_id)
-    if record is None:  # pragma: no cover — row existed above; defensive
+    if record is None:
+        # The row existed above but the rebuild degraded it to absent (e.g.
+        # corrupt inputs_json) — surface as unknown rather than resuming garbage.
         raise KeyError(f"unknown run_id '{run_id}'")
     for st in record.step_states.values():
         if st.state in (StepState.COMPLETED, StepState.COMPLETED_UNVALIDATED):
@@ -959,21 +993,27 @@ async def resume_from_last_completed(run_id: str) -> WorkflowRunResult:
     record.current_step_id = None
     record.finished_at = None
     run_registry[run_id] = record
-    try:
-        workflow_journal.update_run_state(run_id, RunState.RUNNING.value, None)
-    except (
-        Exception
-    ) as e:  # noqa: BLE001 — journal write is best-effort; in-memory floor still serves live reads
-        logger.warning("journal: resume reopen state write for '%s' failed: %s", run_id, e)
-    # Persist the cleared current_step_id too — otherwise the durable row stays
-    # stale until the first resumed step journals (best-effort, B4-BR-5).
-    _journal_current_step(record)
-
-    # 7. Re-enter the SAME shared drive over the snapshotted spec's topo order
-    # (B4-RD-5). Mark the drive live for its whole duration; the ``finally``
-    # clears the mark on EVERY exit path (complete, fail, engine error, cancel).
+    # Mark the drive live BEFORE the first await: the off-loop journal writes
+    # below yield, and a concurrent resume for the same run_id must hit the
+    # liveness guard during that window (B4-BR-7a — never double-drive). The
+    # ``finally`` clears the mark on EVERY exit path (complete, fail, engine
+    # error, cancel, journal-write error).
     _active_drives.add(run_id)
     try:
+        try:
+            await asyncio.to_thread(
+                workflow_journal.update_run_state, run_id, RunState.RUNNING.value, None
+            )
+        except (
+            Exception
+        ) as e:  # noqa: BLE001 — journal write is best-effort; in-memory floor still serves live reads
+            logger.warning("journal: resume reopen state write for '%s' failed: %s", run_id, e)
+        # Persist the cleared current_step_id too — otherwise the durable row stays
+        # stale until the first resumed step journals (best-effort, B4-BR-5).
+        await _ajournal(_journal_current_step, record)
+
+        # 7. Re-enter the SAME shared drive over the snapshotted spec's topo order
+        # (B4-RD-5).
         return await _drive(record, _topological_order(spec))
     finally:
         _active_drives.discard(run_id)

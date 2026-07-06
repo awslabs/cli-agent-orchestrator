@@ -1,6 +1,7 @@
 """Minimal database client with only terminal metadata."""
 
 import logging
+import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, cast
@@ -145,8 +146,24 @@ class FlowModel(Base):
     enabled = Column(Boolean, default=True)
 
 
+def _ensure_db_dir() -> None:
+    """Create the DB dir owner-only (0o700).
+
+    The DB stores sensitive data (workflow spec_snapshot carries full prompt
+    bodies + inputs_json), so the dir is owner-only — the same posture as
+    claude_code prompt files (0o600) and the audit log (0o700/0o600). mkdir's
+    mode is ignored when the dir already exists (exist_ok) and is masked by
+    umask on creation — the chmod enforces 0o700 in both cases, best-effort.
+    """
+    DB_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        os.chmod(DB_DIR, 0o700)
+    except OSError as e:
+        logger.warning(f"Could not restrict DB dir permissions on {DB_DIR}: {e}")
+
+
 # Module-level singletons
-DB_DIR.mkdir(parents=True, exist_ok=True)
+_ensure_db_dir()
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
@@ -155,6 +172,7 @@ def init_db() -> None:
     """Initialize database tables and apply schema migrations."""
     _migrate_project_aliases_schema()
     Base.metadata.create_all(bind=engine)
+    _restrict_db_file_permissions()
     _migrate_terminals_schema()
     _migrate_memory_indexes()
     _migrate_add_access_count()
@@ -163,6 +181,29 @@ def init_db() -> None:
     _migrate_workflow_index()
     _migrate_workflow_run()
     _migrate_workflow_run_step()
+
+
+def _restrict_db_file_permissions() -> None:
+    """Chmod the SQLite file (+ -wal/-shm siblings if present) to 0o600.
+
+    The DB persists sensitive data (workflow spec_snapshot prompt bodies,
+    inputs_json), matching the owner-only posture of prompt files and the audit
+    log. Called after ``create_all`` so the file exists. Best-effort: a chmod
+    failure (exotic filesystems) degrades permissions only, never blocks startup.
+    """
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    for path in (
+        DATABASE_FILE,
+        DATABASE_FILE.with_name(DATABASE_FILE.name + "-wal"),
+        DATABASE_FILE.with_name(DATABASE_FILE.name + "-shm"),
+    ):
+        if not path.exists():
+            continue
+        try:
+            os.chmod(path, 0o600)
+        except OSError as e:
+            logger.warning(f"Could not restrict DB file permissions on {path}: {e}")
 
 
 def _migrate_project_aliases_schema() -> None:
