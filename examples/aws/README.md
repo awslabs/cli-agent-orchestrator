@@ -51,10 +51,10 @@ cao install examples/aws/sqs-monitor/sqs-monitor-agent.md \
   --env TIMEOUT_SECONDS=60
 ```
 
-### 3. Run it
+### 3. Launch the agent
 
 ```bash
-cao run sqs-monitor-agent
+cao launch --agent-profile sqs-monitor-agent --provider kiro_cli
 ```
 
 ## Configuration Reference
@@ -76,16 +76,20 @@ config keys to env var names:
 Service-specific keys (e.g., `poll_interval_seconds`, `max_messages`) map to
 their uppercased equivalents (`POLL_INTERVAL_SECONDS`, `MAX_MESSAGES`).
 
+All values are **required** at install time. If omitted, the unresolved
+`${VAR}` literal will expand to empty in bash, causing commands to fail.
+
 ## Security Notes
 
 - All agents use explicit `--profile` flags, never default credentials
-- Use IAM roles with least-privilege permissions
-- The `dynamodb-delete` agent performs destructive operations: test in dev first
+- Each agent validates that required variables are non-empty before executing
+- The `dynamodb-delete` agent enforces a `MAX_DELETE` safety cap
+- Message-extracted inputs are validated against strict allowlist patterns
 - Never store real credentials in agent profile files
 
 ## Multi-Agent Orchestration
 
 These agents are designed to work standalone or as workers in a multi-agent
-system. To orchestrate them together, create a supervisor agent that delegates
-tasks to these workers. See the [orchestration examples](../orchestration/) for
-patterns.
+system. Each includes a `cao-mcp-server` block so supervisors can delegate
+via `handoff` or `send_message`. See the [orchestration examples](../orchestration/)
+for patterns.

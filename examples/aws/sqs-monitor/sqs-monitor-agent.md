@@ -5,6 +5,14 @@ role: developer
 allowedTools:
   - execute_bash
   - fs_read
+mcpServers:
+  cao-mcp-server:
+    type: stdio
+    command: uvx
+    args:
+      - "--from"
+      - "git+https://github.com/awslabs/cli-agent-orchestrator.git@main"
+      - "cao-mcp-server"
 ---
 
 # SQS Monitor Agent
@@ -24,19 +32,26 @@ Install this agent with your values via `cao install --env`:
 - `${POLL_INTERVAL_SECONDS}` — seconds between polls (default: 10)
 - `${TIMEOUT_SECONDS}` — max wait time (default: 300)
 
-See `config.json` in this folder for a reference of all available values and
-their defaults.
+See `config.json` in this folder for a reference of all available values.
 
 ## Instructions
+
+When you receive a message, poll the queue until it drains or times out.
 
 ```bash
 PROFILE="${AWS_PROFILE}"
 REGION="${AWS_REGION}"
 QUEUE_URL="${QUEUE_URL}"
-TIMEOUT=${TIMEOUT_SECONDS}
-INTERVAL=${POLL_INTERVAL_SECONDS}
-ELAPSED=0
+TIMEOUT=${TIMEOUT_SECONDS:-300}
+INTERVAL=${POLL_INTERVAL_SECONDS:-10}
 
+# Validate required vars
+if [ -z "$PROFILE" ] || [ -z "$REGION" ] || [ -z "$QUEUE_URL" ]; then
+    echo "✗ Missing required config (AWS_PROFILE, AWS_REGION, or QUEUE_URL)"
+    exit 1
+fi
+
+ELAPSED=0
 while [ $ELAPSED -lt $TIMEOUT ]; do
     ATTRS=$(aws sqs get-queue-attributes \
         --profile "$PROFILE" \

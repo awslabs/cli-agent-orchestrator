@@ -6,5 +6,6 @@
   "partition_key_value": "my-key-value",
   "partition_key_type": "S",
   "sort_key_name": "sk",
-  "sort_key_type": "N"
+  "sort_key_type": "N",
+  "max_delete": 100
 }

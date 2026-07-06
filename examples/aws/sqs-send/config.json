@@ -3,5 +3,5 @@
   "region": "us-east-1",
   "queue_url": "https://sqs.us-east-1.amazonaws.com/123456789012/MyQueue",
   "message_body": "{\"key\": \"value\"}",
-  "message_group_id": ""
+  "message_group_id": "my-group-id"
 }

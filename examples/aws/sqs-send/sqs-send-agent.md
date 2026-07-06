@@ -5,6 +5,14 @@ role: developer
 allowedTools:
   - execute_bash
   - fs_read
+mcpServers:
+  cao-mcp-server:
+    type: stdio
+    command: uvx
+    args:
+      - "--from"
+      - "git+https://github.com/awslabs/cli-agent-orchestrator.git@main"
+      - "cao-mcp-server"
 ---
 
 # SQS Send Agent
@@ -23,10 +31,11 @@ Install this agent with your values via `cao install --env`:
 - `${MESSAGE_BODY}` — JSON message body
 - `${MESSAGE_GROUP_ID}` — for FIFO queues (leave empty for standard queues)
 
-See `config.json` in this folder for a reference of all available values and
-their defaults.
+See `config.json` in this folder for a reference of all available values.
 
 ## Instructions
+
+When you receive a message, send it to the SQS queue.
 
 ### Standard queue
 
@@ -35,6 +44,12 @@ PROFILE="${AWS_PROFILE}"
 REGION="${AWS_REGION}"
 QUEUE_URL="${QUEUE_URL}"
 MESSAGE_BODY='${MESSAGE_BODY}'
+
+# Validate required vars
+if [ -z "$PROFILE" ] || [ -z "$REGION" ] || [ -z "$QUEUE_URL" ] || [ -z "$MESSAGE_BODY" ]; then
+    echo "✗ Missing required config"
+    exit 1
+fi
 
 RESULT=$(aws sqs send-message \
     --profile "$PROFILE" \
@@ -57,14 +72,28 @@ echo "✓ Message sent: $MESSAGE_ID"
 For FIFO queues (URL ends with `.fifo`), add group and dedup IDs:
 
 ```bash
+GROUP_ID="${MESSAGE_GROUP_ID}"
+if [ -z "$GROUP_ID" ]; then
+    echo "✗ MESSAGE_GROUP_ID required for FIFO queues"
+    exit 1
+fi
+
 RESULT=$(aws sqs send-message \
     --profile "$PROFILE" \
     --region "$REGION" \
     --queue-url "$QUEUE_URL" \
     --message-body "$MESSAGE_BODY" \
-    --message-group-id "${MESSAGE_GROUP_ID}" \
+    --message-group-id "$GROUP_ID" \
     --message-deduplication-id "$(uuidgen)" \
     --output json)
+
+if [ $? -ne 0 ]; then
+    echo "✗ Failed to send FIFO message"
+    exit 1
+fi
+
+MESSAGE_ID=$(echo "$RESULT" | jq -r '.MessageId')
+echo "✓ FIFO message sent: $MESSAGE_ID (group=$GROUP_ID)"
 ```
 
 ## Required IAM Permissions

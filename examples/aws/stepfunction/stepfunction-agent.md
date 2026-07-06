@@ -5,6 +5,14 @@ role: developer
 allowedTools:
   - execute_bash
   - fs_read
+mcpServers:
+  cao-mcp-server:
+    type: stdio
+    command: uvx
+    args:
+      - "--from"
+      - "git+https://github.com/awslabs/cli-agent-orchestrator.git@main"
+      - "cao-mcp-server"
 ---
 
 # Step Functions Agent
@@ -44,8 +52,7 @@ Trigger Step Function
 Monitor execution arn:aws:states:us-east-1:123456789012:execution:MyStateMachine:cao-exec-abc123
 ```
 
-The execution ARN for monitoring is extracted from the message. If a prior
-trigger step stored it, the supervisor passes it forward.
+The execution ARN for monitoring is extracted from the message.
 
 ## Instructions
 
@@ -57,8 +64,14 @@ When the message contains "trigger", start a new execution:
 PROFILE="${AWS_PROFILE}"
 REGION="${AWS_REGION}"
 STATE_MACHINE_ARN="${STATE_MACHINE_ARN}"
-EXECUTION_NAME="${EXECUTION_NAME_PREFIX}-$(uuidgen | tr '[:upper:]' '[:lower:]')"
+EXECUTION_NAME="${EXECUTION_NAME_PREFIX:-cao-exec}-$(uuidgen | tr '[:upper:]' '[:lower:]')"
 INPUT='${INPUT_PAYLOAD}'
+
+# Validate required vars
+if [ -z "$PROFILE" ] || [ -z "$REGION" ] || [ -z "$STATE_MACHINE_ARN" ]; then
+    echo "✗ Missing required config (AWS_PROFILE, AWS_REGION, or STATE_MACHINE_ARN)"
+    exit 1
+fi
 
 EXECUTION_ARN=$(aws stepfunctions start-execution \
     --profile "$PROFILE" \
@@ -84,14 +97,20 @@ When the message contains "monitor" and an execution ARN, extract the ARN
 from the message and poll until completion:
 
 ```bash
-# EXECUTION_ARN is extracted from the runtime message — not from config
-EXECUTION_ARN="<extracted-from-message>"
 PROFILE="${AWS_PROFILE}"
 REGION="${AWS_REGION}"
-TIMEOUT=${TIMEOUT_SECONDS}
-POLL_INTERVAL=${POLL_INTERVAL_SECONDS}
-ELAPSED=0
+TIMEOUT=${TIMEOUT_SECONDS:-600}
+POLL_INTERVAL=${POLL_INTERVAL_SECONDS:-15}
 
+# EXECUTION_ARN is extracted from the runtime message — not from config.
+# Validate: ARN must match expected pattern.
+EXECUTION_ARN="<extracted-from-message>"
+if ! echo "$EXECUTION_ARN" | grep -qE '^arn:aws:states:[a-z0-9-]+:[0-9]+:execution:.+$'; then
+    echo "✗ Invalid execution ARN format"
+    exit 1
+fi
+
+ELAPSED=0
 while [ $ELAPSED -lt $TIMEOUT ]; do
     STATUS=$(aws stepfunctions describe-execution \
         --profile "$PROFILE" \
@@ -99,6 +118,11 @@ while [ $ELAPSED -lt $TIMEOUT ]; do
         --execution-arn "$EXECUTION_ARN" \
         --query 'status' \
         --output text)
+
+    if [ $? -ne 0 ]; then
+        echo "✗ Failed to describe execution (API error or invalid ARN)"
+        exit 1
+    fi
 
     echo "Status: $STATUS (${ELAPSED}s elapsed)"
 

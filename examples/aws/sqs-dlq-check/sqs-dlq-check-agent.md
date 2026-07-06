@@ -5,6 +5,14 @@ role: developer
 allowedTools:
   - execute_bash
   - fs_read
+mcpServers:
+  cao-mcp-server:
+    type: stdio
+    command: uvx
+    args:
+      - "--from"
+      - "git+https://github.com/awslabs/cli-agent-orchestrator.git@main"
+      - "cao-mcp-server"
 ---
 
 # SQS DLQ Check Agent
@@ -25,19 +33,26 @@ Install this agent with your values via `cao install --env`:
 - `${MESSAGE_GROUP_ID}` — filter by group (FIFO queues, leave empty to skip)
 - `${MAX_MESSAGES}` — max messages to peek (default: 10)
 
-See `config.json` in this folder for a reference of all available values and
-their defaults.
+See `config.json` in this folder for a reference of all available values.
 
 ## Instructions
 
-### Step 1: Check message count
+When you receive a message, check the DLQ for failed messages.
 
 ```bash
 PROFILE="${AWS_PROFILE}"
 REGION="${AWS_REGION}"
 DLQ_URL="${DLQ_URL}"
-MAX_MESSAGES=${MAX_MESSAGES}
+MAX_MESSAGES=${MAX_MESSAGES:-10}
+GROUP_ID="${MESSAGE_GROUP_ID}"
 
+# Validate required vars
+if [ -z "$PROFILE" ] || [ -z "$REGION" ] || [ -z "$DLQ_URL" ]; then
+    echo "✗ Missing required config (AWS_PROFILE, AWS_REGION, or DLQ_URL)"
+    exit 1
+fi
+
+# Step 1: Check message count
 COUNT=$(aws sqs get-queue-attributes \
     --profile "$PROFILE" \
     --region "$REGION" \
@@ -46,18 +61,18 @@ COUNT=$(aws sqs get-queue-attributes \
     --query 'Attributes.ApproximateNumberOfMessages' \
     --output text)
 
-if [ $? -ne 0 ]; then echo "✗ Failed to check DLQ"; exit 1; fi
+if [ $? -ne 0 ]; then
+    echo "✗ Failed to check DLQ"
+    exit 1
+fi
 
 echo "DLQ message count: $COUNT"
 if [ "$COUNT" = "0" ]; then
     echo "✓ DLQ is empty — no processing failures"
     exit 0
 fi
-```
 
-### Step 2: Peek at messages (non-destructive)
-
-```bash
+# Step 2: Peek at messages (non-destructive)
 MESSAGES=$(aws sqs receive-message \
     --profile "$PROFILE" \
     --region "$REGION" \
@@ -67,21 +82,22 @@ MESSAGES=$(aws sqs receive-message \
     --attribute-names MessageGroupId \
     --output json)
 
-echo "$MESSAGES" | jq '.Messages | length'
-```
+if [ $? -ne 0 ]; then
+    echo "✗ Failed to receive messages from DLQ"
+    exit 1
+fi
 
-### Step 3: Filter by MessageGroupId (FIFO queues)
+MSG_COUNT=$(echo "$MESSAGES" | jq '.Messages | length')
+echo "Peeked at $MSG_COUNT message(s)"
 
-```bash
-GROUP_ID="${MESSAGE_GROUP_ID}"
-
+# Step 3: Filter by MessageGroupId (FIFO queues) using jq --arg for safety
 if [ -n "$GROUP_ID" ]; then
-    MATCH=$(echo "$MESSAGES" | jq -r \
-        ".Messages[]? | select(.Attributes.MessageGroupId == \"$GROUP_ID\") | .MessageId")
+    MATCH=$(echo "$MESSAGES" | jq -r --arg gid "$GROUP_ID" \
+        '.Messages[]? | select(.Attributes.MessageGroupId == $gid) | .MessageId')
 
     if [ -n "$MATCH" ]; then
-        BODY=$(echo "$MESSAGES" | jq -r \
-            ".Messages[] | select(.Attributes.MessageGroupId == \"$GROUP_ID\") | .Body" | head -1)
+        BODY=$(echo "$MESSAGES" | jq -r --arg gid "$GROUP_ID" \
+            '.Messages[] | select(.Attributes.MessageGroupId == $gid) | .Body' | head -1)
         echo "✗ Found failed message in DLQ"
         echo "  MessageId: $MATCH"
         echo "  Body: $BODY"

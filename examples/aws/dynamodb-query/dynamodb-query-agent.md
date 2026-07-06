@@ -5,6 +5,14 @@ role: developer
 allowedTools:
   - execute_bash
   - fs_read
+mcpServers:
+  cao-mcp-server:
+    type: stdio
+    command: uvx
+    args:
+      - "--from"
+      - "git+https://github.com/awslabs/cli-agent-orchestrator.git@main"
+      - "cao-mcp-server"
 ---
 
 # DynamoDB Query Agent
@@ -26,8 +34,7 @@ Install this agent with your values via `cao install --env`:
 - `${PARTITION_KEY_TYPE}` — DynamoDB type: `S`, `N`, or `B`
 - `${LIMIT}` — max items to return (default: 1)
 
-See `config.json` in this folder for a reference of all available values and
-their defaults.
+See `config.json` in this folder for a reference of all available values.
 
 ## Instructions
 
@@ -40,14 +47,23 @@ TABLE="${TABLE_NAME}"
 PK_NAME="${PARTITION_KEY_NAME}"
 PK_VALUE="${PARTITION_KEY_VALUE}"
 PK_TYPE="${PARTITION_KEY_TYPE}"
-LIMIT=${LIMIT}
+LIMIT=${LIMIT:-1}
+
+# Validate required vars
+if [ -z "$PROFILE" ] || [ -z "$REGION" ] || [ -z "$TABLE" ] || [ -z "$PK_NAME" ] || [ -z "$PK_VALUE" ]; then
+    echo "✗ Missing required config"
+    exit 1
+fi
+
+# Build expression attribute values safely using jq --arg
+EXPR_VALUES=$(jq -n --arg v "$PK_VALUE" --arg t "$PK_TYPE" '{":pk":{($t):$v}}')
 
 RESULT=$(aws dynamodb query \
     --profile "$PROFILE" \
     --region "$REGION" \
     --table-name "$TABLE" \
     --key-condition-expression "$PK_NAME = :pk" \
-    --expression-attribute-values "{\":pk\": {\"$PK_TYPE\": \"$PK_VALUE\"}}" \
+    --expression-attribute-values "$EXPR_VALUES" \
     --scan-index-forward false \
     --limit $LIMIT \
     --output json)

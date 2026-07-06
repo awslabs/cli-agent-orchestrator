@@ -5,6 +5,14 @@ role: developer
 allowedTools:
   - execute_bash
   - fs_read
+mcpServers:
+  cao-mcp-server:
+    type: stdio
+    command: uvx
+    args:
+      - "--from"
+      - "git+https://github.com/awslabs/cli-agent-orchestrator.git@main"
+      - "cao-mcp-server"
 ---
 
 # CloudWatch Logs Agent
@@ -24,8 +32,7 @@ Install this agent with your values via `cao install --env`:
 - `${SEARCH_TIME_WINDOW_MINUTES}` — how far back to search (default: 60)
 - `${MAX_EVENTS}` — max events to return (default: 50)
 
-See `config.json` in this folder for a reference of all available values and
-their defaults.
+See `config.json` in this folder for a reference of all available values.
 
 ## Message Input
 
@@ -44,28 +51,34 @@ The agent extracts the search target from the message. Everything else
 
 ## Instructions
 
-### Step 1: Extract search target from message
-
-Parse the incoming message to identify the search target. It is the ID or
-keyword the caller wants you to find in the logs.
-
-```bash
-# SEARCH_TARGET is extracted from the runtime message — not from config
-SEARCH_TARGET="<extracted-from-message>"
-```
-
-### Step 2: Search logs
+When you receive a message, extract the search target, validate it, then
+search the configured log group and report findings.
 
 ```bash
 PROFILE="${AWS_PROFILE}"
 REGION="${AWS_REGION}"
 LOG_GROUP="${LOG_GROUP}"
-TIME_WINDOW=${SEARCH_TIME_WINDOW_MINUTES}
-MAX_EVENTS=${MAX_EVENTS}
+TIME_WINDOW=${SEARCH_TIME_WINDOW_MINUTES:-60}
+MAX_EVENTS=${MAX_EVENTS:-50}
+
+# Validate required vars
+if [ -z "$PROFILE" ] || [ -z "$REGION" ] || [ -z "$LOG_GROUP" ]; then
+    echo "✗ Missing required config (AWS_PROFILE, AWS_REGION, or LOG_GROUP)"
+    exit 1
+fi
+
+# SEARCH_TARGET is extracted from the runtime message — not from config.
+# Validate: only allow safe characters (alphanumeric, hyphens, underscores, dots, colons).
+SEARCH_TARGET="<extracted-from-message>"
+if ! echo "$SEARCH_TARGET" | grep -qE '^[a-zA-Z0-9_.:-]+$'; then
+    echo "✗ Invalid search target (contains unsafe characters)"
+    exit 1
+fi
+
 START_TIME=$(( $(date +%s) - (TIME_WINDOW * 60) ))000
 END_TIME=$(date +%s)000
 
-aws logs filter-log-events \
+RESULT=$(aws logs filter-log-events \
     --profile "$PROFILE" \
     --region "$REGION" \
     --log-group-name "$LOG_GROUP" \
@@ -73,17 +86,23 @@ aws logs filter-log-events \
     --end-time "$END_TIME" \
     --filter-pattern "$SEARCH_TARGET" \
     --max-items $MAX_EVENTS \
-    --output json | jq '.events[] | {timestamp: .timestamp, message: .message}'
+    --output json)
+
+if [ $? -ne 0 ]; then
+    echo "✗ Failed to search CloudWatch Logs"
+    exit 1
+fi
+
+# Report findings
+EVENT_COUNT=$(echo "$RESULT" | jq '.events | length')
+echo "Found $EVENT_COUNT event(s) matching '$SEARCH_TARGET'"
+echo "$RESULT" | jq '.events[] | {timestamp: .timestamp, message: .message}'
+
+# Check for success/error patterns
+echo "$RESULT" | jq -r '.events[].message' | grep -qi "error\|exception\|failed" && \
+    echo "⚠ Error patterns detected in results" || \
+    echo "✓ No error patterns found"
 ```
-
-### Step 3: Analyze and report
-
-Look for these patterns in results:
-
-- **Success:** `"status": "SUCCEEDED"`, `"result": "ok"`, `Task completed`
-- **Error:** `ERROR`, `Exception`, `TimeoutError`, `"status": "FAILED"`
-
-Report: event count, success/error patterns found, key error messages, time range.
 
 ## Required IAM Permissions
 
