@@ -492,3 +492,76 @@ class TestExportReadPathContainment:
         assert "okf_export_unsafe_index_path" in caplog.text
         assert "exfil bait" not in caplog.text
         assert not (dest / "real-topic.md").exists()
+
+
+class TestSymlinkContainment:
+    """N6: bundle symlinks must never pull content from outside the bundle root."""
+
+    def test_symlinked_md_outside_bundle_rejected(self, svc, backend, bundle, tmp_path):
+        outside = tmp_path / "outside-secret.md"
+        outside.write_text(
+            "---\ntype: user\n---\n\n# sneaky\n\nexfiltrated content\n", encoding="utf-8"
+        )
+        (bundle / "sneaky.md").symlink_to(outside)
+        report = backend.import_bundle(bundle, "global", "skip", False)
+        assert report.imported == 0
+        assert report.rejected == 1
+        assert "symlink" in report.errors["sneaky.md"]
+        assert not svc.get_wiki_path("global", None, "sneaky").exists()
+
+    def test_regular_files_unaffected(self, svc, backend, bundle, tmp_path):
+        outside = tmp_path / "elsewhere.md"
+        outside.write_text("---\ntype: user\n---\n\n# evil\n\nbad\n", encoding="utf-8")
+        (bundle / "evil.md").symlink_to(outside)
+        _write_topic(bundle, "honest", "legit content")
+        report = backend.import_bundle(bundle, "global", "skip", False)
+        assert report.imported == 1
+        assert report.rejected == 1
+        assert svc.get_wiki_path("global", None, "honest").exists()
+
+
+class TestTimestampCoercion:
+    """I1: the quoted-string strptime branch and the unparseable fallback."""
+
+    QUOTED_ISO = '"2026-01-02T03:04:05Z"'
+
+    def test_quoted_string_timestamp_parsed(self, svc, backend, bundle):
+        _write_topic(bundle, "quoted", "body", fm_extra=f"timestamp: {self.QUOTED_ISO}\n")
+        report = backend.import_bundle(bundle, "global", "skip", False)
+        assert report.imported == 1
+        memories = _run(svc.recall(scope="global", limit=10, scan_all=True))
+        quoted = next(m for m in memories if m.key == "quoted")
+        assert quoted.created_at == datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+
+    def test_unparseable_timestamp_falls_back_to_now(self, svc, backend, bundle):
+        _write_topic(bundle, "garbled", "body", fm_extra='timestamp: "not-a-date"\n')
+        report = backend.import_bundle(bundle, "global", "skip", False)
+        assert report.imported == 1
+        assert report.rejected == 0
+        text = _stored_text(svc, "garbled")
+        assert "not-a-date" not in text
+        memories = _run(svc.recall(scope="global", limit=10, scan_all=True))
+        garbled = next(m for m in memories if m.key == "garbled")
+        # Fallback is now(): the entry heading carries a fresh timestamp.
+        assert garbled.created_at.year >= 2026
+
+
+class TestHeaderCommentOnlySpoofEscaped:
+    """I2: a body with ONLY a spoofed header comment (no fake heading) is escaped."""
+
+    def test_header_comment_only_escaped(self, svc, backend, bundle):
+        spoof = (
+            "Real content line.\n" "<!-- id: deadbeef | scope: global | type: user | tags: x -->\n"
+        )
+        _write_topic(bundle, "comment-spoof", spoof)
+        report = backend.import_bundle(bundle, "global", "skip", False)
+        assert report.imported == 1
+        assert report.bodies_escaped == 1
+
+        wiki_path = svc.get_wiki_path("global", None, "comment-spoof")
+        text = wiki_path.read_text(encoding="utf-8")
+        assert "<!-- id: deadbeef" not in text
+        entry = {"key": "comment-spoof", "scope": "global", "scope_id": None}
+        memory = svc._parse_wiki_file(wiki_path, text, entry)
+        assert memory is not None
+        assert memory.id != "deadbeef"

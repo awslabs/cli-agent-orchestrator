@@ -225,6 +225,13 @@ class OkfArchiveBackend(MemoryArchiveBackend):
             rel = path.relative_to(src_real).as_posix()
             if path.name in _RESERVED_FILES or rel.split("/", 1)[0] == _HISTORY_DIR:
                 continue
+            # rglob follows symlinks; a bundle entry linking outside src_real
+            # would let untrusted content pull arbitrary readable files into
+            # memory. Belt and braces: reject symlinks outright AND anything
+            # whose resolved path escapes the validated bundle root.
+            if path.is_symlink() or not path.resolve().is_relative_to(src_real):
+                self._reject(report, rel, "symlink or path escaping the bundle root")
+                continue
             if "/" in rel:
                 self._reject(
                     report,

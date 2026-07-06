@@ -20,6 +20,7 @@ from cli_agent_orchestrator.constants import (
     MEMORY_SCOPE_BUDGET_CHARS,
 )
 from cli_agent_orchestrator.models.memory import Memory, MemoryScope, MemoryType
+from cli_agent_orchestrator.services.memory_archive.base import ExportReport, ImportReport
 
 logger = logging.getLogger(__name__)
 
@@ -2688,7 +2689,7 @@ class MemoryService:
         include_history: bool = False,
         redact: bool = False,
         prune: bool = False,
-    ) -> Any:
+    ) -> ExportReport:
         """Export one scope through the archive backend registered as ``fmt``.
 
         Raises ``ValueError`` on unknown format names (registry contract);
@@ -2707,7 +2708,7 @@ class MemoryService:
         conflict_policy: str = "skip",
         dry_run: bool = False,
         terminal_context: Optional[dict] = None,
-    ) -> Any:
+    ) -> ImportReport:
         """Import an archive bundle through the backend registered as ``fmt``."""
         from cli_agent_orchestrator.services.memory_archive import get_backend
 

@@ -319,12 +319,14 @@ MEMORY_SCOPE_BUDGET_CHARS = 1000
 # ``cao memory export|import --format``.
 MEMORY_ARCHIVE_DEFAULT_FORMAT = "okf"
 
-# RESERVED for the future CAO-native tar.gz backend (parked branch
-# ``docs/memory-import-export``): tar-input hardening caps per its threat
-# model — total decompressed size, per-member size, and gzip expansion
-# ratio. The first PR accepts directories only, so nothing reads these
-# yet; they are defined here (per the constants.py Mandated rule) so the
-# tar backend lands without inventing new config surface.
+# RESERVED — intentionally unreferenced today. These belong to the future
+# CAO-native tar.gz archive backend (parked branch
+# ``docs/memory-import-export``, #345 follow-up): tar-input hardening caps
+# per its threat model — total decompressed size, per-member size, and
+# gzip expansion ratio. The first PR accepts directories only, so nothing
+# reads these yet; they are defined here (per the constants.py Mandated
+# rule) so the tar backend lands without inventing new config surface.
+# Dead-code sweeps: do not remove.
 MEMORY_ARCHIVE_MAX_DECOMPRESSED_BYTES = 512 * 1024 * 1024  # 512 MiB
 MEMORY_ARCHIVE_MAX_FILE_BYTES = 16 * 1024 * 1024  # 16 MiB per member
 MEMORY_ARCHIVE_MAX_GZIP_RATIO = 100  # reject > 100x expansion

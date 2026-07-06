@@ -13,7 +13,9 @@ from unittest.mock import patch
 import pytest
 from sqlalchemy import create_engine
 
+from cli_agent_orchestrator.api.main import app
 from cli_agent_orchestrator.clients.database import Base
+from cli_agent_orchestrator.security import auth
 from cli_agent_orchestrator.services.memory_service import MemoryService
 
 FACTORY_TARGET = "cli_agent_orchestrator.api.main._get_memory_service"
@@ -81,3 +83,53 @@ class TestExportEndpointStream:
         assert response.status_code == 200
         with tarfile.open(fileobj=io.BytesIO(response.content), mode="r:gz") as tar:
             assert sorted(tar.getnames()) == ["index.md", "manifest.md"]
+
+
+class TestExportEndpointAuth:
+    """B1 — export carries the read-floor scope dependency (mirrors test_scope_coverage)."""
+
+    @pytest.fixture
+    def auth_on(self, monkeypatch):
+        monkeypatch.setenv("CAO_AUTH_JWKS_URI", "https://idp.example/jwks")
+
+    @pytest.fixture(autouse=True)
+    def _clear_overrides(self):
+        yield
+        app.dependency_overrides.pop(auth.get_current_scopes, None)
+
+    @staticmethod
+    def _override_scopes(scopes):
+        async def _dep():
+            return list(scopes)
+
+        return _dep
+
+    def test_export_route_has_scope_dependency(self):
+        """Regression guard: GET /memory/export declares require_any_scope."""
+        route = next(
+            r
+            for r in app.routes
+            if getattr(r, "path", None) == "/memory/export" and "GET" in (r.methods or ())
+        )
+        stack = list(route.dependant.dependencies)
+        found = False
+        while stack:
+            dep = stack.pop()
+            call = getattr(dep, "call", None)
+            if call is not None and "require_any_scope" in getattr(call, "__qualname__", ""):
+                found = True
+                break
+            stack.extend(dep.dependencies)
+        assert found, "GET /memory/export is missing a require_any_scope dependency"
+
+    def test_scopeless_token_forbidden(self, client, real_service, auth_on):
+        app.dependency_overrides[auth.get_current_scopes] = self._override_scopes([])
+        with patch(ENABLED_TARGET, return_value=True):
+            response = client.get("/memory/export?scope=global")
+        assert response.status_code == 403
+
+    def test_read_token_admitted(self, client, real_service, auth_on):
+        app.dependency_overrides[auth.get_current_scopes] = self._override_scopes([auth.SCOPE_READ])
+        with patch(ENABLED_TARGET, return_value=True):
+            response = client.get("/memory/export?scope=global")
+        assert response.status_code == 200

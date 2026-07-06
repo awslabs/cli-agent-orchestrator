@@ -1974,6 +1974,7 @@ async def export_memories_endpoint(
     scope_id: Optional[MemoryScopeId] = None,
     include_history: bool = False,
     redact: bool = False,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ):
     """Stream one scope as an archive tarball (#345 D6, read-only mirror).
 

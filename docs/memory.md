@@ -142,8 +142,10 @@ memory_store(
 ```
 
 > **Storing is MCP-only.** There is no `cao memory store` command — the CLI can
-> `list`/`show`/`delete`/`clear`/`lint`/`compact`/`heal`, but *writing* a memory always
-> goes through the `memory_store` MCP tool.
+> `list`/`show`/`delete`/`clear`/`lint`/`compact`/`heal`/`export`/`import`, but *writing* a
+> memory always goes through the `memory_store` MCP tool (`import` is the one
+> exception: it bulk-writes bundle topics, each routed through the same store
+> pipeline).
 
 #### Storing into each scope
 
@@ -268,6 +270,17 @@ cao memory compact --key testing-framework
 cao memory heal --scope project              # dry-run plan
 cao memory heal --scope project --apply
 cao memory heal --scope project --apply --aggressive   # also heal poison_frequency
+
+# Export a scope as an OKF archive bundle (directory, or .tar.gz file path)
+cao memory export --scope global -o ./memory-bundle
+cao memory export --scope global -o ./memory-bundle.tar.gz
+cao memory export --scope session -o ./bundle --include-private   # private scopes need the flag
+cao memory export --scope global -o ./bundle --include-history --redact --prune
+
+# Import a bundle directory into a scope (global/project/federated only)
+cao memory import ./memory-bundle --scope global
+cao memory import ./memory-bundle --scope project --conflict merge
+cao memory import ./memory-bundle --scope global --dry-run   # full pipeline, no writes
 ```
 
 `cao memory heal` consumes the findings from `cao memory lint` and applies one fix per
@@ -275,6 +288,22 @@ issue type: it deletes orphan pages, resolves contradictions (keeping the newer 
 strips stale claims, and — only under `--aggressive` — zeroes poisoned access counts. It
 is dry-run by default; pass `--apply` to mutate. Every applied mutation is written to the
 daily audit log.
+
+`cao memory export` writes one scope as an OKF bundle. Flags: `--scope` (required),
+`-o/--output` (required — a directory, or a `.tar.gz` path for a tarball),
+`--include-private` (required to export the private `session`/`agent` scopes),
+`--include-history` (emit `history/<key>.md` files), `--redact` (redact secret matches
+instead of skipping the topic), and `--prune` (directory output only — delete destination
+topics no longer in the scope). `--format` selects the archive backend (`okf` today).
+The same bundle is available over HTTP via `GET /memory/export` (see
+[docs/api.md](api.md)), which never exports private scopes.
+
+`cao memory import` reads a bundle directory back into a scope. The bundle is treated as
+untrusted input: target `--scope` is required and limited to `global`/`project`/`federated`,
+every topic runs through the store pipeline's validation and secret gate, and structural
+markers that would spoof entry metadata are escaped. `--conflict` picks the policy when a
+key already exists (`skip` (default) / `replace` / `merge`); `--dry-run` runs the full
+parse/validate/secret pipeline and reports without writing.
 
 ## Context Injection
 
