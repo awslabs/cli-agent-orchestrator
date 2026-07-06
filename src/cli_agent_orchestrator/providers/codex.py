@@ -520,7 +520,15 @@ class CodexProvider(BaseProvider):
         the end of that line and the next empty idle prompt.
         Fallback: use assistant marker based extraction when no user message is found.
         """
-        clean_output = re.sub(ANSI_CODE_PATTERN, "", script_output)
+        # Strip ALL terminal escape sequences, not just SGR colour codes. The
+        # narrow ANSI_CODE_PATTERN (``\x1b[...m``) leaves cursor-movement (H),
+        # erase (K), and scroll CSI sequences in place; codex's TUI emits those
+        # heavily, so an SGR-only strip returned raw escape garbage
+        # (``[49;2H[K[38;2;...m``) as the "response", failing extraction. Use
+        # the shared strip which also normalises \r and column-1 cursor moves to
+        # newlines — this is fed a tmux capture-pane render (already laid out),
+        # so the line-based extraction below still anchors correctly.
+        clean_output = strip_terminal_escapes(script_output)
 
         # Primary: find last user message, extract response between it and idle prompt.
         # Exclude the Codex TUI footer from user-message matching when detected.
