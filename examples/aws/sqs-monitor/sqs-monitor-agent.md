@@ -1,7 +1,6 @@
 ---
 name: sqs-monitor-agent
 description: Poll an SQS queue until all messages are consumed
-role: developer
 allowedTools:
   - execute_bash
   - fs_read
@@ -29,10 +28,10 @@ Install this agent with your values via `cao install --env`:
 - `${AWS_PROFILE}` — AWS CLI profile name
 - `${AWS_REGION}` — target region
 - `${QUEUE_URL}` — full SQS queue URL
-- `${POLL_INTERVAL_SECONDS}` — seconds between polls (default: 10)
-- `${TIMEOUT_SECONDS}` — max wait time (default: 300)
+- `${POLL_INTERVAL_SECONDS}` — seconds between polls
+- `${TIMEOUT_SECONDS}` — max wait time
 
-See `config.json` in this folder for a reference of all available values.
+See `config.json` in this folder for a reference of all values.
 
 ## Instructions
 
@@ -42,17 +41,17 @@ When you receive a message, poll the queue until it drains or times out.
 PROFILE="${AWS_PROFILE}"
 REGION="${AWS_REGION}"
 QUEUE_URL="${QUEUE_URL}"
-TIMEOUT=${TIMEOUT_SECONDS:-300}
-INTERVAL=${POLL_INTERVAL_SECONDS:-10}
+TIMEOUT="${TIMEOUT_SECONDS}"
+INTERVAL="${POLL_INTERVAL_SECONDS}"
 
 # Validate required vars
-if [ -z "$PROFILE" ] || [ -z "$REGION" ] || [ -z "$QUEUE_URL" ]; then
-    echo "✗ Missing required config (AWS_PROFILE, AWS_REGION, or QUEUE_URL)"
+if [ -z "$PROFILE" ] || [ -z "$REGION" ] || [ -z "$QUEUE_URL" ] || [ -z "$TIMEOUT" ] || [ -z "$INTERVAL" ]; then
+    echo "✗ Missing required config"
     exit 1
 fi
 
 ELAPSED=0
-while [ $ELAPSED -lt $TIMEOUT ]; do
+while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
     ATTRS=$(aws sqs get-queue-attributes \
         --profile "$PROFILE" \
         --region "$REGION" \
@@ -77,7 +76,7 @@ while [ $ELAPSED -lt $TIMEOUT ]; do
         exit 0
     fi
 
-    sleep $INTERVAL
+    sleep "$INTERVAL"
     ELAPSED=$((ELAPSED + INTERVAL))
 done
 

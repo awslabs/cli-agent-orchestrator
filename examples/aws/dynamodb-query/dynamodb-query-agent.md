@@ -1,7 +1,6 @@
 ---
 name: dynamodb-query-agent
 description: Query DynamoDB tables by partition key
-role: developer
 allowedTools:
   - execute_bash
   - fs_read
@@ -32,9 +31,9 @@ Install this agent with your values via `cao install --env`:
 - `${PARTITION_KEY_NAME}` — partition key attribute (e.g., `pk`)
 - `${PARTITION_KEY_VALUE}` — value to query
 - `${PARTITION_KEY_TYPE}` — DynamoDB type: `S`, `N`, or `B`
-- `${LIMIT}` — max items to return (default: 1)
+- `${LIMIT}` — max items to return
 
-See `config.json` in this folder for a reference of all available values.
+See `config.json` in this folder for a reference of all values.
 
 ## Instructions
 
@@ -47,25 +46,27 @@ TABLE="${TABLE_NAME}"
 PK_NAME="${PARTITION_KEY_NAME}"
 PK_VALUE="${PARTITION_KEY_VALUE}"
 PK_TYPE="${PARTITION_KEY_TYPE}"
-LIMIT=${LIMIT:-1}
+LIMIT="${LIMIT}"
 
 # Validate required vars
-if [ -z "$PROFILE" ] || [ -z "$REGION" ] || [ -z "$TABLE" ] || [ -z "$PK_NAME" ] || [ -z "$PK_VALUE" ]; then
+if [ -z "$PROFILE" ] || [ -z "$REGION" ] || [ -z "$TABLE" ] || [ -z "$PK_NAME" ] || [ -z "$PK_VALUE" ] || [ -z "$LIMIT" ]; then
     echo "✗ Missing required config"
     exit 1
 fi
 
-# Build expression attribute values safely using jq --arg
+# Build expression attribute values and names safely using jq --arg
 EXPR_VALUES=$(jq -n --arg v "$PK_VALUE" --arg t "$PK_TYPE" '{":pk":{($t):$v}}')
+EXPR_NAMES=$(jq -n --arg pk "$PK_NAME" '{"#pk":$pk}')
 
 RESULT=$(aws dynamodb query \
     --profile "$PROFILE" \
     --region "$REGION" \
     --table-name "$TABLE" \
-    --key-condition-expression "$PK_NAME = :pk" \
+    --key-condition-expression "#pk = :pk" \
     --expression-attribute-values "$EXPR_VALUES" \
+    --expression-attribute-names "$EXPR_NAMES" \
     --scan-index-forward false \
-    --limit $LIMIT \
+    --limit "$LIMIT" \
     --output json)
 
 if [ $? -ne 0 ]; then

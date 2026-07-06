@@ -1,7 +1,6 @@
 ---
 name: stepfunction-agent
 description: Trigger and monitor AWS Step Functions executions
-role: developer
 allowedTools:
   - execute_bash
   - fs_read
@@ -32,11 +31,10 @@ Install this agent with your values via `cao install --env`:
 - `${STATE_MACHINE_ARN}` — state machine ARN
 - `${EXECUTION_NAME_PREFIX}` — prefix for generated execution names
 - `${INPUT_PAYLOAD}` — JSON input to the state machine
-- `${POLL_INTERVAL_SECONDS}` — seconds between status checks (default: 15)
-- `${TIMEOUT_SECONDS}` — max seconds to wait (default: 600)
+- `${POLL_INTERVAL_SECONDS}` — seconds between status checks
+- `${TIMEOUT_SECONDS}` — max seconds to wait
 
-See `config.json` in this folder for a reference of all available values and
-their defaults.
+See `config.json` in this folder for a reference of all values.
 
 ## Message Input
 
@@ -52,7 +50,8 @@ Trigger Step Function
 Monitor execution arn:aws:states:us-east-1:123456789012:execution:MyStateMachine:cao-exec-abc123
 ```
 
-The execution ARN for monitoring is extracted from the message.
+The execution ARN for monitoring is extracted from the message. These agents
+process inputs from trusted supervisors only.
 
 ## Instructions
 
@@ -64,8 +63,8 @@ When the message contains "trigger", start a new execution:
 PROFILE="${AWS_PROFILE}"
 REGION="${AWS_REGION}"
 STATE_MACHINE_ARN="${STATE_MACHINE_ARN}"
-EXECUTION_NAME="${EXECUTION_NAME_PREFIX:-cao-exec}-$(uuidgen | tr '[:upper:]' '[:lower:]')"
-INPUT='${INPUT_PAYLOAD}'
+EXECUTION_NAME="${EXECUTION_NAME_PREFIX}-$(uuidgen | tr '[:upper:]' '[:lower:]')"
+INPUT="${INPUT_PAYLOAD}"
 
 # Validate required vars
 if [ -z "$PROFILE" ] || [ -z "$REGION" ] || [ -z "$STATE_MACHINE_ARN" ]; then
@@ -94,18 +93,24 @@ echo "  ARN: $EXECUTION_ARN"
 ### Monitor Operation
 
 When the message contains "monitor" and an execution ARN, extract the ARN
-from the message and poll until completion:
+from the message and poll until completion. Validate the ARN format before use:
 
 ```bash
 PROFILE="${AWS_PROFILE}"
 REGION="${AWS_REGION}"
-TIMEOUT=${TIMEOUT_SECONDS:-600}
-POLL_INTERVAL=${POLL_INTERVAL_SECONDS:-15}
+TIMEOUT="${TIMEOUT_SECONDS}"
+POLL_INTERVAL="${POLL_INTERVAL_SECONDS}"
 
-# EXECUTION_ARN is extracted from the runtime message — not from config.
-# Validate: ARN must match expected pattern.
-EXECUTION_ARN="<extracted-from-message>"
-if ! echo "$EXECUTION_ARN" | grep -qE '^arn:aws:states:[a-z0-9-]+:[0-9]+:execution:.+$'; then
+# Validate required vars
+if [ -z "$PROFILE" ] || [ -z "$REGION" ] || [ -z "$TIMEOUT" ] || [ -z "$POLL_INTERVAL" ]; then
+    echo "✗ Missing required config"
+    exit 1
+fi
+
+# EXECUTION_ARN is extracted from the runtime message by the agent.
+# Validate: ARN must match the expected Step Functions execution pattern.
+# The agent must assign EXECUTION_ARN from the message before this check.
+if ! echo "$EXECUTION_ARN" | grep -qE '^arn:aws:states:[a-z0-9-]+:[0-9]+:execution:[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+$'; then
     echo "✗ Invalid execution ARN format"
     exit 1
 fi
@@ -137,7 +142,7 @@ while [ $ELAPSED -lt $TIMEOUT ]; do
             ;;
     esac
 
-    sleep $POLL_INTERVAL
+    sleep "$POLL_INTERVAL"
     ELAPSED=$((ELAPSED + POLL_INTERVAL))
 done
 

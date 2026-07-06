@@ -1,7 +1,6 @@
 ---
 name: sqs-dlq-check-agent
 description: Inspect a Dead Letter Queue for failed messages
-role: developer
 allowedTools:
   - execute_bash
   - fs_read
@@ -30,10 +29,10 @@ Install this agent with your values via `cao install --env`:
 - `${AWS_PROFILE}` — AWS CLI profile name
 - `${AWS_REGION}` — target region
 - `${DLQ_URL}` — full DLQ queue URL
-- `${MESSAGE_GROUP_ID}` — filter by group (FIFO queues, leave empty to skip)
-- `${MAX_MESSAGES}` — max messages to peek (default: 10)
+- `${MESSAGE_GROUP_ID}` — filter by group (FIFO queues; leave empty to skip filtering)
+- `${MAX_MESSAGES}` — max messages to peek
 
-See `config.json` in this folder for a reference of all available values.
+See `config.json` in this folder for a reference of all values.
 
 ## Instructions
 
@@ -43,12 +42,12 @@ When you receive a message, check the DLQ for failed messages.
 PROFILE="${AWS_PROFILE}"
 REGION="${AWS_REGION}"
 DLQ_URL="${DLQ_URL}"
-MAX_MESSAGES=${MAX_MESSAGES:-10}
+MAX_MESSAGES="${MAX_MESSAGES}"
 GROUP_ID="${MESSAGE_GROUP_ID}"
 
 # Validate required vars
-if [ -z "$PROFILE" ] || [ -z "$REGION" ] || [ -z "$DLQ_URL" ]; then
-    echo "✗ Missing required config (AWS_PROFILE, AWS_REGION, or DLQ_URL)"
+if [ -z "$PROFILE" ] || [ -z "$REGION" ] || [ -z "$DLQ_URL" ] || [ -z "$MAX_MESSAGES" ]; then
+    echo "✗ Missing required config (AWS_PROFILE, AWS_REGION, DLQ_URL, or MAX_MESSAGES)"
     exit 1
 fi
 
@@ -77,9 +76,9 @@ MESSAGES=$(aws sqs receive-message \
     --profile "$PROFILE" \
     --region "$REGION" \
     --queue-url "$DLQ_URL" \
-    --max-number-of-messages $MAX_MESSAGES \
+    --max-number-of-messages "$MAX_MESSAGES" \
     --visibility-timeout 0 \
-    --attribute-names MessageGroupId \
+    --message-system-attribute-names MessageGroupId \
     --output json)
 
 if [ $? -ne 0 ]; then

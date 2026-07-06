@@ -20,6 +20,7 @@ in its own folder with a profile (`.md`) and a configuration reference (`config.
 - [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)
 - A named AWS profile (`aws configure --profile my-profile`)
 - `jq` installed (used for JSON parsing)
+- `uuidgen` installed (used by stepfunction and sqs-send for unique IDs)
 - IAM permissions scoped to the specific service (see each agent's profile)
 
 ## How to Use
@@ -27,7 +28,7 @@ in its own folder with a profile (`.md`) and a configuration reference (`config.
 ### 1. Check config.json for the values you need
 
 Each folder has a `config.json` that documents every configurable value with
-example defaults:
+example placeholders:
 
 ```json
 {
@@ -39,8 +40,8 @@ example defaults:
 
 ### 2. Install with your values
 
-Pass your values via `--env` flags. The `${VAR}` placeholders in the `.md`
-profile are resolved at install time:
+All values are **required** at install time. Pass them via `--env` flags. The
+`${VAR}` placeholders in the `.md` profile are resolved during install:
 
 ```bash
 cao install examples/aws/sqs-monitor/sqs-monitor-agent.md \
@@ -51,10 +52,14 @@ cao install examples/aws/sqs-monitor/sqs-monitor-agent.md \
   --env TIMEOUT_SECONDS=60
 ```
 
+If any `--env` value is omitted, the `${VAR}` placeholder passes through
+unresolved and the agent's empty-var validation will exit with an error at
+runtime.
+
 ### 3. Launch the agent
 
 ```bash
-cao launch --agent-profile sqs-monitor-agent --provider kiro_cli
+cao launch --agents sqs-monitor-agent --provider claude_code
 ```
 
 ## Configuration Reference
@@ -76,20 +81,25 @@ config keys to env var names:
 Service-specific keys (e.g., `poll_interval_seconds`, `max_messages`) map to
 their uppercased equivalents (`POLL_INTERVAL_SECONDS`, `MAX_MESSAGES`).
 
-All values are **required** at install time. If omitted, the unresolved
-`${VAR}` literal will expand to empty in bash, causing commands to fail.
-
 ## Security Notes
 
 - All agents use explicit `--profile` flags, never default credentials
 - Each agent validates that required variables are non-empty before executing
-- The `dynamodb-delete` agent enforces a `MAX_DELETE` safety cap
-- Message-extracted inputs are validated against strict allowlist patterns
+- The `dynamodb-delete` agent enforces a `MAX_DELETE` safety cap and requires
+  explicit `CONFIRM=yes` to proceed with deletions
+- These agents process inputs from trusted supervisors only; do not expose
+  to untrusted message sources without additional input sanitization
 - Never store real credentials in agent profile files
+
+## Provider Compatibility
+
+`allowedTools` restrictions are enforced by `claude_code` and `codex` providers.
+The `kiro_cli` provider does not currently enforce tool restrictions at the CAO
+level. Use `--provider claude_code` for enforced sandboxing.
 
 ## Multi-Agent Orchestration
 
 These agents are designed to work standalone or as workers in a multi-agent
 system. Each includes a `cao-mcp-server` block so supervisors can delegate
-via `handoff` or `send_message`. See the [orchestration examples](../orchestration/)
-for patterns.
+via `handoff` or `send_message`. See the [assign example](../assign/) for
+orchestration patterns.

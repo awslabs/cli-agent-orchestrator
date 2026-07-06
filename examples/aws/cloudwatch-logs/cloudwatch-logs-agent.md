@@ -1,7 +1,6 @@
 ---
 name: cloudwatch-logs-agent
 description: Search CloudWatch Logs for execution traces and error patterns
-role: developer
 allowedTools:
   - execute_bash
   - fs_read
@@ -29,25 +28,25 @@ Install this agent with your values via `cao install --env`:
 - `${AWS_PROFILE}` — AWS CLI profile name
 - `${AWS_REGION}` — target region
 - `${LOG_GROUP}` — log group name to search
-- `${SEARCH_TIME_WINDOW_MINUTES}` — how far back to search (default: 60)
-- `${MAX_EVENTS}` — max events to return (default: 50)
+- `${SEARCH_TIME_WINDOW_MINUTES}` — how far back to search
+- `${MAX_EVENTS}` — max events to return
 
-See `config.json` in this folder for a reference of all available values.
+See `config.json` in this folder for a reference of all values.
 
 ## Message Input
 
 This agent expects a **search target** in the runtime message from the
-supervisor or user. The search target is the execution ID, request ID, or
-keyword to find in logs. Examples:
+supervisor. The search target is the execution ID, request ID, or keyword
+to find in logs. Examples:
 
 ```
 Search logs for execution abc-123-def-456
 Verify logs for request-id req_9xk2m
-Find errors matching TimeoutException
 ```
 
-The agent extracts the search target from the message. Everything else
-(profile, region, log group, time window) comes from config.
+These agents process inputs from trusted supervisors only. The agent must
+validate the extracted value against `^[a-zA-Z0-9_.:-]+$` before use, and
+must never paste raw message content directly into bash source code.
 
 ## Instructions
 
@@ -58,18 +57,21 @@ search the configured log group and report findings.
 PROFILE="${AWS_PROFILE}"
 REGION="${AWS_REGION}"
 LOG_GROUP="${LOG_GROUP}"
-TIME_WINDOW=${SEARCH_TIME_WINDOW_MINUTES:-60}
-MAX_EVENTS=${MAX_EVENTS:-50}
+TIME_WINDOW="${SEARCH_TIME_WINDOW_MINUTES}"
+MAX_EVENTS="${MAX_EVENTS}"
 
 # Validate required vars
-if [ -z "$PROFILE" ] || [ -z "$REGION" ] || [ -z "$LOG_GROUP" ]; then
-    echo "✗ Missing required config (AWS_PROFILE, AWS_REGION, or LOG_GROUP)"
+if [ -z "$PROFILE" ] || [ -z "$REGION" ] || [ -z "$LOG_GROUP" ] || [ -z "$TIME_WINDOW" ] || [ -z "$MAX_EVENTS" ]; then
+    echo "✗ Missing required config"
     exit 1
 fi
 
-# SEARCH_TARGET is extracted from the runtime message — not from config.
-# Validate: only allow safe characters (alphanumeric, hyphens, underscores, dots, colons).
-SEARCH_TARGET="<extracted-from-message>"
+# SEARCH_TARGET must be assigned by the agent from the supervisor message.
+# Validate: only allow safe characters.
+if [ -z "$SEARCH_TARGET" ]; then
+    echo "✗ No search target provided"
+    exit 1
+fi
 if ! echo "$SEARCH_TARGET" | grep -qE '^[a-zA-Z0-9_.:-]+$'; then
     echo "✗ Invalid search target (contains unsafe characters)"
     exit 1
@@ -85,7 +87,7 @@ RESULT=$(aws logs filter-log-events \
     --start-time "$START_TIME" \
     --end-time "$END_TIME" \
     --filter-pattern "$SEARCH_TARGET" \
-    --max-items $MAX_EVENTS \
+    --max-items "$MAX_EVENTS" \
     --output json)
 
 if [ $? -ne 0 ]; then
@@ -98,7 +100,7 @@ EVENT_COUNT=$(echo "$RESULT" | jq '.events | length')
 echo "Found $EVENT_COUNT event(s) matching '$SEARCH_TARGET'"
 echo "$RESULT" | jq '.events[] | {timestamp: .timestamp, message: .message}'
 
-# Check for success/error patterns
+# Check for error patterns
 echo "$RESULT" | jq -r '.events[].message' | grep -qi "error\|exception\|failed" && \
     echo "⚠ Error patterns detected in results" || \
     echo "✓ No error patterns found"
@@ -109,7 +111,7 @@ echo "$RESULT" | jq -r '.events[].message' | grep -qi "error\|exception\|failed"
 ```json
 {
   "Effect": "Allow",
-  "Action": ["logs:DescribeLogGroups", "logs:FilterLogEvents"],
+  "Action": ["logs:FilterLogEvents"],
   "Resource": "arn:aws:logs:us-east-1:123456789012:log-group:/aws/lambda/MyFunction:*"
 }
 ```
