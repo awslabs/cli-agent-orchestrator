@@ -218,32 +218,30 @@ def poll_until_done(
     terminal_id: str,
     timeout: float,
     polling_interval: float = 1.0,
-    stable_polls: int = 3,
+    idle_stable_polls: int = 3,
 ) -> None:
-    """Poll terminal status until the agent is done (ready), errored, or timeout.
+    """Poll terminal status until the agent is done, errored, or timeout.
 
-    "Done" is a ready status — COMPLETED or IDLE — that persists for
-    ``stable_polls`` consecutive polls. Both count because providers differ in
-    how they signal a finished turn: most reach COMPLETED (a detectable
-    response-done marker like a Credits line or green arrow), but kiro-cli 2.11
-    frequently finishes a turn with no such marker and settles back to its
-    persistent idle prompt, so the detector reports IDLE for a genuinely
-    finished turn. Requiring COMPLETED only would hang here (and time out)
-    whenever a kiro agent completes — even though it is done. The rest of the
-    system already treats IDLE/COMPLETED as equivalent ready states.
+    Two "done" signals, treated differently:
 
-    The ``stable_polls`` requirement guards against returning on a transient
-    idle *before* the agent has started working (callers sleep briefly before
-    calling this, but that alone can't distinguish "idle, not started" from
-    "idle, finished" — a stable ready window can).
+    - **COMPLETED** — a definitive response-done marker (Credits line / green
+      arrow). Returns immediately, exactly as before; a single reading is
+      trustworthy.
+    - **IDLE** — returns only after ``idle_stable_polls`` consecutive IDLE
+      reads. kiro-cli 2.11 frequently finishes a turn with no COMPLETED marker
+      and settles back to its persistent idle prompt, so a finished kiro agent
+      reports IDLE — requiring COMPLETED only would hang here until timeout even
+      though the agent is done. But IDLE is ambiguous (a terminal is also idle
+      *before* it starts, or briefly between a provider's internal steps), so we
+      require a short stable window before treating it as "done". This makes the
+      COMPLETED path byte-for-byte unchanged while adding a guarded IDLE path.
 
     Raises click.ClickException on error, timeout, or request failure.
     """
     import click
 
-    done_states = {TerminalStatus.COMPLETED.value, TerminalStatus.IDLE.value}
     start = time.time()
-    consecutive_ready = 0
+    consecutive_idle = 0
     while True:
         elapsed = time.time() - start
         if elapsed > timeout:
@@ -254,14 +252,16 @@ def poll_until_done(
             resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}")
             resp.raise_for_status()
             status = resp.json().get("status")
+            if status == TerminalStatus.COMPLETED.value:
+                return
             if status == TerminalStatus.ERROR.value:
                 raise click.ClickException("Terminal reached ERROR status")
-            if status in done_states:
-                consecutive_ready += 1
-                if consecutive_ready >= stable_polls:
+            if status == TerminalStatus.IDLE.value:
+                consecutive_idle += 1
+                if consecutive_idle >= idle_stable_polls:
                     return
             else:
-                consecutive_ready = 0
+                consecutive_idle = 0
         except requests.exceptions.RequestException as e:
             raise click.ClickException(f"Failed to poll terminal status: {e}")
         time.sleep(polling_interval)

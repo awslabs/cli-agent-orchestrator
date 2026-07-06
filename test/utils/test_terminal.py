@@ -472,11 +472,13 @@ class TestSyncBackendFromServer:
 
 
 class TestPollUntilDone:
-    """poll_until_done accepts a STABLE ready status (completed OR idle).
+    """poll_until_done: COMPLETED returns immediately; IDLE needs a stable window.
 
     Regression: kiro-cli 2.11 finishes many turns at IDLE (no Credits marker),
     so requiring COMPLETED caused `cao launch` / `cao session send` to hang and
-    time out on a kiro agent that had actually completed.
+    time out on a kiro agent that had actually completed. COMPLETED behaviour is
+    unchanged (single reading returns); IDLE is accepted only after a short
+    stable window since idle is ambiguous mid-turn.
     """
 
     def _resp(self, status):
@@ -485,7 +487,8 @@ class TestPollUntilDone:
         m.json.return_value = {"status": status}
         return m
 
-    def test_returns_on_stable_completed(self):
+    def test_completed_returns_immediately(self):
+        """A single COMPLETED reading returns at once (unchanged behaviour)."""
         from cli_agent_orchestrator.utils.terminal import poll_until_done
 
         with (
@@ -493,8 +496,8 @@ class TestPollUntilDone:
             patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
         ):
             g.return_value = self._resp("completed")
-            # Should return once 3 consecutive completed seen; no exception.
             poll_until_done("abcd1234", timeout=60, polling_interval=0)
+            assert g.call_count == 1
 
     def test_returns_on_stable_idle(self):
         from cli_agent_orchestrator.utils.terminal import poll_until_done
@@ -504,11 +507,12 @@ class TestPollUntilDone:
             patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
         ):
             g.return_value = self._resp("idle")
-            poll_until_done("abcd1234", timeout=60, polling_interval=0)
+            poll_until_done("abcd1234", timeout=60, polling_interval=0, idle_stable_polls=3)
+            assert g.call_count == 3
 
     def test_transient_idle_does_not_return_early(self):
         """A single idle poll surrounded by processing must NOT satisfy the
-        stable-ready gate — otherwise we'd return mid-turn."""
+        stable-idle gate — otherwise we'd return mid-turn."""
         from cli_agent_orchestrator.utils.terminal import poll_until_done
 
         seq = [
@@ -524,9 +528,26 @@ class TestPollUntilDone:
             patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
         ):
             g.side_effect = seq
-            poll_until_done("abcd1234", timeout=60, polling_interval=0, stable_polls=3)
+            poll_until_done("abcd1234", timeout=60, polling_interval=0, idle_stable_polls=3)
             # All 6 responses consumed => the transient idle did not trigger return.
             assert g.call_count == 6
+
+    def test_completed_after_idle_returns_without_full_idle_window(self):
+        """COMPLETED short-circuits even if fewer than idle_stable_polls idles
+        preceded it — the definitive marker wins."""
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        seq = [
+            self._resp("idle"),  # 1 idle, not yet stable
+            self._resp("completed"),  # definitive -> return now
+        ]
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
+        ):
+            g.side_effect = seq
+            poll_until_done("abcd1234", timeout=60, polling_interval=0, idle_stable_polls=3)
+            assert g.call_count == 2
 
     def test_error_raises(self):
         import click
