@@ -326,9 +326,9 @@ async def create_terminal(
         # block on `provider.initialize()`. The remaining initialize + input
         # send runs as a background task, so two concurrent assigns can each
         # kick off their init in parallel. Kiro-cli 2.11's per-tool client
-        # timeout (~60s) previously cancelled assign RPCs when init took long
-        # enough to push the round-trip past that cap; deferring init keeps
-        # the tool call under 2s.
+        # timeout (~120s observed) previously cancelled assign RPCs when init
+        # took long enough to push the round-trip past that cap; deferring init
+        # keeps the tool call under 2s.
         if defer_init:
             shell_command = None  # unknown until initialize() runs
             _schedule_deferred_init(

@@ -115,11 +115,14 @@ TUI_INITIALIZING_PATTERN = (
 # Requires all three options together to avoid false positives on "Yes"/"No" in agent output.
 # Kiro 2.11 renders the same three-way choice with different wording for
 # subagent spawning: "Yes, single permission / Trust, always allow in this
-# session / No (Tab to edit)". Accept both variants.
+# session / No (Tab to edit)". Both alternatives anchor on the full Yes/Trust/No
+# option layout so agent output that merely mentions a permission prompt (or
+# quotes "subagent requires approval") can't flip status to WAITING_USER_ANSWER
+# — the bare header alternative was dropped for that reason. In practice
+# --trust-all-tools suppresses this prompt anyway; detection is a safety net.
 TUI_PERMISSION_PATTERN = (
     r"Yes\s+No\s+Always [Aa]llow"
     r"|Yes,\s*single permission[\s\S]{0,200}?Trust,\s*always allow[\s\S]{0,200}?No"
-    r"|subagent requires approval"
 )
 
 # =============================================================================

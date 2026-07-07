@@ -590,26 +590,6 @@ def _parse_run_step_error(
     return None, fallback, None
 
 
-def _send_direct_input_assign(terminal_id: str, message: str) -> None:
-    """Send assign payload to a worker agent, appending callback instructions."""
-    # Auto-inject sender terminal ID suffix when enabled
-    if ENABLE_SENDER_ID_INJECTION:
-        # Never tell a worker to reply to terminal 'unknown' (issue #284):
-        # a missing ID is a configuration error, not a routable address.
-        sender_id = os.environ.get("CAO_TERMINAL_ID")
-        if not sender_id:
-            raise ValueError(
-                "CAO_TERMINAL_ID not set - cannot inject callback instructions "
-                "for the worker. Run assign from inside a CAO terminal."
-            )
-        message += (
-            f"\n\n[Assigned by terminal {sender_id}. "
-            f"When done, send results back to terminal {sender_id} using send_message]"
-        )
-
-    _send_direct_input(terminal_id, message, OrchestrationType.ASSIGN)
-
-
 def _send_to_inbox(receiver_id: str, message: str) -> Dict[str, Any]:
     """Send message to another terminal's inbox (queued delivery when IDLE).
 

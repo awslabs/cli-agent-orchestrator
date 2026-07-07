@@ -362,7 +362,7 @@ def _route_command(kind: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     * ``assign``           -> ``POST /terminals/{id}/input`` with
       ``orchestration_type=assign`` — there is no single "create terminal + send"
       assign endpoint, so a reassignment-to-an-existing-agent gesture maps to the
-      closest existing route (mirrors ``_send_direct_input_assign`` in server.py).
+      closest existing route (the direct-input path ``_assign_impl`` uses).
     * ``interrupt``        -> ``POST /terminals/{id}/key`` with ``key="C-c"`` (SIGINT;
       ``C-c`` is accepted by the endpoint's ``TMUX_KEY_PATTERN``).
     * ``pause`` / ``resume`` -> no corresponding terminal routes exist,
