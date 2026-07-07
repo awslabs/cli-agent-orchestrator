@@ -6,9 +6,11 @@ The runnable code lives in [`examples/fleet/`](../examples/fleet/); this documen
 the "why and how." It is the reference for issue
 [#349](https://github.com/awslabs/cli-agent-orchestrator/issues/349).
 
-> **Depends on the fleet example PRs.** This guide documents the code added in
-> **PR #365** (coordinator foundation) and **PR #366** (web panel), so read it
-> alongside them — `examples/fleet/` is only present once those merge.
+> **Part of the fleet example.** This guide documents [`examples/fleet/`](../examples/fleet/)
+> — the coordinator foundation (merged in **#365**) and its web panel
+> (`examples/fleet/panel/`, **#366**). Read it alongside that directory's own
+> [`README.md`](../examples/fleet/README.md) and
+> [`panel/README.md`](../examples/fleet/panel/README.md).
 
 > **"Fleet" here means multiple _CAO nodes_ (machines).** CAO's
 > [MCP Apps](mcp-apps.md) also uses "fleet" for the set of agents on **one**
@@ -88,7 +90,11 @@ flowchart TB
 
 `deploy/bootstrap.sh` turns a fresh machine into a fleet node with one command. It is
 transport-agnostic: it picks a bind address from `CAO_BIND_HOST`, then a Tailscale IP
-if present, then the default-route IP — and binds `cao-server` there.
+if present, then the default-route IP — and binds `cao-server` there. On a
+publicly-connected host (a cloud VM/VPS) that last fallback can resolve to a **public**
+IP, which would expose an unauthenticated node; set `CAO_BIND_HOST` to a private/VPN
+address before running bootstrap there. See [Transport and
+security](#transport-and-security).
 
 ```mermaid
 sequenceDiagram
@@ -241,13 +247,30 @@ sequenceDiagram
 
 ## Transport and security
 
+> **⚠️ A node's `cao-server` is an unauthenticated command-execution surface.**
+> Anyone who can reach `host:port` can launch and drive agents on that node — that is
+> full command execution. The private network is the *only* thing protecting it.
+> Keep every node — and the panel — on a private/VPN network, and **never expose a
+> node's port or the panel to the public internet.**
+
 - **Any private network works.** The coordinator only needs to reach each node at
   `host:port`. Tailscale, WireGuard, a VPN, an SSH tunnel, or a trusted LAN are all
   fine — the transport is your choice, not a requirement of this example.
 - **The network is the trust boundary.** Each node's `cao-server` is bound to its
-  private-network address. **There is no per-request API auth in this example** —
-  anyone who can reach the port can launch/attach agents (full command execution) on
-  the node. **Do not expose a node's port to the public internet.**
+  private-network address, and there is **no per-request API auth on a node** in this
+  example (see the callout above). Bind nodes to a private address only.
+- **Bootstrap can bind a public address — set `CAO_BIND_HOST`.** `bootstrap.sh` picks
+  its bind address as `CAO_BIND_HOST` → a Tailscale IP → the default-route IP. On a
+  cloud host/VPS whose default route egresses a *public* interface (and where Tailscale
+  isn't up), that last fallback would bind the unauthenticated `cao-server` to a public
+  IP. Before bootstrapping any host with public connectivity, set `CAO_BIND_HOST` to a
+  private/VPN address (or confirm Tailscale is up).
+- **The panel adds opt-in auth; the nodes don't.** The web panel is also unauthenticated
+  by default, so set **`CAO_PANEL_TOKEN`** whenever you bind it off loopback — every
+  request then needs that shared secret (HTTP Basic password or `Bearer`). That guards
+  the panel's own port; it does not add auth to the nodes it fans out to, which still
+  rely on the private network. See
+  [`panel/README.md`](../examples/fleet/panel/README.md#security).
 - **`CAO_ALLOWED_HOSTS` is not authentication.** It is a `Host`-header allowlist
   enforced by `TrustedHostMiddleware` (a DNS-rebinding mitigation), not a
   network/port exposure control and not peer auth. For real authentication in front
