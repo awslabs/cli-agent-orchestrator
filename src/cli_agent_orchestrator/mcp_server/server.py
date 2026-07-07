@@ -258,7 +258,18 @@ def _create_terminal(
         response.raise_for_status()
         terminal = response.json()
     else:
-        # Create new session with terminal
+        # Create new session with terminal.
+        # The new-session endpoint (POST /sessions) has no deferred-init support,
+        # so defer_init/initial_message CANNOT be honored here. Raise rather than
+        # silently create a worker and drop the task (the caller — _assign_impl —
+        # already fails fast when CAO_TERMINAL_ID is unset, so this is a
+        # belt-and-suspenders guard the docstring promised).
+        if defer_init:
+            raise ValueError(
+                "defer_init/initial_message is not supported when creating a new "
+                "session (no current CAO_TERMINAL_ID); refusing to create a worker "
+                "whose task would never be delivered."
+            )
         session_name = generate_session_name()
         provider = resolve_provider(agent_profile, fallback_provider=provider)
         params = {
@@ -925,16 +936,22 @@ def _assign_impl(
     """
     terminal_id: Optional[str] = None
     try:
-        # Fail fast before creating the worker terminal: with injection on,
-        # a missing CAO_TERMINAL_ID would otherwise surface only after the
-        # terminal exists, leaving an orphan window behind (issue #284).
-        if ENABLE_SENDER_ID_INJECTION and not os.environ.get("CAO_TERMINAL_ID"):
+        # Fail fast before creating the worker terminal when CAO_TERMINAL_ID is
+        # unset — REGARDLESS of the sender-ID-injection flag. The deferred-init
+        # path only forwards the initial message on the existing-session branch
+        # of _create_terminal (an existing session requires a current terminal).
+        # Without CAO_TERMINAL_ID, _create_terminal takes the new-session branch
+        # which cannot honor defer_init/initial_message — assign would create a
+        # worker, never deliver the task, and still return success. Guarding
+        # here also avoids leaving an orphan window behind (issue #284).
+        if not os.environ.get("CAO_TERMINAL_ID"):
             return {
                 "success": False,
                 "terminal_id": None,
                 "message": (
-                    "Assignment failed: CAO_TERMINAL_ID not set - cannot inject callback "
-                    "instructions for the worker. Run assign from inside a CAO terminal."
+                    "Assignment failed: CAO_TERMINAL_ID not set — assign must run "
+                    "from inside a CAO terminal so the worker joins the caller's "
+                    "session and its results can route back."
                 ),
             }
 

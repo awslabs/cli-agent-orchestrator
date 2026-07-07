@@ -1237,3 +1237,94 @@ class TestDeleteTerminal:
         result = delete_terminal("test1234")
 
         assert result is True
+
+
+class TestDeferredInitFailureNotification:
+    """PR #390 must-fixes #1/#3: a deferred-init failure must be OBSERVABLE to
+    the supervisor (assign already returned success=True), teardown must pass
+    the registry (post_kill_terminal parity), and TerminalInputBlockedError
+    must NOT delete the worker.
+    """
+
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.create_inbox_message")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_notify_enqueues_inbox_to_caller_and_deletes_with_registry(
+        self, mock_meta, mock_create_inbox, mock_delete
+    ):
+        from cli_agent_orchestrator.services.terminal_service import (
+            _notify_caller_of_deferred_failure,
+        )
+
+        mock_meta.return_value = {"caller_id": "super123"}
+        registry = MagicMock()
+
+        _notify_caller_of_deferred_failure(
+            "worker99", "init failed: boom", registry, delete_worker=True
+        )
+
+        # Caller notified via inbox (sender = the failed worker, receiver = caller)
+        mock_create_inbox.assert_called_once()
+        _, kwargs = mock_create_inbox.call_args
+        assert kwargs["receiver_id"] == "super123"
+        assert kwargs["sender_id"] == "worker99"
+        assert "init failed: boom" in kwargs["message"]
+        # Teardown passes the registry so post_kill_terminal hooks fire.
+        mock_delete.assert_called_once_with("worker99", registry=registry)
+
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.create_inbox_message")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_notify_without_delete_leaves_worker_alive(
+        self, mock_meta, mock_create_inbox, mock_delete
+    ):
+        """delete_worker=False (the WAITING_USER_ANSWER case) must notify but
+        NOT tear the worker down."""
+        from cli_agent_orchestrator.services.terminal_service import (
+            _notify_caller_of_deferred_failure,
+        )
+
+        mock_meta.return_value = {"caller_id": "super123"}
+
+        _notify_caller_of_deferred_failure(
+            "worker99", "waiting on prompt", None, delete_worker=False
+        )
+
+        mock_create_inbox.assert_called_once()
+        mock_delete.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.create_inbox_message")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_notify_inbox_failure_does_not_block_teardown(
+        self, mock_meta, mock_create_inbox, mock_delete
+    ):
+        """If the inbox enqueue fails, teardown must still happen (independent
+        best-effort steps)."""
+        from cli_agent_orchestrator.services.terminal_service import (
+            _notify_caller_of_deferred_failure,
+        )
+
+        mock_meta.return_value = {"caller_id": "super123"}
+        mock_create_inbox.side_effect = Exception("db down")
+
+        _notify_caller_of_deferred_failure("worker99", "boom", None, delete_worker=True)
+
+        mock_delete.assert_called_once()
+
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.create_inbox_message")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_notify_no_caller_id_is_log_only(self, mock_meta, mock_create_inbox, mock_delete):
+        """No caller_id (e.g. operator-launched) → no inbox attempt, still tears
+        down."""
+        from cli_agent_orchestrator.services.terminal_service import (
+            _notify_caller_of_deferred_failure,
+        )
+
+        mock_meta.return_value = {"caller_id": None}
+
+        _notify_caller_of_deferred_failure("worker99", "boom", None, delete_worker=True)
+
+        mock_create_inbox.assert_not_called()
+        mock_delete.assert_called_once()

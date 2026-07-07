@@ -143,6 +143,26 @@ class TestCreateTerminalProviderResolution:
         assert kwargs["json"]["initial_message"] == "Analyze the sensitive logs at /secret/path"
         assert kwargs["json"]["initial_message_orchestration_type"] == "assign"
 
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_defer_init_on_new_session_branch_raises(self, mock_requests):
+        """PR #390 must-fix #2: the new-session branch can't honor defer_init
+        (POST /sessions has no deferred-init support), so _create_terminal must
+        raise rather than silently create a worker whose task is never
+        delivered. This is the branch taken when CAO_TERMINAL_ID is unset."""
+        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+        from cli_agent_orchestrator.models.inbox import OrchestrationType
+
+        with patch.dict(os.environ, {}, clear=True):  # no CAO_TERMINAL_ID
+            with pytest.raises(ValueError, match="not supported when creating a new session"):
+                _create_terminal(
+                    "reviewer",
+                    defer_init=True,
+                    initial_message="do work",
+                    initial_message_orchestration_type=OrchestrationType.ASSIGN,
+                )
+        # Must raise BEFORE creating anything.
+        mock_requests.post.assert_not_called()
+
 
 class TestAssignSenderIdInjection:
     """Tests for sender ID injection in _assign_impl.
@@ -200,6 +220,24 @@ class TestAssignSenderIdInjection:
         """When CAO_TERMINAL_ID is not set, assign must fail fast (issue #284) —
         never tell a worker to reply to terminal 'unknown', and never leave an
         orphan worker terminal behind."""
+        from cli_agent_orchestrator.mcp_server.server import _assign_impl
+
+        with patch.dict(os.environ, {}, clear=True):
+            result = _assign_impl("developer", "Build feature X")
+
+        assert result["success"] is False
+        assert result["terminal_id"] is None
+        assert "CAO_TERMINAL_ID not set" in result["message"]
+        mock_create.assert_not_called()
+
+    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", False)
+    @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
+    def test_assign_missing_terminal_id_fails_fast_even_with_injection_off(self, mock_create):
+        """PR #390 must-fix #2: the CAO_TERMINAL_ID fail-fast must be
+        UNCONDITIONAL (not gated on sender-ID injection). With injection off and
+        no terminal id, the deferred path would otherwise take the new-session
+        branch, which can't deliver the task — assign would create a worker,
+        drop the task, and still return success. Guard fires regardless."""
         from cli_agent_orchestrator.mcp_server.server import _assign_impl
 
         with patch.dict(os.environ, {}, clear=True):
