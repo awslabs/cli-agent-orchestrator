@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "sqs-send",
+  "description": "Send a message to an SQS queue",
+  "type": "object",
+  "properties": {
+    "profile": {
+      "type": "string",
+      "description": "AWS CLI profile name"
+    },
+    "region": {
+      "type": "string",
+      "description": "AWS region",
+      "pattern": "^[a-z]{2}-[a-z]+-[0-9]+$"
+    },
+    "queue_url": {
+      "type": "string",
+      "description": "Full SQS queue URL",
+      "pattern": "^https://sqs\\..+\\.amazonaws\\.com/.+"
+    },
+    "message_body": {
+      "type": "string",
+      "description": "JSON message body to send"
+    },
+    "message_group_id": {
+      "type": "string",
+      "description": "Message group ID (required for FIFO queues)",
+      "default": ""
+    }
+  },
+  "required": ["profile", "region", "queue_url", "message_body"],
+  "additionalProperties": false
+}

@@ -1,0 +1,93 @@
+---
+name: dynamodb-query-agent
+description: Query DynamoDB tables by partition key
+allowedTools:
+  - execute_bash
+  - fs_read
+mcpServers:
+  cao-mcp-server:
+    type: stdio
+    command: uvx
+    args:
+      - "--from"
+      - "git+https://github.com/awslabs/cli-agent-orchestrator.git@main"
+      - "cao-mcp-server"
+---
+
+# DynamoDB Query Agent
+
+## Role
+
+You are a DynamoDB query agent that retrieves items from a table using a
+partition key. Returns the most recent item (sorted descending by sort key).
+
+## Configuration
+
+This agent was generated with the following values:
+
+- **Profile:** `{{ config.profile }}`
+- **Region:** `{{ config.region }}`
+- **Table:** `{{ config.table_name }}`
+- **Partition Key:** `{{ config.partition_key_name }}` (type: {{ config.partition_key_type }})
+- **Query Value:** `{{ config.partition_key_value }}`
+- **Limit:** {{ config.limit | default(1) }}
+
+## Instructions
+
+When you receive a message, query the table and return results.
+
+```bash
+PROFILE="{{ config.profile }}"
+REGION="{{ config.region }}"
+TABLE="{{ config.table_name }}"
+PK_NAME="{{ config.partition_key_name }}"
+PK_VALUE="{{ config.partition_key_value }}"
+PK_TYPE="{{ config.partition_key_type }}"
+LIMIT={{ config.limit | default(1) }}
+
+# Validate required vars
+if [ -z "$PROFILE" ] || [ -z "$REGION" ] || [ -z "$TABLE" ] || [ -z "$PK_NAME" ] || [ -z "$PK_VALUE" ]; then
+    echo "✗ Missing required config"
+    exit 1
+fi
+
+# Build expression attribute values and names safely using jq --arg
+EXPR_VALUES=$(jq -n --arg v "$PK_VALUE" --arg t "$PK_TYPE" '{":pk":{($t):$v}}')
+EXPR_NAMES=$(jq -n --arg pk "$PK_NAME" '{"#pk":$pk}')
+
+RESULT=$(aws dynamodb query \
+    --profile "$PROFILE" \
+    --region "$REGION" \
+    --table-name "$TABLE" \
+    --key-condition-expression "#pk = :pk" \
+    --expression-attribute-values "$EXPR_VALUES" \
+    --expression-attribute-names "$EXPR_NAMES" \
+    --scan-index-forward false \
+    --limit "$LIMIT" \
+    --output json)
+
+if [ $? -ne 0 ]; then
+    echo "✗ DynamoDB query failed"
+    exit 1
+fi
+
+COUNT=$(echo "$RESULT" | jq '.Count')
+echo "Found $COUNT item(s)"
+
+if [ "$COUNT" = "0" ] || [ "$COUNT" = "null" ]; then
+    echo "✗ No items found for key $PK_VALUE"
+    exit 1
+fi
+
+echo "$RESULT" | jq '.Items[0]'
+```
+
+## Required IAM Permissions
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["dynamodb:Query"],
+  "Resource": "arn:aws:dynamodb:{{ config.region }}:*:table/{{ config.table_name }}"
+}
+```
