@@ -1532,6 +1532,42 @@ async def workflow_run(
 
 
 @mcp.tool()
+async def workflow_resume(
+    run_id: str = Field(description="The run id to resume (a crashed/failed prior run)"),
+) -> Dict[str, Any]:
+    """Resume a crashed or failed workflow run from its durable journal (issue #312, N6).
+
+    A thin HTTP client over ``POST /workflows/runs/{run_id}/resume`` (single seam):
+    the server re-drives the snapshotted spec in-process, skipping already-completed
+    steps and re-running the rest, and this tool blocks until the run finishes (like
+    ``workflow_run``). Returns a structured envelope on EVERY path — it never raises
+    into the agent loop. ``ok=False`` carries the server error detail (unknown run, a
+    terminal/live run that cannot be resumed, a corrupt snapshot, etc.).
+    """
+    try:
+        # Resume re-drives the WHOLE run inline, so block for the full run duration
+        # using the worst-case run timeout, NOT the short per-call _mcp_timeout().
+        response = requests.post(
+            f"{API_BASE_URL}/workflows/runs/{run_id}/resume",
+            timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
+        )
+    except requests.RequestException as e:
+        return {"ok": False, "error": f"could not reach cao-server: {e}"}
+
+    if response.status_code != 200:
+        detail = _extract_error_detail(response, f"status {response.status_code}")
+        return {"ok": False, "error": detail}
+
+    data = response.json()
+    return {
+        "ok": True,
+        "run_id": data.get("run_id"),
+        "state": data.get("state"),
+        "steps": data.get("steps", []),
+    }
+
+
+@mcp.tool()
 async def workflow_cancel(
     run_id: str = Field(description="The run id to cancel (from a prior workflow_run)"),
 ) -> Dict[str, Any]:

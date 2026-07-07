@@ -173,3 +173,88 @@ class TestStepOutputEndpoint:
         # ".." in the path either fails the name regex (400) or is normalized by
         # the router; assert it never stores a traversal key as success.
         assert resp.status_code in (400, 404, 405)
+
+
+class TestResumeEndpoint:
+    """The resume route's exception disambiguation (N6, business-logic-model §5).
+
+    The route must return four distinct status codes for the ValueError-family
+    arms; assert each by mocking the engine function to raise the matching type.
+    The engine itself is exercised by the service tests — here we pin the boundary
+    mapping (validator->400, KeyError->404, ResumeNotAllowedError->409,
+    ResumeCorruptError->422) and that the subtypes are caught before bare ValueError.
+    """
+
+    def test_unknown_run_maps_to_404(self, client, monkeypatch):
+        from cli_agent_orchestrator.services import workflow_service as ws
+
+        async def _raise(run_id):
+            raise KeyError("nope")
+
+        monkeypatch.setattr(ws, "resume_from_last_completed", _raise)
+        resp = client.post("/workflows/runs/runX/resume")
+        assert resp.status_code == 404
+
+    def test_terminal_or_live_run_maps_to_409(self, client, monkeypatch):
+        from cli_agent_orchestrator.services import workflow_service as ws
+
+        async def _raise(run_id):
+            raise ws.ResumeNotAllowedError("already completed")
+
+        monkeypatch.setattr(ws, "resume_from_last_completed", _raise)
+        resp = client.post("/workflows/runs/runX/resume")
+        assert resp.status_code == 409
+
+    def test_corrupt_snapshot_maps_to_422(self, client, monkeypatch):
+        from cli_agent_orchestrator.services import workflow_service as ws
+
+        async def _raise(run_id):
+            raise ws.ResumeCorruptError("corrupt")
+
+        monkeypatch.setattr(ws, "resume_from_last_completed", _raise)
+        resp = client.post("/workflows/runs/runX/resume")
+        assert resp.status_code == 422
+
+    def test_bad_run_id_maps_to_400(self, client, monkeypatch):
+        from cli_agent_orchestrator.services import workflow_service as ws
+
+        async def _raise(run_id):
+            raise ValueError("bad run_id")
+
+        monkeypatch.setattr(ws, "resume_from_last_completed", _raise)
+        resp = client.post("/workflows/runs/runX/resume")
+        assert resp.status_code == 400
+
+    def test_engine_error_maps_to_500(self, client, monkeypatch):
+        from cli_agent_orchestrator.services import workflow_service as ws
+
+        async def _raise(run_id):
+            raise ws.WorkflowEngineError("bad template reference")
+
+        monkeypatch.setattr(ws, "resume_from_last_completed", _raise)
+        resp = client.post("/workflows/runs/runX/resume")
+        assert resp.status_code == 500
+
+    def test_success_returns_result(self, client, monkeypatch):
+        from cli_agent_orchestrator.models.workflow_runtime import (
+            RunState,
+            StepResult,
+            StepState,
+            WorkflowRunResult,
+        )
+        from cli_agent_orchestrator.services import workflow_service as ws
+
+        async def _ok(run_id):
+            return WorkflowRunResult(
+                run_id=run_id,
+                workflow_name="wf",
+                state=RunState.COMPLETED,
+                steps=[StepResult(id="s1", state=StepState.COMPLETED, attempts=1)],
+                started_at="2026-01-01T00:00:00Z",
+                finished_at="2026-01-01T00:00:05Z",
+            )
+
+        monkeypatch.setattr(ws, "resume_from_last_completed", _ok)
+        resp = client.post("/workflows/runs/runX/resume")
+        assert resp.status_code == 200
+        assert resp.json()["state"] == "completed"

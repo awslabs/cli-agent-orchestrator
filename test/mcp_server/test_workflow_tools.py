@@ -12,7 +12,11 @@ from unittest.mock import MagicMock, patch
 import requests
 
 from cli_agent_orchestrator.constants import MCP_REQUEST_TIMEOUT, WORKFLOW_RUN_REQUEST_TIMEOUT
-from cli_agent_orchestrator.mcp_server.server import workflow_cancel, workflow_run
+from cli_agent_orchestrator.mcp_server.server import (
+    workflow_cancel,
+    workflow_resume,
+    workflow_run,
+)
 
 
 def _resp(status_code, json_body):
@@ -70,6 +74,63 @@ class TestWorkflowRun:
             "cli_agent_orchestrator.mcp_server.server.requests.post", return_value=_resp(200, body)
         ) as post:
             asyncio.run(workflow_run("wf", inputs={}))
+        assert post.call_args.kwargs["timeout"] == WORKFLOW_RUN_REQUEST_TIMEOUT
+        assert WORKFLOW_RUN_REQUEST_TIMEOUT > MCP_REQUEST_TIMEOUT
+
+
+class TestWorkflowResume:
+    def test_success_envelope(self):
+        body = {
+            "run_id": "run1",
+            "state": "completed",
+            "steps": [{"id": "s1", "state": "completed", "attempts": 1}],
+        }
+        with patch(
+            "cli_agent_orchestrator.mcp_server.server.requests.post", return_value=_resp(200, body)
+        ):
+            out = asyncio.run(workflow_resume("run1"))
+        assert out["ok"] is True
+        assert out["run_id"] == "run1"
+        assert out["state"] == "completed"
+        assert out["steps"][0]["id"] == "s1"
+
+    def test_server_error_envelope_no_raise(self):
+        with patch(
+            "cli_agent_orchestrator.mcp_server.server.requests.post",
+            return_value=_resp(409, {"detail": "run 'run1' is completed; not resumable"}),
+        ):
+            out = asyncio.run(workflow_resume("run1"))
+        assert out["ok"] is False
+        assert "not resumable" in out["error"]
+
+    def test_transport_error_envelope_no_raise(self):
+        with patch(
+            "cli_agent_orchestrator.mcp_server.server.requests.post",
+            side_effect=requests.ConnectionError("down"),
+        ):
+            out = asyncio.run(workflow_resume("run1"))
+        assert out["ok"] is False
+        assert "could not reach cao-server" in out["error"]
+
+    def test_timeout_envelope_no_raise(self):
+        # A requests.Timeout is a RequestException — it must land in the same
+        # never-raises transport envelope, not escape into the agent loop.
+        with patch(
+            "cli_agent_orchestrator.mcp_server.server.requests.post",
+            side_effect=requests.Timeout("too slow"),
+        ):
+            out = asyncio.run(workflow_resume("run1"))
+        assert out["ok"] is False
+        assert "could not reach cao-server" in out["error"]
+
+    def test_resume_uses_long_run_timeout_not_flat_30s(self):
+        # Resume re-drives the whole run inline, so it must use the worst-case
+        # WORKFLOW_RUN_REQUEST_TIMEOUT, not the flat per-call MCP_REQUEST_TIMEOUT.
+        body = {"run_id": "run1", "state": "completed", "steps": []}
+        with patch(
+            "cli_agent_orchestrator.mcp_server.server.requests.post", return_value=_resp(200, body)
+        ) as post:
+            asyncio.run(workflow_resume("run1"))
         assert post.call_args.kwargs["timeout"] == WORKFLOW_RUN_REQUEST_TIMEOUT
         assert WORKFLOW_RUN_REQUEST_TIMEOUT > MCP_REQUEST_TIMEOUT
 

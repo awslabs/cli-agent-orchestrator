@@ -231,8 +231,6 @@ def run_cmd(name_or_path, inputs, run_id, as_json):
 
     if response.status_code == 404:
         raise click.ClickException(_extract_detail(response, f"unknown workflow '{name_or_path}'"))
-    if response.status_code in (400, 409, 500, 501):
-        raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
     if response.status_code != 200:
         raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
 
@@ -275,6 +273,44 @@ def status_cmd(run_id, as_json):
     click.echo(f"Current: {snapshot.get('current_step_id') or '(none)'}")
     for step in snapshot.get("steps", []):
         click.echo(f"  - {step['id']}: {step['state']} (attempts={step.get('attempts')})")
+
+
+@workflow.command(name="resume")
+@click.argument("run_id")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit the result as JSON.")
+def resume_cmd(run_id, as_json):
+    """Resume a crashed/failed run from its durable journal (blocks until done).
+
+    Skips already-completed steps and re-runs the rest. Exit codes:
+      0  run reached COMPLETED
+      1  run reached FAILED / CANCELLED, or the request errored
+    """
+    try:
+        # Resume re-drives the run inline (the server awaits it), so use the
+        # worst-case-covering run timeout, not the flat MCP_REQUEST_TIMEOUT.
+        response = requests.post(
+            f"{API_BASE_URL}/workflows/runs/{run_id}/resume",
+            timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
+        )
+    except requests.exceptions.RequestException as e:
+        raise click.ClickException(f"could not reach cao-server: {e}")
+
+    if response.status_code == 404:
+        raise click.ClickException(f"unknown run '{run_id}'")
+    if response.status_code != 200:
+        raise click.ClickException(_extract_detail(response, f"status {response.status_code}"))
+
+    result = response.json()
+    if as_json:
+        click.echo(_json.dumps(result, indent=2))
+    else:
+        click.echo(f"Run:   {result.get('run_id')}")
+        click.echo(f"State: {result.get('state')}")
+        for step in result.get("steps", []):
+            click.echo(f"  - {step['id']}: {step['state']} (attempts={step.get('attempts')})")
+
+    if result.get("state") != "completed":
+        raise click.exceptions.Exit(1)
 
 
 @workflow.command(name="cancel")
