@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - add OKF memory export/import — `cao memory export`/`cao memory import` CLI commands plus a read-scoped `GET /memory/export` API endpoint streaming a scope as a tar.gz bundle (#345)
 - add `examples/fleet` — a cross-node fleet coordinator that manages many CAO nodes from one place: one-command node bootstrap, a `fleet` control helper (list/show/exec against any node), and an AI conductor wired to one `cao-ops-mcp-server` per node. Purely additive under `examples/`; each node stays a stateless client of the existing `cao-server` API (#349)
+- add `examples/fleet/panel` — a web control panel + live console for the fleet: a stateless FastAPI app that fans out to every node's `cao-server` REST API and serves a browser SPA (a wall of live agent screens + a focused console). Isolates per-node failures, degrades `/screen` → `/output` for older nodes, and adds opt-in shared-token auth (`CAO_PANEL_TOKEN`) for off-loopback use (#366)
 
 ### Changed
 

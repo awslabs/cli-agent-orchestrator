@@ -1,4 +1,4 @@
-"""Panel configuration: fleet registry loading and bind address.
+"""Panel configuration: fleet registry loading, bind address, and optional auth.
 
 The registry path defaults to `fleet.json` next to this example. If you have not
 created one yet (copy `fleet.example.json` -> `fleet.json`), the packaged
@@ -24,12 +24,24 @@ FLEET_CONFIG = os.environ.get("CAO_FLEET_CONFIG") or _default_config_path()
 # other devices.
 PANEL_HOST = os.environ.get("CAO_PANEL_HOST", "127.0.0.1")
 PANEL_PORT = int(os.environ.get("CAO_PANEL_PORT", "9888"))
+# Optional shared secret. When set, every panel request must present it (HTTP Basic
+# password — any username — or `Authorization: Bearer <token>`). Unset (the default)
+# leaves the panel open, which is fine on loopback but NOT once you bind CAO_PANEL_HOST
+# to a network address. See README "Security".
+PANEL_TOKEN = os.environ.get("CAO_PANEL_TOKEN") or None
 
 
 def load_machines():
     """Return the fleet nodes, each with a concrete int `port`."""
-    with open(FLEET_CONFIG, encoding="utf-8") as f:
-        cfg = json.load(f)
+    try:
+        with open(FLEET_CONFIG, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"fleet registry not found at {FLEET_CONFIG}. Copy "
+            f"{os.path.join(_EXAMPLE_ROOT, 'fleet.example.json')} to fleet.json (or set "
+            "CAO_FLEET_CONFIG) and list your nodes."
+        ) from exc
     default_port = int(cfg.get("port", 9889))
     machines = []
     for m in cfg["machines"]:

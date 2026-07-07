@@ -1,4 +1,12 @@
+import pytest
+
 from app import config
+
+
+def test_missing_registry_raises_clear_error(monkeypatch):
+    monkeypatch.setattr(config, "FLEET_CONFIG", "/no/such/fleet.json")
+    with pytest.raises(RuntimeError, match="fleet registry not found"):
+        config.load_machines()
 
 
 def test_load_machines_has_three_with_ports():

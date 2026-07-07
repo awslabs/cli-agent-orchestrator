@@ -21,15 +21,29 @@ async def test_launch_sends_expected_params():
     def handler(req):
         seen["path"] = req.url.path
         seen["params"] = dict(req.url.params)
-        return httpx.Response(201, json={"id": "term-1", "session_name": "cao-panel-1"})
+        return httpx.Response(201, json={"id": "term-1", "session_name": "sess-1"})
     async with _mock(handler) as c:
-        out = await client.launch(c, "http://x", "developer", "claude_code", "cao-panel-1", "/tmp")
+        out = await client.launch(c, "http://x", "developer", "claude_code", "sess-1", "/tmp")
     assert seen["path"] == "/sessions"
     assert seen["params"]["agent_profile"] == "developer"
     assert seen["params"]["provider"] == "claude_code"
-    assert seen["params"]["session_name"] == "cao-panel-1"
+    assert seen["params"]["session_name"] == "sess-1"
     assert seen["params"]["working_directory"] == "/tmp"
     assert out["id"] == "term-1"
+
+
+async def test_launch_omits_optional_params_when_absent():
+    seen = {}
+    def handler(req):
+        seen["params"] = dict(req.url.params)
+        return httpx.Response(201, json={"id": "term-1"})
+    async with _mock(handler) as c:
+        # no provider, no working_directory → those keys must be absent, not empty
+        await client.launch(c, "http://x", "developer", None, "sess-1")
+    assert seen["params"]["agent_profile"] == "developer"
+    assert seen["params"]["session_name"] == "sess-1"
+    assert "provider" not in seen["params"]
+    assert "working_directory" not in seen["params"]
 
 
 async def test_send_message_path_and_params():

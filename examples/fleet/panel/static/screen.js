@@ -10,10 +10,10 @@ function fgVar(fg) {
 //
 // Container height is governed entirely by CSS — tiles are a fixed height with
 // overflow:hidden, the console is flex:1 + min-height:0 + overflow:auto and
-// scrolls internally. We deliberately do NOT force a min-height here: doing so
-// (via pretext) grew the console to the full frame height and pushed the input
-// bar off-screen. `opts.follow` is "always" (pin bottom, tiles) or "smart"
-// (only follow when the user is already at the bottom, console).
+// scrolls internally. We deliberately do NOT force a min-height on the frame:
+// doing so grew the console to the full frame height and pushed the input bar
+// off-screen. `opts.follow` is "always" (pin bottom, tiles) or "smart" (only
+// follow when the user is already at the bottom, console).
 export function renderScreen(el, frame, opts) {
   const follow = computeFollow(opts.follow, el);
   const prevTop = el.scrollTop;

@@ -5,7 +5,7 @@ const TILE_FONT = '12px "JetBrains Mono", ui-monospace, monospace';
 const TILE_LINE_H = 16;
 
 // status derives from a session's terminal status when known, else machine state
-function tileStatus(machineOnline, termStatus) {
+export function tileStatus(machineOnline, termStatus) {
   if (!machineOnline) return "offline";
   const s = (termStatus || "").toLowerCase();
   if (s.includes("process") || s.includes("run") || s.includes("work")) return "working";
