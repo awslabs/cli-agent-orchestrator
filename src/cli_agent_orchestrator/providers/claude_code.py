@@ -84,6 +84,16 @@ COMPLETION_SUMMARY_PATTERN = r"[✶✢✽✻✳][^\n…]*\bfor\s+\d+(?:\.\d+)?\s
 # stat lines), and only ever turns IDLE/PROCESSING into COMPLETED — the safe
 # direction — and only after the live-spinner PROCESSING checks have passed.
 GET_STATUS_COMPLETION_PATTERN = r"[✶✢✽✻✳][^\n…]*\bfor\b"
+# Background-task wait line, e.g. "✻ Waiting for 1 dynamic workflow to finish".
+# The newest TUI renders this while a backgrounded task (Workflow tool, bash
+# task) keeps running AFTER the turn's text response has printed and the input
+# box is already idle — the terminal looks "finished" (response + empty ❯ box)
+# except for this one line. It carries NO ellipsis, so every spinner-based
+# PROCESSING check misses it, and it satisfies GET_STATUS_COMPLETION_PATTERN's
+# lenient glyph+"for" match ("✻ Waiting *for* 1 …"), so without special
+# handling the whole frame reads COMPLETED while work continues (GH #392:
+# the Runs board showed "Done" with the TUI footer at "2/3 agents done").
+BACKGROUND_WAIT_PATTERN = r"[✶✢✽✻✳·*][ \t]+Waiting for\b"
 # The newest Claude Code TUI renders the ❯ input prompt BOXED between two
 # horizontal separator lines (the older TUI used a single separator ABOVE ❯).
 # Detecting this box GATES the new-TUI status logic so legacy output is
@@ -466,6 +476,8 @@ class ClaudeCodeProvider(BaseProvider):
             _tail = output[_sep_positions[-1] :]
             _last_summary = None
             for _m in re.finditer(GET_STATUS_COMPLETION_PATTERN, _tail):
+                if "Waiting" in _m.group(0):
+                    continue  # background-wait line, not a completion summary (GH #392)
                 _last_summary = _m
             # The summary only marks the turn finished if no LIVE spinner
             # renders after it. Claude prints interim summaries mid-turn
@@ -505,6 +517,8 @@ class ClaudeCodeProvider(BaseProvider):
         # after a finished turn.
         last_completion = None
         for m in re.finditer(GET_STATUS_COMPLETION_PATTERN, output):
+            if "Waiting" in m.group(0):
+                continue  # background-wait line, not a completion summary (GH #392)
             last_completion = m
 
         # FALLBACK PROCESSING: spinner visible AND no separator follows it yet
@@ -564,6 +578,26 @@ class ClaudeCodeProvider(BaseProvider):
         last_sol_response = None
         for m in re.finditer(EXTRACTION_RESPONSE_PATTERN, output):
             last_sol_response = m
+
+        # BACKGROUND TASK still running (GH #392): the newest TUI prints the
+        # turn's text response, shows an idle ❯ box, and renders
+        # "✻ Waiting for N dynamic workflow(s) to finish" — a frame that looks
+        # COMPLETED to the signature check below while work continues. Honor
+        # the wait line only while it is the NEWEST activity marker: once the
+        # backgrounded task finishes, Claude prints a fresh response and/or a
+        # real completion summary BELOW it in the rolling buffer, which
+        # re-enables the normal COMPLETED path (so a stale wait line in
+        # scrollback can never pin PROCESSING).
+        last_bg_wait = None
+        for m in re.finditer(BACKGROUND_WAIT_PATTERN, output):
+            last_bg_wait = m
+        if last_bg_wait is not None and not any(
+            marker.start() > last_bg_wait.start()
+            for marker in (last_completion, last_response, last_sol_response)
+            if marker is not None
+        ):
+            return TerminalStatus.PROCESSING
+
         if last_idle is not None and (
             last_completion is not None
             or last_sol_response is not None
@@ -619,6 +653,16 @@ class ClaudeCodeProvider(BaseProvider):
         # The raw get_status() path already switched to the tight pattern for the
         # same reason; the screen path must match.
         if any(NEW_TUI_BOX_SPINNER_PATTERN.search(ln) for ln in bottom):
+            return TerminalStatus.PROCESSING
+
+        # Background task still running (GH #392): "✻ Waiting for N dynamic
+        # workflow(s)…" has no spinner ellipsis, so the check above misses it,
+        # while the response + boxed-prompt signature below would read
+        # COMPLETED. The composited screen shows only LIVE content — the line
+        # disappears on the finished repaint — so its mere presence in the
+        # bottom region is a safe PROCESSING signal (no staleness risk, unlike
+        # the raw rolling-buffer path).
+        if any(re.search(BACKGROUND_WAIT_PATTERN, ln) for ln in bottom):
             return TerminalStatus.PROCESSING
 
         bottom_joined = "\n".join(bottom)

@@ -27,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- claude_code: a backgrounded task (“✻ Waiting for N dynamic workflow(s) to finish”) no longer reads as COMPLETED — the wait line has no spinner ellipsis (invisible to every PROCESSING check) while the printed response + idle ❯ box look like a finished turn, and it even matched the lenient completion pattern; both the raw-buffer and pyte screen paths now report PROCESSING until a newer response/completion summary appears, so dashboards and wait_until_terminal_status no longer see a mid-run terminal as done (#392)
+
 - fifo: non-blocking FIFO reader loop and event-loop-safe session teardown — reader threads can no longer be stranded in a blocking FIFO `open()` by a stop/reopen race, and `DELETE /sessions` runs teardown in a worker thread, so repeated create/delete cycles can no longer wedge cao-server (#382)
 
 ## [2.2.0] - 2026-06-04

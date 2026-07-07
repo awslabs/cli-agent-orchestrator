@@ -1673,3 +1673,92 @@ class TestClaudeCodeScreenDetection:
 
     def test_empty_screen_is_unknown(self):
         assert self._p().get_status_from_screen(["", "", ""]) == TerminalStatus.UNKNOWN
+
+
+class TestClaudeCodeBackgroundTaskNotCompleted:
+    """A backgrounded task must not read as COMPLETED (GH #392).
+
+    Real failure (first observed live on the Runs dashboard): a code_supervisor
+    launched its own backgrounded Workflow. The TUI printed the turn's text
+    response, showed an EMPTY idle ❯ box, and rendered
+    "✻ Waiting for 1 dynamic workflow to finish" above it — while the status
+    bar read "2/3 agents done". That line has no spinner ellipsis (invisible to
+    every PROCESSING check) and even matches the lenient completion pattern
+    ("✻ Waiting *for* 1 …"), so the frame read COMPLETED, the ready-latch
+    pinned it, and the dashboard showed the run as Done mid-execution.
+    """
+
+    BOX = "─" * 30
+
+    def _p(self):
+        return ClaudeCodeProvider("test123", "test-session", "window-0")
+
+    def _wait_frame(self) -> str:
+        """The exact live-frame shape from the GH #392 report."""
+        return (
+            "● Workflow(Developer agent builds a todo app; Reviewer verifies)\n"
+            "  ⎿  Running in background · /workflows to monitor and save\n"
+            "● The build is now running in the background. Here's what's happening:\n"
+            "  1. Developer agent is building a single-file todo app\n"
+            "  2. Code Reviewer agent then verifies every criterion\n"
+            "✻ Waiting for 1 dynamic workflow to finish\n"
+            + self.BOX
+            + "\n❯ \n"
+            + self.BOX
+            + "\n  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+        )
+
+    def test_background_wait_frame_is_processing(self):
+        assert self._p().get_status(self._wait_frame()) == TerminalStatus.PROCESSING
+
+    def test_finished_after_background_wait_is_completed(self):
+        """Once the workflow finishes, a fresh response + real completion
+        summary render BELOW the (now stale, still-in-rolling-buffer) wait
+        line — the wait line must not pin PROCESSING."""
+        output = (
+            self._wait_frame()
+            + "● All 12 acceptance criteria pass — here is the artifact link.\n"
+            + "✻ Baked for 7m 48s\n"
+            + self.BOX
+            + "\n❯ \n"
+            + self.BOX
+            + "\n  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+        )
+        assert self._p().get_status(output) == TerminalStatus.COMPLETED
+
+    def test_wait_line_after_last_separator_is_not_a_completion_summary(self):
+        """Boxless-repaint variant: the wait line lands AFTER the last
+        separator, where the lenient glyph+"for" completion match would
+        otherwise count it as a finished-turn summary."""
+        output = (
+            "● Kicking the workflow off now.\n"
+            + self.BOX
+            + "\n❯ \n"
+            + self.BOX
+            + "\n✻ Waiting for 1 dynamic workflow to finish\n"
+        )
+        assert self._p().get_status(output) == TerminalStatus.PROCESSING
+
+    def test_screen_background_wait_is_processing(self):
+        screen = [
+            "● The build is now running in the background.",
+            "✻ Waiting for 1 dynamic workflow to finish",
+            "─" * 60,
+            "❯",
+            "─" * 60,
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+        ]
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.PROCESSING
+
+    def test_screen_finished_frame_is_completed(self):
+        """The finished repaint no longer shows the wait line — composited
+        screens carry only live content, so COMPLETED resumes normally."""
+        screen = [
+            "● All 12 acceptance criteria pass — artifact link below.",
+            "✻ Baked for 7m 48s",
+            "─" * 60,
+            "❯",
+            "─" * 60,
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+        ]
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.COMPLETED
