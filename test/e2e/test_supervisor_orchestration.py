@@ -116,18 +116,21 @@ def _wait_for_ready(terminal_id: str, timeout: float = 120.0, poll: float = 3.0)
     return False
 
 
-# A supervisor is "done" when it is in a ready state. Both COMPLETED and IDLE
-# count: COMPLETED is emitted by providers that print a detectable response-done
-# marker (Credits line / green arrow), but kiro-cli 2.11's TUI often finishes a
-# turn with no Credits marker and settles back to its persistent idle prompt +
-# footer chrome, so the detector reports IDLE for a genuinely finished turn.
-# InboxService and _wait_for_ready already treat IDLE and COMPLETED as
-# equivalent "ready" states, so requiring COMPLETED here would reject a kiro
-# supervisor that has actually completed its orchestration. The real "done"
-# signal is a ready status that is STABLE for ``stable_count`` polls AFTER all
-# expected workers have been observed — that combination cannot be satisfied by
-# a transient inter-turn idle (the supervisor is mid-turn spawning workers then,
-# not stably ready with every worker already seen).
+# A supervisor is "done" when it is in a ready state (COMPLETED or IDLE). Both
+# are accepted because kiro 2.11 legitimately finishes a turn at IDLE with no
+# Credits marker (the marker is intermittent in TUI mode; verified by a run
+# where the supervisor produced a full combined report yet never emitted
+# COMPLETED — a COMPLETED-only gate hung until timeout on it). But IDLE alone is
+# ambiguous: a kiro supervisor is ALSO idle *between* firing an async assign and
+# receiving the worker's callback, so a bare idle+workers check can declare
+# "done" mid-orchestration and tear the session down before results are combined
+# (the original hollow-pass regression). The status alone cannot tell the two
+# idles apart — the mid-dispatch idle observed in one run lasted ~32s, longer
+# than any stable-window guard. So for async assign flows the gate additionally
+# requires the worker callback to have actually landed in the supervisor's inbox
+# (see ``require_inbox_callback``): that delivery is impossible during the
+# mid-dispatch idle (no worker has reported back yet) and is the assign
+# protocol's real completion signal.
 _SUPERVISOR_DONE_STATES = {"completed", "idle"}
 
 
@@ -138,6 +141,7 @@ def _wait_for_supervisor_done(
     timeout: float = SUPERVISOR_COMPLETION_TIMEOUT,
     poll: float = 5.0,
     stable_count: int = 2,
+    require_inbox_callback: bool = False,
 ) -> tuple:
     """Wait for the supervisor to reach a stable ready state AND spawn workers.
 
@@ -151,9 +155,13 @@ def _wait_for_supervisor_done(
     (e.g., after assign returns but before handoff starts). Requiring
     ``stable_count`` consecutive ready readings avoids these false positives.
 
-    "Ready" means COMPLETED or IDLE (see ``_SUPERVISOR_DONE_STATES``): kiro-cli
-    2.11 finishes many turns at IDLE with no Credits marker, and the rest of the
-    system treats IDLE/COMPLETED as equivalent ready states.
+    "Done" means a ready status (idle/completed) that is STABLE for
+    ``stable_count`` polls AFTER all expected workers have been observed. When
+    ``require_inbox_callback`` is set (async assign flows), the supervisor must
+    also have received at least one worker callback in its inbox — this is the
+    signal that distinguishes a genuinely-finished turn from the mid-dispatch
+    idle a kiro supervisor sits in while an async worker is still running (that
+    idle happens BEFORE any callback lands, so it cannot satisfy this check).
 
     The ``handoff`` MCP tool auto-deletes its worker terminal as soon as the
     worker finishes. A point-in-time session listing taken after the supervisor
@@ -162,11 +170,13 @@ def _wait_for_supervisor_done(
     observed across all polls — once seen, a worker "counts" even if it has
     since been cleaned up.
 
-    This function polls until BOTH conditions are true:
+    This function polls until ALL of these are true:
     - Terminal status is ready (idle/completed) for ``stable_count`` consecutive
       polls
     - At least min_terminals unique terminals have been observed in the
       session at some point during the run (supervisor + workers)
+    - If ``require_inbox_callback``: a worker callback has been delivered to (or
+      is at least present in) the supervisor's inbox
 
     Returns (last_status, terminals_list) where terminals_list is the union
     of all unique terminals seen during polling.
@@ -186,7 +196,20 @@ def _wait_for_supervisor_done(
         if last_status == "error":
             return last_status, list(seen_terminals.values())
 
-        if last_status in _SUPERVISOR_DONE_STATES and len(seen_terminals) >= min_terminals:
+        # A ready status (idle/completed) for stable_count consecutive polls,
+        # AFTER all expected workers have been observed. kiro finishes many turns
+        # at IDLE with no Credits marker, so IDLE must be accepted — but IDLE is
+        # ambiguous (the supervisor is also idle mid-dispatch while an async
+        # worker runs), so for assign flows we additionally require a worker
+        # callback to have reached the inbox before treating idle as "done".
+        ready = last_status in _SUPERVISOR_DONE_STATES and len(seen_terminals) >= min_terminals
+        if ready and require_inbox_callback:
+            # Any message in the supervisor's inbox (pending or delivered) means
+            # a worker has already reported back — impossible during the
+            # mid-dispatch idle, so this cleanly rejects that false-positive.
+            ready = bool(_get_inbox_messages(supervisor_id))
+
+        if ready:
             consecutive_ready += 1
             if consecutive_ready >= stable_count:
                 return last_status, list(seen_terminals.values())
@@ -244,6 +267,10 @@ def _run_supervisor_handoff_test(provider: str):
         # Step 4+5: Wait for supervisor to complete AND create worker terminal.
         # Uses combined polling because some providers report COMPLETED from
         # initial text output before MCP tool calls finish.
+        # Handoff is synchronous — the worker result returns inline to the
+        # supervisor's turn, there is no async inbox callback — so a stable
+        # ready status after the worker terminal has been observed is the done
+        # signal here (no require_inbox_callback).
         status, terminals = _wait_for_supervisor_done(
             supervisor_id, actual_session, min_terminals=2
         )
@@ -336,8 +363,11 @@ def _run_supervisor_assign_test(provider: str):
         # assign(data_analyst) + handoff(report_generator) = at least 3 terminals.
         # Uses combined polling because some providers report COMPLETED from
         # initial text output before MCP tool calls finish.
+        # assign is async — the data_analyst reports back via send_message to the
+        # supervisor's inbox. Require that callback before accepting idle so we
+        # don't grab the mid-dispatch idle (which precedes any callback).
         status, terminals = _wait_for_supervisor_done(
-            supervisor_id, actual_session, min_terminals=3
+            supervisor_id, actual_session, min_terminals=3, require_inbox_callback=True
         )
         assert status in _SUPERVISOR_DONE_STATES, (
             f"Supervisor did not reach a ready state (idle/completed) within "
@@ -453,7 +483,11 @@ def _run_supervisor_assign_three_analysts_test(provider: str):
 
         # Expected minimum: supervisor + 3 analysts + report generator
         status, terminals = _wait_for_supervisor_done(
-            supervisor_id, actual_session, min_terminals=5, timeout=420
+            supervisor_id,
+            actual_session,
+            min_terminals=5,
+            timeout=420,
+            require_inbox_callback=True,
         )
         assert status in _SUPERVISOR_DONE_STATES, (
             f"Supervisor did not reach a ready state (idle/completed) within timeout "

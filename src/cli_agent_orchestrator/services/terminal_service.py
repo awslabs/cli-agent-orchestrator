@@ -26,7 +26,9 @@ from enum import Enum
 from typing import Dict, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
-from cli_agent_orchestrator.clients.database import create_inbox_message
+from cli_agent_orchestrator.clients.database import (
+    create_inbox_message,
+)
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (

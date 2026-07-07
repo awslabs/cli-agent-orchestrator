@@ -144,3 +144,48 @@ class TestQueueFullRateLimit:
         ]
         assert any("terminal.ddd.output" in m for m in messages)
         assert any("terminal.eee.output" in m for m in messages)
+
+
+class TestDropStatePruning:
+    """The per-topic drop-state maps must stay bounded on a long-running server
+    that churns through many short-lived terminals (topics embed terminal IDs).
+    """
+
+    def test_stale_topics_are_evicted_once_over_cap(self):
+        """Once the map exceeds the cap, a new topic triggers eviction of
+        entries older than the TTL; fresh entries are retained."""
+        import cli_agent_orchestrator.services.event_bus as eb
+
+        bus = EventBus()
+        # Fill the map past the cap with entries whose last-log timestamp is
+        # older than the TTL (i.e. stale). _record_drop's clock is
+        # time.monotonic(); seed last-logged in the distant past.
+        old = 1.0
+        for i in range(eb._DROP_STATE_MAX_TOPICS):
+            topic = f"terminal.stale-{i}.output"
+            bus._drop_last_logged[topic] = old
+            bus._drop_counts[topic] = 1
+
+        assert len(bus._drop_last_logged) == eb._DROP_STATE_MAX_TOPICS
+
+        # A brand-new topic dropping now: monotonic() >> old + TTL, so all the
+        # seeded entries are stale and get evicted before the new one registers.
+        bus._record_drop("terminal.fresh.output")
+
+        # All stale entries gone; only the fresh first-drop remains (its count
+        # is reset to 0 by the first-drop path, and it's tracked in last_logged).
+        assert not any(k.startswith("terminal.stale-") for k in bus._drop_last_logged)
+        assert "terminal.fresh.output" in bus._drop_last_logged
+        assert len(bus._drop_last_logged) == 1
+
+    def test_no_pruning_below_cap(self):
+        """Below the cap the maps are never pruned, even with old entries —
+        pruning cost is only paid once the map has actually grown."""
+        bus = EventBus()
+        bus._drop_last_logged["terminal.old.output"] = 1.0
+        bus._drop_counts["terminal.old.output"] = 1
+
+        bus._record_drop("terminal.new.output")
+
+        # Old entry survives (map was below cap, so _prune_drop_state not called).
+        assert "terminal.old.output" in bus._drop_last_logged
