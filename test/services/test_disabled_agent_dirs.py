@@ -209,3 +209,89 @@ class TestStaleDisabledPruning:
         # Re-adding the path later starts ENABLED.
         svc.set_extra_agent_dirs([str(d)])
         assert svc.get_disabled_agent_dirs() == []
+
+
+class TestNormalizationVariants:
+    """Round-3 review: the docstring promises `~`/symlink handling — pin it."""
+
+    def test_symlink_spelling_accepted_and_skips(self, isolated_settings):
+        real = isolated_settings / "real-dir"
+        real.mkdir()
+        _profile(real, "zzsymlink", "via-real")
+        link = isolated_settings / "link-dir"
+        link.symlink_to(real)
+        svc.set_extra_agent_dirs([str(real)])  # configured via the REAL path
+
+        # Disable using the SYMLINK spelling — realpath matches them up and
+        # the configured spelling is what gets stored.
+        assert svc.set_disabled_agent_dirs([str(link)]) == [str(real)]
+        names = {p["name"] for p in agent_profiles.list_agent_profiles()}
+        assert "zzsymlink" not in names
+
+    def test_tilde_and_trailing_slash_normalize(self, isolated_settings):
+        from pathlib import Path
+
+        from cli_agent_orchestrator.utils.paths import normalized_path
+
+        assert normalized_path("~") == str(Path.home().resolve())
+        d = isolated_settings / "slash"
+        d.mkdir()
+        assert normalized_path(str(d) + "/") == normalized_path(str(d))
+
+
+class TestDefensiveBranches:
+    """Round-3 review: the guards against hand-edited settings are untested."""
+
+    def test_get_returns_empty_for_non_list_value(self, isolated_settings):
+        import json
+
+        svc.SETTINGS_FILE.write_text(json.dumps({"disabled_agent_dirs": "oops-a-string"}))
+        assert svc.get_disabled_agent_dirs() == []
+
+    def test_set_skips_non_string_and_blank_entries(self, isolated_settings):
+        d = isolated_settings / "extra"
+        d.mkdir()
+        svc.set_extra_agent_dirs([str(d)])
+        assert svc.set_disabled_agent_dirs([42, "", "   ", None, str(d)]) == [str(d)]
+
+
+class TestNestedSchemaStorage:
+    """Round-3 review: disabled_dirs follows the agents.* nested schema with a
+    flat back-compat mirror, like agents.dirs / agents.extra_dirs."""
+
+    def test_set_writes_nested_and_flat(self, isolated_settings):
+        import json
+
+        d = isolated_settings / "extra"
+        d.mkdir()
+        svc.set_extra_agent_dirs([str(d)])
+        svc.set_disabled_agent_dirs([str(d)])
+        data = json.loads(svc.SETTINGS_FILE.read_text())
+        assert data["agents"]["disabled_dirs"] == [str(d)]  # nested schema
+        assert data["disabled_agent_dirs"] == [str(d)]  # flat back-compat
+
+    def test_get_prefers_nested_falls_back_to_flat(self, isolated_settings):
+        import json
+
+        # Legacy flat-only file (written by an older CAO) still reads.
+        svc.SETTINGS_FILE.write_text(json.dumps({"disabled_agent_dirs": ["/flat"]}))
+        assert svc.get_disabled_agent_dirs() == ["/flat"]
+        # Nested wins when both exist.
+        svc.SETTINGS_FILE.write_text(
+            json.dumps(
+                {
+                    "agents": {"disabled_dirs": ["/nested"]},
+                    "disabled_agent_dirs": ["/flat"],
+                }
+            )
+        )
+        assert svc.get_disabled_agent_dirs() == ["/nested"]
+
+    def test_config_service_routes_agents_disabled_dirs(self, isolated_settings):
+        from cli_agent_orchestrator.services.config_service import ConfigService
+
+        d = isolated_settings / "extra"
+        d.mkdir()
+        svc.set_extra_agent_dirs([str(d)])
+        ConfigService.set("agents.disabled_dirs", [str(d)])
+        assert ConfigService.get("agents.disabled_dirs") == [str(d)]

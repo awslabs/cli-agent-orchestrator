@@ -1,7 +1,6 @@
 """Agent profile utilities."""
 
 import logging
-import os
 from importlib import resources
 from pathlib import Path
 from typing import Dict, List, Set
@@ -11,20 +10,9 @@ import frontmatter
 from cli_agent_orchestrator.constants import LOCAL_AGENT_STORE_DIR, PROVIDERS
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.utils.env import resolve_env_vars
+from cli_agent_orchestrator.utils.paths import normalized_path
 
 logger = logging.getLogger(__name__)
-
-
-def _normalized_path(path: str | Path) -> str:
-    """Canonical form for comparing configured directory paths (GH #280/#281).
-
-    Disabled dirs are stored as the exact strings the UI sends, but the same
-    directory can be reached via a different spelling (`~`, trailing slash, a
-    symlink; e.g. the local agent-store is also a provider default).
-    ``realpath`` + ``expanduser`` canonicalises all of those, so the disable
-    check matches whenever two spellings reach the same physical directory.
-    """
-    return os.path.realpath(os.path.expanduser(str(path)))
 
 
 def _validate_agent_name(agent_name: str) -> None:
@@ -131,14 +119,14 @@ def list_agent_profiles() -> List[Dict]:
     # name -> every enabled directory the name was found in (winner first), used
     # to flag same-named profiles defined in more than one dir (GH #280).
     name_sources: Dict[str, List[str]] = {}
-    disabled = {_normalized_path(d) for d in get_disabled_agent_dirs()}
+    disabled = {normalized_path(d) for d in get_disabled_agent_dirs()}
     scanned_paths: Set[str] = set()
 
     # 1. Local agent store (~/.aws/cli-agent-orchestrator/agent-store/).
     # It shares a path with the claude_code/codex default, so honour the
     # disable toggle here too — otherwise disabling that default wouldn't hide
     # its profiles.
-    local_norm = _normalized_path(LOCAL_AGENT_STORE_DIR)
+    local_norm = normalized_path(LOCAL_AGENT_STORE_DIR)
     if local_norm not in disabled:
         _scan_directory(LOCAL_AGENT_STORE_DIR, "local", profiles, name_sources)
         scanned_paths.add(local_norm)
@@ -152,7 +140,7 @@ def list_agent_profiles() -> List[Dict]:
         "cao_installed": "installed",
     }
     for provider, dir_path in agent_dirs.items():
-        norm = _normalized_path(dir_path)
+        norm = normalized_path(dir_path)
         if norm in disabled or norm in scanned_paths:
             continue
         label = provider_source_labels.get(provider, provider)
@@ -161,7 +149,7 @@ def list_agent_profiles() -> List[Dict]:
 
     # 3. Extra user-added directories
     for extra_dir in get_extra_agent_dirs():
-        norm = _normalized_path(extra_dir)
+        norm = normalized_path(extra_dir)
         if norm in disabled or norm in scanned_paths:
             continue
         _scan_directory(Path(extra_dir), "custom", profiles, name_sources)
@@ -241,14 +229,14 @@ def _read_agent_profile_source(agent_name: str) -> str:
     # Honour the disable toggle on the load path too, so disabling a directory
     # actually swaps which same-named profile wins (GH #280), not just what the
     # Settings list shows.
-    disabled = {_normalized_path(d) for d in get_disabled_agent_dirs()}
+    disabled = {normalized_path(d) for d in get_disabled_agent_dirs()}
 
     # Every filesystem read below goes through _safe_join so the path is
     # normalised and verified to stay inside its configured root. This is
     # belt-and-braces on top of _validate_agent_name above — the name check
     # rejects obvious traversal inputs, and _safe_join additionally blocks
     # anything that sneaks past (e.g. symlinks resolving outside the root).
-    if _normalized_path(LOCAL_AGENT_STORE_DIR) not in disabled:
+    if normalized_path(LOCAL_AGENT_STORE_DIR) not in disabled:
         local_profile = _safe_join(LOCAL_AGENT_STORE_DIR, f"{agent_name}.md")
         if local_profile is not None and local_profile.exists():
             return local_profile.read_text(encoding="utf-8")
@@ -265,14 +253,14 @@ def _read_agent_profile_source(agent_name: str) -> str:
         return None
 
     for dir_path in get_agent_dirs().values():
-        if _normalized_path(dir_path) in disabled:
+        if normalized_path(dir_path) in disabled:
             continue
         found = _lookup_in_directory(Path(dir_path))
         if found is not None:
             return found
 
     for extra_dir in get_extra_agent_dirs():
-        if _normalized_path(extra_dir) in disabled:
+        if normalized_path(extra_dir) in disabled:
             continue
         found = _lookup_in_directory(Path(extra_dir))
         if found is not None:

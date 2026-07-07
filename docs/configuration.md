@@ -22,6 +22,7 @@ CLI flag  >  CAO_* environment variable  >  settings.json  >  built-in default
       "cao_installed": "~/.aws/cli-agent-orchestrator/agent-context"
     },
     "extra_dirs": [],
+    "disabled_dirs": [],
     "roles": {}
   },
   "skills": {
@@ -93,6 +94,8 @@ CAO discovers agent profiles by scanning multiple directories, in this order (fi
 | `cao_installed` | CAO Installed | `~/.aws/cli-agent-orchestrator/agent-context` |
 
 Override via REST API, Web UI Settings page, `cao config set agents.dirs.<provider> <path>`, or editing `settings.json` directly. Only specified providers are updated; others keep their defaults.
+
+`agents.disabled_dirs` lists configured directories (defaults or extras) the user has toggled **off**: a disabled directory stays listed in Settings but is skipped when scanning for and loading agent profiles, so its profiles leave the active set without removing the path (GH #280/#281). Only paths that match a configured directory are accepted; entries are validated with the same path normalization the scanner uses (`~`, trailing slashes, and symlinks all match). Manage it via the Web UI Settings toggles, `cao config set agents.disabled_dirs '[...]'`, or `settings.json`.
 
 `agents.roles` defines custom [role](../CODEBASE.md) → `allowedTools` bundles, layered on top of the built-in `supervisor` / `reviewer` / `developer` roles.
 

@@ -701,8 +701,14 @@ async def list_providers_endpoint() -> List[Dict]:
 
 
 @app.get("/settings/agent-dirs")
-async def get_agent_dirs_endpoint() -> Dict:
-    """Get configured agent directories per provider."""
+async def get_agent_dirs_endpoint(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Get configured agent directories per provider.
+
+    Read-scope gated when auth is enabled: the response discloses local
+    filesystem layout (home paths), so it gets the same floor as other reads.
+    """
     from cli_agent_orchestrator.services.settings_service import (
         get_agent_dirs,
         get_disabled_agent_dirs,
