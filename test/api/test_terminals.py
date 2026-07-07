@@ -247,6 +247,29 @@ class TestTerminalCreationWithWorkingDirectory:
             call_kwargs = mock_svc.create_terminal.call_args.kwargs
             assert call_kwargs.get("working_directory") == "/session/path"
 
+    def test_create_terminal_rejects_initial_message_without_defer_init(self, client):
+        """initial_message is only delivered on the deferred-init path; sending
+        it with defer_init=false must 400 rather than silently drop the payload."""
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            mock_svc.create_terminal = AsyncMock()
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={"provider": "kiro_cli", "agent_profile": "analyst"},
+                json={"initial_message": "do work"},
+            )
+
+            assert response.status_code == 400
+            assert "defer_init=true" in response.json()["detail"]
+            # The payload was rejected before reaching the service.
+            mock_svc.create_terminal.assert_not_called()
+
 
 class TestExitTerminalEndpoint:
     """Test POST /terminals/{terminal_id}/exit endpoint.

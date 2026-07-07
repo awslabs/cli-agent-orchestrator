@@ -1019,6 +1019,26 @@ async def create_terminal_in_session(
 
         initial_message = body.initial_message if body else None
 
+        # The initial-message payload is only delivered on the deferred-init
+        # path; create_terminal() ignores it otherwise. Reject it explicitly
+        # when defer_init is false rather than silently dropping it, which would
+        # surface later as a "worker never received task" mystery.
+        if (
+            not defer_init
+            and body
+            and (
+                body.initial_message is not None
+                or body.initial_message_orchestration_type is not None
+            )
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "initial_message / initial_message_orchestration_type require "
+                    "defer_init=true; they are not delivered on the synchronous path"
+                ),
+            )
+
         # Deferred init only makes sense when a message will follow — we
         # still accept the flag alone (no message) for future non-assign uses.
         orch_type = None
@@ -1048,6 +1068,10 @@ async def create_terminal_in_session(
             initial_message_orchestration_type=orch_type,
         )
         return result
+    except HTTPException:
+        # Deliberate 4xx (e.g. the initial_message/defer_init guard, invalid
+        # orchestration_type) — propagate as-is instead of masking as a 500.
+        raise
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
