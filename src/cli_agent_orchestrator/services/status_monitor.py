@@ -376,8 +376,20 @@ class StatusMonitor:
         """
 
         def _arm() -> None:
-            handle = loop.call_later(PYTE_QUIESCENCE_DELAY_S, callback, terminal_id, *cb_args)
+            # Runs on the loop thread (via call_soon_threadsafe), so it is safe
+            # to cancel a prior TimerHandle directly here. Cancel any existing
+            # timer for this terminal BEFORE arming the new one: if several
+            # chunks arrive in quick succession their _arm closures are queued
+            # together, and without this the later closure would overwrite
+            # _quiesce_handle while leaving the earlier timer live — two timers
+            # then fire, and a stale one firing mid-burst causes early/duplicate
+            # quiescence detections and status flaps. One outstanding timer per
+            # terminal, always the latest.
             with self._lock:
+                prior = self._quiesce_handle.get(terminal_id)
+                if prior is not None:
+                    prior.cancel()
+                handle = loop.call_later(PYTE_QUIESCENCE_DELAY_S, callback, terminal_id, *cb_args)
                 self._quiesce_handle[terminal_id] = handle
 
         try:

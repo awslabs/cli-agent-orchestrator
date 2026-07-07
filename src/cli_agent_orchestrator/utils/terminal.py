@@ -257,7 +257,9 @@ def poll_until_done(
                 f"Timed out after {int(elapsed)}s waiting for terminal {terminal_id}"
             )
         try:
-            resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}")
+            # Per-request timeout so a stalled server/network can't block past
+            # the outer timeout budget (matches wait_until_terminal_status).
+            resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
             resp.raise_for_status()
             status = resp.json().get("status")
             if status == TerminalStatus.COMPLETED.value:
@@ -273,11 +275,22 @@ def poll_until_done(
                     consecutive_idle += 1
                     if consecutive_idle >= idle_stable_polls:
                         return
-            else:
-                # PROCESSING / WAITING_USER_ANSWER / UNKNOWN: the agent is (or
-                # was) doing something. Mark that it started, and reset the idle
-                # streak so a mid-turn idle flap can't accumulate.
+            elif status in (
+                TerminalStatus.PROCESSING.value,
+                TerminalStatus.WAITING_USER_ANSWER.value,
+            ):
+                # The agent is actively working (or blocked on a prompt after
+                # starting). Mark that it started and reset the idle streak so a
+                # mid-turn idle flap can't accumulate. UNKNOWN is deliberately
+                # NOT treated as "started": a terminal can report UNKNOWN before
+                # it begins (no output yet / provider not registered / deferred
+                # init), and counting it would let a subsequent stable idle
+                # satisfy the gate and return early with empty output.
                 observed_working = True
+                consecutive_idle = 0
+            else:
+                # UNKNOWN or any other non-ready status: not evidence of work.
+                # Reset the idle streak but do not flip observed_working.
                 consecutive_idle = 0
         except requests.exceptions.RequestException as e:
             raise click.ClickException(f"Failed to poll terminal status: {e}")

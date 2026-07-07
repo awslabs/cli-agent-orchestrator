@@ -157,26 +157,54 @@ class TestDropStatePruning:
         import cli_agent_orchestrator.services.event_bus as eb
 
         bus = EventBus()
-        # Fill the map past the cap with entries whose last-log timestamp is
-        # older than the TTL (i.e. stale). _record_drop's clock is
-        # time.monotonic(); seed last-logged in the distant past.
-        old = 1.0
+        # Seed the map past the cap. Pin the clock so the seeded last-logged
+        # timestamps are unambiguously older than the TTL (time.monotonic()'s
+        # origin is arbitrary, so absolute values like 1.0 can't be assumed
+        # "old" — control the clock instead).
+        seeded_at = 1000.0
         for i in range(eb._DROP_STATE_MAX_TOPICS):
             topic = f"terminal.stale-{i}.output"
-            bus._drop_last_logged[topic] = old
+            bus._drop_last_logged[topic] = seeded_at
             bus._drop_counts[topic] = 1
 
         assert len(bus._drop_last_logged) == eb._DROP_STATE_MAX_TOPICS
 
-        # A brand-new topic dropping now: monotonic() >> old + TTL, so all the
-        # seeded entries are stale and get evicted before the new one registers.
-        bus._record_drop("terminal.fresh.output")
+        # A brand-new topic dropping well past the TTL: every seeded entry is
+        # stale and gets evicted before the new one registers.
+        now = seeded_at + eb._DROP_STATE_TTL_SECS + 1.0
+        with patch("cli_agent_orchestrator.services.event_bus.time.monotonic", return_value=now):
+            bus._record_drop("terminal.fresh.output")
 
         # All stale entries gone; only the fresh first-drop remains (its count
         # is reset to 0 by the first-drop path, and it's tracked in last_logged).
         assert not any(k.startswith("terminal.stale-") for k in bus._drop_last_logged)
         assert "terminal.fresh.output" in bus._drop_last_logged
         assert len(bus._drop_last_logged) == 1
+
+    def test_fresh_entries_survive_pruning(self):
+        """Eviction only removes entries idle past the TTL — entries touched
+        recently are kept even when the map is over the cap."""
+        import cli_agent_orchestrator.services.event_bus as eb
+
+        bus = EventBus()
+        now = 1000.0
+        # Half stale (well past TTL), half fresh (touched "now").
+        half = eb._DROP_STATE_MAX_TOPICS // 2
+        for i in range(half):
+            bus._drop_last_logged[f"terminal.stale-{i}.output"] = now - eb._DROP_STATE_TTL_SECS - 1
+            bus._drop_counts[f"terminal.stale-{i}.output"] = 1
+        for i in range(eb._DROP_STATE_MAX_TOPICS - half):
+            bus._drop_last_logged[f"terminal.fresh-{i}.output"] = now
+            bus._drop_counts[f"terminal.fresh-{i}.output"] = 1
+
+        with patch("cli_agent_orchestrator.services.event_bus.time.monotonic", return_value=now):
+            bus._record_drop("terminal.new.output")
+
+        # Stale evicted, fresh retained.
+        assert not any(k.startswith("terminal.stale-") for k in bus._drop_last_logged)
+        assert sum(k.startswith("terminal.fresh-") for k in bus._drop_last_logged) == (
+            eb._DROP_STATE_MAX_TOPICS - half
+        )
 
     def test_no_pruning_below_cap(self):
         """Below the cap the maps are never pruned, even with old entries —

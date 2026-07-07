@@ -581,6 +581,50 @@ class TestPollUntilDone:
             poll_until_done("abcd1234", timeout=60, polling_interval=0, idle_stable_polls=3)
             assert g.call_count == 2
 
+    def test_unknown_does_not_count_as_working(self):
+        """Regression (PR #390 review): UNKNOWN must NOT flip observed_working —
+        a terminal can report UNKNOWN before it starts (no output yet / provider
+        not registered / deferred init). If UNKNOWN counted as "started", a
+        following stable idle would satisfy the gate and return early with empty
+        output. Here: unknown then all-idle must time out, not return.
+        """
+        import click
+
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        times = iter([0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 100.0])
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
+            patch(
+                "cli_agent_orchestrator.utils.terminal.time.time", side_effect=lambda: next(times)
+            ),
+        ):
+            # unknown first, then idle forever — never a working reading.
+            g.side_effect = [self._resp("unknown")] + [self._resp("idle")] * 10
+            with pytest.raises(click.ClickException, match="Timed out"):
+                poll_until_done("abcd1234", timeout=10, polling_interval=0, idle_stable_polls=3)
+
+    def test_processing_then_idle_still_returns(self):
+        """PROCESSING (unlike UNKNOWN) does flip observed_working, so a stable
+        idle after it returns normally — guards against over-tightening."""
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        seq = [
+            self._resp("unknown"),  # not working
+            self._resp("processing"),  # now working
+            self._resp("idle"),
+            self._resp("idle"),
+            self._resp("idle"),  # stable -> return
+        ]
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
+        ):
+            g.side_effect = seq
+            poll_until_done("abcd1234", timeout=60, polling_interval=0, idle_stable_polls=3)
+            assert g.call_count == 5
+
     def test_error_raises(self):
         import click
 

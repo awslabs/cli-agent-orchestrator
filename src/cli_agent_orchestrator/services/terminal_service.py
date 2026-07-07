@@ -552,14 +552,20 @@ def _schedule_deferred_init(
                 delete_worker=False,
             )
         except Exception as e:
+            # exc_info=True preserves the traceback for debugging; {e!r} avoids
+            # newline/control-character injection into logs and the inbox message
+            # (the exception text can contain provider-supplied content).
             logger.error(
-                f"Deferred init for terminal {terminal_id} failed: {e}. "
-                f"Notifying caller and tearing down worker."
+                "Deferred init for terminal %s failed: %r. "
+                "Notifying caller and tearing down worker.",
+                terminal_id,
+                e,
+                exc_info=True,
             )
             await asyncio.to_thread(
                 _notify_caller_of_deferred_failure,
                 terminal_id,
-                f"Worker {terminal_id} failed to initialize: {e}. It has been "
+                f"Worker {terminal_id} failed to initialize: {e!r}. It has been "
                 f"deleted — re-assign the task or report the failure.",
                 registry,
                 delete_worker=True,
