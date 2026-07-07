@@ -15,6 +15,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from cli_agent_orchestrator.models.workflow import LintFinding, ScriptValidationResult
+from cli_agent_orchestrator.services import script_lint as script_lint_module
 from cli_agent_orchestrator.services.script_lint import lint_script
 
 
@@ -72,13 +73,35 @@ class TestSyntaxRule:
         assert result.findings[0].line == 1
 
     def test_deeply_nested_expression_is_total(self):
-        # Deep attribute chains overflow the AST constructor's recursion —
-        # the RecursionError arm converts it to a fail-closed syntax ERROR.
+        # Deep attribute chains MAY overflow the parser's recursion (3.10/3.11)
+        # or MAY parse cleanly (3.12+ raised its limits, and CPython's C parser
+        # is not gated by sys.setrecursionlimit). Per the never-assert-which-arm
+        # rule (gh-96670), assert only totality: a result is returned, the status
+        # is in-domain, and any failure is fail-closed as a syntax ERROR.
         source = "a" + ".b" * 200_000 + "\n"
         result = lint_script(source, "deep.py")
         assert isinstance(result, ScriptValidationResult)
+        assert result.status in ("pass", "fail")
+        if result.status == "fail":
+            f = result.findings[0]
+            assert f.rule_id == "syntax"
+            assert f.severity == "error"
+
+    def test_recursion_error_arm_is_fail_closed_syntax(self, monkeypatch):
+        # Deterministic coverage of the RecursionError arm on ALL supported
+        # versions: sys.setrecursionlimit does not gate CPython's C parser, so
+        # instead force ast.parse to raise RecursionError and assert the arm
+        # converts it to a fail-closed syntax ERROR anchored at line 1.
+        def _raise(*args, **kwargs):
+            raise RecursionError("maximum recursion depth exceeded")
+
+        monkeypatch.setattr(script_lint_module.ast, "parse", _raise)
+        result = lint_script("a.b.c\n", "deep.py")
         assert result.status == "fail"
-        assert result.findings[0].rule_id == "syntax"
+        f = result.findings[0]
+        assert f.rule_id == "syntax"
+        assert f.severity == "error"
+        assert f.line == 1
 
 
 class TestDisallowedImportRule:
