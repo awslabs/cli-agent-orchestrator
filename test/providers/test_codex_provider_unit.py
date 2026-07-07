@@ -205,6 +205,88 @@ class TestCodexBuildCommand:
         assert mock_resolve.called
         assert 'mcp_servers.cao-mcp-server.command="/home/u/.local/bin/cao-mcp-server"' in command
 
+    @patch("cli_agent_orchestrator.providers.codex.resolve_mcp_server_config")
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_mcp_server_command_field_is_toml_escaped(self, mock_load_profile, mock_resolve):
+        """A resolved command containing TOML-special chars is escaped so the
+        -c override stays a valid TOML basic string."""
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = "You are a supervisor."
+        mock_profile.mcpServers = {
+            "cao-mcp-server": {"type": "stdio", "command": "cao-mcp-server", "args": []}
+        }
+        mock_profile.codexProfile = None
+        mock_load_profile.return_value = mock_profile
+        # Simulate a resolved path containing a backslash and a quote.
+        mock_resolve.side_effect = lambda cfg: {
+            **cfg,
+            "command": r'/tmp/we"ird\path/cao-mcp-server',
+            "args": [],
+        }
+
+        provider = CodexProvider("test1234", "test-session", "window-0", "code_supervisor")
+        command = provider._build_codex_command()
+
+        # The backslash and quote are TOML-escaped in the emitted override.
+        assert r"/tmp/we\"ird\\path/cao-mcp-server" in command
+        # The raw (unescaped) form must NOT appear -- that would break TOML.
+        assert '"/tmp/we"ird' not in command
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_mcp_server_args_and_env_are_toml_escaped(self, mock_load_profile):
+        """Args and env values containing TOML-special chars are escaped."""
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = ""
+        mock_profile.mcpServers = {
+            "test-server": {
+                "command": "runner",
+                "args": [r'--flag="C:\data"'],
+                "env": {"TOKEN": 'se"cret\nvalue'},
+            }
+        }
+        mock_profile.codexProfile = None
+        mock_load_profile.return_value = mock_profile
+
+        provider = CodexProvider("test1234", "test-session", "window-0", "test_agent")
+        command = provider._build_codex_command()
+
+        # Arg: quote and backslash escaped inside the TOML array element.
+        assert r"--flag=\"C:\\data\"" in command
+        # Env value: quote escaped, literal newline escaped to \n.
+        assert r"se\"cret\nvalue" in command
+        assert "\n" not in command
+        # The raw (unescaped) forms must NOT appear -- that would break TOML.
+        assert r'--flag="C:\data"' not in command
+        assert 'se"cret' not in command
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_mcp_env_vars_non_string_entry_fails_fast(self, mock_load_profile):
+        """A non-string env_vars entry raises TypeError (intentional fail-fast).
+
+        _toml_scalar rejects non-scalar values so a malformed profile fails at
+        launch-command build time with a clear error instead of emitting a
+        silently-broken override. Previously the entry was rendered via a raw
+        f-string and never raised; the fail-fast is a deliberate change.
+        """
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = ""
+        mock_profile.mcpServers = {
+            "test-server": {
+                "command": "runner",
+                "args": [],
+                "env_vars": [{"not": "a-string"}],
+            }
+        }
+        mock_profile.codexProfile = None
+        mock_load_profile.return_value = mock_profile
+
+        provider = CodexProvider("test1234", "test-session", "window-0", "test_agent")
+        with pytest.raises(TypeError, match="scalars"):
+            provider._build_codex_command()
+
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_build_command_with_mcp_servers_env(self, mock_load_profile):
         mock_profile = MagicMock()
