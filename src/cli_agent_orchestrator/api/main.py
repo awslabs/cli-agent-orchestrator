@@ -28,9 +28,12 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from pydantic import BaseModel, Field, field_validator
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from cli_agent_orchestrator.backends import TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
@@ -54,6 +57,8 @@ from cli_agent_orchestrator.constants import (
     SERVER_VERSION,
     TERMINALS_RUN_STEP_ROUTE,
     TRUSTED_FORWARDER_IPS,
+    WORKFLOW_ENV_ALLOWLIST,
+    WORKFLOW_ENV_VALUE_MAX_LEN,
     WS_ALLOWED_CLIENTS,
     add_local_cors_origins,
 )
@@ -98,6 +103,7 @@ from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.services.install_service import InstallResult, install_agent
 from cli_agent_orchestrator.services.log_writer import log_writer
 from cli_agent_orchestrator.services.status_monitor import status_monitor
+from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_service import OutputMode, TerminalInputBlockedError
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.logging import setup_logging
@@ -200,6 +206,87 @@ class RunStepRequest(BaseModel):
         default=None,
         description="Resolved allowed-tools list for a freshly created terminal (handoff inheritance)",
     )
+    env_vars: Optional[Dict[str, str]] = Field(
+        default=None,
+        description=(
+            "Workflow identity env vars injected into a freshly created terminal. "
+            "Keys are restricted to the WORKFLOW_ENV_ALLOWLIST (NFR-SEC-4); "
+            "values are validated but never echoed in error bodies."
+        ),
+    )
+
+    @field_validator("env_vars")
+    @classmethod
+    def validate_env_vars(cls, v: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
+        """Per-key checks for the env-var injection surface (U2/C6, A2).
+
+        Check order is load-bearing (security-requirements.md): allowlist ->
+        length cap -> control chars -> shared validator. Error messages name
+        the KEY and the violated rule only — the supplied VALUE is never
+        echoed into a 422 body (NFR-SEC-2 extended to the error path).
+        """
+        if v is None:
+            return v
+        for key, value in v.items():
+            if key not in WORKFLOW_ENV_ALLOWLIST:
+                raise ValueError(
+                    f"env var key '{key}' not in allowlist "
+                    f"{{{', '.join(sorted(WORKFLOW_ENV_ALLOWLIST))}}}"
+                )
+            # Pre-regex defense-in-depth, NOT redundancy: bounds the input
+            # O(1) before any regex evaluation and bounds what can be staged
+            # into a terminal environment regardless of future regex changes.
+            # Do not simplify away as duplicate validation (the effective
+            # accepted length is 64 via WORKFLOW_NAME_RE downstream).
+            if len(value) > WORKFLOW_ENV_VALUE_MAX_LEN:
+                raise ValueError(
+                    f"value for '{key}' exceeds the {WORKFLOW_ENV_VALUE_MAX_LEN}-char cap"
+                )
+            # Values land in a tmux session environment — escape-sequence
+            # injection into a terminal is the concrete threat.
+            if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+                raise ValueError(f"value for '{key}' contains control characters")
+            try:
+                _validate_key_part(value, key)
+            except ValueError:
+                # The shared validator's message interpolates the VALUE;
+                # re-raise with a key-name-only message so the supplied value
+                # never round-trips into the 422 body (NFR-SEC-4 sanitized
+                # error rule). `from None` drops the value-bearing cause.
+                raise ValueError(
+                    f"value for '{key}' is invalid (must be a 1-64 char "
+                    "[A-Za-z0-9_-] identifier)"
+                ) from None
+        return v
+
+    @model_validator(mode="after")
+    def validate_env_var_shape(self) -> "RunStepRequest":
+        """Cross-field checks (U2/C6, A3) — all surface as FastAPI-native 422s.
+
+        RUN_ID <-> GENERATION is a symmetric required pair (ADR-9/10): an
+        unanchored generation token — or a run id without its fence — would
+        silently no-op the stale-generation fence. STEP_ID requires RUN_ID
+        (a step key with no run to journal under is meaningless; RUN_ID
+        without STEP_ID is allowed for run-row-level calls).
+        """
+        keys = set(self.env_vars or {})
+        has_run = "CAO_WORKFLOW_RUN_ID" in keys
+        has_gen = "CAO_WORKFLOW_GENERATION" in keys
+        if has_run and not has_gen:
+            raise ValueError("CAO_WORKFLOW_RUN_ID requires CAO_WORKFLOW_GENERATION (required pair)")
+        if has_gen and not has_run:
+            raise ValueError("CAO_WORKFLOW_GENERATION requires CAO_WORKFLOW_RUN_ID (required pair)")
+        if "CAO_WORKFLOW_STEP_ID" in keys and not has_run:
+            raise ValueError("CAO_WORKFLOW_STEP_ID requires CAO_WORKFLOW_RUN_ID")
+        if self.env_vars and self.reuse_terminal_id:
+            # run_agent_step documents env injection as ignored on reused
+            # terminals — a silently dropped RUN_ID/GENERATION fence token is
+            # the quiet identity failure NFR-SEC-4 exists to prevent (BR-8).
+            raise ValueError(
+                "env_vars cannot be injected into a reused terminal "
+                "(env injection only applies to freshly created terminals)"
+            )
+        return self
 
 
 class RunStepResponse(BaseModel):
@@ -469,6 +556,33 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def _redact_env_vars_validation_error(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """Redact ``env_vars`` VALUES from 422 bodies (U2, NFR-SEC-4).
+
+    FastAPI's default 422 envelope echoes the offending ``input`` back to the
+    caller. For ``env_vars`` violations the values are agent- or
+    attacker-supplied and must never round-trip into a response body — the
+    validator messages already name only the key and the rule, so the echoed
+    ``input``/``ctx`` are dropped for those entries. Every other field's 422
+    keeps FastAPI's stock shape byte-identical.
+    """
+    errors = []
+    for err in exc.errors():
+        # Field-validator errors anchor at ("body", "env_vars"); model-validator
+        # errors anchor at ("body",) with the WHOLE body echoed as input — both
+        # shapes can carry env_vars values, so both are redacted.
+        echoes_env_vars = "env_vars" in err.get("loc", ()) or (
+            isinstance(err.get("input"), dict) and "env_vars" in err["input"]
+        )
+        if echoes_env_vars:
+            err = {k: v for k, v in err.items() if k not in ("input", "ctx")}
+        errors.append(err)
+    return JSONResponse(status_code=422, content={"detail": jsonable_encoder(errors)})
 
 
 @app.get("/.well-known/oauth-protected-resource")
@@ -1232,6 +1346,7 @@ async def run_step(
             caller_id=body.caller_id,
             allowed_tools=body.allowed_tools,
             registry=get_plugin_registry(request),
+            env_vars=body.env_vars,
         )
         return RunStepResponse(
             terminal_id=result.terminal_id,

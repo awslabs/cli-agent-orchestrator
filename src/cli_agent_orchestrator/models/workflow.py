@@ -294,6 +294,36 @@ class ValidationResult(BaseModel):
     errors: List[str] = Field(default_factory=list)
 
 
+class LintFinding(BaseModel):
+    """One script-lint observation (Bolt 2, U1/C2 — the FR-2.3 findings shape).
+
+    Every finding carries all four fields; ``line`` is a REQUIRED 1-based
+    source anchor (FR-2.3 — no finding may omit it).
+    """
+
+    rule_id: Literal["syntax", "disallowed-import", "nondeterminism", "dynamic-import"]
+    severity: Literal["error", "warning"]
+    line: int
+    message: str
+
+
+class ScriptValidationResult(ValidationResult):
+    """The script tier's validate outcome — additive over ``ValidationResult``.
+
+    Subclasses the shipped base (U1-BR-7, Q4=A) so YAML validate output stays
+    byte-identical (FR-5.1) and every base-vocabulary consumer renders a
+    script result unmodified. ``status`` is INHERITED unnarrowed; a script
+    result is never ``pass_reserved`` — enforced by construction in
+    ``lint_script`` (only ``pass``/``fail`` are ever emitted), not by
+    re-typing the field. ``errors`` carries the Q5=A mirror: one
+    ``"line N: [rule_id] message"`` string per ERROR finding; warnings appear
+    ONLY in ``findings``.
+    """
+
+    tier: Literal["script"] = "script"
+    findings: List[LintFinding] = Field(default_factory=list)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

@@ -430,3 +430,31 @@ WORKFLOW_STEP_TIMEOUT = 600.0
 # flat 30s and covers any plausible multi-step, multi-minute workflow; an operator
 # running near the 100-step ceiling can raise it via the env override if needed.
 WORKFLOW_RUN_REQUEST_TIMEOUT = (WORKFLOW_STEP_TIMEOUT + 120.0) * 12 + 180.0  # = 8820.0s (~2.45h)
+
+# Script-linter rule inputs (Bolt 2, U1/C2, FR-1.3 / U1-BR-8). Import prefixes
+# whose first dotted segment marks a CAO-internal import — scripts reach CAO
+# over HTTP only (C-1). The ``cao_workflow`` shim (U6, ADR-6) is the sanctioned
+# import surface and is deliberately ABSENT from this set (U1-BR-3). Frozensets:
+# the prohibition list cannot drift within a process lifetime; extending it is a
+# reviewed constants.py diff, never a linter-local edit.
+SCRIPT_LINT_DISALLOWED_IMPORT_PREFIXES = frozenset({"cli_agent_orchestrator"})
+
+# Modules whose import earns a nondeterminism WARNING (U1-A3, Q3=A): resume
+# replays journaled calls and requires deterministic re-execution. Import-level
+# only — no call-site analysis. A warning never fails a script (FR-1.7).
+SCRIPT_LINT_NONDETERMINISM_MODULES = frozenset({"random", "secrets", "uuid", "time", "datetime"})
+
+# Env-var injection allowlist for POST /terminals/run-step (Bolt 2, U2/C6,
+# NFR-SEC-4 BINDING). Deny-by-default: the injection surface into a tmux
+# terminal environment is exactly these three documented identity keys.
+# Extending it is a constants.py + gate decision, never a route-local edit.
+WORKFLOW_ENV_ALLOWLIST = frozenset(
+    {"CAO_WORKFLOW_RUN_ID", "CAO_WORKFLOW_STEP_ID", "CAO_WORKFLOW_GENERATION"}
+)
+
+# Pre-regex length cap on run-step env-var VALUES (U2-BR-2). Defense-in-depth,
+# not redundancy: bounds the input O(1) before any regex evaluation and bounds
+# what can be staged into a terminal environment regardless of future regex
+# changes — do not simplify away as duplicate validation (the effective
+# accepted length is 64 via WORKFLOW_NAME_RE; this cap is the outer fence).
+WORKFLOW_ENV_VALUE_MAX_LEN = 256
