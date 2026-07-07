@@ -516,6 +516,24 @@ def send_input(
 
         update_last_active(terminal_id)
         logger.info(f"Sent input to terminal: {terminal_id}")
+        # Announce only delegation sends (handoff/assign) as flow pulses for the
+        # Runs graph (supervisor -> worker). Plain inbox message deliveries are
+        # already announced once by the inbox endpoint, so publishing here too
+        # would double-count them and spam roster refreshes. (GH #292)
+        if sender_id and orchestration_value in (
+            OrchestrationType.HANDOFF.value,
+            OrchestrationType.ASSIGN.value,
+        ):
+            from cli_agent_orchestrator.services.event_bus import bus as _bus
+
+            _bus.publish(
+                "flow.message",
+                {
+                    "sender_id": sender_id,
+                    "receiver_id": terminal_id,
+                    "kind": orchestration_value,
+                },
+            )
         if registry is not None and sender_id is not None and orchestration_type is not None:
             dispatch_plugin_event(
                 registry,

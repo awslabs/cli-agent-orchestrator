@@ -11,6 +11,15 @@ interface Snackbar {
   message: string
 }
 
+// Runs UI: an agent-to-agent message pulse animated on the flow graph.
+export interface FlowPulse {
+  id: number
+  sender: string
+  receiver: string
+  kind: string // 'handoff' | 'assign' | 'message' | 'task'
+  ts: number
+}
+
 interface Store {
   sessions: Session[]
   activeSession: string | null
@@ -18,6 +27,7 @@ interface Store {
   connected: boolean
   snackbar: Snackbar | null
   terminalStatuses: Record<string, string>
+  flowPulses: FlowPulse[]
 
   fetchSessions: () => Promise<void>
   selectSession: (name: string | null) => Promise<void>
@@ -28,7 +38,11 @@ interface Store {
   setConnected: (connected: boolean) => void
   setTerminalStatus: (id: string, status: string) => void
   clearTerminalStatuses: (ids: string[]) => void
+  connectStatusStream: () => EventSource
+  pushFlowPulse: (pulse: Omit<FlowPulse, 'id' | 'ts'>) => void
 }
+
+let pulseSeq = 0
 
 export const useStore = create<Store>((set, get) => ({
   sessions: [],
@@ -37,6 +51,7 @@ export const useStore = create<Store>((set, get) => ({
   connected: false,
   snackbar: null,
   terminalStatuses: {},
+  flowPulses: [],
 
   fetchSessions: async () => {
     try {
@@ -98,6 +113,50 @@ export const useStore = create<Store>((set, get) => ({
   showSnackbar: (snackbar) => set({ snackbar }),
   hideSnackbar: () => set({ snackbar: null }),
   setConnected: (connected) => set({ connected }),
+  connectStatusStream: () => {
+    // Live status push: one EventSource replaces per-terminal polling.
+    // The stream is deltas-only and lossy on reconnect, so components still
+    // fetch current state via REST on mount/(re)connect; this just makes
+    // status changes land instantly. EventSource auto-reconnects. This is the
+    // Runs dashboard's own stream (/events/runs), kept distinct from the
+    // fleet-UI /events stream so the two can coexist.
+    const es = new EventSource('/events/runs')
+    es.addEventListener('status', (e: MessageEvent) => {
+      try {
+        const { terminal_id, status } = JSON.parse(e.data)
+        if (terminal_id && status) get().setTerminalStatus(terminal_id, status)
+      } catch {
+        // Malformed frame — ignore; REST refresh remains the safety net.
+      }
+    })
+    es.addEventListener('flow', (e: MessageEvent) => {
+      try {
+        const { sender_id, receiver_id, kind } = JSON.parse(e.data)
+        if (sender_id && receiver_id) {
+          const k = kind || 'message'
+          get().pushFlowPulse({ sender: sender_id, receiver: receiver_id, kind: k })
+          // Only delegation (handoff/assign) can add a worker to the roster, so
+          // refresh sooner only for those; plain message pulses are UI-only and
+          // ride the 10s reconcile, to avoid a /sessions burst on chatty runs.
+          if (k === 'handoff' || k === 'assign') get().fetchSessions()
+        }
+      } catch {
+        // Malformed frame — ignore.
+      }
+    })
+    es.onopen = () => get().setConnected(true)
+    // A dropped stream flips to Offline; EventSource auto-reconnects and
+    // onopen flips it back. The 10s REST reconcile remains the safety net.
+    es.onerror = () => get().setConnected(false)
+    return es
+  },
+  pushFlowPulse: (pulse) =>
+    set(state => ({
+      flowPulses: [
+        ...state.flowPulses.filter(p => Date.now() - p.ts < 30_000),
+        { ...pulse, id: ++pulseSeq, ts: Date.now() },
+      ],
+    })),
   setTerminalStatus: (id, status) =>
     set(state => {
       const normalized = status ? status.toUpperCase() : status
