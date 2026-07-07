@@ -227,14 +227,18 @@ def poll_until_done(
     - **COMPLETED** — a definitive response-done marker (Credits line / green
       arrow). Returns immediately, exactly as before; a single reading is
       trustworthy.
-    - **IDLE** — returns only after ``idle_stable_polls`` consecutive IDLE
-      reads. kiro-cli 2.11 frequently finishes a turn with no COMPLETED marker
-      and settles back to its persistent idle prompt, so a finished kiro agent
-      reports IDLE — requiring COMPLETED only would hang here until timeout even
-      though the agent is done. But IDLE is ambiguous (a terminal is also idle
-      *before* it starts, or briefly between a provider's internal steps), so we
-      require a short stable window before treating it as "done". This makes the
-      COMPLETED path byte-for-byte unchanged while adding a guarded IDLE path.
+    - **IDLE** — returns only after (a) the agent has been observed actually
+      working at least once (a PROCESSING/non-ready reading), AND (b) IDLE then
+      persists for ``idle_stable_polls`` consecutive reads. kiro-cli 2.11
+      frequently finishes a turn with no COMPLETED marker and settles back to
+      its persistent idle prompt, so a finished kiro agent reports IDLE —
+      requiring COMPLETED only would hang here until timeout even though the
+      agent is done. But IDLE is ambiguous: a terminal is *also* idle right
+      after a send before it has begun processing. Gating the IDLE path on
+      "has started" prevents returning early with empty/partial output when the
+      agent simply hasn't picked up the task yet; the stable-window then guards
+      against a momentary idle flap mid-turn. The COMPLETED path is byte-for-byte
+      unchanged.
 
     Raises click.ClickException on error, timeout, or request failure.
     """
@@ -245,6 +249,7 @@ def poll_until_done(
 
     start = time.time()
     consecutive_idle = 0
+    observed_working = False
     while True:
         elapsed = time.time() - start
         if elapsed > timeout:
@@ -260,10 +265,19 @@ def poll_until_done(
             if status == TerminalStatus.ERROR.value:
                 raise click.ClickException("Terminal reached ERROR status")
             if status == TerminalStatus.IDLE.value:
-                consecutive_idle += 1
-                if consecutive_idle >= idle_stable_polls:
-                    return
+                # Only count IDLE as progress toward "done" once we've seen the
+                # agent actually start working — otherwise the idle-before-
+                # processing window right after a send would return early with
+                # empty output.
+                if observed_working:
+                    consecutive_idle += 1
+                    if consecutive_idle >= idle_stable_polls:
+                        return
             else:
+                # PROCESSING / WAITING_USER_ANSWER / UNKNOWN: the agent is (or
+                # was) doing something. Mark that it started, and reset the idle
+                # streak so a mid-turn idle flap can't accumulate.
+                observed_working = True
                 consecutive_idle = 0
         except requests.exceptions.RequestException as e:
             raise click.ClickException(f"Failed to poll terminal status: {e}")

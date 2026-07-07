@@ -499,16 +499,48 @@ class TestPollUntilDone:
             poll_until_done("abcd1234", timeout=60, polling_interval=0)
             assert g.call_count == 1
 
-    def test_returns_on_stable_idle(self):
+    def test_returns_on_stable_idle_after_working(self):
+        """IDLE completes only after the agent has been observed working, then
+        stays idle for idle_stable_polls reads."""
         from cli_agent_orchestrator.utils.terminal import poll_until_done
 
+        seq = [
+            self._resp("processing"),  # agent started
+            self._resp("idle"),
+            self._resp("idle"),
+            self._resp("idle"),  # 3rd stable idle -> return
+        ]
         with (
             patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
             patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
         ):
-            g.return_value = self._resp("idle")
+            g.side_effect = seq
             poll_until_done("abcd1234", timeout=60, polling_interval=0, idle_stable_polls=3)
-            assert g.call_count == 3
+            assert g.call_count == 4
+
+    def test_idle_before_processing_does_not_return_early(self):
+        """Regression (PR #390 review): idle right after a send, before the
+        agent has begun processing, must NOT be treated as done — that would
+        yield empty/partial output. Only after a working reading does idle
+        count. Times out here (never sees working) rather than returning early.
+        """
+        import click
+
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        # Always idle, never working; timeout guard uses time.time, so make it
+        # advance to force a timeout after a few polls.
+        times = iter([0, 0.5, 1.0, 1.5, 2.0, 2.5, 100.0])
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
+            patch(
+                "cli_agent_orchestrator.utils.terminal.time.time", side_effect=lambda: next(times)
+            ),
+        ):
+            g.return_value = self._resp("idle")
+            with pytest.raises(click.ClickException, match="Timed out"):
+                poll_until_done("abcd1234", timeout=10, polling_interval=0, idle_stable_polls=3)
 
     def test_transient_idle_does_not_return_early(self):
         """A single idle poll surrounded by processing must NOT satisfy the

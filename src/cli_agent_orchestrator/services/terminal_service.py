@@ -598,6 +598,20 @@ def send_input(
         # working on the new message.
         status_monitor.notify_input_sent(terminal_id)
 
+        # Clear ONLY the rolling byte buffer BEFORE sending keys, so stale idle
+        # prompts from BEFORE the input can't trigger a false COMPLETED
+        # (kiro-cli 2.11's TUI keeps the "ask a question" placeholder in the raw
+        # buffer, which combined with input_received=True would return COMPLETED
+        # within seconds of send_input). Clearing here — not after send_keys —
+        # avoids a race: send_keys includes a submit-delay sleep during which
+        # the agent can begin emitting output; a post-send_keys clear would wipe
+        # that newly-emitted first chunk of the turn (lost from
+        # GET /terminals/{id}/output?mode=full and from early detection). This
+        # uses clear_rolling_buffer (byte-only), which preserves the sticky-latch
+        # arm set by notify_input_sent above; reset_buffer would wipe the arm and
+        # latch-block the IDLE→PROCESSING transition for the whole turn.
+        status_monitor.clear_rolling_buffer(terminal_id)
+
         get_backend().send_keys(
             metadata["tmux_session"],
             metadata["tmux_window"],
@@ -613,17 +627,6 @@ def send_input(
         # state and resume normal COMPLETED detection after a real task.
         if provider:
             provider.mark_input_received()
-
-        # Clear ONLY the rolling byte buffer so stale idle prompts from BEFORE
-        # the input can't trigger a false COMPLETED (kiro-cli 2.11's TUI keeps
-        # the "ask a question" placeholder in the raw buffer, which combined
-        # with input_received=True would return COMPLETED within seconds of
-        # send_input). This uses clear_rolling_buffer (byte-only) rather than
-        # reset_buffer, so it preserves the sticky-latch arm set by
-        # notify_input_sent above — otherwise the IDLE→PROCESSING transition
-        # gets latch-blocked and the terminal reads IDLE for the entire
-        # busy turn.
-        status_monitor.clear_rolling_buffer(terminal_id)
 
         update_last_active(terminal_id)
         logger.info(f"Sent input to terminal: {terminal_id}")

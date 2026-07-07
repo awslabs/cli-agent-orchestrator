@@ -814,6 +814,26 @@ class TestSendInput:
         # reset_buffer would wipe the arm — must NOT be called on send_input.
         mock_status_monitor.reset_buffer.assert_not_called()
 
+        # Ordering guard: the byte-buffer clear must run BEFORE send_keys, not
+        # after. send_keys includes a submit-delay sleep during which the agent
+        # can start emitting output; a post-send_keys clear would wipe that
+        # newly-emitted first chunk of the turn. Attach both calls to a shared
+        # manager so we can assert their relative order.
+        manager = MagicMock()
+        manager.attach_mock(mock_status_monitor.clear_rolling_buffer, "clear")
+        manager.attach_mock(mock_tmux.send_keys, "send_keys")
+        # Re-run with the manager wired in to capture ordered calls.
+        mock_status_monitor.reset_mock()
+        mock_tmux.reset_mock()
+        manager.reset_mock()
+        manager.attach_mock(mock_status_monitor.clear_rolling_buffer, "clear")
+        manager.attach_mock(mock_tmux.send_keys, "send_keys")
+        send_input("test1234", "hello again")
+        ordered = [c[0] for c in manager.mock_calls]
+        assert ordered.index("clear") < ordered.index(
+            "send_keys"
+        ), f"clear_rolling_buffer must precede send_keys; got order {ordered}"
+
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
