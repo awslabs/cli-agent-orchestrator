@@ -6,7 +6,8 @@
   "properties": {
     "profile": {
       "type": "string",
-      "description": "AWS CLI profile name"
+      "description": "AWS CLI profile name",
+      "pattern": "^[a-zA-Z0-9_-]+$"
     },
     "region": {
       "type": "string",
@@ -16,15 +17,16 @@
     "queue_url": {
       "type": "string",
       "description": "Full SQS queue URL",
-      "pattern": "^https://sqs\\..+\\.amazonaws\\.com/.+"
+      "pattern": "^https://sqs\\.[a-z0-9-]+\\.amazonaws\\.com/[0-9]+/[a-zA-Z0-9_.-]+$"
     },
     "message_body": {
       "type": "string",
-      "description": "JSON message body to send"
+      "description": "JSON message body to send (rendered via heredoc, safe for arbitrary JSON)"
     },
     "message_group_id": {
       "type": "string",
       "description": "Message group ID (required for FIFO queues)",
+      "pattern": "^[a-zA-Z0-9_.-]*$",
       "default": ""
     }
   },

@@ -6,7 +6,8 @@
   "properties": {
     "profile": {
       "type": "string",
-      "description": "AWS CLI profile name"
+      "description": "AWS CLI profile name",
+      "pattern": "^[a-zA-Z0-9_-]+$"
     },
     "region": {
       "type": "string",
@@ -16,16 +17,17 @@
     "state_machine_arn": {
       "type": "string",
       "description": "Step Functions state machine ARN",
-      "pattern": "^arn:aws:states:[a-z0-9-]+:[0-9]+:stateMachine:.+$"
+      "pattern": "^arn:aws:states:[a-z0-9-]+:[0-9]+:stateMachine:[a-zA-Z0-9_.-]+$"
     },
     "execution_name_prefix": {
       "type": "string",
       "description": "Prefix for generated execution names",
+      "pattern": "^[a-zA-Z0-9_-]+$",
       "default": "cao-exec"
     },
     "input_payload": {
       "type": "string",
-      "description": "JSON input to the state machine",
+      "description": "JSON input to the state machine (rendered via heredoc, safe for arbitrary JSON)",
       "default": "{}"
     },
     "poll_interval_seconds": {

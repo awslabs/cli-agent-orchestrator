@@ -62,7 +62,10 @@ PROFILE="{{ config.profile }}"
 REGION="{{ config.region }}"
 STATE_MACHINE_ARN="{{ config.state_machine_arn }}"
 EXECUTION_NAME="{{ config.execution_name_prefix | default('cao-exec') }}-$(uuidgen | tr '[:upper:]' '[:lower:]')"
-INPUT='{{ config.input_payload | default('{}') }}'
+INPUT=$(cat <<'INPUTEOF'
+{{ config.input_payload | default('{}') }}
+INPUTEOF
+)
 
 # Validate required vars
 if [ -z "$PROFILE" ] || [ -z "$REGION" ] || [ -z "$STATE_MACHINE_ARN" ]; then

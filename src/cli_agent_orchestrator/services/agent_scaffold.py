@@ -10,12 +10,22 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from jinja2 import Environment, FileSystemLoader, TemplateNotFound
-from jsonschema import Draft202012Validator, ValidationError
+from jinja2 import Environment, FileSystemLoader
+from jsonschema import Draft202012Validator
 
 
 # Templates live under src/cli_agent_orchestrator/templates/
 _TEMPLATES_ROOT = Path(__file__).resolve().parent.parent / "templates"
+
+
+def _check_containment(path: Path, root: Path) -> None:
+    """Raise FileNotFoundError if resolved path escapes root."""
+    resolved = path.resolve()
+    root_resolved = root.resolve()
+    if not resolved.is_relative_to(root_resolved):
+        raise FileNotFoundError(
+            f"Template path escapes templates root: {path}"
+        )
 
 
 def list_templates() -> list[dict]:
@@ -62,7 +72,8 @@ def get_template_schema(template_name: str) -> Optional[dict]:
     template_name: category/name format (e.g., 'aws/stepfunction').
     Returns the schema dict, or None if not found.
     """
-    schema_path = _TEMPLATES_ROOT / template_name / "schema.json"
+    schema_path = (_TEMPLATES_ROOT / template_name / "schema.json").resolve()
+    _check_containment(schema_path, _TEMPLATES_ROOT)
     if not schema_path.exists():
         return None
     return json.loads(schema_path.read_text(encoding="utf-8"))
@@ -93,10 +104,11 @@ def render_template(template_name: str, config: dict) -> str:
     config: dict of user values (flat keys matching the template schema).
 
     Returns the rendered markdown string.
-    Raises FileNotFoundError if template doesn't exist.
+    Raises FileNotFoundError if template doesn't exist or escapes root.
     Raises ValueError if config fails validation.
     """
-    template_dir = _TEMPLATES_ROOT / template_name
+    template_dir = (_TEMPLATES_ROOT / template_name).resolve()
+    _check_containment(template_dir, _TEMPLATES_ROOT)
     template_file = template_dir / "template.md.j2"
 
     if not template_file.exists():
@@ -112,16 +124,11 @@ def render_template(template_name: str, config: dict) -> str:
             + "\n".join(f"  - {e}" for e in errors)
         )
 
-    # Load and render
+    # Render with Jinja2 defaults. Templates use {{ config.x }} for values
+    # and bash ${VAR} passes through unchanged (not Jinja2 syntax).
     env = Environment(
         loader=FileSystemLoader(str(template_dir)),
         keep_trailing_newline=True,
-        # Use custom delimiters to avoid conflicts with bash ${VAR}
-        # Jinja2 uses {{ }} by default but we use {< >} to not collide
-        # Actually, since our templates produce ${VAR} for CAO install-time
-        # substitution, we keep Jinja2 defaults and just don't use ${} in
-        # Jinja2 expressions. The templates use {{ config.xxx }} for render-
-        # time values.
     )
     template = env.get_template("template.md.j2")
 

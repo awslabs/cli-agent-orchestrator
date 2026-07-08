@@ -6,7 +6,8 @@
   "properties": {
     "profile": {
       "type": "string",
-      "description": "AWS CLI profile name"
+      "description": "AWS CLI profile name",
+      "pattern": "^[a-zA-Z0-9_-]+$"
     },
     "region": {
       "type": "string",
@@ -15,15 +16,18 @@
     },
     "table_name": {
       "type": "string",
-      "description": "DynamoDB table name"
+      "description": "DynamoDB table name",
+      "pattern": "^[a-zA-Z0-9._-]+$"
     },
     "partition_key_name": {
       "type": "string",
-      "description": "Partition key attribute name"
+      "description": "Partition key attribute name",
+      "pattern": "^[a-zA-Z0-9_#.-]+$"
     },
     "partition_key_value": {
       "type": "string",
-      "description": "Value to query"
+      "description": "Value to query",
+      "pattern": "^[a-zA-Z0-9_.:-]+$"
     },
     "partition_key_type": {
       "type": "string",

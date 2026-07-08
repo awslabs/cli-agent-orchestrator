@@ -42,7 +42,10 @@ When you receive a message, send it to the SQS queue.
 PROFILE="{{ config.profile }}"
 REGION="{{ config.region }}"
 QUEUE_URL="{{ config.queue_url }}"
-MESSAGE_BODY="{{ config.message_body }}"
+MESSAGE_BODY=$(cat <<'MSGEOF'
+{{ config.message_body }}
+MSGEOF
+)
 
 # Validate required vars
 if [ -z "$PROFILE" ] || [ -z "$REGION" ] || [ -z "$QUEUE_URL" ] || [ -z "$MESSAGE_BODY" ]; then

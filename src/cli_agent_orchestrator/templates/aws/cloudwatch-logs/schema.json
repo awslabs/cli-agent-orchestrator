@@ -6,7 +6,8 @@
   "properties": {
     "profile": {
       "type": "string",
-      "description": "AWS CLI profile name"
+      "description": "AWS CLI profile name",
+      "pattern": "^[a-zA-Z0-9_-]+$"
     },
     "region": {
       "type": "string",
@@ -15,7 +16,8 @@
     },
     "log_group": {
       "type": "string",
-      "description": "CloudWatch log group name"
+      "description": "CloudWatch log group name",
+      "pattern": "^[a-zA-Z0-9/_#.:-]+$"
     },
     "search_time_window_minutes": {
       "type": "integer",

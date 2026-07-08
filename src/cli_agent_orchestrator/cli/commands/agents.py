@@ -1,20 +1,19 @@
 """Agent profile lifecycle management commands.
 
-Provides list/show/validate/remove for installed CAO agent profiles.
+Provides list/show/validate/remove/create/templates for installed CAO agent profiles.
 Ref: https://github.com/awslabs/cli-agent-orchestrator/issues/340
 """
 
 import json
 import sys
-from importlib import resources as importlib_resources
 from pathlib import Path
 from typing import Optional
 
 import click
 import frontmatter
-from jsonschema import Draft202012Validator, ValidationError
+from jsonschema import Draft202012Validator
 
-from cli_agent_orchestrator.constants import LOCAL_AGENT_STORE_DIR
+from cli_agent_orchestrator.constants import LOCAL_AGENT_STORE_DIR, ROLE_TOOL_DEFAULTS
 from cli_agent_orchestrator.utils.agent_profiles import (
     list_agent_profiles,
     parse_agent_profile_text,
@@ -23,22 +22,14 @@ from cli_agent_orchestrator.utils.agent_profiles import (
 # Known deprecated frontmatter fields that should trigger warnings.
 _DEPRECATED_FIELDS = {"autoApproveTools"}
 
-# Valid CAO tool vocabulary (from constants.ROLE_TOOL_DEFAULTS + tool_mapping.py).
-_VALID_TOOL_VOCAB = {
-    "execute_bash",
-    "fs_read",
-    "fs_write",
-    "fs_list",
-    "fs_*",
-    "web_fetch",
-    "@builtin",
-    "@cao-mcp-server",
-}
+# Derive valid tool vocabulary from constants (single source of truth).
+_VALID_TOOL_VOCAB: set[str] = set()
+for _tools in ROLE_TOOL_DEFAULTS.values():
+    _VALID_TOOL_VOCAB.update(_tools)
 
 
 def _load_schema() -> dict:
     """Load the agent profile JSON-Schema from package resources."""
-    # __file__ is cli/commands/agents.py → go up 3 levels to package root
     schema_path = (
         Path(__file__).resolve().parent.parent.parent / "schemas" / "agent_profile.schema.json"
     )
@@ -54,15 +45,17 @@ def _resolve_profile_path(name_or_path: str) -> Optional[Path]:
 
     Returns the resolved Path, or None if not found.
     """
-    # File path?
     if name_or_path.endswith(".md"):
-        p = Path(name_or_path).expanduser()
+        p = Path(name_or_path).expanduser().resolve()
         if p.exists():
             return p
         return None
 
-    # Bare name: look in local store
-    candidate = LOCAL_AGENT_STORE_DIR / f"{name_or_path}.md"
+    # Bare name: look in local store with containment check
+    store_root = LOCAL_AGENT_STORE_DIR.resolve()
+    candidate = (LOCAL_AGENT_STORE_DIR / f"{name_or_path}.md").resolve()
+    if not candidate.is_relative_to(store_root):
+        return None
     if candidate.exists():
         return candidate
 
@@ -76,22 +69,21 @@ def _validate_frontmatter(metadata: dict) -> list[str]:
     """
     messages: list[str] = []
 
-    # 1. JSON-Schema structural validation
-    schema = _load_schema()
-    validator = Draft202012Validator(schema)
-    for error in sorted(validator.iter_errors(metadata), key=lambda e: list(e.path)):
-        path = ".".join(str(p) for p in error.absolute_path) or "(root)"
-        messages.append(f"[error] {path}: {error.message}")
-
-    # 2. Deprecated field check (not caught by additionalProperties because
-    #    the schema uses strict mode -- but we also check explicitly in case
-    #    the field arrives via extra=ignore from Pydantic parsing elsewhere).
+    # 1. Check deprecated fields first (before schema rejects them via
+    #    additionalProperties:false, which gives a less helpful message).
     for field in _DEPRECATED_FIELDS:
         if field in metadata:
             messages.append(
                 f"[warn] '{field}' is deprecated and silently ignored by CAO 2.2+. "
                 f"Use 'allowedTools' instead."
             )
+
+    # 2. JSON-Schema structural validation
+    schema = _load_schema()
+    validator = Draft202012Validator(schema)
+    for error in sorted(validator.iter_errors(metadata), key=lambda e: list(e.path)):
+        path = ".".join(str(p) for p in error.absolute_path) or "(root)"
+        messages.append(f"[error] {path}: {error.message}")
 
     # 3. allowedTools vocabulary check (advisory, not blocking)
     allowed = metadata.get("allowedTools")
@@ -119,15 +111,13 @@ def list_cmd():
         click.echo("No agent profiles found.")
         return
 
-    # Header
     click.echo(f"{'NAME':<30} {'SOURCE':<12} {'DESCRIPTION'}")
     click.echo(f"{'─' * 30} {'─' * 12} {'─' * 40}")
 
-    for p in sorted(profiles.values() if isinstance(profiles, dict) else profiles,
-                    key=lambda x: x.get("name", "")):
+    for p in sorted(profiles, key=lambda x: x.get("name", "")):
         name = p.get("name", "?")
         source = p.get("source", "?")
-        desc = p.get("description", "")[:40]
+        desc = (p.get("description") or "")[:40]
         click.echo(f"{name:<30} {source:<12} {desc}")
 
     click.echo(f"\n{len(profiles)} profile(s) found.")
@@ -143,37 +133,34 @@ def show_cmd(name_or_path: str):
     """
     path = _resolve_profile_path(name_or_path)
     if path is None:
-        click.echo(f"Error: Profile '{name_or_path}' not found.", err=True)
-        raise SystemExit(1)
+        raise click.ClickException(f"Profile '{name_or_path}' not found.")
 
     try:
         post = frontmatter.loads(path.read_text(encoding="utf-8"))
     except Exception as e:
-        click.echo(f"Error reading profile: {e}", err=True)
-        raise SystemExit(1)
+        raise click.ClickException(f"Error reading profile: {e}")
 
     meta = post.metadata
 
     click.echo(f"Profile: {path}")
     click.echo(f"{'─' * 60}")
     click.echo(f"  name:         {meta.get('name', '(missing)')}")
-    click.echo(f"  description:  {meta.get('description', '(none)')}")
+    click.echo(f"  description:  {(meta.get('description') or '(none)')}")
     click.echo(f"  role:         {meta.get('role', '(none)')}")
     click.echo(f"  provider:     {meta.get('provider', '(none)')}")
 
     allowed = meta.get("allowedTools")
-    if allowed:
+    if allowed and isinstance(allowed, list):
         click.echo(f"  allowedTools: {', '.join(allowed)}")
 
     mcp = meta.get("mcpServers")
-    if mcp:
+    if mcp and isinstance(mcp, dict):
         click.echo(f"  mcpServers:   {', '.join(mcp.keys())}")
 
     model = meta.get("model")
     if model:
         click.echo(f"  model:        {model}")
 
-    # Prompt length
     body_len = len(post.content) if post.content else 0
     click.echo(f"  prompt:       {body_len} chars")
 
@@ -195,14 +182,12 @@ def validate_cmd(name_or_path: str):
     """
     path = _resolve_profile_path(name_or_path)
     if path is None:
-        click.echo(f"Error: Profile '{name_or_path}' not found.", err=True)
-        raise SystemExit(1)
+        raise click.ClickException(f"Profile '{name_or_path}' not found.")
 
     try:
         post = frontmatter.loads(path.read_text(encoding="utf-8"))
     except Exception as e:
-        click.echo(f"Error reading profile: {e}", err=True)
-        raise SystemExit(1)
+        raise click.ClickException(f"Error reading profile: {e}")
 
     messages = _validate_frontmatter(post.metadata)
 
@@ -214,7 +199,6 @@ def validate_cmd(name_or_path: str):
     for msg in messages:
         click.echo(f"  {msg}")
 
-    # Exit non-zero if any errors (not just warnings)
     if any(msg.startswith("[error]") for msg in messages):
         raise SystemExit(1)
 
@@ -228,12 +212,18 @@ def remove_cmd(name: str, yes: bool):
     Only removes profiles from ~/.aws/cli-agent-orchestrator/agent-store/.
     Does not affect built-in or provider-managed profiles.
     """
-    target = LOCAL_AGENT_STORE_DIR / f"{name}.md"
+    store_root = LOCAL_AGENT_STORE_DIR.resolve()
+    target = (LOCAL_AGENT_STORE_DIR / f"{name}.md").resolve()
+
+    # Containment check
+    if not target.is_relative_to(store_root):
+        raise click.ClickException(f"Invalid profile name '{name}'.")
 
     if not target.exists():
-        click.echo(f"Error: Profile '{name}' not found in local store.", err=True)
-        click.echo(f"  (looked in: {LOCAL_AGENT_STORE_DIR})")
-        raise SystemExit(1)
+        raise click.ClickException(
+            f"Profile '{name}' not found in local store.\n"
+            f"  (looked in: {LOCAL_AGENT_STORE_DIR})"
+        )
 
     if not yes:
         click.confirm(f"Remove profile '{name}' from local store?", abort=True)
@@ -299,26 +289,15 @@ def create_cmd(template: str, config_path: str, output_dir: str):
     try:
         config = json.loads(config_file.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
-        click.echo(f"Error: Invalid JSON in {config_path}: {e}", err=True)
-        raise SystemExit(1)
+        raise click.ClickException(f"Invalid JSON in {config_path}: {e}")
 
-    # Validate config against template schema
-    errors = validate_config(template, config)
-    if errors:
-        click.echo(f"✗ Config validation failed for template '{template}':", err=True)
-        for err in errors:
-            click.echo(f"  - {err}", err=True)
-        raise SystemExit(1)
-
-    # Render template
+    # Render template (validates config internally)
     try:
         rendered = render_template(template, config)
     except FileNotFoundError as e:
-        click.echo(f"Error: {e}", err=True)
-        raise SystemExit(1)
+        raise click.ClickException(str(e))
     except ValueError as e:
-        click.echo(f"Error: {e}", err=True)
-        raise SystemExit(1)
+        raise click.ClickException(str(e))
 
     # Determine output filename from template name
     template_basename = template.split("/")[-1]

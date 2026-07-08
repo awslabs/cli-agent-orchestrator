@@ -6,7 +6,8 @@
   "properties": {
     "profile": {
       "type": "string",
-      "description": "AWS CLI profile name"
+      "description": "AWS CLI profile name",
+      "pattern": "^[a-zA-Z0-9_-]+$"
     },
     "region": {
       "type": "string",
@@ -15,15 +16,18 @@
     },
     "table_name": {
       "type": "string",
-      "description": "DynamoDB table name"
+      "description": "DynamoDB table name",
+      "pattern": "^[a-zA-Z0-9._-]+$"
     },
     "partition_key_name": {
       "type": "string",
-      "description": "Partition key attribute name"
+      "description": "Partition key attribute name",
+      "pattern": "^[a-zA-Z0-9_#.-]+$"
     },
     "partition_key_value": {
       "type": "string",
-      "description": "Value to match for deletion"
+      "description": "Value to match for deletion",
+      "pattern": "^[a-zA-Z0-9_.:-]+$"
     },
     "partition_key_type": {
       "type": "string",
@@ -33,6 +37,7 @@
     "sort_key_name": {
       "type": "string",
       "description": "Sort key attribute name (empty for PK-only tables)",
+      "pattern": "^[a-zA-Z0-9_#.-]*$",
       "default": ""
     },
     "sort_key_type": {

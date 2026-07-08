@@ -93,24 +93,5 @@
       "type": "boolean"
     }
   },
-  "additionalProperties": false,
-  "$defs": {
-    "deprecated_fields": {
-      "description": "Fields that are deprecated and should not be used.",
-      "enum": ["autoApproveTools"]
-    },
-    "valid_tool_vocabulary": {
-      "description": "Known CAO tool vocabulary entries.",
-      "enum": [
-        "execute_bash",
-        "fs_read",
-        "fs_write",
-        "fs_list",
-        "fs_*",
-        "web_fetch",
-        "@builtin",
-        "@cao-mcp-server"
-      ]
-    }
-  }
+  "additionalProperties": false
 }

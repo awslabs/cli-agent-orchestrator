@@ -6,7 +6,8 @@
   "properties": {
     "profile": {
       "type": "string",
-      "description": "AWS CLI profile name"
+      "description": "AWS CLI profile name",
+      "pattern": "^[a-zA-Z0-9_-]+$"
     },
     "region": {
       "type": "string",
@@ -16,11 +17,12 @@
     "dlq_url": {
       "type": "string",
       "description": "Full DLQ queue URL",
-      "pattern": "^https://sqs\\..+\\.amazonaws\\.com/.+"
+      "pattern": "^https://sqs\\.[a-z0-9-]+\\.amazonaws\\.com/[0-9]+/[a-zA-Z0-9_.-]+$"
     },
     "message_group_id": {
       "type": "string",
       "description": "Filter by group (FIFO queues; empty to skip filtering)",
+      "pattern": "^[a-zA-Z0-9_.-]*$",
       "default": ""
     },
     "max_messages": {

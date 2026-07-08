@@ -205,3 +205,84 @@ class TestAgentsRemoveCommand:
         result = runner.invoke(agents, ["remove", "nonexistent-agent-xyz", "-y"])
         assert result.exit_code == 1
         assert "not found" in result.output
+
+
+class TestAgentsTemplatesCommand:
+    """Tests for cao agents templates."""
+
+    def test_templates_lists_all(self, runner: CliRunner):
+        result = runner.invoke(agents, ["templates"])
+        assert result.exit_code == 0
+        assert "aws/stepfunction" in result.output
+        assert "aws/cloudwatch-logs" in result.output
+        assert "7 template(s) available" in result.output
+
+    def test_templates_shows_description(self, runner: CliRunner):
+        result = runner.invoke(agents, ["templates"])
+        assert "Trigger and monitor" in result.output
+
+
+class TestAgentsCreateCommand:
+    """Tests for cao agents create."""
+
+    def test_create_writes_file(self, runner: CliRunner, tmp_path: Path):
+        config = tmp_path / "config.json"
+        config.write_text(json.dumps({
+            "profile": "test",
+            "region": "us-east-1",
+            "state_machine_arn": "arn:aws:states:us-east-1:123456789012:stateMachine:X",
+        }))
+        result = runner.invoke(agents, [
+            "create", "-t", "aws/stepfunction",
+            "-c", str(config), "-o", str(tmp_path),
+        ])
+        assert result.exit_code == 0
+        assert "Generated" in result.output
+        output_file = tmp_path / "stepfunction-agent.md"
+        assert output_file.exists()
+        content = output_file.read_text()
+        assert "test" in content
+        assert "{{" not in content
+
+    def test_create_invalid_config(self, runner: CliRunner, tmp_path: Path):
+        config = tmp_path / "config.json"
+        config.write_text(json.dumps({"profile": "x"}))
+        result = runner.invoke(agents, [
+            "create", "-t", "aws/stepfunction",
+            "-c", str(config), "-o", str(tmp_path),
+        ])
+        assert result.exit_code != 0
+        assert "state_machine_arn" in result.output
+
+    def test_create_invalid_json(self, runner: CliRunner, tmp_path: Path):
+        config = tmp_path / "config.json"
+        config.write_text("not json {{{")
+        result = runner.invoke(agents, [
+            "create", "-t", "aws/stepfunction",
+            "-c", str(config), "-o", str(tmp_path),
+        ])
+        assert result.exit_code != 0
+        assert "Invalid JSON" in result.output
+
+    def test_create_nonexistent_template(self, runner: CliRunner, tmp_path: Path):
+        config = tmp_path / "config.json"
+        config.write_text(json.dumps({"profile": "x"}))
+        result = runner.invoke(agents, [
+            "create", "-t", "aws/nonexistent",
+            "-c", str(config), "-o", str(tmp_path),
+        ])
+        assert result.exit_code != 0
+
+
+class TestPathTraversal:
+    """Tests for path traversal prevention."""
+
+    def test_scaffold_rejects_traversal(self):
+        from cli_agent_orchestrator.services.agent_scaffold import render_template
+        with pytest.raises(FileNotFoundError, match="escapes"):
+            render_template("../../etc/passwd", {})
+
+    def test_scaffold_schema_rejects_traversal(self):
+        from cli_agent_orchestrator.services.agent_scaffold import get_template_schema
+        with pytest.raises(FileNotFoundError, match="escapes"):
+            get_template_schema("../../etc/passwd")

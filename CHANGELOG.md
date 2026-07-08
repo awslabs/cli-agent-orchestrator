@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- add `cao agents` command group for profile lifecycle management: list/show/validate/remove/templates/create. Includes Jinja2 scaffolding engine with 7 AWS templates (stepfunction, cloudwatch-logs, dynamodb-query, dynamodb-delete, sqs-monitor, sqs-send, sqs-dlq-check) and JSON-Schema validation for both profiles and template configs (#340)
+
 - add optional `skills` field to `AgentProfile` to scope the per-agent skill catalog via an fnmatch allowlist; runtime-prompt providers only, `load_skill` resolution unchanged (#351)
 
 - add Antigravity CLI (`agy`) provider — Google's terminal-native coding agent and the successor to the Gemini CLI after the free "Login with Google" path was retired (#323)
