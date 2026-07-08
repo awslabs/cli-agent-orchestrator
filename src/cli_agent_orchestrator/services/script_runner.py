@@ -535,13 +535,17 @@ async def _drive_process(
     only difference is the env (``CAO_WORKFLOW_RESUME``) and the script path
     (author file vs materialized snapshot). Never ``shell=True`` (C-2).
     """
-    record.process = await asyncio.create_subprocess_exec(
-        sys.executable,
-        script_path,
-        env=env,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    try:
+        record.process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            script_path,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except Exception as e:  # noqa: BLE001 — spawn failure should not raise past the runner boundary
+        logger.warning("script spawn failed for run '%s': %s", record.run_id, e)
+        return await _finalize(record, state=RunState.FAILED, kind="error", error=str(e))
     process = record.process
 
     stdout_ring = _RingBuffer(WORKFLOW_SCRIPT_LOG_CAP)
