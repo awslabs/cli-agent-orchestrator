@@ -86,9 +86,31 @@ class StatusMonitor:
         # so the cancel is marshaled back onto this loop. See
         # _cancel_quiesce_handle.
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # Strong references to in-flight quiescence-detection tasks. asyncio only
+        # keeps a WEAK reference to tasks created via loop.create_task, so without
+        # this a detection task can be garbage-collected mid-run and silently drop
+        # a status transition. Tasks remove themselves on completion.
+        self._detect_tasks: set = set()
 
     async def run(self) -> None:
-        """Subscribe to output events and detect status changes."""
+        """Subscribe to output events and detect status changes.
+
+        ``_process_chunk`` runs provider status detection which, for tmux-backed
+        providers, shells out to the ``tmux`` binary via libtmux (a blocking
+        ``subprocess`` fork/exec — e.g. kiro's ``get_pane_current_command`` in
+        Check 3). Running that inline on the event loop meant every output chunk
+        from every worker forked tmux ON the loop; with a few concurrent workers
+        streaming, that fork storm froze the whole server (no /health, assign
+        POSTs stranded until the MCP client's ~120s timeout). Offload
+        ``_process_chunk`` to a worker thread so the loop stays free.
+
+        Chunks are processed one at a time (each ``to_thread`` is awaited before
+        the next ``queue.get()``), so per-terminal ordering and the latch's
+        read-modify-write sequence are preserved exactly as before.
+        """
+        # Capture the loop up front, on the loop thread, so the debounce timers
+        # scheduled from the worker thread can be marshaled back onto it.
+        self._loop = asyncio.get_running_loop()
         queue = bus.subscribe("terminal.*.output")
         logger.info("StatusMonitor started")
 
@@ -96,7 +118,7 @@ class StatusMonitor:
             try:
                 event = await queue.get()
                 terminal_id = terminal_id_from_topic(event["topic"])
-                self._process_chunk(terminal_id, event["data"]["data"])
+                await asyncio.to_thread(self._process_chunk, terminal_id, event["data"]["data"])
             except Exception as e:
                 logger.exception(f"Error in StatusMonitor: {e}")
 
@@ -264,15 +286,12 @@ class StatusMonitor:
         mid-burst, which is what eliminates the flaps naive per-chunk rendered
         detection produces.
         """
-        loop = self._running_loop()
+        loop = self._loop or self._running_loop()
         if loop is None:
             # No event loop (unit tests / offline replay): detect immediately
             # on the current screen — deterministic, no timing.
             self._apply_detection(terminal_id, self._detect_screen(terminal_id, provider))
             return
-        # Remember the timer-owning loop so an off-thread clear/reset can marshal
-        # the cancel back onto it (this runs on the loop thread).
-        self._loop = loop
 
         with self._lock:
             was_bursting = self._bursting.get(terminal_id, False)
@@ -283,18 +302,27 @@ class StatusMonitor:
         if not was_bursting:
             self._apply_detection(terminal_id, self._detect_screen(terminal_id, provider))
 
-        new_handle = loop.call_later(
-            PYTE_QUIESCENCE_DELAY_S, self._on_screen_quiescent, terminal_id, provider
-        )
-        with self._lock:
-            self._quiesce_handle[terminal_id] = new_handle
+        self._arm_quiesce_timer(loop, terminal_id, self._on_screen_quiescent, provider)
 
     def _on_screen_quiescent(self, terminal_id: str, provider) -> None:
-        """Quiescence timer fired: output stopped, so the screen has settled."""
+        """Quiescence timer fired: output stopped, so the screen has settled.
+
+        Fires on the loop; offload the (potentially blocking) screen detection
+        to a worker thread so the loop stays free.
+        """
         with self._lock:
             self._bursting[terminal_id] = False
             self._quiesce_handle.pop(terminal_id, None)
-        self._apply_detection(terminal_id, self._detect_screen(terminal_id, provider))
+
+        async def _detect_and_apply() -> None:
+            detected = await asyncio.to_thread(self._detect_screen, terminal_id, provider)
+            self._apply_detection(terminal_id, detected)
+
+        loop = self._loop or self._running_loop()
+        if loop is None:
+            self._apply_detection(terminal_id, self._detect_screen(terminal_id, provider))
+        else:
+            self._spawn_tracked(loop, _detect_and_apply())
 
     def _schedule_raw_detection(self, terminal_id: str, buffer: str) -> None:
         """Edge-debounce detection on the raw rolling buffer.
@@ -305,12 +333,20 @@ class StatusMonitor:
         transition only matters after output settles). This prevents queue
         overflow during sustained output while ensuring InboxService never
         pastes into a busy terminal.
+
+        Runs on a StatusMonitor worker thread (``run`` dispatches
+        ``_process_chunk`` via ``asyncio.to_thread``), so the blocking
+        ``_detect_status`` (which shells out to tmux) executes off the event
+        loop. The quiescence timer is loop-affine, so it is armed on the
+        captured loop via ``call_soon_threadsafe`` rather than the current
+        thread's (nonexistent) loop.
         """
-        loop = self._running_loop()
+        loop = self._loop or self._running_loop()
         if loop is None:
+            # No loop ever captured (unit tests / offline replay): detect
+            # inline and skip the debounce timer.
             self._apply_detection(terminal_id, self._detect_status(terminal_id, buffer))
             return
-        self._loop = loop
 
         with self._lock:
             was_bursting = self._bursting.get(terminal_id, False)
@@ -326,17 +362,71 @@ class StatusMonitor:
             detected = self._detect_status(terminal_id, buffer)
             self._apply_detection(terminal_id, detected)
 
-        new_handle = loop.call_later(PYTE_QUIESCENCE_DELAY_S, self._on_raw_quiescent, terminal_id)
-        with self._lock:
-            self._quiesce_handle[terminal_id] = new_handle
+        self._arm_quiesce_timer(loop, terminal_id, self._on_raw_quiescent)
+
+    def _arm_quiesce_timer(self, loop, terminal_id: str, callback, *cb_args) -> None:
+        """Schedule the quiescence timer on ``loop`` from any thread.
+
+        ``loop.call_later`` is not thread-safe and this may run on a worker
+        thread, so marshal the scheduling onto the loop with
+        ``call_soon_threadsafe``. The resulting TimerHandle is stored from
+        inside the marshaled closure (still on the loop thread) so cancel
+        marshaling in ``_cancel_quiesce_handle`` stays correct. ``cb_args``
+        are extra positional args passed to ``callback`` after ``terminal_id``.
+        """
+
+        def _arm() -> None:
+            # Runs on the loop thread (via call_soon_threadsafe), so it is safe
+            # to cancel a prior TimerHandle directly here. Cancel any existing
+            # timer for this terminal BEFORE arming the new one: if several
+            # chunks arrive in quick succession their _arm closures are queued
+            # together, and without this the later closure would overwrite
+            # _quiesce_handle while leaving the earlier timer live — two timers
+            # then fire, and a stale one firing mid-burst causes early/duplicate
+            # quiescence detections and status flaps. One outstanding timer per
+            # terminal, always the latest.
+            with self._lock:
+                prior = self._quiesce_handle.get(terminal_id)
+                if prior is not None:
+                    prior.cancel()
+                handle = loop.call_later(PYTE_QUIESCENCE_DELAY_S, callback, terminal_id, *cb_args)
+                self._quiesce_handle[terminal_id] = handle
+
+        try:
+            loop.call_soon_threadsafe(_arm)
+        except RuntimeError:
+            # Loop closed during shutdown — quiescence re-detect is moot.
+            pass
 
     def _on_raw_quiescent(self, terminal_id: str) -> None:
-        """Quiescence timer fired for raw path: re-detect from current buffer."""
+        """Quiescence timer fired for raw path: re-detect from current buffer.
+
+        Fires on the event loop (via call_later), so the blocking
+        ``_detect_status`` is offloaded to a worker thread to keep the loop
+        free — a tmux ``get_pane_current_command`` here would otherwise fork
+        on the loop.
+        """
         with self._lock:
             self._bursting[terminal_id] = False
             self._quiesce_handle.pop(terminal_id, None)
             buffer = self._buffers.get(terminal_id, "")
-        self._apply_detection(terminal_id, self._detect_status(terminal_id, buffer))
+
+        async def _detect_and_apply() -> None:
+            detected = await asyncio.to_thread(self._detect_status, terminal_id, buffer)
+            self._apply_detection(terminal_id, detected)
+
+        loop = self._loop or self._running_loop()
+        if loop is None:
+            self._apply_detection(terminal_id, self._detect_status(terminal_id, buffer))
+        else:
+            self._spawn_tracked(loop, _detect_and_apply())
+
+    def _spawn_tracked(self, loop, coro) -> None:
+        """Create a task on ``loop`` and hold a strong reference until it
+        finishes, so asyncio's weak task references can't GC it mid-run."""
+        task = loop.create_task(coro)
+        self._detect_tasks.add(task)
+        task.add_done_callback(self._detect_tasks.discard)
 
     @staticmethod
     def _running_loop() -> Optional[asyncio.AbstractEventLoop]:
@@ -383,6 +473,20 @@ class StatusMonitor:
         """
         with self._lock:
             self._allow_processing_revert[terminal_id] = True
+
+    def clear_rolling_buffer(self, terminal_id: str) -> None:
+        """Clear ONLY the rolling byte buffer for a terminal — preserves
+        ``_last_status`` and ``_allow_processing_revert``.
+
+        Used by send_input to drop stale pre-task content (e.g. kiro-cli 2.11's
+        "ask a question" idle placeholder) so it can't combine with the
+        input_received flag to trigger a false COMPLETED before the agent has
+        rendered its processing indicator. Unlike ``reset_buffer``, this does
+        NOT wipe the sticky-latch state, so the arm set by ``notify_input_sent``
+        survives and the subsequent IDLE→PROCESSING transition is honored.
+        """
+        with self._lock:
+            self._buffers[terminal_id] = ""
 
     def _detect_status(self, terminal_id: str, buffer: str) -> TerminalStatus:
         """Detect status: provider-specific patterns or UNKNOWN if no provider."""

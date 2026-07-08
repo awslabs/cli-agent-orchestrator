@@ -469,3 +469,171 @@ class TestSyncBackendFromServer:
         ):
             sync_backend_from_server()
             mock_set.assert_not_called()
+
+
+class TestPollUntilDone:
+    """poll_until_done: COMPLETED returns immediately; IDLE needs a stable window.
+
+    Regression: kiro-cli 2.11 finishes many turns at IDLE (no Credits marker),
+    so requiring COMPLETED caused `cao launch` / `cao session send` to hang and
+    time out on a kiro agent that had actually completed. COMPLETED behaviour is
+    unchanged (single reading returns); IDLE is accepted only after a short
+    stable window since idle is ambiguous mid-turn.
+    """
+
+    def _resp(self, status):
+        m = MagicMock()
+        m.raise_for_status.return_value = None
+        m.json.return_value = {"status": status}
+        return m
+
+    def test_completed_returns_immediately(self):
+        """A single COMPLETED reading returns at once (unchanged behaviour)."""
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
+        ):
+            g.return_value = self._resp("completed")
+            poll_until_done("abcd1234", timeout=60, polling_interval=0)
+            assert g.call_count == 1
+
+    def test_returns_on_stable_idle_after_working(self):
+        """IDLE completes only after the agent has been observed working, then
+        stays idle for idle_stable_polls reads."""
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        seq = [
+            self._resp("processing"),  # agent started
+            self._resp("idle"),
+            self._resp("idle"),
+            self._resp("idle"),  # 3rd stable idle -> return
+        ]
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
+        ):
+            g.side_effect = seq
+            poll_until_done("abcd1234", timeout=60, polling_interval=0, idle_stable_polls=3)
+            assert g.call_count == 4
+
+    def test_idle_before_processing_does_not_return_early(self):
+        """Regression (PR #390 review): idle right after a send, before the
+        agent has begun processing, must NOT be treated as done — that would
+        yield empty/partial output. Only after a working reading does idle
+        count. Times out here (never sees working) rather than returning early.
+        """
+        import click
+
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        # Always idle, never working; timeout guard uses time.time, so make it
+        # advance to force a timeout after a few polls.
+        times = iter([0, 0.5, 1.0, 1.5, 2.0, 2.5, 100.0])
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
+            patch(
+                "cli_agent_orchestrator.utils.terminal.time.time", side_effect=lambda: next(times)
+            ),
+        ):
+            g.return_value = self._resp("idle")
+            with pytest.raises(click.ClickException, match="Timed out"):
+                poll_until_done("abcd1234", timeout=10, polling_interval=0, idle_stable_polls=3)
+
+    def test_transient_idle_does_not_return_early(self):
+        """A single idle poll surrounded by processing must NOT satisfy the
+        stable-idle gate — otherwise we'd return mid-turn."""
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        seq = [
+            self._resp("processing"),
+            self._resp("idle"),  # transient
+            self._resp("processing"),
+            self._resp("idle"),
+            self._resp("idle"),
+            self._resp("idle"),  # now stable -> return
+        ]
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
+        ):
+            g.side_effect = seq
+            poll_until_done("abcd1234", timeout=60, polling_interval=0, idle_stable_polls=3)
+            # All 6 responses consumed => the transient idle did not trigger return.
+            assert g.call_count == 6
+
+    def test_completed_after_idle_returns_without_full_idle_window(self):
+        """COMPLETED short-circuits even if fewer than idle_stable_polls idles
+        preceded it — the definitive marker wins."""
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        seq = [
+            self._resp("idle"),  # 1 idle, not yet stable
+            self._resp("completed"),  # definitive -> return now
+        ]
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
+        ):
+            g.side_effect = seq
+            poll_until_done("abcd1234", timeout=60, polling_interval=0, idle_stable_polls=3)
+            assert g.call_count == 2
+
+    def test_unknown_does_not_count_as_working(self):
+        """Regression (PR #390 review): UNKNOWN must NOT flip observed_working —
+        a terminal can report UNKNOWN before it starts (no output yet / provider
+        not registered / deferred init). If UNKNOWN counted as "started", a
+        following stable idle would satisfy the gate and return early with empty
+        output. Here: unknown then all-idle must time out, not return.
+        """
+        import click
+
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        times = iter([0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 100.0])
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
+            patch(
+                "cli_agent_orchestrator.utils.terminal.time.time", side_effect=lambda: next(times)
+            ),
+        ):
+            # unknown first, then idle forever — never a working reading.
+            g.side_effect = [self._resp("unknown")] + [self._resp("idle")] * 10
+            with pytest.raises(click.ClickException, match="Timed out"):
+                poll_until_done("abcd1234", timeout=10, polling_interval=0, idle_stable_polls=3)
+
+    def test_processing_then_idle_still_returns(self):
+        """PROCESSING (unlike UNKNOWN) does flip observed_working, so a stable
+        idle after it returns normally — guards against over-tightening."""
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        seq = [
+            self._resp("unknown"),  # not working
+            self._resp("processing"),  # now working
+            self._resp("idle"),
+            self._resp("idle"),
+            self._resp("idle"),  # stable -> return
+        ]
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
+        ):
+            g.side_effect = seq
+            poll_until_done("abcd1234", timeout=60, polling_interval=0, idle_stable_polls=3)
+            assert g.call_count == 5
+
+    def test_error_raises(self):
+        import click
+
+        from cli_agent_orchestrator.utils.terminal import poll_until_done
+
+        with (
+            patch("cli_agent_orchestrator.utils.terminal.requests.get") as g,
+            patch("cli_agent_orchestrator.utils.terminal.time.sleep"),
+        ):
+            g.return_value = self._resp("error")
+            with pytest.raises(click.ClickException):
+                poll_until_done("abcd1234", timeout=60, polling_interval=0)

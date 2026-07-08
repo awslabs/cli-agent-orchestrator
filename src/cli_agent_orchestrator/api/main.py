@@ -177,6 +177,20 @@ class TerminalOutputResponse(BaseModel):
     mode: str
 
 
+class CreateTerminalBody(BaseModel):
+    """Optional JSON body for POST /sessions/{name}/terminals.
+
+    Carries the deferred-init message payload OUT of the query string:
+    prompt content can be large (URL-length 414 risk) and sensitive (query
+    strings are routinely captured in HTTP access logs and traces). Routing
+    fields (provider, defer_init, etc.) stay as query params; only the
+    message content lives here.
+    """
+
+    initial_message: Optional[str] = None
+    initial_message_orchestration_type: Optional[str] = None
+
+
 class RunStepRequest(BaseModel):
     """Request body for the combined step-execution endpoint (N0, #312)."""
 
@@ -1084,9 +1098,26 @@ async def create_terminal_in_session(
     working_directory: Optional[str] = None,
     allowed_tools: Optional[str] = None,
     caller_id: Optional[TerminalId] = None,
+    defer_init: bool = False,
+    body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
-    """Create additional terminal in existing session."""
+    """Create additional terminal in existing session.
+
+    ``defer_init=true``: return as soon as the tmux window is created and the
+    terminal is registered in the DB, without waiting for the CLI provider to
+    reach IDLE. Provider initialization runs as a background task; when
+    ``body.initial_message`` is also provided it is sent to the terminal via
+    the same task once init completes. Used by the MCP `assign` tool to keep
+    tool-call latency well under kiro-cli 2.11's ~60s per-tool client
+    timeout, and to allow multiple concurrent assigns to run their init
+    phases in parallel.
+
+    The message payload lives in the JSON body (``initial_message``,
+    ``initial_message_orchestration_type``) rather than query params so prompt
+    content isn't exposed in HTTP access logs and isn't subject to URL-length
+    limits.
+    """
     try:
         validate_tmux_name(session_name, "session_name")
     except ValueError as e:
@@ -1100,6 +1131,43 @@ async def create_terminal_in_session(
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
+        initial_message = body.initial_message if body else None
+
+        # The initial-message payload is only delivered on the deferred-init
+        # path; create_terminal() ignores it otherwise. Reject it explicitly
+        # when defer_init is false rather than silently dropping it, which would
+        # surface later as a "worker never received task" mystery.
+        if (
+            not defer_init
+            and body
+            and (
+                body.initial_message is not None
+                or body.initial_message_orchestration_type is not None
+            )
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "initial_message / initial_message_orchestration_type require "
+                    "defer_init=true; they are not delivered on the synchronous path"
+                ),
+            )
+
+        # Deferred init only makes sense when a message will follow — we
+        # still accept the flag alone (no message) for future non-assign uses.
+        orch_type = None
+        if body and body.initial_message_orchestration_type:
+            try:
+                orch_type = OrchestrationType(body.initial_message_orchestration_type)
+            except ValueError:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"invalid initial_message_orchestration_type: "
+                        f"{body.initial_message_orchestration_type!r}"
+                    ),
+                )
+
         result = await terminal_service.create_terminal(
             provider=resolved_provider,
             agent_profile=agent_profile,
@@ -1109,8 +1177,15 @@ async def create_terminal_in_session(
             allowed_tools=allowed_tools_list,
             registry=get_plugin_registry(request),
             caller_id=caller_id,
+            defer_init=defer_init,
+            initial_message=initial_message,
+            initial_message_orchestration_type=orch_type,
         )
         return result
+    except HTTPException:
+        # Deliberate 4xx (e.g. the initial_message/defer_init guard, invalid
+        # orchestration_type) — propagate as-is instead of masking as a 500.
+        raise
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -1141,7 +1216,12 @@ async def list_terminals_in_session(session_name: str) -> List[Dict]:
 @app.get("/terminals/{terminal_id}", response_model=Terminal)
 async def get_terminal(terminal_id: TerminalId) -> Terminal:
     try:
-        terminal = terminal_service.get_terminal(terminal_id)
+        # get_terminal reads status_monitor.get_status(), which for a
+        # PROCESSING terminal does a fresh detection that can shell out to
+        # tmux (blocking subprocess). This endpoint is polled heavily by
+        # wait_until_terminal_status, so run it off the loop to keep the
+        # server responsive under concurrent orchestration.
+        terminal = await asyncio.to_thread(terminal_service.get_terminal, terminal_id)
         return Terminal(**terminal)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -1203,7 +1283,12 @@ async def send_terminal_input(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
     try:
-        success = terminal_service.send_input(
+        # send_input is blocking tmux I/O (bracketed paste + key sends). Run it
+        # off the event loop so a slow tmux call can't freeze every other
+        # request — including /health and concurrent assign/handoff. Same
+        # hazard class as issue #382 (only fixed for DELETE /sessions there).
+        success = await asyncio.to_thread(
+            terminal_service.send_input,
             terminal_id,
             message,
             registry=get_plugin_registry(request),
@@ -1239,7 +1324,8 @@ async def send_terminal_key(
         )
 
     try:
-        success = terminal_service.send_special_key(terminal_id, key)
+        # Blocking tmux send-keys — off the loop.
+        success = await asyncio.to_thread(terminal_service.send_special_key, terminal_id, key)
         return {"success": success}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -1255,7 +1341,10 @@ async def get_terminal_output(
     terminal_id: TerminalId, mode: OutputMode = OutputMode.FULL
 ) -> TerminalOutputResponse:
     try:
-        output = terminal_service.get_output(terminal_id, mode)
+        # get_output does a blocking tmux capture-pane plus provider regex
+        # extraction over the scrollback — run it off the loop so a large
+        # transcript can't stall the whole server.
+        output = await asyncio.to_thread(terminal_service.get_output, terminal_id, mode)
         return TerminalOutputResponse(output=output, mode=mode)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -1273,7 +1362,8 @@ async def exit_terminal(
 ) -> Dict:
     """Send provider-specific exit command to terminal."""
     try:
-        terminal_service.exit_terminal_cli(terminal_id)
+        # Blocking tmux I/O — off the loop.
+        await asyncio.to_thread(terminal_service.exit_terminal_cli, terminal_id)
         return {"success": True}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -1630,8 +1720,15 @@ async def delete_terminal(
 ) -> Dict:
     """Delete a terminal."""
     try:
-        success = terminal_service.delete_terminal(
-            terminal_id, registry=get_plugin_registry(request)
+        # delete_terminal is fully synchronous: blocking tmux kills, a
+        # full-history scrollback snapshot capture, and DB writes. Off the
+        # loop so a stalled tmux/FIFO op bounds its blast radius to this one
+        # request instead of wedging the whole server (issue #382 fixed this
+        # for DELETE /sessions; the per-terminal path had the same hazard).
+        success = await asyncio.to_thread(
+            terminal_service.delete_terminal,
+            terminal_id,
+            registry=get_plugin_registry(request),
         )
         return {"success": success}
     except ValueError as e:

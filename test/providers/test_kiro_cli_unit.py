@@ -41,7 +41,7 @@ class TestKiroCliProviderInitialization:
         assert result is True
         mock_wait_shell.assert_called_once()
         mock_tmux.return_value.send_keys.assert_called_once_with(
-            "test-session", "window-0", "kiro-cli chat --agent developer"
+            "test-session", "window-0", "kiro-cli chat --trust-all-tools --agent developer"
         )
         mock_wait_status.assert_called_once()
 
@@ -99,13 +99,13 @@ class TestKiroCliProviderInitialization:
         assert calls[0].args == (
             "test-session",
             "window-0",
-            "kiro-cli chat --agent developer",
+            "kiro-cli chat --trust-all-tools --agent developer",
         )
         assert calls[1].args == ("test-session", "window-0", "/exit")
         assert calls[2].args == (
             "test-session",
             "window-0",
-            "kiro-cli chat --legacy-ui --agent developer",
+            "kiro-cli chat --legacy-ui --trust-all-tools --agent developer",
         )
 
     @pytest.mark.asyncio
@@ -157,7 +157,7 @@ class TestKiroCliProviderInitialization:
         mock_tmux.return_value.send_keys.assert_called_once_with(
             "test-session",
             "window-0",
-            "kiro-cli chat --model claude-opus-4-6 --agent developer",
+            "kiro-cli chat --trust-all-tools --model claude-opus-4-6 --agent developer",
         )
 
     @pytest.mark.asyncio
@@ -236,13 +236,13 @@ class TestKiroCliProviderInitialization:
         assert calls[0].args == (
             "test-session",
             "window-0",
-            "kiro-cli chat --model claude-opus-4.6 --agent developer",
+            "kiro-cli chat --trust-all-tools --model claude-opus-4.6 --agent developer",
         )
         assert calls[1].args == ("test-session", "window-0", "/exit")
         assert calls[2].args == (
             "test-session",
             "window-0",
-            "kiro-cli chat --legacy-ui --model claude-opus-4.6 --agent developer",
+            "kiro-cli chat --legacy-ui --trust-all-tools --model claude-opus-4.6 --agent developer",
         )
 
     def test_initialization_with_different_agent_profiles(self):
@@ -536,10 +536,23 @@ class TestKiroCliProviderMessageExtraction:
         assert "How can I help?" not in message
         assert "User message" not in message
 
-    def test_paste_enter_count_returns_one(self):
-        """Kiro CLI submits on single Enter after bracketed paste."""
+    def test_paste_enter_count_returns_two(self):
+        """Kiro CLI 2.11+ needs two Enters after bracketed paste to submit.
+
+        The first Enter finalizes the paste in the TUI input area; the second
+        submits the message. Older kiro versions (pre-2.11) only needed one.
+        """
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
-        assert provider.paste_enter_count == 1
+        assert provider.paste_enter_count == 2
+
+    def test_paste_submit_delay_returns_one_second(self):
+        """Kiro CLI 2.11+ TUI needs a 1s delay after paste before Enter registers.
+
+        The default 0.3s from BaseProvider is too short — Enter is swallowed by
+        the TUI's paste-end processing.
+        """
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        assert provider.paste_submit_delay == 1.0
 
     def test_extract_slash_command_output(self):
         """Test extraction of slash command output (no green arrow)."""
@@ -1804,3 +1817,86 @@ class TestKiroCliCheck6NoCredits:
         """extraction_tail_lines must be 2000 to cover long no-credits responses."""
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         assert provider.extraction_tail_lines == 2000
+
+
+class TestKiroCli211Regressions:
+    """Regression tests for kiro-cli 2.11+ TUI compatibility.
+
+    kiro-cli 2.11 changed three things that broke CAO's handoff flow:
+    1. Bracketed paste needs 2 Enters (not 1) to submit
+    2. Processing indicator renamed from "Kiro is working" to "Thinking..."
+    3. "ask a question or describe a task" placeholder stays visible in the
+       raw buffer at all times, causing premature COMPLETED detection
+
+    These tests lock in the fixes so a future refactor doesn't regress them.
+    """
+
+    SEP = "─" * 60
+
+    def test_thinking_pattern_treated_as_processing(self):
+        """kiro 2.11's 'Thinking...' indicator must match TUI_PROCESSING_PATTERN."""
+        from cli_agent_orchestrator.providers.kiro_cli import TUI_PROCESSING_PATTERN
+
+        assert re.search(TUI_PROCESSING_PATTERN, "⠹ Thinking... (esc to cancel)")
+        # Old form still matches for pre-2.11 kiro
+        assert re.search(TUI_PROCESSING_PATTERN, "Kiro is working · Type to steer")
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    def test_stale_idle_placeholder_does_not_trigger_completed(self, mock_backend):
+        """kiro 2.11 renders the idle placeholder even during processing.
+
+        Right after send_input, the buffer has: pre-task idle placeholder text
+        (kept as chrome) + task echo that hasn't been submitted to the model yet.
+        Old Check 6 returned COMPLETED here (input_received + any idle match),
+        causing the worker to be torn down before it did any work. The new
+        Check 6 requires two separators + real content between them.
+        """
+        # Buffer state at ~2s post-send-input: idle placeholder still visible,
+        # no response content yet, no bordered response box.
+        output = (
+            f"{self.SEP}\n"
+            "developer · claude-opus-4.8 · ◔ 12%\n"
+            " ask a question or describe a task ↵\n"
+        )
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        provider.mark_input_received()  # simulate send_input having occurred
+        status = provider.get_status(output)
+
+        assert status != TerminalStatus.COMPLETED, (
+            "Bare idle placeholder + input_received must NOT return COMPLETED "
+            "(would tear down worker before it processes the task)"
+        )
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    def test_response_box_with_two_separators_yields_completed(self, mock_backend):
+        """A real completion frame has two separators bracketing the response."""
+        output = (
+            f"{self.SEP}\n"
+            "  What is 1+1?\n"
+            "\n"
+            "  The answer is 2.\n"
+            "\n"
+            f"{self.SEP}\n"
+            "developer · claude-opus-4.8 · ◔ 3%\n"
+            " Ask a question or describe a task ↵\n"
+        )
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        provider.mark_input_received()
+        assert provider.get_status(output) == TerminalStatus.COMPLETED
+
+    @patch("cli_agent_orchestrator.providers.kiro_cli.get_backend")
+    def test_single_separator_alone_does_not_yield_completed(self, mock_backend):
+        """A single separator (no bordered response box) is not enough for COMPLETED.
+
+        Guards against a lone TUI separator (e.g. from the header divider)
+        combined with the idle placeholder being mistaken for a completion.
+        """
+        output = (
+            f"{self.SEP}\n"
+            "developer · claude-opus-4.8 · ◔ 12%\n"
+            "some transient chrome line\n"
+            " ask a question or describe a task ↵\n"
+        )
+        provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
+        provider.mark_input_received()
+        assert provider.get_status(output) != TerminalStatus.COMPLETED

@@ -74,11 +74,20 @@ NEW_TUI_IDLE_PATTERN_LOG = r"[Aa]sk a question,? or describe a task"
 # Require 20+ chars to avoid matching short markdown separators in agent output.
 TUI_SEPARATOR_PATTERN = r"^[─]{20,}$"
 
+# Non-SGR CSI sequences (erase-line \x1b[2K, cursor moves, etc.) — everything
+# except colour codes ending in 'm'. Compiled once at module scope because
+# get_status() is on a hot path (called per output burst); recompiling per call
+# was avoidable overhead. Used in Check 6 to strip TUI chrome so the separator
+# regex can anchor on the raw ─── characters.
+_NON_SGR_CSI = re.compile(r"\x1b\[[0-9;?]*[^m]")
+
 # TUI Credits line: "▸ Credits: N.NN • Time: Ns" marks response completion
 TUI_CREDITS_PATTERN = r"▸\s*Credits:\s*[\d.]+"
 
-# TUI processing indicator: ghost text shown while agent is working
-TUI_PROCESSING_PATTERN = r"Kiro is working"
+# TUI processing indicator: ghost text shown while agent is working.
+# kiro-cli 2.11+ replaced "Kiro is working" with "Thinking..." (with an
+# optional "(esc to cancel)" suffix). Match either variant.
+TUI_PROCESSING_PATTERN = r"Kiro is working|Thinking\.\.\."
 
 # TUI initialization indicator: shown during startup before chat is ready.
 # Kiro TUI renders the idle prompt placeholder ("Ask a question or describe
@@ -104,7 +113,17 @@ TUI_INITIALIZING_PATTERN = (
 
 # TUI permission prompt: shown instead of legacy [y/n/t] format.
 # Requires all three options together to avoid false positives on "Yes"/"No" in agent output.
-TUI_PERMISSION_PATTERN = r"Yes\s+No\s+Always [Aa]llow"
+# Kiro 2.11 renders the same three-way choice with different wording for
+# subagent spawning: "Yes, single permission / Trust, always allow in this
+# session / No (Tab to edit)". Both alternatives anchor on the full Yes/Trust/No
+# option layout so agent output that merely mentions a permission prompt (or
+# quotes "subagent requires approval") can't flip status to WAITING_USER_ANSWER
+# — the bare header alternative was dropped for that reason. In practice
+# --trust-all-tools suppresses this prompt anyway; detection is a safety net.
+TUI_PERMISSION_PATTERN = (
+    r"Yes\s+No\s+Always [Aa]llow"
+    r"|Yes,\s*single permission[\s\S]{0,200}?Trust,\s*always allow[\s\S]{0,200}?No"
+)
 
 # =============================================================================
 # Error Detection
@@ -168,8 +187,18 @@ class KiroCliProvider(BaseProvider):
 
     @property
     def paste_enter_count(self) -> int:
-        """Kiro CLI submits on single Enter after bracketed paste."""
-        return 1
+        """Kiro CLI 2.11 needs 2 Enters after bracketed paste to submit.
+
+        The first Enter is consumed by the TUI (finalizes the paste), the
+        second submits the message. Older kiro versions only needed 1.
+        """
+        return 2
+
+    @property
+    def paste_submit_delay(self) -> float:
+        """Kiro 2.11's TUI needs a longer delay after bracketed paste before
+        the Enter key registers as submit rather than being swallowed."""
+        return 1.0
 
     def mark_input_received(self) -> None:
         """Track that input was sent, enabling separator-free completion detection."""
@@ -251,6 +280,15 @@ class KiroCliProvider(BaseProvider):
         yolo = bool(self._allowed_tools and "*" in self._allowed_tools)
         model = self._get_profile_model()
 
+        # kiro-cli 2.11 introduced a "subagent requires approval" prompt that
+        # blocks MCP tool calls that spawn subagents (e.g. cao-mcp-server's
+        # assign/handoff). Even for non-yolo profiles, CAO enforces tool
+        # scoping at its own layers (profile allowedTools + MCP allowlist),
+        # so passing --trust-all-tools is safe: it bypasses kiro's
+        # per-invocation UI prompt (there is no human at the terminal in
+        # headless orchestration to answer), while CAO still gates what
+        # tools can be called. Without this, a supervisor invoking assign()
+        # hangs indefinitely on the approval dialog.
         if yolo:
             logger.info(
                 "kiro_cli yolo mode: forcing --legacy-ui (kiro-cli 2.0.1 TUI "
@@ -258,7 +296,7 @@ class KiroCliProvider(BaseProvider):
             )
             base_args = ["kiro-cli", "chat", "--legacy-ui", "--trust-all-tools"]
         else:
-            base_args = ["kiro-cli", "chat"]
+            base_args = ["kiro-cli", "chat", "--trust-all-tools"]
         if model:
             base_args.extend(["--model", model])
         base_args.extend(["--agent", self._agent_profile])
@@ -293,7 +331,7 @@ class KiroCliProvider(BaseProvider):
             # against a clean buffer, not one still full of stale TUI marker bytes
             # from the failed first attempt (which would otherwise time out too).
             status_monitor.reset_buffer(self.terminal_id)
-            legacy_args = ["kiro-cli", "chat", "--legacy-ui"]
+            legacy_args = ["kiro-cli", "chat", "--legacy-ui", "--trust-all-tools"]
             if model:
                 legacy_args.extend(["--model", model])
             legacy_args.extend(["--agent", self._agent_profile])
@@ -483,36 +521,52 @@ class KiroCliProvider(BaseProvider):
             return TerminalStatus.PROCESSING
 
         # Check 6: Kiro CLI 2.3.0+ — no Credits marker emitted. Detect completion
-        # by presence of idle prompt after input was sent. For long responses the
-        # separator may have scrolled out of the capture buffer, so we search the
-        # entire buffer. If no separator is found but input was previously received,
-        # the idle prompt alone signals completion.
+        # by finding the bordered "response box" — two separators with ≥2 lines
+        # of non-empty content between them — followed by the idle prompt.
+        #
+        # kiro-cli 2.11+ keeps the "ask a question or describe a task" placeholder
+        # visible in the raw buffer at all times (it's part of the TUI chrome),
+        # so a bare idle-prompt match does NOT mean the agent finished. Requiring
+        # a full response box (two separators + content in between) distinguishes
+        # a real completion frame from the pre-response idle state where the
+        # placeholder is visible but the agent hasn't produced output yet.
+        # A minimal completion is user query + agent response = 2 non-empty lines
+        # inside the box.
         if has_new_tui_idle:
             lines = clean_output.split("\n")
+
+            # Strip non-SGR CSI (erase-line \x1b[2K, cursor moves, etc.) so
+            # the separator regex can see the raw ─── characters. The top-of-
+            # function strip only removes SGR codes ending in 'm' (color) —
+            # kiro's TUI prefixes many lines with \x1b[2K which would prevent
+            # the separator regex from anchoring at start-of-line.
+            # (_NON_SGR_CSI is compiled once at module scope — hot path.)
+            def _sep_line(line: str) -> str:
+                return _NON_SGR_CSI.sub("", line).strip()
+
             idle_line_idx = None
             for i in range(len(lines) - 1, -1, -1):
                 if re.search(NEW_TUI_IDLE_PATTERN, lines[i]):
                     idle_line_idx = i
                     break
             if idle_line_idx is not None:
-                # If input was sent, idle prompt alone means completion.
-                # The >=3 content check was blocking detection because the
-                # TUI's final frame only has the header between separator
-                # and idle prompt.
-                if self._input_received:
-                    logger.debug("get_status: returning COMPLETED (TUI idle after input)")
-                    return TerminalStatus.COMPLETED
-                # Before any input is sent, require separator + content to
-                # distinguish startup chrome from a real response.
+                # Find the last separator BEFORE the idle line.
+                last_sep_idx = None
                 for i in range(idle_line_idx - 1, -1, -1):
-                    if re.search(TUI_SEPARATOR_PATTERN, lines[i].strip()):
-                        content_between = [l for l in lines[i + 1 : idle_line_idx] if l.strip()]
-                        if len(content_between) >= 3:
-                            logger.debug(
-                                "get_status: returning COMPLETED (TUI no-credits fallback)"
-                            )
-                            return TerminalStatus.COMPLETED
+                    if re.search(TUI_SEPARATOR_PATTERN, _sep_line(lines[i])):
+                        last_sep_idx = i
                         break
+                if last_sep_idx is not None:
+                    # Find the previous separator, and require content between them.
+                    for j in range(last_sep_idx - 1, -1, -1):
+                        if re.search(TUI_SEPARATOR_PATTERN, _sep_line(lines[j])):
+                            content = [l for l in lines[j + 1 : last_sep_idx] if _sep_line(l)]
+                            if len(content) >= 2:
+                                logger.debug(
+                                    "get_status: returning COMPLETED (TUI no-credits fallback)"
+                                )
+                                return TerminalStatus.COMPLETED
+                            break
 
         # Default: Agent is IDLE, waiting for user input
         return TerminalStatus.IDLE

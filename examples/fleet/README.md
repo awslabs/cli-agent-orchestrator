@@ -17,7 +17,7 @@ behavior. It is the reference implementation for issue
 
 > **This is PR 1 of a 3-PR series for #349.** It ships the coordinator foundation
 > (bootstrap + AI conductor + the `fleet` helper + registry). The **web panel**
-> (`panel/`) lands in **PR #366** and the **full guide** (`docs/fleet_instructions.md`)
+> (`panel/`) lands in **PR #366** and the **full guide** (`docs/fleet-coordinator.md`)
 > in **PR #367**. Sections below tagged _(PR #366)_ / _(PR #367)_ are not runnable from
 > this PR alone.
 
@@ -136,5 +136,5 @@ The panel's Python + JS suites land with the panel in _PR #366_.
 
 This example lands as a short PR series against #349: (1) this coordinator
 foundation, (2) the web panel + live console (`panel/`, #366), (3) the guide
-(`docs/fleet_instructions.md`, #367). Provider adapters (Qwen/MiniMax) mentioned in
+(`docs/fleet-coordinator.md`, #367). Provider adapters (Qwen/MiniMax) mentioned in
 the issue are tracked separately.
