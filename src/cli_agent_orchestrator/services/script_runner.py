@@ -578,6 +578,10 @@ async def _drive_process(
             warnings=[f"run exceeded the {WORKFLOW_SCRIPT_TIMEOUT}s wall-clock bound"],
         )
 
+    if record.cancelled or record.state == RunState.CANCELLED:
+        await _reconcile_orphans(record.run_id)
+        return await _finalize(record, state=RunState.CANCELLED, kind="cancelled")
+
     rc = process.returncode
     if rc == 0:
         output, warnings = _scan_sentinel(stdout_ring.text())
