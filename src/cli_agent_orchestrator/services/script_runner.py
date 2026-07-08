@@ -543,7 +543,9 @@ async def _drive_process(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-    except (OSError, ValueError) as exc:
+    except (
+        Exception
+    ) as exc:  # noqa: BLE001 — spawn failure should not raise past the runner boundary
         # The OS/interpreter refused to spawn (e.g. the executable vanished, or a
         # bad exec argument) — this is a run failure, not an engine invariant
         # violation (module contract: only the lint gate and admission gates
@@ -588,10 +590,11 @@ async def _drive_process(
             warnings=[f"run exceeded the {WORKFLOW_SCRIPT_TIMEOUT}s wall-clock bound"],
         )
 
-    if record.cancelled:
+    if record.cancelled or record.state == RunState.CANCELLED:
         # A concurrent cancel_script_run already signalled, swept, and journaled
         # CANCELLED (A3) — the drive must not overwrite that with FAILED/COMPLETED
         # just because the process happened to exit after the cancel fired.
+        await _reconcile_orphans(record.run_id)
         return await _finalize(record, state=RunState.CANCELLED, kind="cancelled")
 
     rc = process.returncode
