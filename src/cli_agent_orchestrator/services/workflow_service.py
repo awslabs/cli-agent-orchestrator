@@ -923,8 +923,10 @@ def check_generation(run_id: str, generation: str) -> None:
     """Reject a stale-generation script call (A3, the ADR-9 anti-double-drive).
 
     Every script ``run-step`` call carries ``CAO_WORKFLOW_GENERATION`` (forwarded
-    by U2); the run-step handler calls this BEFORE doing any work (VR-3). Resume
-    bumps the run's generation BEFORE spawning (A4), so a reparented predecessor
+    by U2); the run-step handler (U5, ``api/main.py::run_step``) calls this BEFORE
+    doing any work whenever the request's ``env_vars`` carries BOTH
+    ``CAO_WORKFLOW_RUN_ID`` and ``CAO_WORKFLOW_GENERATION`` (VR-3). Resume bumps
+    the run's generation BEFORE spawning (A4), so a reparented predecessor
     subprocess that survived a crash still carries the OLD generation — its late
     calls land here and are fenced out (DR-5 -> ``StaleGenerationError`` -> 409).
 

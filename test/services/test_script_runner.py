@@ -96,7 +96,10 @@ class _FakeProcess:
     ``returncode`` is None until ``exit_rc`` is delivered. ``wait()`` returns
     immediately with ``exit_rc`` unless ``hang=True`` (then it awaits forever,
     exercising the wall-clock reaper). ``terminate``/``kill`` record the signal
-    order and settle the returncode so ``_terminate``'s reap completes.
+    order and settle the returncode so ``_terminate``'s reap completes — UNLESS
+    ``uncooperative=True``, in which case ``terminate()`` (SIGTERM) is recorded
+    but does NOT settle the process (an uncooperative child that ignores
+    SIGTERM), so only ``kill()`` (SIGKILL) releases ``wait()``.
     """
 
     def __init__(
@@ -106,12 +109,14 @@ class _FakeProcess:
         stdout: bytes = b"",
         stderr: bytes = b"",
         hang: bool = False,
+        uncooperative: bool = False,
     ):
         self._exit_rc = exit_rc
         self.returncode: Optional[int] = None
         self.stdout = _FakeStream(stdout)
         self.stderr = _FakeStream(stderr)
         self._hang = hang
+        self._uncooperative = uncooperative
         self.signals: List[str] = []
         self._exited = asyncio.Event()
         if not hang:
@@ -126,6 +131,8 @@ class _FakeProcess:
 
     def terminate(self) -> None:
         self.signals.append("SIGTERM")
+        if self._uncooperative:
+            return  # ignores SIGTERM — only kill() below releases wait()
         # A cooperative child exits on SIGTERM: settle + release wait().
         self.returncode = self._exit_rc
         self._exited.set()
@@ -255,6 +262,9 @@ async def test_happy_completed_result_shape_and_sentinel(monkeypatch: pytest.Mon
     row = workflow_journal.get_run("run-ok")
     assert row is not None and row.tier == "script" and row.generation == "1"
     assert row.state == "completed"
+    # F3: the journaled started_at is the SAME timestamp as the record's, not a
+    # second independent _now() call.
+    assert row.started_at == result.started_at
     # Constructed env is the exact 5-key allowlist (INV-2), no resume flag.
     env = captured["env"]
     assert set(env) == {
@@ -317,6 +327,8 @@ async def test_hang_timeout_reap_bumps_generation(monkeypatch: pytest.MonkeyPatc
     # Generation bumped + persisted on the timeout arm (INV-6, the straggler fence).
     row = workflow_journal.get_run("run-hang")
     assert row is not None and row.generation == "2"
+    # F10d: the wall-clock timeout marker is surfaced in warnings for observability.
+    assert any("[wall-clock timeout]" in w for w in result.warnings)
 
 
 @pytest.mark.asyncio
@@ -325,6 +337,50 @@ async def test_timeout_bound_helper_raises():
     proc = _FakeProcess(exit_rc=0, hang=True)
     with pytest.raises(TimeoutBound):
         await script_runner._await_exit_within_bound(proc, timeout=0.02)
+
+
+# ---------------------------------------------------------------------------
+# A4 — _terminate escalation (F7, Important #2)
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_terminate_escalates_to_sigkill_when_uncooperative():
+    """An uncooperative child (ignores SIGTERM) is escalated to SIGKILL and reaped."""
+    proc = _FakeProcess(exit_rc=0, hang=True, uncooperative=True)
+    await script_runner._terminate(proc, grace=0.05)
+    assert proc.signals == ["SIGTERM", "SIGKILL"]
+    assert proc.returncode == -9  # reaped after kill()
+
+
+@pytest.mark.asyncio
+async def test_terminate_cooperative_never_escalates():
+    """A cooperative child settles on SIGTERM alone — kill() is never called."""
+    proc = _FakeProcess(exit_rc=0, hang=True)
+    await script_runner._terminate(proc, grace=0.05)
+    assert proc.signals == ["SIGTERM"]
+    assert proc.returncode == 0
+
+
+@pytest.mark.asyncio
+async def test_spawn_failure_returns_failed_never_raises(monkeypatch: pytest.MonkeyPatch):
+    """F4: a spawn-time OSError is caught -> FAILED,kind=error; never raises.
+
+    Module contract: only the lint gate and admission gates raise out of U4 —
+    a spawn failure (e.g. the interpreter vanished) is a run failure, not an
+    engine invariant violation.
+    """
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+
+    async def _boom_exec(*a, **k):
+        raise FileNotFoundError("no such file: python3")
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.script_runner.asyncio.create_subprocess_exec",
+        _boom_exec,
+    )
+    result = await run_script_workflow(_FakeScriptSpec(), {}, "run-spawn-fail")
+    assert result.state == RunState.FAILED
+    assert result.kind == "error"
+    assert any("spawn failed" in w for w in result.warnings)
 
 
 @pytest.mark.asyncio
@@ -374,6 +430,49 @@ async def test_cancel_signal_first_order(monkeypatch: pytest.MonkeyPatch):
     row = workflow_journal.get_run("run-cancel")
     assert row is not None and row.generation == "2"
     assert row.state == "cancelled"  # retained -> resumable for scripts
+
+
+@pytest.mark.asyncio
+async def test_cancel_drive_race_drive_yields_to_cancelled(monkeypatch: pytest.MonkeyPatch):
+    """F2: cancel wins a race with the drive's own exit interpretation.
+
+    A cancel signals the process; the process then "exits" (rc != 0, as an
+    unrelated SIGTERM-adjacent death would look). ``_drive_process`` must check
+    ``record.cancelled`` BEFORE interpreting ``rc`` and defer to the CANCELLED
+    result cancel_script_run already journaled — never overwrite it with
+    FAILED.
+    """
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _noop_sweep)
+    proc = _FakeProcess(exit_rc=1)  # would-be FAILED if cancel had not already fired
+    _install_fake_spawn(monkeypatch, proc)
+
+    _seed_script_run("run-race", generation="1")
+    record = _make_record("run-race", process=None, generation="1")
+    from cli_agent_orchestrator.services import workflow_service
+
+    workflow_service.run_registry["run-race"] = record
+    env = script_runner._build_env("run-race", "1")
+
+    async def _cancel_mid_flight():
+        # Simulate cancel_script_run having already fired: signal + journal
+        # CANCELLED, set the flag the drive must respect.
+        record.cancelled = True
+        record.state = RunState.CANCELLED
+        record.finished_at = script_runner._now()
+        await asyncio.to_thread(
+            workflow_journal.update_run_state,
+            "run-race",
+            RunState.CANCELLED.value,
+            record.finished_at,
+        )
+
+    await _cancel_mid_flight()
+    result = await script_runner._drive_process(record, "/tmp/wf.py", env)
+
+    assert result.state == RunState.CANCELLED
+    assert result.kind == "cancelled"
+    row = workflow_journal.get_run("run-race")
+    assert row is not None and row.state == "cancelled"  # drive did not overwrite it
 
 
 @pytest.mark.asyncio
@@ -431,6 +530,59 @@ async def test_resume_live_run_raises_not_allowed(monkeypatch: pytest.MonkeyPatc
         proc.terminate()
         await asyncio.wait_for(drive, timeout=5.0)
     assert "run-live" not in workflow_service._active_drives  # cleared on drive exit
+
+
+@pytest.mark.asyncio
+async def test_resume_toctou_second_concurrent_resume_rejected(monkeypatch: pytest.MonkeyPatch):
+    """F5: a second concurrent resume is fenced even while the first is pre-spawn.
+
+    Without marking ``_active_drives`` immediately after Gate 2, two resumes for
+    the same run_id could both pass Gate 2 before either registers liveness (a
+    TOCTOU double-drive). We block the FIRST resume inside a patched
+    ``update_run_generation`` (after Gate 2 passes, before spawn — it runs via
+    ``asyncio.to_thread``, so blocking with a plain ``threading.Event`` does not
+    freeze the event loop) and assert a SECOND concurrent resume attempt hits
+    Gate 2 and gets ``ResumeNotAllowedError`` while the first is still blocked.
+    """
+    import threading
+
+    from cli_agent_orchestrator.services import workflow_service
+    from cli_agent_orchestrator.services.workflow_service import update_run_generation
+
+    _seed_script_run("run-toctou", state="failed", generation="1")
+
+    first_blocked = threading.Event()
+    release_first = threading.Event()
+
+    def _blocking_update_run_generation(run_id, generation):
+        first_blocked.set()
+        release_first.wait(timeout=5.0)
+        return update_run_generation(run_id, generation)
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.workflow_service.update_run_generation",
+        _blocking_update_run_generation,
+    )
+
+    first = asyncio.create_task(resume_script_run("run-toctou"))
+    try:
+        for _ in range(500):
+            if first_blocked.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert first_blocked.is_set()
+        # The first resume passed Gate 2 and is now blocked pre-spawn — it must
+        # already be marked live so a second concurrent resume is fenced.
+        assert "run-toctou" in workflow_service._active_drives
+        with pytest.raises(ResumeNotAllowedError):
+            await resume_script_run("run-toctou")
+    finally:
+        release_first.set()
+        # Let the first resume's drive (real spawn, mocked below) settle.
+        proc = _FakeProcess(exit_rc=0)
+        _install_fake_spawn(monkeypatch, proc)
+        await asyncio.wait_for(first, timeout=5.0)
+    assert "run-toctou" not in workflow_service._active_drives
 
 
 @pytest.mark.asyncio
@@ -576,6 +728,10 @@ async def test_orphan_sweep_teardown_failure_never_raises(monkeypatch: pytest.Mo
     workflow_service.run_registry["run-sweep-fail"] = record
     # Must not raise.
     await script_runner._reconcile_orphans("run-sweep-fail")
+    # F10c: the swallowed teardown failure leaves the record's in-flight step
+    # untouched — the sweep never mutates state on a failure, it only logs.
+    assert record.step_states["s1"].state == StepState.RUNNING
+    assert record.step_states["s1"].terminal_id == "term-x"
 
 
 # ---------------------------------------------------------------------------
@@ -593,7 +749,11 @@ def test_terminal_recorder_none_without_script_record():
 
 
 def test_terminal_recorder_records_into_step_states():
-    """The recorder writes terminal_id into the shared record's step_states (BR-31)."""
+    """The recorder writes terminal_id into the shared record's step_states (BR-31).
+
+    F9(a) new-StepRunState branch: no ``step_states[step_id]`` entry exists yet,
+    so the recorder creates one (RUNNING) before writing ``terminal_id``.
+    """
     record = _make_record("run-rec", process=None, generation="1")
     from cli_agent_orchestrator.services import workflow_service
 
@@ -605,6 +765,61 @@ def test_terminal_recorder_records_into_step_states():
     recorder("term-created")
     assert record.step_states["s1"].terminal_id == "term-created"
     assert record.step_states["s1"].state == StepState.RUNNING
+
+
+def test_terminal_recorder_updates_already_present_step_state():
+    """F9(a) already-present branch: an existing StepRunState's terminal_id is
+    overwritten rather than the entry being replaced."""
+    record = _make_record("run-rec2", process=None, generation="1")
+    record.step_states["s1"] = StepRunState(
+        step_id="s1", state=StepState.RUNNING, attempts=2, terminal_id="term-old"
+    )
+    from cli_agent_orchestrator.services import workflow_service
+
+    workflow_service.run_registry["run-rec2"] = record
+    recorder = make_step_terminal_recorder(
+        {"CAO_WORKFLOW_RUN_ID": "run-rec2", "CAO_WORKFLOW_STEP_ID": "s1"}
+    )
+    assert recorder is not None
+    recorder("term-new")
+    assert record.step_states["s1"].terminal_id == "term-new"
+    assert record.step_states["s1"].attempts == 2  # untouched, only terminal_id updates
+
+
+def test_terminal_recorder_none_for_non_script_record():
+    """F9(c) a live but non-``ScriptRunRecord`` (YAML tier) registry entry -> None."""
+    from cli_agent_orchestrator.models.workflow import WorkflowSpec
+    from cli_agent_orchestrator.services import workflow_service
+    from cli_agent_orchestrator.services.workflow_service import RunRecord
+
+    yaml_record = RunRecord(
+        run_id="run-yaml",
+        workflow_name="wf",
+        spec=WorkflowSpec.model_validate(
+            {
+                "name": "wf",
+                "version": "1",
+                "mode": "sequential",
+                "steps": [
+                    {"id": "s1", "provider": "kiro_cli", "agent": "developer", "prompt": "do it"}
+                ],
+            }
+        ),
+        inputs={},
+        state=RunState.RUNNING,
+        cancelled=False,
+        current_step_id=None,
+        step_states={},
+        started_at="2026-07-08T00:00:00Z",
+        finished_at=None,
+    )
+    workflow_service.run_registry["run-yaml"] = yaml_record
+    assert (
+        make_step_terminal_recorder(
+            {"CAO_WORKFLOW_RUN_ID": "run-yaml", "CAO_WORKFLOW_STEP_ID": "s1"}
+        )
+        is None
+    )
 
 
 # ---------------------------------------------------------------------------

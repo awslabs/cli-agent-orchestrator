@@ -1337,9 +1337,30 @@ async def run_step(
     # shared ScriptRunRecord's step_states AT creation time, so U4's orphan sweep
     # can tear it down if the subprocess dies mid-call. No-op for YAML/handoff
     # callers (no run/step env or no script record in the registry).
+    from cli_agent_orchestrator.services import workflow_service
     from cli_agent_orchestrator.services.script_runner import make_step_terminal_recorder
+    from cli_agent_orchestrator.services.workflow_service import StaleGenerationError
 
     on_terminal_created = make_step_terminal_recorder(body.env_vars)
+
+    # The generation fence (ADR-9 anti-double-drive, DR-5): a script run-step call
+    # carrying BOTH CAO_WORKFLOW_RUN_ID and CAO_WORKFLOW_GENERATION must be checked
+    # against the run's current journaled generation BEFORE dispatch — a resume or
+    # cancel bumps the generation, and a reparented predecessor subprocess's late
+    # calls must be fenced out rather than allowed to run.
+    env_vars = body.env_vars or {}
+    fence_run_id = env_vars.get("CAO_WORKFLOW_RUN_ID")
+    fence_generation = env_vars.get("CAO_WORKFLOW_GENERATION")
+    if fence_run_id is not None and fence_generation is not None:
+        try:
+            workflow_service.check_generation(fence_run_id, fence_generation)
+        except StaleGenerationError as e:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"run '{fence_run_id}': {e}",
+            )
+        except KeyError as e:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
     try:
         result = await run_agent_step(

@@ -417,10 +417,10 @@ def _materialize_snapshot(run_id: str, source: str) -> str:
     path = scratch / f"resume-{run_id}.py"
     # Open with O_CREAT|O_EXCL-free write but an explicit restrictive mode: create
     # owner-only, truncating any stale file from a prior aborted resume.
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
     try:
         fh = os.fdopen(fd, "w", encoding="utf-8")
-    except Exception:
+    except OSError:
         # os.fdopen failed to wrap the fd, so it never took ownership — close the
         # raw fd ourselves to avoid a descriptor leak, then re-raise.
         os.close(fd)
@@ -535,13 +535,27 @@ async def _drive_process(
     only difference is the env (``CAO_WORKFLOW_RESUME``) and the script path
     (author file vs materialized snapshot). Never ``shell=True`` (C-2).
     """
-    record.process = await asyncio.create_subprocess_exec(
-        sys.executable,
-        script_path,
-        env=env,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    try:
+        record.process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            script_path,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except (OSError, ValueError) as exc:
+        # The OS/interpreter refused to spawn (e.g. the executable vanished, or a
+        # bad exec argument) — this is a run failure, not an engine invariant
+        # violation (module contract: only the lint gate and admission gates
+        # raise). Sweep any already-recorded in-flight terminals and settle FAILED.
+        logger.warning("script run '%s' failed to spawn: %s", record.run_id, exc)
+        await _reconcile_orphans(record.run_id)
+        return await _finalize(
+            record,
+            state=RunState.FAILED,
+            kind="error",
+            error=f"spawn failed: {exc}",
+        )
     process = record.process
 
     stdout_ring = _RingBuffer(WORKFLOW_SCRIPT_LOG_CAP)
@@ -573,6 +587,12 @@ async def _drive_process(
             error=(stderr_tail + "\n[wall-clock timeout]").strip(),
             warnings=[f"run exceeded the {WORKFLOW_SCRIPT_TIMEOUT}s wall-clock bound"],
         )
+
+    if record.cancelled:
+        # A concurrent cancel_script_run already signalled, swept, and journaled
+        # CANCELLED (A3) — the drive must not overwrite that with FAILED/COMPLETED
+        # just because the process happened to exit after the cancel fired.
+        return await _finalize(record, state=RunState.CANCELLED, kind="cancelled")
 
     rc = process.returncode
     if rc == 0:
@@ -676,7 +696,7 @@ async def run_script_workflow(spec: Any, inputs: Dict[str, Any], run_id: str) ->
             spec_snapshot,
             json.dumps(inputs),
             RunState.RUNNING.value,
-            _now(),
+            record.started_at,
             "script",
             "1",
         )
@@ -742,61 +762,65 @@ async def resume_script_run(run_id: str) -> WorkflowRunResult:
             f"run '{run_id}' is currently executing; cannot resume a live run"
         )
 
-    # --- Gate 3: terminal-state / tier resumability (delegated to U3) -> 409 ---
-    if not _is_resumable_for_tier(row):
-        raise ResumeNotAllowedError(f"run '{run_id}' is {row.state}; not resumable")
-
-    # --- Gate 4: corrupt snapshot -> 422 (script-tier rebuild, NOT the YAML rebuild) ---
-    try:
-        snapshot = json.loads(row.spec_snapshot)
-        source = snapshot["source"]
-        if not isinstance(source, str):
-            raise ValueError("spec_snapshot.source is not a string")
-    except (ValueError, TypeError, KeyError) as e:
-        raise ResumeCorruptError(f"run '{run_id}' snapshot is corrupt: {e}") from e
-
-    # Script-tier record reconstruction (CONTRADICTION #3): minimal, from RunRow.
-    # Does NOT reuse the YAML _rebuild_record_from_journal (which YAML-validates
-    # spec_snapshot and would degrade a ScriptSpec snapshot to corrupt).
-    record = ScriptRunRecord(
-        run_id=row.run_id,
-        workflow_name=row.workflow_name,
-        state=RunState.RUNNING,
-        cancelled=False,
-        current_step_id=None,
-        step_states={},
-        process=None,
-        generation=row.generation,
-        started_at=row.started_at,
-        finished_at=None,
-        tier="script",
-    )
-
-    # --- Execution: bump + PERSIST generation BEFORE spawn (INV-6, load-bearing) ---
-    record.generation = _bump(row.generation)
-    # NOT best-effort: an unpersisted bump would let an orphan's old-generation
-    # calls through (U3's update_run_generation raises on failure by design).
-    await asyncio.to_thread(update_run_generation, run_id, record.generation)
-    run_registry[run_id] = record
-
-    # Re-open the durable row to RUNNING (best-effort) so a status read reflects it.
-    try:
-        await asyncio.to_thread(
-            workflow_journal.update_run_state, run_id, RunState.RUNNING.value, None
-        )
-    except (
-        Exception
-    ) as e:  # noqa: BLE001 — journal reopen write is best-effort; live floor serves (INV-4)
-        logger.warning("journal: resume reopen state write for '%s' failed: %s", run_id, e)
-
-    env = _build_env(run_id, record.generation, resume=True)
-    snapshot_path = _materialize_snapshot(run_id, source)
-    # Mark the drive live for the whole spawn->reap window so a concurrent resume
-    # hits Gate 2 (b4c1 liveness truth, mirrors base _drive_resume at
-    # workflow_service.py:1125). The ``finally`` clears it AND deletes the temp
-    # file on EVERY exit path so a settled run stays resumable (BR-30).
+    # Mark the drive live IMMEDIATELY after Gate 2 passes — before the generation
+    # bump or any other await — so a second concurrent resume for the SAME run_id
+    # hits Gate 2 even while this resume is still pre-spawn (TOCTOU: without this,
+    # two resumes could both pass Gate 2 and double-drive). The ``finally`` spans
+    # the ENTIRE remainder of the function so the discard (and temp-file delete)
+    # still fire on every exit path — including a Gate-3/Gate-4 rejection or an
+    # ``update_run_generation`` raise — not just the happy spawn path.
     _active_drives.add(run_id)
+    snapshot_path: Optional[str] = None
     try:
+        # --- Gate 3: terminal-state / tier resumability (delegated to U3) -> 409 ---
+        if not _is_resumable_for_tier(row):
+            raise ResumeNotAllowedError(f"run '{run_id}' is {row.state}; not resumable")
+
+        # --- Gate 4: corrupt snapshot -> 422 (script-tier rebuild, NOT the YAML rebuild) ---
+        try:
+            snapshot = json.loads(row.spec_snapshot)
+            source = snapshot["source"]
+            if not isinstance(source, str):
+                raise ValueError("spec_snapshot.source is not a string")
+        except (ValueError, TypeError, KeyError) as e:
+            raise ResumeCorruptError(f"run '{run_id}' snapshot is corrupt: {e}") from e
+
+        # Script-tier record reconstruction (CONTRADICTION #3): minimal, from RunRow.
+        # Does NOT reuse the YAML _rebuild_record_from_journal (which YAML-validates
+        # spec_snapshot and would degrade a ScriptSpec snapshot to corrupt).
+        record = ScriptRunRecord(
+            run_id=row.run_id,
+            workflow_name=row.workflow_name,
+            state=RunState.RUNNING,
+            cancelled=False,
+            current_step_id=None,
+            step_states={},
+            process=None,
+            generation=row.generation,
+            started_at=row.started_at,
+            finished_at=None,
+            tier="script",
+        )
+
+        # --- Execution: bump + PERSIST generation BEFORE spawn (INV-6, load-bearing) ---
+        record.generation = _bump(row.generation)
+        # NOT best-effort: an unpersisted bump would let an orphan's old-generation
+        # calls through (U3's update_run_generation raises on failure by design).
+        await asyncio.to_thread(update_run_generation, run_id, record.generation)
+        run_registry[run_id] = record
+
+        # Re-open the durable row to RUNNING (best-effort) so a status read reflects it.
+        try:
+            await asyncio.to_thread(
+                workflow_journal.update_run_state, run_id, RunState.RUNNING.value, None
+            )
+        except (
+            Exception
+        ) as e:  # noqa: BLE001 — journal reopen write is best-effort; live floor serves (INV-4)
+            logger.warning("journal: resume reopen state write for '%s' failed: %s", run_id, e)
+
+        env = _build_env(run_id, record.generation, resume=True)
+        snapshot_path = _materialize_snapshot(run_id, source)
         return await _drive_process(record, snapshot_path, env)
     finally:
         _active_drives.discard(run_id)
