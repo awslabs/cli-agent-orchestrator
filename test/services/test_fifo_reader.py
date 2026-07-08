@@ -179,13 +179,17 @@ class TestReaderLoopCoalescing:
         def fake_publish(topic, payload):
             published.append({"topic": topic, "data": payload["data"]})
 
+        # _reader_loop is an instance method (it records per-terminal liveness
+        # on self for the #388 watchdog), so it needs a bound manager, not the
+        # bare unbound function.
+        manager = FifoManager()
         stop_flag = threading.Event()
         with patch(
             "cli_agent_orchestrator.services.fifo_reader.bus.publish",
             side_effect=fake_publish,
         ):
             reader = threading.Thread(
-                target=FifoManager._reader_loop,
+                target=manager._reader_loop,
                 args=("term-coalesce", fifo_path, stop_flag),
                 daemon=True,
             )
@@ -240,13 +244,17 @@ class TestReaderLoopCoalescing:
         def fake_publish(topic, payload):
             published.append({"topic": topic, "data": payload["data"]})
 
+        # _reader_loop is an instance method (it records per-terminal liveness
+        # on self for the #388 watchdog), so it needs a bound manager, not the
+        # bare unbound function.
+        manager = FifoManager()
         stop_flag = threading.Event()
         with patch(
             "cli_agent_orchestrator.services.fifo_reader.bus.publish",
             side_effect=fake_publish,
         ):
             reader = threading.Thread(
-                target=FifoManager._reader_loop,
+                target=manager._reader_loop,
                 args=("term-flush", fifo_path, stop_flag),
                 daemon=True,
             )
@@ -269,3 +277,157 @@ class TestReaderLoopCoalescing:
         assert len(published) >= 1, "Pending data was never flushed"
         combined = "".join(p["data"] for p in published)
         assert "lonely-chunk" in combined
+
+
+class TestPipeLivenessWatchdog:
+    """Issue #388: tmux's pipe-pane forwarder can silently stop delivering bytes
+    to the FIFO after an alternate-screen redraw burst — the pane keeps
+    rendering (visible via capture-pane) but the piped copy freezes, so the FIFO
+    reader, the StatusMonitor buffer, and GET /terminals/{id}/output stall on
+    stale content indefinitely. The watchdog compares tmux's live pane content
+    against whether the FIFO delivered any bytes and re-arms a stalled forwarder.
+
+    These drive ``_check_pipe_liveness`` directly (no real tmux, no timing) so
+    the detect/idle/healthy branches are deterministic. Enrollment/threading is
+    covered separately below.
+    """
+
+    def _manager(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cli_agent_orchestrator.services.fifo_reader.FIFO_DIR", tmp_path)
+        return FifoManager()
+
+    def _enroll(self, manager, terminal_id, pane_holder, rearm_calls, last_data_at):
+        """Register a terminal with fake probe/rearm WITHOUT starting the reader
+        thread or the real watchdog — we call _check_pipe_liveness by hand."""
+        manager._pane_probe[terminal_id] = lambda: pane_holder["content"]
+        manager._rearm[terminal_id] = lambda: rearm_calls.append(True)
+        manager._last_data_at[terminal_id] = last_data_at
+
+    def test_stall_is_detected_and_pipe_rearmed(self, tmp_path, monkeypatch):
+        """Pane advanced but the FIFO delivered nothing since the last check ->
+        the forwarder is stalled and gets re-armed."""
+        import time
+
+        manager = self._manager(tmp_path, monkeypatch)
+        pane = {"content": "line0"}
+        rearm_calls: list = []
+        # FIFO's last delivery is in the past — it has been silent.
+        self._enroll(manager, "term", pane, rearm_calls, last_data_at=time.monotonic())
+
+        # First check just establishes a baseline, never acts.
+        manager._check_pipe_liveness("term")
+        assert rearm_calls == []
+
+        # Pane advances (redraw) while the FIFO stays silent -> stall.
+        pane["content"] = "line0\nline1 (rendered but never piped)"
+        manager._check_pipe_liveness("term")
+        assert rearm_calls == [True], "a stalled pipe-pane forwarder must be re-armed"
+
+    def test_idle_terminal_is_not_rearmed(self, tmp_path, monkeypatch):
+        """Pane unchanged + FIFO silent = a genuinely idle terminal, which must
+        NOT trigger a needless re-pipe (the false-positive guard)."""
+        import time
+
+        manager = self._manager(tmp_path, monkeypatch)
+        pane = {"content": "idle prompt"}
+        rearm_calls: list = []
+        self._enroll(manager, "term", pane, rearm_calls, last_data_at=time.monotonic())
+
+        for _ in range(4):
+            manager._check_pipe_liveness("term")  # pane never changes
+        assert rearm_calls == [], "an idle terminal must never be re-armed"
+
+    def test_healthy_pipe_is_not_rearmed(self, tmp_path, monkeypatch):
+        """Pane advancing AND the FIFO delivering bytes = a healthy pipe; no
+        re-arm even though the screen keeps changing."""
+        import time
+
+        manager = self._manager(tmp_path, monkeypatch)
+        pane = {"content": "line0"}
+        rearm_calls: list = []
+        self._enroll(manager, "term", pane, rearm_calls, last_data_at=time.monotonic())
+
+        manager._check_pipe_liveness("term")  # baseline
+        for i in range(1, 4):
+            pane["content"] = f"line{i}"
+            # Simulate the reader delivering a byte right before this check.
+            manager._last_data_at["term"] = time.monotonic()
+            manager._check_pipe_liveness("term")
+        assert rearm_calls == [], "a healthy, delivering pipe must never be re-armed"
+
+    def test_rearm_replays_live_pane_into_pipeline(self, tmp_path, monkeypatch):
+        """After re-arm the lost bytes are gone, but the pane's CURRENT content
+        is republished so the StatusMonitor buffer / GET output stop being frozen
+        instead of waiting for the agent to emit something new."""
+        import time
+
+        from cli_agent_orchestrator.services import fifo_reader as fr
+
+        published: list = []
+        monkeypatch.setattr(fr.bus, "publish", lambda topic, data: published.append((topic, data)))
+
+        manager = self._manager(tmp_path, monkeypatch)
+        pane = {"content": "before"}
+        rearm_calls: list = []
+        self._enroll(manager, "term", pane, rearm_calls, last_data_at=time.monotonic())
+
+        manager._check_pipe_liveness("term")  # baseline
+        pane["content"] = "current live screen the pipe never forwarded"
+        manager._check_pipe_liveness("term")
+
+        assert rearm_calls == [True]
+        assert ("terminal.term.output", {"data": pane["content"]}) in published
+
+    def test_stall_requires_configured_consecutive_checks(self, tmp_path, monkeypatch):
+        """With PIPE_LIVENESS_STALL_CHECKS > 1, a single diverging check is not
+        enough — re-arm waits for the configured number of consecutive stalls."""
+        import time
+
+        from cli_agent_orchestrator.services import fifo_reader as fr
+
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_STALL_CHECKS", 2)
+        manager = self._manager(tmp_path, monkeypatch)
+        pane = {"content": "l0"}
+        rearm_calls: list = []
+        self._enroll(manager, "term", pane, rearm_calls, last_data_at=time.monotonic())
+
+        manager._check_pipe_liveness("term")  # baseline
+        pane["content"] = "l1"
+        manager._check_pipe_liveness("term")  # strike 1 — not yet
+        assert rearm_calls == []
+        pane["content"] = "l2"
+        manager._check_pipe_liveness("term")  # strike 2 — re-arm
+        assert rearm_calls == [True]
+
+    def test_create_reader_enrolls_and_starts_watchdog(self, tmp_path, monkeypatch):
+        """A tmux caller passing probe+rearm enrolls the terminal and starts the
+        watchdog; stop_reader unenrolls it and clears its liveness state."""
+        manager = self._manager(tmp_path, monkeypatch)
+        try:
+            manager.create_reader(
+                "term-enroll",
+                pane_probe=lambda: "content",
+                rearm=lambda: None,
+            )
+            assert "term-enroll" in manager._pane_probe
+            assert "term-enroll" in manager._rearm
+            assert manager._watchdog_thread is not None
+            assert manager._watchdog_thread.is_alive()
+
+            manager.stop_reader("term-enroll")
+            assert "term-enroll" not in manager._pane_probe
+            assert "term-enroll" not in manager._rearm
+            assert "term-enroll" not in manager._liveness
+        finally:
+            manager.stop_watchdog()
+
+    def test_create_reader_without_callbacks_is_not_watched(self, tmp_path, monkeypatch):
+        """Backward compat: callers that omit probe/rearm (or backends without
+        pipe-pane) get the old behavior — no enrollment, no watchdog thread."""
+        manager = self._manager(tmp_path, monkeypatch)
+        manager.create_reader("term-plain")
+        try:
+            assert "term-plain" not in manager._pane_probe
+            assert manager._watchdog_thread is None
+        finally:
+            manager.stop_reader("term-plain")

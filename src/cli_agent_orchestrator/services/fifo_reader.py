@@ -8,9 +8,13 @@ import os
 import select
 import threading
 import time
-from typing import Dict
+from typing import Callable, Dict, Optional, Tuple
 
-from cli_agent_orchestrator.constants import FIFO_DIR
+from cli_agent_orchestrator.constants import (
+    FIFO_DIR,
+    PIPE_LIVENESS_CHECK_INTERVAL_S,
+    PIPE_LIVENESS_STALL_CHECKS,
+)
 from cli_agent_orchestrator.services.event_bus import bus
 
 logger = logging.getLogger(__name__)
@@ -38,19 +42,65 @@ _COALESCE_WINDOW = 0.05
 # of ~16 back-to-back reads is fine.
 _COALESCE_MAX_BYTES = 64 * 1024
 
+# Type of the per-terminal callbacks the pipe-pane liveness watchdog needs.
+# Kept as injected callables so FifoManager stays backend-agnostic (it knows
+# nothing about tmux sessions/windows or the backend) and unit-testable with
+# fakes. terminal_service wires the real backend calls at create_reader time.
+PaneProbe = Callable[[], str]  # returns the live pane content (tmux capture-pane tail)
+RearmPipe = Callable[[], None]  # re-attaches pipe-pane (stop then start, NOT a bare toggle)
+
 
 class FifoManager:
-    """Manages FIFO lifecycle: create named pipe, start reader thread, stop and cleanup."""
+    """Manages FIFO lifecycle: create named pipe, start reader thread, stop and cleanup.
+
+    Also runs a pipe-pane liveness watchdog (issue #388): tmux can silently
+    stop forwarding a pane's output to the FIFO after a burst of alternate-screen
+    redraws — the pane keeps rendering but the piped copy freezes, and nothing
+    errors (``pane_pipe`` still reports 1, the reader thread is healthy, there is
+    simply no data to read). From inside the FIFO reader a stalled forwarder is
+    indistinguishable from a genuinely idle terminal, so the watchdog compares
+    tmux's *live* pane content against whether the FIFO delivered any bytes: pane
+    advanced + FIFO silent = a stall, which it self-heals by re-arming the pipe.
+    """
 
     def __init__(self):
         self._readers: Dict[str, threading.Event] = {}  # terminal_id -> stop flag
         self._threads: Dict[str, threading.Thread] = {}
         self._lock = threading.Lock()
+
+        # ---- pipe-pane liveness watchdog state (issue #388) ----
+        # Monotonic timestamp of the last byte the FIFO reader delivered for a
+        # terminal. Updated by the reader thread; read by the watchdog to tell a
+        # stalled pipe (pane moving, FIFO silent) from a genuinely idle one.
+        self._last_data_at: Dict[str, float] = {}
+        # Per-terminal probes/re-arm callbacks (only tmux/pipe-pane terminals
+        # register these; herdr and callers that pass none are never watched).
+        self._pane_probe: Dict[str, PaneProbe] = {}
+        self._rearm: Dict[str, RearmPipe] = {}
+        # Per-terminal watchdog bookkeeping: (last_pane_hash, last_check_monotonic,
+        # consecutive_diverging_checks).
+        self._liveness: Dict[str, Tuple[int, float, int]] = {}
+        self._watchdog_stop = threading.Event()
+        self._watchdog_thread: Optional[threading.Thread] = None
+
         FIFO_DIR.mkdir(parents=True, exist_ok=True)
 
-    def create_reader(self, terminal_id: str) -> None:
-        """Create FIFO and start reader thread."""
+    def create_reader(
+        self,
+        terminal_id: str,
+        pane_probe: Optional[PaneProbe] = None,
+        rearm: Optional[RearmPipe] = None,
+    ) -> None:
+        """Create FIFO and start reader thread.
+
+        ``pane_probe``/``rearm`` are optional and only supplied by pipe-pane
+        (tmux) callers. When both are given, the terminal is enrolled in the
+        liveness watchdog (issue #388). Callers that omit them (or backends
+        without pipe-pane) get exactly the old behavior — no watchdog.
+        """
         fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
+
+        enroll = pane_probe is not None and rearm is not None
 
         with self._lock:
             if terminal_id in self._readers:
@@ -68,7 +118,16 @@ class FifoManager:
             )
             self._readers[terminal_id] = stop_flag
             self._threads[terminal_id] = thread
+            # Seed the liveness clock BEFORE pipe-pane starts so the first
+            # watchdog check has a baseline; the reader bumps it on real data.
+            self._last_data_at[terminal_id] = time.monotonic()
+            if enroll:
+                self._pane_probe[terminal_id] = pane_probe
+                self._rearm[terminal_id] = rearm
             thread.start()
+
+        if enroll:
+            self._ensure_watchdog()
 
         logger.info(f"Started FIFO reader for terminal {terminal_id}")
 
@@ -84,6 +143,12 @@ class FifoManager:
         with self._lock:
             stop_flag = self._readers.pop(terminal_id, None)
             thread = self._threads.pop(terminal_id, None)
+            # Drop watchdog bookkeeping so a re-created terminal starts clean and
+            # the watchdog stops probing a gone pane.
+            self._pane_probe.pop(terminal_id, None)
+            self._rearm.pop(terminal_id, None)
+            self._liveness.pop(terminal_id, None)
+            self._last_data_at.pop(terminal_id, None)
 
         fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
 
@@ -114,8 +179,7 @@ class FifoManager:
         except OSError:
             pass
 
-    @staticmethod
-    def _reader_loop(terminal_id: str, fifo_path, stop_flag: threading.Event) -> None:
+    def _reader_loop(self, terminal_id: str, fifo_path, stop_flag: threading.Event) -> None:
         """Read chunks from FIFO and publish to the event bus.
 
         Never blocks in a FIFO ``open()`` (issue #382): the previous design
@@ -147,6 +211,11 @@ class FifoManager:
         during bursts while staying well under the status monitor's 200ms
         quiescence debounce, so detection is unaffected and consumers see
         the same bytes in the same order.
+
+        Liveness bookkeeping for the pipe-pane watchdog (issue #388) is
+        recorded independent of coalescing, right when bytes are pulled off
+        the FIFO — the watchdog only cares whether the FIFO delivered data
+        in a window, not whether/when that data was published.
         """
         topic = f"terminal.{terminal_id}.output"
         read_fd = -1
@@ -175,6 +244,14 @@ class FifoManager:
                     except BlockingIOError:
                         raw = b""
                     if raw:
+                        # Record liveness for the pipe-pane watchdog (issue
+                        # #388): the watchdog treats "pane advanced but no
+                        # byte delivered since the last check" as a stall.
+                        # This must be recorded the instant bytes are pulled
+                        # off the FIFO, independent of the coalescing/publish
+                        # schedule below — the watchdog cares whether the FIFO
+                        # delivered data, not whether/when a batch flushed.
+                        self._last_data_at[terminal_id] = time.monotonic()
                         if not pending:
                             batch_start = time.monotonic()
                         pending.extend(raw)
@@ -208,6 +285,105 @@ class FifoManager:
                         os.close(fd)
                     except OSError:
                         pass
+
+    # ---- pipe-pane liveness watchdog (issue #388) ---------------------------
+
+    def _ensure_watchdog(self) -> None:
+        """Start the single background watchdog thread on first enrolled reader."""
+        with self._lock:
+            if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
+                return
+            self._watchdog_stop.clear()
+            self._watchdog_thread = threading.Thread(
+                target=self._watchdog_loop,
+                daemon=True,
+                name="fifo-pipe-watchdog",
+            )
+            self._watchdog_thread.start()
+
+    def stop_watchdog(self) -> None:
+        """Stop the watchdog thread (shutdown / tests)."""
+        self._watchdog_stop.set()
+        thread = self._watchdog_thread
+        if thread is not None:
+            thread.join(timeout=2.0)
+
+    def _watchdog_loop(self) -> None:
+        while not self._watchdog_stop.wait(PIPE_LIVENESS_CHECK_INTERVAL_S):
+            for terminal_id in list(self._pane_probe.keys()):
+                try:
+                    self._check_pipe_liveness(terminal_id)
+                except Exception:
+                    logger.exception(
+                        "pipe-pane liveness check failed for terminal %s", terminal_id
+                    )
+
+    def _check_pipe_liveness(self, terminal_id: str) -> None:
+        """One liveness check for a terminal: re-arm a stalled pipe-pane forwarder.
+
+        A stalled forwarder is invisible from inside the FIFO reader (no bytes to
+        read, exactly like an idle terminal). The only ground truth is tmux's own
+        live pane content, which keeps rendering through the stall. So:
+
+        - pane content advanced since the last check AND the FIFO delivered no
+          bytes in that same window  -> the pipe is stalled: re-arm it.
+        - pane content unchanged                                   -> idle: do nothing.
+        - FIFO delivered bytes                                     -> healthy: do nothing.
+
+        Requiring BOTH "pane advanced" and "FIFO silent" is what stops a
+        legitimately idle terminal (pane unchanged, FIFO silent) from triggering
+        a needless re-pipe. Re-arm only after ``PIPE_LIVENESS_STALL_CHECKS``
+        consecutive diverging checks (default 1).
+        """
+        probe = self._pane_probe.get(terminal_id)
+        rearm = self._rearm.get(terminal_id)
+        if probe is None or rearm is None:
+            return
+
+        content = probe()
+        now = time.monotonic()
+        current_hash = hash(content)
+        last_data_at = self._last_data_at.get(terminal_id, 0.0)
+
+        prev = self._liveness.get(terminal_id)
+        if prev is None:
+            # First observation: establish a baseline, never act on it.
+            self._liveness[terminal_id] = (current_hash, now, 0)
+            return
+        prev_hash, last_check_at, strikes = prev
+
+        pane_advanced = current_hash != prev_hash
+        # Did the reader deliver anything since the previous check?
+        fifo_advanced = last_data_at >= last_check_at
+
+        if pane_advanced and not fifo_advanced:
+            strikes += 1
+            if strikes >= PIPE_LIVENESS_STALL_CHECKS:
+                logger.warning(
+                    "pipe-pane forwarder for terminal %s appears stalled "
+                    "(pane advanced, no FIFO data for %.1fs) — re-arming",
+                    terminal_id,
+                    now - last_check_at,
+                )
+                try:
+                    rearm()
+                except Exception:
+                    logger.exception(
+                        "failed to re-arm pipe-pane for terminal %s", terminal_id
+                    )
+                else:
+                    # Bytes lost during the stall are gone (tmux never buffered
+                    # them), but the pane's *current* content is not — replay it
+                    # into the pipeline so the StatusMonitor buffer / GET output
+                    # immediately reflect the live screen instead of staying
+                    # frozen until the agent happens to emit something new.
+                    bus.publish(f"terminal.{terminal_id}.output", {"data": content})
+                    self._last_data_at[terminal_id] = time.monotonic()
+                strikes = 0
+        else:
+            strikes = 0
+
+        self._liveness[terminal_id] = (current_hash, now, strikes)
 
 
 # Module-level singleton

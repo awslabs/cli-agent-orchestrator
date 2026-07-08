@@ -36,7 +36,12 @@ from cli_agent_orchestrator.clients.database import (
     update_last_active,
     update_terminal_shell_command,
 )
-from cli_agent_orchestrator.constants import FIFO_DIR, SESSION_PREFIX, TERMINAL_LOG_DIR
+from cli_agent_orchestrator.constants import (
+    FIFO_DIR,
+    PIPE_LIVENESS_TAIL_LINES,
+    SESSION_PREFIX,
+    TERMINAL_LOG_DIR,
+)
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
@@ -290,14 +295,28 @@ async def create_terminal(
         # socket events and their pipe_pane is a no-op, so skip the FIFO there and
         # rely on the herdr inbox registration below.
         if not get_backend().supports_event_inbox():
-            # Reader must exist BEFORE pipe-pane starts so it captures from the start.
-            fifo_manager.create_reader(terminal_id)
+            fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
+
+            # Reader must exist BEFORE pipe-pane starts so it captures from the
+            # start. Enroll it in the pipe-pane liveness watchdog (issue #388):
+            # supply a probe for tmux's live pane content and a re-arm that
+            # re-attaches a stalled forwarder. The re-arm does stop-then-start,
+            # NOT a bare pipe_pane() — a stalled pane still reports pane_pipe=1,
+            # so the backend's ``pipe-pane -o`` toggle would just switch the
+            # dead pipe OFF instead of restarting it.
+            def _probe_pane(s=session_name, w=window_name) -> str:
+                return get_backend().get_history(s, w, tail_lines=PIPE_LIVENESS_TAIL_LINES)
+
+            def _rearm_pipe(s=session_name, w=window_name, p=str(fifo_path)) -> None:
+                get_backend().stop_pipe_pane(s, w)
+                get_backend().pipe_pane(s, w, p)
+
+            fifo_manager.create_reader(terminal_id, pane_probe=_probe_pane, rearm=_rearm_pipe)
 
             # Configure pipe-pane to stream output to the FIFO. This enables
             # real-time event-driven processing via StatusMonitor and LogWriter
             # (LogWriter writes TERMINAL_LOG_DIR/{id}.log from the FIFO). A pane
             # has a single pipe-pane target, so we pipe ONLY to the FIFO.
-            fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
             get_backend().pipe_pane(session_name, window_name, str(fifo_path))
 
             # Nudge the shell so it re-renders its prompt AFTER pipe-pane attaches.

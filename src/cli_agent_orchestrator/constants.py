@@ -78,6 +78,30 @@ STATE_BUFFER_MAX = 8192
 # above the old 1024 default while still bounded.
 EVENT_BUS_MAX_QUEUE_SIZE = _env_int("CAO_EVENT_BUS_MAX_QUEUE_SIZE", 16384)
 
+# ---- pipe-pane liveness watchdog (issue #388) -------------------------------
+# tmux's own pipe-pane forwarder can silently stop delivering bytes to the FIFO
+# after a burst of alternate-screen redraws — the pane keeps rendering (visible
+# via capture-pane) but the piped copy freezes, so the FIFO reader, the
+# StatusMonitor buffer, and GET /terminals/{id}/output all stall on stale
+# content indefinitely (pane_pipe still reports 1; nothing errors). The
+# FifoManager watchdog compares tmux's live pane content against whether the
+# FIFO delivered any bytes in the same window: pane advanced + FIFO silent =
+# a stalled forwarder, which it re-arms (stop_pipe_pane then pipe_pane — a bare
+# re-pipe would just toggle the already-"piped" pane OFF).
+PIPE_LIVENESS_CHECK_INTERVAL_S = float(
+    _env_int("CAO_PIPE_LIVENESS_CHECK_INTERVAL_S", 4)
+)
+# Lines of live pane content hashed to decide whether the pane advanced. A tail
+# is enough: a stall diverges the visible screen, and hashing only the tail
+# keeps each check to one cheap capture-pane call.
+PIPE_LIVENESS_TAIL_LINES = _env_int("CAO_PIPE_LIVENESS_TAIL_LINES", 80)
+# Consecutive diverging checks (pane advanced, FIFO delivered nothing) before
+# re-arming. 1 = re-arm on first confirmed divergence: with a multi-second
+# window a healthy pipe always delivers within milliseconds of a pane change,
+# so "pane moved but not one byte arrived in the whole interval" is already a
+# strong stall signal. Raise it to trade recovery latency for extra caution.
+PIPE_LIVENESS_STALL_CHECKS = _env_int("CAO_PIPE_LIVENESS_STALL_CHECKS", 1)
+
 # pyte-rendered status detection. When enabled, the StatusMonitor feeds each
 # terminal's output through a pyte terminal emulator and runs detection against
 # the COMPOSITED screen (redraws/cursor-moves resolved) instead of the raw
