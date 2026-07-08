@@ -108,7 +108,9 @@ def get_disabled_agent_dirs() -> List[str]:
     settings = _load()
     nested = settings.get("agents", {})
     if isinstance(nested, dict) and isinstance(nested.get("disabled_dirs"), list):
-        return nested["disabled_dirs"]
+        # list(...) narrows the untyped-dict Any to list[str] for mypy's
+        # no-any-return gate, matching get_extra_agent_dirs' return guard.
+        return list(nested["disabled_dirs"])
     dirs = settings.get("disabled_agent_dirs", [])
     return dirs if isinstance(dirs, list) else []
 
