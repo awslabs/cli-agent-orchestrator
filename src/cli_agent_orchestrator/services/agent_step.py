@@ -22,7 +22,7 @@ retry policy (FR-5.3); the HTTP handler maps it to an ``HTTPException``.
 """
 
 import logging
-from typing import Optional
+from typing import Callable, Optional
 
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
@@ -85,6 +85,7 @@ async def run_agent_step(
     allowed_tools: Optional[list[str]] = None,
     registry: Optional[PluginRegistry] = None,
     env_vars: Optional[dict[str, str]] = None,
+    on_terminal_created: Optional[Callable[[str], None]] = None,
 ) -> AgentStepResult:
     """Run one agent step and return its result (success only).
 
@@ -137,6 +138,16 @@ async def run_agent_step(
             the substrate creates a fresh session per step, so the per-step env is
             injected cleanly (no stale step_id from a shared session). Default None
             = behavior unchanged (the handoff caller passes nothing).
+        on_terminal_created: Optional callback invoked with the ``terminal_id``
+            IMMEDIATELY after a freshly created terminal exists (before the
+            readiness wait / input). U4's script-tier orphan sweep (BR-31) uses
+            this to record the live terminal into the shared ``ScriptRunRecord``
+            ``step_states`` map AT terminal-creation time — so a subprocess that
+            crashes/times out while a run-step call is mid-flight still leaves the
+            in-flight terminal visible to ``_reconcile_orphans``. Not called for a
+            reused terminal (the caller already owns it). A callback exception is
+            logged and swallowed — recording a terminal for the sweep must never
+            fail the step. Default None = behavior unchanged.
 
     Returns:
         ``AgentStepResult`` with status COMPLETED — ONLY on success.
@@ -174,6 +185,24 @@ async def run_agent_step(
             env_vars=env_vars,
         )
         terminal_id = terminal.id
+
+        # BR-31: make the just-created terminal visible to U4's orphan sweep
+        # BEFORE the readiness wait / input send — the dangerous edge is a
+        # subprocess that dies while this call is mid-flight, between create and
+        # the journal write. Recording it now (into the shared record's
+        # step_states) closes that window. Best-effort: a callback failure must
+        # never turn a live step into a failure.
+        if on_terminal_created is not None:
+            try:
+                on_terminal_created(terminal_id)
+            except (
+                Exception
+            ) as exc:  # noqa: BLE001 — sweep bookkeeping is best-effort; step must not fail on it
+                logger.warning(
+                    "run_agent_step: on_terminal_created callback failed for terminal %s: %s",
+                    terminal_id,
+                    exc,
+                )
 
         # Secondary in-process readiness wait: provider.initialize() can return a
         # false-positive on the shell prompt before the CLI is truly ready, so we

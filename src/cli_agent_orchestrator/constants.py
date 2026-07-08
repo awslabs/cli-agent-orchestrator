@@ -458,3 +458,13 @@ WORKFLOW_ENV_ALLOWLIST = frozenset(
 # changes — do not simplify away as duplicate validation (the effective
 # accepted length is 64 via WORKFLOW_NAME_RE; this cap is the outer fence).
 WORKFLOW_ENV_VALUE_MAX_LEN = 256
+
+# Script-runner subprocess lifecycle (Bolt 3, U4/C1). Wall-clock bound + grace,
+# output ring-buffer cap, engine-owned scratch root for resume materialization.
+WORKFLOW_SCRIPT_TERM_GRACE = 5.0  # SIGTERM->SIGKILL grace (BR-10/11, NFR-REL-1)
+# INVARIANT: WORKFLOW_SCRIPT_TIMEOUT + WORKFLOW_SCRIPT_TERM_GRACE must be
+# <= WORKFLOW_RUN_REQUEST_TIMEOUT (= 8820.0), so the blocking POST socket outlives
+# the reap+grace envelope (tech-stack-decisions B3 fix). 8700 + 5 = 8705 <= 8820.
+WORKFLOW_SCRIPT_TIMEOUT = 8700.0
+WORKFLOW_SCRIPT_LOG_CAP = 256 * 1024  # per-stream tail cap, bytes (BR-24/25, Q7=A)
+WORKFLOW_SCRIPT_SCRATCH_DIR = CAO_HOME_DIR / "workflow-script-scratch"  # 0o700 (BR-30)

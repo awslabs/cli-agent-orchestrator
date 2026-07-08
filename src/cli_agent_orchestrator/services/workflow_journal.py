@@ -88,6 +88,8 @@ def insert_run(
     inputs_json: str,
     state: str,
     started_at: str,
+    tier: str = "yaml",
+    generation: str = "1",
 ) -> None:
     """INSERT the ``workflow_run`` row at ``start_run`` (lifecycle table, E1).
 
@@ -96,14 +98,30 @@ def insert_run(
     (a resume never calls this — it only UPDATEs). The engine both pre-checks the
     journal in ``start_run`` and wraps this call best-effort, so a lost race
     logs instead of clobbering history.
+
+    U4 addition (issue #312, script-tier runner, C1): optional ``tier`` /
+    ``generation`` kwargs (additive, INV-1 — YAML callers are byte-identical and
+    default to ``tier='yaml'``/``generation='1'``, the migration defaults). A
+    script run passes ``tier='script'`` in ONE write so a script row is never
+    journaled with a transient ``tier='yaml'`` window that would break tier
+    dispatch / resumability (code-generation-plan CONTRADICTION #4).
     """
     with _connect() as conn:
         conn.execute(
             "INSERT INTO workflow_run "
             "(run_id, workflow_name, spec_snapshot, inputs_json, state, "
-            " current_step_id, started_at, finished_at) "
-            "VALUES (?, ?, ?, ?, ?, NULL, ?, NULL)",
-            (run_id, workflow_name, spec_snapshot, inputs_json, state, started_at),
+            " current_step_id, started_at, finished_at, tier, generation) "
+            "VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?)",
+            (
+                run_id,
+                workflow_name,
+                spec_snapshot,
+                inputs_json,
+                state,
+                started_at,
+                tier,
+                generation,
+            ),
         )
 
 

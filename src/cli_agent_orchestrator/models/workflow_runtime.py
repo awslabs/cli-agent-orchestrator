@@ -163,3 +163,9 @@ class WorkflowRunResult(BaseModel):
     steps: List[StepResult] = Field(default_factory=list)
     started_at: str
     finished_at: Optional[str] = None
+    # Bolt 3 (U4/C1) additive envelope fields — Optional/defaulted so a YAML run's
+    # shape stays byte-identical (INV-5, M4 tripwire). A YAML run leaves
+    # ``kind=None``, ``output=None``, ``warnings=[]``.
+    kind: Optional[str] = None  # error|timeout|cancelled; None on COMPLETED (BR-3, Q1=A)
+    output: Optional[Any] = None  # last-match CAO_WORKFLOW_OUTPUT: JSON (BR-7/8/9, Q2=A)
+    warnings: List[str] = Field(default_factory=list)  # e.g. "malformed sentinel payload" (BR-9)

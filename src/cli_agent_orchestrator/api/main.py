@@ -1333,6 +1333,14 @@ async def run_step(
     The plugin registry is threaded so teardown's ``post_kill_terminal`` hooks
     fire (parity with the DELETE endpoint).
     """
+    # BR-31: for a script-tier run-step call, record the created terminal into the
+    # shared ScriptRunRecord's step_states AT creation time, so U4's orphan sweep
+    # can tear it down if the subprocess dies mid-call. No-op for YAML/handoff
+    # callers (no run/step env or no script record in the registry).
+    from cli_agent_orchestrator.services.script_runner import make_step_terminal_recorder
+
+    on_terminal_created = make_step_terminal_recorder(body.env_vars)
+
     try:
         result = await run_agent_step(
             provider=body.provider,
@@ -1347,6 +1355,7 @@ async def run_step(
             allowed_tools=body.allowed_tools,
             registry=get_plugin_registry(request),
             env_vars=body.env_vars,
+            on_terminal_created=on_terminal_created,
         )
         return RunStepResponse(
             terminal_id=result.terminal_id,
