@@ -1608,8 +1608,15 @@ async def get_workflow_endpoint(name: str) -> Dict:
     (a same-stem cross-tier sibling, BR-2/BR-3) maps to 409, checked BEFORE
     the bare ``ValueError`` arm (it is a ``ValueError`` subclass).
     """
+    from cli_agent_orchestrator.constants import WORKFLOW_NAME_RE
     from cli_agent_orchestrator.models.workflow import TierCollisionError
     from cli_agent_orchestrator.services import workflow_spec_service
+
+    if os.sep in name or (os.altsep and os.altsep in name) or not WORKFLOW_NAME_RE.match(name):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"invalid workflow name '{name}'",
+        )
 
     try:
         spec = workflow_spec_service.get_workflow(name)
