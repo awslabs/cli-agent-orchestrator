@@ -13,8 +13,30 @@ class GraphSink(ABC):
 
     @abstractmethod
     def export(self, view: GraphView, dest: str, **options: Any) -> list[str]:
-        """Write view to dest per sink format; return the written file paths."""
+        """Write view to dest per sink format; return the written file paths.
+
+        Returns the written file paths as list[str]. The API route (U4)
+        owns wrapping this into the response envelope
+        ({written_files, sink, dest}) — GraphSink.export() itself never
+        returns that envelope shape.
+        """
         raise NotImplementedError
+
+    def query(self, *args: Any, **kwargs: Any) -> Any:
+        """Optional read-query entry point, gated on capabilities (FR-5).
+
+        Only sinks that declare "query" in `capabilities` support this;
+        every other sink raises NotImplementedError. A subclass declaring
+        "query" must override this method with its own implementation.
+        """
+        if "query" not in self.capabilities:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support query() "
+                f"('query' not in capabilities={sorted(self.capabilities)!r})"
+            )
+        raise NotImplementedError(
+            f"{type(self).__name__} declares 'query' in capabilities but did not override query()"
+        )
 
 
 _SINK_REGISTRY: dict[str, type[GraphSink]] = {}

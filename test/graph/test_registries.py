@@ -74,3 +74,33 @@ class TestSinkRegistry:
     def test_unregistered_name_raises_key_error(self):
         with pytest.raises(KeyError):
             get_sink("no-such-sink")
+
+
+class TestSinkQueryCapabilityGate:
+    """Tests for GraphSink.query() capability gating (FR-5)."""
+
+    def test_sink_without_query_capability_raises_not_implemented(self):
+        @register_sink("test-sink-no-query")
+        class NoQuerySink(GraphSink):
+            def export(self, view, dest, **options):
+                return [dest]
+
+        sink = get_sink("test-sink-no-query")
+
+        with pytest.raises(NotImplementedError):
+            sink.query()
+
+    def test_sink_declaring_query_capability_can_override(self):
+        @register_sink("test-sink-with-query")
+        class QuerySink(GraphSink):
+            capabilities = {"query"}
+
+            def export(self, view, dest, **options):
+                return [dest]
+
+            def query(self, *args, **kwargs):
+                return "queried"
+
+        sink = get_sink("test-sink-with-query")
+
+        assert sink.query() == "queried"
