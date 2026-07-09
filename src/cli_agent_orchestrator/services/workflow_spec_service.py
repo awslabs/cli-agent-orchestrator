@@ -114,8 +114,17 @@ def _safe_spec_path(path: str, base_dir: Optional[str] = None) -> str:
         ValueError: the base directory is blocked, or the resolved file escapes
             that validated base directory.
     """
-    real_path = Path(path).resolve()
+    if not path or not path.strip():
+        raise ValueError("workflow spec path is required")
+
+    user_path = Path(path)
+    if user_path.is_absolute():
+        raise ValueError(f"workflow spec path '{path}' must be relative")
+    if ".." in user_path.parts:
+        raise ValueError(f"workflow spec path '{path}' must not contain parent traversal")
+
     safe_base = Path(_safe_dir(base_dir))  # None -> WORKFLOW_SPEC_DIR; realpath + blocked-dir guard
+    real_path = (safe_base / user_path).resolve()
     if not real_path.is_relative_to(safe_base):
         raise ValueError(f"workflow spec path '{path}' escapes its validated directory")
     return str(real_path)
