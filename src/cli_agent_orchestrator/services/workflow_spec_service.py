@@ -29,6 +29,7 @@ import logging
 import os
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import List, Optional, Union
 
 import yaml
@@ -92,33 +93,32 @@ def _safe_spec_path(path: str, base_dir: Optional[str] = None) -> str:
     """Canonicalize a spec FILE path and bind it to a CONFIGURED base directory.
 
     The single guarded entry for turning a user/agent-supplied spec path into a
-    real path safe to stat/open. Two stages, mirroring the shared working-dir
-    validator (the CodeQL ``py/path-injection`` two-state model — see
-    ``tmux.py``):
+    real path safe to stat/open. Two stages, mirroring the bundle-import
+    containment check (``okf.py::ImportService.import_bundle``):
 
-    1. ``os.path.realpath`` canonicalizes the path (resolves symlinks + ``..``).
+    1. ``Path.resolve()`` canonicalizes the path (resolves symlinks + ``..``).
        This is the PathNormalization step.
     2. ``_safe_dir`` policy-checks the base directory (``base_dir`` if given,
        else ``WORKFLOW_SPEC_DIR``) against the blocked-system-directory
        frozenset, then we assert the resolved file lies INSIDE that validated
-       base via ``startswith`` — the SafeAccessCheck that clears the normalized
-       path for the filesystem ops downstream.
+       base via ``Path.is_relative_to`` — the SafeAccessCheck that clears the
+       normalized path for the filesystem ops downstream.
 
     The base is a SEPARATELY-derived configured root, NOT the file's own parent —
     so the containment check is load-bearing: a spec must resolve inside the
     workflow directory (or the caller-supplied ``scan_dir``). A path whose
-    realpath escapes that base (e.g. a symlink pointing out, ``..`` traversal, or
-    an arbitrary external path) is rejected rather than silently followed.
+    resolved form escapes that base (e.g. a symlink pointing out, ``..`` traversal,
+    or an arbitrary external path) is rejected rather than silently followed.
 
     Raises:
         ValueError: the base directory is blocked, or the resolved file escapes
             that validated base directory.
     """
-    real_path = os.path.realpath(os.path.abspath(path))
-    safe_base = _safe_dir(base_dir)  # None -> WORKFLOW_SPEC_DIR; realpath + blocked-dir guard
-    if real_path != safe_base and not real_path.startswith(safe_base + os.sep):
+    real_path = Path(path).resolve()
+    safe_base = Path(_safe_dir(base_dir))  # None -> WORKFLOW_SPEC_DIR; realpath + blocked-dir guard
+    if not real_path.is_relative_to(safe_base):
         raise ValueError(f"workflow spec path '{path}' escapes its validated directory")
-    return real_path
+    return str(real_path)
 
 
 # ---------------------------------------------------------------------------

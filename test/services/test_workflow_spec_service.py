@@ -345,6 +345,26 @@ class TestScriptTierGetWorkflow:
         assert spec.name == "onlyyaml"
         assert spec.mode == "sequential"
 
+    def test_py_traversal_escaping_scan_dir_rejected(self, spec_dir, tmp_path):
+        """A ``.py`` path reaching outside ``scan_dir`` via ``..`` traversal is
+        rejected by ``_safe_spec_path`` before the file is ever opened
+        (CodeQL py/path-injection sink at ``_read_script_spec``'s ``open()``)."""
+        outside = tmp_path / "outside.py"
+        outside.write_text("def main():\n    pass\n")
+        with pytest.raises(ValueError, match="escapes its validated directory"):
+            svc.get_workflow(str(spec_dir / ".." / "outside.py"), scan_dir=str(spec_dir))
+
+    def test_py_symlink_escaping_scan_dir_rejected(self, spec_dir):
+        """A ``.py`` symlink inside ``scan_dir`` whose target resolves OUTSIDE it
+        is rejected — the resolved (not the literal) path is what's checked."""
+        target = "/etc/hosts"
+        link = spec_dir / "sneaky.py"
+        if not os.path.exists(target):
+            pytest.skip("no stable escape target on this platform")
+        os.symlink(target, link)
+        with pytest.raises(ValueError, match="escapes its validated directory"):
+            svc.get_workflow(str(link), scan_dir=str(spec_dir))
+
 
 class TestScriptTierRebuildIndex:
     """``rebuild_index_from_files`` .py glob widening (A2, BR-4)."""

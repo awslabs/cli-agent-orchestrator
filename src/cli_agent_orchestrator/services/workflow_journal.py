@@ -71,9 +71,22 @@ class StepRow:
 
 
 def _connect() -> sqlite3.Connection:
-    """Open a connection to the shared SQLite file (self-connecting, like B2)."""
+    """Open a connection to the shared SQLite file (self-connecting, like B2).
+
+    Ensures the ``workflow_run`` / ``workflow_run_step`` tables exist first
+    (idempotent ``CREATE TABLE IF NOT EXISTS`` via the shared migrators) so a
+    read/write here never races ``init_db()`` — a process that never went
+    through the FastAPI lifespan (e.g. a test that instantiates the app
+    without entering it as a context manager) still finds its schema.
+    """
+    from cli_agent_orchestrator.clients.database import (
+        _migrate_workflow_run,
+        _migrate_workflow_run_step,
+    )
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
+    _migrate_workflow_run()
+    _migrate_workflow_run_step()
     return sqlite3.connect(str(DATABASE_FILE))
 
 

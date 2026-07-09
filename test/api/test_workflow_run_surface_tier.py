@@ -101,6 +101,15 @@ class TestValidateTierDispatch:
         assert resp.status_code == 200
         assert resp.json()["status"] == "pass"
 
+    def test_py_traversal_escaping_spec_dir_rejected_400(self, client, isolated_db, spec_dir):
+        """A ``.py`` path reaching outside the configured spec dir via ``..``
+        traversal is rejected with 400 before the file is ever opened
+        (CodeQL py/path-injection sink at the ``.py`` arm's ``open()``,
+        api/main.py's ``validate_workflow_endpoint``)."""
+        traversal_path = str(spec_dir / ".." / "outside.py")
+        resp = client.post("/workflows/validate", json={"path": traversal_path})
+        assert resp.status_code == 400
+
 
 class TestRunTierDispatch:
     def _script_spec(self, name="scriptwf"):
