@@ -95,10 +95,9 @@ def _safe_spec_path(path: Union[str, Path], base_dir: Optional[str] = None) -> P
     The single guarded entry for turning a user/agent-supplied spec path into a
     real path safe to stat/open. The API contract accepts BOTH absolute and
     relative spec paths (every authoring caller — CLI, HTTP, tests — passes an
-    absolute path resolved against its own cwd/tmp fixture), so a relative
-    ``path`` is joined onto the configured base BEFORE resolution while an
-    absolute ``path`` resolves as-is; either way the containment check below is
-    what actually gates access, not the shape of the input string.
+    absolute path resolved against its own cwd/tmp fixture), but both forms are
+    anchored under the validated base BEFORE resolution; the containment check
+    below is the policy gate.
 
     Two stages, mirroring the bundle-import containment check
     (``okf.py::ImportService.import_bundle``):
@@ -134,8 +133,13 @@ def _safe_spec_path(path: Union[str, Path], base_dir: Optional[str] = None) -> P
         raise ValueError("workflow spec path is required")
 
     user_path = Path(path)
-    safe_base = Path(_safe_dir(base_dir))  # None -> WORKFLOW_SPEC_DIR; realpath + blocked-dir guard
-    candidate = user_path if user_path.is_absolute() else safe_base / user_path
+    safe_base = Path(_safe_dir(base_dir)).resolve()  # None -> WORKFLOW_SPEC_DIR; realpath + blocked-dir guard
+
+    # Always anchor user input under the validated base. For absolute input,
+    # drop the anchor/root and keep only relative path components.
+    rel_user_path = Path(*user_path.parts[1:]) if user_path.is_absolute() else user_path
+    candidate = safe_base / rel_user_path
+
     real_path = candidate.resolve()
     if not real_path.is_relative_to(safe_base):
         raise ValueError(f"workflow spec path '{path}' escapes its validated directory")
