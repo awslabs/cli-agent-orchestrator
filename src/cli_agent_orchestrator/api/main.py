@@ -12,7 +12,7 @@ import struct
 import subprocess
 import termios
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Dict, List, Optional, cast
 
@@ -1549,21 +1549,34 @@ async def validate_workflow_endpoint(body: WorkflowValidateRequest) -> Dict:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
         return result.model_dump()
     if ext == ".py":
+        from cli_agent_orchestrator.constants import WORKFLOW_MAX_SPEC_BYTES
         from cli_agent_orchestrator.models.workflow import ScriptValidationResult
         from cli_agent_orchestrator.services.script_lint import lint_script
 
         try:
+            # ``_safe_spec_path`` returns the resolved, contained Path; every
+            # filesystem op below MUST use THIS object (not ``body.path``) so the
+            # resolve-then-contain check dominates the sink (CodeQL sanitizer
+            # requirement — it does not track taint through a re-derived path).
             real_path = workflow_spec_service._safe_spec_path(body.path)
         except ValueError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
         try:
             with open(real_path, "rb") as fh:
-                source = fh.read().decode("utf-8", errors="replace")
+                # Capped read: an oversized file is rejected without ever
+                # being fully read into memory.
+                raw = fh.read(WORKFLOW_MAX_SPEC_BYTES + 1)
         except OSError as e:
             return ScriptValidationResult(
                 status="fail", errors=[f"could not read spec: {e}"]
             ).model_dump()
-        result = lint_script(source, real_path)
+        if len(raw) > WORKFLOW_MAX_SPEC_BYTES:
+            return ScriptValidationResult(
+                status="fail",
+                errors=[f"spec exceeds {WORKFLOW_MAX_SPEC_BYTES} bytes (max)"],
+            ).model_dump()
+        source = raw.decode("utf-8", errors="replace")
+        result = lint_script(source, str(real_path))
         return result.model_dump()
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST, detail=f"unrecognized spec extension: {ext}"
@@ -1770,9 +1783,14 @@ async def cancel_workflow_run_endpoint(
     ``getattr(record, "tier", "yaml")`` — because cancel's async/sync split is
     a property of which function to call on a live process. If absent
     (crash remnant or already-finalized), falls back to the durable journal
-    (BR-16): absent row -> 404; terminal state -> 409; otherwise the base
-    ``cancel_run`` (idempotent) applies regardless of the row's tier.
+    (BR-16): absent row -> 404; terminal state -> 409; otherwise the row is a
+    JOURNALED-BUT-NOT-LIVE run — no in-memory record for ``cancel_run`` (which
+    only ever consults ``run_registry``) to flip, so this arm marks the journal
+    row CANCELLED directly rather than calling ``cancel_run`` (which would
+    unconditionally raise ``KeyError`` here and mask every crash-remnant cancel
+    as a 404).
     """
+    from cli_agent_orchestrator.models.workflow_runtime import RunState
     from cli_agent_orchestrator.services import script_runner, workflow_journal, workflow_service
 
     record = workflow_service.run_registry.get(run_id)
@@ -1783,13 +1801,16 @@ async def cancel_workflow_run_endpoint(
                 status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'"
             )
         try:
-            workflow_service.cancel_run(run_id)
-        except KeyError:
+            row_state = RunState(row.state)
+        except ValueError:
+            row_state = None
+        if row_state in (RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED):
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'"
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"run '{run_id}' is already {row.state}; cannot cancel",
             )
-        except ValueError as e:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+        finished_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        workflow_journal.update_run_state(run_id, RunState.CANCELLED.value, finished_at)
         return {"success": True, "run_id": run_id}
 
     if getattr(record, "tier", "yaml") == "script":

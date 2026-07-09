@@ -89,12 +89,19 @@ def _safe_dir(scan_dir: Optional[str]) -> str:
     return tmux_client._resolve_and_validate_working_directory(scan_dir)
 
 
-def _safe_spec_path(path: str, base_dir: Optional[str] = None) -> str:
+def _safe_spec_path(path: Union[str, Path], base_dir: Optional[str] = None) -> Path:
     """Canonicalize a spec FILE path and bind it to a CONFIGURED base directory.
 
     The single guarded entry for turning a user/agent-supplied spec path into a
-    real path safe to stat/open. Two stages, mirroring the bundle-import
-    containment check (``okf.py::ImportService.import_bundle``):
+    real path safe to stat/open. The API contract accepts BOTH absolute and
+    relative spec paths (every authoring caller — CLI, HTTP, tests — passes an
+    absolute path resolved against its own cwd/tmp fixture), so a relative
+    ``path`` is joined onto the configured base BEFORE resolution while an
+    absolute ``path`` resolves as-is; either way the containment check below is
+    what actually gates access, not the shape of the input string.
+
+    Two stages, mirroring the bundle-import containment check
+    (``okf.py::ImportService.import_bundle``):
 
     1. ``Path.resolve()`` canonicalizes the path (resolves symlinks + ``..``).
        This is the PathNormalization step.
@@ -110,30 +117,35 @@ def _safe_spec_path(path: str, base_dir: Optional[str] = None) -> str:
     resolved form escapes that base (e.g. a symlink pointing out, ``..`` traversal,
     or an arbitrary external path) is rejected rather than silently followed.
 
+    Every CodeQL-flagged sink downstream MUST open/stat the ``Path`` object this
+    function RETURNS — never re-derive a path from the original string — so the
+    resolve-then-contain check dominates the sink and CodeQL recognizes it as a
+    sanitizer.
+
+    Returns:
+        The resolved, contained ``Path`` — the only value callers may pass to a
+        filesystem operation.
+
     Raises:
         ValueError: the base directory is blocked, or the resolved file escapes
             that validated base directory.
     """
-    if not path or not path.strip():
+    if not path or (isinstance(path, str) and not path.strip()):
         raise ValueError("workflow spec path is required")
 
     user_path = Path(path)
-    if user_path.is_absolute():
-        raise ValueError(f"workflow spec path '{path}' must be relative")
-    if ".." in user_path.parts:
-        raise ValueError(f"workflow spec path '{path}' must not contain parent traversal")
-
     safe_base = Path(_safe_dir(base_dir))  # None -> WORKFLOW_SPEC_DIR; realpath + blocked-dir guard
-    real_path = (safe_base / user_path).resolve()
+    candidate = user_path if user_path.is_absolute() else safe_base / user_path
+    real_path = candidate.resolve()
     if not real_path.is_relative_to(safe_base):
         raise ValueError(f"workflow spec path '{path}' escapes its validated directory")
-    return str(real_path)
+    return real_path
 
 
 # ---------------------------------------------------------------------------
 # Read path
 # ---------------------------------------------------------------------------
-def load_and_validate(path: str, base_dir: Optional[str] = None) -> WorkflowSpec:
+def load_and_validate(path: Union[str, Path], base_dir: Optional[str] = None) -> WorkflowSpec:
     """Load a spec file, validate its grammar, and return the typed model (C2).
 
     The single read path. The containing directory is policy-checked by the
@@ -162,11 +174,16 @@ def load_and_validate(path: str, base_dir: Optional[str] = None) -> WorkflowSpec
 
     # Single read: byte-cap, decode, then reuse the text for BOTH validation and
     # construction so they see byte-identical content (closes the TOCTOU window).
+    # The read itself is capped at MAX+1 bytes — an oversized file is rejected
+    # without ever being fully read into memory.
     with open(real_path, "rb") as fh:
-        raw = fh.read()
+        raw = fh.read(WORKFLOW_MAX_SPEC_BYTES + 1)
     if len(raw) > WORKFLOW_MAX_SPEC_BYTES:
-        raise ValueError(f"spec is {len(raw)} bytes (max {WORKFLOW_MAX_SPEC_BYTES})")
-    text = raw.decode("utf-8")
+        raise ValueError(f"spec exceeds {WORKFLOW_MAX_SPEC_BYTES} bytes (max)")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise ValueError(f"spec is not valid UTF-8: {e}") from e
 
     result = _model_validate_only(text)  # raw text, not path; NEVER raises (BR-7)
     if result.status == "fail":
@@ -180,7 +197,7 @@ def load_and_validate(path: str, base_dir: Optional[str] = None) -> WorkflowSpec
     return WorkflowSpec(**data)
 
 
-def validate_only(path: str, base_dir: Optional[str] = None) -> ValidationResult:
+def validate_only(path: Union[str, Path], base_dir: Optional[str] = None) -> ValidationResult:
     """Read a spec file behind the path guard and validate its grammar (FR-1.3).
 
     The path is canonicalized + bound to its configured base directory first
@@ -197,14 +214,16 @@ def validate_only(path: str, base_dir: Optional[str] = None) -> ValidationResult
     real_path = _safe_spec_path(path, base_dir)
     try:
         with open(real_path, "rb") as fh:
-            raw = fh.read()
+            # Capped read: an oversized file is rejected without ever being
+            # fully read into memory.
+            raw = fh.read(WORKFLOW_MAX_SPEC_BYTES + 1)
     except OSError as exc:
         logger.debug("validate_only: could not read spec %s: %s", real_path, exc)
         return ValidationResult(status="fail", errors=[f"could not read spec: {exc}"])
     if len(raw) > WORKFLOW_MAX_SPEC_BYTES:
         return ValidationResult(
             status="fail",
-            errors=[f"spec is {len(raw)} bytes (max {WORKFLOW_MAX_SPEC_BYTES})"],
+            errors=[f"spec exceeds {WORKFLOW_MAX_SPEC_BYTES} bytes (max)"],
         )
     return _model_validate_only(raw.decode("utf-8", errors="replace"))
 
@@ -221,13 +240,18 @@ def _connect():
     return sqlite3.connect(str(DATABASE_FILE))
 
 
-def upsert_index(spec: Union[WorkflowSpec, ScriptSpec], source_path: str) -> None:
+def upsert_index(spec: Union[WorkflowSpec, ScriptSpec], source_path: Union[str, Path]) -> None:
     """Idempotently materialize a spec into ``workflow_index`` (C2, FR-2.3).
 
     Keyed by ``name`` (ON CONFLICT DO UPDATE) so re-authoring the same spec
-    updates the row in place rather than duplicating. ``source_path`` is the
-    ``realpath`` of the canonical file; ``indexed_at`` is derived bookkeeping
-    (ISO-8601 Z), never an ordering key (B2-BR-3 orders by ``name``).
+    updates the row in place rather than duplicating. ``source_path`` MUST
+    already be the resolved, contained ``Path`` a caller got back from
+    ``_safe_spec_path`` — this function stores it as-is (``os.fspath``, no
+    re-derivation) rather than re-running ``os.path.realpath`` on it, which
+    would re-introduce an unchecked path string into the value later read
+    back by ``_resolve_source_path`` and fed to a filesystem sink.
+    ``indexed_at`` is derived bookkeeping (ISO-8601 Z), never an ordering key
+    (B2-BR-3 orders by ``name``).
 
     A ``ScriptSpec`` (U5, A2) indexes with ``mode="script"`` and
     ``step_count=None`` — step count is run-time-determined and unknowable at
@@ -243,7 +267,7 @@ def upsert_index(spec: Union[WorkflowSpec, ScriptSpec], source_path: str) -> Non
         description = spec.description
     row = WorkflowIndexRow(
         name=spec.name,
-        source_path=os.path.realpath(source_path),
+        source_path=os.fspath(source_path),
         mode=mode,
         step_count=step_count,
         description=description,
@@ -295,12 +319,16 @@ def rebuild_index_from_files(scan_dir: Optional[str] = None) -> int:
     for path in yaml_paths:
         try:
             # Bind containment to the SAME dir we globbed from (not WORKFLOW_SPEC_DIR)
-            # so a caller-supplied scan_dir resolves its own specs.
-            spec = load_and_validate(path, base_dir=safe_dir)
+            # so a caller-supplied scan_dir resolves its own specs. The glob
+            # string itself is untrusted until re-validated — resolve it via
+            # _safe_spec_path and store THAT (not the raw glob string) in the
+            # index, matching the .py loop below.
+            real_path = _safe_spec_path(path, base_dir=safe_dir)
+            spec = load_and_validate(real_path, base_dir=safe_dir)
         except (ValueError, FileNotFoundError) as e:
             logger.warning("rebuild: skipping unparseable spec %s: %s", path, e)
             continue
-        upsert_index(spec, path)
+        upsert_index(spec, real_path)
         rows += 1
     for path in py_paths:
         stem = _stem_of(path)
@@ -310,11 +338,16 @@ def rebuild_index_from_files(scan_dir: Optional[str] = None) -> int:
             logger.warning("rebuild: skipping colliding script spec %s: %s", path, e)
             continue
         try:
-            script_spec = _read_script_spec(path, stem)
+            # Bind containment to the SAME dir we globbed from, mirroring the
+            # YAML loop above — the glob string is untrusted until re-validated
+            # against safe_dir; the resolved Path this returns is the ONLY
+            # value passed to _read_script_spec (never the raw glob string).
+            real_path = _safe_spec_path(path, base_dir=safe_dir)
+            script_spec = _read_script_spec(real_path, stem, base_dir=safe_dir)
         except (ValueError, OSError, UnicodeDecodeError) as e:
             logger.warning("rebuild: skipping unreadable script spec %s: %s", path, e)
             continue
-        upsert_index(script_spec, path)
+        upsert_index(script_spec, real_path)
         rows += 1
     return rows
 
@@ -379,7 +412,7 @@ def render_findings(findings: List[LintFinding]) -> List[dict]:
     return [finding.model_dump() for finding in findings]
 
 
-def _stem_of(path: str) -> str:
+def _stem_of(path: Union[str, Path]) -> str:
     """Return the file stem (basename minus extension) for tier/collision keys."""
     return os.path.splitext(os.path.basename(path))[0]
 
@@ -399,23 +432,39 @@ def _check_tier_collision(stem: str, safe_dir: str) -> None:
         raise TierCollisionError(stem)
 
 
-def _read_script_spec(real_path: str, stem: str) -> ScriptSpec:
+def _read_script_spec(
+    path: Union[str, Path], stem: str, base_dir: Optional[str] = None
+) -> ScriptSpec:
     """Read + lint a ``.py`` spec file into a ``ScriptSpec`` (A1, E1).
+
+    Re-validates ``path`` through ``_safe_spec_path`` itself — this is the
+    ONLY entry that opens a ``.py`` spec file, and it must stay safe no matter
+    which caller reaches it. Some callers (``get_workflow``'s bare-name arm,
+    via ``_resolve_source_path``) hand back a plain string pulled from the
+    SQLite index rather than an already-validated ``Path``, so re-validating
+    HERE — not trusting the caller to have done it — is what keeps every
+    ``.py`` open() sink covered by the resolve-then-contain check regardless
+    of call site.
 
     The load-time lint (U1) is INFORMATIONAL only — feeds ``validate``/
     ``list``/``get`` rendering (BR-6); it is a SEPARATE call from U4's
     run-path defensive re-check.
     """
+    real_path = _safe_spec_path(path, base_dir)
     with open(real_path, "rb") as fh:
-        raw = fh.read()
+        raw = fh.read(WORKFLOW_MAX_SPEC_BYTES + 1)
     if len(raw) > WORKFLOW_MAX_SPEC_BYTES:
-        raise ValueError(f"spec is {len(raw)} bytes (max {WORKFLOW_MAX_SPEC_BYTES})")
-    source = raw.decode("utf-8")
+        raise ValueError(f"spec exceeds {WORKFLOW_MAX_SPEC_BYTES} bytes (short-circuited read)")
+    display_path = str(real_path)
+    try:
+        source = raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise ValueError(f"spec is not valid UTF-8: {e}") from e
     content_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
-    result = lint_script(source, real_path)
+    result = lint_script(source, display_path)
     return ScriptSpec(
         name=stem,
-        path=real_path,
+        path=display_path,
         source=source,
         content_hash=content_hash,
         findings=result.findings,
@@ -449,7 +498,9 @@ def get_workflow(
     return _load_by_extension(source_path, scan_dir)
 
 
-def _load_by_extension(real_path: str, scan_dir: Optional[str]) -> Union[WorkflowSpec, ScriptSpec]:
+def _load_by_extension(
+    real_path: Union[str, Path], scan_dir: Optional[str]
+) -> Union[WorkflowSpec, ScriptSpec]:
     """Extension-based dispatch shared by both ``get_workflow`` call sites (A1)."""
     ext = os.path.splitext(real_path)[1].lower()
     if ext in (".yaml", ".yml"):
@@ -458,7 +509,11 @@ def _load_by_extension(real_path: str, scan_dir: Optional[str]) -> Union[Workflo
         safe_dir = _safe_dir(scan_dir)
         stem = _stem_of(real_path)
         _check_tier_collision(stem, safe_dir)  # -> TierCollisionError (409)
-        return _read_script_spec(real_path, stem)
+        # ``real_path`` may still be an UNVALIDATED string here (the bare-name
+        # arm hands back whatever ``_resolve_source_path`` read out of SQLite);
+        # ``_read_script_spec`` re-validates it against ``scan_dir`` itself
+        # before opening — never trust this call site's naming.
+        return _read_script_spec(real_path, stem, base_dir=scan_dir)
     raise ValueError(f"unrecognized spec extension: {ext}")
 
 
@@ -468,11 +523,15 @@ def delete_workflow(name: str, scan_dir: Optional[str] = None) -> None:
     Files are canonical, so removing the YAML is the authoritative act; the index
     row removal is bookkeeping (rebuild would also drop it). An unknown name
     raises ``KeyError`` -> 404; a repeat delete of an already-removed name is a
-    404, not a silent success (the unknown name is surfaced, not masked). Delete
-    never removes anything outside the validated spec directory (the source path
-    came from the policy-checked rebuild).
+    404, not a silent success (the unknown name is surfaced, not masked).
+    ``_resolve_source_path`` returns a raw string pulled out of SQLite — the
+    SAME shape of value ``_read_script_spec`` re-validates before its own
+    sink — so this function re-validates it through ``_safe_spec_path`` too
+    before ``os.remove``, rather than trusting the index row is still
+    in-policy (a reconfigured ``scan_dir`` or direct DB write could otherwise
+    let ``os.remove`` follow an unchecked path).
     """
-    source_path = _resolve_source_path(name, scan_dir)
+    source_path = _safe_spec_path(_resolve_source_path(name, scan_dir), scan_dir)
     try:
         os.remove(source_path)
     except FileNotFoundError:

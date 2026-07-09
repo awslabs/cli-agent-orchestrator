@@ -110,6 +110,62 @@ class TestValidateTierDispatch:
         resp = client.post("/workflows/validate", json={"path": traversal_path})
         assert resp.status_code == 400
 
+    def test_py_arm_oversized_spec_rejected(self, client, isolated_db, spec_dir):
+        """The ``.py`` validate arm enforces the same ``WORKFLOW_MAX_SPEC_BYTES``
+        byte cap as ``workflow_spec_service.validate_only``/``load_and_validate`` —
+        it must not read an unbounded file into memory before linting it."""
+        from cli_agent_orchestrator.constants import WORKFLOW_MAX_SPEC_BYTES
+
+        oversized = "# " + ("x" * (WORKFLOW_MAX_SPEC_BYTES + 1)) + "\ndef main():\n    pass\n"
+        path = _write_script(spec_dir, "huge", oversized)
+        resp = client.post("/workflows/validate", json={"path": str(path)})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "fail"
+        assert any("bytes" in e for e in body["errors"])
+
+    def test_py_arm_oversized_spec_read_is_capped_not_full_file(
+        self, client, isolated_db, spec_dir, monkeypatch
+    ):
+        """The oversized-rejection above must come from a BOUNDED read (MAX+1
+        bytes passed to ``fh.read()``), not from reading the whole file and
+        checking its length afterward — a several-times-oversized file must
+        still only ever have MAX+1 bytes pulled off disk."""
+        import os as _os
+
+        from cli_agent_orchestrator.constants import WORKFLOW_MAX_SPEC_BYTES
+
+        oversized = "x" * (WORKFLOW_MAX_SPEC_BYTES * 4)
+        path = _write_script(spec_dir, "reallyhuge", oversized)
+        real_open = open
+        captured = {}
+
+        class _WrappedFile:
+            def __init__(self, fh):
+                self._fh = fh
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return self._fh.__exit__(*exc)
+
+            def read(self, size=-1):
+                captured["size"] = size
+                return self._fh.read(size)
+
+        def wrapped_open(file, *a, **kw):
+            fh = real_open(file, *a, **kw)
+            if str(file) == _os.path.realpath(str(path)):
+                return _WrappedFile(fh)
+            return fh
+
+        monkeypatch.setattr("builtins.open", wrapped_open)
+        resp = client.post("/workflows/validate", json={"path": str(path)})
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "fail"
+        assert captured["size"] == WORKFLOW_MAX_SPEC_BYTES + 1
+
 
 class TestRunTierDispatch:
     def _script_spec(self, name="scriptwf"):
@@ -329,3 +385,64 @@ class TestCancelTierDispatch:
         monkeypatch.setattr(workflow_journal, "get_run", lambda rid: None)
         resp = client.post("/workflows/runs/ghost/cancel")
         assert resp.status_code == 404
+
+    def test_journaled_not_live_running_row_cancelled_via_journal(self, client, monkeypatch):
+        """A journaled-but-not-live run (crash remnant: no ``run_registry``
+        entry, journal row still RUNNING) must be cancellable — the route must
+        NOT dispatch to ``workflow_service.cancel_run`` here, since that
+        function only ever consults ``run_registry`` and would unconditionally
+        raise ``KeyError`` for a run with no live record (Copilot review,
+        main.py:1793)."""
+        monkeypatch.setattr(workflow_service, "run_registry", {})
+        row = workflow_journal.RunRow(
+            run_id="run1",
+            workflow_name="wf",
+            spec_snapshot="{}",
+            inputs_json="{}",
+            state="running",
+            current_step_id=None,
+            started_at="2026-01-01T00:00:00Z",
+            finished_at=None,
+            tier="yaml",
+        )
+        monkeypatch.setattr(workflow_journal, "get_run", lambda rid: row)
+
+        def _raise(*a, **k):
+            raise AssertionError("cancel_run must not be called for a journal-only run")
+
+        monkeypatch.setattr(workflow_service, "cancel_run", _raise)
+
+        recorded = {}
+
+        def _update_run_state(run_id, state, finished_at):
+            recorded["run_id"] = run_id
+            recorded["state"] = state
+            recorded["finished_at"] = finished_at
+
+        monkeypatch.setattr(workflow_journal, "update_run_state", _update_run_state)
+        resp = client.post("/workflows/runs/run1/cancel")
+        assert resp.status_code == 200
+        assert resp.json()["success"] is True
+        assert recorded["run_id"] == "run1"
+        assert recorded["state"] == "cancelled"
+        assert recorded["finished_at"] is not None
+
+    def test_journaled_not_live_terminal_row_409(self, client, monkeypatch):
+        """A journal-only row already in a terminal state (completed) is a 409,
+        not a silent 200 or an unconditional 404 from a doomed ``cancel_run``
+        call."""
+        monkeypatch.setattr(workflow_service, "run_registry", {})
+        row = workflow_journal.RunRow(
+            run_id="run1",
+            workflow_name="wf",
+            spec_snapshot="{}",
+            inputs_json="{}",
+            state="completed",
+            current_step_id=None,
+            started_at="2026-01-01T00:00:00Z",
+            finished_at="2026-01-01T00:00:01Z",
+            tier="yaml",
+        )
+        monkeypatch.setattr(workflow_journal, "get_run", lambda rid: row)
+        resp = client.post("/workflows/runs/run1/cancel")
+        assert resp.status_code == 409
