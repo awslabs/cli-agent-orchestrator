@@ -24,11 +24,12 @@ The service raises only NARROW exceptions (``ValueError`` / ``FileNotFoundError`
 from __future__ import annotations
 
 import glob
+import hashlib
 import logging
 import os
 import re
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import yaml
 
@@ -39,11 +40,15 @@ from cli_agent_orchestrator.constants import (
     WORKFLOW_SPEC_DIR,
 )
 from cli_agent_orchestrator.models.workflow import (
+    LintFinding,
+    ScriptSpec,
+    TierCollisionError,
     ValidationResult,
     WorkflowIndexRow,
     WorkflowSpec,
 )
 from cli_agent_orchestrator.models.workflow import validate_only as _model_validate_only
+from cli_agent_orchestrator.services.script_lint import lint_script
 
 logger = logging.getLogger(__name__)
 
@@ -207,20 +212,32 @@ def _connect():
     return sqlite3.connect(str(DATABASE_FILE))
 
 
-def upsert_index(spec: WorkflowSpec, source_path: str) -> None:
+def upsert_index(spec: Union[WorkflowSpec, ScriptSpec], source_path: str) -> None:
     """Idempotently materialize a spec into ``workflow_index`` (C2, FR-2.3).
 
     Keyed by ``name`` (ON CONFLICT DO UPDATE) so re-authoring the same spec
     updates the row in place rather than duplicating. ``source_path`` is the
-    ``realpath`` of the canonical YAML; ``indexed_at`` is derived bookkeeping
+    ``realpath`` of the canonical file; ``indexed_at`` is derived bookkeeping
     (ISO-8601 Z), never an ordering key (B2-BR-3 orders by ``name``).
+
+    A ``ScriptSpec`` (U5, A2) indexes with ``mode="script"`` and
+    ``step_count=None`` — step count is run-time-determined and unknowable at
+    index time (BR-4). A ``WorkflowSpec`` keeps the unchanged YAML behavior.
     """
+    if isinstance(spec, ScriptSpec):
+        mode = "script"
+        step_count: Optional[int] = None
+        description = ""
+    else:
+        mode = spec.mode
+        step_count = len(spec.steps)
+        description = spec.description
     row = WorkflowIndexRow(
         name=spec.name,
         source_path=os.path.realpath(source_path),
-        mode=spec.mode,
-        step_count=len(spec.steps),
-        description=spec.description,
+        mode=mode,
+        step_count=step_count,
+        description=description,
         indexed_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     )
     with _connect() as conn:
@@ -245,25 +262,28 @@ def upsert_index(spec: WorkflowSpec, source_path: str) -> None:
 
 
 def rebuild_index_from_files(scan_dir: Optional[str] = None) -> int:
-    """Full-rebuild ``workflow_index`` from the YAML files in ``scan_dir`` (C1a).
+    """Full-rebuild ``workflow_index`` from the spec files in ``scan_dir`` (C1a, A2).
 
     The index is disposable: DELETE everything, then re-materialize from the
     files in a **stable** (case-sensitive filename) sort so the resulting listing
-    is byte-identical across drop+relist (B2-BR-3). An unparseable spec is
+    is byte-identical across drop+relist (B2-BR-3). An unparseable YAML spec is
     SKIPPED and logged — it never appears in the listing in either run, so
-    identity is preserved.
+    identity is preserved. A same-stem cross-tier collision (BR-2) is skipped
+    from indexing (not raised — a collision is rejected at ACCESS time, in
+    ``get_workflow``, not at scan time, so other names still index).
 
     Returns the number of rows rebuilt.
     """
     safe_dir = _safe_dir(scan_dir)
-    paths = sorted(
+    yaml_paths = sorted(
         glob.glob(os.path.join(safe_dir, "*.yaml")) + glob.glob(os.path.join(safe_dir, "*.yml"))
     )
+    py_paths = sorted(glob.glob(os.path.join(safe_dir, "*.py")))
     with _connect() as conn:
         conn.execute("DELETE FROM workflow_index")
         conn.commit()
     rows = 0
-    for path in paths:
+    for path in yaml_paths:
         try:
             # Bind containment to the SAME dir we globbed from (not WORKFLOW_SPEC_DIR)
             # so a caller-supplied scan_dir resolves its own specs.
@@ -272,6 +292,20 @@ def rebuild_index_from_files(scan_dir: Optional[str] = None) -> int:
             logger.warning("rebuild: skipping unparseable spec %s: %s", path, e)
             continue
         upsert_index(spec, path)
+        rows += 1
+    for path in py_paths:
+        stem = _stem_of(path)
+        try:
+            _check_tier_collision(stem, safe_dir)
+        except TierCollisionError as e:
+            logger.warning("rebuild: skipping colliding script spec %s: %s", path, e)
+            continue
+        try:
+            script_spec = _read_script_spec(path, stem)
+        except (ValueError, OSError, UnicodeDecodeError) as e:
+            logger.warning("rebuild: skipping unreadable script spec %s: %s", path, e)
+            continue
+        upsert_index(script_spec, path)
         rows += 1
     return rows
 
@@ -326,13 +360,72 @@ def _resolve_source_path(name: str, scan_dir: Optional[str] = None) -> str:
     return str(row[0])
 
 
-def get_workflow(name_or_path: str, scan_dir: Optional[str] = None) -> WorkflowSpec:
-    """Return the parsed/validated spec for a workflow name or a file path (C2).
+def render_findings(findings: List[LintFinding]) -> List[dict]:
+    """Render a list of ``LintFinding`` into the shared 422/findings-body shape (A1a, BR-10).
 
-    If ``name_or_path`` points at an existing file, it is loaded directly;
-    otherwise it is treated as an indexed workflow name and resolved to its
-    canonical source path. Raises ``KeyError`` for an unknown name (-> 404),
-    ``FileNotFoundError`` / ``ValueError`` as ``load_and_validate`` does.
+    ONE function used by BOTH the validate route's ``.py`` success path (A1a)
+    and the run route's ``ScriptLintError`` 422 handler (A3) — never
+    duplicated per-verb (BR-21).
+    """
+    return [finding.model_dump() for finding in findings]
+
+
+def _stem_of(path: str) -> str:
+    """Return the file stem (basename minus extension) for tier/collision keys."""
+    return os.path.splitext(os.path.basename(path))[0]
+
+
+def _check_tier_collision(stem: str, safe_dir: str) -> None:
+    """Raise ``TierCollisionError`` if ``stem`` exists in BOTH tiers in ``safe_dir``.
+
+    A same-stem sibling across the ``.py`` / ``.yaml`` / ``.yml`` extensions
+    within one scan dir is a rejected collision (BR-2) — never resolved by
+    precedence. Consulted by both the access-time (A1) and scan-time (A2)
+    paths.
+    """
+    siblings = glob.glob(os.path.join(safe_dir, f"{stem}.yaml")) + glob.glob(
+        os.path.join(safe_dir, f"{stem}.yml")
+    )
+    if siblings:
+        raise TierCollisionError(stem)
+
+
+def _read_script_spec(real_path: str, stem: str) -> ScriptSpec:
+    """Read + lint a ``.py`` spec file into a ``ScriptSpec`` (A1, E1).
+
+    The load-time lint (U1) is INFORMATIONAL only — feeds ``validate``/
+    ``list``/``get`` rendering (BR-6); it is a SEPARATE call from U4's
+    run-path defensive re-check.
+    """
+    with open(real_path, "rb") as fh:
+        raw = fh.read()
+    if len(raw) > WORKFLOW_MAX_SPEC_BYTES:
+        raise ValueError(f"spec is {len(raw)} bytes (max {WORKFLOW_MAX_SPEC_BYTES})")
+    source = raw.decode("utf-8")
+    content_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    result = lint_script(source, real_path)
+    return ScriptSpec(
+        name=stem,
+        path=real_path,
+        source=source,
+        content_hash=content_hash,
+        findings=result.findings,
+    )
+
+
+def get_workflow(
+    name_or_path: str, scan_dir: Optional[str] = None
+) -> Union[WorkflowSpec, ScriptSpec]:
+    """Return the parsed/validated spec for a workflow name or a file path (C4, A1).
+
+    Extension-based tier dispatch (FR-4.2): ``.yaml``/``.yml`` resolves via the
+    UNCHANGED YAML path (byte-identical, FR-5.1); ``.py`` resolves to a
+    ``ScriptSpec`` — collision-checked (BR-2) THEN read THEN load-time-linted
+    (BR-6) — before construction. Raises ``KeyError`` for an unknown name
+    (-> 404), ``TierCollisionError`` for a same-stem cross-tier sibling
+    (-> 409), ``ValueError`` for an unrecognized extension (-> 400),
+    ``FileNotFoundError`` / ``ValueError`` as ``load_and_validate`` does for
+    the YAML arm.
     """
     # A path-like argument is canonicalized + bound to its configured base
     # directory BEFORE the stat (never stat raw user input); a bare name falls
@@ -340,11 +433,24 @@ def get_workflow(name_or_path: str, scan_dir: Optional[str] = None) -> WorkflowS
     if os.sep in name_or_path or (os.altsep and os.altsep in name_or_path):
         safe_path = _safe_spec_path(name_or_path, scan_dir)
         if os.path.isfile(safe_path):
-            return load_and_validate(safe_path, base_dir=scan_dir)
+            return _load_by_extension(safe_path, scan_dir)
     # The resolved source_path lives under scan_dir (the index was rebuilt from
     # it), so bind containment to that same dir on load.
     source_path = _resolve_source_path(name_or_path, scan_dir)
-    return load_and_validate(source_path, base_dir=scan_dir)
+    return _load_by_extension(source_path, scan_dir)
+
+
+def _load_by_extension(real_path: str, scan_dir: Optional[str]) -> Union[WorkflowSpec, ScriptSpec]:
+    """Extension-based dispatch shared by both ``get_workflow`` call sites (A1)."""
+    ext = os.path.splitext(real_path)[1].lower()
+    if ext in (".yaml", ".yml"):
+        return load_and_validate(real_path, base_dir=scan_dir)  # UNCHANGED, FR-5.1
+    if ext == ".py":
+        safe_dir = _safe_dir(scan_dir)
+        stem = _stem_of(real_path)
+        _check_tier_collision(stem, safe_dir)  # -> TierCollisionError (409)
+        return _read_script_spec(real_path, stem)
+    raise ValueError(f"unrecognized spec extension: {ext}")
 
 
 def delete_workflow(name: str, scan_dir: Optional[str] = None) -> None:

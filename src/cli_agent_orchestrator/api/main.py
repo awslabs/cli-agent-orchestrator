@@ -1529,14 +1529,45 @@ async def run_step(
 
 @app.post("/workflows/validate")
 async def validate_workflow_endpoint(body: WorkflowValidateRequest) -> Dict:
-    """Validate a workflow spec without running it (FR-1.3). Returns ValidationResult."""
+    """Validate a workflow spec without running it (FR-1.3/A1a). Returns ValidationResult.
+
+    Extension-based dispatch (U5, A1a, BR-23a): ``.yaml``/``.yml`` calls
+    ``validate_only`` UNCHANGED (FR-5.1); ``.py`` calls ``lint_script``
+    DIRECTLY — NOT via ``get_workflow``/``ScriptSpec`` — staying read-only,
+    side-effect-free, and collision-check-free like the YAML arm (BR-23b),
+    and renders through the shared ``render_findings`` helper (BR-10 reuse).
+    """
+    import os as _os
+
     from cli_agent_orchestrator.services import workflow_spec_service
 
-    try:
-        result = workflow_spec_service.validate_only(body.path)
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    return result.model_dump()
+    ext = _os.path.splitext(body.path)[1].lower()
+    if ext in (".yaml", ".yml"):
+        try:
+            result = workflow_spec_service.validate_only(body.path)
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        return result.model_dump()
+    if ext == ".py":
+        from cli_agent_orchestrator.models.workflow import ScriptValidationResult
+        from cli_agent_orchestrator.services.script_lint import lint_script
+
+        try:
+            real_path = workflow_spec_service._safe_spec_path(body.path)
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        try:
+            with open(real_path, "rb") as fh:
+                source = fh.read().decode("utf-8", errors="replace")
+        except OSError as e:
+            return ScriptValidationResult(
+                status="fail", errors=[f"could not read spec: {e}"]
+            ).model_dump()
+        result = lint_script(source, real_path)
+        return result.model_dump()
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST, detail=f"unrecognized spec extension: {ext}"
+    )
 
 
 @app.get("/workflows")
@@ -1553,7 +1584,15 @@ async def list_workflows_endpoint(dir: Optional[str] = Query(default=None)) -> L
 
 @app.get("/workflows/{name}")
 async def get_workflow_endpoint(name: str) -> Dict:
-    """Return the parsed/validated spec for a workflow name (FR-2.1)."""
+    """Return the parsed/validated spec for a workflow name (FR-2.1, A1).
+
+    Widened return: ``get_workflow`` may now resolve a ``.py`` name to a
+    ``ScriptSpec`` (U5, C4) — ``.model_dump()`` is unconditional on either
+    return type (BR-7a), so no branch is needed here. ``TierCollisionError``
+    (a same-stem cross-tier sibling, BR-2/BR-3) maps to 409, checked BEFORE
+    the bare ``ValueError`` arm (it is a ``ValueError`` subclass).
+    """
+    from cli_agent_orchestrator.models.workflow import TierCollisionError
     from cli_agent_orchestrator.services import workflow_spec_service
 
     try:
@@ -1564,6 +1603,8 @@ async def get_workflow_endpoint(name: str) -> Dict:
         )
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except TierCollisionError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     return spec.model_dump()
@@ -1635,11 +1676,28 @@ async def start_workflow_run_endpoint(
     body: WorkflowRunRequest,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
-    """Resolve a spec, run it to completion inline, return the WorkflowRunResult."""
+    """Resolve a spec, run it to completion inline, return the WorkflowRunResult.
+
+    Tier dispatch (U5, A3, BR-8): ONE ``isinstance(spec, ScriptSpec)`` check,
+    immediately after ``get_workflow`` resolves the spec — no downstream code
+    re-derives the tier. The YAML arm (``start_run``) is called UNCHANGED
+    (FR-5.1). The script arm pre-checks run_id availability itself (BR-9a —
+    ``run_script_workflow`` has no admission gate of its own) before calling
+    ``run_script_workflow``; a lint failure maps to 422 with a findings body
+    (BR-10), via the shared ``render_findings`` helper.
+    """
     import uuid
 
-    from cli_agent_orchestrator.models.workflow import NotBuiltYetError
-    from cli_agent_orchestrator.services import workflow_service, workflow_spec_service
+    from cli_agent_orchestrator.models.workflow import (
+        NotBuiltYetError,
+        ScriptSpec,
+        TierCollisionError,
+    )
+    from cli_agent_orchestrator.services import (
+        script_runner,
+        workflow_service,
+        workflow_spec_service,
+    )
 
     try:
         spec = workflow_spec_service.get_workflow(body.name_or_path)
@@ -1650,10 +1708,31 @@ async def start_workflow_run_endpoint(
         )
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except TierCollisionError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
     run_id = body.run_id or f"run-{uuid.uuid4().hex[:16]}"
+
+    if isinstance(spec, ScriptSpec):
+        try:
+            workflow_service._check_run_id_available(run_id)
+        except KeyError as e:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+        try:
+            result = await script_runner.run_script_workflow(spec, body.inputs, run_id)
+        except script_runner.ScriptLintError as e:
+            raise HTTPException(
+                status_code=422,
+                detail={"findings": workflow_spec_service.render_findings(e.findings)},
+            )
+        except KeyError as e:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        return result.model_dump()
+
     try:
         result = await workflow_service.start_run(spec, body.inputs, run_id)
     except NotBuiltYetError as e:
@@ -1685,8 +1764,39 @@ async def cancel_workflow_run_endpoint(
     run_id: str,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
-    """Cooperatively cancel a running workflow (FR-5.4)."""
-    from cli_agent_orchestrator.services import workflow_service
+    """Cooperatively cancel a running workflow (FR-5.4, U5 A5).
+
+    Tier dispatch reads the LIVE ``run_registry`` record FIRST (BR-15) —
+    ``getattr(record, "tier", "yaml")`` — because cancel's async/sync split is
+    a property of which function to call on a live process. If absent
+    (crash remnant or already-finalized), falls back to the durable journal
+    (BR-16): absent row -> 404; terminal state -> 409; otherwise the base
+    ``cancel_run`` (idempotent) applies regardless of the row's tier.
+    """
+    from cli_agent_orchestrator.services import script_runner, workflow_journal, workflow_service
+
+    record = workflow_service.run_registry.get(run_id)
+    if record is None:
+        row = workflow_journal.get_run(run_id)
+        if row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'"
+            )
+        try:
+            workflow_service.cancel_run(run_id)
+        except KeyError:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'"
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+        return {"success": True, "run_id": run_id}
+
+    if getattr(record, "tier", "yaml") == "script":
+        await script_runner.cancel_script_run(
+            cast(script_runner.ScriptRunRecord, record)
+        )  # NEVER raises (BR-19)
+        return {"success": True, "run_id": run_id}
 
     try:
         workflow_service.cancel_run(run_id)
@@ -1702,16 +1812,37 @@ async def resume_workflow_run_endpoint(
     run_id: str,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
-    """Resume a crashed/failed run from its durable journal (FR-6.2, N6).
+    """Resume a crashed/failed run from its durable journal (FR-6.2, N6, U5 A4).
 
-    Re-drives the snapshotted spec from the journal, skipping already-completed
-    steps and re-running the rest with fresh terminals; awaited INLINE like the run
-    endpoint and returns the same ``WorkflowRunResult``. Error mapping
-    (business-logic-model §5): malformed run_id -> 400, unknown run -> 404, terminal
-    or live-RUNNING run -> 409, corrupt snapshot -> 422. The two resume subtypes are
-    caught BEFORE the bare ``ValueError`` arm so they map to their distinct codes.
+    Tier dispatch reads the run's **journaled** tier (``RunRow.tier``), NEVER
+    by re-resolving a spec (BR-11) — the spec file may have moved/changed
+    since the run started. Any ``tier`` value other than the literal string
+    ``"script"`` routes to the YAML arm (U5-Q2=A, default-to-YAML). The YAML
+    arm (``resume_from_last_completed``) is called UNCHANGED (FR-5.1). The
+    script arm's typed-error catch order matches the boundary table: narrower
+    ``ResumeNotAllowedError``/``ResumeCorruptError`` (both ``ValueError``
+    subclasses) are caught BEFORE the bare ``ValueError`` arm.
     """
-    from cli_agent_orchestrator.services import workflow_service
+    from cli_agent_orchestrator.services import script_runner, workflow_journal, workflow_service
+
+    row = workflow_journal.get_run(run_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
+
+    if row.tier == "script":
+        try:
+            result = await script_runner.resume_script_run(run_id)
+        except KeyError:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'"
+            )
+        except workflow_service.ResumeNotAllowedError as e:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+        except workflow_service.ResumeCorruptError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        return result.model_dump()
 
     try:
         result = await workflow_service.resume_from_last_completed(run_id)

@@ -1,0 +1,322 @@
+"""Tests for U5 RunSurface tier dispatch (issue #312, Bolt 4).
+
+Covers: per-verb tier routing (run/validate/resume/cancel), collision
+rejection, error-status mapping for every U5-mapped error, the route-level
+lint integration test (422 + zero journal rows + zero script code run),
+unknown-tier -> YAML-arm default, and duplicate-run_id 409. The script
+engine (``script_runner``) is mocked at the route boundary — no real
+subprocess spawn.
+"""
+
+from __future__ import annotations
+
+import types
+import uuid
+from pathlib import Path
+
+import pytest
+
+from cli_agent_orchestrator.clients.database import (
+    _migrate_workflow_index,
+    _migrate_workflow_run,
+)
+from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.models.workflow import ScriptSpec, TierCollisionError
+from cli_agent_orchestrator.services import script_runner, workflow_journal, workflow_service
+
+_GOOD_SCRIPT = "def main():\n    pass\n"
+_BAD_SCRIPT = "def main(:\n"  # syntax error -> lint fail
+
+
+@pytest.fixture
+def isolated_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    db_path = tmp_path / "wf.db"
+    monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", db_path, raising=True)
+    _migrate_workflow_index()
+    _migrate_workflow_run()
+    return db_path
+
+
+@pytest.fixture
+def spec_dir(monkeypatch: pytest.MonkeyPatch):
+    base = Path.home() / ".cao-test-wf-tier-api" / uuid.uuid4().hex
+    base.mkdir(parents=True, exist_ok=True)
+    tmux_client._resolve_and_validate_working_directory(str(base))
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.workflow_spec_service.WORKFLOW_SPEC_DIR",
+        base,
+        raising=True,
+    )
+    try:
+        yield base
+    finally:
+        import shutil
+
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def _write_script(spec_dir: Path, name: str, body: str) -> Path:
+    p = spec_dir / f"{name}.py"
+    p.write_text(body)
+    return p
+
+
+def _write_yaml(spec_dir: Path, name: str) -> Path:
+    p = spec_dir / f"{name}.yaml"
+    p.write_text(
+        "name: {name}\nmode: sequential\nsteps:\n"
+        "  - id: only-step\n    provider: claude_code\n    agent: dev\n    prompt: go\n".format(
+            name=name
+        )
+    )
+    return p
+
+
+class TestValidateTierDispatch:
+    def test_py_arm_bypasses_get_workflow_and_returns_findings(self, client, isolated_db, spec_dir):
+        path = _write_script(spec_dir, "good", _GOOD_SCRIPT)
+        resp = client.post("/workflows/validate", json={"path": str(path)})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "pass"
+        assert body["findings"] == []
+
+    def test_py_arm_lint_fail_surfaces_findings(self, client, isolated_db, spec_dir):
+        path = _write_script(spec_dir, "bad", _BAD_SCRIPT)
+        resp = client.post("/workflows/validate", json={"path": str(path)})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "fail"
+        assert any(f["rule_id"] == "syntax" for f in body["findings"])
+
+    def test_unrecognized_extension_400(self, client, isolated_db, spec_dir):
+        path = spec_dir / "bad.txt"
+        path.write_text("hello")
+        resp = client.post("/workflows/validate", json={"path": str(path)})
+        assert resp.status_code == 400
+
+    def test_yaml_arm_unchanged(self, client, isolated_db, spec_dir):
+        path = _write_yaml(spec_dir, "yamlwf")
+        resp = client.post("/workflows/validate", json={"path": str(path)})
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "pass"
+
+
+class TestRunTierDispatch:
+    def _script_spec(self, name="scriptwf"):
+        return ScriptSpec(
+            name=name, path=f"/tmp/{name}.py", source=_GOOD_SCRIPT, content_hash="deadbeef"
+        )
+
+    def test_script_happy_path_dispatches_to_run_script_workflow(self, client, monkeypatch):
+        spec = self._script_spec()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.workflow_spec_service.get_workflow",
+            lambda name_or_path, scan_dir=None: spec,
+        )
+        monkeypatch.setattr(workflow_service, "_check_run_id_available", lambda rid: None)
+
+        async def _fake_run(spec_arg, inputs, run_id):
+            from cli_agent_orchestrator.models.workflow_runtime import (
+                RunState,
+                WorkflowRunResult,
+            )
+
+            return WorkflowRunResult(
+                run_id=run_id,
+                workflow_name=spec_arg.name,
+                state=RunState.COMPLETED,
+                started_at="2026-01-01T00:00:00Z",
+            )
+
+        monkeypatch.setattr(script_runner, "run_script_workflow", _fake_run)
+        resp = client.post(
+            "/workflows/runs", json={"name_or_path": "scriptwf", "inputs": {}, "run_id": "r1"}
+        )
+        assert resp.status_code == 200
+        assert resp.json()["state"] == "completed"
+
+    def test_tier_collision_maps_to_409(self, client, monkeypatch):
+        def _raise(name_or_path, scan_dir=None):
+            raise TierCollisionError("dup")
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.workflow_spec_service.get_workflow", _raise
+        )
+        resp = client.post("/workflows/runs", json={"name_or_path": "dup", "inputs": {}})
+        assert resp.status_code == 409
+
+    def test_duplicate_run_id_precheck_409_and_engine_never_called(self, client, monkeypatch):
+        spec = self._script_spec()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.workflow_spec_service.get_workflow",
+            lambda name_or_path, scan_dir=None: spec,
+        )
+
+        def _raise(run_id):
+            raise KeyError(f"run_id '{run_id}' already exists")
+
+        monkeypatch.setattr(workflow_service, "_check_run_id_available", _raise)
+
+        called = {"hit": False}
+
+        async def _should_not_run(spec_arg, inputs, run_id):
+            called["hit"] = True
+            raise AssertionError("run_script_workflow must not be called after a 409 pre-check")
+
+        monkeypatch.setattr(script_runner, "run_script_workflow", _should_not_run)
+        resp = client.post(
+            "/workflows/runs", json={"name_or_path": "scriptwf", "inputs": {}, "run_id": "dup"}
+        )
+        assert resp.status_code == 409
+        assert called["hit"] is False
+
+    def test_lint_fail_maps_to_422_with_findings_zero_journal_rows(
+        self, client, monkeypatch, isolated_db
+    ):
+        spec = self._script_spec()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.workflow_spec_service.get_workflow",
+            lambda name_or_path, scan_dir=None: spec,
+        )
+        monkeypatch.setattr(workflow_service, "_check_run_id_available", lambda rid: None)
+
+        from cli_agent_orchestrator.models.workflow import LintFinding
+
+        finding = LintFinding(rule_id="syntax", severity="error", line=1, message="bad")
+
+        async def _raise(spec_arg, inputs, run_id):
+            raise script_runner.ScriptLintError([finding])
+
+        monkeypatch.setattr(script_runner, "run_script_workflow", _raise)
+        resp = client.post(
+            "/workflows/runs",
+            json={"name_or_path": "scriptwf", "inputs": {}, "run_id": "r-lint"},
+        )
+        assert resp.status_code == 422
+        assert resp.json()["detail"]["findings"][0]["rule_id"] == "syntax"
+        # Zero journal rows / zero script code run: the run route never reached
+        # anything past the mocked (raising) run_script_workflow call.
+        assert workflow_journal.get_run("r-lint") is None
+
+
+class TestResumeTierDispatch:
+    def _seed_row(self, monkeypatch, tier, run_id="run1"):
+        row = workflow_journal.RunRow(
+            run_id=run_id,
+            workflow_name="wf",
+            spec_snapshot="{}",
+            inputs_json="{}",
+            state="failed",
+            current_step_id=None,
+            started_at="2026-01-01T00:00:00Z",
+            finished_at="2026-01-01T00:00:01Z",
+            tier=tier,
+        )
+        monkeypatch.setattr(workflow_journal, "get_run", lambda rid: row)
+
+    def test_script_tier_dispatches_to_resume_script_run(self, client, monkeypatch):
+        self._seed_row(monkeypatch, "script")
+
+        async def _ok(run_id):
+            from cli_agent_orchestrator.models.workflow_runtime import (
+                RunState,
+                WorkflowRunResult,
+            )
+
+            return WorkflowRunResult(
+                run_id=run_id, workflow_name="wf", state=RunState.COMPLETED, started_at="t"
+            )
+
+        monkeypatch.setattr(script_runner, "resume_script_run", _ok)
+        resp = client.post("/workflows/runs/run1/resume")
+        assert resp.status_code == 200
+        assert resp.json()["state"] == "completed"
+
+    def test_script_tier_resume_not_allowed_409(self, client, monkeypatch):
+        self._seed_row(monkeypatch, "script")
+
+        async def _raise(run_id):
+            raise workflow_service.ResumeNotAllowedError("live")
+
+        monkeypatch.setattr(script_runner, "resume_script_run", _raise)
+        resp = client.post("/workflows/runs/run1/resume")
+        assert resp.status_code == 409
+
+    def test_script_tier_resume_corrupt_422(self, client, monkeypatch):
+        self._seed_row(monkeypatch, "script")
+
+        async def _raise(run_id):
+            raise workflow_service.ResumeCorruptError("corrupt")
+
+        monkeypatch.setattr(script_runner, "resume_script_run", _raise)
+        resp = client.post("/workflows/runs/run1/resume")
+        assert resp.status_code == 422
+
+    def test_unknown_tier_value_routes_to_yaml_arm(self, client, monkeypatch):
+        """U5-Q2=A: any tier value other than the literal 'script' is the YAML arm."""
+        self._seed_row(monkeypatch, "some-future-tier")
+        called = {"yaml": False, "script": False}
+
+        async def _yaml_ok(run_id):
+            called["yaml"] = True
+            from cli_agent_orchestrator.models.workflow_runtime import (
+                RunState,
+                WorkflowRunResult,
+            )
+
+            return WorkflowRunResult(
+                run_id=run_id, workflow_name="wf", state=RunState.COMPLETED, started_at="t"
+            )
+
+        async def _script_should_not_run(run_id):
+            called["script"] = True
+            raise AssertionError("must not dispatch to the script arm")
+
+        monkeypatch.setattr(workflow_service, "resume_from_last_completed", _yaml_ok)
+        monkeypatch.setattr(script_runner, "resume_script_run", _script_should_not_run)
+        resp = client.post("/workflows/runs/run1/resume")
+        assert resp.status_code == 200
+        assert called["yaml"] is True
+        assert called["script"] is False
+
+
+class TestCancelTierDispatch:
+    def test_script_tier_live_record_dispatches_to_cancel_script_run(self, client, monkeypatch):
+        record = types.SimpleNamespace(tier="script")
+        monkeypatch.setattr(workflow_service, "run_registry", {"run1": record})
+
+        called = {"hit": False}
+
+        async def _cancel(rec):
+            called["hit"] = True
+            assert rec is record
+
+        monkeypatch.setattr(script_runner, "cancel_script_run", _cancel)
+        resp = client.post("/workflows/runs/run1/cancel")
+        assert resp.status_code == 200
+        assert called["hit"] is True
+
+    def test_no_live_record_falls_back_to_journal(self, client, monkeypatch):
+        monkeypatch.setattr(workflow_service, "run_registry", {})
+        row = workflow_journal.RunRow(
+            run_id="run1",
+            workflow_name="wf",
+            spec_snapshot="{}",
+            inputs_json="{}",
+            state="running",
+            current_step_id=None,
+            started_at="2026-01-01T00:00:00Z",
+            finished_at=None,
+            tier="script",
+        )
+        monkeypatch.setattr(workflow_journal, "get_run", lambda rid: row)
+        monkeypatch.setattr(workflow_service, "cancel_run", lambda rid: None)
+        resp = client.post("/workflows/runs/run1/cancel")
+        assert resp.status_code == 200
+
+    def test_no_live_record_no_journal_row_404(self, client, monkeypatch):
+        monkeypatch.setattr(workflow_service, "run_registry", {})
+        monkeypatch.setattr(workflow_journal, "get_run", lambda rid: None)
+        resp = client.post("/workflows/runs/ghost/cancel")
+        assert resp.status_code == 404

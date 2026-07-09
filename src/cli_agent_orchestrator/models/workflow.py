@@ -307,6 +307,40 @@ class LintFinding(BaseModel):
     message: str
 
 
+class TierCollisionError(ValueError):
+    """Same-stem name exists in both tiers within one scan dir (U5, FR-4.2).
+
+    A ``ValueError`` subclass — mapped to 409 (a resource conflict, not a
+    malformed request) at the API boundary, BEFORE any bare ``ValueError``
+    catch, matching the precedent U3 established for
+    ``ResumeNotAllowedError``/``ResumeCorruptError``.
+    """
+
+    def __init__(self, stem: str) -> None:
+        super().__init__(
+            f"workflow '{stem}' exists in both the script and YAML tiers "
+            "(same-stem collision across tiers)"
+        )
+        self.stem = stem
+
+
+class ScriptSpec(BaseModel):
+    """The ``.py`` counterpart to ``WorkflowSpec`` (U5, E1, C4).
+
+    A pydantic ``BaseModel`` (not a plain dataclass) — every route that
+    serializes whatever ``get_workflow`` returns calls ``.model_dump()``
+    unconditionally, with no ``isinstance`` branch on the read side
+    (BR-7a). TRANSIENT: resolved fresh per ``get_workflow`` call, never
+    persisted as a row.
+    """
+
+    name: str
+    path: str
+    source: str
+    content_hash: str
+    findings: List[LintFinding] = Field(default_factory=list)
+
+
 class ScriptValidationResult(ValidationResult):
     """The script tier's validate outcome — additive over ``ValidationResult``.
 

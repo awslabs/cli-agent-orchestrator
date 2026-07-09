@@ -297,3 +297,89 @@ class TestDeleteWorkflow:
         svc.delete_workflow("twice", scan_dir=str(spec_dir))
         with pytest.raises(KeyError):
             svc.delete_workflow("twice", scan_dir=str(spec_dir))
+
+
+def _write_script(spec_dir: Path, name: str, body: str = "def main():\n    pass\n") -> Path:
+    path = spec_dir / f"{name}.py"
+    path.write_text(body)
+    return path
+
+
+class TestScriptTierGetWorkflow:
+    """Tier detection + ScriptSpec resolution (issue #312, Bolt 4 / U5, A1)."""
+
+    def test_py_extension_resolves_to_scriptspec(self, spec_dir):
+        from cli_agent_orchestrator.models.workflow import ScriptSpec
+
+        path = _write_script(spec_dir, "scr")
+        spec = svc.get_workflow(str(path), scan_dir=str(spec_dir))
+        assert isinstance(spec, ScriptSpec)
+        assert spec.name == "scr"
+        assert spec.findings == []
+
+    def test_py_load_time_lint_carries_findings(self, spec_dir):
+        path = _write_script(spec_dir, "badscr", "def main(:\n")
+        spec = svc.get_workflow(str(path), scan_dir=str(spec_dir))
+        assert any(f.rule_id == "syntax" for f in spec.findings)
+
+    def test_cross_tier_collision_raises_at_access_time(self, spec_dir):
+        from cli_agent_orchestrator.models.workflow import TierCollisionError
+
+        _write_spec(spec_dir, "dup")
+        _write_script(spec_dir, "dup")
+        with pytest.raises(TierCollisionError):
+            svc.get_workflow(str(spec_dir / "dup.py"), scan_dir=str(spec_dir))
+
+    def test_unrecognized_extension_raises_valueerror(self, spec_dir):
+        path = spec_dir / "weird.txt"
+        path.write_text("hello")
+        with pytest.raises(ValueError):
+            svc.get_workflow(str(path), scan_dir=str(spec_dir))
+
+    def test_yaml_arm_stays_byte_identical(self, spec_dir):
+        # A .yaml file alongside a UNRELATED .py file (different stem) must
+        # resolve exactly as before — no collision, no new dispatch executed.
+        path = _write_spec(spec_dir, "onlyyaml")
+        _write_script(spec_dir, "unrelated")
+        spec = svc.get_workflow(str(path), scan_dir=str(spec_dir))
+        assert spec.name == "onlyyaml"
+        assert spec.mode == "sequential"
+
+
+class TestScriptTierRebuildIndex:
+    """``rebuild_index_from_files`` .py glob widening (A2, BR-4)."""
+
+    def test_script_row_has_none_step_count(self, isolated_db, spec_dir):
+        _write_script(spec_dir, "scr")
+        rows = svc.list_workflows(scan_dir=str(spec_dir))
+        assert len(rows) == 1
+        assert rows[0].mode == "script"
+        assert rows[0].step_count is None
+
+    def test_yaml_row_step_count_unchanged(self, isolated_db, spec_dir):
+        _write_spec(spec_dir, "yamlwf")
+        rows = svc.list_workflows(scan_dir=str(spec_dir))
+        assert rows[0].step_count == 1
+
+    def test_colliding_stem_skipped_from_index_other_names_still_index(self, isolated_db, spec_dir):
+        # The .py arm skips a colliding stem (BR-2); the pre-existing YAML arm
+        # is unaffected — its own scan loop indexes "dup.yaml" unchanged
+        # (FR-5.1) even though the SAME name also has a colliding .py sibling.
+        # Only the .py arm's OWN row is suppressed; other .py names still index.
+        _write_spec(spec_dir, "dup")
+        _write_script(spec_dir, "dup")
+        _write_script(spec_dir, "solo")
+        rows = svc.list_workflows(scan_dir=str(spec_dir))
+        by_name = {r.name: r for r in rows}
+        assert sorted(by_name) == ["dup", "solo"]
+        assert by_name["dup"].mode == "sequential"  # the YAML row, not a script row
+        assert by_name["solo"].mode == "script"
+
+
+class TestRenderFindings:
+    def test_renders_lint_findings_as_dicts(self):
+        from cli_agent_orchestrator.models.workflow import LintFinding
+
+        findings = [LintFinding(rule_id="syntax", severity="error", line=1, message="bad")]
+        rendered = svc.render_findings(findings)
+        assert rendered == [{"rule_id": "syntax", "severity": "error", "line": 1, "message": "bad"}]
