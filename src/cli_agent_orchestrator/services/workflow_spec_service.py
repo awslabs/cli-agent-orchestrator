@@ -95,35 +95,43 @@ def _safe_spec_path(path: Union[str, Path], base_dir: Optional[str] = None) -> P
     The single guarded entry for turning a user/agent-supplied spec path into a
     real path safe to stat/open. The API contract accepts BOTH absolute and
     relative spec paths (every authoring caller — CLI, HTTP, tests — passes an
-    absolute path resolved against its own cwd/tmp fixture), but both forms are
-    anchored under the validated base BEFORE resolution; the containment check
-    below is the policy gate.
+    absolute path resolved against its own cwd/tmp fixture): a relative ``path``
+    is joined onto the configured base BEFORE resolution, while an absolute
+    ``path`` resolves as-is (never re-anchored/stripped) — either way the
+    containment check below is what actually gates access, not the shape of
+    the input string.
 
-    Two stages, mirroring the bundle-import containment check
-    (``okf.py::ImportService.import_bundle``):
+    Deliberately mirrors ``utils/path_validation.py::resolve_and_validate_path``
+    — the ``os.path.realpath`` + ``str.startswith`` idiom CodeQL's
+    ``py/path-injection`` query already recognizes as a sanitizer in THIS repo
+    (that module carries zero open alerts). A ``pathlib``-only
+    ``Path.resolve()``/``Path.is_relative_to()`` rewrite was tried and is NOT
+    recognized by the same query — it closed the alerts at the old sink lines
+    only to reopen equivalent alerts at the new ones, because the analyzer
+    doesn't treat that pair as a taint-clearing barrier. Two stages:
 
-    1. ``Path.resolve()`` canonicalizes the path (resolves symlinks + ``..``).
-       This is the PathNormalization step.
+    1. ``os.path.realpath(os.path.abspath(...))`` canonicalizes the path
+       (resolves symlinks + ``..``) — the PathNormalization step CodeQL
+       tracks.
     2. ``_safe_dir`` policy-checks the base directory (``base_dir`` if given,
        else ``WORKFLOW_SPEC_DIR``) against the blocked-system-directory
        frozenset, then we assert the resolved file lies INSIDE that validated
-       base via ``Path.is_relative_to`` — the SafeAccessCheck that clears the
-       normalized path for the filesystem ops downstream.
+       base via ``startswith(safe_base + os.sep)`` — the SafeAccessCheck that
+       clears the normalized path for the filesystem ops downstream.
 
     The base is a SEPARATELY-derived configured root, NOT the file's own parent —
     so the containment check is load-bearing: a spec must resolve inside the
     workflow directory (or the caller-supplied ``scan_dir``). A path whose
-    resolved form escapes that base (e.g. a symlink pointing out, ``..`` traversal,
+    realpath escapes that base (e.g. a symlink pointing out, ``..`` traversal,
     or an arbitrary external path) is rejected rather than silently followed.
 
-    Every CodeQL-flagged sink downstream MUST open/stat the ``Path`` object this
-    function RETURNS — never re-derive a path from the original string — so the
-    resolve-then-contain check dominates the sink and CodeQL recognizes it as a
-    sanitizer.
+    Every CodeQL-flagged sink downstream MUST open/stat the value this
+    function RETURNS — never re-derive a path from the original string — so
+    the resolve-then-contain check dominates the sink.
 
     Returns:
-        The resolved, contained ``Path`` — the only value callers may pass to a
-        filesystem operation.
+        The resolved, contained ``Path`` — the only value callers may pass to
+        a filesystem operation.
 
     Raises:
         ValueError: the base directory is blocked, or the resolved file escapes
@@ -132,18 +140,13 @@ def _safe_spec_path(path: Union[str, Path], base_dir: Optional[str] = None) -> P
     if not path or (isinstance(path, str) and not path.strip()):
         raise ValueError("workflow spec path is required")
 
-    user_path = Path(path)
-    safe_base = Path(_safe_dir(base_dir)).resolve()  # None -> WORKFLOW_SPEC_DIR; realpath + blocked-dir guard
-
-    # Always anchor user input under the validated base. For absolute input,
-    # drop the anchor/root and keep only relative path components.
-    rel_user_path = Path(*user_path.parts[1:]) if user_path.is_absolute() else user_path
-    candidate = safe_base / rel_user_path
-
-    real_path = candidate.resolve()
-    if not real_path.is_relative_to(safe_base):
+    safe_base = _safe_dir(base_dir)  # None -> WORKFLOW_SPEC_DIR; realpath + blocked-dir guard
+    user_path = os.fspath(path)
+    candidate = user_path if os.path.isabs(user_path) else os.path.join(safe_base, user_path)
+    real_path = os.path.realpath(os.path.abspath(candidate))
+    if real_path != safe_base and not real_path.startswith(safe_base + os.sep):
         raise ValueError(f"workflow spec path '{path}' escapes its validated directory")
-    return real_path
+    return Path(real_path)
 
 
 # ---------------------------------------------------------------------------

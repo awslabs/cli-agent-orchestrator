@@ -1554,16 +1554,11 @@ async def validate_workflow_endpoint(body: WorkflowValidateRequest) -> Dict:
         from cli_agent_orchestrator.services.script_lint import lint_script
 
         try:
-            # Build a sink-local, analyzer-visible safe path from user input:
-            # normalize and enforce containment under the validated workflow base.
-            safe_base = Path(workflow_spec_service._safe_dir(None)).resolve()
-            user_path = Path(body.path)
-            rel_user_path = (
-                Path(*user_path.parts[1:]) if user_path.is_absolute() else user_path
-            )
-            real_path = (safe_base / rel_user_path).resolve()
-            if not real_path.is_relative_to(safe_base):
-                raise ValueError("workflow spec path escapes its validated directory")
+            # ``_safe_spec_path`` returns the resolved, contained path; every
+            # filesystem op below MUST use THIS value (not ``body.path``) so the
+            # resolve-then-contain check dominates the sink (CodeQL sanitizer
+            # requirement — it does not track taint through a re-derived path).
+            real_path = workflow_spec_service._safe_spec_path(body.path)
         except ValueError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
         try:
@@ -1610,15 +1605,8 @@ async def get_workflow_endpoint(name: str) -> Dict:
     (a same-stem cross-tier sibling, BR-2/BR-3) maps to 409, checked BEFORE
     the bare ``ValueError`` arm (it is a ``ValueError`` subclass).
     """
-    from cli_agent_orchestrator.constants import WORKFLOW_NAME_RE
     from cli_agent_orchestrator.models.workflow import TierCollisionError
     from cli_agent_orchestrator.services import workflow_spec_service
-
-    if os.sep in name or (os.altsep and os.altsep in name) or not WORKFLOW_NAME_RE.match(name):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"invalid workflow name '{name}'",
-        )
 
     try:
         spec = workflow_spec_service.get_workflow(name)
