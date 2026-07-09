@@ -1554,12 +1554,14 @@ async def validate_workflow_endpoint(body: WorkflowValidateRequest) -> Dict:
         from cli_agent_orchestrator.services.script_lint import lint_script
 
         try:
-            # Resolve via service-level policy first.
-            real_path = workflow_spec_service._safe_spec_path(body.path)
-            # Re-assert containment locally at the sink boundary so path safety is
-            # explicit and analyzer-visible in this function.
+            # Build a sink-local, analyzer-visible safe path from user input:
+            # normalize and enforce containment under the validated workflow base.
             safe_base = Path(workflow_spec_service._safe_dir(None)).resolve()
-            real_path = real_path.resolve()
+            user_path = Path(body.path)
+            rel_user_path = (
+                Path(*user_path.parts[1:]) if user_path.is_absolute() else user_path
+            )
+            real_path = (safe_base / rel_user_path).resolve()
             if not real_path.is_relative_to(safe_base):
                 raise ValueError("workflow spec path escapes its validated directory")
         except ValueError as e:
