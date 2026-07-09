@@ -1554,11 +1554,14 @@ async def validate_workflow_endpoint(body: WorkflowValidateRequest) -> Dict:
         from cli_agent_orchestrator.services.script_lint import lint_script
 
         try:
-            # ``_safe_spec_path`` returns the resolved, contained Path; every
-            # filesystem op below MUST use THIS object (not ``body.path``) so the
-            # resolve-then-contain check dominates the sink (CodeQL sanitizer
-            # requirement — it does not track taint through a re-derived path).
+            # Resolve via service-level policy first.
             real_path = workflow_spec_service._safe_spec_path(body.path)
+            # Re-assert containment locally at the sink boundary so path safety is
+            # explicit and analyzer-visible in this function.
+            safe_base = Path(workflow_spec_service._safe_dir(None)).resolve()
+            real_path = real_path.resolve()
+            if not real_path.is_relative_to(safe_base):
+                raise ValueError("workflow spec path escapes its validated directory")
         except ValueError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
         try:
