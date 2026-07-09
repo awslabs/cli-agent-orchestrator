@@ -16,8 +16,7 @@
     },
     "role": {
       "type": "string",
-      "enum": ["supervisor", "developer", "reviewer"],
-      "description": "Built-in role that maps to default allowedTools."
+      "description": "Agent role. Built-in values: supervisor, developer, reviewer. Custom roles are also supported via settings.json."
     },
     "provider": {
       "type": "string",

@@ -106,6 +106,6 @@ echo "✓ FIFO message sent: $MESSAGE_ID (group=$GROUP_ID)"
 {
   "Effect": "Allow",
   "Action": ["sqs:SendMessage"],
-  "Resource": "arn:aws:sqs:{{ config.region }}:*:{{ config.queue_url | replace('https://sqs.' + config.region + '.amazonaws.com/', '') | replace('/', ':') }}"
+  "Resource": "arn:aws:sqs:{{ config.region }}:{{ config.queue_url.split('/')[3] }}:{{ config.queue_url.split('/')[4] }}"
 }
 ```

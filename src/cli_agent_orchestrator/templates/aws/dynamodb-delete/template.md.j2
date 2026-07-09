@@ -88,7 +88,8 @@ else
     PROJ_EXPR="#pk"
 fi
 
-# Query items to delete
+# Query items to delete (single page — max 1MB / ~100-1000 items per call).
+# For tables with more matching items, run the agent multiple times.
 RESULT=$(aws dynamodb query \
     --profile "$PROFILE" \
     --region "$REGION" \

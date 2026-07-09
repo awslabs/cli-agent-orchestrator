@@ -122,7 +122,7 @@ class TestValidateFrontmatter:
     def test_invalid_role(self):
         meta = {"name": "x", "role": "worker"}
         msgs = _validate_frontmatter(meta)
-        assert any("[error]" in m and "role" in m for m in msgs)
+        assert any("[warn]" in m and "role" in m for m in msgs)
 
     def test_valid_role(self):
         meta = {"name": "x", "role": "developer"}
@@ -184,8 +184,10 @@ class TestAgentsValidateCommand:
 
     def test_validate_invalid_role(self, runner: CliRunner, sample_profile_invalid_role: Path):
         result = runner.invoke(agents, ["validate", str(sample_profile_invalid_role)])
-        assert result.exit_code == 1
+        # Unknown role is a warning, not an error — exits 0
+        assert result.exit_code == 0
         assert "role" in result.output
+        assert "[warn]" in result.output
 
     def test_validate_bad_tools(self, runner: CliRunner, sample_profile_bad_tools: Path):
         result = runner.invoke(agents, ["validate", str(sample_profile_bad_tools)])

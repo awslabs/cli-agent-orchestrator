@@ -5,7 +5,6 @@ Ref: https://github.com/awslabs/cli-agent-orchestrator/issues/340
 """
 
 import json
-import sys
 from pathlib import Path
 from typing import Optional
 
@@ -16,7 +15,6 @@ from jsonschema import Draft202012Validator
 from cli_agent_orchestrator.constants import LOCAL_AGENT_STORE_DIR, ROLE_TOOL_DEFAULTS
 from cli_agent_orchestrator.utils.agent_profiles import (
     list_agent_profiles,
-    parse_agent_profile_text,
 )
 
 # Known deprecated frontmatter fields that should trigger warnings.
@@ -41,7 +39,8 @@ def _resolve_profile_path(name_or_path: str) -> Optional[Path]:
 
     Accepts:
     - A file path (absolute or relative, must end in .md and exist)
-    - A bare agent name (looked up in LOCAL_AGENT_STORE_DIR)
+    - A bare agent name (looked up via the same search order as list_agent_profiles:
+      local store, provider dirs, extra dirs, built-in store)
 
     Returns the resolved Path, or None if not found.
     """
@@ -51,15 +50,41 @@ def _resolve_profile_path(name_or_path: str) -> Optional[Path]:
             return p
         return None
 
-    # Bare name: look in local store with containment check
+    # Bare name: use the shared lookup that searches all stores
+    from cli_agent_orchestrator.utils.agent_profiles import _read_agent_profile_source
+    try:
+        _read_agent_profile_source(name_or_path)
+    except (FileNotFoundError, ValueError):
+        return None
+
+    # The shared lookup found it. Now find the actual path for display.
+    # Check local store first (most common case for user-installed profiles)
     store_root = LOCAL_AGENT_STORE_DIR.resolve()
     candidate = (LOCAL_AGENT_STORE_DIR / f"{name_or_path}.md").resolve()
-    if not candidate.is_relative_to(store_root):
-        return None
-    if candidate.exists():
+    if candidate.is_relative_to(store_root) and candidate.exists():
         return candidate
 
+    # For built-in/provider profiles, write the content to a temp-like path
+    # isn't ideal. Instead, return None and let the caller use the text directly.
+    # Actually: we can return a sentinel that triggers text-based reading.
+    # Simpler: just return None and handle at the show/validate call sites.
     return None
+
+
+def _read_profile_text(name_or_path: str) -> Optional[str]:
+    """Read profile text by name or path. Returns None if not found."""
+    if name_or_path.endswith(".md"):
+        p = Path(name_or_path).expanduser().resolve()
+        if p.exists():
+            return p.read_text(encoding="utf-8")
+        return None
+
+    # Bare name: use shared lookup
+    from cli_agent_orchestrator.utils.agent_profiles import _read_agent_profile_source
+    try:
+        return _read_agent_profile_source(name_or_path)
+    except (FileNotFoundError, ValueError):
+        return None
 
 
 def _validate_frontmatter(metadata: dict) -> list[str]:
@@ -94,6 +119,16 @@ def _validate_frontmatter(metadata: dict) -> list[str]:
                     f"[warn] allowedTools entry '{tool}' is not in CAO's recognized "
                     f"vocabulary. It may be silently ignored by some providers."
                 )
+
+    # 4. Role check (advisory — custom roles are valid but worth flagging)
+    _BUILTIN_ROLES = set(ROLE_TOOL_DEFAULTS.keys())
+    role = metadata.get("role")
+    if role and role not in _BUILTIN_ROLES:
+        messages.append(
+            f"[warn] role '{role}' is not a built-in CAO role "
+            f"({', '.join(sorted(_BUILTIN_ROLES))}). "
+            f"Ensure it is defined in your settings.json custom roles."
+        )
 
     return messages
 
@@ -132,17 +167,23 @@ def show_cmd(name_or_path: str):
     or a path to a .md file.
     """
     path = _resolve_profile_path(name_or_path)
-    if path is None:
-        raise click.ClickException(f"Profile '{name_or_path}' not found.")
+    if path is not None:
+        profile_text = path.read_text(encoding="utf-8")
+        source_display = str(path)
+    else:
+        profile_text = _read_profile_text(name_or_path)
+        if profile_text is None:
+            raise click.ClickException(f"Profile '{name_or_path}' not found.")
+        source_display = f"{name_or_path} (built-in/provider)"
 
     try:
-        post = frontmatter.loads(path.read_text(encoding="utf-8"))
+        post = frontmatter.loads(profile_text)
     except Exception as e:
         raise click.ClickException(f"Error reading profile: {e}")
 
     meta = post.metadata
 
-    click.echo(f"Profile: {path}")
+    click.echo(f"Profile: {source_display}")
     click.echo(f"{'─' * 60}")
     click.echo(f"  name:         {meta.get('name', '(missing)')}")
     click.echo(f"  description:  {(meta.get('description') or '(none)')}")
@@ -181,11 +222,15 @@ def validate_cmd(name_or_path: str):
     - Unrecognized allowedTools vocabulary
     """
     path = _resolve_profile_path(name_or_path)
-    if path is None:
-        raise click.ClickException(f"Profile '{name_or_path}' not found.")
+    if path is not None:
+        profile_text = path.read_text(encoding="utf-8")
+    else:
+        profile_text = _read_profile_text(name_or_path)
+        if profile_text is None:
+            raise click.ClickException(f"Profile '{name_or_path}' not found.")
 
     try:
-        post = frontmatter.loads(path.read_text(encoding="utf-8"))
+        post = frontmatter.loads(profile_text)
     except Exception as e:
         raise click.ClickException(f"Error reading profile: {e}")
 
@@ -200,7 +245,7 @@ def validate_cmd(name_or_path: str):
         click.echo(f"  {msg}")
 
     if any(msg.startswith("[error]") for msg in messages):
-        raise SystemExit(1)
+        raise click.exceptions.Exit(1)
 
 
 @agents.command("remove")
@@ -281,7 +326,6 @@ def create_cmd(template: str, config_path: str, output_dir: str):
     """
     from cli_agent_orchestrator.services.agent_scaffold import (
         render_template,
-        validate_config,
     )
 
     # Load config

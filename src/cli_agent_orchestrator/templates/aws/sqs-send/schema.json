@@ -21,7 +21,9 @@
     },
     "message_body": {
       "type": "string",
-      "description": "JSON message body to send (rendered via heredoc, safe for arbitrary JSON)"
+      "description": "JSON message body to send (rendered via heredoc, safe for arbitrary JSON)",
+      "pattern": "^[^\n\r]*$",
+      "maxLength": 4096
     },
     "message_group_id": {
       "type": "string",
@@ -30,6 +32,11 @@
       "default": ""
     }
   },
-  "required": ["profile", "region", "queue_url", "message_body"],
+  "required": [
+    "profile",
+    "region",
+    "queue_url",
+    "message_body"
+  ],
   "additionalProperties": false
 }

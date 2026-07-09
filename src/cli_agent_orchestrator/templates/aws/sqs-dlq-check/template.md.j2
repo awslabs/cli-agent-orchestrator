@@ -118,6 +118,6 @@ fi
 {
   "Effect": "Allow",
   "Action": ["sqs:GetQueueAttributes", "sqs:ReceiveMessage"],
-  "Resource": "arn:aws:sqs:{{ config.region }}:*:{{ config.dlq_url | replace('https://sqs.' + config.region + '.amazonaws.com/', '') | replace('/', ':') }}"
+  "Resource": "arn:aws:sqs:{{ config.region }}:{{ config.dlq_url.split('/')[3] }}:{{ config.dlq_url.split('/')[4] }}"
 }
 ```

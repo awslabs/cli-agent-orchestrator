@@ -28,7 +28,9 @@
     "input_payload": {
       "type": "string",
       "description": "JSON input to the state machine (rendered via heredoc, safe for arbitrary JSON)",
-      "default": "{}"
+      "default": "{}",
+      "pattern": "^[^\n\r]*$",
+      "maxLength": 4096
     },
     "poll_interval_seconds": {
       "type": "integer",
@@ -43,6 +45,10 @@
       "default": 600
     }
   },
-  "required": ["profile", "region", "state_machine_arn"],
+  "required": [
+    "profile",
+    "region",
+    "state_machine_arn"
+  ],
   "additionalProperties": false
 }
