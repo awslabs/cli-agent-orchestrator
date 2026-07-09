@@ -17,6 +17,7 @@ Terminal Workflow:
 4. delete_terminal() → Cleans up provider, database record, and logging
 """
 
+import asyncio
 import logging
 import threading
 import time
@@ -25,6 +26,9 @@ from enum import Enum
 from typing import Dict, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.clients.database import (
+    create_inbox_message,
+)
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (
@@ -66,6 +70,12 @@ logger = logging.getLogger(__name__)
 # Track terminals that have already received memory injection (first message only).
 _memory_injected_terminals: set = set()
 _memory_injected_lock = threading.Lock()
+
+# Strong references to in-flight deferred-init background tasks. asyncio keeps
+# only a WEAK reference to tasks from loop.create_task, so without this a
+# deferred provider.initialize() + input-send task could be GC'd mid-run,
+# silently leaving a worker uninitialized. Tasks drop themselves on completion.
+_deferred_init_tasks: set = set()
 
 
 class TerminalInputBlockedError(Exception):
@@ -139,6 +149,9 @@ async def create_terminal(
     registry: PluginRegistry | None = None,
     env_vars: Optional[dict[str, str]] = None,
     caller_id: Optional[str] = None,
+    defer_init: bool = False,
+    initial_message: Optional[str] = None,
+    initial_message_orchestration_type: Optional[OrchestrationType] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -310,16 +323,40 @@ async def create_terminal(
             skill_prompt=skill_prompt,
             model=profile.model if profile else None,
         )
-        await provider_instance.initialize()
 
-        # Persist shell_command baseline if the provider captured one
-        shell_command = provider_instance.shell_baseline
-        if not isinstance(shell_command, str):
-            shell_command = None
-        if shell_command:
-            update_terminal_shell_command(terminal_id, shell_command)
+        # Deferred-init path: return fast so callers (e.g. MCP assign) do not
+        # block on `provider.initialize()`. The remaining initialize + input
+        # send runs as a background task, so two concurrent assigns can each
+        # kick off their init in parallel. Kiro-cli 2.11's per-tool client
+        # timeout (~120s observed) previously cancelled assign RPCs when init
+        # took long enough to push the round-trip past that cap; deferring init
+        # keeps the tool call under 2s.
+        if defer_init:
+            shell_command = None  # unknown until initialize() runs
+            _schedule_deferred_init(
+                provider_instance,
+                terminal_id,
+                initial_message,
+                initial_message_orchestration_type,
+                registry,
+            )
+        else:
+            await provider_instance.initialize()
 
-        # Build and return the Terminal object
+            # Persist shell_command baseline if the provider captured one
+            shell_command = provider_instance.shell_baseline
+            if not isinstance(shell_command, str):
+                shell_command = None
+            if shell_command:
+                update_terminal_shell_command(terminal_id, shell_command)
+
+        # Build and return the Terminal object. In the deferred-init path the
+        # provider is still initializing on a background task, so the terminal
+        # is NOT ready for input yet — report UNKNOWN (not IDLE) so a client
+        # can't mistake it for ready and send input early. Callers poll
+        # GET /terminals/{id} for the live status once init completes. The
+        # synchronous path has already reached IDLE by here.
+        initial_status = TerminalStatus.UNKNOWN if defer_init else TerminalStatus.IDLE
         terminal = Terminal(
             id=terminal_id,
             name=window_name,
@@ -329,7 +366,7 @@ async def create_terminal(
             caller_id=caller_id,
             allowed_tools=allowed_tools,
             shell_command=shell_command,
-            status=TerminalStatus.IDLE,
+            status=initial_status,
             last_active=datetime.now(),
         )
 
@@ -383,6 +420,165 @@ async def create_terminal(
             # of the same name.
             clear_session_env(session_name)
         raise
+
+
+def _notify_caller_of_deferred_failure(
+    terminal_id: str,
+    message: str,
+    registry: "PluginRegistry | None",
+    delete_worker: bool,
+) -> None:
+    """Make a deferred-init failure observable to the supervisor that assigned
+    the worker, then optionally tear the worker down.
+
+    Runs in a worker thread (blocking DB + tmux I/O). The supervisor is the
+    worker's ``caller_id``; we enqueue a PENDING inbox message to it so the
+    failure surfaces as the supervisor's next input instead of leaving it to
+    wait forever on a callback that will never come. Every step is best-effort
+    and independently guarded — a failure to notify must not prevent teardown,
+    and a failure to tear down must not crash the background task.
+    """
+    caller_id = None
+    try:
+        metadata = get_terminal_metadata(terminal_id)
+        if metadata:
+            caller_id = metadata.get("caller_id")
+    except Exception as exc:  # noqa: BLE001 — notification is best-effort
+        logger.warning(
+            "Deferred-init failure notify: could not read metadata for %s: %s",
+            terminal_id,
+            exc,
+        )
+
+    if caller_id:
+        try:
+            create_inbox_message(sender_id=terminal_id, receiver_id=caller_id, message=message)
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            logger.warning(
+                "Deferred-init failure notify: could not enqueue inbox message to "
+                "caller %s for worker %s: %s",
+                caller_id,
+                terminal_id,
+                exc,
+            )
+    else:
+        logger.warning(
+            "Deferred-init failure for %s has no caller_id to notify; failure is " "log-only.",
+            terminal_id,
+        )
+
+    if delete_worker:
+        try:
+            # Pass registry so post_kill_terminal hooks fire — parity with the
+            # DELETE endpoint and agent_step teardown.
+            delete_terminal(terminal_id, registry=registry)
+        except Exception as exc:  # noqa: BLE001 — teardown is best-effort
+            logger.warning(
+                "Deferred-init failure: teardown of worker %s failed (zombie "
+                "window may remain): %s",
+                terminal_id,
+                exc,
+            )
+
+
+def _schedule_deferred_init(
+    provider_instance,
+    terminal_id: str,
+    initial_message: Optional[str],
+    orchestration_type: Optional[OrchestrationType],
+    registry: PluginRegistry | None,
+) -> None:
+    """Kick off provider.initialize() in the background and, on success,
+    deliver the initial message via send_input.
+
+    Runs as an asyncio task on the running event loop so it doesn't block
+    the caller. Because assign() has already returned success=True by the
+    time this runs, a failure here must be made OBSERVABLE to the supervisor
+    rather than silently swallowed — otherwise the supervisor waits forever
+    on a callback that can never arrive and a later inspect 404s. On failure
+    we notify the caller's inbox (best-effort) and then tear the worker down.
+
+    ``TerminalInputBlockedError`` (the worker is parked on a WAITING_USER_ANSWER
+    prompt right after init) is NOT a teardown case: the worker is alive and
+    answerable via answer_user_prompt, so we leave it in place and only log.
+    """
+
+    async def _run() -> None:
+        caller_id: Optional[str] = None
+        try:
+            await provider_instance.initialize()
+            shell_command = provider_instance.shell_baseline
+            if isinstance(shell_command, str) and shell_command:
+                update_terminal_shell_command(terminal_id, shell_command)
+            if initial_message:
+                # For assign/handoff the sender is the CALLER (the supervisor),
+                # not this MCP server. But the deferred path is used only via
+                # /assign, and _assign_impl on the MCP-server side already
+                # embedded the callback instructions into initial_message.
+                # We still pass sender_id=caller_id if present in DB metadata
+                # so plugin events see it.
+                metadata = await asyncio.to_thread(get_terminal_metadata, terminal_id)
+                if metadata:
+                    caller_id = metadata.get("caller_id")
+                # send_input is blocking tmux I/O — off the loop so it can't
+                # freeze the server for concurrent requests.
+                await asyncio.to_thread(
+                    send_input,
+                    terminal_id,
+                    initial_message,
+                    registry=registry,
+                    sender_id=caller_id,
+                    orchestration_type=orchestration_type,
+                )
+        except TerminalInputBlockedError as e:
+            # The worker initialized but is parked on an interactive prompt
+            # (WAITING_USER_ANSWER). It is alive and can be driven via
+            # answer_user_prompt — do NOT delete it. Just surface the state to
+            # the supervisor so it knows delivery is pending on a prompt.
+            logger.warning(
+                "Deferred init for terminal %s: worker is waiting on a user "
+                "prompt; task not yet delivered. Leaving worker alive for "
+                "answer_user_prompt. (%s)",
+                terminal_id,
+                e,
+            )
+            await asyncio.to_thread(
+                _notify_caller_of_deferred_failure,
+                terminal_id,
+                f"Worker {terminal_id} is waiting on an interactive prompt; the "
+                f"assigned task has not been delivered yet. Use answer_user_prompt "
+                f"to unblock it, then it will receive the task.",
+                registry,
+                delete_worker=False,
+            )
+        except Exception as e:
+            # exc_info=True preserves the traceback for debugging; {e!r} avoids
+            # newline/control-character injection into logs and the inbox message
+            # (the exception text can contain provider-supplied content).
+            logger.error(
+                "Deferred init for terminal %s failed: %r. "
+                "Notifying caller and tearing down worker.",
+                terminal_id,
+                e,
+                exc_info=True,
+            )
+            await asyncio.to_thread(
+                _notify_caller_of_deferred_failure,
+                terminal_id,
+                f"Worker {terminal_id} failed to initialize: {e!r}. It has been "
+                f"deleted — re-assign the task or report the failure.",
+                registry,
+                delete_worker=True,
+            )
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        logger.error(f"Deferred init for {terminal_id}: no running event loop; init skipped")
+        return
+    task = loop.create_task(_run())
+    _deferred_init_tasks.add(task)
+    task.add_done_callback(_deferred_init_tasks.discard)
 
 
 def get_terminal(terminal_id: str) -> Dict:
@@ -497,6 +693,20 @@ def send_input(
         # the genuine PROCESSING signal that arrives once the agent starts
         # working on the new message.
         status_monitor.notify_input_sent(terminal_id)
+
+        # Clear ONLY the rolling byte buffer BEFORE sending keys, so stale idle
+        # prompts from BEFORE the input can't trigger a false COMPLETED
+        # (kiro-cli 2.11's TUI keeps the "ask a question" placeholder in the raw
+        # buffer, which combined with input_received=True would return COMPLETED
+        # within seconds of send_input). Clearing here — not after send_keys —
+        # avoids a race: send_keys includes a submit-delay sleep during which
+        # the agent can begin emitting output; a post-send_keys clear would wipe
+        # that newly-emitted first chunk of the turn (lost from
+        # GET /terminals/{id}/output?mode=full and from early detection). This
+        # uses clear_rolling_buffer (byte-only), which preserves the sticky-latch
+        # arm set by notify_input_sent above; reset_buffer would wipe the arm and
+        # latch-block the IDLE→PROCESSING transition for the whole turn.
+        status_monitor.clear_rolling_buffer(terminal_id)
 
         get_backend().send_keys(
             metadata["tmux_session"],

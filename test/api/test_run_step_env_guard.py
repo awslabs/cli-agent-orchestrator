@@ -13,6 +13,7 @@ from cli_agent_orchestrator.constants import TERMINALS_RUN_STEP_ROUTE
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 
 _RUN_STEP = "cli_agent_orchestrator.api.main.run_agent_step"
+_CHECK_GENERATION = "cli_agent_orchestrator.services.workflow_service.check_generation"
 
 _ALL_KEYS = {
     "CAO_WORKFLOW_RUN_ID": "run-abc123",
@@ -35,7 +36,13 @@ def _ok_result():
 
 class TestForwarding:
     def test_all_three_allowlisted_keys_forward_to_run_agent_step(self, client):
-        with patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())) as m_run:
+        # RUN_ID + GENERATION are both present, so the F1 fence fires — mock it
+        # to a pass-through so this test stays focused on forwarding, not the
+        # fence (which has its own TestGenerationFence coverage).
+        with (
+            patch(_CHECK_GENERATION, return_value=None),
+            patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())) as m_run,
+        ):
             resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(env_vars=_ALL_KEYS))
         assert resp.status_code == 200
         # BR-14: forwarded verbatim — no rewriting, no defaults, no merging.
@@ -49,9 +56,13 @@ class TestForwarding:
         assert m_run.await_args.kwargs["env_vars"] is None
 
     def test_run_id_with_generation_but_no_step_id_is_allowed(self, client):
-        # BR-7: RUN_ID without STEP_ID is a valid run-row-level call.
+        # BR-7: RUN_ID without STEP_ID is a valid run-row-level call. The pair is
+        # present, so the fence fires too — mocked to a pass-through here.
         env = {"CAO_WORKFLOW_RUN_ID": "run-abc", "CAO_WORKFLOW_GENERATION": "1"}
-        with patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())):
+        with (
+            patch(_CHECK_GENERATION, return_value=None),
+            patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())),
+        ):
             resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(env_vars=env))
         assert resp.status_code == 200
 
@@ -61,7 +72,10 @@ class TestForwarding:
             "CAO_WORKFLOW_RUN_ID": "r" * 64,
             "CAO_WORKFLOW_GENERATION": "g" * 64,
         }
-        with patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())):
+        with (
+            patch(_CHECK_GENERATION, return_value=None),
+            patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())),
+        ):
             resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(env_vars=env))
         assert resp.status_code == 200
 
@@ -191,3 +205,59 @@ class TestSentinelNeverEchoed:
         )
         assert resp.status_code == 422
         assert "SENTINELzzz" not in resp.text
+
+
+class TestGenerationFence:
+    """F1: the run-step handler checks the generation fence BEFORE dispatch,
+    whenever env_vars carries BOTH CAO_WORKFLOW_RUN_ID and
+    CAO_WORKFLOW_GENERATION."""
+
+    _ENV = {"CAO_WORKFLOW_RUN_ID": "run-fence", "CAO_WORKFLOW_GENERATION": "2"}
+
+    def test_stale_generation_is_409(self, client):
+        from cli_agent_orchestrator.services.workflow_service import StaleGenerationError
+
+        with (
+            patch(
+                _CHECK_GENERATION,
+                side_effect=StaleGenerationError("run 'run-fence': stale generation"),
+            ) as m_check,
+            patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())) as m_run,
+        ):
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(env_vars=self._ENV))
+        assert resp.status_code == 409
+        assert "run-fence" in resp.text
+        m_check.assert_called_once_with("run-fence", "2")
+        m_run.assert_not_awaited()  # fence fired BEFORE dispatch
+
+    def test_current_generation_passes_through(self, client):
+        with (
+            patch(_CHECK_GENERATION, return_value=None) as m_check,
+            patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())) as m_run,
+        ):
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(env_vars=self._ENV))
+        assert resp.status_code == 200
+        m_check.assert_called_once_with("run-fence", "2")
+        m_run.assert_awaited_once()
+
+    def test_unknown_run_id_is_404(self, client):
+        with (
+            patch(_CHECK_GENERATION, side_effect=KeyError("unknown run_id 'run-fence'")),
+            patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())) as m_run,
+        ):
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(env_vars=self._ENV))
+        assert resp.status_code == 404
+        m_run.assert_not_awaited()
+
+    def test_env_vars_without_the_pair_never_calls_fence(self, client):
+        # RUN_ID alone (no GENERATION) — invalid per BR-6/BR-7's cross-field rule,
+        # so this never reaches the fence; asserted separately below with a valid
+        # env shape that simply omits the pair (absent env_vars entirely).
+        with (
+            patch(_CHECK_GENERATION) as m_check,
+            patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())) as m_run,
+        ):
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body())
+        assert resp.status_code == 200
+        m_check.assert_not_called()
+        m_run.assert_awaited_once()

@@ -13,7 +13,6 @@ from typing import Optional
 from jinja2 import Environment, FileSystemLoader
 from jsonschema import Draft202012Validator
 
-
 # Templates live under src/cli_agent_orchestrator/templates/
 _TEMPLATES_ROOT = Path(__file__).resolve().parent.parent / "templates"
 
@@ -23,9 +22,7 @@ def _check_containment(path: Path, root: Path) -> None:
     resolved = path.resolve()
     root_resolved = root.resolve()
     if not resolved.is_relative_to(root_resolved):
-        raise FileNotFoundError(
-            f"Template path escapes templates root: {path}"
-        )
+        raise FileNotFoundError(f"Template path escapes templates root: {path}")
 
 
 def list_templates() -> list[dict]:
@@ -57,11 +54,13 @@ def list_templates() -> list[dict]:
                 except (json.JSONDecodeError, OSError):
                     pass
 
-            templates.append({
-                "name": f"{category_dir.name}/{template_dir.name}",
-                "description": description,
-                "path": str(template_dir),
-            })
+            templates.append(
+                {
+                    "name": f"{category_dir.name}/{template_dir.name}",
+                    "description": description,
+                    "path": str(template_dir),
+                }
+            )
 
     return templates
 
@@ -112,9 +111,7 @@ def render_template(template_name: str, config: dict) -> str:
     template_file = template_dir / "template.md.j2"
 
     if not template_file.exists():
-        raise FileNotFoundError(
-            f"Template '{template_name}' not found at {template_dir}"
-        )
+        raise FileNotFoundError(f"Template '{template_name}' not found at {template_dir}")
 
     # Validate config against schema (if schema exists)
     errors = validate_config(template_name, config)

@@ -45,6 +45,7 @@ logger = logging.getLogger(__name__)
 class AgentsConfig(BaseModel):
     dirs: Dict[str, str] = Field(default_factory=dict)
     extra_dirs: List[str] = Field(default_factory=list)
+    disabled_dirs: List[str] = Field(default_factory=list)
     roles: Dict[str, List[str]] = Field(default_factory=dict)
 
 
@@ -137,6 +138,7 @@ LEGACY_CONFIG_FILE = CAO_HOME_DIR / "config.json"
 _LEGACY_KEY_MAP: Dict[str, Tuple[str, ...]] = {
     "agents.dirs": ("agent_dirs",),
     "agents.extra_dirs": ("extra_agent_dirs",),
+    "agents.disabled_dirs": ("disabled_agent_dirs",),
     "agents.roles": ("roles",),
     "skills.extra_dirs": ("extra_skill_dirs",),
 }
@@ -310,6 +312,8 @@ def _get_owned_section(path: str, default: Any) -> Any:
         return settings_service.get_agent_dirs()
     if path == "agents.extra_dirs":
         return settings_service.get_extra_agent_dirs()
+    if path == "agents.disabled_dirs":
+        return settings_service.get_disabled_agent_dirs()
     if path == "agents.roles":
         data = settings_service._load()
         # Nested format: {"agents": {"roles": {...}}}
@@ -386,6 +390,8 @@ def _set_value(path: str, value: Any) -> Any:
 
     if path == "agents.extra_dirs":
         return settings_service.set_extra_agent_dirs(value)
+    if path == "agents.disabled_dirs":
+        return settings_service.set_disabled_agent_dirs(value)
     if path == "skills.extra_dirs":
         return settings_service.set_extra_skill_dirs(value)
     if path.startswith("agents.dirs."):
@@ -428,6 +434,7 @@ _ALL_PATHS = sorted(
     | {
         "agents.dirs",
         "agents.extra_dirs",
+        "agents.disabled_dirs",
         "agents.roles",
         "skills.extra_dirs",
         "server.mcp_request_timeout",
@@ -481,6 +488,7 @@ class ConfigService:
             agents=AgentsConfig(
                 dirs=_get_value("agents.dirs", default={}),
                 extra_dirs=_get_value("agents.extra_dirs", default=[]),
+                disabled_dirs=_get_value("agents.disabled_dirs", default=[]),
                 roles=_get_value("agents.roles", default={}),
             ),
             skills=SkillsConfig(extra_dirs=_get_value("skills.extra_dirs", default=[])),

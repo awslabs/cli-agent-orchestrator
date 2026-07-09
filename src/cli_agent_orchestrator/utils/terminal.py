@@ -5,7 +5,7 @@ import logging
 import re
 import time
 import uuid
-from typing import Union
+from typing import Optional, Union
 
 import requests
 
@@ -214,14 +214,42 @@ def sync_backend_from_server() -> None:
         logger.debug(f"sync_backend_from_server: could not reach server: {e}")
 
 
-def poll_until_done(terminal_id: str, timeout: float, polling_interval: float = 1.0) -> None:
-    """Poll terminal status until completed/error or timeout.
+def poll_until_done(
+    terminal_id: str,
+    timeout: float,
+    polling_interval: float = 1.0,
+    idle_stable_polls: int = 3,
+) -> None:
+    """Poll terminal status until the agent is done, errored, or timeout.
+
+    Two "done" signals, treated differently:
+
+    - **COMPLETED** — a definitive response-done marker (Credits line / green
+      arrow). Returns immediately, exactly as before; a single reading is
+      trustworthy.
+    - **IDLE** — returns only after (a) the agent has been observed actually
+      working at least once (a PROCESSING/non-ready reading), AND (b) IDLE then
+      persists for ``idle_stable_polls`` consecutive reads. kiro-cli 2.11
+      frequently finishes a turn with no COMPLETED marker and settles back to
+      its persistent idle prompt, so a finished kiro agent reports IDLE —
+      requiring COMPLETED only would hang here until timeout even though the
+      agent is done. But IDLE is ambiguous: a terminal is *also* idle right
+      after a send before it has begun processing. Gating the IDLE path on
+      "has started" prevents returning early with empty/partial output when the
+      agent simply hasn't picked up the task yet; the stable-window then guards
+      against a momentary idle flap mid-turn. The COMPLETED path is byte-for-byte
+      unchanged.
 
     Raises click.ClickException on error, timeout, or request failure.
     """
     import click
 
+    if idle_stable_polls < 1:
+        raise click.ClickException(f"idle_stable_polls must be >= 1, got {idle_stable_polls}")
+
     start = time.time()
+    consecutive_idle = 0
+    observed_working = False
     while True:
         elapsed = time.time() - start
         if elapsed > timeout:
@@ -229,13 +257,41 @@ def poll_until_done(terminal_id: str, timeout: float, polling_interval: float = 
                 f"Timed out after {int(elapsed)}s waiting for terminal {terminal_id}"
             )
         try:
-            resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}")
+            # Per-request timeout so a stalled server/network can't block past
+            # the outer timeout budget (matches wait_until_terminal_status).
+            resp = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
             resp.raise_for_status()
             status = resp.json().get("status")
             if status == TerminalStatus.COMPLETED.value:
                 return
             if status == TerminalStatus.ERROR.value:
                 raise click.ClickException("Terminal reached ERROR status")
+            if status == TerminalStatus.IDLE.value:
+                # Only count IDLE as progress toward "done" once we've seen the
+                # agent actually start working — otherwise the idle-before-
+                # processing window right after a send would return early with
+                # empty output.
+                if observed_working:
+                    consecutive_idle += 1
+                    if consecutive_idle >= idle_stable_polls:
+                        return
+            elif status in (
+                TerminalStatus.PROCESSING.value,
+                TerminalStatus.WAITING_USER_ANSWER.value,
+            ):
+                # The agent is actively working (or blocked on a prompt after
+                # starting). Mark that it started and reset the idle streak so a
+                # mid-turn idle flap can't accumulate. UNKNOWN is deliberately
+                # NOT treated as "started": a terminal can report UNKNOWN before
+                # it begins (no output yet / provider not registered / deferred
+                # init), and counting it would let a subsequent stable idle
+                # satisfy the gate and return early with empty output.
+                observed_working = True
+                consecutive_idle = 0
+            else:
+                # UNKNOWN or any other non-ready status: not evidence of work.
+                # Reset the idle streak but do not flip observed_working.
+                consecutive_idle = 0
         except requests.exceptions.RequestException as e:
             raise click.ClickException(f"Failed to poll terminal status: {e}")
         time.sleep(polling_interval)
@@ -263,15 +319,34 @@ def wait_until_terminal_status(
     else:
         target_values = {s.value for s in target_status}
 
+    logger.info(
+        f"wait_until_terminal_status [{terminal_id}]: waiting for "
+        f"{{{', '.join(target_values)}}}, timeout={timeout}s"
+    )
     start_time = time.time()
+    last_seen: Optional[str] = None
+    poll_count = 0
     while time.time() - start_time < timeout:
+        poll_count += 1
         try:
             response = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=5.0)
             if response.status_code == 200:
                 current_status = response.json().get("status")
+                last_seen = current_status
                 if current_status in target_values:
+                    logger.info(
+                        f"wait_until_terminal_status [{terminal_id}]: reached "
+                        f"{current_status} after {poll_count} polls "
+                        f"({time.time() - start_time:.1f}s)"
+                    )
                     return True
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(
+                f"wait_until_terminal_status [{terminal_id}] poll #{poll_count} error: {e}"
+            )
         time.sleep(polling_interval)
+    logger.warning(
+        f"wait_until_terminal_status [{terminal_id}]: timeout after {timeout}s "
+        f"(polls={poll_count}, last_seen={last_seen!r})"
+    )
     return False

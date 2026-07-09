@@ -4,9 +4,10 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.utils.paths import normalized_path
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,73 @@ def set_agent_dirs(dirs: Dict[str, str]) -> Dict[str, str]:
     _save(settings)
     logger.info(f"Updated agent directories: {current}")
     return get_agent_dirs()
+
+
+def get_disabled_agent_dirs() -> List[str]:
+    """Directory paths the user has toggled OFF.
+
+    A disabled directory stays listed in Settings but is skipped when scanning
+    for (and loading) agent profiles, so its profiles disappear from the active
+    set without editing paths. Covers both provider defaults (fixes GH #281 —
+    a removed default used to silently reappear) and user extras (GH #280).
+
+    Reads from the nested schema first (``agents.disabled_dirs``), falls back
+    to the legacy flat key (``disabled_agent_dirs``) — same contract as the
+    sibling ``agents.dirs`` / ``agents.extra_dirs`` settings.
+    """
+    settings = _load()
+    nested = settings.get("agents", {})
+    if isinstance(nested, dict) and isinstance(nested.get("disabled_dirs"), list):
+        # list(...) narrows the untyped-dict Any to list[str] for mypy's
+        # no-any-return gate, matching get_extra_agent_dirs' return guard.
+        return list(nested["disabled_dirs"])
+    dirs = settings.get("disabled_agent_dirs", [])
+    return dirs if isinstance(dirs, list) else []
+
+
+def set_disabled_agent_dirs(dirs: List[str]) -> List[str]:
+    """Persist which configured directories are disabled.
+
+    Only paths that are actually configured (a provider default from
+    ``get_agent_dirs`` or a user extra) are accepted — an arbitrary path would
+    silently match nothing during scanning, so rejecting it keeps the stored
+    state honest and the UI truthful. Validation uses the same path
+    normalization as the scan/load side (``utils.paths.normalized_path``), so
+    a valid directory sent in a different spelling (trailing slash, ``~``,
+    symlink) is accepted rather than silently dropped; what gets PERSISTED is
+    always the configured spelling, so the UI's exact-string matching keeps
+    working. Order and duplicates are normalized away.
+
+    Writes to the nested schema (``agents.disabled_dirs``) and the legacy flat
+    key (``disabled_agent_dirs``) for backward compatibility — mirroring
+    ``set_agent_dirs`` / ``set_extra_agent_dirs``.
+    """
+    norm_to_configured = {
+        normalized_path(v): v
+        for v in list(get_agent_dirs().values()) + list(get_extra_agent_dirs())
+        if isinstance(v, str)
+    }
+    seen: Set[str] = set()
+    cleaned: List[str] = []
+    for d in dirs:
+        if not isinstance(d, str) or not d.strip():
+            continue
+        configured = norm_to_configured.get(normalized_path(d.strip()))
+        if configured is not None and configured not in seen:
+            seen.add(configured)
+            cleaned.append(configured)
+    settings = _load()
+    # Write nested format
+    agents_section = settings.get("agents", {})
+    if not isinstance(agents_section, dict):
+        agents_section = {}
+    agents_section["disabled_dirs"] = cleaned
+    settings["agents"] = agents_section
+    # Also write flat key for backward compat
+    settings["disabled_agent_dirs"] = cleaned
+    _save(settings)
+    logger.info(f"Disabled agent dirs: {cleaned}")
+    return cleaned
 
 
 # Default server tuning values
@@ -347,6 +415,12 @@ def set_extra_agent_dirs(dirs: List[str]) -> List[str]:
     # Also write flat key for backward compat
     settings["extra_agent_dirs"] = extra_agent_dirs
     _save(settings)
+    # Prune disabled entries that no longer point at any configured directory —
+    # otherwise removing an extra dir leaves a stale disabled entry behind, and
+    # re-adding that path later would come back silently pre-disabled.
+    disabled = get_disabled_agent_dirs()
+    if disabled:
+        set_disabled_agent_dirs(disabled)
     return extra_agent_dirs
 
 

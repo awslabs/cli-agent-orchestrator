@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CAO Fleet Console</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <span class="brand">CAO&nbsp;FLEET</span>
+    <span id="status-line" class="status-line">loading…</span>
+    <button id="launch-btn" class="primary launch-btn" type="button">＋ Launch</button>
+  </header>
+  <main id="wall" class="wall" aria-label="Fleet video wall"></main>
+
+  <dialog id="launch-dialog">
+    <form id="launch-form" method="dialog">
+      <h2>Launch an agent</h2>
+      <label>Node
+        <select name="node" id="launch-node"></select>
+      </label>
+      <label>Working directory
+        <input name="working_directory" id="launch-wd" placeholder="/path/to/project" autocomplete="off" />
+      </label>
+      <label>Provider (CLI)
+        <select name="provider" id="launch-provider"></select>
+      </label>
+      <label>Agent profile
+        <select name="agent_profile" id="launch-profile"></select>
+      </label>
+      <label>First task <span class="opt">(optional)</span>
+        <textarea name="task" id="launch-task" rows="2" placeholder="e.g. run the tests and summarise failures"></textarea>
+      </label>
+      <div id="launch-msg" class="dialog-msg"></div>
+      <div class="dialog-actions">
+        <button value="cancel" class="ghost" type="submit">Cancel</button>
+        <button value="ok" class="primary" type="submit">Launch</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

@@ -780,6 +780,65 @@ class TestSendInput:
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_input_clears_rolling_buffer_preserving_arm(
+        self, mock_get_metadata, mock_tmux, mock_pm, mock_update, mock_status_monitor
+    ):
+        """send_input clears the byte buffer AFTER arming the sticky latch.
+
+        Uses clear_rolling_buffer (byte-only) rather than reset_buffer so the
+        arm set by notify_input_sent survives. Without this distinction, the
+        buffer-clear would also wipe the arm, latch-blocking the subsequent
+        IDLE→PROCESSING transition and causing the terminal to read IDLE for
+        the entire busy turn (regression seen in test_supervisor_assign_and_
+        handoff — supervisor completed real work but wait_until_status timed
+        out because status never left IDLE).
+
+        The buffer clear itself is still needed to prevent stale idle
+        placeholders from the pre-task buffer combining with input_received=
+        True to trigger a false COMPLETED (the handoff-worker-killed-in-8s bug).
+        """
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_provider = mock_pm.get_provider.return_value
+        mock_provider.paste_enter_count = 2
+        mock_provider.paste_submit_delay = 1.0
+        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+
+        send_input("test1234", "hello worker")
+
+        mock_provider.mark_input_received.assert_called_once()
+        mock_status_monitor.notify_input_sent.assert_called_once_with("test1234")
+        mock_status_monitor.clear_rolling_buffer.assert_called_once_with("test1234")
+        # reset_buffer would wipe the arm — must NOT be called on send_input.
+        mock_status_monitor.reset_buffer.assert_not_called()
+
+        # Ordering guard: the byte-buffer clear must run BEFORE send_keys, not
+        # after. send_keys includes a submit-delay sleep during which the agent
+        # can start emitting output; a post-send_keys clear would wipe that
+        # newly-emitted first chunk of the turn. Attach both calls to a shared
+        # manager so we can assert their relative order.
+        manager = MagicMock()
+        manager.attach_mock(mock_status_monitor.clear_rolling_buffer, "clear")
+        manager.attach_mock(mock_tmux.send_keys, "send_keys")
+        # Re-run with the manager wired in to capture ordered calls.
+        mock_status_monitor.reset_mock()
+        mock_tmux.reset_mock()
+        manager.reset_mock()
+        manager.attach_mock(mock_status_monitor.clear_rolling_buffer, "clear")
+        manager.attach_mock(mock_tmux.send_keys, "send_keys")
+        send_input("test1234", "hello again")
+        ordered = [c[0] for c in manager.mock_calls]
+        assert ordered.index("clear") < ordered.index(
+            "send_keys"
+        ), f"clear_rolling_buffer must precede send_keys; got order {ordered}"
+
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_send_input_blocks_assign_when_provider_waits_for_user_answer(
         self, mock_get_metadata, mock_tmux, mock_pm, mock_update, mock_status_monitor
     ):
@@ -1178,3 +1237,94 @@ class TestDeleteTerminal:
         result = delete_terminal("test1234")
 
         assert result is True
+
+
+class TestDeferredInitFailureNotification:
+    """PR #390 must-fixes #1/#3: a deferred-init failure must be OBSERVABLE to
+    the supervisor (assign already returned success=True), teardown must pass
+    the registry (post_kill_terminal parity), and TerminalInputBlockedError
+    must NOT delete the worker.
+    """
+
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.create_inbox_message")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_notify_enqueues_inbox_to_caller_and_deletes_with_registry(
+        self, mock_meta, mock_create_inbox, mock_delete
+    ):
+        from cli_agent_orchestrator.services.terminal_service import (
+            _notify_caller_of_deferred_failure,
+        )
+
+        mock_meta.return_value = {"caller_id": "super123"}
+        registry = MagicMock()
+
+        _notify_caller_of_deferred_failure(
+            "worker99", "init failed: boom", registry, delete_worker=True
+        )
+
+        # Caller notified via inbox (sender = the failed worker, receiver = caller)
+        mock_create_inbox.assert_called_once()
+        _, kwargs = mock_create_inbox.call_args
+        assert kwargs["receiver_id"] == "super123"
+        assert kwargs["sender_id"] == "worker99"
+        assert "init failed: boom" in kwargs["message"]
+        # Teardown passes the registry so post_kill_terminal hooks fire.
+        mock_delete.assert_called_once_with("worker99", registry=registry)
+
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.create_inbox_message")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_notify_without_delete_leaves_worker_alive(
+        self, mock_meta, mock_create_inbox, mock_delete
+    ):
+        """delete_worker=False (the WAITING_USER_ANSWER case) must notify but
+        NOT tear the worker down."""
+        from cli_agent_orchestrator.services.terminal_service import (
+            _notify_caller_of_deferred_failure,
+        )
+
+        mock_meta.return_value = {"caller_id": "super123"}
+
+        _notify_caller_of_deferred_failure(
+            "worker99", "waiting on prompt", None, delete_worker=False
+        )
+
+        mock_create_inbox.assert_called_once()
+        mock_delete.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.create_inbox_message")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_notify_inbox_failure_does_not_block_teardown(
+        self, mock_meta, mock_create_inbox, mock_delete
+    ):
+        """If the inbox enqueue fails, teardown must still happen (independent
+        best-effort steps)."""
+        from cli_agent_orchestrator.services.terminal_service import (
+            _notify_caller_of_deferred_failure,
+        )
+
+        mock_meta.return_value = {"caller_id": "super123"}
+        mock_create_inbox.side_effect = Exception("db down")
+
+        _notify_caller_of_deferred_failure("worker99", "boom", None, delete_worker=True)
+
+        mock_delete.assert_called_once()
+
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.create_inbox_message")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_notify_no_caller_id_is_log_only(self, mock_meta, mock_create_inbox, mock_delete):
+        """No caller_id (e.g. operator-launched) → no inbox attempt, still tears
+        down."""
+        from cli_agent_orchestrator.services.terminal_service import (
+            _notify_caller_of_deferred_failure,
+        )
+
+        mock_meta.return_value = {"caller_id": None}
+
+        _notify_caller_of_deferred_failure("worker99", "boom", None, delete_worker=True)
+
+        mock_create_inbox.assert_not_called()
+        mock_delete.assert_called_once()

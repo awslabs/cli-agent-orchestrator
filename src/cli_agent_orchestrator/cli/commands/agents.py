@@ -52,6 +52,7 @@ def _resolve_profile_path(name_or_path: str) -> Optional[Path]:
 
     # Bare name: use the shared lookup that searches all stores
     from cli_agent_orchestrator.utils.agent_profiles import _read_agent_profile_source
+
     try:
         _read_agent_profile_source(name_or_path)
     except (FileNotFoundError, ValueError):
@@ -81,6 +82,7 @@ def _read_profile_text(name_or_path: str) -> Optional[str]:
 
     # Bare name: use shared lookup
     from cli_agent_orchestrator.utils.agent_profiles import _read_agent_profile_source
+
     try:
         return _read_agent_profile_source(name_or_path)
     except (FileNotFoundError, ValueError):
@@ -298,16 +300,23 @@ def templates_cmd():
 
 @agents.command("create")
 @click.option(
-    "--template", "-t", required=True,
+    "--template",
+    "-t",
+    required=True,
     help="Template name (e.g., 'aws/stepfunction'). Run 'cao agents templates' to list.",
 )
 @click.option(
-    "--config", "-c", "config_path", required=True,
+    "--config",
+    "-c",
+    "config_path",
+    required=True,
     type=click.Path(exists=True),
     help="Path to config.json with user values.",
 )
 @click.option(
-    "--output-dir", "-o", "output_dir",
+    "--output-dir",
+    "-o",
+    "output_dir",
     type=click.Path(),
     default=".",
     help="Output directory for the generated profile (default: current dir).",

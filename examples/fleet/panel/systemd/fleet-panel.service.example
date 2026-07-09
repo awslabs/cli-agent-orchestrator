@@ -1,0 +1,39 @@
+# Example systemd unit for the CAO Fleet Panel, running on the coordinator.
+# Replace the placeholders, then:
+#   sudo cp fleet-panel.service.example /etc/systemd/system/fleet-panel.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now fleet-panel.service
+#
+# Placeholders:
+#   YOUR_USER            OS user that owns the checkout
+#   YOUR_PANEL_HOST      address to bind the panel to (127.0.0.1, or your private-network IP)
+#   YOUR_PANEL_TOKEN     shared secret required on every request (see below)
+#   /path/to/examples/fleet/panel   absolute path to this panel directory
+#
+# SECURITY: binding YOUR_PANEL_HOST to anything other than 127.0.0.1 exposes an
+# unauthenticated control plane (launch/keystroke/shutdown across the fleet). Set
+# CAO_PANEL_TOKEN to require a shared secret, and keep the panel on a private/VPN
+# network. See the panel README "Security".
+
+[Unit]
+Description=CAO Fleet Panel
+After=network-online.target cao-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+Group=YOUR_USER
+Environment=HOME=/home/YOUR_USER
+# Point at your own registry (defaults to fleet.json next to the example if unset):
+# Environment=CAO_FLEET_CONFIG=/path/to/examples/fleet/fleet.json
+Environment=CAO_PANEL_HOST=YOUR_PANEL_HOST
+Environment=CAO_PANEL_PORT=9888
+# Require a shared secret on every request whenever the panel is off loopback:
+Environment=CAO_PANEL_TOKEN=YOUR_PANEL_TOKEN
+WorkingDirectory=/path/to/examples/fleet/panel
+ExecStart=/home/YOUR_USER/.local/bin/uv run fleet-panel
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

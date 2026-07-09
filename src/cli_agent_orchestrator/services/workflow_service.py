@@ -29,7 +29,10 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
+
+if TYPE_CHECKING:  # avoid a runtime circular import (script_runner imports this module)
+    from cli_agent_orchestrator.services.script_runner import ScriptRunRecord
 
 from pydantic import ValidationError
 
@@ -156,7 +159,14 @@ class RunRecord:
 
 # Process-local run registry (ADR-8, B3-LC-2 singleton). A process restart loses
 # in-flight runs — the explicit, documented pre-N6 gap (A-5).
-run_registry: Dict[str, RunRecord] = {}
+#
+# U4 (issue #312, script tier, C1) widens the value type to a union: a script run
+# registers a ``ScriptRunRecord`` (a separate dataclass carrying a live subprocess
+# handle) in the SAME map YAML runs use, so status/cancel dispatch is one lookup
+# path (code-generation-plan CONTRADICTION #6). U5 dispatches by tier via
+# ``getattr(record, "tier", "yaml")`` — ``RunRecord`` has no ``tier`` attribute, so
+# the default keeps YAML records on the YAML path.
+run_registry: Dict[str, Union[RunRecord, "ScriptRunRecord"]] = {}
 
 # run_ids whose drive loop is executing IN THIS PROCESS right now (B4-BR-7a / F4).
 # The registry alone cannot answer "is anything actually driving this run?" — a
@@ -913,8 +923,10 @@ def check_generation(run_id: str, generation: str) -> None:
     """Reject a stale-generation script call (A3, the ADR-9 anti-double-drive).
 
     Every script ``run-step`` call carries ``CAO_WORKFLOW_GENERATION`` (forwarded
-    by U2); the run-step handler calls this BEFORE doing any work (VR-3). Resume
-    bumps the run's generation BEFORE spawning (A4), so a reparented predecessor
+    by U2); the run-step handler (U5, ``api/main.py::run_step``) calls this BEFORE
+    doing any work whenever the request's ``env_vars`` carries BOTH
+    ``CAO_WORKFLOW_RUN_ID`` and ``CAO_WORKFLOW_GENERATION`` (VR-3). Resume bumps
+    the run's generation BEFORE spawning (A4), so a reparented predecessor
     subprocess that survived a crash still carries the OLD generation — its late
     calls land here and are fenced out (DR-5 -> ``StaleGenerationError`` -> 409).
 

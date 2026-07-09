@@ -58,6 +58,46 @@ class InstallResult(BaseModel):
 # CodeQL also recognises this regex as a path-injection sanitiser.
 _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
+# Per-MCP-server tool-call timeout (milliseconds) injected into cao-mcp-server
+# entries in kiro agent profiles. kiro-cli's default MCP tool-call timeout
+# (~120s, inherited from the Q Developer CLI) is far too short for the handoff
+# tool, which blocks until a spawned worker finishes an entire task — routinely
+# minutes. Without a raised timeout kiro cancels the handoff RPC client-side and
+# tells the supervisor the tool failed even though CAO is still running the
+# worker. 1_200_000 ms (20 min) matches CAO's default handoff/run-step budget.
+# This mirrors the kimi_cli provider's tool_call_timeout_ms override.
+_KIRO_MCP_TOOL_TIMEOUT_MS = 1_200_000
+
+
+def _inject_kiro_mcp_timeout(
+    mcp_servers: Optional[Dict[str, object]],
+) -> Optional[Dict[str, object]]:
+    """Return a copy of ``mcp_servers`` with a large ``timeout`` set on every
+    cao-mcp-server entry that does not already specify one.
+
+    kiro reads the per-server ``timeout`` field (milliseconds) as its tool-call
+    timeout. We only touch entries whose args reference ``cao-mcp-server`` so a
+    user's other MCP servers keep their own (or kiro's default) timeout. An
+    explicit operator-set ``timeout`` is never overwritten.
+    """
+    if not mcp_servers:
+        return mcp_servers
+
+    result: Dict[str, object] = {}
+    for name, cfg in mcp_servers.items():
+        if not isinstance(cfg, dict):
+            result[name] = cfg
+            continue
+        args = cfg.get("args") or []
+        is_cao = name == "cao-mcp-server" or any(
+            isinstance(a, str) and "cao-mcp-server" in a for a in args
+        )
+        if is_cao and "timeout" not in cfg:
+            cfg = {**cfg, "timeout": _KIRO_MCP_TOOL_TIMEOUT_MS}
+        result[name] = cfg
+    return result
+
+
 # URL path component for allowlisted hosts. Each segment must start with an
 # alphanumeric, which forbids "..", "." and hidden segments — and by extension
 # any traversal sequence. Used to rebuild a safe URL from validated parts,
@@ -259,7 +299,9 @@ def install_agent(
                 allowedTools=allowed_tools,
                 resources=kiro_resources,
                 prompt=raw_prompt,
-                mcpServers=profile.mcpServers,
+                # Raise the cao-mcp-server tool-call timeout so kiro doesn't
+                # cancel long handoff RPCs client-side (see helper docstring).
+                mcpServers=_inject_kiro_mcp_timeout(profile.mcpServers),
                 toolAliases=profile.toolAliases,
                 toolsSettings=profile.toolsSettings,
                 hooks=profile.hooks,
