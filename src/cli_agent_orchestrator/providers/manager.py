@@ -15,6 +15,7 @@ from cli_agent_orchestrator.providers.hermes import HermesProvider
 from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
 from cli_agent_orchestrator.providers.opencode_cli import OpenCodeCliProvider
+from cli_agent_orchestrator.providers.qwen_cli import QwenCliProvider
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +116,16 @@ class ProviderManager:
                 )
             elif provider_type == ProviderType.ANTIGRAVITY_CLI.value:
                 provider = AntigravityCliProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    model=model,
+                    skill_prompt=skill_prompt,
+                )
+            elif provider_type == ProviderType.QWEN_CLI.value:
+                provider = QwenCliProvider(
                     terminal_id,
                     tmux_session,
                     tmux_window,

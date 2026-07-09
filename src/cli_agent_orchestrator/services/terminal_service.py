@@ -128,6 +128,7 @@ RUNTIME_SKILL_PROMPT_PROVIDERS = {
     ProviderType.CODEX.value,
     ProviderType.KIMI_CLI.value,
     ProviderType.ANTIGRAVITY_CLI.value,
+    ProviderType.QWEN_CLI.value,
 }
 
 # Providers whose tool restrictions are prompt-level text only (no native
@@ -136,6 +137,7 @@ SOFT_ENFORCEMENT_PROVIDERS = {
     ProviderType.KIMI_CLI.value,
     ProviderType.CODEX.value,
     ProviderType.ANTIGRAVITY_CLI.value,
+    ProviderType.QWEN_CLI.value,
 }
 
 

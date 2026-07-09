@@ -124,6 +124,13 @@ def require_antigravity():
 
 
 @pytest.fixture()
+def require_qwen_cli():
+    """Skip test if Qwen Code (``qwen``) is not available."""
+    if not _cli_available("qwen"):
+        pytest.skip("Qwen Code (qwen) not installed")
+
+
+@pytest.fixture()
 def require_cursor():
     """Skip test if Cursor CLI (agent or cursor-agent) is not available."""
     if _cli_available("agent") or _cli_available("cursor-agent"):

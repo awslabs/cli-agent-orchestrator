@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - add Antigravity CLI (`agy`) provider — Google's terminal-native coding agent and the successor to the Gemini CLI after the free "Login with Google" path was retired (#323)
 
+- add Qwen Code (`qwen`) provider — Alibaba's terminal-native coding agent (a Gemini-CLI fork); launches `qwen --approval-mode yolo` with `--append-system-prompt` role injection and a per-terminal `--mcp-config`, footer-anchored status detection with pyte stale-footer resolution, and OpenAI-compatible/`qwen-oauth` user-managed auth (#376)
+
 - add built-in Hermes provider support through profile-configured `hermesProfile` wrappers
 
 - add OKF memory export/import — `cao memory export`/`cao memory import` CLI commands plus a read-scoped `GET /memory/export` API endpoint streaming a scope as a tar.gz bundle (#345)

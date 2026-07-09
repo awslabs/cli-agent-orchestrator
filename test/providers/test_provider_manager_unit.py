@@ -53,6 +53,24 @@ def test_create_provider_hermes_stores_mapping():
     assert manager.get_provider("t1") is provider
 
 
+def test_create_provider_qwen_cli_stores_mapping():
+    from cli_agent_orchestrator.providers.qwen_cli import QwenCliProvider
+
+    manager = ProviderManager()
+    provider = manager.create_provider(
+        ProviderType.QWEN_CLI.value,
+        terminal_id="t1",
+        tmux_session="s1",
+        tmux_window="w1",
+        agent_profile=None,
+        model="qwen3-coder-plus",
+    )
+
+    assert isinstance(provider, QwenCliProvider)
+    assert provider._model == "qwen3-coder-plus"
+    assert manager.get_provider("t1") is provider
+
+
 def test_create_provider_unknown_type_raises():
     manager = ProviderManager()
     with pytest.raises(ValueError, match="Unknown provider type"):

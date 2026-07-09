@@ -651,3 +651,59 @@ class TestAntigravityCliAssign:
     def test_assign_with_callback(self, require_antigravity):
         """Antigravity CLI full round-trip: worker completes → sends result → supervisor receives."""
         _run_assign_with_callback_test(provider="antigravity_cli")
+
+
+# ---------------------------------------------------------------------------
+# Qwen Code provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestQwenCliAssign:
+    """E2E assign tests for the Qwen Code provider using examples/assign/ profiles.
+
+    Requires:
+    - ``qwen`` binary on PATH (skip otherwise via ``require_qwen_cli`` fixture).
+    - Running CAO server.
+    - Agent profiles installed for qwen_cli::
+
+        cao install examples/assign/data_analyst.md --provider qwen_cli
+        cao install examples/assign/report_generator.md --provider qwen_cli
+        cao install developer --provider qwen_cli  # for callback test
+
+    Run::
+
+        uv run pytest -m e2e test/e2e/test_assign.py -k Qwen -v
+    """
+
+    def test_assign_data_analyst(self, require_qwen_cli):
+        """Qwen Code data_analyst receives dataset, performs statistical analysis.
+
+        Like Gemini CLI, qwen's data_analyst profile tends to call send_message
+        rather than print raw results, so we accept the broader orchestration
+        keywords in addition to the statistical ones.
+        """
+        _run_assign_test(
+            provider="qwen_cli",
+            agent_profile="data_analyst",
+            task_message=DATA_ANALYST_TASK,
+            content_keywords=DATA_ANALYST_KEYWORDS
+            + [
+                "analysis",
+                "send_message",
+                "CAO_TERMINAL_ID",
+            ],
+        )
+
+    def test_assign_report_generator(self, require_qwen_cli):
+        """Qwen Code report_generator creates a report template."""
+        _run_assign_test(
+            provider="qwen_cli",
+            agent_profile="report_generator",
+            task_message=REPORT_GENERATOR_TASK,
+            content_keywords=REPORT_GENERATOR_KEYWORDS,
+        )
+
+    def test_assign_with_callback(self, require_qwen_cli):
+        """Qwen Code full round-trip: worker completes → sends result → supervisor receives."""
+        _run_assign_with_callback_test(provider="qwen_cli")

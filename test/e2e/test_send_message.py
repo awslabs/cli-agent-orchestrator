@@ -300,3 +300,17 @@ class TestAntigravityCliSendMessage:
     def test_send_message_to_inbox(self, require_antigravity):
         """Send a message to another Antigravity CLI terminal's inbox and verify delivery."""
         _run_send_message_test(provider="antigravity_cli", agent_profile="developer")
+
+
+# ---------------------------------------------------------------------------
+# Qwen Code provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestQwenCliSendMessage:
+    """E2E send_message tests for the Qwen Code provider."""
+
+    def test_send_message_to_inbox(self, require_qwen_cli):
+        """Send a message to another Qwen Code terminal's inbox and verify delivery."""
+        _run_send_message_test(provider="qwen_cli", agent_profile="developer")
