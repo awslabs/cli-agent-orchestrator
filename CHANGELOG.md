@@ -50,6 +50,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - terminal_service: deferred-init failure path logs with `exc_info=True` (preserving the traceback) and formats the exception with `{e!r}` in both the log line and the supervisor-facing inbox message, so provider-supplied error text can't inject newlines/control characters
 - api: `POST /sessions/{name}/terminals` now rejects an `initial_message` / `initial_message_orchestration_type` body with 400 when `defer_init=false` — that payload is only delivered on the deferred-init path, so silently dropping it previously surfaced as a hard-to-diagnose "worker never received task". Deliberate 4xx responses (this guard and the invalid-orchestration-type check) also propagate as-is instead of being masked as 500
 
+### Security
+
+- memory: validate every user-derived path component (`key`, `scope`, `scope_id`) as a single safe path segment and confine assembled wiki/index paths under the memory base directory via `os.path.realpath` + an explicit containment guard, closing the 11 CodeQL `py/path-injection` alerts in `memory_service.py`. Added shared helpers `validate_path_component` / `safe_join_under_base` in `utils/path_validation.py`. The remaining `py/clear-text-storage-sensitive-data` alert is assessed as a false positive (the memory wiki is intentionally plaintext markdown; the flagged value is a topic `key` slug, not a credential) and documented in-code for won't-fix dismissal.
+
 ## [2.2.0] - 2026-06-04
 
 ### Highlights
