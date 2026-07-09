@@ -89,7 +89,7 @@ def _safe_dir(scan_dir: Optional[str]) -> str:
     return tmux_client._resolve_and_validate_working_directory(scan_dir)
 
 
-def _safe_spec_path(path: Union[str, Path], base_dir: Optional[str] = None) -> Path:
+def _safe_spec_path(path: Union[str, Path], base_dir: Optional[str] = None) -> str:
     """Canonicalize a spec FILE path and bind it to a CONFIGURED base directory.
 
     The single guarded entry for turning a user/agent-supplied spec path into a
@@ -104,11 +104,16 @@ def _safe_spec_path(path: Union[str, Path], base_dir: Optional[str] = None) -> P
     Deliberately mirrors ``utils/path_validation.py::resolve_and_validate_path``
     — the ``os.path.realpath`` + ``str.startswith`` idiom CodeQL's
     ``py/path-injection`` query already recognizes as a sanitizer in THIS repo
-    (that module carries zero open alerts). A ``pathlib``-only
-    ``Path.resolve()``/``Path.is_relative_to()`` rewrite was tried and is NOT
-    recognized by the same query — it closed the alerts at the old sink lines
-    only to reopen equivalent alerts at the new ones, because the analyzer
-    doesn't treat that pair as a taint-clearing barrier. Two stages:
+    (that module carries zero open alerts), returning the SAME plain ``str``
+    shape that module returns. A ``pathlib``-only rewrite (``Path.resolve()``/
+    ``Path.is_relative_to()``, and later a hybrid that still wrapped the
+    checked string in ``Path(real_path)`` before returning) was tried and is
+    NOT recognized by the same query at any downstream sink that receives the
+    wrapped ``Path`` object — CodeQL's sanitizer-then-sink match apparently
+    doesn't track taint through a ``Path()`` constructor call, even when its
+    argument is the exact checked string. Returning the bare ``str`` (as
+    ``path_validation.py`` does) is what every "fixed" alert in this file's
+    history has in common. Two stages:
 
     1. ``os.path.realpath(os.path.abspath(...))`` canonicalizes the path
        (resolves symlinks + ``..``) — the PathNormalization step CodeQL
@@ -126,12 +131,13 @@ def _safe_spec_path(path: Union[str, Path], base_dir: Optional[str] = None) -> P
     or an arbitrary external path) is rejected rather than silently followed.
 
     Every CodeQL-flagged sink downstream MUST open/stat the value this
-    function RETURNS — never re-derive a path from the original string — so
-    the resolve-then-contain check dominates the sink.
+    function RETURNS DIRECTLY — never re-derive a path from the original
+    string, and never re-wrap the returned string in ``Path(...)`` before the
+    sink — so the resolve-then-contain check dominates the sink.
 
     Returns:
-        The resolved, contained ``Path`` — the only value callers may pass to
-        a filesystem operation.
+        The resolved, contained realpath ``str`` — the only value callers may
+        pass to a filesystem operation.
 
     Raises:
         ValueError: the base directory is blocked, or the resolved file escapes
@@ -146,13 +152,13 @@ def _safe_spec_path(path: Union[str, Path], base_dir: Optional[str] = None) -> P
     real_path = os.path.realpath(os.path.abspath(candidate))
     if real_path != safe_base and not real_path.startswith(safe_base + os.sep):
         raise ValueError(f"workflow spec path '{path}' escapes its validated directory")
-    return Path(real_path)
+    return real_path
 
 
 # ---------------------------------------------------------------------------
 # Read path
 # ---------------------------------------------------------------------------
-def load_and_validate(path: Union[str, Path], base_dir: Optional[str] = None) -> WorkflowSpec:
+def load_and_validate(path: str, base_dir: Optional[str] = None) -> WorkflowSpec:
     """Load a spec file, validate its grammar, and return the typed model (C2).
 
     The single read path. The containing directory is policy-checked by the
@@ -204,7 +210,7 @@ def load_and_validate(path: Union[str, Path], base_dir: Optional[str] = None) ->
     return WorkflowSpec(**data)
 
 
-def validate_only(path: Union[str, Path], base_dir: Optional[str] = None) -> ValidationResult:
+def validate_only(path: str, base_dir: Optional[str] = None) -> ValidationResult:
     """Read a spec file behind the path guard and validate its grammar (FR-1.3).
 
     The path is canonicalized + bound to its configured base directory first
@@ -247,16 +253,16 @@ def _connect():
     return sqlite3.connect(str(DATABASE_FILE))
 
 
-def upsert_index(spec: Union[WorkflowSpec, ScriptSpec], source_path: Union[str, Path]) -> None:
+def upsert_index(spec: Union[WorkflowSpec, ScriptSpec], source_path: str) -> None:
     """Idempotently materialize a spec into ``workflow_index`` (C2, FR-2.3).
 
     Keyed by ``name`` (ON CONFLICT DO UPDATE) so re-authoring the same spec
     updates the row in place rather than duplicating. ``source_path`` MUST
-    already be the resolved, contained ``Path`` a caller got back from
-    ``_safe_spec_path`` — this function stores it as-is (``os.fspath``, no
-    re-derivation) rather than re-running ``os.path.realpath`` on it, which
-    would re-introduce an unchecked path string into the value later read
-    back by ``_resolve_source_path`` and fed to a filesystem sink.
+    already be the resolved, contained realpath ``str`` a caller got back
+    from ``_safe_spec_path`` — this function stores it as-is, with NO
+    re-derivation (no ``os.path.realpath`` re-run, no wrapping/unwrapping),
+    which would re-introduce an unchecked path string into the value later
+    read back by ``_resolve_source_path`` and fed to a filesystem sink.
     ``indexed_at`` is derived bookkeeping (ISO-8601 Z), never an ordering key
     (B2-BR-3 orders by ``name``).
 
@@ -274,7 +280,7 @@ def upsert_index(spec: Union[WorkflowSpec, ScriptSpec], source_path: Union[str, 
         description = spec.description
     row = WorkflowIndexRow(
         name=spec.name,
-        source_path=os.fspath(source_path),
+        source_path=source_path,
         mode=mode,
         step_count=step_count,
         description=description,
@@ -347,7 +353,7 @@ def rebuild_index_from_files(scan_dir: Optional[str] = None) -> int:
         try:
             # Bind containment to the SAME dir we globbed from, mirroring the
             # YAML loop above — the glob string is untrusted until re-validated
-            # against safe_dir; the resolved Path this returns is the ONLY
+            # against safe_dir; the resolved realpath this returns is the ONLY
             # value passed to _read_script_spec (never the raw glob string).
             real_path = _safe_spec_path(path, base_dir=safe_dir)
             script_spec = _read_script_spec(real_path, stem, base_dir=safe_dir)
@@ -419,7 +425,7 @@ def render_findings(findings: List[LintFinding]) -> List[dict]:
     return [finding.model_dump() for finding in findings]
 
 
-def _stem_of(path: Union[str, Path]) -> str:
+def _stem_of(path: str) -> str:
     """Return the file stem (basename minus extension) for tier/collision keys."""
     return os.path.splitext(os.path.basename(path))[0]
 
@@ -439,19 +445,17 @@ def _check_tier_collision(stem: str, safe_dir: str) -> None:
         raise TierCollisionError(stem)
 
 
-def _read_script_spec(
-    path: Union[str, Path], stem: str, base_dir: Optional[str] = None
-) -> ScriptSpec:
+def _read_script_spec(path: str, stem: str, base_dir: Optional[str] = None) -> ScriptSpec:
     """Read + lint a ``.py`` spec file into a ``ScriptSpec`` (A1, E1).
 
     Re-validates ``path`` through ``_safe_spec_path`` itself — this is the
     ONLY entry that opens a ``.py`` spec file, and it must stay safe no matter
     which caller reaches it. Some callers (``get_workflow``'s bare-name arm,
     via ``_resolve_source_path``) hand back a plain string pulled from the
-    SQLite index rather than an already-validated ``Path``, so re-validating
-    HERE — not trusting the caller to have done it — is what keeps every
-    ``.py`` open() sink covered by the resolve-then-contain check regardless
-    of call site.
+    SQLite index rather than an already-validated path, so re-validating HERE
+    — not trusting the caller to have done it — is what keeps every ``.py``
+    open() sink covered by the resolve-then-contain check regardless of call
+    site.
 
     The load-time lint (U1) is INFORMATIONAL only — feeds ``validate``/
     ``list``/``get`` rendering (BR-6); it is a SEPARATE call from U4's
@@ -462,7 +466,7 @@ def _read_script_spec(
         raw = fh.read(WORKFLOW_MAX_SPEC_BYTES + 1)
     if len(raw) > WORKFLOW_MAX_SPEC_BYTES:
         raise ValueError(f"spec exceeds {WORKFLOW_MAX_SPEC_BYTES} bytes (short-circuited read)")
-    display_path = str(real_path)
+    display_path = real_path
     try:
         source = raw.decode("utf-8")
     except UnicodeDecodeError as e:
@@ -505,9 +509,7 @@ def get_workflow(
     return _load_by_extension(source_path, scan_dir)
 
 
-def _load_by_extension(
-    real_path: Union[str, Path], scan_dir: Optional[str]
-) -> Union[WorkflowSpec, ScriptSpec]:
+def _load_by_extension(real_path: str, scan_dir: Optional[str]) -> Union[WorkflowSpec, ScriptSpec]:
     """Extension-based dispatch shared by both ``get_workflow`` call sites (A1)."""
     ext = os.path.splitext(real_path)[1].lower()
     if ext in (".yaml", ".yml"):

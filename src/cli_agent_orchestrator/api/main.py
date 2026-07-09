@@ -1576,7 +1576,7 @@ async def validate_workflow_endpoint(body: WorkflowValidateRequest) -> Dict:
                 errors=[f"spec exceeds {WORKFLOW_MAX_SPEC_BYTES} bytes (max)"],
             ).model_dump()
         source = raw.decode("utf-8", errors="replace")
-        result = lint_script(source, str(real_path))
+        result = lint_script(source, real_path)
         return result.model_dump()
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST, detail=f"unrecognized spec extension: {ext}"
