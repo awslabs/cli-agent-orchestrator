@@ -309,3 +309,13 @@ class TestSkillApi:
         resp = requests.get(f"{API_BASE_URL}/skills/../../../etc/passwd")
         # FastAPI will either return 400 (our validation) or 404 (path routing)
         assert resp.status_code in (400, 404, 422)
+
+@pytest.mark.e2e
+class TestQwenCliSkills:
+    """E2E skill injection tests for the Qwen Code provider."""
+
+    def test_skill_catalog_injected(self, require_qwen_cli):
+        """Qwen Code terminal command contains the injected skill catalog."""
+        _run_skill_injection_test(provider="qwen_cli", agent_profile="developer")
+
+

@@ -422,3 +422,11 @@ def cleanup_terminal(terminal_id: str, session_name: str) -> None:
         requests.delete(f"{API_BASE_URL}/sessions/{session_name}")
     except Exception:
         pass
+
+@pytest.fixture()
+def require_qwen_cli():
+    """Skip test if Qwen Code (``qwen``) is not available."""
+    if not _cli_available("qwen"):
+        pytest.skip("Qwen Code (qwen) not installed")
+
+

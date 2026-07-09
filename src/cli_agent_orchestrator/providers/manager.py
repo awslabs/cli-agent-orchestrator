@@ -25,6 +25,7 @@ from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
 from cli_agent_orchestrator.providers.kiro_launch_home import KiroLaunch
 from cli_agent_orchestrator.providers.minimax_code import MiniMaxCodeProvider
 from cli_agent_orchestrator.providers.mock_cli import MockCliProvider
+from cli_agent_orchestrator.providers.qwen_cli import QwenCliProvider
 from cli_agent_orchestrator.providers.omp import OmpProvider
 from cli_agent_orchestrator.providers.opencode_cli import OpenCodeCliProvider
 
@@ -46,6 +47,7 @@ class ProviderManager:
             ProviderType.CODEX.value: CodexProvider,
             ProviderType.COPILOT_CLI.value: CopilotCliProvider,
             ProviderType.KIMI_CLI.value: KimiCliProvider,
+            ProviderType.QWEN_CLI.value: QwenCliProvider,
             ProviderType.OPENCODE_CLI.value: OpenCodeCliProvider,
             ProviderType.OMP.value: OmpProvider,
             ProviderType.HERMES.value: HermesProvider,
@@ -169,6 +171,11 @@ class ProviderManager:
                 )
                 if provider_variant is not None:
                     provider.restore_runtime_variant(provider_variant)
+            elif provider_type == ProviderType.QWEN_CLI.value:
+                provider = QwenCliProvider(
+                    terminal_id, tmux_session, tmux_window, agent_profile, allowed_tools,
+                    skill_prompt=skill_prompt, model=model,
+                )
             elif provider_type == ProviderType.OPENCODE_CLI.value:
                 provider = OpenCodeCliProvider(
                     terminal_id,

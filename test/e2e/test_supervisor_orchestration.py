@@ -918,3 +918,22 @@ class TestMiniMaxCodeSupervisorOrchestration:
 
     def test_supervisor_assign_and_handoff(self, require_minimax_code):
         _run_supervisor_assign_test(provider="mcode")
+
+
+
+# ---------------------------------------------------------------------------
+# Qwen Code provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestQwenCliSupervisorOrchestration:
+    """E2E supervisor orchestration tests for the Qwen Code provider."""
+
+    def test_supervisor_handoff(self, require_qwen_cli):
+        """Supervisor uses handoff MCP tool to delegate to report_generator."""
+        _run_supervisor_handoff_test(provider="qwen_cli")
+
+    def test_supervisor_assign_and_handoff(self, require_qwen_cli):
+        """Supervisor uses assign + handoff to orchestrate multi-agent workflow."""
+        _run_supervisor_assign_test(provider="qwen_cli")
