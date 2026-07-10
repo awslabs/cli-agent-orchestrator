@@ -135,7 +135,7 @@ def resolve_and_validate_path(
 # distinct from the absolute-path validator.
 
 # A single safe path segment: strict allowlist, no separators, no traversal.
-_SAFE_PATH_COMPONENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_SAFE_PATH_COMPONENT_RE = re.compile(r"\A[A-Za-z0-9._-]+\Z")
 
 
 def validate_path_component(component: str, description: str = "path component") -> str:

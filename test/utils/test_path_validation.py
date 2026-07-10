@@ -196,6 +196,14 @@ class TestValidatePathComponent:
         with pytest.raises(ValueError, match="NUL byte"):
             validate_path_component("a\x00b")
 
+    @pytest.mark.parametrize("value", ["topic\n", "topic\r\n", "\ntopic", "a\nb"])
+    def test_trailing_or_embedded_newline_rejected(self, value):
+        # In Python, ``$`` also matches just before a trailing newline, so the
+        # end anchor must be ``\Z`` — otherwise ``"topic\n"`` would slip past
+        # the allowlist and become a path segment carrying a newline.
+        with pytest.raises(ValueError):
+            validate_path_component(value)
+
     def test_description_in_error_message(self):
         with pytest.raises(ValueError, match="scope_id must"):
             validate_path_component("../evil", description="scope_id")

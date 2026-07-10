@@ -1994,6 +1994,9 @@ class MemoryService:
             if not index_path.exists():
                 continue
 
+            wiki_dir = project_dir / "wiki"
+            wiki_resolved = os.path.realpath(str(wiki_dir))
+
             entries = self._parse_index(index_path)
 
             for entry in entries:
@@ -2009,11 +2012,23 @@ class MemoryService:
                     continue
 
                 # Read the wiki file
-                wiki_file = project_dir / "wiki" / entry["relative_path"]
-                if not wiki_file.exists():
+                wiki_file = wiki_dir / entry["relative_path"]
+                resolved_wiki = Path(os.path.realpath(str(wiki_file)))
+                # Guard against a crafted/corrupted index entry (e.g.
+                # ``[x](../../../../etc/passwd)``) escaping this scope's wiki
+                # directory and leaking an arbitrary out-of-base file as a
+                # "memory". Mirrors get_memory_context_for_terminal: skip the
+                # escaping entry rather than raising, keeping recall resilient
+                # to a corrupted index.
+                if not str(resolved_wiki).startswith(wiki_resolved + os.sep):
+                    logger.warning(
+                        f"Path traversal in index entry rejected: {entry.get('relative_path')}"
+                    )
+                    continue
+                if not resolved_wiki.exists():
                     continue
 
-                file_content = wiki_file.read_text(encoding="utf-8")
+                file_content = resolved_wiki.read_text(encoding="utf-8")
 
                 # Query matching: check if query terms appear in content (case-insensitive)
                 if query:
