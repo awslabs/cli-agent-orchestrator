@@ -189,6 +189,15 @@ class TestAntigravityCliSkills:
         _run_skill_injection_test(provider="antigravity_cli", agent_profile="developer")
 
 
+@pytest.mark.e2e
+class TestQwenCliSkills:
+    """E2E skill injection tests for the Qwen Code provider."""
+
+    def test_skill_catalog_injected(self, require_qwen_cli):
+        """Qwen Code terminal command contains the injected skill catalog."""
+        _run_skill_injection_test(provider="qwen_cli", agent_profile="developer")
+
+
 # ---------------------------------------------------------------------------
 # Skill API endpoint test (deterministic — no agent needed)
 # ---------------------------------------------------------------------------

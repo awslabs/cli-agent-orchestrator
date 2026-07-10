@@ -3,6 +3,8 @@
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 
 class TestServerConstants:
     """Tests for server configuration constants."""
@@ -309,6 +311,105 @@ class TestEventBusConstants:
         mod = self._reload_constants({"CAO_EVENT_BUS_MAX_QUEUE_SIZE": "not-a-number"})
 
         assert mod.EVENT_BUS_MAX_QUEUE_SIZE == 16384
+
+
+class TestEnvBool:
+    """Tests for the ``env_bool()`` tolerant truthy/falsy env parser.
+
+    Regression guard for the ``CAO_PYTE_STATUS`` footgun: the previous
+    ``os.environ.get(...).lower() == "true"`` parse silently evaluated the
+    common truthy spellings ``1`` / ``yes`` / ``on`` as *False*, which disabled
+    the pyte screen-detector that qwen_cli (and antigravity_cli) require and
+    hung cross-provider handoffs. ``env_bool`` accepts the usual spellings.
+    """
+
+    @pytest.mark.parametrize(
+        "value",
+        ["1", "true", "TRUE", "True", "yes", "YES", "on", "ON", "  true  ", "\t1\n"],
+    )
+    def test_recognized_truthy_values_return_true(self, value):
+        from cli_agent_orchestrator.constants import env_bool
+
+        with patch.dict("os.environ", {"CAO_TEST_FLAG": value}, clear=False):
+            assert env_bool("CAO_TEST_FLAG", default=False) is True
+
+    @pytest.mark.parametrize(
+        "value",
+        ["0", "false", "FALSE", "no", "NO", "off", "OFF", "  0 "],
+    )
+    def test_recognized_falsy_values_return_false(self, value):
+        from cli_agent_orchestrator.constants import env_bool
+
+        with patch.dict("os.environ", {"CAO_TEST_FLAG": value}, clear=False):
+            assert env_bool("CAO_TEST_FLAG", default=True) is False
+
+    def test_unset_returns_default(self):
+        import os
+
+        from cli_agent_orchestrator.constants import env_bool
+
+        env_copy = os.environ.copy()
+        env_copy.pop("CAO_TEST_FLAG", None)
+        with patch.dict("os.environ", env_copy, clear=True):
+            assert env_bool("CAO_TEST_FLAG", default=True) is True
+            assert env_bool("CAO_TEST_FLAG", default=False) is False
+
+    def test_empty_value_returns_default(self):
+        from cli_agent_orchestrator.constants import env_bool
+
+        with patch.dict("os.environ", {"CAO_TEST_FLAG": ""}, clear=False):
+            assert env_bool("CAO_TEST_FLAG", default=True) is True
+            assert env_bool("CAO_TEST_FLAG", default=False) is False
+
+    def test_unrecognized_value_returns_default(self):
+        """A typo like ``tru`` must fall back to the default, never silently flip."""
+        from cli_agent_orchestrator.constants import env_bool
+
+        with patch.dict("os.environ", {"CAO_TEST_FLAG": "tru"}, clear=False):
+            assert env_bool("CAO_TEST_FLAG", default=True) is True
+            assert env_bool("CAO_TEST_FLAG", default=False) is False
+
+    def test_cao_pyte_status_1_enables_pyte(self):
+        """Regression: ``CAO_PYTE_STATUS=1`` must ENABLE pyte (previously it
+        silently disabled it and hung qwen handoffs)."""
+        import importlib
+
+        import cli_agent_orchestrator.constants as constants_module
+
+        try:
+            with patch.dict("os.environ", {"CAO_PYTE_STATUS": "1"}, clear=False):
+                importlib.reload(constants_module)
+                assert constants_module.CAO_PYTE_STATUS is True
+        finally:
+            # Restore module-level state from the real (unpatched) environment.
+            importlib.reload(constants_module)
+
+    def test_cao_pyte_status_defaults_to_true_when_unset(self):
+        import importlib
+        import os
+
+        import cli_agent_orchestrator.constants as constants_module
+
+        env_copy = os.environ.copy()
+        env_copy.pop("CAO_PYTE_STATUS", None)
+        try:
+            with patch.dict("os.environ", env_copy, clear=True):
+                importlib.reload(constants_module)
+                assert constants_module.CAO_PYTE_STATUS is True
+        finally:
+            importlib.reload(constants_module)
+
+    def test_cao_pyte_status_false_disables_pyte(self):
+        import importlib
+
+        import cli_agent_orchestrator.constants as constants_module
+
+        try:
+            with patch.dict("os.environ", {"CAO_PYTE_STATUS": "false"}, clear=False):
+                importlib.reload(constants_module)
+                assert constants_module.CAO_PYTE_STATUS is False
+        finally:
+            importlib.reload(constants_module)
 
 
 class TestOpenCodeConstants:

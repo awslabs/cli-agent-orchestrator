@@ -14,6 +14,7 @@ from cli_agent_orchestrator.constants import (
     API_BASE_URL,
     DEFAULT_PROVIDER,
     WORKFLOW_RUN_REQUEST_TIMEOUT,
+    env_bool,
 )
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
 from cli_agent_orchestrator.models.inbox import OrchestrationType
@@ -36,12 +37,12 @@ def _mcp_timeout() -> float:
 
 
 # Environment variable to enable/disable working_directory parameter
-ENABLE_WORKING_DIRECTORY = os.getenv("CAO_ENABLE_WORKING_DIRECTORY", "false").lower() == "true"
+ENABLE_WORKING_DIRECTORY = env_bool("CAO_ENABLE_WORKING_DIRECTORY", default=False)
 
 # Environment variable to enable/disable automatic sender terminal ID injection.
 # Defaults to enabled (issue #284): callback routing must not depend on the
 # supervisor LLM remembering to hand-write its terminal ID into the message.
-ENABLE_SENDER_ID_INJECTION = os.getenv("CAO_ENABLE_SENDER_ID_INJECTION", "true").lower() == "true"
+ENABLE_SENDER_ID_INJECTION = env_bool("CAO_ENABLE_SENDER_ID_INJECTION", default=True)
 
 # Terminal count threshold for cleanup nudge
 TERMINAL_CLEANUP_NUDGE_THRESHOLD = 10

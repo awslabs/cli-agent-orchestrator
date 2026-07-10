@@ -820,6 +820,7 @@ async def list_providers_endpoint() -> List[Dict]:
         "opencode_cli": "opencode",
         "cursor_cli": "agent",
         "antigravity_cli": "agy",
+        "qwen_cli": "qwen",
     }
     result = []
     for provider, binary in provider_binaries.items():

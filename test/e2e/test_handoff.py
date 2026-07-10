@@ -359,3 +359,37 @@ class TestAntigravityCliHandoff:
             ),
             content_keywords=["square", "return", "def"],
         )
+
+
+# ---------------------------------------------------------------------------
+# Qwen Code provider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.e2e
+class TestQwenCliHandoff:
+    """E2E handoff tests for the Qwen Code provider."""
+
+    def test_handoff_simple_function(self, require_qwen_cli):
+        """Qwen Code developer creates a simple Python function and returns output."""
+        _run_handoff_test(
+            provider="qwen_cli",
+            agent_profile="developer",
+            task_message=(
+                "Create a Python function called 'greet' that takes a name parameter "
+                "and returns 'Hello, {name}!'. Output only the function code."
+            ),
+            content_keywords=["greet", "hello", "def"],
+        )
+
+    def test_handoff_second_task(self, require_qwen_cli):
+        """Qwen Code developer handles a second independent task."""
+        _run_handoff_test(
+            provider="qwen_cli",
+            agent_profile="developer",
+            task_message=(
+                "Create a Python function called 'square' that takes a parameter n "
+                "and returns n squared. Output only the function code."
+            ),
+            content_keywords=["square", "return", "def"],
+        )
