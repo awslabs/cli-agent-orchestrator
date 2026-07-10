@@ -319,6 +319,19 @@ def test_build_command_includes_yolo_and_model():
     assert "--model" in cmd and "qwen3-coder-plus" in cmd
 
 
+def test_build_command_excludes_native_send_message():
+    """qwen-code ships a native ``send_message`` team tool whose bare name
+    collides with cao-mcp-server's ``send_message`` (exposed to qwen as
+    ``mcp__cao-mcp-server__send_message``). Told to "send_message", the model
+    picks the native tool → "No active team" → assign/handoff callbacks never
+    route back to the supervisor. We exclude it so only the MCP tool remains.
+    See issue #376.
+    """
+    with patch(WHICH_QWEN, return_value="/usr/local/bin/qwen"):
+        cmd = make_provider()._build_qwen_command()
+    assert "--exclude-tools send_message" in cmd
+
+
 def test_build_command_without_profile_has_no_system_prompt():
     with patch(WHICH_QWEN, return_value="/usr/local/bin/qwen"):
         cmd = make_provider()._build_qwen_command()
