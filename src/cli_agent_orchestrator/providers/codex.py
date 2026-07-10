@@ -75,8 +75,16 @@ TUI_FOOTER_PATTERN = r"(?:\?\s+for shortcuts|context left|\d+%\s+left|·\s+[~/])
 # ASSISTANT_PREFIX_PATTERN and the TUI footer › matches idle prompt).
 TUI_PROGRESS_PATTERN = r"•.*\(\d+s\s*•\s*esc to interrupt\)"
 
-# Workspace trust/approval prompt shown when Codex opens a new directory
-TRUST_PROMPT_PATTERN = r"allow Codex to work in this folder"
+# Workspace trust/approval prompt shown when Codex opens a new directory.
+# codex-cli has reworded this dialog across versions, so match either phrasing:
+#   older:   "… allow Codex to work in this folder without asking for approval"
+#   0.144.1: "Do you trust the contents of this directory? … › 1. Yes, continue"
+# A stale single-phrase pattern silently stops matching on a CLI update, which
+# lets the worker hang on the unanswered prompt (it never auto-accepts).
+TRUST_PROMPT_PATTERN = (
+    r"allow Codex to work in this folder"
+    r"|Do you trust the contents of this (?:directory|folder)"
+)
 # Codex welcome banner indicating normal startup (no trust prompt)
 CODEX_WELCOME_PATTERN = r"OpenAI Codex"
 
