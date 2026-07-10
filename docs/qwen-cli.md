@@ -7,15 +7,44 @@ The Qwen Code provider enables CAO to work with [Qwen Code](https://github.com/Q
 ## Prerequisites
 
 - **Qwen Code**: Install via `npm install -g @qwen-code/qwen-code` (Node.js 20+).
-- **Authentication** (user-managed): `qwen` reads OpenAI-compatible credentials from the environment. Set all three before starting `cao-server`:
+- **Authentication** (inherited from Qwen Code — no CAO-specific setup): CAO does **not** manage qwen credentials. Exactly like the `claude_code` provider inherits your `claude` login, `qwen_cli` inherits qwen's own OpenAI-compatible credentials. Configure `qwen` **once** — the same way you would to use it standalone — and every CAO-spawned qwen worker picks it up automatically (no `export` before `cao-server`, no `--env`).
+
+  **Simplest path — a one-time `~/.qwen/.env` file.** `qwen` loads it natively (bundled `dotenv`):
 
   ```bash
-  export OPENAI_API_KEY="<your key>"
-  export OPENAI_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"   # or your gateway
-  export OPENAI_MODEL="qwen3-coder-plus"
+  # ~/.qwen/.env      (chmod 600 — it holds your API key)
+  OPENAI_API_KEY=sk-...
+  OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1   # your region — see table below
   ```
 
-  When all three are present, `qwen` auto-selects `openai` auth and skips the interactive auth dialog. `qwen-oauth` (browser login) also works interactively but **cannot complete headless/in-container**, so it is not suitable for CAO-spawned sessions. The provider never handles credentials itself.
+  That is the whole setup. `OPENAI_MODEL` is **optional** — set the model in the agent profile (`model: qwen3-coder-plus`) instead, so the only secret you ever plug in is the **API key**. (`qwen` also reads these from `~/.env`, a project-level `.qwen/.env`, or `~/.qwen/settings.json` → `security.auth.apiKey`; a value already present in the process environment always wins over the file, which is what makes the overrides below work.)
+
+  When an API key + base URL are present, `qwen` auto-selects `openai` auth and skips the interactive auth dialog. (`qwen-oauth` browser login also works interactively but **cannot complete headless/in-container**, so it is unsuitable for CAO-spawned sessions.)
+
+  **Choose your region / endpoint.** The endpoint *is* the `OPENAI_BASE_URL`, so switching region is just switching that one value — pick the region your account is provisioned for.
+
+  *Shared DashScope endpoints* (simplest — no workspace needed):
+
+  | Endpoint | `OPENAI_BASE_URL` |
+  |----------|-------------------|
+  | Mainland China (Beijing) | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
+  | International (Singapore) | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` |
+
+  *Model Studio (百炼) workspace gateway* — a per-workspace host of the form `https://<workspace-id>.<region>.maas.aliyuncs.com/compatible-mode/v1`. Copy the exact host from your Model Studio console; the region code is one of:
+
+  | Region | Region code |
+  |--------|-------------|
+  | North China (Beijing) | `cn-beijing` |
+  | Singapore | `ap-southeast-1` |
+  | US (Virginia) | `us-east-1` |
+  | Germany (Frankfurt) | `eu-central-1` |
+  | Japan (Tokyo) | `ap-northeast-1` |
+
+  Any other OpenAI-compatible `/v1` endpoint (custom / self-hosted gateway) works too. The model ids in [Quick Start](#quick-start) must be ones your chosen endpoint exposes.
+
+  **Overrides** (optional — take precedence over `~/.qwen/.env`; handy for CI or targeting a different region per session):
+  - Per session, forwarded to the supervisor **and** every handoff-spawned worker: `cao launch … --env OPENAI_API_KEY=… --env OPENAI_BASE_URL=…` (values travel in the request body, not the URL).
+  - Or process-wide: `export OPENAI_API_KEY=… OPENAI_BASE_URL=…` before starting `cao-server`.
 - **tmux 3.2+**
 
 Verify installation:
@@ -64,7 +93,9 @@ The provider classifies `qwen` states from the tmux output buffer (footer-anchor
 
 The TUI is identical for IDLE and COMPLETED, so the two are split on an internal turn counter (`mark_input_received`), exactly as the Antigravity CLI provider does. This preserves the "wait for IDLE before delivering the task" contract right after initialization.
 
-Because `qwen` redraws the spinner/footer in place, the raw append-only pipe-pane stream keeps a stale `esc to cancel` after a turn ends. The provider therefore opts into pyte rendered-screen detection (`supports_screen_detection = True` / `get_status_from_screen`), which resolves the in-place redraw so only the live frame is classified. Enable it with `CAO_PYTE_STATUS=1`.
+Because `qwen` redraws the spinner/footer in place, the raw append-only pipe-pane stream keeps a stale `esc to cancel` after a turn ends. The provider therefore opts into pyte rendered-screen detection (`supports_screen_detection = True` / `get_status_from_screen`), which resolves the in-place redraw so only the live frame is classified.
+
+> **`qwen_cli` requires pyte detection.** Without it the stale spinner pins the terminal to PROCESSING forever, so a completed turn is never detected and orchestrated `handoff` / `assign` calls block until they time out. Pyte detection is **on by default** (`CAO_PYTE_STATUS`, which accepts `1` / `true` / `yes` / `on`); set `CAO_PYTE_STATUS=false` (or `0`) only to deliberately fall back to the raw-stream path. Set the value in the environment where you start `cao-server`.
 
 ### TUI Structure
 
