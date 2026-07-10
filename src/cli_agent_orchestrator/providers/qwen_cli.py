@@ -155,6 +155,19 @@ _BANNER_PATTERN = r"(?:Qwen Code \(?v?\d|▀|▄|█|╚|╝|╔|╗|║)"
 _TIP_PATTERN = r"^\s*Tips?:"
 _FOOTER_LINE_PATTERN = r"(?:\? for shortcuts|esc to cancel|shift \+ tab to cycle|Type your message or @|YOLO mode|Auto mode|plan mode|Accepting edits|➜ )"
 
+# qwen-code ships a native ``send_message`` tool (its team / background-task
+# messaging feature — class ``_SendMessageTool``, described as "Send a message
+# to a teammate … or to a running background task"). Its *bare* name collides
+# with cao-mcp-server's ``send_message``, which qwen exposes under the prefixed
+# name ``mcp__cao-mcp-server__send_message``. When a CAO worker is told to
+# "send_message" its result back, the model matches the shorter native tool and
+# calls it → "No active team and no task_id provided" → the assign/handoff
+# callback never routes back to the supervisor. CAO orchestration never uses
+# qwen-code's native team messaging (it routes through cao-mcp-server), so we
+# drop the native tool via ``--exclude-tools`` and leave the MCP tool as the
+# only send-message-shaped tool the model can pick. See issue #376.
+QWEN_CONFLICTING_NATIVE_TOOL = "send_message"
+
 
 class QwenCliProvider(BaseProvider):
     """Provider for Qwen Code (``qwen``).
@@ -285,7 +298,15 @@ class QwenCliProvider(BaseProvider):
                 "Install via: npm install -g @qwen-code/qwen-code"
             )
 
-        command_parts = ["qwen", "--approval-mode", "yolo"]
+        # Drop qwen-code's native ``send_message`` tool so it can't shadow
+        # cao-mcp-server's ``send_message`` in orchestration callbacks (#376).
+        command_parts = [
+            "qwen",
+            "--approval-mode",
+            "yolo",
+            "--exclude-tools",
+            QWEN_CONFLICTING_NATIVE_TOOL,
+        ]
 
         profile = None
         if self._agent_profile is not None:
