@@ -136,11 +136,11 @@ def _validate_frontmatter(metadata: dict) -> list[str]:
 
 
 @click.group()
-def agents():
-    """Manage installed agent profiles."""
+def profile():
+    """Manage agent profiles."""
 
 
-@agents.command("list")
+@profile.command("list")
 def list_cmd():
     """List all available agent profiles."""
     profiles = list_agent_profiles()
@@ -154,13 +154,13 @@ def list_cmd():
     for p in sorted(profiles, key=lambda x: x.get("name", "")):
         name = p.get("name", "?")
         source = p.get("source", "?")
-        desc = (p.get("description") or "")[:40]
+        desc = (p.get("description") or "")[:108]
         click.echo(f"{name:<30} {source:<12} {desc}")
 
     click.echo(f"\n{len(profiles)} profile(s) found.")
 
 
-@agents.command("show")
+@profile.command("show")
 @click.argument("name_or_path")
 def show_cmd(name_or_path: str):
     """Show details of an agent profile.
@@ -208,7 +208,7 @@ def show_cmd(name_or_path: str):
     click.echo(f"  prompt:       {body_len} chars")
 
 
-@agents.command("validate")
+@profile.command("validate")
 @click.argument("name_or_path")
 def validate_cmd(name_or_path: str):
     """Validate an agent profile against the CAO schema.
@@ -250,7 +250,7 @@ def validate_cmd(name_or_path: str):
         raise click.exceptions.Exit(1)
 
 
-@agents.command("remove")
+@profile.command("remove")
 @click.argument("name")
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt.")
 def remove_cmd(name: str, yes: bool):
@@ -279,7 +279,7 @@ def remove_cmd(name: str, yes: bool):
     click.echo(f"✓ Removed '{name}' from {LOCAL_AGENT_STORE_DIR}")
 
 
-@agents.command("templates")
+@profile.command("templates")
 def templates_cmd():
     """List available agent templates for scaffolding."""
     from cli_agent_orchestrator.services.agent_scaffold import list_templates
@@ -292,18 +292,18 @@ def templates_cmd():
     click.echo(f"{'TEMPLATE':<30} {'DESCRIPTION'}")
     click.echo(f"{'─' * 30} {'─' * 50}")
     for t in templates:
-        click.echo(f"{t['name']:<30} {t['description'][:50]}")
+        click.echo(f"{t['name']:<30} {t['description'][:108]}")
 
     click.echo(f"\n{len(templates)} template(s) available.")
-    click.echo("Use: cao agents create --template <name> --config <file>")
+    click.echo("Use: cao profile create --template <name> --config <file>")
 
 
-@agents.command("create")
+@profile.command("create")
 @click.option(
     "--template",
     "-t",
     required=True,
-    help="Template name (e.g., 'aws/stepfunction'). Run 'cao agents templates' to list.",
+    help="Template name (e.g., 'aws/stepfunction'). Run 'cao profile templates' to list.",
 )
 @click.option(
     "--config",
@@ -329,9 +329,9 @@ def create_cmd(template: str, config_path: str, output_dir: str):
 
     Examples:
 
-        cao agents create --template aws/stepfunction --config my-config.json
+        cao profile create --template aws/stepfunction --config my-config.json
 
-        cao agents create -t aws/sqs-monitor -c config.json -o ./agents/
+        cao profile create -t aws/sqs-monitor -c config.json -o ./agents/
     """
     from cli_agent_orchestrator.services.agent_scaffold import (
         render_template,

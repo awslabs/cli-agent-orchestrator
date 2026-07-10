@@ -9,7 +9,7 @@ from click.testing import CliRunner
 
 from cli_agent_orchestrator.cli.commands.agents import (
     _validate_frontmatter,
-    agents,
+    profile,
 )
 
 
@@ -143,12 +143,12 @@ class TestAgentsListCommand:
 
     def test_list_runs(self, runner: CliRunner):
         """Test that list command runs without error."""
-        result = runner.invoke(agents, ["list"])
+        result = runner.invoke(profile, ["list"])
         assert result.exit_code == 0
 
     def test_list_shows_header(self, runner: CliRunner):
         """Test that list shows column headers."""
-        result = runner.invoke(agents, ["list"])
+        result = runner.invoke(profile, ["list"])
         # Either shows profiles or 'No agent profiles found'
         assert "NAME" in result.output or "No agent profiles" in result.output
 
@@ -157,13 +157,13 @@ class TestAgentsShowCommand:
     """Tests for cao agents show."""
 
     def test_show_valid_file(self, runner: CliRunner, sample_profile_valid: Path):
-        result = runner.invoke(agents, ["show", str(sample_profile_valid)])
+        result = runner.invoke(profile, ["show", str(sample_profile_valid)])
         assert result.exit_code == 0
         assert "test-agent" in result.output
         assert "allowedTools" in result.output
 
     def test_show_not_found(self, runner: CliRunner):
-        result = runner.invoke(agents, ["show", "nonexistent-agent-xyz"])
+        result = runner.invoke(profile, ["show", "nonexistent-agent-xyz"])
         assert result.exit_code == 1
         assert "not found" in result.output
 
@@ -172,31 +172,31 @@ class TestAgentsValidateCommand:
     """Tests for cao agents validate."""
 
     def test_validate_valid_profile(self, runner: CliRunner, sample_profile_valid: Path):
-        result = runner.invoke(agents, ["validate", str(sample_profile_valid)])
+        result = runner.invoke(profile, ["validate", str(sample_profile_valid)])
         assert result.exit_code == 0
         assert "✓" in result.output
 
     def test_validate_deprecated_field(self, runner: CliRunner, sample_profile_deprecated: Path):
-        result = runner.invoke(agents, ["validate", str(sample_profile_deprecated)])
+        result = runner.invoke(profile, ["validate", str(sample_profile_deprecated)])
         # autoApproveTools triggers additionalProperties error (blocking)
         assert result.exit_code == 1
         assert "autoApproveTools" in result.output
 
     def test_validate_invalid_role(self, runner: CliRunner, sample_profile_invalid_role: Path):
-        result = runner.invoke(agents, ["validate", str(sample_profile_invalid_role)])
+        result = runner.invoke(profile, ["validate", str(sample_profile_invalid_role)])
         # Unknown role is a warning, not an error — exits 0
         assert result.exit_code == 0
         assert "role" in result.output
         assert "[warn]" in result.output
 
     def test_validate_bad_tools(self, runner: CliRunner, sample_profile_bad_tools: Path):
-        result = runner.invoke(agents, ["validate", str(sample_profile_bad_tools)])
+        result = runner.invoke(profile, ["validate", str(sample_profile_bad_tools)])
         # Bad tools are warnings, not errors, so exit 0
         assert result.exit_code == 0
         assert "shell:aws" in result.output
 
     def test_validate_not_found(self, runner: CliRunner):
-        result = runner.invoke(agents, ["validate", "nonexistent.md"])
+        result = runner.invoke(profile, ["validate", "nonexistent.md"])
         assert result.exit_code == 1
 
 
@@ -204,7 +204,7 @@ class TestAgentsRemoveCommand:
     """Tests for cao agents remove."""
 
     def test_remove_not_found(self, runner: CliRunner):
-        result = runner.invoke(agents, ["remove", "nonexistent-agent-xyz", "-y"])
+        result = runner.invoke(profile, ["remove", "nonexistent-agent-xyz", "-y"])
         assert result.exit_code == 1
         assert "not found" in result.output
 
@@ -213,14 +213,14 @@ class TestAgentsTemplatesCommand:
     """Tests for cao agents templates."""
 
     def test_templates_lists_all(self, runner: CliRunner):
-        result = runner.invoke(agents, ["templates"])
+        result = runner.invoke(profile, ["templates"])
         assert result.exit_code == 0
         assert "aws/stepfunction" in result.output
         assert "aws/cloudwatch-logs" in result.output
         assert "7 template(s) available" in result.output
 
     def test_templates_shows_description(self, runner: CliRunner):
-        result = runner.invoke(agents, ["templates"])
+        result = runner.invoke(profile, ["templates"])
         assert "Trigger and monitor" in result.output
 
 
@@ -239,7 +239,7 @@ class TestAgentsCreateCommand:
             )
         )
         result = runner.invoke(
-            agents,
+            profile,
             [
                 "create",
                 "-t",
@@ -262,7 +262,7 @@ class TestAgentsCreateCommand:
         config = tmp_path / "config.json"
         config.write_text(json.dumps({"profile": "x"}))
         result = runner.invoke(
-            agents,
+            profile,
             [
                 "create",
                 "-t",
@@ -280,7 +280,7 @@ class TestAgentsCreateCommand:
         config = tmp_path / "config.json"
         config.write_text("not json {{{")
         result = runner.invoke(
-            agents,
+            profile,
             [
                 "create",
                 "-t",
@@ -298,7 +298,7 @@ class TestAgentsCreateCommand:
         config = tmp_path / "config.json"
         config.write_text(json.dumps({"profile": "x"}))
         result = runner.invoke(
-            agents,
+            profile,
             [
                 "create",
                 "-t",
