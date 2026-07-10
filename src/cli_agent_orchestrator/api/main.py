@@ -1446,10 +1446,32 @@ async def run_step(
     # can tear it down if the subprocess dies mid-call. No-op for YAML/handoff
     # callers (no run/step env or no script record in the registry).
     from cli_agent_orchestrator.services import workflow_service
-    from cli_agent_orchestrator.services.script_runner import make_step_terminal_recorder
+    from cli_agent_orchestrator.services.script_runner import (
+        make_step_terminal_recorder,
+        record_step_completion,
+    )
     from cli_agent_orchestrator.services.workflow_service import StaleGenerationError
 
     on_terminal_created = make_step_terminal_recorder(body.env_vars)
+    # BR-31 companion: the recorder above seeds a step RUNNING at terminal
+    # creation, but nothing transitions it — so a completed script run reports
+    # every step frozen at running/attempts=0/output=null. ``on_step_settled``
+    # transitions the shared ScriptRunRecord's step RUNNING->COMPLETED on success
+    # (or ->FAILED on a StepExecutionError), matching the YAML tier. No-op for
+    # YAML/handoff callers (same guard as the recorder). Settling is best-effort:
+    # it must never turn a successful step into an HTTP error, so ``_settle_step``
+    # swallows + logs any bookkeeping failure.
+    on_step_settled = record_step_completion(
+        body.env_vars, provider=body.provider, agent=body.agent, prompt=body.prompt
+    )
+
+    def _settle_step(terminal_id: Optional[str], error: Optional[str]) -> None:
+        if on_step_settled is None:
+            return
+        try:
+            on_step_settled(terminal_id, error)
+        except Exception:  # noqa: BLE001 — step bookkeeping is best-effort; never fail the step
+            logger.warning("run_step: script step completion bookkeeping failed", exc_info=True)
 
     # The generation fence (ADR-9 anti-double-drive, DR-5): a script run-step call
     # carrying BOTH CAO_WORKFLOW_RUN_ID and CAO_WORKFLOW_GENERATION must be checked
@@ -1486,6 +1508,10 @@ async def run_step(
             env_vars=body.env_vars,
             on_terminal_created=on_terminal_created,
         )
+        # Success -> transition the script step RUNNING->COMPLETED (no-op for
+        # non-script callers). Before building the response so a settle failure
+        # is logged, not raised.
+        _settle_step(result.terminal_id, None)
         return RunStepResponse(
             terminal_id=result.terminal_id,
             last_message=result.last_message,
@@ -1498,6 +1524,8 @@ async def run_step(
         # apart instead of reporting every failure as a timeout. The detail is a
         # structured object carrying terminal_id, so callers read it as a field
         # rather than regex-scraping the message (the future engine reads it too).
+        # Transition the script step RUNNING->FAILED (no-op for non-script callers).
+        _settle_step(e.terminal_id, str(e))
         code = status.HTTP_502_BAD_GATEWAY if e.kind == "error" else status.HTTP_504_GATEWAY_TIMEOUT
         raise HTTPException(
             status_code=code,

@@ -114,8 +114,14 @@ def list_cmd(scan_dir, as_json):
     click.echo(header)
     click.echo("-" * len(header))
     for row in rows:
+        # A script-tier spec has no static step count (it is determined at run
+        # time), so its index row carries ``step_count=None``. Render that as a
+        # ``-`` placeholder — formatting ``None`` with the ``:<6`` numeric field
+        # would raise a TypeError and crash the whole listing.
+        step_count = row.get("step_count")
+        steps_cell = "-" if step_count is None else str(step_count)
         click.echo(
-            f"{row['name']:<30} {row['mode']:<12} {row['step_count']:<6} {row.get('description', '')}"
+            f"{row['name']:<30} {row['mode']:<12} {steps_cell:<6} {row.get('description', '')}"
         )
 
 

@@ -29,6 +29,7 @@ FAILURE/timeout/cancel is NEVER an exception — it returns a FAILED/CANCELLED
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -47,11 +48,12 @@ from cli_agent_orchestrator.constants import (
 from cli_agent_orchestrator.models.workflow_runtime import (
     RunState,
     StepResult,
+    StepState,
     WorkflowRunResult,
 )
 from cli_agent_orchestrator.services import terminal_service, workflow_journal
 from cli_agent_orchestrator.services.script_lint import lint_script
-from cli_agent_orchestrator.services.step_output_store import _validate_key_part
+from cli_agent_orchestrator.services.step_output_store import _validate_key_part, step_output_store
 from cli_agent_orchestrator.services.workflow_service import (
     ResumeCorruptError,
     ResumeNotAllowedError,
@@ -390,6 +392,130 @@ def make_step_terminal_recorder(
         st.terminal_id = terminal_id
 
     return _record
+
+
+# ---------------------------------------------------------------------------
+# Per-step completion transition — wired into the server-side run-step path
+# ---------------------------------------------------------------------------
+def _step_call_fingerprint(provider: str, agent: str, prompt: str) -> str:
+    """``sha256(provider || agent || prompt)`` for the journal step row (ADR-5).
+
+    The stable call identity U3's ``lookup_replay`` compares against on resume:
+    a completed step row keeps the fingerprint recorded at its FIRST arrival, so
+    a resume can replay it instead of re-executing. NUL-separated so distinct
+    field boundaries can never collide (``a|b`` vs ``ab|``).
+    """
+    joined = "\x00".join((provider, agent, prompt))
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+
+
+def record_step_completion(
+    env_vars: Optional[Dict[str, str]],
+    *,
+    provider: str,
+    agent: str,
+    prompt: str,
+) -> Optional[Callable[[Optional[str], Optional[str]], None]]:
+    """Build the RUNNING->COMPLETED/FAILED transition for a script-tier step.
+
+    Mirrors ``make_step_terminal_recorder``'s guard exactly (BR-31 pattern):
+    returns ``None`` (no-op) unless the call carries both ``CAO_WORKFLOW_RUN_ID``
+    and ``CAO_WORKFLOW_STEP_ID`` AND that run is a live ``ScriptRunRecord`` in the
+    registry — so YAML/handoff callers are wholly unaffected.
+
+    The BR-31 recorder seeds a step ``RUNNING`` at terminal creation but nothing
+    ever transitions it, so a completed script run reports every step frozen at
+    ``running``/``attempts=0``/``output=null``. The returned callback settles the
+    step at the end of a run-step call, matching the YAML tier's per-step
+    transition (``workflow_service._run_step``):
+
+    - success -> ``COMPLETED`` (or ``COMPLETED_UNVALIDATED`` when the worker's
+      structured output is present but failed schema validation — the same
+      missing==invalid distinction the YAML tier records), attempts incremented,
+      any structured output copied onto the step state;
+    - ``StepExecutionError`` (a crashed/timed-out step) -> ``FAILED`` with the
+      error string recorded.
+
+    The transition is written through to the durable journal best-effort
+    (``append_step`` — U3's sole ``call_fingerprint`` write path) so a resume's
+    ``lookup_replay`` sees the completed step and skips re-execution. A journal
+    failure only degrades resumability; it never fails the step (INV-4).
+    """
+    if not env_vars:
+        return None
+    run_id = env_vars.get("CAO_WORKFLOW_RUN_ID")
+    step_id = env_vars.get("CAO_WORKFLOW_STEP_ID")
+    if not run_id or not step_id:
+        return None
+    record = run_registry.get(run_id)
+    if not isinstance(record, ScriptRunRecord):
+        return None
+
+    fingerprint = _step_call_fingerprint(provider, agent, prompt)
+
+    def _settle(terminal_id: Optional[str], error: Optional[str]) -> None:
+        st = record.step_states.get(step_id)
+        if st is None:
+            # No prior RUNNING seed (e.g. the terminal-created callback never
+            # fired) — create the state so the transition is still recorded.
+            st = StepRunState(step_id=step_id, state=StepState.RUNNING)
+            record.step_states[step_id] = st
+        if terminal_id is not None:
+            st.terminal_id = terminal_id
+        st.attempts += 1
+
+        if error is not None:
+            st.state = StepState.FAILED
+            st.error = error
+        else:
+            # Adopt any structured output the worker returned via
+            # ``workflow_return`` (keyed by the same run/step ids). A present but
+            # unvalidated record settles COMPLETED_UNVALIDATED, mirroring the YAML
+            # tier's _collect_structured_output; absent output stays COMPLETED.
+            rec = step_output_store.get(run_id, step_id)
+            if rec is not None:
+                st.output = rec
+                st.state = (
+                    StepState.COMPLETED if rec.validated else StepState.COMPLETED_UNVALIDATED
+                )
+            else:
+                st.state = StepState.COMPLETED
+            st.error = None
+
+        # Best-effort durable write-through so resume's lookup_replay sees the
+        # settled row WITH its attempts/output/error, not just its state. Two
+        # writes, matching the U3 contract (append_step's docstring): (1)
+        # append_step establishes the row + the stable call_fingerprint (its sole
+        # writer, VR-4 — excluded from DO UPDATE so it is fixed at first arrival);
+        # (2) update_step fills attempts/output_json/error, which append_step
+        # hardcodes to 0/NULL/NULL. Without (2) a resumed run's lookup_replay
+        # would read null output for a step that produced structured data (silent
+        # data loss on resume). Never raises into the step (INV-4).
+        now = _now()
+        output_json = json.dumps(st.output.output) if st.output is not None else None
+        try:
+            workflow_journal.append_step(run_id, step_id, st.state.value, now, fingerprint)
+            workflow_journal.update_step(
+                run_id=run_id,
+                step_id=step_id,
+                state=st.state.value,
+                attempts=st.attempts,
+                updated_at=now,
+                output_json=output_json,
+                error=st.error,
+            )
+        except (
+            Exception
+        ) as e:  # noqa: BLE001 — journal write is best-effort; resumability degraded only (INV-4)
+            logger.warning(
+                "journal: script step '%s/%s' completion write failed "
+                "(resumability degraded): %s",
+                run_id,
+                step_id,
+                e,
+            )
+
+    return _settle
 
 
 # ---------------------------------------------------------------------------

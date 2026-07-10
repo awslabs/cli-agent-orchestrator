@@ -261,3 +261,97 @@ class TestGenerationFence:
         assert resp.status_code == 200
         m_check.assert_not_called()
         m_run.assert_awaited_once()
+
+
+class TestScriptStepCompletion:
+    """Bug 2: a script-tier run-step call must transition its shared
+    ScriptRunRecord step RUNNING -> COMPLETED (success) or -> FAILED (crash),
+    end-to-end through the run_step endpoint. Without it a completed script run
+    reports every step frozen at running/attempts=0/output=null."""
+
+    _ENV = {
+        "CAO_WORKFLOW_RUN_ID": "run-step-done",
+        "CAO_WORKFLOW_STEP_ID": "s1",
+        "CAO_WORKFLOW_GENERATION": "1",
+    }
+
+    def _register_script_record(self, run_id):
+        from cli_agent_orchestrator.models.workflow_runtime import RunState
+        from cli_agent_orchestrator.services import workflow_service
+        from cli_agent_orchestrator.services.script_runner import ScriptRunRecord
+
+        record = ScriptRunRecord(
+            run_id=run_id,
+            workflow_name="wf",
+            state=RunState.RUNNING,
+            cancelled=False,
+            current_step_id=None,
+            step_states={},
+            process=None,
+            generation="1",
+            started_at="2026-07-10T00:00:00Z",
+            finished_at=None,
+            tier="script",
+        )
+        workflow_service.run_registry[run_id] = record
+        return record
+
+    def test_success_transitions_step_to_completed(self, client):
+        from cli_agent_orchestrator.models.workflow import StepState
+        from cli_agent_orchestrator.services import workflow_service
+
+        record = self._register_script_record("run-step-done")
+        try:
+            with (
+                patch(_CHECK_GENERATION, return_value=None),
+                patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())),
+            ):
+                resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(env_vars=self._ENV))
+            assert resp.status_code == 200
+            st = record.step_states["s1"]
+            assert st.state == StepState.COMPLETED
+            assert st.attempts == 1
+        finally:
+            workflow_service.run_registry.pop("run-step-done", None)
+
+    def test_crash_transitions_step_to_failed(self, client):
+        from cli_agent_orchestrator.models.workflow import StepState
+        from cli_agent_orchestrator.services import workflow_service
+        from cli_agent_orchestrator.services.agent_step import StepExecutionError
+
+        env = dict(self._ENV, CAO_WORKFLOW_RUN_ID="run-step-fail")
+        record = self._register_script_record("run-step-fail")
+        try:
+            with (
+                patch(_CHECK_GENERATION, return_value=None),
+                patch(
+                    _RUN_STEP,
+                    new=AsyncMock(
+                        side_effect=StepExecutionError(
+                            "terminal t1 reached ERROR status",
+                            kind="error",
+                            terminal_id="t1",
+                        )
+                    ),
+                ),
+            ):
+                resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(env_vars=env))
+            assert resp.status_code == 502  # kind=error -> 502
+            st = record.step_states["s1"]
+            assert st.state == StepState.FAILED
+            assert st.error is not None
+            assert st.terminal_id == "t1"
+        finally:
+            workflow_service.run_registry.pop("run-step-fail", None)
+
+    def test_non_script_caller_no_step_state_side_effect(self, client):
+        """A plain handoff call (no run/step env) must not create any script
+        step state — the completion path is a strict no-op for it."""
+        from cli_agent_orchestrator.services import workflow_service
+
+        before = dict(workflow_service.run_registry)
+        with patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())):
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body())
+        assert resp.status_code == 200
+        # Registry untouched — no phantom record/step created.
+        assert dict(workflow_service.run_registry) == before
