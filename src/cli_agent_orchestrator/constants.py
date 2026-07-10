@@ -22,6 +22,34 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+# Recognized spellings for env_bool(). Kept small and conventional so an
+# operator can write whichever truthy/falsy form is habitual.
+_ENV_TRUE = frozenset({"1", "true", "yes", "on"})
+_ENV_FALSE = frozenset({"0", "false", "no", "off"})
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    """Read a boolean env var, tolerating the usual truthy/falsy spellings.
+
+    Accepts ``1/true/yes/on`` (True) and ``0/false/no/off`` (False),
+    case-insensitively and whitespace-tolerant. Unset, empty, or unrecognized
+    values fall back to ``default`` rather than silently flipping the flag.
+
+    This replaces the ``os.environ.get(name, ...).lower() == "true"`` idiom,
+    which treated the common ``CAO_PYTE_STATUS=1`` as False and silently
+    disabled the pyte screen-detector that some providers require.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    token = raw.strip().lower()
+    if token in _ENV_TRUE:
+        return True
+    if token in _ENV_FALSE:
+        return False
+    return default
+
+
 # =============================================================================
 # Session Configuration
 # =============================================================================
@@ -91,9 +119,13 @@ EVENT_BUS_MAX_QUEUE_SIZE = _env_int("CAO_EVENT_BUS_MAX_QUEUE_SIZE", 16384)
 # handoff, send_message, skills, supervisor orchestration — every test green;
 # the only failures traced to network outages and a slow uvx MCP launch path,
 # not detection). Only providers that opt in via supports_screen_detection
-# (claude_code, kimi_cli) use it; all others and the herdr backend are
-# unaffected. Set CAO_PYTE_STATUS=false to fall back to the raw-stream path.
-CAO_PYTE_STATUS = os.environ.get("CAO_PYTE_STATUS", "true").lower() == "true"
+# (claude_code, kimi_cli, qwen_cli, antigravity_cli) use it; all others and the
+# herdr backend are unaffected. Set CAO_PYTE_STATUS=false to fall back to the
+# raw-stream path. qwen_cli/antigravity_cli REQUIRE this (their raw pipe-pane
+# retains a stale "esc to cancel" → false PROCESSING), so a truthy value must
+# actually enable it — hence env_bool(), which accepts 1/yes/on/true, not just
+# the literal "true".
+CAO_PYTE_STATUS = env_bool("CAO_PYTE_STATUS", default=True)
 
 # pyte screen geometry — mirror the tmux pane size (clients/tmux.py x=220 y=50)
 # so the rendered viewport matches what the agent's TUI actually drew.
@@ -112,7 +144,7 @@ PYTE_QUIESCENCE_DELAY_S = 0.2
 # PROCESSING state for providers that declare
 # accepts_input_while_processing=True. Eliminates latency between agent turns
 # for capable providers (e.g., Claude Code).
-EAGER_INBOX_DELIVERY = os.environ.get("CAO_EAGER_INBOX_DELIVERY", "false").lower() == "true"
+EAGER_INBOX_DELIVERY = env_bool("CAO_EAGER_INBOX_DELIVERY", default=False)
 
 # Poll interval (seconds) for the OpenCode inbox poller. OpenCode buffers input
 # and its pipe-pane output can stop changing once the TUI settles, so the
