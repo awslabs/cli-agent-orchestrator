@@ -189,9 +189,14 @@ def get_server_settings() -> Dict[str, Any]:
     Returns a dict with the following keys (defaults shown):
       - mcp_request_timeout (30): Seconds to wait for MCP HTTP calls
       - event_bus_max_queue_size (1024): Max events buffered per subscriber
-      - provider_init_timeout (60): Seconds to wait for a CLI agent to reach IDLE
-      - startup_prompt_handler_timeout (20): Seconds to handle startup prompts
-        (e.g., workspace trust dialogs) before giving up
+      - provider_init_timeout (60): Seconds to wait for a CLI agent to reach IDLE.
+        Also the hard outer cap on total time the startup-prompt handler may run.
+      - startup_prompt_handler_timeout (20): Idle gap, in seconds, between
+        consecutive startup prompts (e.g. workspace trust / bypass dialogs). The
+        handler keeps polling and resets this timer every time it answers a
+        prompt; it stops once no new prompt appears for this many seconds (so a
+        dialog a cold/containerized start renders late is still handled). Total
+        time is bounded by provider_init_timeout.
 
     Values can be set via CAO_* environment variables or in
     ~/.aws/cli-agent-orchestrator/settings.json under the "server" key:

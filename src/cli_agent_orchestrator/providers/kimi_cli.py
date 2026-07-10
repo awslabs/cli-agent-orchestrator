@@ -411,30 +411,53 @@ class KimiCliProvider(BaseProvider):
 
         cls._mcp_timeout_configured = True
 
-    def _handle_startup_dialog(self, timeout: Optional[float] = None) -> None:
+    def _handle_startup_dialog(self, idle_gap: Optional[float] = None) -> None:
         """Dismiss kimi's startup upgrade-reminder dialog if it appears.
 
         Mirrors ClaudeCodeProvider._handle_startup_prompts: polls the pane for
         the interactive "[s] Skip reminders for version X" menu and answers 's'
         so kimi can proceed to its ready prompt. Exits early if kimi is already
         ready (no newer version → no dialog), so a no-update start isn't delayed.
+
+        Idle-gap semantics (see issue #400): a cold or containerized start can
+        render the dialog LATE, past the old fixed ~20s window. Rather than a
+        total-window budget, ``idle_gap`` is the maximum quiet stretch tolerated
+        with no new prompt: answering the dialog resets the idle timer, and the
+        loop exits once no prompt appears for ``idle_gap`` seconds (or kimi is
+        ready). Total runtime is hard-capped by ``provider_init_timeout``.
+
+        Args:
+            idle_gap: Seconds of no-new-prompt quiet that ends the loop. Defaults
+                to the ``startup_prompt_handler_timeout`` setting.
         """
-        if timeout is None:
-            timeout = get_server_settings()["startup_prompt_handler_timeout"]
-        start_time = time.time()
-        while time.time() - start_time < timeout:
+        if idle_gap is None:
+            idle_gap = get_server_settings()["startup_prompt_handler_timeout"]
+        outer_deadline = time.monotonic() + get_server_settings()["provider_init_timeout"]
+        last_prompt_time = time.monotonic()
+        upgrade_dismissed = False
+        while True:
+            now = time.monotonic()
+            if now >= outer_deadline:
+                logger.warning("Kimi startup dialog handler hit provider_init_timeout outer cap")
+                return
+            if now - last_prompt_time >= idle_gap:
+                return  # no new prompt within the idle gap — startup settled
             output = get_backend().get_history(self.session_name, self.window_name)
             if output:
                 clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
-                if re.search(UPGRADE_PROMPT_PATTERN, clean_output):
+                # Answer the upgrade dialog once; its text lingers in the buffer
+                # after dismissal, so the flag stops a re-answer on later polls.
+                if not upgrade_dismissed and re.search(UPGRADE_PROMPT_PATTERN, clean_output):
                     from cli_agent_orchestrator.services.status_monitor import status_monitor
 
                     logger.info("Kimi upgrade-reminder dialog detected, skipping reminders")
                     status_monitor.notify_input_sent(self.terminal_id)
                     # 's' = "Skip reminders for version X"; single-key menu, no Enter.
                     get_backend().send_keys(self.session_name, self.window_name, "s", enter_count=0)
+                    upgrade_dismissed = True
+                    last_prompt_time = time.monotonic()  # reset idle timer
                     time.sleep(1.0)
-                    return
+                    continue
                 # Already at a ready prompt → no dialog to handle, stop early.
                 if self.get_status(output) in (
                     TerminalStatus.IDLE,
@@ -516,7 +539,7 @@ class KimiCliProvider(BaseProvider):
         """
         # Native status (herdr): trust the backend's agent state when available;
         # on herdr the buffer is never fed, so buffer parsing can't leave UNKNOWN.
-        native = self._resolve_native_status()
+        native = self._resolve_native_status(output)
         if native is not None:
             return native
 

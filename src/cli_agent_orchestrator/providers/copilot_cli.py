@@ -412,7 +412,7 @@ class CopilotCliProvider(BaseProvider):
     def get_status(self, output: str) -> TerminalStatus:
         # Native status (herdr): trust the backend's agent state when available,
         # before the tmux capture-pane fallback below (which is a tmux-only path).
-        native = self._resolve_native_status()
+        native = self._resolve_native_status(output)
         if native is not None:
             return native
 

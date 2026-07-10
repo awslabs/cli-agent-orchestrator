@@ -184,10 +184,10 @@ class TestNonPermissionCases:
         assert provider.get_status(output) == TerminalStatus.IDLE
 
     def test_empty_output(self):
-        """Empty output returns UNKNOWN."""
+        """Empty output returns IDLE (empty buffer + no dispatch)."""
         output = ""
         provider = make_provider("developer")
-        assert provider.get_status(output) == TerminalStatus.UNKNOWN
+        assert provider.get_status(output) == TerminalStatus.IDLE
 
 
 class TestPermissionPromptEdgeCases:

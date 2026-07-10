@@ -145,14 +145,14 @@ class TestGetStatusFromFixtures:
         assert provider.get_status(output) == TerminalStatus.IDLE
 
     def test_empty_output_returns_unknown(self):
-        # Merged tree: empty output → UNKNOWN (was ERROR).
+        # Empty buffer + native None + no dispatch → IDLE.
         provider = make_provider()
-        assert provider.get_status("") == TerminalStatus.UNKNOWN
+        assert provider.get_status("") == TerminalStatus.IDLE
 
     def test_none_output_returns_unknown(self):
-        # Merged tree: None output → UNKNOWN (was ERROR).
+        # None buffer + native None + no dispatch → IDLE.
         provider = make_provider()
-        assert provider.get_status(None) == TerminalStatus.UNKNOWN
+        assert provider.get_status(None) == TerminalStatus.IDLE
 
     def test_unknown_output_returns_unknown_fallback(self):
         """Non-empty output with no recognizable pattern → UNKNOWN fallback.

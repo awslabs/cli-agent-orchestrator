@@ -23,9 +23,12 @@ import logging
 import re
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+
+if TYPE_CHECKING:
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +47,12 @@ class BaseProvider(ABC):
         _status: Internal status cache (use get_status() for current status)
         _allowed_tools: CAO-vocabulary tool names this agent is allowed to use
     """
+
+    # Seconds after task dispatch that an unresolvable native status (herdr
+    # "unknown" with an empty buffer) is treated as optimistic PROCESSING.
+    # Past this, the agent is presumed wedged and reported ERROR. See the
+    # native-None matrix in _resolve_native_status().
+    _TASK_DISPATCH_STALENESS_TIMEOUT = 120
 
     def __init__(
         self,
@@ -264,7 +273,7 @@ class BaseProvider(ABC):
         self._done_first_detected = 0.0
         self._idle_first_detected = 0.0
 
-    def _resolve_native_status(self) -> Optional[TerminalStatus]:
+    def _resolve_native_status(self, buffer: Optional[str]) -> Optional[TerminalStatus]:
         """Resolve status from the backend's native agent state, if available.
 
         On the herdr backend, ``pipe_pane`` is a no-op so the StatusMonitor
@@ -272,17 +281,38 @@ class BaseProvider(ABC):
         rather than buffer parsing. Every provider calls this at the top of
         ``get_status()``; when it returns non-None the buffer path is skipped.
 
-        The tmux backend returns None from ``get_native_status()``, so this
-        returns None and the caller falls through to its buffer analysis
-        unchanged.
+        ``get_native_status()`` returns None in two distinct situations, which
+        ``buffer`` disambiguates:
 
-        The only ambiguous native state is IDLE: herdr reports "idle" both
-        before any task has been dispatched AND after a task completed (e.g. the
-        user focused the tab, resetting "done" -> "idle"). ``_task_dispatched``
-        (set by mark_input_received()) disambiguates. COMPLETED ("done") and
-        IDLE-post-dispatch both wait 10s from first detection for the pane buffer
-        to flush before reporting COMPLETED, so extract_last_message sees settled
-        output; the idle path gives up (reports COMPLETED) 300s after dispatch.
+        - tmux backend: always None, and the StatusMonitor ``buffer`` is
+          populated. This method returns None so the caller falls through to
+          buffer analysis unchanged.
+        - herdr backend, "unknown" agent_status: None with an empty ``buffer``
+          (a wrapped ``podman``/``docker exec`` launch hides the agent CLI from
+          herdr). Buffer parsing cannot help, so status is inferred from
+          dispatch state per the matrix below.
+
+        Native-None resolution matrix:
+
+        | buffer      | _task_dispatched      | Result                    |
+        |-------------|-----------------------|---------------------------|
+        | non-empty   | *                     | None (fall to buffer)     |
+        | empty       | False                 | IDLE                      |
+        | empty       | True, fresh (<120s)   | PROCESSING (optimistic)   |
+        | empty       | True, stale (>=120s)  | ERROR (+ warning log)     |
+
+        The only ambiguous non-None native state is IDLE: herdr reports "idle"
+        both before any task has been dispatched AND after a task completed
+        (e.g. the user focused the tab, resetting "done" -> "idle").
+        ``_task_dispatched`` (set by mark_input_received()) disambiguates.
+        COMPLETED ("done") and IDLE-post-dispatch both wait 10s from first
+        detection for the pane buffer to flush before reporting COMPLETED, so
+        extract_last_message sees settled output; the idle path gives up
+        (reports COMPLETED) 300s after dispatch.
+
+        Args:
+            buffer: The StatusMonitor output buffer for this terminal. Empty (or
+                None) on the herdr backend; populated on tmux.
         """
         from cli_agent_orchestrator.backends.registry import get_backend
 
@@ -293,7 +323,30 @@ class BaseProvider(ABC):
             native.value if native is not None else None,
         )
         if native is None:
-            return None
+            # Native status unresolvable. On tmux the buffer is populated —
+            # fall through to buffer analysis. On herdr "unknown" the buffer is
+            # empty (wrapped exec hides the agent), so infer from dispatch state.
+            if buffer:
+                return None
+            if not self._task_dispatched:
+                return TerminalStatus.IDLE
+            elapsed = time.time() - self._last_dispatch_time
+            if elapsed < self._TASK_DISPATCH_STALENESS_TIMEOUT:
+                logger.debug(
+                    "[get_status] terminal=%s -> PROCESSING "
+                    "(native unresolved, %.0fs since dispatch, optimistic)",
+                    self.terminal_id,
+                    elapsed,
+                )
+                return TerminalStatus.PROCESSING
+            logger.warning(
+                "[get_status] terminal=%s -> ERROR "
+                "(native unresolved, %.0fs since dispatch exceeds %ds staleness timeout)",
+                self.terminal_id,
+                elapsed,
+                self._TASK_DISPATCH_STALENESS_TIMEOUT,
+            )
+            return TerminalStatus.ERROR
         if native == TerminalStatus.PROCESSING:
             # Reset flush-wait timers — herdr is actively working, so any
             # previously stamped idle/done timestamp is from a pre-work gap
@@ -439,6 +492,50 @@ class BaseProvider(ABC):
         if system_prompt:
             return f"{system_prompt}\n\n{self._skill_prompt}"
         return self._skill_prompt
+
+    def get_init_timeout(self, profile: Optional["AgentProfile"] = None) -> int:
+        """Resolve the provider initialization timeout (seconds).
+
+        Returns the per-profile ``provider_init_timeout`` override when the
+        profile declares one, else the server default from
+        ``get_server_settings()`` (60s). Lets containerized profiles, whose
+        wrapped CLI can take far longer to reach IDLE, declare a longer init
+        cap without changing global config.
+
+        Passed the loaded profile as a parameter (like ``_translate_path``)
+        rather than reading ``self`` — subclasses store a profile *name string*
+        in ``self._agent_profile``, not an ``AgentProfile`` object.
+        """
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        if profile is not None and profile.provider_init_timeout is not None:
+            return profile.provider_init_timeout
+        return int(get_server_settings()["provider_init_timeout"])
+
+    def _translate_path(self, path: str, profile: Optional["AgentProfile"] = None) -> str:
+        """Translate a host path to a container guest path using profile path_maps.
+
+        Uses longest-prefix-match: if multiple path_maps match, the one with the
+        longest host prefix wins.  If no map matches, returns the path unchanged.
+        """
+        if profile is None or profile.container is None or not profile.container.path_maps:
+            return path
+
+        best_match = None
+        best_len = 0
+        for mapping in profile.container.path_maps:
+            host_prefix = mapping.host.rstrip("/")
+            if path == host_prefix or path.startswith(host_prefix + "/"):
+                if len(host_prefix) > best_len:
+                    best_match = mapping
+                    best_len = len(host_prefix)
+
+        if best_match is None:
+            return path
+
+        host_prefix = best_match.host.rstrip("/")
+        guest_prefix = best_match.guest.rstrip("/")
+        return guest_prefix + path[best_len:]
 
     def _update_status(self, status: TerminalStatus) -> None:
         """Update internal status."""

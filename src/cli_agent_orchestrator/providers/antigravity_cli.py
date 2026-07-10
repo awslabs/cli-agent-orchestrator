@@ -382,7 +382,7 @@ class AntigravityCliProvider(BaseProvider):
             # names behind and block terminal teardown.
             self._mcp_server_names = []
 
-    def _handle_startup_dialog(self, timeout: Optional[float] = None) -> None:
+    def _handle_startup_dialog(self, idle_gap: Optional[float] = None) -> None:
         """Dismiss agy's blocking startup dialogs (workspace-trust, survey).
 
         Mirrors ClaudeCodeProvider._handle_startup_prompts / KimiCliProvider.
@@ -393,14 +393,35 @@ class AntigravityCliProvider(BaseProvider):
         dismissal continues the loop rather than returning. Exits once agy is
         at its ready footer with no dialog on screen — the survey renders ON
         TOP of the footer, so the survey check must run before the idle exit.
+
+        Idle-gap semantics (see issue #400): a cold or containerized start can
+        render these dialogs LATE and in sequence, past the old fixed ~20s
+        window. Rather than a total-window budget, ``idle_gap`` is the maximum
+        quiet stretch tolerated BETWEEN prompts: answering a dialog resets the
+        idle timer, and the loop exits once no new prompt appears for
+        ``idle_gap`` seconds (or agy reaches its ready footer). Total runtime is
+        hard-capped by ``provider_init_timeout``.
+
+        Args:
+            idle_gap: Seconds of no-new-prompt quiet that ends the loop. Defaults
+                to the ``startup_prompt_handler_timeout`` setting.
         """
-        if timeout is None:
-            timeout = get_server_settings()["startup_prompt_handler_timeout"]
+        if idle_gap is None:
+            idle_gap = get_server_settings()["startup_prompt_handler_timeout"]
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
-        start_time = time.time()
+        outer_deadline = time.monotonic() + get_server_settings()["provider_init_timeout"]
+        last_prompt_time = time.monotonic()
         trust_done = survey_done = False
-        while time.time() - start_time < timeout:
+        while True:
+            now = time.monotonic()
+            if now >= outer_deadline:
+                logger.warning(
+                    "Antigravity startup dialog handler hit provider_init_timeout outer cap"
+                )
+                return
+            if now - last_prompt_time >= idle_gap:
+                return  # no new prompt within the idle gap — startup settled
             output = get_backend().get_history(self.session_name, self.window_name)
             if output:
                 clean = strip_terminal_escapes(output)
@@ -409,6 +430,7 @@ class AntigravityCliProvider(BaseProvider):
                     status_monitor.notify_input_sent(self.terminal_id)
                     get_backend().send_special_key(self.session_name, self.window_name, "Enter")
                     trust_done = True
+                    last_prompt_time = time.monotonic()  # reset idle timer — survey may follow
                     time.sleep(1.0)
                     continue
                 if not survey_done and re.search(SURVEY_PROMPT_PATTERN, clean):
@@ -418,6 +440,7 @@ class AntigravityCliProvider(BaseProvider):
                     time.sleep(0.5)
                     get_backend().send_special_key(self.session_name, self.window_name, "Enter")
                     survey_done = True
+                    last_prompt_time = time.monotonic()  # reset idle timer
                     time.sleep(1.0)
                     continue
                 # At the ready footer with no dialog pending → done.
@@ -483,7 +506,7 @@ class AntigravityCliProvider(BaseProvider):
         """
         # Native status (herdr): trust the backend's agent state when available;
         # on herdr the buffer is never fed, so buffer parsing can't leave UNKNOWN.
-        native = self._resolve_native_status()
+        native = self._resolve_native_status(output)
         if native is not None:
             return native
 

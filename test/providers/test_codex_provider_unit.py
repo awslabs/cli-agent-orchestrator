@@ -750,7 +750,7 @@ class TestCodexProviderStatusDetection:
         provider = CodexProvider("test1234", "test-session", "window-0")
         status = provider.get_status("")
 
-        assert status == TerminalStatus.UNKNOWN
+        assert status == TerminalStatus.IDLE
 
     def test_get_status_processing_when_old_prompt_present(self):
         # If the captured history contains an earlier prompt but the *latest* output is processing,

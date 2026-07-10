@@ -241,14 +241,14 @@ class TestKimiCliProviderStatusDetection:
         )
 
     def test_get_status_unknown_empty(self):
-        """Test UNKNOWN on empty output."""
+        """Test IDLE on empty output (empty buffer + no dispatch)."""
         provider = KimiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status("") == TerminalStatus.UNKNOWN
+        assert provider.get_status("") == TerminalStatus.IDLE
 
     def test_get_status_unknown_none(self):
-        """Test UNKNOWN on None output."""
+        """Test IDLE on None output (empty buffer + no dispatch)."""
         provider = KimiCliProvider("term-1", "session-1", "window-1")
-        assert provider.get_status(None) == TerminalStatus.UNKNOWN
+        assert provider.get_status(None) == TerminalStatus.IDLE
 
     def test_get_status_error_pattern(self):
         """Test ERROR detection from error output fixture."""

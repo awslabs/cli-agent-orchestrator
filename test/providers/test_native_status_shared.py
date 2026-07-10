@@ -127,18 +127,23 @@ class TestSharedNativeStatus:
         assert provider.get_status("") == TerminalStatus.COMPLETED
 
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_native_none_falls_through_to_buffer(self, mock_backend, provider_cls, _flag):
-        """tmux backend returns None -> buffer path runs; empty buffer is not COMPLETED/IDLE.
+    def test_native_none_empty_buffer_not_dispatched_returns_idle(
+        self, mock_backend, provider_cls, _flag
+    ):
+        """native None + empty buffer + no task dispatched -> IDLE for every provider.
 
-        Guards the fall-through: with native None and an empty buffer every
-        provider must return its buffer-path default (UNKNOWN, or ERROR for
-        hermes) — never a native status leaking through.
+        On the herdr backend an 'unknown' agent_status surfaces as native None
+        with an empty StatusMonitor buffer (a wrapped exec launch hides the
+        agent CLI). Before any task is dispatched, base resolution reports IDLE
+        to unblock init rather than falling through to each provider's
+        empty-buffer default (UNKNOWN, or ERROR for hermes). No provider
+        overrides _resolve_native_status, so this holds for all of them.
         """
         mock_backend.get_native_status.return_value = None
         mock_backend.get_history.return_value = ""
         provider = _make(provider_cls)
-        result = provider.get_status("")
-        assert result in (TerminalStatus.UNKNOWN, TerminalStatus.ERROR)
+        # _task_dispatched defaults to False
+        assert provider.get_status("") == TerminalStatus.IDLE
 
     def test_mark_input_received_sets_dispatch_flags(self, provider_cls, _flag):
         """mark_input_received() sets shared _task_dispatched AND the provider's own flag."""

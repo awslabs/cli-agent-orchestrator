@@ -430,7 +430,7 @@ class TestHermesStatusDetection:
 
     def test_get_status_empty_output(self):
         provider = HermesProvider("tid", "sess", "win", None)
-        assert provider.get_status("") == TerminalStatus.ERROR
+        assert provider.get_status("") == TerminalStatus.IDLE
 
 
 class TestHermesExtraction:

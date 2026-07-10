@@ -71,8 +71,8 @@ def test_status_idle_vs_completed_split_on_turns():
 
 
 def test_status_empty_is_unknown():
-    assert make_provider().get_status("") == TerminalStatus.UNKNOWN
-    assert make_provider().get_status(None) == TerminalStatus.UNKNOWN
+    assert make_provider().get_status("") == TerminalStatus.IDLE
+    assert make_provider().get_status(None) == TerminalStatus.IDLE
 
 
 def test_status_processing_takes_priority_over_idle_footer():

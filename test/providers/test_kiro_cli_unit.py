@@ -311,7 +311,7 @@ class TestKiroCliProviderStatusDetection:
         provider = KiroCliProvider("test1234", "test-session", "window-0", "developer")
         status = provider.get_status(output)
 
-        assert status == TerminalStatus.UNKNOWN
+        assert status == TerminalStatus.IDLE
 
     def test_status_processing_response_started_no_final_prompt(self):
         """Test status returns PROCESSING when response started but no final prompt."""

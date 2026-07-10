@@ -633,7 +633,7 @@ class CursorCliProvider(BaseProvider):
         """
         # Native status (herdr): trust the backend's agent state when available;
         # on herdr the buffer is never fed, so buffer parsing can't leave UNKNOWN.
-        native = self._resolve_native_status()
+        native = self._resolve_native_status(output)
         if native is not None:
             return native
 

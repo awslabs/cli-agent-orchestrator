@@ -283,11 +283,11 @@ class TestGetStatus:
 
     def test_empty_output_returns_unknown(self):
         provider = make_provider()
-        assert provider.get_status("") == TerminalStatus.UNKNOWN
+        assert provider.get_status("") == TerminalStatus.IDLE
 
     def test_none_output_returns_unknown(self):
         provider = make_provider()
-        assert provider.get_status(None) == TerminalStatus.UNKNOWN
+        assert provider.get_status(None) == TerminalStatus.IDLE
 
     def test_unrecognizable_output_returns_unknown(self):
         provider = make_provider()
