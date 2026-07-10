@@ -35,14 +35,11 @@ def _load_schema() -> dict:
 
 
 def _resolve_profile_path(name_or_path: str) -> Optional[Path]:
-    """Resolve an agent name or file path to a profile .md file.
+    """Resolve an agent name or file path to a local profile .md file.
 
-    Accepts:
-    - A file path (absolute or relative, must end in .md and exist)
-    - A bare agent name (looked up via the same search order as list_agent_profiles:
-      local store, provider dirs, extra dirs, built-in store)
-
-    Returns the resolved Path, or None if not found.
+    Returns the resolved Path for file paths and local-store profiles,
+    or None if the profile is built-in/provider-managed (resolved via
+    _read_profile_text instead) or not found at all.
     """
     if name_or_path.endswith(".md"):
         p = Path(name_or_path).expanduser().resolve()
@@ -65,10 +62,7 @@ def _resolve_profile_path(name_or_path: str) -> Optional[Path]:
     if candidate.is_relative_to(store_root) and candidate.exists():
         return candidate
 
-    # For built-in/provider profiles, write the content to a temp-like path
-    # isn't ideal. Instead, return None and let the caller use the text directly.
-    # Actually: we can return a sentinel that triggers text-based reading.
-    # Simpler: just return None and handle at the show/validate call sites.
+    # For built-in/provider profiles, return None — caller uses _read_profile_text.
     return None
 
 
@@ -101,7 +95,7 @@ def _validate_frontmatter(metadata: dict) -> list[str]:
     for field in _DEPRECATED_FIELDS:
         if field in metadata:
             messages.append(
-                f"[warn] '{field}' is deprecated and silently ignored by CAO 2.2+. "
+                f"[warn] '{field}' is deprecated and rejected by CAO 2.2+. "
                 f"Use 'allowedTools' instead."
             )
 

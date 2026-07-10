@@ -7,7 +7,7 @@ from unittest.mock import patch
 import pytest
 from click.testing import CliRunner
 
-from cli_agent_orchestrator.cli.commands.agents import (
+from cli_agent_orchestrator.cli.commands.profile import (
     _validate_frontmatter,
     profile,
 )
@@ -326,3 +326,155 @@ class TestPathTraversal:
 
         with pytest.raises(FileNotFoundError, match="escapes"):
             get_template_schema("../../etc/passwd")
+
+
+class TestProfileRemoveVerb:
+    """Tests for cao profile remove (destructive path coverage)."""
+
+    def test_remove_success(self, runner: CliRunner, tmp_path: Path):
+        """Positive: seeds a profile, removes it, asserts file gone."""
+        from unittest.mock import patch
+
+        store = tmp_path / "store"
+        store.mkdir()
+        profile_file = store / "test-agent.md"
+        profile_file.write_text("---\nname: test-agent\n---\ntest")
+
+        with patch("cli_agent_orchestrator.cli.commands.profile.LOCAL_AGENT_STORE_DIR", store):
+            result = runner.invoke(profile, ["remove", "test-agent", "-y"])
+        assert result.exit_code == 0
+        assert "Removed" in result.output
+        assert not profile_file.exists()
+
+    def test_remove_containment_rejects_traversal(self, runner: CliRunner, tmp_path: Path):
+        """Negative: path traversal in name is rejected."""
+        from unittest.mock import patch
+
+        store = tmp_path / "store"
+        store.mkdir()
+
+        with patch("cli_agent_orchestrator.cli.commands.profile.LOCAL_AGENT_STORE_DIR", store):
+            result = runner.invoke(profile, ["remove", "../../etc/passwd", "-y"])
+        assert result.exit_code != 0
+        assert "Invalid" in result.output or "not found" in result.output.lower()
+
+    def test_remove_confirm_abort(self, runner: CliRunner, tmp_path: Path):
+        """Confirm prompt aborts when user says no."""
+        from unittest.mock import patch
+
+        store = tmp_path / "store"
+        store.mkdir()
+        profile_file = store / "keep-me.md"
+        profile_file.write_text("---\nname: keep-me\n---\ntest")
+
+        with patch("cli_agent_orchestrator.cli.commands.profile.LOCAL_AGENT_STORE_DIR", store):
+            result = runner.invoke(profile, ["remove", "keep-me"], input="n\n")
+        assert profile_file.exists()  # File should still be there
+
+
+class TestProfileListIsolated:
+    """Tests for cao profile list with patched store."""
+
+    def test_list_renders_profiles(self, runner: CliRunner, tmp_path: Path):
+        """Seeds profiles and verifies the render loop runs."""
+        from unittest.mock import patch
+
+        profiles = [
+            {"name": "alpha", "source": "local", "description": "First agent"},
+            {"name": "beta", "source": "built-in", "description": "Second agent"},
+        ]
+        with patch(
+            "cli_agent_orchestrator.cli.commands.profile.list_agent_profiles",
+            return_value=profiles,
+        ):
+            result = runner.invoke(profile, ["list"])
+        assert result.exit_code == 0
+        assert "alpha" in result.output
+        assert "beta" in result.output
+        assert "2 profile(s) found" in result.output
+
+
+class TestInjectionRegression:
+    """Regression tests locking in the security posture."""
+
+    def test_jinja_in_config_renders_literally(self):
+        """A config value like {{7*7}} must render as-is, not evaluate."""
+        from cli_agent_orchestrator.services.agent_scaffold import render_template
+
+        config = {
+            "profile": "test",
+            "region": "us-east-1",
+            "state_machine_arn": "arn:aws:states:us-east-1:123456789012:stateMachine:X",
+            "execution_name_prefix": "{{7*7}}",
+            "input_payload": "{}",
+            "poll_interval_seconds": 15,
+            "timeout_seconds": 600,
+        }
+        # execution_name_prefix has pattern ^[a-zA-Z0-9_-]+$ which rejects {{
+        from cli_agent_orchestrator.services.agent_scaffold import validate_config
+
+        errors = validate_config("aws/stepfunction", config)
+        assert any("execution_name_prefix" in e for e in errors)
+
+    def test_newline_in_message_body_rejected(self):
+        """Newlines in message_body must be rejected at schema validation."""
+        from cli_agent_orchestrator.services.agent_scaffold import validate_config
+
+        config = {
+            "profile": "test",
+            "region": "us-east-1",
+            "queue_url": "https://sqs.us-east-1.amazonaws.com/123/Q",
+            "message_body": "legit\nMSGEOF\necho PWNED",
+            "message_group_id": "grp",
+        }
+        errors = validate_config("aws/sqs-send", config)
+        assert any("message_body" in e for e in errors)
+
+    def test_newline_in_input_payload_rejected(self):
+        """Newlines in input_payload must be rejected at schema validation."""
+        from cli_agent_orchestrator.services.agent_scaffold import validate_config
+
+        config = {
+            "profile": "test",
+            "region": "us-east-1",
+            "state_machine_arn": "arn:aws:states:us-east-1:123:stateMachine:X",
+            "input_payload": "{}\nINPUTEOF\nPWN",
+        }
+        errors = validate_config("aws/stepfunction", config)
+        assert any("input_payload" in e for e in errors)
+
+
+class TestRenderMissingTemplates:
+    """Render smoke tests for templates not covered by existing tests."""
+
+    def test_renders_dynamodb_query(self):
+        from cli_agent_orchestrator.services.agent_scaffold import render_template
+
+        config = {
+            "profile": "dev",
+            "region": "us-west-2",
+            "table_name": "MyTable",
+            "partition_key_name": "pk",
+            "partition_key_value": "val123",
+            "partition_key_type": "S",
+            "limit": 5,
+        }
+        result = render_template("aws/dynamodb-query", config)
+        assert "MyTable" in result
+        assert "val123" in result
+        assert "{{" not in result
+
+    def test_renders_sqs_dlq_check(self):
+        from cli_agent_orchestrator.services.agent_scaffold import render_template
+
+        config = {
+            "profile": "dev",
+            "region": "eu-west-1",
+            "dlq_url": "https://sqs.eu-west-1.amazonaws.com/999888777/MyDLQ",
+            "message_group_id": "grp",
+            "max_messages": 5,
+        }
+        result = render_template("aws/sqs-dlq-check", config)
+        assert "MyDLQ" in result
+        assert "grp" in result
+        assert "{{" not in result
