@@ -1,4 +1,9 @@
-"""GraphSink ABC and its name-keyed registry (FR-5)."""
+"""GraphSink ABC and its name-keyed registry (FR-5).
+
+Design: Issue #348 (graph-layer epic); design record:
+aidlc/spaces/default/intents/260709-graph-layer/ (AIDLC intent, not shipped
+with the package).
+"""
 
 from abc import ABC, abstractmethod
 from typing import Any, Callable, ClassVar
@@ -7,7 +12,17 @@ from cli_agent_orchestrator.graph.models import GraphView
 
 
 class GraphSink(ABC):
-    """Exports a GraphView to some external format/destination."""
+    """Exports a GraphView to some external format/destination.
+
+    Security contract for ``dest``: implementations MUST resolve and
+    confine ``dest`` under an allowed base directory before writing —
+    reject ``..`` traversal, absolute-path escapes, and symlink escapes.
+    Follow this repo's path-validation convention
+    (``utils/path_validation.resolve_and_validate_path``). Validation is
+    owned by BOTH the U4 route (first line of defense, validates before
+    calling a sink) AND each sink implementation (defense in depth) — a
+    sink must not assume its caller already validated ``dest``.
+    """
 
     capabilities: ClassVar[set[str]] = set()
 

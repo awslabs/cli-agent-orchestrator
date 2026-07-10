@@ -20,7 +20,7 @@ class TestNode:
 
     @pytest.mark.parametrize(
         "kind",
-        ["", "Topic", "topic-name", "1topic", "topic name", "topic."],
+        ["", "Topic", "topic-name", "1topic", "topic name", "topic.", "topic\n"],
     )
     def test_rejects_invalid_kind_shape(self, kind):
         with pytest.raises(ValidationError):
@@ -94,3 +94,41 @@ class TestGraphView:
                 nodes=[Node(id="n1", kind="topic", label="Foo")],
                 edges=[Edge(source="n1", target="missing", type=EdgeType.RELATES_TO)],
             )
+
+    def test_rejects_duplicate_node_ids(self):
+        with pytest.raises(ValidationError):
+            GraphView(
+                nodes=[
+                    Node(id="n1", kind="topic", label="Foo"),
+                    Node(id="n1", kind="topic", label="Bar"),
+                ],
+                edges=[],
+            )
+
+    def test_to_dict_serializes_non_default_status_and_populated_attrs(self):
+        view = GraphView(
+            nodes=[
+                Node(
+                    id="n1",
+                    kind="topic",
+                    label="Foo",
+                    status=NodeStatus.PROPOSAL,
+                    attrs={"weight": 3},
+                ),
+            ],
+            edges=[],
+            meta={"generated_by": "stub"},
+        )
+
+        result = view.to_dict()
+
+        assert result["nodes"] == [
+            {
+                "id": "n1",
+                "kind": "topic",
+                "label": "Foo",
+                "status": "proposal",
+                "attrs": {"weight": 3},
+            }
+        ]
+        assert result["meta"] == {"generated_by": "stub"}

@@ -2,7 +2,7 @@
 
 import pytest
 
-from cli_agent_orchestrator.graph.models import GraphView
+from cli_agent_orchestrator.graph.models import GraphView, Node
 from cli_agent_orchestrator.graph.providers.base import (
     GraphProvider,
     get_provider,
@@ -104,3 +104,55 @@ class TestSinkQueryCapabilityGate:
         sink = get_sink("test-sink-with-query")
 
         assert sink.query() == "queried"
+
+    def test_sink_declaring_query_capability_without_override_raises_not_implemented(self):
+        @register_sink("test-sink-declared-not-overridden")
+        class DeclaredOnlySink(GraphSink):
+            capabilities = {"query"}
+
+            def export(self, view, dest, **options):
+                return [dest]
+
+        sink = get_sink("test-sink-declared-not-overridden")
+
+        with pytest.raises(NotImplementedError, match="did not override"):
+            sink.query()
+
+    def test_sink_export_writes_and_returns_paths(self):
+        @register_sink("test-sink-export")
+        class ExportSink(GraphSink):
+            def export(self, view, dest, **options):
+                return [dest]
+
+        sink = get_sink("test-sink-export")
+
+        assert sink.export(GraphView(nodes=[], edges=[]), "out.json") == ["out.json"]
+
+
+class TestProviderAsyncContract:
+    """Tests exercising the async project() contract end-to-end (ADR-7)."""
+
+    @pytest.mark.asyncio
+    async def test_project_is_awaited_and_returns_empty_graph_view(self):
+        @register_provider("test-provider-async")
+        class EmptyProvider(GraphProvider):
+            async def project(self, **filters):
+                return GraphView(nodes=[], edges=[])
+
+        provider = get_provider("test-provider-async")
+        gv = await provider.project()
+
+        assert gv.nodes == []
+        assert gv.edges == []
+
+    @pytest.mark.asyncio
+    async def test_project_returns_provided_nodes(self):
+        @register_provider("test-provider-async-nodes")
+        class OneNodeProvider(GraphProvider):
+            async def project(self, **filters):
+                return GraphView(nodes=[Node(id="n1", kind="topic", label="Foo")], edges=[])
+
+        provider = get_provider("test-provider-async-nodes")
+        gv = await provider.project()
+
+        assert [node.id for node in gv.nodes] == ["n1"]

@@ -1,4 +1,9 @@
-"""GraphProvider ABC and its name-keyed registry (FR-4)."""
+"""GraphProvider ABC and its name-keyed registry (FR-4).
+
+Design: Issue #348 (graph-layer epic); design record:
+aidlc/spaces/default/intents/260709-graph-layer/ (AIDLC intent, not shipped
+with the package).
+"""
 
 from abc import ABC, abstractmethod
 from typing import Any, Callable
