@@ -11,6 +11,7 @@ import os
 import tarfile
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import frontmatter
 import pytest
@@ -63,23 +64,23 @@ def _store(svc, key, content, scope="global", memory_type="reference", tags="", 
 
 
 def _plant_secret_on_disk(svc, key, secret_content, scope="global", memory_type="reference"):
-    """Seed a secret-bearing wiki file directly on disk, bypassing store()'s
-    credential gate.
+    """Seed a secret-bearing wiki file on disk, bypassing store()'s credential
+    gate for fixture setup only.
 
     store() now rejects credential-shaped input at write time for every scope
     (CWE-312 fix). The export/import secret handling is DEFENSE-IN-DEPTH for
-    files that are already on disk — e.g. memories written before the store
-    gate existed, or a hand-edited wiki file. This helper reproduces exactly
-    that state: store a clean placeholder (so the wiki file, index.md entry and
-    DB row are laid out the way store() produces them), then overwrite the wiki
-    file's section body with the secret. The export reader parses the file from
-    disk, so the on-disk layout is what matters.
+    files ALREADY on disk — memories written before the store gate existed, or a
+    hand-edited wiki. To reproduce that state we still write through the real
+    ``store()`` (so the wiki file, index.md entry and DB row are laid out exactly
+    as in production), but disable the gate for the duration of the plant by
+    patching ``scan_for_secrets`` to report "clean". Doing it this way keeps the
+    clear-text write inside product code (the path already covered by alert #142)
+    rather than introducing a second write sink in test code.
     """
-    mem = _store(svc, key, "placeholder body", scope=scope, memory_type=memory_type)
-    wiki_path = Path(mem.file_path)
-    text = wiki_path.read_text(encoding="utf-8")
-    wiki_path.write_text(text.replace("placeholder body", secret_content), encoding="utf-8")
-    return mem
+    from cli_agent_orchestrator.services import secret_gate
+
+    with patch.object(secret_gate, "scan_for_secrets", return_value=None):
+        return _store(svc, key, secret_content, scope=scope, memory_type=memory_type)
 
 
 def _frontmatter(path):
@@ -217,19 +218,12 @@ class TestSecretGate:
         assert "clean-topic" in index
 
     def test_history_sections_gated_when_included(self, svc, backend, dest):
-        # A clean latest section on disk, with an OLDER leaky history section
-        # injected before it (simulating a secret that predates the store gate).
-        # store() lays out the file + index + row; we then splice a leaky
-        # earlier ``## <ts>`` section ahead of the latest one.
-        mem = _store(svc, "old-leak", "latest entry is clean")
-        wiki_path = Path(mem.file_path)
-        text = wiki_path.read_text(encoding="utf-8")
-        marker = "\n## "
-        head, _, latest_section = text.partition(marker)
-        leaky_section = f"2000-01-01T00:00:00Z\nold entry with {PLANTED_AWS_KEY}\n"
-        wiki_path.write_text(
-            head + marker + leaky_section + marker + latest_section, encoding="utf-8"
-        )
+        # An OLDER leaky section followed by a clean latest section, both written
+        # through the real store() append path (gate patched off for the leaky
+        # seed, as with pre-gate on-disk data). The second clean store() appends
+        # a newer section, so the leak becomes history, not the latest.
+        _plant_secret_on_disk(svc, "old-leak", f"old entry with {PLANTED_AWS_KEY}")
+        _store(svc, "old-leak", "latest entry is clean")
         # Without history the latest-only content is clean → exports.
         report = backend.export_bundle("global", None, dest, False, False)
         assert report.exported == 1
