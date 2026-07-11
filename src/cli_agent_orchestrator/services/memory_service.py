@@ -667,17 +667,21 @@ class MemoryService:
         MemoryScope(scope)
         MemoryType(memory_type)
 
-        # Federated writes are credential-gated. The machine-wide shared
-        # tier rejects content matching common secret patterns. The log
-        # line carries the pattern NAME only — never content bytes.
-        if scope == MemoryScope.FEDERATED.value:
-            from cli_agent_orchestrator.services.secret_gate import scan_for_secrets
+        # Writes are credential-gated for EVERY scope. Memory content is
+        # persisted as clear text on disk (no encryption-at-rest), so
+        # credential-shaped content must be rejected before any write reaches
+        # the filesystem — otherwise a secret pasted into any scope lands in a
+        # plaintext wiki file (CodeQL py/clear-text-storage-sensitive-data,
+        # alert #142). The gate previously covered only the federated tier; it
+        # now applies uniformly. The log line carries the pattern NAME only, and
+        # the raised message is generic — never content bytes.
+        from cli_agent_orchestrator.services.secret_gate import scan_for_secrets
 
-            hit = scan_for_secrets(content)
-            if hit:
-                # Do not log detector output; emit only a constant event marker.
-                logger.warning("federated_secret_rejected")
-                raise ValueError(f"federated write rejected: matched credential pattern {hit!r}")
+        hit = scan_for_secrets(content)
+        if hit:
+            # Do not log detector output; emit only a constant event marker.
+            logger.warning("memory_secret_rejected")
+            raise ValueError(f"memory write rejected: matched credential pattern {hit!r}")
 
         # Store-time cross-scope write guard. A caller may
         # only write a scope it is authorised for (SCOPE_RANK). The caller
@@ -804,11 +808,6 @@ class MemoryService:
             # AND merges) or a value older than the topic's latest section
             # is clamped to now(), with provenance preserved as a first
             # body line. occurred_at=None keeps the pre-#345 bytes exactly.
-            # Reject credential-like content before any plaintext persistence.
-            # This prevents cleartext-at-rest of likely secrets across all scopes.
-            if self.scan_for_secrets(content):
-                raise ValueError("Memory content appears to contain sensitive credentials and was rejected.")
-
             entry_body = content
             if occurred_at is not None:
                 if self._occurred_at_would_clamp(occurred_at, latest_section_at, now):
