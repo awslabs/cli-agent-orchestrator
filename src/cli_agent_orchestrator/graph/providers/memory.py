@@ -91,10 +91,14 @@ class MemoryGraphProvider(GraphProvider):
         # Lint findings — awaited directly in-request (ADR-7); no SQL or LLM
         # calls beyond what run_lint itself performs (FR-7, C-1). A lint
         # failure degrades to a lint-free graph rather than a 500.
+        import asyncio
+
         try:
             issues = await wiki_lint.run_lint(scope_id or scope, scope=scope)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            logger.warning(f"memory graph provider: run_lint failed: {e}")
+            logger.warning("memory graph provider: run_lint failed: %r", e, exc_info=True)
             meta["lint_error"] = type(e).__name__
             issues = []
 
