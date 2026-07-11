@@ -127,8 +127,7 @@ class TestMemoryProviderHappyPath:
 
         assert {n.id for n in view.nodes} >= {"a", "b", "c"}
         assert all(n.kind == "topic" for n in view.nodes)
-        assert all(n.attrs["status"] == "active" for n in view.nodes)
-
+        assert all(n.status.value == "active" for n in view.nodes)
         related = [e for e in view.edges if e.type == EdgeType.RELATES_TO]
         assert [(e.source, e.target) for e in related] == [("a", "b")]
         assert related[0].attrs["source"] == "related_keys"
