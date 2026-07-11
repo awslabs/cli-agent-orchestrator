@@ -10,6 +10,7 @@ import asyncio
 import os
 import tarfile
 from datetime import datetime
+from pathlib import Path
 
 import frontmatter
 import pytest
@@ -59,6 +60,26 @@ def _store(svc, key, content, scope="global", memory_type="reference", tags="", 
             terminal_context=ctx,
         )
     )
+
+
+def _plant_secret_on_disk(svc, key, secret_content, scope="global", memory_type="reference"):
+    """Seed a secret-bearing wiki file directly on disk, bypassing store()'s
+    credential gate.
+
+    store() now rejects credential-shaped input at write time for every scope
+    (CWE-312 fix). The export/import secret handling is DEFENSE-IN-DEPTH for
+    files that are already on disk — e.g. memories written before the store
+    gate existed, or a hand-edited wiki file. This helper reproduces exactly
+    that state: store a clean placeholder (so the wiki file, index.md entry and
+    DB row are laid out the way store() produces them), then overwrite the wiki
+    file's section body with the secret. The export reader parses the file from
+    disk, so the on-disk layout is what matters.
+    """
+    mem = _store(svc, key, "placeholder body", scope=scope, memory_type=memory_type)
+    wiki_path = Path(mem.file_path)
+    text = wiki_path.read_text(encoding="utf-8")
+    wiki_path.write_text(text.replace("placeholder body", secret_content), encoding="utf-8")
+    return mem
 
 
 def _frontmatter(path):
@@ -167,7 +188,7 @@ class TestSecretGate:
 
     def test_default_skips_topic_with_pattern_name_only(self, svc, backend, dest, caplog):
         _store(svc, "clean-topic", "Nothing sensitive here.")
-        _store(svc, "leaky-topic", f"My key is {PLANTED_AWS_KEY} do not share.")
+        _plant_secret_on_disk(svc, "leaky-topic", f"My key is {PLANTED_AWS_KEY} do not share.")
         with caplog.at_level("DEBUG"):
             report = backend.export_bundle("global", None, dest, False, False)
         assert report.exported == 1
@@ -179,7 +200,7 @@ class TestSecretGate:
         assert PLANTED_AWS_KEY not in caplog.text
 
     def test_redact_exports_with_marker(self, svc, backend, dest):
-        _store(svc, "leaky-topic", f"My key is {PLANTED_AWS_KEY} do not share.")
+        _plant_secret_on_disk(svc, "leaky-topic", f"My key is {PLANTED_AWS_KEY} do not share.")
         report = backend.export_bundle("global", None, dest, False, True)
         assert report.redacted == 1
         assert report.skipped_secret == 0
@@ -188,7 +209,7 @@ class TestSecretGate:
         assert "[REDACTED:aws_access_key]" in text
 
     def test_skipped_topic_absent_from_index(self, svc, backend, dest):
-        _store(svc, "leaky-topic", f"key {PLANTED_AWS_KEY}")
+        _plant_secret_on_disk(svc, "leaky-topic", f"key {PLANTED_AWS_KEY}")
         _store(svc, "clean-topic", "fine")
         backend.export_bundle("global", None, dest, False, False)
         index = (dest / "index.md").read_text(encoding="utf-8")
@@ -196,8 +217,19 @@ class TestSecretGate:
         assert "clean-topic" in index
 
     def test_history_sections_gated_when_included(self, svc, backend, dest):
-        _store(svc, "old-leak", f"old entry with {PLANTED_AWS_KEY}")
-        _store(svc, "old-leak", "latest entry is clean")
+        # A clean latest section on disk, with an OLDER leaky history section
+        # injected before it (simulating a secret that predates the store gate).
+        # store() lays out the file + index + row; we then splice a leaky
+        # earlier ``## <ts>`` section ahead of the latest one.
+        mem = _store(svc, "old-leak", "latest entry is clean")
+        wiki_path = Path(mem.file_path)
+        text = wiki_path.read_text(encoding="utf-8")
+        marker = "\n## "
+        head, _, latest_section = text.partition(marker)
+        leaky_section = f"2000-01-01T00:00:00Z\nold entry with {PLANTED_AWS_KEY}\n"
+        wiki_path.write_text(
+            head + marker + leaky_section + marker + latest_section, encoding="utf-8"
+        )
         # Without history the latest-only content is clean → exports.
         report = backend.export_bundle("global", None, dest, False, False)
         assert report.exported == 1
@@ -341,7 +373,7 @@ class TestSeeAlso:
 
     def test_link_to_skipped_topic_degrades_to_text(self, svc, backend, dest):
         _store(svc, "source-topic", "links out")
-        _store(svc, "secret-topic", f"key {PLANTED_AWS_KEY}")
+        _plant_secret_on_disk(svc, "secret-topic", f"key {PLANTED_AWS_KEY}")
         self._append_see_also(svc, "source-topic", "secret-topic")
         report = backend.export_bundle("global", None, dest, False, False)
         assert report.links_dropped == 1
@@ -391,8 +423,6 @@ class TestTamperedIndex:
 
 class TestDestValidation:
     def test_blocked_system_dest_rejected(self, backend):
-        from pathlib import Path
-
         with pytest.raises(ValueError, match="not allowed"):
             backend.export_bundle("global", None, Path("/etc/new-bundle"), False, False)
 

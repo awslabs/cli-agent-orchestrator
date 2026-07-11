@@ -1383,20 +1383,61 @@ class TestFederatedScope:
         assert not wiki.exists()
         assert _fed_row(engine, "fed-secret") is None
 
-    def test_same_secret_content_rejected_at_global_scope(self, tmp_path: Path):
-        """Credential-like content is rejected for global scope as well."""
+    def test_same_secret_content_rejected_at_global_scope(self, tmp_path: Path, caplog):
+        """Credential-like content is rejected for global scope as well, nothing
+        is written, and neither the raised error nor the logs echo the secret."""
         svc = MemoryService(base_dir=tmp_path)
         ctx = _make_terminal_context()
         secret = "deploy creds AKIAIOSFODNN7EXAMPLE here"
-        with pytest.raises(ValueError):
+        with caplog.at_level("WARNING", logger="cli_agent_orchestrator.services.memory_service"):
+            with pytest.raises(ValueError) as exc_info:
+                _run(
+                    svc.store(
+                        content=secret,
+                        scope="global",
+                        memory_type="reference",
+                        key="glob-secret-ok",
+                        terminal_context=ctx,
+                    )
+                )
+        # No secret bytes in the raised message...
+        assert "AKIAIOSFODNN7EXAMPLE" not in str(exc_info.value)
+        # ...nor in any log record.
+        for rec in caplog.records:
+            assert "AKIAIOSFODNN7EXAMPLE" not in rec.getMessage()
+        # Nothing persisted.
+        wiki = tmp_path / "global" / "wiki" / "global" / "glob-secret-ok.md"
+        assert not wiki.exists()
+
+    def test_secret_in_key_or_tags_rejected(self, tmp_path: Path):
+        """The gate scans every persisted field: a credential in ``key`` or
+        ``tags`` (not just ``content``) is rejected before any write."""
+        svc = MemoryService(base_dir=tmp_path)
+        ctx = _make_terminal_context()
+        # Secret smuggled via tags.
+        with pytest.raises(ValueError) as exc_tags:
             _run(
                 svc.store(
-                    content=secret,
+                    content="clean body",
                     scope="global",
                     memory_type="reference",
-                    key="glob-secret-ok",
+                    key="clean-key",
+                    tags="env,AKIAIOSFODNN7EXAMPLE",
                     terminal_context=ctx,
                 )
             )
-        wiki = tmp_path / "global" / "wiki" / "global" / "glob-secret-ok.md"
-        assert not wiki.exists()
+        assert "AKIAIOSFODNN7EXAMPLE" not in str(exc_tags.value)
+        assert not list(tmp_path.rglob("clean-key.md"))
+        # Secret smuggled via key (ghp_ GitHub PAT shape).
+        pat_key = "ghp_" + "A" * 36
+        with pytest.raises(ValueError):
+            _run(
+                svc.store(
+                    content="clean body",
+                    scope="global",
+                    memory_type="reference",
+                    key=pat_key,
+                    terminal_context=ctx,
+                )
+            )
+        assert not list(tmp_path.rglob(f"{pat_key}.md"))

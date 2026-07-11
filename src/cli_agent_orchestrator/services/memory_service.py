@@ -667,21 +667,30 @@ class MemoryService:
         MemoryScope(scope)
         MemoryType(memory_type)
 
-        # Writes are credential-gated for EVERY scope. Memory content is
-        # persisted as clear text on disk (no encryption-at-rest), so
-        # credential-shaped content must be rejected before any write reaches
-        # the filesystem — otherwise a secret pasted into any scope lands in a
-        # plaintext wiki file (CodeQL py/clear-text-storage-sensitive-data,
-        # alert #142). The gate previously covered only the federated tier; it
-        # now applies uniformly. The log line carries the pattern NAME only, and
-        # the raised message is generic — never content bytes.
+        # Writes are credential-gated for EVERY scope, across every field that
+        # is persisted. Memory is stored as clear-text markdown on disk (no
+        # encryption-at-rest — agents and humans read these files directly), so
+        # credential-shaped input must be rejected before any write reaches the
+        # filesystem; otherwise a secret in any scope lands in a plaintext wiki
+        # file (CodeQL py/clear-text-storage-sensitive-data / CWE-312, alert
+        # #142). The gate previously covered only the federated tier and only
+        # ``content``. It now applies to every scope and scans ``content`` (body),
+        # ``key`` (header + filename) and ``tags`` (header + index) — every
+        # caller-supplied value that reaches ``new_content``/disk. Fail closed on
+        # the first match. The log line carries the pattern NAME only, and the
+        # raised message names the offending FIELD and pattern, never the bytes.
         from cli_agent_orchestrator.services.secret_gate import scan_for_secrets
 
-        hit = scan_for_secrets(content)
-        if hit:
-            # Do not log detector output; emit only a constant event marker.
-            logger.warning("memory_secret_rejected")
-            raise ValueError(f"memory write rejected: matched credential pattern {hit!r}")
+        for field_name, field_value in (("content", content), ("key", key), ("tags", tags)):
+            if not field_value:
+                continue
+            hit = scan_for_secrets(field_value)
+            if hit:
+                # Do not log detector output; emit only a constant event marker.
+                logger.warning("memory_secret_rejected field=%s", field_name)
+                raise ValueError(
+                    f"memory write rejected: {field_name} matched credential pattern {hit!r}"
+                )
 
         # Store-time cross-scope write guard. A caller may
         # only write a scope it is authorised for (SCOPE_RANK). The caller
