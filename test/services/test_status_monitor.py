@@ -489,3 +489,38 @@ class TestUntestedMethods:
 
         assert result == TerminalStatus.IDLE
         assert sm._last_status["t1"] == TerminalStatus.IDLE
+
+
+class TestGetStatusIntegratedFallback:
+    """Regression: integrated get_status() must trigger history fallback when
+    the FIFO buffer is empty for non-PROCESSING cached statuses.
+
+    The refactor that extracted _get_buffer_for_processing_check changed the
+    buffer retrieval to be unconditional. This test pins the integrated
+    get_status() path to ensure the history-fallback gate still works for
+    the empty-buffer case (e.g. WSL FIFO limitations).
+    """
+
+    @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor._resolve_window")
+    def test_empty_buffer_triggers_history_fallback(
+        self, mock_resolve_window, mock_get_backend, mock_pm
+    ):
+        """When buffer is empty and cached status is IDLE, history fallback fires."""
+        mock_get_backend.return_value = _backend(event_inbox=False)
+        provider = MagicMock()
+        provider.get_status.return_value = TerminalStatus.COMPLETED
+        mock_pm.get_provider.return_value = provider
+        mock_resolve_window.return_value = ("session", "window")
+        mock_get_backend.return_value.get_history.return_value = "terminal history output"
+
+        sm = StatusMonitor()
+        sm._last_status["t1"] = TerminalStatus.IDLE
+        # No buffer set — simulates empty FIFO (WSL limitation)
+
+        result = sm.get_status("t1")
+
+        # The history fallback should have fired and returned COMPLETED
+        assert result == TerminalStatus.COMPLETED
+        mock_get_backend.return_value.get_history.assert_called_once()

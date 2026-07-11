@@ -10,7 +10,6 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-from cli_agent_orchestrator.clients.tmux import tmux_client  # Kept for test mocks only
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
@@ -39,7 +38,6 @@ USER_INPUT_PATTERN = r"^>\s+\S"
 
 # Devin shows a "#" prompt when idle and waiting for input
 IDLE_PROMPT_PATTERN = r"^[\s]*#[\s]*$"
-IDLE_PROMPT_PATTERN_LOG = IDLE_PROMPT_PATTERN
 
 # Processing state indicators (take priority over the fixed `#` prompt)
 PROCESSING_PATTERNS = [
@@ -234,27 +232,32 @@ You are restricted to only use the following tools: {tools_list}
 
     async def initialize(self) -> bool:
         """Initialize Devin CLI provider."""
-        # Wait for shell prompt to appear in the tmux window
-        if not await wait_for_shell(self.terminal_id, timeout=10.0):
-            raise TimeoutError("Shell initialization timed out after 10 seconds")
+        try:
+            # Wait for shell prompt to appear in the tmux window
+            if not await wait_for_shell(self.terminal_id, timeout=10.0):
+                raise TimeoutError("Shell initialization timed out after 10 seconds")
 
-        command = self._build_command()
-        from cli_agent_orchestrator.backends.registry import get_backend
+            command = self._build_command()
+            from cli_agent_orchestrator.backends.registry import get_backend
 
-        get_backend().send_keys(
-            self.session_name,
-            self.window_name,
-            command,
-            use_paste_buffer=True,  # Use paste-buffer for shell commands
-        )
+            get_backend().send_keys(
+                self.session_name,
+                self.window_name,
+                command,
+                use_paste_buffer=True,  # Use paste-buffer for shell commands
+            )
 
-        if not await wait_until_status(
-            self.terminal_id, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=60.0
-        ):
-            raise TimeoutError("Devin CLI initialization timed out after 60 seconds")
+            if not await wait_until_status(
+                self.terminal_id, {TerminalStatus.IDLE, TerminalStatus.COMPLETED}, timeout=60.0
+            ):
+                raise TimeoutError("Devin CLI initialization timed out after 60 seconds")
 
-        self._initialized = True
-        return True
+            self._initialized = True
+            return True
+        except Exception:
+            # Clean up temp files on failure to prevent credential residue
+            self.cleanup()
+            raise
 
     @staticmethod
     def _is_processing(lines: list[str]) -> bool:
@@ -262,14 +265,6 @@ You are restricted to only use the following tools: {tools_list}
         combined = "\n".join(lines[-50:])
         for pattern in PROCESSING_PATTERNS:
             if re.search(pattern, combined, re.IGNORECASE):
-                return True
-        return False
-
-    @staticmethod
-    def _has_status_bar(lines: list[str]) -> bool:
-        """Return True if the Devin status bar (Mode: ... Model:) is visible."""
-        for line in reversed(lines[-20:]):
-            if re.search(STATUS_BAR_PATTERN, line):
                 return True
         return False
 
@@ -347,7 +342,7 @@ You are restricted to only use the following tools: {tools_list}
         return TerminalStatus.ERROR
 
     def get_idle_pattern_for_log(self) -> str:
-        return IDLE_PROMPT_PATTERN_LOG
+        return IDLE_PROMPT_PATTERN
 
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract agent response between last user-input line and horizontal rule."""
@@ -387,13 +382,4 @@ You are restricted to only use the following tools: {tools_list}
 
     def cleanup(self) -> None:
         """Clean up temp files."""
-        if self._temp_prompt_file:
-            try:
-                Path(self._temp_prompt_file).unlink()
-            except OSError:
-                pass
-        if self._temp_config_file:
-            try:
-                Path(self._temp_config_file).unlink()
-            except OSError:
-                pass
+        self._cleanup_temp_files()

@@ -133,6 +133,7 @@ SOFT_ENFORCEMENT_PROVIDERS = {
     ProviderType.KIMI_CLI.value,
     ProviderType.CODEX.value,
     ProviderType.ANTIGRAVITY_CLI.value,
+    ProviderType.DEVIN_CLI.value,
 }
 
 
