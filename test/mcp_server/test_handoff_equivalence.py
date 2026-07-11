@@ -7,9 +7,13 @@ shared run_agent_step substrate:
   - the handoff path: ``_handoff_impl`` -> ``POST /terminals/run-step`` ->
     ``run_agent_step(...)`` (the MCP client's six-call loop collapsed to one).
 
-Both must produce the same ordered terminal-layer calls (create -> send_input
--> wait COMPLETED -> get_output LAST -> delete). No latency assertion (Q7=A):
-equivalence is proven functionally, not by timing.
+Both must produce the same ordered terminal-layer calls (create -> readiness
+wait -> send_input -> completion poll -> get_output LAST -> delete). No latency
+assertion (Q7=A): equivalence is proven functionally, not by timing.
+
+Completion is a ``status_monitor.get_status`` poll (issue #409a: a post-input
+IDLE is a valid completion signal alongside COMPLETED), NOT a second
+``wait_until_status`` call — the recorder captures that poll as ``"poll"``.
 """
 
 import asyncio
@@ -56,16 +60,19 @@ class _SequenceRecorder:
             self.calls.append(("wait", terminal_id, target))
             return True
 
+        def _poll(terminal_id):
+            # The post-input completion poll (issue #409a). Returns COMPLETED on
+            # the first read so the wait settles immediately.
+            self.calls.append(("poll", terminal_id))
+            return TerminalStatus.COMPLETED
+
         return [
             patch(f"{_STEP}.terminal_service.create_terminal", new=AsyncMock(side_effect=_create)),
             patch(f"{_STEP}.terminal_service.send_input", side_effect=_send),
             patch(f"{_STEP}.terminal_service.get_output", side_effect=_get_output),
             patch(f"{_STEP}.terminal_service.delete_terminal", side_effect=_delete),
             patch(f"{_STEP}.wait_until_status", new=AsyncMock(side_effect=_wait)),
-            patch(
-                f"{_STEP}.status_monitor.get_status",
-                return_value=TerminalStatus.COMPLETED,
-            ),
+            patch(f"{_STEP}.status_monitor.get_status", side_effect=_poll),
         ]
 
     def kinds(self):
@@ -97,7 +104,7 @@ class TestEngineHandoffEquivalence:
             "create",
             "wait",  # readiness
             "send_input",
-            "wait",  # completion
+            "poll",  # completion (status_monitor.get_status; issue #409a)
             "get_output",
             "delete",
         ]
@@ -153,7 +160,7 @@ class TestEngineHandoffEquivalence:
             "create",
             "wait",
             "send_input",
-            "wait",
+            "poll",
             "get_output",
             "delete",
         ]

@@ -475,9 +475,7 @@ def record_step_completion(
             rec = step_output_store.get(run_id, step_id)
             if rec is not None:
                 st.output = rec
-                st.state = (
-                    StepState.COMPLETED if rec.validated else StepState.COMPLETED_UNVALIDATED
-                )
+                st.state = StepState.COMPLETED if rec.validated else StepState.COMPLETED_UNVALIDATED
             else:
                 st.state = StepState.COMPLETED
             st.error = None

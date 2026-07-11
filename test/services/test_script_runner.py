@@ -847,15 +847,11 @@ def test_completion_guard_none_without_script_record():
     record -> None (YAML/handoff callers untouched)."""
     assert record_step_completion(None, provider="p", agent="a", prompt="x") is None
     assert (
-        record_step_completion(
-            {"CAO_WORKFLOW_RUN_ID": "x"}, provider="p", agent="a", prompt="x"
-        )
+        record_step_completion({"CAO_WORKFLOW_RUN_ID": "x"}, provider="p", agent="a", prompt="x")
         is None
     )
     # run/step present but no record in the registry.
-    assert (
-        record_step_completion(_kw("ghost", "s1"), provider="p", agent="a", prompt="x") is None
-    )
+    assert record_step_completion(_kw("ghost", "s1"), provider="p", agent="a", prompt="x") is None
 
 
 def test_completion_transitions_running_to_completed(_patched_journal):
@@ -869,7 +865,9 @@ def test_completion_transitions_running_to_completed(_patched_journal):
     )
     workflow_service.run_registry["run-c"] = record
 
-    settle = record_step_completion(_kw("run-c", "s1"), provider="kiro_cli", agent="dev", prompt="go")
+    settle = record_step_completion(
+        _kw("run-c", "s1"), provider="kiro_cli", agent="dev", prompt="go"
+    )
     assert settle is not None
     settle("term-1", None)
 
@@ -923,7 +921,10 @@ def test_completion_unvalidated_output_settles_completed_unvalidated(_patched_jo
     workflow_service.run_registry["run-inv"] = record
     # Output fails its schema -> validated=False, state COMPLETED_UNVALIDATED.
     record_step_output(
-        "run-inv", "s1", {"answer": "not-an-int"}, {"type": "object", "properties": {"answer": {"type": "integer"}}, "required": ["answer"]}
+        "run-inv",
+        "s1",
+        {"answer": "not-an-int"},
+        {"type": "object", "properties": {"answer": {"type": "integer"}}, "required": ["answer"]},
     )
 
     settle = record_step_completion(_kw("run-inv", "s1"), provider="p", agent="a", prompt="go")

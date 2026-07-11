@@ -172,8 +172,10 @@ async def create_terminal(
             ``new_session=True``, these are stored on the session record and
             inherited by every worker spawned later in the same session. On
             ``new_session=False``, the persisted session vars are merged in
-            automatically; the explicit ``env_vars`` argument is ignored to
-            keep the per-session view consistent. See issue #248.
+            automatically and the explicit ``env_vars`` argument is merged on
+            top, winning on key conflict — per-step vars (e.g. workflow
+            routing ids) must reach the window even inside an existing
+            session. See issues #248 and #408.
         caller_id: Terminal ID of the supervisor that created this terminal
             via handoff/assign. Recorded so send_message can route callbacks
             structurally instead of parsing IDs out of message text (issue #284).
@@ -229,12 +231,16 @@ async def create_terminal(
             # Add window to existing session
             if not get_backend().session_exists(session_name):
                 raise ValueError(f"Session '{session_name}' not found")
+            # Merge explicit per-step env_vars over the persisted session env
+            # (per-step wins on conflict): workflow routing ids like
+            # CAO_WORKFLOW_RUN_ID must reach the window even when it joins an
+            # existing session (issue #408).
             window_name = get_backend().create_window(
                 session_name,
                 window_name,
                 terminal_id,
                 working_directory,
-                extra_env=get_session_env(session_name),
+                extra_env={**get_session_env(session_name), **(env_vars or {})},
             )
 
         # Step 3: Load the profile once for allowed tool resolution before

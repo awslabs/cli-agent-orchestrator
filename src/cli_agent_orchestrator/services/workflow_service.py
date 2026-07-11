@@ -55,7 +55,11 @@ from cli_agent_orchestrator.models.workflow_runtime import (
     WorkflowRunResult,
 )
 from cli_agent_orchestrator.services import workflow_journal
-from cli_agent_orchestrator.services.agent_step import StepExecutionError, run_agent_step
+from cli_agent_orchestrator.services.agent_step import (
+    StepCancelledError,
+    StepExecutionError,
+    run_agent_step,
+)
 from cli_agent_orchestrator.services.step_output_store import (
     _validate_key_part,
     step_output_store,
@@ -155,6 +159,13 @@ class RunRecord:
     step_states: Dict[str, StepRunState] = field(default_factory=dict)
     started_at: str = ""
     finished_at: Optional[str] = None
+    # Set by cancel_run to interrupt the CURRENTLY in-flight step wait (issue
+    # #409b). Without it, cancel was only observed at the NEXT step boundary — so
+    # exactly the runs hung inside a long/never-settling step wait (the codex-IDLE
+    # case #409a targets) could not be cancelled at all. ``asyncio.Event`` is
+    # constructed here; it binds to the running loop lazily on first await, so
+    # building a RunRecord outside a loop (unit tests) is safe.
+    cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 # Process-local run registry (ADR-8, B3-LC-2 singleton). A process restart loses
@@ -511,6 +522,7 @@ async def _collect_structured_output(record: RunRecord, step: WorkflowStep) -> S
                 "CAO_WORKFLOW_RUN_ID": record.run_id,
                 "CAO_WORKFLOW_STEP_ID": step.id,
             },
+            cancel_event=record.cancel_event,
         )
         st.terminal_id = result.terminal_id
         rec = step_output_store.get(record.run_id, step.id)
@@ -563,12 +575,31 @@ async def _run_step(record: RunRecord, step: WorkflowStep) -> None:
                     "CAO_WORKFLOW_RUN_ID": record.run_id,
                     "CAO_WORKFLOW_STEP_ID": step.id,
                 },
+                cancel_event=record.cancel_event,
             )
             st.terminal_id = result.terminal_id
             # Resolve the structured return INSIDE the try so a crash during the
             # reprompt (§3 re-raises StepExecutionError) is caught below and
             # consumes an attempt (Q6=A, Trace C).
             outcome = await _collect_structured_output(record, step)
+        except StepCancelledError as exc:
+            # An in-flight cancel (#409b) is NOT a run-failure: do NOT consume the
+            # rest of the retry budget and do NOT mark the step FAILED. Settle the
+            # interrupted step SKIPPED (its work is abandoned; there is no
+            # CANCELLED step state, and leaving it RUNNING would reproduce exactly
+            # the stuck-`running` smell #409 targets). Then return so the drive
+            # loop converges the run to CANCELLED. The interrupted step already
+            # self-tore-down its own terminal inside run_agent_step.
+            if exc.terminal_id is not None:
+                st.terminal_id = exc.terminal_id
+            st.state = StepState.SKIPPED
+            await _ajournal(_journal_step, record, step.id)
+            logger.info(
+                "run '%s' step '%s' wait interrupted by cancel; converging CANCELLED",
+                record.run_id,
+                step.id,
+            )
+            return
         except StepExecutionError as exc:
             st.error = str(exc)
             if exc.terminal_id is not None:
@@ -679,7 +710,14 @@ async def _drive(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunRes
         logger.error("drive: run '%s' failed with an engine error", record.run_id)
         raise
 
-    # Finalize.
+    # Finalize. A cancel that interrupted the FINAL (or only) step's in-flight
+    # wait (#409b) leaves the loop with no further boundary iteration to observe
+    # ``record.cancelled`` — converge to CANCELLED here so the run never settles
+    # COMPLETED after being cancelled. Any still-PENDING steps (none, for a
+    # last-step cancel) are marked SKIPPED for consistency with the boundary path.
+    if record.cancelled and record.state not in (RunState.FAILED, RunState.CANCELLED):
+        await _skip_remaining(record, order, from_index=0)
+        record.state = RunState.CANCELLED
     if record.state not in (RunState.FAILED, RunState.CANCELLED):
         record.state = RunState.COMPLETED
     record.current_step_id = None
@@ -790,11 +828,16 @@ async def start_run(spec: WorkflowSpec, inputs: Dict[str, Any], run_id: str) -> 
 def cancel_run(run_id: str) -> None:
     """Cooperatively cancel a running workflow (§5, B3-BR-7).
 
-    Sets the ``cancelled`` flag; the engine observes it at the NEXT step boundary
-    (the in-flight step runs to natural completion and self-tears-down its own
-    terminal). Never raises into the engine/worker path. Raises ``KeyError`` (->
-    404) for an unknown run and ``ValueError`` (-> 409) for a run already in a
-    terminal state.
+    Sets the ``cancelled`` flag AND fires ``cancel_event`` so the engine interrupts
+    the CURRENTLY in-flight step wait (issue #409b) rather than observing the cancel
+    only at the next step boundary — that boundary-only behavior meant a run hung
+    inside a long or never-settling step wait (the codex-IDLE case #409a addresses)
+    could never converge to CANCELLED. The interrupted step tears down its own
+    terminal; the drive loop then settles the run CANCELLED.
+
+    Idempotent (setting an already-set Event is a no-op), never raises into the
+    engine/worker path. Raises ``KeyError`` (-> 404) for an unknown run and
+    ``ValueError`` (-> 409) for a run already in a terminal state.
     """
     record = run_registry.get(run_id)
     if record is None:
@@ -802,9 +845,11 @@ def cancel_run(run_id: str) -> None:
     if record.state in (RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED):
         raise ValueError(f"run '{run_id}' is already {record.state.value}; cannot cancel")
     record.cancelled = True
-    # Best-effort: there is no separate live terminal for cancel to tear down (the
-    # running step owns and releases its own). Any future best-effort cleanup must
-    # be wrapped + logged and must never raise into this path.
+    # Interrupt any in-flight step wait immediately (#409b). Guard the attribute
+    # for records rebuilt from an older journal shape that predates the field.
+    cancel_event = getattr(record, "cancel_event", None)
+    if cancel_event is not None:
+        cancel_event.set()
     logger.info("cancel_run: run '%s' flagged for cooperative cancel", run_id)
 
 
