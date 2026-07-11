@@ -804,6 +804,11 @@ class MemoryService:
             # AND merges) or a value older than the topic's latest section
             # is clamped to now(), with provenance preserved as a first
             # body line. occurred_at=None keeps the pre-#345 bytes exactly.
+            # Reject credential-like content before any plaintext persistence.
+            # This prevents cleartext-at-rest of likely secrets across all scopes.
+            if self.scan_for_secrets(content):
+                raise ValueError("Memory content appears to contain sensitive credentials and was rejected.")
+
             entry_body = content
             if occurred_at is not None:
                 if self._occurred_at_would_clamp(occurred_at, latest_section_at, now):
@@ -829,20 +834,9 @@ class MemoryService:
             # This is always the immediate, durable result of store(). LLM
             # compaction (below) is deferred and rewrites the file later.
             #
-            # CodeQL note (py/clear-text-storage-sensitive-data): this write is
-            # flagged only because ``new_content`` embeds the topic ``key`` and
-            # CodeQL's name-based heuristic classifies any variable named
-            # ``key`` as a secret. It is a FALSE POSITIVE, not a leak: ``key``
-            # is a user-authored topic slug (see ``_sanitize_key``), never a
-            # credential. The memory wiki is intentionally human-readable
-            # plaintext markdown — that is the product contract, and encrypting
-            # it would defeat the feature (agents and humans read these files
-            # directly). No secret is persisted here. Dismiss the alert as
-            # "won't fix / by-design" in the Security tab with this rationale;
-            # do NOT add encryption. As an additional safeguard, content
-            # written to the machine-wide federated tier is screened by the
-            # secret gate (``scan_for_secrets``) earlier in ``store()`` and
-            # rejected if it matches a credential pattern.
+            # Plaintext wiki storage is intentional for product usability, but
+            # `store()` now rejects credential-like content via `scan_for_secrets`
+            # before reaching this write path.
             tmp_path = wiki_path.parent / f".{wiki_path.stem}.tmp"
             tmp_path.write_text(new_content, encoding="utf-8")
             os.replace(str(tmp_path), str(wiki_path))

@@ -1383,20 +1383,20 @@ class TestFederatedScope:
         assert not wiki.exists()
         assert _fed_row(engine, "fed-secret") is None
 
-    def test_same_secret_content_allowed_at_global_scope(self, tmp_path: Path):
-        """The gate is federated-only: identical AKIA-bearing content stores
-        fine at scope=global.
-        """
+    def test_same_secret_content_rejected_at_global_scope(self, tmp_path: Path):
+        """Credential-like content is rejected for global scope as well."""
         svc = MemoryService(base_dir=tmp_path)
         ctx = _make_terminal_context()
         secret = "deploy creds AKIAIOSFODNN7EXAMPLE here"
-        mem = _run(
-            svc.store(
-                content=secret,
-                scope="global",
-                memory_type="reference",
-                key="glob-secret-ok",
-                terminal_context=ctx,
+        with pytest.raises(ValueError):
+            _run(
+                svc.store(
+                    content=secret,
+                    scope="global",
+                    memory_type="reference",
+                    key="glob-secret-ok",
+                    terminal_context=ctx,
+                )
             )
-        )
-        assert Path(mem.file_path).exists()
+        wiki = tmp_path / "global" / "wiki" / "global" / "glob-secret-ok.md"
+        assert not wiki.exists()
