@@ -275,6 +275,45 @@ def test_mcp_registration_writes_config(tmp_path, monkeypatch):
         assert "cao-mcp-server" not in data2.get("mcpServers", {})
 
 
+def test_mcp_registration_resolves_bundled_command(tmp_path, monkeypatch):
+    """The bundled bare `cao-mcp-server` command is resolved to a PATH-
+    independent invocation before it is written to mcp_config.json. agy reads
+    that file at a later launch (persisted=True), so the stable PATH launcher
+    is preferred over the versioned interpreter-sibling path."""
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+    cfg = tmp_path / "mcp_config.json"
+    profile = AgentProfile(
+        name="reviewer_gemini",
+        description="Reviewer",
+        system_prompt="You review code.",
+        mcpServers={"cao-mcp-server": {"command": "cao-mcp-server", "args": []}},
+    )
+    p = make_provider(agent_profile="reviewer_gemini")
+    MOD = "cli_agent_orchestrator.utils.mcp_resolution"
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+            return_value="/usr/local/bin/agy",
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.load_agent_profile",
+            return_value=profile,
+        ),
+        patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg),
+        patch(f"{MOD}._sibling_script", return_value="/versioned/venv/bin/cao-mcp-server"),
+        patch(f"{MOD}.shutil.which", return_value="/home/u/.local/bin/cao-mcp-server"),
+    ):
+        p._build_agy_command()
+        import json
+
+        entry = json.loads(cfg.read_text())["mcpServers"]["cao-mcp-server"]
+        # persisted=True prefers the stable PATH launcher, not the bare command
+        # or the versioned sibling.
+        assert entry["command"] == "/home/u/.local/bin/cao-mcp-server"
+        assert entry["args"] == []
+
+
 # --------------------------------------------------------------------------- #
 # Misc lifecycle
 # --------------------------------------------------------------------------- #

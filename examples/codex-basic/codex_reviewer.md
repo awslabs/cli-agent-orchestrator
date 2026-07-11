@@ -6,11 +6,8 @@ role: reviewer  # @builtin, fs_read, fs_list, @cao-mcp-server. For fine-grained 
 mcpServers:
   cao-mcp-server:
     type: stdio
-    command: uvx
-    args:
-      - "--from"
-      - "git+https://github.com/awslabs/cli-agent-orchestrator.git@main"
-      - "cao-mcp-server"
+    command: cao-mcp-server
+    args: []
 
 skills: [code-review, security-audit, performance-analysis, best-practices, testing-strategies, documentation-review]
 experience_level: senior

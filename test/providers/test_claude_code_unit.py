@@ -1145,6 +1145,31 @@ class TestClaudeCodeProviderMisc:
         assert server_env["CAO_TERMINAL_ID"] == "term-42"
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_build_command_resolves_bundled_mcp_command(self, mock_load):
+        """The bare cao-mcp-server command is resolved to a PATH-independent
+        invocation in the written MCP config (wiring guard: a refactor that
+        drops the resolve_mcp_server_config call must fail this test)."""
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = {
+            "cao-mcp-server": {"type": "stdio", "command": "cao-mcp-server", "args": []}
+        }
+        mock_profile.permissionMode = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("term-43", "test-session", "window-0", "test-agent")
+        MOD = "cli_agent_orchestrator.utils.mcp_resolution"
+        with (
+            patch(f"{MOD}._sibling_script", return_value="/venv/bin/cao-mcp-server"),
+            patch(f"{MOD}.shutil.which", return_value=None),
+        ):
+            command = provider._build_claude_command()
+
+        mcp_data = _extract_mcp_config(command)
+        assert mcp_data["mcpServers"]["cao-mcp-server"]["command"] == "/venv/bin/cao-mcp-server"
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     def test_build_command_mcp_preserves_existing_env(self, mock_load):
         """Test that existing env vars in MCP config are preserved when injecting CAO_TERMINAL_ID."""
         mock_profile = MagicMock()
@@ -1673,3 +1698,175 @@ class TestClaudeCodeScreenDetection:
 
     def test_empty_screen_is_unknown(self):
         assert self._p().get_status_from_screen(["", "", ""]) == TerminalStatus.UNKNOWN
+
+
+class TestClaudeCodeBackgroundTaskNotCompleted:
+    """A backgrounded task must not read as COMPLETED (GH #392).
+
+    Real failure (first observed live on the Runs dashboard): a code_supervisor
+    launched its own backgrounded Workflow. The TUI printed the turn's text
+    response, showed an EMPTY idle ❯ box, and rendered
+    "✻ Waiting for 1 dynamic workflow to finish" above it — while the status
+    bar read "2/3 agents done". That line has no spinner ellipsis (invisible to
+    every PROCESSING check) and even matches the lenient completion pattern
+    ("✻ Waiting *for* 1 …"), so the frame read COMPLETED, the ready-latch
+    pinned it, and the dashboard showed the run as Done mid-execution.
+    """
+
+    BOX = "─" * 30
+
+    def _p(self):
+        return ClaudeCodeProvider("test123", "test-session", "window-0")
+
+    def _wait_frame(self) -> str:
+        """The exact live-frame shape from the GH #392 report."""
+        return (
+            "● Workflow(Developer agent builds a todo app; Reviewer verifies)\n"
+            "  ⎿  Running in background · /workflows to monitor and save\n"
+            "● The build is now running in the background. Here's what's happening:\n"
+            "  1. Developer agent is building a single-file todo app\n"
+            "  2. Code Reviewer agent then verifies every criterion\n"
+            "✻ Waiting for 1 dynamic workflow to finish\n"
+            + self.BOX
+            + "\n❯ \n"
+            + self.BOX
+            + "\n  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+        )
+
+    def test_background_wait_frame_is_processing(self):
+        assert self._p().get_status(self._wait_frame()) == TerminalStatus.PROCESSING
+
+    def test_finished_after_background_wait_is_completed(self):
+        """Once the workflow finishes, a fresh response + real completion
+        summary render BELOW the (now stale, still-in-rolling-buffer) wait
+        line — the wait line must not pin PROCESSING."""
+        output = (
+            self._wait_frame()
+            + "● All 12 acceptance criteria pass — here is the artifact link.\n"
+            + "✻ Baked for 7m 48s\n"
+            + self.BOX
+            + "\n❯ \n"
+            + self.BOX
+            + "\n  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+        )
+        assert self._p().get_status(output) == TerminalStatus.COMPLETED
+
+    def test_wait_line_after_last_separator_is_not_a_completion_summary(self):
+        """Boxless-repaint variant: the wait line lands AFTER the last
+        separator, where the lenient glyph+"for" completion match would
+        otherwise count it as a finished-turn summary."""
+        output = (
+            "● Kicking the workflow off now.\n"
+            + self.BOX
+            + "\n❯ \n"
+            + self.BOX
+            + "\n✻ Waiting for 1 dynamic workflow to finish\n"
+        )
+        assert self._p().get_status(output) == TerminalStatus.PROCESSING
+
+    def test_screen_background_wait_is_processing(self):
+        screen = [
+            "● The build is now running in the background.",
+            "✻ Waiting for 1 dynamic workflow to finish",
+            "─" * 60,
+            "❯",
+            "─" * 60,
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+        ]
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.PROCESSING
+
+    def test_screen_finished_frame_is_completed(self):
+        """The finished repaint no longer shows the wait line — composited
+        screens carry only live content, so COMPLETED resumes normally."""
+        screen = [
+            "● All 12 acceptance criteria pass — artifact link below.",
+            "✻ Baked for 7m 48s",
+            "─" * 60,
+            "❯",
+            "─" * 60,
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+        ]
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.COMPLETED
+
+
+class TestBackgroundWaitReviewHardening:
+    """Round-2 review of PR #393: the wait-line match must not over-reach.
+
+    The original pattern's glyph class included the markdown bullets ·/* with
+    no line anchor or tail restriction, so a settled response containing
+    "* Waiting for review" pinned the terminal at PROCESSING (denial of
+    progress via the ready-latch), and the screen path checked the wait line
+    BEFORE the permission-prompt footer, masking a security-relevant
+    WAITING_USER_ANSWER as "working". Both were confirmed by probe before the
+    fix; these tests pin the hardened behavior.
+    """
+
+    BOX = "─" * 30
+
+    def _p(self):
+        return ClaudeCodeProvider("test123", "test-session", "window-0")
+
+    def test_markdown_bullet_wait_text_is_completed_not_pinned(self):
+        """Reviewer probe 1: '* Waiting for review' in a settled response body
+        must read COMPLETED — no tail keyword, so the pattern cannot match."""
+        output = (
+            "● Review checklist posted.\n"
+            "* Waiting for review\n"
+            "· Waiting for approval\n"
+            + self.BOX
+            + "\n❯ \n"
+            + self.BOX
+            + "\n  ⏵⏵ bypass permissions on\n"
+        )
+        assert self._p().get_status(output) == TerminalStatus.COMPLETED
+
+    def test_screen_markdown_bullet_is_completed(self):
+        screen = [
+            "● Review checklist posted.",
+            "* Waiting for review",
+            "─" * 60,
+            "❯",
+            "─" * 60,
+        ]
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.COMPLETED
+
+    def test_middle_dot_glyph_wait_frame_is_processing(self):
+        """The TUI cycles the glyph through '· ✢ * ✶ ✻ ✽' — a ·-glyph frame of
+        the REAL wait line (tail keyword present) must still read PROCESSING,
+        or one missed frame would false-COMPLETE and re-latch GH #392."""
+        output = (
+            "● Kicking the workflow off now.\n"
+            "· Waiting for 1 dynamic workflow to finish\n"
+            + self.BOX
+            + "\n❯ \n"
+            + self.BOX
+            + "\n  ⏵⏵ bypass permissions on\n"
+        )
+        assert self._p().get_status(output) == TerminalStatus.PROCESSING
+
+    def test_screen_permission_prompt_wins_over_background_wait(self):
+        """Reviewer probe 2: a permission prompt co-rendering with the wait
+        line is a security gate — WAITING_USER_ANSWER must win."""
+        screen = [
+            "✻ Waiting for 1 dynamic workflow to finish",
+            "Do you want to allow this tool?",
+            "❯ 1. Yes",
+            "  2. No, and tell Claude what to do differently",
+            "  ↑/↓ to navigate · Enter to select",
+        ]
+        assert self._p().get_status_from_screen(screen) == TerminalStatus.WAITING_USER_ANSWER
+
+    def test_wait_text_outside_tail_region_is_completed(self):
+        """A wait-shaped line buried >20 lines above the buffer end (old
+        response text) is outside the live-region restriction."""
+        filler = "\n".join(f"  step {i} done" for i in range(25))
+        output = (
+            "✻ Waiting for 1 dynamic workflow to finish\n"
+            + filler
+            + "\n● All finished, results above.\n"
+            + self.BOX
+            + "\n❯ \n"
+            + self.BOX
+            + "\n  ⏵⏵ bypass permissions on\n"
+        )
+        assert self._p().get_status(output) == TerminalStatus.COMPLETED

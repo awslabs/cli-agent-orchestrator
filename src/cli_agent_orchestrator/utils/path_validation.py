@@ -8,6 +8,7 @@ must-exist, directory-only settings.
 """
 
 import os
+import re
 
 # Paths that should never be used as working directories or archive
 # targets. Prevents user-supplied paths from pointing at sensitive system
@@ -120,4 +121,89 @@ def resolve_and_validate_path(
         )
     if not os.path.isdir(ancestor_real):
         raise ValueError(f"{description} has no existing ancestor directory: {path}")
+    return real_path
+
+
+# ── component-under-base confinement (memory wiki paths) ─────────────
+#
+# ``resolve_and_validate_path`` above validates *absolute* user paths with a
+# blocked-system-directory policy. The memory subsystem has a different
+# shape: it composes filesystem paths out of individual, user-derived
+# *segments* (``key``, ``scope``, ``scope_id``) under a fixed base
+# directory. The safe primitive there is strict per-segment validation plus
+# realpath containment under the base, so the two helpers below are kept
+# distinct from the absolute-path validator.
+
+# A single safe path segment: strict allowlist, no separators, no traversal.
+_SAFE_PATH_COMPONENT_RE = re.compile(r"\A[A-Za-z0-9._-]+\Z")
+
+
+def validate_path_component(component: str, description: str = "path component") -> str:
+    """Validate that ``component`` is a single, safe path segment.
+
+    A path segment is rejected when it is empty, equals ``.`` or ``..``,
+    contains a NUL byte, contains any path separator (``/``, ``\\``,
+    ``os.sep``, or ``os.altsep``), or falls outside the strict
+    ``[A-Za-z0-9._-]`` allowlist. Any of these could let a user-derived
+    value escape its intended parent directory when joined into a path.
+
+    Returns the component unchanged when valid, so callers may assign the
+    return value and let static analysis (CodeQL) see the checked value
+    flow into subsequent path construction.
+
+    Raises:
+        ValueError: If the component is not a safe single path segment.
+    """
+    if not isinstance(component, str) or not component:
+        raise ValueError(f"{description} must be a non-empty string")
+    if component in (".", ".."):
+        raise ValueError(f"{description} must not be '.' or '..': {component!r}")
+    if "\x00" in component:
+        raise ValueError(f"{description} must not contain a NUL byte: {component!r}")
+    separators = {"/", "\\", os.sep}
+    if os.altsep:
+        separators.add(os.altsep)
+    if any(sep in component for sep in separators):
+        raise ValueError(f"{description} must not contain a path separator: {component!r}")
+    if not _SAFE_PATH_COMPONENT_RE.match(component):
+        raise ValueError(f"{description} must match ^[A-Za-z0-9._-]+$: {component!r}")
+    return component
+
+
+def safe_join_under_base(
+    base_dir: str,
+    *components: str,
+    description: str = "path component",
+) -> str:
+    """Validate each segment and join it under ``base_dir``, confined to it.
+
+    Each element of ``components`` is checked with
+    :func:`validate_path_component`, then joined under the
+    realpath-canonicalized base directory. The joined path is canonicalized
+    again with ``os.path.realpath`` (recognized by CodeQL as a
+    PathNormalization) and an explicit containment guard rejects any result
+    that is not the base itself or a descendant of it — satisfying CodeQL's
+    two-state taint model for path injection while providing a genuine
+    traversal defence.
+
+    Args:
+        base_dir: The trusted base directory the result must stay under.
+        components: User-derived path segments to validate and join.
+        description: Noun used in per-segment error messages.
+
+    Returns:
+        The canonicalized absolute path, guaranteed to be within ``base_dir``.
+
+    Raises:
+        ValueError: If any segment is unsafe or the joined path escapes the
+            base directory.
+    """
+    base_real = os.path.realpath(os.path.abspath(base_dir))
+    validated = [validate_path_component(c, description) for c in components]
+    candidate = os.path.join(base_real, *validated)
+    real_path = os.path.realpath(os.path.abspath(candidate))
+    if real_path != base_real and not real_path.startswith(base_real + os.sep):
+        raise ValueError(
+            f"Path traversal detected: {real_path!r} escapes base directory {base_real!r}"
+        )
     return real_path

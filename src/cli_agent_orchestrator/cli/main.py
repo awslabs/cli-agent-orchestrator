@@ -12,6 +12,7 @@ from cli_agent_orchestrator.cli.commands.install import install
 from cli_agent_orchestrator.cli.commands.launch import launch
 from cli_agent_orchestrator.cli.commands.mcp_server import mcp_server
 from cli_agent_orchestrator.cli.commands.memory import memory
+from cli_agent_orchestrator.cli.commands.profile import profile
 from cli_agent_orchestrator.cli.commands.schedule import flow, schedule
 from cli_agent_orchestrator.cli.commands.session import session
 from cli_agent_orchestrator.cli.commands.shutdown import shutdown
@@ -32,6 +33,7 @@ def cli():
 
 
 # Register commands
+cli.add_command(profile)
 cli.add_command(launch)
 cli.add_command(config)
 cli.add_command(init)

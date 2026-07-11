@@ -15,6 +15,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
@@ -84,6 +85,32 @@ COMPLETION_SUMMARY_PATTERN = r"[✶✢✽✻✳][^\n…]*\bfor\s+\d+(?:\.\d+)?\s
 # stat lines), and only ever turns IDLE/PROCESSING into COMPLETED — the safe
 # direction — and only after the live-spinner PROCESSING checks have passed.
 GET_STATUS_COMPLETION_PATTERN = r"[✶✢✽✻✳][^\n…]*\bfor\b"
+# Background-task wait line, e.g. "✻ Waiting for 1 dynamic workflow to finish".
+# The newest TUI renders this while a backgrounded task (Workflow tool, bash
+# task) keeps running AFTER the turn's text response has printed and the input
+# box is already idle — the terminal looks "finished" (response + empty ❯ box)
+# except for this one line. It carries NO ellipsis, so every spinner-based
+# PROCESSING check misses it, and it satisfies GET_STATUS_COMPLETION_PATTERN's
+# lenient glyph+"for" match ("✻ Waiting *for* 1 …"), so without special
+# handling the whole frame reads COMPLETED while work continues (GH #392:
+# the Runs board showed "Done" with the TUI footer at "2/3 agents done").
+#
+# Match shape (review-hardened, PR #393):
+# - Start-of-line anchor + a REQUIRED tail keyword (workflow/task/background/
+#   "to finish"), so a markdown bullet in a settled response body
+#   ("* Waiting for review") can never match — an over-match here pins the
+#   terminal at PROCESSING via the ready-latch (denial-of-progress).
+# - The glyph class DELIBERATELY keeps "·" and "*", unlike
+#   GET_STATUS_COMPLETION_PATTERN: the TUI cycles the glyph through
+#   "· ✢ * ✶ ✻ ✽", and a single missed frame here would false-COMPLETE and
+#   latch (the exact #392 bug) — the tail keywords carry the disambiguation
+#   the completion pattern gets from excluding those glyphs.
+# - "\xa0" is allowed as the gap, matching IDLE_PROMPT_PATTERN's handling of
+#   the TUI's non-breaking-space rendering.
+BACKGROUND_WAIT_PATTERN = re.compile(
+    r"(?m)^[ \t\xa0]*[✶✢✽✻✳·*][ \t\xa0]+Waiting for\b"
+    r"(?=[^\n]*\b(?:workflows?|tasks?|to finish|background)\b)"
+)
 # The newest Claude Code TUI renders the ❯ input prompt BOXED between two
 # horizontal separator lines (the older TUI used a single separator ABOVE ❯).
 # Detecting this box GATES the new-TUI status logic so legacy output is
@@ -224,6 +251,10 @@ class ClaudeCodeProvider(BaseProvider):
                         mcp_config[server_name] = dict(server_config)
                     else:
                         mcp_config[server_name] = server_config.model_dump(exclude_none=True)
+
+                    # Resolve the bundled cao-mcp-server console script to a
+                    # PATH-independent invocation.
+                    mcp_config[server_name] = resolve_mcp_server_config(mcp_config[server_name])
 
                     env = mcp_config[server_name].get("env", {})
                     if "CAO_TERMINAL_ID" not in env:
@@ -466,6 +497,8 @@ class ClaudeCodeProvider(BaseProvider):
             _tail = output[_sep_positions[-1] :]
             _last_summary = None
             for _m in re.finditer(GET_STATUS_COMPLETION_PATTERN, _tail):
+                if "Waiting" in _m.group(0):
+                    continue  # background-wait line, not a completion summary (GH #392)
                 _last_summary = _m
             # The summary only marks the turn finished if no LIVE spinner
             # renders after it. Claude prints interim summaries mid-turn
@@ -505,6 +538,8 @@ class ClaudeCodeProvider(BaseProvider):
         # after a finished turn.
         last_completion = None
         for m in re.finditer(GET_STATUS_COMPLETION_PATTERN, output):
+            if "Waiting" in m.group(0):
+                continue  # background-wait line, not a completion summary (GH #392)
             last_completion = m
 
         # FALLBACK PROCESSING: spinner visible AND no separator follows it yet
@@ -564,6 +599,31 @@ class ClaudeCodeProvider(BaseProvider):
         last_sol_response = None
         for m in re.finditer(EXTRACTION_RESPONSE_PATTERN, output):
             last_sol_response = m
+
+        # BACKGROUND TASK still running (GH #392): the newest TUI prints the
+        # turn's text response, shows an idle ❯ box, and renders
+        # "✻ Waiting for N dynamic workflow(s) to finish" — a frame that looks
+        # COMPLETED to the signature check below while work continues. Two
+        # containment guards (review-hardened):
+        # 1. Region: the live wait line renders just above the input box, i.e.
+        #    within the last few lines of the rolling buffer — restrict the
+        #    match to the buffer's final 20 lines so response-body text higher
+        #    up can never trigger it.
+        # 2. Recency: honor the wait line only while it is the NEWEST activity
+        #    marker — once the task finishes, Claude prints a fresh response
+        #    and/or completion summary BELOW it, re-enabling the normal
+        #    COMPLETED path (a stale wait line can never pin PROCESSING).
+        tail_region_start = len(output) - len("\n".join(output.split("\n")[-20:]))
+        last_bg_wait = None
+        for m in BACKGROUND_WAIT_PATTERN.finditer(output, tail_region_start):
+            last_bg_wait = m
+        if last_bg_wait is not None and not any(
+            marker.start() > last_bg_wait.start()
+            for marker in (last_completion, last_response, last_sol_response)
+            if marker is not None
+        ):
+            return TerminalStatus.PROCESSING
+
         if last_idle is not None and (
             last_completion is not None
             or last_sol_response is not None
@@ -628,6 +688,19 @@ class ClaudeCodeProvider(BaseProvider):
             and not re.search(BYPASS_PROMPT_PATTERN, joined)
         ):
             return TerminalStatus.WAITING_USER_ANSWER
+
+        # Background task still running (GH #392): "✻ Waiting for N dynamic
+        # workflow(s)…" has no spinner ellipsis, so the spinner check above
+        # misses it, while the response + boxed-prompt signature below would
+        # read COMPLETED. Checked AFTER the Ink selection footer on purpose: a
+        # permission prompt co-rendering with a wait line must surface as
+        # WAITING_USER_ANSWER (a security gate the user has to answer), never
+        # be masked as "working" — mirrors the raw path's precedence. The
+        # composited screen shows only LIVE content — the line disappears on
+        # the finished repaint — so presence in the bottom region is a safe
+        # PROCESSING signal (no staleness risk, unlike the raw buffer path).
+        if any(BACKGROUND_WAIT_PATTERN.search(ln) for ln in bottom):
+            return TerminalStatus.PROCESSING
 
         # Real input box: a prompt line with a "────" rail BOTH within 2 rows
         # above AND within 2 rows below — the "──── / ❯ / ────" box Claude pins

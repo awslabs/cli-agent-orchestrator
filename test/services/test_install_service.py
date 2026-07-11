@@ -226,6 +226,43 @@ class TestInstallAgent:
         assert kiro_config["name"] == "developer"
         assert kiro_config["mcpServers"]["service"]["env"]["API_TOKEN"] == "secret-token"
 
+    def test_install_kiro_resolves_bundled_mcp_command_persisted(
+        self, install_paths: dict[str, Path]
+    ) -> None:
+        """The bare cao-mcp-server command in a profile is resolved with
+        persisted=True (PATH launcher preferred over the versioned venv
+        sibling) in the written Kiro agent JSON — the config is consumed
+        verbatim by kiro at later launches, so resolution must happen here.
+        Wiring guard: dropping the resolve call in install_agent fails this."""
+        profile_text = (
+            "---\n"
+            "name: cao-agent\n"
+            "description: Test agent\n"
+            "role: developer\n"
+            "mcpServers:\n"
+            "  cao-mcp-server:\n"
+            "    command: cao-mcp-server\n"
+            "    args: []\n"
+            "prompt: |\n  Do work\n"
+            "---\n"
+            "Body.\n"
+        )
+        local_profile = install_paths["local_store_dir"] / "cao-agent.md"
+        local_profile.write_text(profile_text, encoding="utf-8")
+
+        MOD = "cli_agent_orchestrator.utils.mcp_resolution"
+        with (
+            patch(f"{MOD}._sibling_script", return_value="/versioned/venv/bin/cao-mcp-server"),
+            patch(f"{MOD}.shutil.which", return_value="/home/u/.local/bin/cao-mcp-server"),
+        ):
+            result = install_agent("cao-agent", "kiro_cli")
+
+        assert result.success is True
+        kiro_config = json.loads((install_paths["kiro_dir"] / "cao-agent.json").read_text())
+        entry = kiro_config["mcpServers"]["cao-mcp-server"]
+        # persisted=True prefers the stable PATH launcher.
+        assert entry["command"] == "/home/u/.local/bin/cao-mcp-server"
+
     def test_install_sets_env_vars_before_profile_loading(
         self, install_paths: dict[str, Path]
     ) -> None:
@@ -816,6 +853,36 @@ class TestInjectKiroMcpTimeout:
         )
 
         servers = {"orchestrator": {"command": "uvx", "args": ["--from", "x", "cao-mcp-server"]}}
+        out = _inject_kiro_mcp_timeout(servers)
+        assert out["orchestrator"]["timeout"] == _KIRO_MCP_TOOL_TIMEOUT_MS
+
+    def test_detects_cao_by_command_even_with_different_key(self):
+        from cli_agent_orchestrator.services.install_service import (
+            _KIRO_MCP_TOOL_TIMEOUT_MS,
+            _inject_kiro_mcp_timeout,
+        )
+
+        # Bare console script (bundled profile form) and a resolved absolute
+        # path (what resolve_mcp_server_config writes) both carry the marker
+        # in the command, not the args.
+        for command in ("cao-mcp-server", "/home/u/.local/bin/cao-mcp-server"):
+            servers = {"orchestrator": {"command": command, "args": []}}
+            out = _inject_kiro_mcp_timeout(servers)
+            assert out["orchestrator"]["timeout"] == _KIRO_MCP_TOOL_TIMEOUT_MS
+
+    def test_detects_cao_module_entrypoint_fallback(self):
+        from cli_agent_orchestrator.services.install_service import (
+            _KIRO_MCP_TOOL_TIMEOUT_MS,
+            _inject_kiro_mcp_timeout,
+        )
+
+        # The resolver's last-resort form: <python> -m <module>.
+        servers = {
+            "orchestrator": {
+                "command": "/venv/bin/python3",
+                "args": ["-m", "cli_agent_orchestrator.mcp_server.server"],
+            }
+        }
         out = _inject_kiro_mcp_timeout(servers)
         assert out["orchestrator"]["timeout"] == _KIRO_MCP_TOOL_TIMEOUT_MS
 

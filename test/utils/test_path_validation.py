@@ -160,3 +160,89 @@ class TestTmuxDelegationRegression:
     def test_blocked_frozenset_alias_preserved(self, tmux):
         assert tmux._BLOCKED_DIRECTORIES is BLOCKED_SYSTEM_DIRECTORIES
         assert "/etc" in tmux._BLOCKED_DIRECTORIES
+
+
+# ── component-under-base confinement helpers ─────────────────────────
+
+
+from cli_agent_orchestrator.utils.path_validation import (  # noqa: E402
+    safe_join_under_base,
+    validate_path_component,
+)
+
+
+class TestValidatePathComponent:
+    @pytest.mark.parametrize(
+        "value",
+        ["global", "project", "shared-key", "a.b", "abc123", "under_score", "KEY.md", "a"],
+    )
+    def test_valid_components_pass_through_unchanged(self, value):
+        assert validate_path_component(value) == value
+
+    @pytest.mark.parametrize("value", ["", ".", ".."])
+    def test_empty_or_dot_rejected(self, value):
+        with pytest.raises(ValueError):
+            validate_path_component(value)
+
+    @pytest.mark.parametrize(
+        "value",
+        ["a/b", "a\\b", "..%2f", "foo/../bar", "/etc", "a b", "a:b", "a*b", "café"],
+    )
+    def test_separator_or_disallowed_chars_rejected(self, value):
+        with pytest.raises(ValueError):
+            validate_path_component(value)
+
+    def test_nul_byte_rejected(self):
+        with pytest.raises(ValueError, match="NUL byte"):
+            validate_path_component("a\x00b")
+
+    @pytest.mark.parametrize("value", ["topic\n", "topic\r\n", "\ntopic", "a\nb"])
+    def test_trailing_or_embedded_newline_rejected(self, value):
+        # In Python, ``$`` also matches just before a trailing newline, so the
+        # end anchor must be ``\Z`` — otherwise ``"topic\n"`` would slip past
+        # the allowlist and become a path segment carrying a newline.
+        with pytest.raises(ValueError):
+            validate_path_component(value)
+
+    def test_description_in_error_message(self):
+        with pytest.raises(ValueError, match="scope_id must"):
+            validate_path_component("../evil", description="scope_id")
+
+
+class TestSafeJoinUnderBase:
+    def test_valid_join_stays_under_base(self, tmp_path):
+        result = safe_join_under_base(str(tmp_path), "proj", "wiki", "project", "topic.md")
+        expected = os.path.join(
+            os.path.realpath(str(tmp_path)), "proj", "wiki", "project", "topic.md"
+        )
+        assert result == expected
+        assert result.startswith(os.path.realpath(str(tmp_path)) + os.sep)
+
+    def test_no_components_returns_base(self, tmp_path):
+        assert safe_join_under_base(str(tmp_path)) == os.path.realpath(str(tmp_path))
+
+    def test_traversal_component_rejected(self, tmp_path):
+        with pytest.raises(ValueError):
+            safe_join_under_base(str(tmp_path), "..", "etc")
+
+    def test_separator_in_component_rejected(self, tmp_path):
+        with pytest.raises(ValueError):
+            safe_join_under_base(str(tmp_path), "../../etc/passwd")
+
+    def test_absolute_ish_component_rejected(self, tmp_path):
+        # A leading-slash segment would reset os.path.join to an absolute
+        # path outside the base; the component validator rejects it first.
+        with pytest.raises(ValueError):
+            safe_join_under_base(str(tmp_path), "/etc")
+
+    def test_symlink_escape_is_contained(self, tmp_path):
+        # A symlinked base component that resolves outside the base must be
+        # caught by the realpath containment guard, not silently followed.
+        outside = tmp_path.parent / "outside_base"
+        outside.mkdir()
+        base = tmp_path / "base"
+        base.mkdir()
+        # 'link' is a valid single segment but points outside the base.
+        (base / "link").symlink_to(outside)
+        with pytest.raises(ValueError, match="Path traversal detected"):
+            safe_join_under_base(str(base), "link", "topic.md")

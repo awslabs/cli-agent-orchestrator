@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- add `cao profile` command group for profile lifecycle management: list/show/validate/remove/templates/create. Includes Jinja2 scaffolding engine with 7 AWS templates (stepfunction, cloudwatch-logs, dynamodb-query, dynamodb-delete, sqs-monitor, sqs-send, sqs-dlq-check) and JSON-Schema validation for both profiles and template configs (#340)
+
 - Enable/disable an agent-profile directory without removing it, so its profiles leave the active set while the path stays listed (#280, #281).
 
 - add script-tier workflows: a `.py` workflow spec is now runnable via `cao workflow run` (and the `workflow_run`/`workflow_cancel` MCP tools), with the same `resume`/`cancel`/`status` support as YAML workflows — tier is detected automatically from the file extension (#312)
@@ -32,6 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- mcp: bundled agent profiles now launch the installed `cao-mcp-server` console script instead of re-fetching the whole package from GitHub via `uvx --from git+…@main` on every agent launch — the cold fetch (~20s) exceeded some providers' MCP startup timeout (Codex: 10s), so agents came up without their orchestration tools (`handoff`/`assign`/`send_message`) and silently could not delegate; a shared resolver (`utils/mcp_resolution.py`) rewrites the bare command to a PATH-independent invocation (interpreter-sibling → PATH → `python -m`), used by all providers, and a regression test keeps new profiles from reintroducing the network fetch (#403)
+
+- claude_code: a backgrounded task ("✻ Waiting for N dynamic workflow(s) to finish") no longer reads as COMPLETED — the wait line has no spinner ellipsis (invisible to every PROCESSING check) while the printed response + idle ❯ box look like a finished turn, and it even matched the lenient completion pattern; both the raw-buffer and pyte screen paths now report PROCESSING until a newer response/completion summary appears, so dashboards and wait_until_terminal_status no longer see a mid-run terminal as done (#392)
+
 - fifo: non-blocking FIFO reader loop and event-loop-safe session teardown — reader threads can no longer be stranded in a blocking FIFO `open()` by a stop/reopen race, and `DELETE /sessions` runs teardown in a worker thread, so repeated create/delete cycles can no longer wedge cao-server (#382)
 - kiro-cli 2.11 compatibility:
   - bracketed paste now sends 2 Enters with a 1s submit delay so pasted task text is actually submitted (kiro 2.11's TUI swallows the single Enter used by older versions, leaving the message unsent)
@@ -48,6 +54,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - status monitor: `_arm_quiesce_timer` now cancels any outstanding quiescence timer for a terminal before arming the new one. Several output chunks arriving in quick succession queued multiple `_arm` closures; the later one overwrote the stored `TimerHandle` while leaving the earlier timer live, so two timers fired and a stale one firing mid-burst caused early/duplicate quiescence detections and status flaps. One outstanding timer per terminal now, always the latest
 - terminal_service: deferred-init failure path logs with `exc_info=True` (preserving the traceback) and formats the exception with `{e!r}` in both the log line and the supervisor-facing inbox message, so provider-supplied error text can't inject newlines/control characters
 - api: `POST /sessions/{name}/terminals` now rejects an `initial_message` / `initial_message_orchestration_type` body with 400 when `defer_init=false` — that payload is only delivered on the deferred-init path, so silently dropping it previously surfaced as a hard-to-diagnose "worker never received task". Deliberate 4xx responses (this guard and the invalid-orchestration-type check) also propagate as-is instead of being masked as 500
+
+### Security
+
+- memory: validate every user-derived path component (`key`, `scope`, `scope_id`) as a single safe path segment and confine assembled wiki/index paths under the memory base directory via `os.path.realpath` + an explicit containment guard, closing the 11 CodeQL `py/path-injection` alerts in `memory_service.py`. Added shared helpers `validate_path_component` / `safe_join_under_base` in `utils/path_validation.py`. The remaining `py/clear-text-storage-sensitive-data` alert is assessed as a false positive (the memory wiki is intentionally plaintext markdown; the flagged value is a topic `key` slug, not a credential) and documented in-code for won't-fix dismissal.
 
 ## [2.2.0] - 2026-06-04
 

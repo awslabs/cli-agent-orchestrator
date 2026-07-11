@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "dynamodb-delete",
+  "description": "Delete all items matching a partition key from a DynamoDB table",
+  "type": "object",
+  "properties": {
+    "profile": {
+      "type": "string",
+      "description": "AWS CLI profile name",
+      "pattern": "^[a-zA-Z0-9_-]+$"
+    },
+    "region": {
+      "type": "string",
+      "description": "AWS region",
+      "pattern": "^[a-z]{2}-[a-z]+-[0-9]+$"
+    },
+    "table_name": {
+      "type": "string",
+      "description": "DynamoDB table name",
+      "pattern": "^[a-zA-Z0-9._-]+$"
+    },
+    "partition_key_name": {
+      "type": "string",
+      "description": "Partition key attribute name",
+      "pattern": "^[a-zA-Z0-9_#.-]+$"
+    },
+    "partition_key_value": {
+      "type": "string",
+      "description": "Value to match for deletion",
+      "pattern": "^[a-zA-Z0-9_.:-]+$"
+    },
+    "partition_key_type": {
+      "type": "string",
+      "description": "DynamoDB type",
+      "enum": ["S", "N", "B"]
+    },
+    "sort_key_name": {
+      "type": "string",
+      "description": "Sort key attribute name (empty for PK-only tables)",
+      "pattern": "^[a-zA-Z0-9_#.-]*$",
+      "default": ""
+    },
+    "sort_key_type": {
+      "type": "string",
+      "description": "Sort key DynamoDB type",
+      "enum": ["S", "N", "B", ""],
+      "default": ""
+    },
+    "max_delete": {
+      "type": "integer",
+      "description": "Safety cap: abort if more items match",
+      "minimum": 1,
+      "default": 100
+    }
+  },
+  "required": ["profile", "region", "table_name", "partition_key_name", "partition_key_value", "partition_key_type"],
+  "additionalProperties": false
+}

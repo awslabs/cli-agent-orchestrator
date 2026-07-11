@@ -21,6 +21,10 @@ from cli_agent_orchestrator.constants import (
 )
 from cli_agent_orchestrator.models.memory import Memory, MemoryScope, MemoryType
 from cli_agent_orchestrator.services.memory_archive.base import ExportReport, ImportReport
+from cli_agent_orchestrator.utils.path_validation import (
+    safe_join_under_base,
+    validate_path_component,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -544,7 +548,11 @@ class MemoryService:
         # wiki path (see get_wiki_path) for isolation, not into the
         # container directory.
         if scope == MemoryScope.PROJECT.value and scope_id:
-            return self.base_dir / scope_id
+            # ``scope_id`` is user/context-derived (project-identity slug,
+            # override, or cwd hash). Validate it as a single safe path
+            # segment and confine the container under the memory base via
+            # realpath containment so a crafted scope_id cannot escape.
+            return Path(safe_join_under_base(str(self.base_dir), scope_id, description="scope_id"))
         # ``federated`` is a machine-wide shared tier living in its own
         # top-level container, a sibling of ``global``.
         if scope == MemoryScope.FEDERATED.value:
@@ -558,23 +566,40 @@ class MemoryService:
         path so that two sessions (or two agent profiles) with the same
         key do not collide on disk.
 
-        Validates the resolved path stays within MEMORY_BASE_DIR to
-        prevent path traversal.
+        Every user-derived segment (``scope``, ``scope_id``, ``key``) is
+        validated as a single safe path component and the assembled path is
+        confined under MEMORY_BASE_DIR via realpath containment, so a
+        crafted value cannot traverse out of the memory base directory.
         """
-        project_dir = self._get_project_dir(scope, scope_id)
-        if scope in (MemoryScope.SESSION.value, MemoryScope.AGENT.value) and scope_id:
-            wiki_path = (project_dir / "wiki" / scope / scope_id / f"{key}.md").resolve()
+        # Validate every user-derived segment as a single safe path
+        # component up front. ``key`` is validated in its raw form (not just
+        # the ``{key}.md`` filename) so empty/``.``/``..`` keys are rejected
+        # rather than turning into benign-but-unintended filenames.
+        validate_path_component(scope, "scope")
+        validate_path_component(key, "key")
+        if scope_id is not None:
+            validate_path_component(scope_id, "scope_id")
+
+        # Container segment: ``project`` scope keys off the scope_id;
+        # session/agent memories live under the ``global`` container with
+        # scope_id nested into the wiki path; federated is its own tier.
+        if scope == MemoryScope.PROJECT.value and scope_id:
+            container = scope_id
+        elif scope == MemoryScope.FEDERATED.value:
+            container = "federated"
         else:
-            wiki_path = (project_dir / "wiki" / scope / f"{key}.md").resolve()
-        base_resolved = self.base_dir.resolve()
-        if (
-            not str(wiki_path).startswith(str(base_resolved) + os.sep)
-            and wiki_path != base_resolved
-        ):
-            raise ValueError(
-                f"Path traversal detected: resolved path escapes memory base directory"
+            container = "global"
+
+        if scope in (MemoryScope.SESSION.value, MemoryScope.AGENT.value) and scope_id:
+            components = [container, "wiki", scope, scope_id, f"{key}.md"]
+        else:
+            components = [container, "wiki", scope, f"{key}.md"]
+
+        return Path(
+            safe_join_under_base(
+                str(self.base_dir), *components, description="memory path component"
             )
-        return wiki_path
+        )
 
     def get_index_path(self, scope: str, scope_id: Optional[str]) -> Path:
         """Get the path to the index.md file."""
@@ -727,7 +752,7 @@ class MemoryService:
         # (scope, scope_id, key) can both read the old content and
         # then overwrite each other, losing one update. Mirrors the
         # .index.lock pattern in _update_index.
-        topic_lock_path = wiki_path.parent / f".{key}.lock"
+        topic_lock_path = wiki_path.parent / f".{wiki_path.stem}.lock"
         topic_lock_fd = open(topic_lock_path, "w")
         try:
             fcntl.flock(topic_lock_fd, fcntl.LOCK_EX)
@@ -803,7 +828,22 @@ class MemoryService:
             # Atomic write of the append version: write to tmp then os.replace.
             # This is always the immediate, durable result of store(). LLM
             # compaction (below) is deferred and rewrites the file later.
-            tmp_path = wiki_path.parent / f".{key}.tmp"
+            #
+            # CodeQL note (py/clear-text-storage-sensitive-data): this write is
+            # flagged only because ``new_content`` embeds the topic ``key`` and
+            # CodeQL's name-based heuristic classifies any variable named
+            # ``key`` as a secret. It is a FALSE POSITIVE, not a leak: ``key``
+            # is a user-authored topic slug (see ``_sanitize_key``), never a
+            # credential. The memory wiki is intentionally human-readable
+            # plaintext markdown — that is the product contract, and encrypting
+            # it would defeat the feature (agents and humans read these files
+            # directly). No secret is persisted here. Dismiss the alert as
+            # "won't fix / by-design" in the Security tab with this rationale;
+            # do NOT add encryption. As an additional safeguard, content
+            # written to the machine-wide federated tier is screened by the
+            # secret gate (``scan_for_secrets``) earlier in ``store()`` and
+            # rejected if it matches a credential pattern.
+            tmp_path = wiki_path.parent / f".{wiki_path.stem}.tmp"
             tmp_path.write_text(new_content, encoding="utf-8")
             os.replace(str(tmp_path), str(wiki_path))
 
@@ -1077,7 +1117,7 @@ class MemoryService:
         except Exception as e:  # noqa: BLE001 — non-blocking promise
             logger.warning(f"find_related raised, ignoring: {e}")
 
-        topic_lock_path = wiki_path.parent / f".{key}.lock"
+        topic_lock_path = wiki_path.parent / f".{wiki_path.stem}.lock"
         try:
             topic_lock_fd = open(topic_lock_path, "w")
         except OSError:
@@ -1093,7 +1133,7 @@ class MemoryService:
                 logger.info(f"background compile stale, dropping (key={key})")
                 _audit("compile_stale_dropped", "newer store won the race")
                 return "stale"
-            tmp_path = wiki_path.parent / f".{key}.compile.tmp"
+            tmp_path = wiki_path.parent / f".{wiki_path.stem}.compile.tmp"
             tmp_path.write_text(compiled_content, encoding="utf-8")
             os.replace(str(tmp_path), str(wiki_path))
             try:
@@ -1401,7 +1441,7 @@ class MemoryService:
         try:
             if not wiki_path.exists():
                 return None
-            resolved = wiki_path.resolve()
+            resolved = Path(os.path.realpath(str(wiki_path)))
             # Validate against the scope directory the key legitimately lives
             # in, not the global memory base — a symlink planted inside one
             # scope's tree must not leak another scope's (or project's)
@@ -1412,7 +1452,8 @@ class MemoryService:
             scope_dir = self._get_project_dir(scope, scope_id) / "wiki" / scope
             if scope in (MemoryScope.SESSION.value, MemoryScope.AGENT.value) and scope_id:
                 scope_dir = scope_dir / scope_id
-            if resolved.parent != scope_dir.resolve():
+            scope_dir_real = os.path.realpath(str(scope_dir))
+            if not str(resolved).startswith(scope_dir_real + os.sep):
                 return None
             file_content = resolved.read_text(encoding="utf-8")
             entry = {
@@ -1953,6 +1994,9 @@ class MemoryService:
             if not index_path.exists():
                 continue
 
+            wiki_dir = project_dir / "wiki"
+            wiki_resolved = os.path.realpath(str(wiki_dir))
+
             entries = self._parse_index(index_path)
 
             for entry in entries:
@@ -1968,11 +2012,23 @@ class MemoryService:
                     continue
 
                 # Read the wiki file
-                wiki_file = project_dir / "wiki" / entry["relative_path"]
-                if not wiki_file.exists():
+                wiki_file = wiki_dir / entry["relative_path"]
+                resolved_wiki = Path(os.path.realpath(str(wiki_file)))
+                # Guard against a crafted/corrupted index entry (e.g.
+                # ``[x](../../../../etc/passwd)``) escaping this scope's wiki
+                # directory and leaking an arbitrary out-of-base file as a
+                # "memory". Mirrors get_memory_context_for_terminal: skip the
+                # escaping entry rather than raising, keeping recall resilient
+                # to a corrupted index.
+                if not str(resolved_wiki).startswith(wiki_resolved + os.sep):
+                    logger.warning(
+                        f"Path traversal in index entry rejected: {entry.get('relative_path')}"
+                    )
+                    continue
+                if not resolved_wiki.exists():
                     continue
 
-                file_content = wiki_file.read_text(encoding="utf-8")
+                file_content = resolved_wiki.read_text(encoding="utf-8")
 
                 # Query matching: check if query terms appear in content (case-insensitive)
                 if query:
@@ -2258,8 +2314,17 @@ class MemoryService:
             # Include the specific project dir for this terminal's cwd
             project_scope_id = self.resolve_scope_id("project", terminal_context)
             if project_scope_id:
-                project_dir = self.base_dir / project_scope_id
-                if project_dir.exists() and project_dir not in dirs:
+                # ``project_scope_id`` is context-derived; validate + confine
+                # under the base before touching the filesystem.
+                try:
+                    project_dir = Path(
+                        safe_join_under_base(
+                            str(self.base_dir), project_scope_id, description="scope_id"
+                        )
+                    )
+                except ValueError:
+                    project_dir = None
+                if project_dir is not None and project_dir.exists() and project_dir not in dirs:
                     dirs.append(project_dir)
                 # Also include legacy cwd-hash dirs recorded as aliases so
                 # pre-U6 memories survive the canonical-id transition.
@@ -2271,7 +2336,18 @@ class MemoryService:
                     for alias in list_aliases_for_project(project_scope_id):
                         if alias.get("kind") != "cwd_hash":
                             continue
-                        alias_dir = self.base_dir / alias["alias"]
+                        # Alias names originate from stored git/cwd identities;
+                        # validate + confine each before filesystem access.
+                        try:
+                            alias_dir = Path(
+                                safe_join_under_base(
+                                    str(self.base_dir),
+                                    alias["alias"],
+                                    description="alias",
+                                )
+                            )
+                        except (ValueError, KeyError, TypeError):
+                            continue
                         if alias_dir.exists() and alias_dir not in dirs:
                             dirs.append(alias_dir)
                 except Exception as e:
@@ -2484,7 +2560,7 @@ class MemoryService:
             scope_id = self.resolve_scope_id(scope_val, terminal_context)
             project_dir = self._get_project_dir(scope_val, scope_id)
             wiki_dir = project_dir / "wiki"
-            wiki_resolved = wiki_dir.resolve()
+            wiki_resolved = os.path.realpath(str(wiki_dir))
             index_path = wiki_dir / "index.md"
             if not index_path.exists():
                 continue
@@ -2508,12 +2584,12 @@ class MemoryService:
                 if len(scope_memories) >= MEMORY_MAX_PER_SCOPE:
                     break
                 wiki_file = wiki_dir / entry["relative_path"]
-                resolved_wiki = wiki_file.resolve()
+                resolved_wiki = Path(os.path.realpath(str(wiki_file)))
                 # Guard against a crafted/corrupted index entry (e.g.
                 # ``../<other-project>/wiki/...``) escaping this scope's wiki
                 # directory and leaking another project's memory. Validate
                 # against the per-scope wiki dir, not the global memory base.
-                if not str(resolved_wiki).startswith(str(wiki_resolved) + os.sep):
+                if not str(resolved_wiki).startswith(wiki_resolved + os.sep):
                     logger.warning(
                         f"Path traversal in index entry rejected: {entry.get('relative_path')}"
                     )

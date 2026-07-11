@@ -136,28 +136,41 @@ class TestTranslateMcpServerConfig:
         assert "environment" not in result
         assert "env" not in result
 
-    def test_real_cao_mcp_server_entry(self):
-        """Full translation of the cao-mcp-server entry as it appears in agent profiles."""
+    def test_custom_uvx_entry_passes_through(self):
+        """A user-defined uvx-based MCP server is translated verbatim.
+
+        Only the bundled ``cao-mcp-server`` command is rewritten (see
+        test_bundled_cao_mcp_server_command_is_resolved); any other command —
+        including a user's own ``uvx --from ...`` server — flattens unchanged.
+        """
         cao_cfg = {
             "type": "stdio",
             "command": "uvx",
-            "args": [
-                "--from",
-                "git+https://github.com/awslabs/cli-agent-orchestrator.git@main",
-                "cao-mcp-server",
-            ],
+            "args": ["--from", "some-pkg", "my-mcp-server"],
         }
         result = translate_mcp_server_config(cao_cfg)
         assert result == {
             "type": "local",
-            "command": [
-                "uvx",
-                "--from",
-                "git+https://github.com/awslabs/cli-agent-orchestrator.git@main",
-                "cao-mcp-server",
-            ],
+            "command": ["uvx", "--from", "some-pkg", "my-mcp-server"],
             "enabled": True,
         }
+
+    def test_bundled_cao_mcp_server_command_is_resolved(self):
+        """The bare cao-mcp-server command is resolved to a PATH-independent form.
+
+        The bundled profiles declare ``command: cao-mcp-server``; the translator
+        resolves it so OpenCode launches it without depending on
+        the script being on the agent subprocess's PATH.
+        """
+        result = translate_mcp_server_config(
+            {"type": "stdio", "command": "cao-mcp-server", "args": []}
+        )
+        assert result["type"] == "local"
+        assert result["enabled"] is True
+        # Resolved away from the bare console-script name into a concrete
+        # invocation (abs path to the script, or `<python> -m ...`).
+        assert result["command"][0] != "cao-mcp-server"
+        assert result["command"]  # non-empty
 
 
 class TestReadConfig:

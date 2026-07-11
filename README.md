@@ -148,6 +148,17 @@ cao install https://example.com/agents/custom-agent.md
 
 For creating custom agent profiles, see [docs/agent-profile.md](docs/agent-profile.md).
 
+#### Profile management (`cao profile`)
+
+```bash
+cao profile list                                    # List all installed profiles
+cao profile show <name|file>                        # Inspect frontmatter details
+cao profile validate <name|file>                    # Schema + deprecation checks
+cao profile templates                               # List scaffolding templates
+cao profile create -t aws/stepfunction -c config.json  # Generate from template
+cao profile remove <name>                           # Delete from local store
+```
+
 ### 2. Start the server
 
 ```bash
