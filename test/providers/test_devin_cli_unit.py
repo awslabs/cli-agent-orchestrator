@@ -12,7 +12,7 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
 def load_fixture(filename: str) -> str:
-    with open(FIXTURES_DIR / filename, "r") as f:
+    with open(FIXTURES_DIR / filename, "r", encoding="utf-8") as f:
         return f.read()
 
 
@@ -79,13 +79,13 @@ class TestDevinCliProviderStatusDetection:
         assert status == TerminalStatus.COMPLETED
 
     def test_get_status_empty_output(self):
-        """ERROR: empty/blank output → CLI failed to start."""
+        """UNKNOWN: empty/blank output → keep polling, don't latch a false error."""
         buffer = ""
 
         provider = DevinCliProvider("test1234", "test-session", "window-0")
         status = provider.get_status(buffer)
 
-        assert status == TerminalStatus.ERROR
+        assert status == TerminalStatus.UNKNOWN
 
     def test_get_status_user_input_no_response(self):
         """COMPLETED: user input sent, prompt returned (ready for next input)."""

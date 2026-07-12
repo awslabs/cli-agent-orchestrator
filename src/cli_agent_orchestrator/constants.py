@@ -8,7 +8,9 @@ Codex, Kimi CLI, Q CLI) through tmux sessions, providing a unified interface
 for agent management.
 """
 
+import getpass
 import os
+import stat
 import tempfile
 from pathlib import Path
 
@@ -66,21 +68,92 @@ TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
 # FIFO directory for event-driven terminal output streaming
 # Try system temp directory first, fall back to CAO_HOME_DIR for restricted environments
 # (containers, read-only filesystems, etc.)
-# Security: use a per-user subdirectory to prevent symlink/pre-creation attacks
-# on multi-user hosts; apply mode=0o700 to the leaf directory.
-import getpass as _getpass
-import os as _os
+# Security: create and validate a user-owned, non-symlink directory hierarchy
+# atomically to prevent symlink/pre-creation attacks on multi-user hosts; apply
+# mode=0o700 to the leaf directory.
 
-_user = _getpass.getuser()
-try:
-    TEMP_BASE = Path(tempfile.gettempdir())
-    FIFO_DIR = TEMP_BASE / "cli-agent-orchestrator" / _user / "fifos"
-    FIFO_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
-except OSError:
-    # Fallback to CAO_HOME_DIR if temp directory is not accessible
-    # (e.g., restricted containers, read-only filesystems)
-    FIFO_DIR = CAO_HOME_DIR / "fifos"
-    FIFO_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
+
+def _get_user_name() -> str:
+    """Return a unique per-user directory name.
+
+    ``getpass.getuser()`` can raise ``KeyError`` when no ``USER``/``LOGNAME``
+    environment variable is set (e.g., in stripped containers). Fall back to
+    ``os.getuid()`` on Unix, then to the process id, which is still unique per
+    user session on a single machine.
+    """
+    try:
+        return getpass.getuser()
+    except (KeyError, OSError):
+        try:
+            return str(os.getuid())
+        except AttributeError:
+            return str(os.getpid())
+
+
+def _is_safe_dir(path: Path, mode: int = 0o700) -> bool:
+    """Return True if *path* is an existing directory owned by us and not a symlink.
+
+    If the directory exists with extra permission bits, try to tighten it to
+    *mode*. Any failure (missing, symlink, wrong owner, chmod error) returns
+    False so the caller can fall back.
+    """
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode):
+        return False
+    if hasattr(st, "st_uid") and hasattr(os, "getuid"):
+        if st.st_uid != os.getuid():
+            return False
+    if stat.S_IMODE(st.st_mode) & ~mode:
+        try:
+            os.chmod(path, mode)
+        except OSError:
+            return False
+    return True
+
+
+def _secure_dir(path: Path, mode: int = 0o700) -> bool:
+    """Create *path* as a safe directory if it does not exist.
+
+    ``exists_ok=False`` is used deliberately so a pre-existing symlink or file
+    is caught as an ``OSError`` rather than silently used.
+    """
+    try:
+        if path.exists():
+            return _is_safe_dir(path, mode)
+        path.mkdir(mode=mode, exist_ok=False)
+    except OSError:
+        return False
+    return True
+
+
+def _init_fifo_dir() -> Path:
+    """Initialize a secure FIFO directory, falling back to CAO_HOME_DIR if needed."""
+    temp_base = Path(tempfile.gettempdir())
+    user = _get_user_name()
+    fifo_dir = temp_base / "cli-agent-orchestrator" / user / "fifos"
+    try:
+        if (
+            _secure_dir(temp_base / "cli-agent-orchestrator", 0o700)
+            and _secure_dir(temp_base / "cli-agent-orchestrator" / user, 0o700)
+            and _secure_dir(fifo_dir, 0o700)
+        ):
+            return fifo_dir
+    except OSError:
+        pass
+    # Fallback to CAO_HOME_DIR if temp directory is not accessible or unsafe
+    # (e.g., restricted containers, read-only filesystems, hostile pre-creation).
+    fallback = CAO_HOME_DIR / "fifos"
+    try:
+        fallback.mkdir(parents=True, mode=0o700, exist_ok=True)
+    except OSError:
+        pass
+    return fallback
+
+
+FIFO_DIR = _init_fifo_dir()
 
 # =============================================================================
 # Event-Driven State Detection Configuration

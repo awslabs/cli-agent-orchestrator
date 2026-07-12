@@ -141,8 +141,8 @@ uv run pytest -m e2e test/e2e/ -v -k devin
 # Run specific test types
 uv run pytest -m e2e test/e2e/test_handoff.py -v -k devin
 uv run pytest -m e2e test/e2e/test_assign.py -v -k devin
-uv run pytest -m e2e/test/e2e/test_send_message.py -v -k devin
-uv run pytest -m e2e/test/e2e/test_supervisor_orchestration.py -v -k devin -o "addopts="
+uv run pytest -m e2e test/e2e/test_send_message.py -v -k devin
+uv run pytest -m e2e test/e2e/test_supervisor_orchestration.py -v -k devin -o "addopts="
 ```
 
 ## Troubleshooting

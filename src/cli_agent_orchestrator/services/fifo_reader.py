@@ -154,6 +154,7 @@ class FifoManager:
         pending = bytearray()
         # Time at which the currently-accumulating batch started.
         batch_start = 0.0
+        reader_failed = False
         try:
             # Non-blocking read open of a FIFO succeeds immediately (POSIX),
             # writer attached or not.
@@ -192,12 +193,15 @@ class FifoManager:
                     bus.publish(topic, {"data": pending.decode("utf-8", errors="replace")})
                     pending.clear()
         except Exception as e:
+            reader_failed = True
+            pending.clear()  # discard stale/partial bytes from the failing reader
             if not stop_flag.is_set():
                 logger.error(f"FIFO reader for terminal {terminal_id} exiting on error: {e}")
         finally:
-            # Flush any unpublished bytes so the last frame of a torn-down
-            # terminal isn't lost — status/log consumers may need it.
-            if pending:
+            # Only flush pending bytes on a clean exit; on a failing reader the
+            # partial bytes are discarded and the status monitor is told to
+            # invalidate the rolling buffer so the WSL/history fallback can fire.
+            if not reader_failed and pending:
                 try:
                     bus.publish(topic, {"data": pending.decode("utf-8", errors="replace")})
                 except Exception:
@@ -208,6 +212,13 @@ class FifoManager:
                         os.close(fd)
                     except OSError:
                         pass
+            if reader_failed and not stop_flag.is_set():
+                try:
+                    from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+                    status_monitor.invalidate_fifo_buffer(terminal_id)
+                except Exception:
+                    pass
 
 
 # Module-level singleton

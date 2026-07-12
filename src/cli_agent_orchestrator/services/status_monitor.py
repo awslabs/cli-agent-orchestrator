@@ -7,7 +7,11 @@ Publisher: terminal.{id}.status
 import asyncio
 import logging
 import threading
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    import pyte
+    from cli_agent_orchestrator.providers.base import BaseProvider
 
 from cli_agent_orchestrator.constants import (
     CAO_PYTE_STATUS,
@@ -76,7 +80,7 @@ class StatusMonitor:
         # on two edges only — rising (output resumed) and quiescence (output
         # stopped for PYTE_QUIESCENCE_DELAY_S) — never mid-burst, which is what
         # keeps status flap-free.
-        self._screens: Dict[str, Tuple[object, object]] = {}
+        self._screens: Dict[str, Tuple["pyte.Screen", "pyte.Stream"]] = {}
         self._bursting: Dict[str, bool] = {}
         # Pending quiescence-detect timer handle per terminal (loop.call_later).
         self._quiesce_handle: Dict[str, asyncio.TimerHandle] = {}
@@ -241,7 +245,7 @@ class StatusMonitor:
             self._screens[terminal_id] = scr
         scr[1].feed(chunk)
 
-    def _detect_screen(self, terminal_id: str, provider) -> TerminalStatus:
+    def _detect_screen(self, terminal_id: str, provider: Optional["BaseProvider"]) -> TerminalStatus:
         """Detect status from the terminal's composited pyte screen."""
         fallback_buffer: Optional[str] = None
         with self._lock:
@@ -532,6 +536,15 @@ class StatusMonitor:
             handle = self._quiesce_handle.pop(terminal_id, None)
         self._cancel_quiesce_handle(handle)
 
+    def invalidate_fifo_buffer(self, terminal_id: str) -> None:
+        """Invalidate the rolling buffer for a terminal when its FIFO reader dies.
+
+        This resets the cached status to UNKNOWN and clears the byte buffer so
+        ``get_status()`` falls back to pane history instead of returning stale
+        bytes from before the reader error.
+        """
+        self.reset_buffer(terminal_id)
+
     def _get_event_inbox_status(self, terminal_id: str) -> Optional[TerminalStatus]:
         """Get status for event-inbox backends (herdr) by calling provider.get_status()."""
         try:
@@ -596,6 +609,11 @@ class StatusMonitor:
                             f"get_status [{terminal_id}]: fallback from history, "
                             f"status={fresh.value}, history_len={len(history)}"
                         )
+                        # Do not latch ERROR or UNKNOWN from a partial history snapshot.
+                        # Those are typically transient (TUI still rendering, or a
+                        # torn frame) and should not overwrite a valid ready status.
+                        if fresh in (TerminalStatus.ERROR, TerminalStatus.UNKNOWN):
+                            return fresh
                         # Update the cached status so subsequent calls don't re-read history
                         self._apply_detection(terminal_id, fresh)
                         return fresh
