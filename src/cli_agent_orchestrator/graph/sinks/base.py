@@ -18,10 +18,10 @@ class GraphSink(ABC):
     confine ``dest`` under an allowed base directory before writing —
     reject ``..`` traversal, absolute-path escapes, and symlink escapes.
     Follow this repo's path-validation convention
-    (``utils/path_validation.resolve_and_validate_path``). Validation is
-    owned by BOTH the U4 route (first line of defense, validates before
-    calling a sink) AND each sink implementation (defense in depth) — a
-    sink must not assume its caller already validated ``dest``.
+    (``utils/path_validation.resolve_and_validate_path``). ``dest``
+    validation is owned by the sink implementation itself — the U4 route
+    forwards ``dest`` unvalidated, so a sink must never assume its caller
+    already confined the path. Every sink validates before its first write.
     """
 
     capabilities: ClassVar[set[str]] = set()

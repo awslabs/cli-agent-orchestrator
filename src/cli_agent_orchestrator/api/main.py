@@ -63,6 +63,11 @@ from cli_agent_orchestrator.constants import (
     add_local_cors_origins,
 )
 from cli_agent_orchestrator.ext_apps import mount_widget_static
+from cli_agent_orchestrator.graph.providers import get_provider
+
+# Import the sinks package for its import-time @register_sink side effects
+# ("okf", "obsidian", "graphml"); get_sink resolves by name from the registry.
+from cli_agent_orchestrator.graph.sinks import get_sink
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.memory import (
@@ -85,6 +90,7 @@ from cli_agent_orchestrator.security.auth import (
 )
 from cli_agent_orchestrator.services import (
     flow_service,
+    secret_gate,
     session_service,
     terminal_service,
 )
@@ -341,6 +347,17 @@ class WorkflowRunRequest(BaseModel):
     run_id: Optional[str] = Field(
         default=None,
         description="Optional run id (matches WORKFLOW_NAME_RE); auto-generated if omitted",
+    )
+
+
+class GraphExportRequest(BaseModel):
+    """Request body for ``POST /graph/{provider}/export`` (U4, Issue #348)."""
+
+    sink: str = Field(description="Registered sink name (resolved via get_sink; KeyError -> 404)")
+    dest: str = Field(description="Export destination, passed positionally to sink.export")
+    options: dict = Field(
+        default_factory=dict,
+        description="Opaque per-sink options forwarded as **options; the route never inspects them",
     )
 
 
@@ -1728,6 +1745,93 @@ async def resume_workflow_run_endpoint(
     except workflow_service.WorkflowEngineError as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
     return result.model_dump()
+
+
+# ── graph layer (U4, Issue #348) ────────────────────────────────────────
+#
+# Two routes over the provider/sink seams. There is ZERO branching over the
+# provider or sink NAME (NFR-5): the only conditionals are try/except on
+# registry-resolution outcome. Names resolve through get_provider/get_sink,
+# which raise KeyError for an unregistered name (mapped to 404 here).
+
+
+@app.get("/graph/{provider}")
+async def get_graph_endpoint(provider: str, request: Request) -> Dict:
+    """Project a provider's GraphView and return its wire shape (FR-12).
+
+    UNGATED by design: this route carries no ``require_any_scope``
+    dependency at all — graph reads are open (per business-rules.md). All
+    query params (``scope``, ``scope_id``, and any extras) are forwarded to
+    the provider as ``**filters``.
+
+    Error taxonomy: unregistered provider -> 404; provider ValueError
+    (e.g. a bad filter value) -> 400.
+    """
+    filters = dict(request.query_params)
+    try:
+        inst = get_provider(provider)
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"unknown graph provider '{provider}'",
+        )
+    try:
+        view = await inst.project(**filters)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return view.to_dict()
+
+
+@app.post("/graph/{provider}/export")
+async def export_graph_endpoint(
+    provider: str,
+    body: GraphExportRequest,
+    request: Request,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Project a provider's view and export it through a named sink (FR-12).
+
+    Scope-gated (401 no/invalid token, 403 valid-but-insufficient). The
+    serialized view is scanned by ``secret_gate`` BEFORE the sink is
+    invoked; a hit rejects the export with 422 and the sink's ``export`` is
+    never called. The 422 detail names only the matched PATTERN, never the
+    matched bytes.
+
+    Error taxonomy: unregistered provider or sink -> 404; secret hit -> 422;
+    provider/sink ValueError -> 400.
+    """
+    filters = dict(request.query_params)
+    try:
+        prov = get_provider(provider)
+        sink = get_sink(body.sink)
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"unknown graph provider '{provider}' or sink '{body.sink}'",
+        )
+
+    try:
+        view = await prov.project(**filters)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    # Credential gate (ADR-5): scan the serialized view; on a hit, reject
+    # before the sink writes anything. secret_gate returns the pattern NAME,
+    # never the matched bytes, so the detail is safe to surface.
+    serialized = json.dumps(view.to_dict())
+    hit = secret_gate.scan_for_secrets(serialized)
+    if hit is not None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"export rejected: secret pattern '{hit}' detected",
+        )
+
+    try:
+        written_files = sink.export(view, body.dest, **body.options)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    return {"written_files": written_files, "sink": body.sink, "dest": body.dest}
 
 
 @app.delete("/terminals/{terminal_id}")
