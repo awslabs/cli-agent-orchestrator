@@ -7,25 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-07-12
+
+### Highlights
+
+This is a substantial release. CAO 2.3 introduces **`cao workflow`** — a script-tier orchestration engine that lets a supervisor author multi-agent runs as plain JavaScript (`agent()` / `parallel()` / `pipeline()`), with a durable run journal, resumable execution, and a linter + run-step env guard for safety (#312, Bolts 1–4). Alongside it: **CAO memory federation and portability** — cross-project `FEDERATED` scope, Open Knowledge Format (OKF) export/import, and self-healing wiki repair (`cao memory heal`); a **major event-driven architecture rebase** (#273) that removes polling from inbox delivery across the terminal/session stack; a new **cross-node fleet coordinator + web control panel** for managing many CAO nodes from one place; and a broad **kiro-cli 2.11 compatibility pass** that fixes a supervisor deadlock plus several TUI status-detection regressions. New providers this release: Cursor CLI, Antigravity CLI (`agy`), Kimi CLI, and Hermes/herdr backends; Amazon Q CLI and Gemini CLI providers were removed. (`cao profile` and the graph rendering layer are in progress on `main` and will ship in a following minor release, not 2.3.0.)
+
 ### Added
 
-- add `cao profile` command group for profile lifecycle management: list/show/validate/remove/templates/create. Includes Jinja2 scaffolding engine with 7 AWS templates (stepfunction, cloudwatch-logs, dynamodb-query, dynamodb-delete, sqs-monitor, sqs-send, sqs-dlq-check) and JSON-Schema validation for both profiles and template configs (#340)
+- add `cao workflow` — script-tier orchestration engine for authoring multi-agent runs as plain JS instead of prose instructions to a supervisor: spec grammar + `run_agent_step` substrate (#320), authoring/persistence/structured returns (#326), orchestration run engine (#329), durable run journal + resume (#372), script-tier journal extension (#391), script linter + run-step env guard (#394), script-tier execution engine / U4 runner (#396) (#312)
+
+- add CAO memory cross-project federation — `FEDERATED` scope lets memories be shared and recalled across projects rather than pinned to one (#314)
+
+- add OKF memory export/import — `cao memory export`/`cao memory import` CLI commands plus a read-scoped `GET /memory/export` API endpoint streaming a scope as a tar.gz bundle (#345)
+
+- add CAO memory wiki self-healing — `cao memory heal` detects and repairs structural drift in the memory wiki (orphaned entries, broken cross-references, stale index) without a full rebuild (#306)
+
+- add CAO memory Phase 3 — LLM wiki compile, cross-reference linking, a lint pass for wiki health, a daily audit log, and a memory-quality scoring pass (#285)
+
+- add CAO memory Web UI support — browse, search, and manage stored memories from the Web UI dashboard (#290)
+
+- add built-in memory plugins bundled for Claude Code, Kiro, and Codex so `memory.enabled` works out of the box without custom wiring (#269)
 
 - Enable/disable an agent-profile directory without removing it, so its profiles leave the active set while the path stays listed (#280, #281).
 
 - add optional `skills` field to `AgentProfile` to scope the per-agent skill catalog via an fnmatch allowlist; runtime-prompt providers only, `load_skill` resolution unchanged (#351)
 
+- discover skills from `extra_skill_dirs`, mirroring the existing `extra_agent_dirs` pattern (#277)
+
+- rebase inbox delivery onto an event-driven model across the terminal/session stack, replacing polling (#273)
+
+- add `cao-mcp-server` worker status/output tools and bundled orchestration worker profiles (#324)
+
+- gate network egress behind a `web_fetch` tool category — network-fetch capability is now explicit and allowlist-gated rather than implicit (#311)
+
+- add pyte rendered-screen status detection — uses a virtual terminal screen buffer instead of raw-buffer regex matching for provider status, reducing false IDLE/PROCESSING reads (#293)
+
+- add herdr terminal backend with native event-driven inbox delivery (#271)
+
+- add built-in Hermes provider support through profile-configured `hermesProfile` wrappers (#272)
+
+- add Cursor CLI as a first-class provider (#296)
+
 - add Antigravity CLI (`agy`) provider — Google's terminal-native coding agent and the successor to the Gemini CLI after the free "Login with Google" path was retired (#323)
 
-- add built-in Hermes provider support through profile-configured `hermesProfile` wrappers
+- add optional `codexConfig` field to `AgentProfile` for per-agent config overrides on the codex provider (#278)
 
-- add OKF memory export/import — `cao memory export`/`cao memory import` CLI commands plus a read-scoped `GET /memory/export` API endpoint streaming a scope as a tar.gz bundle (#345)
-- add `examples/fleet` — a cross-node fleet coordinator that manages many CAO nodes from one place: one-command node bootstrap, a `fleet` control helper (list/show/exec against any node), and an AI conductor wired to one `cao-ops-mcp-server` per node. Purely additive under `examples/`; each node stays a stateless client of the existing `cao-server` API (#349)
+- add optional Session Name field to the Web UI's Spawn Agent dialog (#279)
+
+- add configurable server timeouts and file-based Claude Code prompt delivery (#318)
+
+- add `examples/fleet` — a cross-node fleet coordinator that manages many CAO nodes from one place: one-command node bootstrap, a `fleet` control helper (list/show/exec against any node), and an AI conductor wired to one `cao-ops-mcp-server` per node. Purely additive under `examples/`; each node stays a stateless client of the existing `cao-server` API (#365)
 - add `examples/fleet/panel` — a web control panel + live console for the fleet: a stateless FastAPI app that fans out to every node's `cao-server` REST API and serves a browser SPA (a wall of live agent screens + a focused console). Isolates per-node failures, degrades `/screen` → `/output` for older nodes, and adds opt-in shared-token auth (`CAO_PANEL_TOKEN`) for off-loopback use (#366)
+- add `examples/aws` cloud-ops agent examples with config (#377)
 
 ### Changed
 
 - rename `cao flow` → `cao schedule` to avoid confusion with the new `cao workflow` feature. `cao flow` remains as a hidden deprecated alias that prints a warning to stderr; flow files, `~/.cao/flows`, stored schedules, and the `/flows` REST API are unchanged, and the web UI only updates its CLI hint string (#378)
+
+- unify CAO configuration into a single source of truth, consolidating config resolution that was previously spread across multiple layers/files (#381)
+
+### Removed
+
+- remove the Amazon Q CLI and Gemini CLI providers — Q CLI is superseded by `kiro_cli`; Gemini CLI's free "Login with Google" path was retired (see the new Antigravity CLI provider above) (#353)
 
 ### Deprecated
 
@@ -54,9 +98,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - terminal_service: deferred-init failure path logs with `exc_info=True` (preserving the traceback) and formats the exception with `{e!r}` in both the log line and the supervisor-facing inbox message, so provider-supplied error text can't inject newlines/control characters
 - api: `POST /sessions/{name}/terminals` now rejects an `initial_message` / `initial_message_orchestration_type` body with 400 when `defer_init=false` — that payload is only delivered on the deferred-init path, so silently dropping it previously surfaced as a hard-to-diagnose "worker never received task". Deliberate 4xx responses (this guard and the invalid-orchestration-type check) also propagate as-is instead of being masked as 500
 
+- cli: auto-detect server backend, plus herdr reconcile fixes (#309)
+
+- cli: add `--version`/`-V` option (#354, #379)
+
+- providers: read herdr native status in all providers (#359, #361)
+
+- providers: harden Claude and OpenCode status detection (#327)
+
+- kiro: detect TUI idle state without falling back to `--legacy-ui` (#330)
+
+- claude_code: fix an echoed system prompt false-matching idle and blocking the workspace-trust dialog (#319)
+
+- claude_code: allow `permissionMode` to override yolo mode (#322)
+
+- antigravity: dismiss the startup feedback survey so init doesn't block (#371)
+
+- antigravity: accept the workspace-trust dialog so init doesn't hang (#364)
+
+- kimi: dismiss the startup upgrade-reminder dialog so init doesn't hang (#363)
+
+- tool-restrictions: also deny Claude Code's renamed subagent tool (`Agent`) (#350)
+
+- fix structural callback routing for worker agents (#284, #289)
+
+- codex: handle the v0.136+ TUI footer (which dropped a status-bar segment CAO relied on) and skip `• Called <tool>(...)` MCP tool-call markers during last-message extraction so their contents no longer leak into the extracted response (#274)
+
+- inbox: mark messages DELIVERED before `send_input` to stop double delivery (#265)
+
+- inbox: add a reconciliation sweep for orphaned PENDING messages (#266)
+
+- ci: stop TestPyPI squats from breaking the release smoke test (#270)
+
 ### Security
 
 - memory: validate every user-derived path component (`key`, `scope`, `scope_id`) as a single safe path segment and confine assembled wiki/index paths under the memory base directory via `os.path.realpath` + an explicit containment guard, closing the 11 CodeQL `py/path-injection` alerts in `memory_service.py`. Added shared helpers `validate_path_component` / `safe_join_under_base` in `utils/path_validation.py`. The remaining `py/clear-text-storage-sensitive-data` alert is assessed as a false positive (the memory wiki is intentionally plaintext markdown; the flagged value is a topic `key` slug, not a credential) and documented in-code for won't-fix dismissal.
+
+- address CodeQL command-injection and URL-sanitization findings, including alert #66 (uncontrolled command line) (#275, #288)
+
+- bump `starlette` 0.49.1 → 1.3.1, `python-multipart` 0.0.27 → 0.0.31, `pyjwt` 2.12.0 → 2.13.0, `cryptography` 46.0.7 → 48.0.1, `form-data` 4.0.5 → 4.0.6 (`/web`), `esbuild`/`@vitejs/plugin-react`/`vite` (`/web`), `happy-dom` 15.11.7 → 20.10.6 (`/cao_mcp_apps`), `ws` 8.20.0 → 8.21.0 (`/web`)
+
+### Upgrade notes
+
+- **Breaking:** the Amazon Q CLI and Gemini CLI providers have been removed. Profiles pinned to `provider: q_cli` or `provider: gemini_cli` must migrate to `kiro_cli` or `antigravity_cli` respectively.
+- `cao flow` continues to work as a deprecated alias for `cao schedule`.
+- `cao profile` and the graph rendering layer (`GraphView`) are in progress on `main` and are not part of this release; they will ship in a following minor release.
 
 ## [2.2.0] - 2026-06-04
 
