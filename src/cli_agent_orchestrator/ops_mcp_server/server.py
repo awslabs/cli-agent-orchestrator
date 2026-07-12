@@ -34,8 +34,9 @@ mcp = FastMCP(
     5. send_session_message to deliver a prompt to a running terminal
     6. get_terminal_status to poll a worker until it finishes a task
     7. get_terminal_output to read a worker's result (or review its files/git diff)
-    8. get_session_info or list_sessions to monitor overall progress
-    9. shutdown_session to clean up when done
+    8. read_session_output to read a terminal's captured output by session name
+    9. get_session_info or list_sessions to monitor overall progress
+    10. shutdown_session to clean up when done
     """,
 )
 
@@ -323,6 +324,127 @@ async def send_session_message(
         message=f"Message queued for terminal '{terminal_id}'",
         terminal_id=terminal_id,
     )
+
+
+def _read_session_output_impl(
+    terminal_id: Optional[str],
+    session_name: Optional[str],
+    mode: str,
+    max_chars: Optional[int],
+) -> JsonDict:
+    """Resolve a terminal and return its captured output (sync; mirrors other helpers)."""
+    if mode not in ("full", "last"):
+        return {"success": False, "message": f"Invalid mode '{mode}'; expected 'full' or 'last'"}
+
+    resolved_terminal_id = terminal_id
+    if not resolved_terminal_id:
+        if not session_name:
+            return {"success": False, "message": "Provide either terminal_id or session_name"}
+        info, error = _request_json(
+            "get",
+            f"/sessions/{session_name}",
+            operation=f"Resolve terminals for session '{session_name}'",
+        )
+        if error:
+            return {"success": False, "message": error}
+        terminals = info.get("terminals", []) if isinstance(info, dict) else []
+        if len(terminals) == 1:
+            resolved_terminal_id = str(terminals[0].get("id"))
+        elif not terminals:
+            return {"success": False, "message": f"Session '{session_name}' has no terminals"}
+        else:
+            return {
+                "success": False,
+                "message": (
+                    f"Session '{session_name}' has {len(terminals)} terminals; "
+                    "specify terminal_id"
+                ),
+                "terminals": terminals,
+            }
+
+    data, error = _request_json(
+        "get",
+        f"/terminals/{resolved_terminal_id}/output",
+        params={"mode": mode},
+        operation=f"Read output for terminal '{resolved_terminal_id}'",
+    )
+    if error:
+        return {"success": False, "message": error}
+    if not isinstance(data, dict) or "output" not in data:
+        return {"success": False, "message": "Read output failed: invalid response payload"}
+
+    output = data["output"]
+    total_chars = len(output)
+    truncated = False
+    if max_chars is not None and max_chars > 0 and total_chars > max_chars:
+        output = output[-max_chars:]
+        truncated = True
+
+    return {
+        "success": True,
+        "terminal_id": resolved_terminal_id,
+        "mode": mode,
+        "output": output,
+        "truncated": truncated,
+        "total_chars": total_chars,
+    }
+
+
+@mcp.tool()
+async def read_session_output(
+    terminal_id: Annotated[
+        Optional[str],
+        Field(
+            description="Target terminal ID (from list_sessions / get_session_info). "
+            "Primary key; either terminal_id or session_name is required."
+        ),
+    ] = None,
+    session_name: Annotated[
+        Optional[str],
+        Field(
+            description="CAO session name; convenience alternative to terminal_id. "
+            "Resolved to a terminal when the session has exactly one; if it has more "
+            "than one, the terminal list is returned and terminal_id is required."
+        ),
+    ] = None,
+    mode: Annotated[
+        str,
+        Field(
+            description="'full' (default): the recent rolling output buffer — deterministic "
+            "and provider-agnostic. 'last': provider-extracted last response — can be "
+            "unreliable on redraw-heavy TUIs; prefer 'full'."
+        ),
+    ] = "full",
+    max_chars: Annotated[
+        Optional[int],
+        Field(
+            description="Optional cap: return only the last max_chars of output "
+            "(guards against flooding the caller's context). Truncation is flagged "
+            "in the result."
+        ),
+    ] = None,
+) -> JsonDict:
+    """Read a CAO terminal's captured text output.
+
+    Wraps GET /terminals/{id}/output with two conveniences get_terminal_output
+    does not offer: the terminal can be addressed by session_name (resolved when
+    the session has exactly one terminal), and the returned text can be tail-capped
+    with max_chars so large buffers do not flood the caller. For sandboxed MCP
+    consumers whose own network cannot reach the CAO API, this tool is the only
+    way to read a worker's output; for host-side callers it is a typed convenience
+    over a raw HTTP GET.
+
+    Args:
+        terminal_id: Target terminal ID (primary key)
+        session_name: Convenience alternative; resolved to a terminal when unambiguous
+        mode: 'full' (default, rolling buffer) or 'last' (provider-extracted)
+        max_chars: Optional tail cap on returned characters
+
+    Returns:
+        Dict {success, terminal_id, mode, output, truncated, total_chars}, or
+        {success: False, message[, terminals]} on error / ambiguous session
+    """
+    return _read_session_output_impl(terminal_id, session_name, mode, max_chars)
 
 
 @mcp.tool()
