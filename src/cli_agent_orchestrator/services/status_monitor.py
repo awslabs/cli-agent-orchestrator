@@ -245,7 +245,9 @@ class StatusMonitor:
             self._screens[terminal_id] = scr
         scr[1].feed(chunk)
 
-    def _detect_screen(self, terminal_id: str, provider: Optional["BaseProvider"]) -> TerminalStatus:
+    def _detect_screen(
+        self, terminal_id: str, provider: Optional["BaseProvider"]
+    ) -> TerminalStatus:
         """Detect status from the terminal's composited pyte screen."""
         fallback_buffer: Optional[str] = None
         with self._lock:
