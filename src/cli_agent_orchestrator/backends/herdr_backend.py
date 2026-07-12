@@ -284,7 +284,7 @@ class HerdrBackend(TerminalBackend):
             session_name, window_name, terminal_id, pane_id=new_pane_id, extra_env=extra_env
         )
 
-        logger.info("Created herdr workspace: %s in %s", session_name, working_directory)
+        logger.info("Created herdr workspace")
         return window_name
 
     def session_exists(self, session_name: str) -> bool:
@@ -323,12 +323,12 @@ class HerdrBackend(TerminalBackend):
         try:
             workspace_id = self._resolve_workspace_id(session_name)
         except TerminalBackendError:
-            logger.warning("kill_session: workspace '%s' not found", session_name)
+            logger.warning("kill_session: workspace not found")
             return False
         result = self._run_herdr(["workspace", "close", workspace_id], check=False)
         if result.returncode == 0:
             self._workspace_cache.pop(session_name, None)
-            logger.info("Killed herdr workspace: %s", session_name)
+            logger.info("Killed herdr workspace")
             return True
         return False
 
@@ -375,7 +375,7 @@ class HerdrBackend(TerminalBackend):
                     "create_window: pane run failed for %s (non-fatal): %s", new_pane_id, e
                 )
 
-        logger.info("Created herdr tab in workspace %s", session_name)
+        logger.info("Created herdr tab")
         return window_name
 
     def kill_window(self, session_name: str, window_name: str) -> bool:
@@ -681,7 +681,7 @@ class HerdrBackend(TerminalBackend):
         deadline = time.time() + 15.0
         while time.time() < deadline:
             if os.path.exists(socket_path):
-                logger.info("Herdr session '%s' is ready.", self._herdr_session)
+                logger.info("Herdr session is ready.")
                 return
             time.sleep(0.1)
 
