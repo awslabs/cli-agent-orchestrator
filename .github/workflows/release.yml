@@ -49,7 +49,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add pyproject.toml CHANGELOG.md
+          git add pyproject.toml CHANGELOG.md .devcontainer/features/cao/devcontainer-feature.json
           git commit -m "chore: release v${{ steps.bump.outputs.version }}"
           git tag "v${{ steps.bump.outputs.version }}"
           git push && git push --tags
