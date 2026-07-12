@@ -255,7 +255,12 @@ class DevinCliProvider(BaseProvider):
 
             command = self._build_command()
             from cli_agent_orchestrator.backends.registry import get_backend
+            from cli_agent_orchestrator.services.status_monitor import status_monitor
 
+            # Arm the StatusMonitor stickiness gate before launching the CLI so
+            # the PROCESSING and IDLE/COMPLETED transitions during init are
+            # honored past any previously-latched ready state.
+            status_monitor.notify_input_sent(self.terminal_id)
             get_backend().send_keys(
                 self.session_name,
                 self.window_name,
