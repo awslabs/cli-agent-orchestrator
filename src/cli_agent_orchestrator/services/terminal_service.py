@@ -410,6 +410,16 @@ async def create_terminal(
             provider_manager.cleanup_provider(terminal_id)
         except Exception:
             pass  # Ignore cleanup errors
+        # Roll back the DB terminal row so a failed create does not leave an
+        # orphan record: the stale row would still be listed for the session
+        # and report UNKNOWN status even though nothing is running. Idempotent
+        # (DELETE ... WHERE id = ?), so it is a no-op when the failure happened
+        # before the row was written. Runs regardless of session_created so a
+        # pre-existing session keeps its live terminals but loses the dead row.
+        try:
+            db_delete_terminal(terminal_id)
+        except Exception:
+            pass  # Ignore cleanup errors
         if session_created and session_name:
             try:
                 get_backend().kill_session(session_name)
