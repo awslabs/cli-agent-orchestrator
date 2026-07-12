@@ -8,9 +8,7 @@ import logging
 import os
 import re
 import shlex
-import shutil
 import subprocess
-import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -21,6 +19,7 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
+from cli_agent_orchestrator.utils.mcp_resolution import resolve_cao_mcp_command
 from cli_agent_orchestrator.utils.terminal import wait_for_shell
 
 logger = logging.getLogger(__name__)
@@ -178,25 +177,16 @@ class CopilotCliProvider(BaseProvider):
         return shlex.join(command_parts)
 
     def _build_runtime_mcp_config(self) -> str:
-        merged_servers: dict = {}
-        venv_script = Path(sys.executable).with_name("cao-mcp-server")
-        found_script = shutil.which("cao-mcp-server")
-        mcp_args: list[str]
-        if venv_script.exists():
-            mcp_command = str(venv_script)
-            mcp_args = []
-        elif found_script:
-            mcp_command = found_script
-            mcp_args = []
-        else:
-            mcp_command = sys.executable
-            mcp_args = ["-m", "cli_agent_orchestrator.mcp_server.server"]
-
-        merged_servers["cao-mcp-server"] = {
-            "command": mcp_command,
-            "args": mcp_args,
-            "disabled": False,
-            "env": {"CAO_TERMINAL_ID": self.terminal_id},
+        # Resolve the bundled cao-mcp-server console script to a PATH-independent
+        # invocation via the shared resolver.
+        mcp_command, mcp_args = resolve_cao_mcp_command("cao-mcp-server", [])
+        merged_servers: dict = {
+            "cao-mcp-server": {
+                "command": mcp_command,
+                "args": mcp_args,
+                "disabled": False,
+                "env": {"CAO_TERMINAL_ID": self.terminal_id},
+            }
         }
         return json.dumps({"mcpServers": merged_servers}, ensure_ascii=False)
 

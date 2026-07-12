@@ -12,6 +12,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
@@ -277,9 +278,12 @@ class CodexProvider(BaseProvider):
                 for server_name, server_config in profile.mcpServers.items():
                     prefix = f"mcp_servers.{server_name}"
                     if isinstance(server_config, dict):
-                        cfg = server_config
+                        cfg = dict(server_config)
                     else:
                         cfg = server_config.model_dump(exclude_none=True)
+                    # Resolve the bundled cao-mcp-server console script to a
+                    # PATH-independent invocation.
+                    cfg = resolve_mcp_server_config(cfg)
                     if "command" in cfg:
                         command_parts.extend(["-c", f'{prefix}.command="{cfg["command"]}"'])
                     if "args" in cfg:
@@ -520,7 +524,15 @@ class CodexProvider(BaseProvider):
         the end of that line and the next empty idle prompt.
         Fallback: use assistant marker based extraction when no user message is found.
         """
-        clean_output = re.sub(ANSI_CODE_PATTERN, "", script_output)
+        # Strip ALL terminal escape sequences, not just SGR colour codes. The
+        # narrow ANSI_CODE_PATTERN (``\x1b[...m``) leaves cursor-movement (H),
+        # erase (K), and scroll CSI sequences in place; codex's TUI emits those
+        # heavily, so an SGR-only strip returned raw escape garbage
+        # (``[49;2H[K[38;2;...m``) as the "response", failing extraction. Use
+        # the shared strip which also normalises \r and column-1 cursor moves to
+        # newlines — this is fed a tmux capture-pane render (already laid out),
+        # so the line-based extraction below still anchors correctly.
+        clean_output = strip_terminal_escapes(script_output)
 
         # Primary: find last user message, extract response between it and idle prompt.
         # Exclude the Codex TUI footer from user-message matching when detected.

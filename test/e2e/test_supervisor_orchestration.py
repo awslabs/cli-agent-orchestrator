@@ -40,17 +40,26 @@ import pytest
 import requests
 
 from cli_agent_orchestrator.constants import API_BASE_URL
+from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 
 def _get_full_output(terminal_id: str) -> str:
-    """Get full terminal output (entire scrollback)."""
+    """Get full terminal output (entire scrollback), escape-stripped.
+
+    ``mode=full`` returns the raw StatusMonitor rolling buffer verbatim — for a
+    TUI provider (kiro, codex) that buffer is dominated by cursor-movement /
+    erase CSI sequences, so plain-text keyword checks must strip escapes first.
+    We do NOT strip at the service layer because the web UI renders ``mode=full``
+    as a live terminal and needs the escapes for colour/layout; stripping is the
+    right thing only here, where the test greps for human-readable content.
+    """
     resp = requests.get(
         f"{API_BASE_URL}/terminals/{terminal_id}/output",
         params={"mode": "full"},
     )
     if resp.status_code != 200:
         return ""
-    return resp.json().get("output", "")
+    return strip_terminal_escapes(resp.json().get("output", ""))
 
 
 def _get_inbox_messages(terminal_id: str, status_filter: str = None):
@@ -72,11 +81,12 @@ def _get_inbox_messages(terminal_id: str, status_filter: str = None):
 # 2. Call handoff/assign MCP tools (which create new terminals)
 # 3. Wait for workers to initialize and complete
 # 4. Collect results and produce final output
-# 600s, not 300: a kimi worker alone takes ~3m20s on the report-template
-# handoff, and the supervisor then streams a long report response. 300s only
-# appeared sufficient while status detection reported a false early COMPLETED
-# mid-turn — with honest detection the slowest provider needs the headroom.
-SUPERVISOR_COMPLETION_TIMEOUT = 600
+# 1200s: a kimi worker alone takes ~3m20s on the report-template handoff, and
+# multi-step supervisor flows (assign + handoff, or supervisor + 2 workers with
+# Opus 4.8) commonly need ~15 min end-to-end. Earlier 600s appeared sufficient
+# while status detection reported a false early COMPLETED mid-turn — with
+# honest detection the slowest provider needs more headroom for the real turn.
+SUPERVISOR_COMPLETION_TIMEOUT = 1200
 
 
 def _list_terminals_in_session(session_name: str) -> list:
@@ -106,6 +116,24 @@ def _wait_for_ready(terminal_id: str, timeout: float = 120.0, poll: float = 3.0)
     return False
 
 
+# A supervisor is "done" when it is in a ready state (COMPLETED or IDLE). Both
+# are accepted because kiro 2.11 legitimately finishes a turn at IDLE with no
+# Credits marker (the marker is intermittent in TUI mode; verified by a run
+# where the supervisor produced a full combined report yet never emitted
+# COMPLETED — a COMPLETED-only gate hung until timeout on it). But IDLE alone is
+# ambiguous: a kiro supervisor is ALSO idle *between* firing an async assign and
+# receiving the worker's callback, so a bare idle+workers check can declare
+# "done" mid-orchestration and tear the session down before results are combined
+# (the original hollow-pass regression). The status alone cannot tell the two
+# idles apart — the mid-dispatch idle observed in one run lasted ~32s, longer
+# than any stable-window guard. So for async assign flows the gate additionally
+# requires the worker callback to have actually landed in the supervisor's inbox
+# (see ``require_inbox_callback``): that delivery is impossible during the
+# mid-dispatch idle (no worker has reported back yet) and is the assign
+# protocol's real completion signal.
+_SUPERVISOR_DONE_STATES = {"completed", "idle"}
+
+
 def _wait_for_supervisor_done(
     supervisor_id: str,
     session_name: str,
@@ -113,30 +141,53 @@ def _wait_for_supervisor_done(
     timeout: float = SUPERVISOR_COMPLETION_TIMEOUT,
     poll: float = 5.0,
     stable_count: int = 2,
+    require_inbox_callback: bool = False,
+    require_worker_completed: bool = False,
 ) -> tuple:
-    """Wait for supervisor to reach COMPLETED AND spawn expected workers.
+    """Wait for the supervisor to reach a stable ready state AND spawn workers.
 
-    Some providers report COMPLETED after initial text output but before MCP
-    tool calls (handoff/assign) finish creating worker terminals. A provider
+    Some providers report a ready status after initial text output but before
+    MCP tool calls (handoff/assign) finish creating worker terminals. A provider
     whose TUI keeps the idle prompt visible at all times can make the status
-    detector see "response + idle prompt" = COMPLETED even while the model is
+    detector see "response + idle prompt" = ready even while the model is
     between text output and the first MCP tool call.
 
-    Similarly, Codex can briefly show COMPLETED between consecutive MCP tool
-    calls (e.g., after assign returns but before handoff starts). Requiring
-    ``stable_count`` consecutive COMPLETED readings avoids these false positives.
+    Similarly, Codex can briefly show ready between consecutive MCP tool calls
+    (e.g., after assign returns but before handoff starts). Requiring
+    ``stable_count`` consecutive ready readings avoids these false positives.
+
+    "Done" means the supervisor has finished RENDERING its final output — not
+    merely that it reached a ready status. kiro's IDLE is ambiguous (it is idle
+    mid-dispatch, idle while awaiting a worker callback, and idle mid-repaint
+    while presenting), so a status-only check races the presentation turn and
+    reads a half-drawn TUI frame. The deterministic completion signal is OUTPUT
+    QUIESCENCE: the ``mode=full`` buffer is byte-for-byte unchanged across
+    ``stable_count`` consecutive polls. While the supervisor works, dispatches,
+    or repaints (its spinner animates ~10 fps, text streams), the buffer keeps
+    changing, so quiescence cannot hold mid-turn; once the report is fully
+    rendered and the turn ends, it goes static. This removes the need to poll
+    extraction with retries — by the time this returns, the output is complete.
+
+    Because a genuine end-of-turn idle and an inter-turn idle can both be briefly
+    quiescent, orchestration flows add a structural completion guard:
+    - ``require_inbox_callback`` (async assign): a DELIVERED callback exists and
+      nothing is still PENDING — the supervisor has received every worker result.
+    - ``require_worker_completed`` (sync handoff): a seen worker has left the
+      session (handoff auto-deletes its worker on completion).
 
     The ``handoff`` MCP tool auto-deletes its worker terminal as soon as the
-    worker finishes. A point-in-time session listing taken after the
-    supervisor reports COMPLETED can therefore miss workers that came and
-    went during the run. To avoid this race we accumulate the union of every
-    unique terminal id observed across all polls — once seen, a worker
-    "counts" even if it has since been cleaned up.
+    worker finishes. A point-in-time session listing taken after the supervisor
+    reports ready can therefore miss workers that came and went during the run.
+    To avoid this race we accumulate the union of every unique terminal id
+    observed across all polls — once seen, a worker "counts" even if it has
+    since been cleaned up.
 
-    This function polls until BOTH conditions are true:
-    - Terminal status is 'completed' for ``stable_count`` consecutive polls
-    - At least min_terminals unique terminals have been observed in the
-      session at some point during the run (supervisor + workers)
+    This function polls until ALL of these are true:
+    - Terminal status is ready (idle/completed)
+    - The output buffer is unchanged for ``stable_count`` consecutive polls
+    - At least min_terminals unique terminals have been observed in the session
+    - If ``require_inbox_callback``: a delivered callback exists, none pending
+    - If ``require_worker_completed``: a seen worker has left the live session
 
     Returns (last_status, terminals_list) where terminals_list is the union
     of all unique terminals seen during polling.
@@ -144,24 +195,71 @@ def _wait_for_supervisor_done(
     start = time.time()
     last_status = "unknown"
     seen_terminals: dict = {}
-    consecutive_completed = 0
+    worker_completed = False
+    consecutive_ready = 0
+    prev_output = None
 
     while time.time() - start < timeout:
         last_status = get_terminal_status(supervisor_id)
+        live_ids = set()
         for t in _list_terminals_in_session(session_name):
             tid = t.get("id")
             if tid:
                 seen_terminals[tid] = t
+                live_ids.add(tid)
+
+        # A worker "completed" once a previously-seen worker (any non-supervisor
+        # terminal) has left the live session — handoff auto-deletes its worker
+        # on completion. Latch True; stays true afterward even though the union
+        # in seen_terminals keeps the worker for the min_terminals count.
+        seen_workers = set(seen_terminals) - {supervisor_id}
+        if seen_workers and not seen_workers & live_ids:
+            worker_completed = True
 
         if last_status == "error":
             return last_status, list(seen_terminals.values())
 
-        if last_status == "completed" and len(seen_terminals) >= min_terminals:
-            consecutive_completed += 1
-            if consecutive_completed >= stable_count:
+        # "Done" = the supervisor has finished RENDERING its final output, not
+        # merely reached a ready status. kiro's IDLE is ambiguous (idle mid-
+        # dispatch, idle awaiting a callback, idle mid-presentation-repaint), so
+        # status alone races the presentation turn and reads a half-drawn frame.
+        # The deterministic signal is OUTPUT QUIESCENCE: while the supervisor is
+        # working, dispatching, or repainting its TUI, the output buffer keeps
+        # changing; once the report is fully rendered and the turn ends, it goes
+        # static. We require a ready status AND the output byte-for-byte
+        # unchanged across stable_count consecutive polls — that quiescence
+        # cannot hold mid-turn (spinner animates, text streams).
+        current_output = _get_full_output(supervisor_id)
+        output_quiesced = current_output == prev_output and bool(current_output.strip())
+        prev_output = current_output
+
+        ready = (
+            last_status in _SUPERVISOR_DONE_STATES
+            and len(seen_terminals) >= min_terminals
+            and output_quiesced
+        )
+        if ready and require_inbox_callback:
+            # assign is async: the analyst reports back via send_message. Require
+            # a DELIVERED callback with nothing still PENDING — i.e. the
+            # supervisor has actually received every worker result, not that a
+            # worker merely queued one. This rejects the idle-awaiting-delivery
+            # window (a pending-but-undelivered message) as well as the mid-
+            # dispatch idle (no message at all).
+            delivered = _get_inbox_messages(supervisor_id, status_filter="delivered")
+            pending = _get_inbox_messages(supervisor_id, status_filter="pending")
+            ready = bool(delivered) and not pending
+        if ready and require_worker_completed:
+            # handoff is synchronous with no inbox callback: the worker result
+            # returns inline. Require the worker to have finished (left the
+            # session) so we don't accept the mid-handoff idle.
+            ready = worker_completed
+
+        if ready:
+            consecutive_ready += 1
+            if consecutive_ready >= stable_count:
                 return last_status, list(seen_terminals.values())
         else:
-            consecutive_completed = 0
+            consecutive_ready = 0
 
         time.sleep(poll)
 
@@ -211,15 +309,20 @@ def _run_supervisor_handoff_test(provider: str):
         )
         assert resp.status_code == 200, f"Send message failed: {resp.status_code}"
 
-        # Step 4+5: Wait for supervisor to complete AND create worker terminal.
-        # Uses combined polling because some providers report COMPLETED from
-        # initial text output before MCP tool calls finish.
+        # Step 4+5: Wait for supervisor to finish rendering its combined output
+        # (output-quiescence gate) AND create the worker terminal.
+        # Handoff is synchronous — the worker result returns inline to the
+        # supervisor's turn, there is no async inbox callback — so the structural
+        # guard is require_worker_completed: the worker must have finished and
+        # left the session before we accept the supervisor's idle. Combined with
+        # output quiescence, this ensures the report is fully rendered by the
+        # time this returns, so extract_output below reads a settled frame.
         status, terminals = _wait_for_supervisor_done(
-            supervisor_id, actual_session, min_terminals=2
+            supervisor_id, actual_session, min_terminals=2, require_worker_completed=True
         )
-        assert status == "completed", (
-            f"Supervisor did not reach COMPLETED within {SUPERVISOR_COMPLETION_TIMEOUT}s "
-            f"(provider={provider}). Last status: {status}"
+        assert status in _SUPERVISOR_DONE_STATES, (
+            f"Supervisor did not reach a ready state (idle/completed) within "
+            f"{SUPERVISOR_COMPLETION_TIMEOUT}s (provider={provider}). Last status: {status}"
         )
         assert len(terminals) >= 2, (
             f"Expected at least 2 terminals (supervisor + worker), got {len(terminals)}. "
@@ -306,12 +409,15 @@ def _run_supervisor_assign_test(provider: str):
         # assign(data_analyst) + handoff(report_generator) = at least 3 terminals.
         # Uses combined polling because some providers report COMPLETED from
         # initial text output before MCP tool calls finish.
+        # assign is async — the data_analyst reports back via send_message to the
+        # supervisor's inbox. Require that callback before accepting idle so we
+        # don't grab the mid-dispatch idle (which precedes any callback).
         status, terminals = _wait_for_supervisor_done(
-            supervisor_id, actual_session, min_terminals=3
+            supervisor_id, actual_session, min_terminals=3, require_inbox_callback=True
         )
-        assert status == "completed", (
-            f"Supervisor did not reach COMPLETED within {SUPERVISOR_COMPLETION_TIMEOUT}s "
-            f"(provider={provider}). Last status: {status}"
+        assert status in _SUPERVISOR_DONE_STATES, (
+            f"Supervisor did not reach a ready state (idle/completed) within "
+            f"{SUPERVISOR_COMPLETION_TIMEOUT}s (provider={provider}). Last status: {status}"
         )
         assert len(terminals) >= 3, (
             f"Expected at least 3 terminals (supervisor + data_analyst + report_generator), "
@@ -423,11 +529,15 @@ def _run_supervisor_assign_three_analysts_test(provider: str):
 
         # Expected minimum: supervisor + 3 analysts + report generator
         status, terminals = _wait_for_supervisor_done(
-            supervisor_id, actual_session, min_terminals=5, timeout=420
+            supervisor_id,
+            actual_session,
+            min_terminals=5,
+            timeout=420,
+            require_inbox_callback=True,
         )
-        assert status == "completed", (
-            f"Supervisor did not reach COMPLETED within timeout (provider={provider}). "
-            f"Last status: {status}"
+        assert status in _SUPERVISOR_DONE_STATES, (
+            f"Supervisor did not reach a ready state (idle/completed) within timeout "
+            f"(provider={provider}). Last status: {status}"
         )
         assert len(terminals) >= 5, (
             "Expected at least 5 terminals " "(supervisor + analyst A/B/C + report_generator)"

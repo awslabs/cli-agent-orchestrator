@@ -1,7 +1,7 @@
 """Provider manager as module singleton with direct terminal_id → provider mapping."""
 
 import logging
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from cli_agent_orchestrator.clients.database import get_terminal_metadata
 from cli_agent_orchestrator.models.provider import ProviderType
@@ -26,9 +26,9 @@ class ProviderManager:
     def __init__(self) -> None:
         self._providers: Dict[str, BaseProvider] = {}
 
-    def _get_provider_factory(self, provider_type: str):
+    def _get_provider_factory(self, provider_type: str) -> Callable[..., BaseProvider]:
         """Get provider factory function for given type."""
-        factories = {
+        factories: Dict[str, Callable[..., BaseProvider]] = {
             ProviderType.KIRO_CLI.value: self._create_kiro_cli_provider,
             ProviderType.CLAUDE_CODE.value: self._create_claude_code_provider,
             ProviderType.CODEX.value: self._create_codex_provider,

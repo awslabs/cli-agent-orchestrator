@@ -4,15 +4,61 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
 ## [Unreleased]
 
 ### Added
+
+- add `cao profile` command group for profile lifecycle management: list/show/validate/remove/templates/create. Includes Jinja2 scaffolding engine with 7 AWS templates (stepfunction, cloudwatch-logs, dynamodb-query, dynamodb-delete, sqs-monitor, sqs-send, sqs-dlq-check) and JSON-Schema validation for both profiles and template configs (#340)
+
+- Enable/disable an agent-profile directory without removing it, so its profiles leave the active set while the path stays listed (#280, #281).
+
+- add optional `skills` field to `AgentProfile` to scope the per-agent skill catalog via an fnmatch allowlist; runtime-prompt providers only, `load_skill` resolution unchanged (#351)
 
 - add Antigravity CLI (`agy`) provider — Google's terminal-native coding agent and the successor to the Gemini CLI after the free "Login with Google" path was retired (#323)
 
 - add Devin CLI (`devin`) provider (#336)
 
 - add built-in Hermes provider support through profile-configured `hermesProfile` wrappers
+
+- add OKF memory export/import — `cao memory export`/`cao memory import` CLI commands plus a read-scoped `GET /memory/export` API endpoint streaming a scope as a tar.gz bundle (#345)
+- add `examples/fleet` — a cross-node fleet coordinator that manages many CAO nodes from one place: one-command node bootstrap, a `fleet` control helper (list/show/exec against any node), and an AI conductor wired to one `cao-ops-mcp-server` per node. Purely additive under `examples/`; each node stays a stateless client of the existing `cao-server` API (#349)
+- add `examples/fleet/panel` — a web control panel + live console for the fleet: a stateless FastAPI app that fans out to every node's `cao-server` REST API and serves a browser SPA (a wall of live agent screens + a focused console). Isolates per-node failures, degrades `/screen` → `/output` for older nodes, and adds opt-in shared-token auth (`CAO_PANEL_TOKEN`) for off-loopback use (#366)
+
+### Changed
+
+- rename `cao flow` → `cao schedule` to avoid confusion with the new `cao workflow` feature. `cao flow` remains as a hidden deprecated alias that prints a warning to stderr; flow files, `~/.cao/flows`, stored schedules, and the `/flows` REST API are unchanged, and the web UI only updates its CLI hint string (#378)
+
+### Deprecated
+
+- `cao flow` — use `cao schedule` instead; the alias will be removed in a future release (#378)
+
+### Fixed
+
+- mcp: bundled agent profiles now launch the installed `cao-mcp-server` console script instead of re-fetching the whole package from GitHub via `uvx --from git+…@main` on every agent launch — the cold fetch (~20s) exceeded some providers' MCP startup timeout (Codex: 10s), so agents came up without their orchestration tools (`handoff`/`assign`/`send_message`) and silently could not delegate; a shared resolver (`utils/mcp_resolution.py`) rewrites the bare command to a PATH-independent invocation (interpreter-sibling → PATH → `python -m`), used by all providers, and a regression test keeps new profiles from reintroducing the network fetch (#403)
+
+- claude_code: a backgrounded task ("✻ Waiting for N dynamic workflow(s) to finish") no longer reads as COMPLETED — the wait line has no spinner ellipsis (invisible to every PROCESSING check) while the printed response + idle ❯ box look like a finished turn, and it even matched the lenient completion pattern; both the raw-buffer and pyte screen paths now report PROCESSING until a newer response/completion summary appears, so dashboards and wait_until_terminal_status no longer see a mid-run terminal as done (#392)
+
+- fifo: non-blocking FIFO reader loop and event-loop-safe session teardown — reader threads can no longer be stranded in a blocking FIFO `open()` by a stop/reopen race, and `DELETE /sessions` runs teardown in a worker thread, so repeated create/delete cycles can no longer wedge cao-server (#382)
+- kiro-cli 2.11 compatibility:
+  - bracketed paste now sends 2 Enters with a 1s submit delay so pasted task text is actually submitted (kiro 2.11's TUI swallows the single Enter used by older versions, leaving the message unsent)
+  - `TUI_PROCESSING_PATTERN` matches both `"Kiro is working"` (pre-2.11) and `"Thinking..."` (2.11+)
+  - Check 6 (no-Credits completion path) now requires a full bordered response box (two separators + ≥2 content lines) instead of any idle-prompt match after `input_received`; kiro 2.11 keeps the `"ask a question or describe a task"` placeholder in the raw buffer at all times, so the previous logic tore workers down within seconds of receiving a task
+  - always launch `kiro-cli chat` with `--trust-all-tools`, not just in yolo mode. kiro 2.11 introduced a `"subagent requires approval"` interactive prompt that fires on every MCP tool call spawning a subagent (e.g. `cao-mcp-server` `assign`/`handoff`); with no human at the terminal in headless orchestration, the supervisor deadlocked on the dialog. CAO still enforces tool scoping at its own layers (profile `allowedTools` + MCP allowlist), so bypassing kiro's UI-level per-invocation confirm is safe. Also broadened `TUI_PERMISSION_PATTERN` to detect the new `Yes / Trust / No` layout and the `"subagent requires approval"` header
+- status monitor: `send_input` now uses `clear_rolling_buffer` (byte-only) instead of `reset_buffer` so the sticky-latch arm set by `notify_input_sent` survives. Prevents the IDLE→PROCESSING transition from being latch-blocked when kiro 2.11's TUI immediately renders a partial idle frame after `send_input` (regression seen in `test_supervisor_assign_and_handoff`: supervisor completed real work but status stayed IDLE for the whole turn)
+- fifo reader: coalesce chunks arriving within a 50ms window into one publish. Kiro's TUI spinner animates ~10 fps and each frame is a separate FIFO write — without coalescing that flooded the shared async queue and dropped worker state transitions along with the animation noise, breaking assign and handoff (supervisor never saw the worker's completion). Coalescing reduces publish rate ~20x during bursts and keeps the queue drained
+- event_bus: rate-limit "queue full" drop reporting to at most one line per topic per second (first drop still logs immediately so back-pressure is not silently swallowed). Under a real dual-worker output burst the previous per-drop ERROR log accumulated 42,000+ lines in ~20 minutes, which itself contributed to event-loop starvation. Also downgraded the message from ERROR to WARNING — a dropped event is a soft signal, not a fatal condition. The per-topic drop-state maps are now bounded: since topics embed terminal IDs, a long-running server that churns through many short-lived terminals would otherwise accumulate a dead entry per terminal forever — stale entries (idle past a TTL) are evicted once the map grows past a cap
+- log_writer: drain the event-bus queue in batches of up to 256 events and group same-file writes so each unique log file is opened at most once per batch. The prior "one asyncio.to_thread(write) per event" pattern capped throughput at ~one file-write per event-loop tick, which was slower than the FIFO reader's publish rate under two concurrent evaluators streaming multi-KB frames. Ordering per terminal is preserved (chunks are concatenated in drain order before the write)
+- event loop: offload blocking tmux subprocess I/O off the asyncio event loop — the most operator-relevant fix here. `StatusMonitor` chunk processing (which shells out to `tmux` per output burst for tmux-backed providers) and the blocking `terminal_service` calls in the API handlers (`send_input`, `get_output`, `exit_terminal_cli`, `delete_terminal`, `send_special_key`, `get_terminal`) and in `run_agent_step` (handoff) now run via `asyncio.to_thread`. Under concurrent worker output these were forking `tmux` directly on the loop, freezing the whole server — `/health` and the supervisor's follow-up `assign` calls stranded until clients timed out. Diagnosed via lldb (loop thread parked in `__fork`/`subprocess_fork_exec`). Same hazard class as #382, previously fixed only for `DELETE /sessions`. Spawned detection/deferred-init tasks are held in strong-reference sets (asyncio only weak-refs `create_task` results)
+- codex: `extract_last_message_from_script` now strips ALL terminal escape sequences (`strip_terminal_escapes`) instead of only SGR colour codes. codex's TUI emits cursor-move/erase CSI sequences heavily; the SGR-only strip left them in, so `get_output(mode=last)` returned escape garbage instead of the response
+- poll_until_done (`cao launch` / `cao session send`, sync mode): now returns on a STABLE ready state — COMPLETED immediately (unchanged), or IDLE after the agent has been observed working and idle then persists for a short window. Previously required COMPLETED only, so a kiro agent that finished a turn at IDLE with no Credits marker would hang until the 300s timeout. This semantics change affects every provider, not just kiro. Only PROCESSING/WAITING_USER_ANSWER now flip the "observed working" flag — UNKNOWN does not, since a terminal can report UNKNOWN before it starts (no output yet / provider not registered / deferred init) and counting it would let a following stable idle return early with empty output. The status GET also carries a per-request timeout so a stalled server cannot block past the outer timeout budget
+- status monitor: `_arm_quiesce_timer` now cancels any outstanding quiescence timer for a terminal before arming the new one. Several output chunks arriving in quick succession queued multiple `_arm` closures; the later one overwrote the stored `TimerHandle` while leaving the earlier timer live, so two timers fired and a stale one firing mid-burst caused early/duplicate quiescence detections and status flaps. One outstanding timer per terminal now, always the latest
+- terminal_service: deferred-init failure path logs with `exc_info=True` (preserving the traceback) and formats the exception with `{e!r}` in both the log line and the supervisor-facing inbox message, so provider-supplied error text can't inject newlines/control characters
+- api: `POST /sessions/{name}/terminals` now rejects an `initial_message` / `initial_message_orchestration_type` body with 400 when `defer_init=false` — that payload is only delivered on the deferred-init path, so silently dropping it previously surfaced as a hard-to-diagnose "worker never received task". Deliberate 4xx responses (this guard and the invalid-orchestration-type check) also propagate as-is instead of being masked as 500
+
+### Security
+
+- memory: validate every user-derived path component (`key`, `scope`, `scope_id`) as a single safe path segment and confine assembled wiki/index paths under the memory base directory via `os.path.realpath` + an explicit containment guard, closing the 11 CodeQL `py/path-injection` alerts in `memory_service.py`. Added shared helpers `validate_path_component` / `safe_join_under_base` in `utils/path_validation.py`. The remaining `py/clear-text-storage-sensitive-data` alert is assessed as a false positive (the memory wiki is intentionally plaintext markdown; the flagged value is a topic `key` slug, not a credential) and documented in-code for won't-fix dismissal.
 
 ## [2.2.0] - 2026-06-04
 

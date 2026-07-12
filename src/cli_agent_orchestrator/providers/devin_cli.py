@@ -106,6 +106,8 @@ class DevinCliProvider(BaseProvider):
 
     def _build_security_constraint(self) -> str:
         """Build security constraint prompt for allowed tools."""
+        if self._allowed_tools is None:
+            return ""
         tools_list = ", ".join(self._allowed_tools)
         return f"""## SECURITY CONSTRAINTS
 1. NEVER read/output: ~/.aws/credentials, ~/.ssh/*, .env, *.pem
@@ -134,9 +136,11 @@ You are restricted to only use the following tools: {tools_list}
         user_config_path = Path.home() / ".config" / "devin" / "config.json"
         if user_config_path.exists():
             try:
-                return json.loads(user_config_path.read_text())
+                data = json.loads(user_config_path.read_text())
+                if isinstance(data, dict):
+                    return data
             except (json.JSONDecodeError, OSError):
-                return {}
+                pass
         # Minimal config to skip the first-run wizard
         return {
             "shell": {"setup_complete": True},
@@ -189,6 +193,7 @@ You are restricted to only use the following tools: {tools_list}
         if self._allowed_tools is not None and "*" not in self._allowed_tools:
             security_constraint = self._build_security_constraint()
             self._write_prompt_file(security_constraint)
+            assert self._temp_prompt_file is not None
             command_parts.extend(["--prompt-file", self._temp_prompt_file])
 
         if self._agent_profile is not None:
@@ -210,6 +215,7 @@ You are restricted to only use the following tools: {tools_list}
                         f.write(combined_prompt)
                 else:
                     self._write_prompt_file(system_prompt)
+                    assert self._temp_prompt_file is not None
                     command_parts.extend(["--prompt-file", self._temp_prompt_file])
 
             # Add MCP config if present

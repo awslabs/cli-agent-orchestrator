@@ -178,6 +178,33 @@ class TestCodexBuildCommand:
         # Tool timeout must be a TOML float (600.0) for Codex's f64 deserializer
         assert "mcp_servers.cao-mcp-server.tool_timeout_sec=600.0" in command
 
+    @patch("cli_agent_orchestrator.providers.codex.resolve_mcp_server_config")
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_bundled_mcp_command_is_resolved(self, mock_load_profile, mock_resolve):
+        """The bundled bare cao-mcp-server command is run through the resolver
+        before being emitted as a -c override."""
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = "You are a supervisor."
+        mock_profile.mcpServers = {
+            "cao-mcp-server": {"type": "stdio", "command": "cao-mcp-server", "args": []}
+        }
+        mock_profile.codexProfile = None
+        mock_load_profile.return_value = mock_profile
+        # Simulate the resolver returning a PATH-independent absolute path.
+        mock_resolve.side_effect = lambda cfg: {
+            **cfg,
+            "command": "/home/u/.local/bin/cao-mcp-server",
+            "args": [],
+        }
+
+        provider = CodexProvider("test1234", "test-session", "window-0", "code_supervisor")
+        command = provider._build_codex_command()
+
+        # The resolver was invoked and its resolved command appears in the override.
+        assert mock_resolve.called
+        assert 'mcp_servers.cao-mcp-server.command="/home/u/.local/bin/cao-mcp-server"' in command
+
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_build_command_with_mcp_servers_env(self, mock_load_profile):
         mock_profile = MagicMock()
@@ -1164,6 +1191,30 @@ class TestCodexProviderMessageExtraction:
 
         with pytest.raises(ValueError, match="No Codex response found"):
             provider.extract_last_message_from_script(output)
+
+    def test_extract_strips_cursor_and_erase_escapes(self):
+        """PR #390: extraction must strip ALL terminal escapes, not just SGR
+        colour codes. codex's TUI emits cursor-move (H) and erase (K) CSI
+        sequences heavily; the old SGR-only strip (\\x1b[...m) left them in the
+        result as garbage. This fixture interleaves those sequences with the
+        response; the extracted text must be clean and contain the answer.
+        """
+        # Cursor-position (\x1b[<r>;<c>H), erase-line (\x1b[K), and truecolor SGR
+        # (\x1b[38;2;...m) all interleaved — the exact shape seen in the failing
+        # e2e run. Only the SGR codes end in 'm'; H and K would survive a
+        # SGR-only strip.
+        output = (
+            "\x1b[2K\x1b[38;2;200;200;200m› analyze dataset A\x1b[0m\n"
+            "\x1b[32;76H\x1b[K• The mean is 3.0 and the median is 3.0.\x1b[K\n"
+            "\x1b[33;2H\x1b[38;2;120;120;120mDataset is symmetric.\x1b[0m\n"
+            "\x1b[K❯ \n"
+        )
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        message = provider.extract_last_message_from_script(output)
+
+        assert "\x1b" not in message, f"escapes leaked into extracted message: {message!r}"
+        assert "mean is 3.0" in message
+        assert "median is 3.0" in message
 
     def test_extract_message_empty_response(self):
         output = "assistant:   \n\n❯ "

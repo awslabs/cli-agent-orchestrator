@@ -26,6 +26,13 @@ class AgentProfile(BaseModel):
     system_prompt: Optional[str] = None  # The markdown content
     role: Optional[str] = None  # "supervisor", "developer", "reviewer"
 
+    # CAO-native. Per-agent skill-catalog scope: when set, only skills whose name
+    # matches one of these patterns (exact name or fnmatch glob, e.g. "ads-*") are
+    # injected into this agent's "## Available Skills" catalog at launch. None =
+    # the full catalog (backward-compatible); [] = no skills advertised. Consumed
+    # by CAO when composing the prompt, not passed through to provider JSON.
+    skills: Optional[List[str]] = None
+
     # Q CLI agent fields (all optional, will be passed through to JSON)
     prompt: Optional[str] = None
     mcpServers: Optional[Dict[str, Any]] = None

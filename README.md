@@ -149,6 +149,17 @@ cao install https://example.com/agents/custom-agent.md
 
 For creating custom agent profiles, see [docs/agent-profile.md](docs/agent-profile.md).
 
+#### Profile management (`cao profile`)
+
+```bash
+cao profile list                                    # List all installed profiles
+cao profile show <name|file>                        # Inspect frontmatter details
+cao profile validate <name|file>                    # Schema + deprecation checks
+cao profile templates                               # List scaffolding templates
+cao profile create -t aws/stepfunction -c config.json  # Generate from template
+cao profile remove <name>                           # Delete from local store
+```
+
 ### 2. Start the server
 
 ```bash
@@ -359,14 +370,14 @@ Typical workflow: `list_profiles` → `install_profile` → `launch_session` →
 Schedule agent sessions to run automatically using cron expressions:
 
 ```bash
-cao flow add daily-standup.md
-cao flow list
-cao flow run daily-standup   # manual run, ignores schedule
+cao schedule add daily-standup.md
+cao schedule list
+cao schedule run daily-standup   # manual run, ignores schedule
 ```
 
 Flows support static prompts or conditional execution via a gating script. `cao-server` must be running for scheduled execution.
 
-For the full guide — flow file format, the conditional-execution pattern, and all `cao flow` commands — see [docs/flows.md](docs/flows.md).
+For the full guide — flow file format, the conditional-execution pattern, and all `cao schedule` commands — see [docs/flows.md](docs/flows.md).
 
 ### Skills
 

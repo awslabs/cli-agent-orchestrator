@@ -21,8 +21,9 @@ or ``None`` "success". The caller (engine) maps the raised exception to its 3x
 retry policy (FR-5.3); the HTTP handler maps it to an ``HTTPException``.
 """
 
+import asyncio
 import logging
-from typing import Optional
+from typing import Callable, Optional
 
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
@@ -85,6 +86,7 @@ async def run_agent_step(
     allowed_tools: Optional[list[str]] = None,
     registry: Optional[PluginRegistry] = None,
     env_vars: Optional[dict[str, str]] = None,
+    on_terminal_created: Optional[Callable[[str], None]] = None,
 ) -> AgentStepResult:
     """Run one agent step and return its result (success only).
 
@@ -137,6 +139,16 @@ async def run_agent_step(
             the substrate creates a fresh session per step, so the per-step env is
             injected cleanly (no stale step_id from a shared session). Default None
             = behavior unchanged (the handoff caller passes nothing).
+        on_terminal_created: Optional callback invoked with the ``terminal_id``
+            IMMEDIATELY after a freshly created terminal exists (before the
+            readiness wait / input). U4's script-tier orphan sweep (BR-31) uses
+            this to record the live terminal into the shared ``ScriptRunRecord``
+            ``step_states`` map AT terminal-creation time — so a subprocess that
+            crashes/times out while a run-step call is mid-flight still leaves the
+            in-flight terminal visible to ``_reconcile_orphans``. Not called for a
+            reused terminal (the caller already owns it). A callback exception is
+            logged and swallowed — recording a terminal for the sweep must never
+            fail the step. Default None = behavior unchanged.
 
     Returns:
         ``AgentStepResult`` with status COMPLETED — ONLY on success.
@@ -175,6 +187,24 @@ async def run_agent_step(
         )
         terminal_id = terminal.id
 
+        # BR-31: make the just-created terminal visible to U4's orphan sweep
+        # BEFORE the readiness wait / input send — the dangerous edge is a
+        # subprocess that dies while this call is mid-flight, between create and
+        # the journal write. Recording it now (into the shared record's
+        # step_states) closes that window. Best-effort: a callback failure must
+        # never turn a live step into a failure.
+        if on_terminal_created is not None:
+            try:
+                on_terminal_created(terminal_id)
+            except (
+                Exception
+            ) as exc:  # noqa: BLE001 — sweep bookkeeping is best-effort; step must not fail on it
+                logger.warning(
+                    "run_agent_step: on_terminal_created callback failed for terminal %s: %s",
+                    terminal_id,
+                    exc,
+                )
+
         # Secondary in-process readiness wait: provider.initialize() can return a
         # false-positive on the shell prompt before the CLI is truly ready, so we
         # confirm a ready status before sending input (same guard handoff uses).
@@ -191,8 +221,11 @@ async def run_agent_step(
 
     assert terminal_id is not None  # for type-checkers: set in both branches
 
-    # Send the prompt (sync). Any failure raises and propagates.
-    terminal_service.send_input(terminal_id, prompt)
+    # Send the prompt. send_input is synchronous tmux I/O (bracketed paste +
+    # key sends); run it off the event loop so a slow tmux call cannot freeze
+    # the whole server for other requests (same hazard as issue #382, which was
+    # only fixed for DELETE /sessions). Any failure raises and propagates.
+    await asyncio.to_thread(terminal_service.send_input, terminal_id, prompt)
 
     # Wait for completion — IN-PROCESS poll of status_monitor (NOT the
     # HTTP-polling wait_until_terminal_status, which would reintroduce the
@@ -227,8 +260,12 @@ async def run_agent_step(
 
     # Extract the last agent message via the provider-specific path (mirrors
     # how the handoff caller obtained output: get_output in LAST mode runs the
-    # provider's extract_last_message_from_script under the hood).
-    last_message = terminal_service.get_output(terminal_id, OutputMode.LAST)
+    # provider's extract_last_message_from_script under the hood). This does a
+    # blocking tmux capture-pane plus regex extraction over the scrollback —
+    # potentially seconds for a large transcript — so run it off the loop.
+    last_message = await asyncio.to_thread(
+        terminal_service.get_output, terminal_id, OutputMode.LAST
+    )
 
     result = AgentStepResult(
         terminal_id=terminal_id,
@@ -246,7 +283,8 @@ async def run_agent_step(
             # Graceful CLI shutdown before kill_window (e.g. "/exit" for Claude
             # Code, C-d for others). Skipped implicitly for reused terminals
             # because this whole block is guarded on created_here.
-            terminal_service.exit_terminal_cli(terminal_id)
+            # Off the loop: exit_terminal_cli is blocking tmux I/O.
+            await asyncio.to_thread(terminal_service.exit_terminal_cli, terminal_id)
         except (
             Exception
         ) as exc:  # noqa: BLE001 — graceful exit is best-effort; step already succeeded
@@ -259,7 +297,12 @@ async def run_agent_step(
         try:
             # Thread the registry so post_kill_terminal plugin hooks dispatch
             # (parity with the DELETE endpoint); None = no hooks (engine path).
-            terminal_service.delete_terminal(terminal_id, registry=registry)
+            # Off the loop: delete_terminal does blocking tmux kills, a
+            # full-history scrollback snapshot, and DB writes — the exact
+            # teardown that wedged the server in issue #382.
+            await asyncio.to_thread(
+                terminal_service.delete_terminal, terminal_id, registry=registry
+            )
         except Exception as exc:  # noqa: BLE001 — teardown is best-effort; step already succeeded
             logger.warning(
                 "run_agent_step: failed to tear down terminal %s after success: %s",

@@ -331,6 +331,22 @@ MEMORY_BASE_DIR = CAO_HOME_DIR / "memory"
 MEMORY_MAX_PER_SCOPE = 10
 MEMORY_SCOPE_BUDGET_CHARS = 1000
 
+# Memory archive export/import (#345). Default backend for
+# ``cao memory export|import --format``.
+MEMORY_ARCHIVE_DEFAULT_FORMAT = "okf"
+
+# RESERVED — intentionally unreferenced today. These belong to the future
+# CAO-native tar.gz archive backend (parked branch
+# ``docs/memory-import-export``, #345 follow-up): tar-input hardening caps
+# per its threat model — total decompressed size, per-member size, and
+# gzip expansion ratio. The first PR accepts directories only, so nothing
+# reads these yet; they are defined here (per the constants.py Mandated
+# rule) so the tar backend lands without inventing new config surface.
+# Dead-code sweeps: do not remove.
+MEMORY_ARCHIVE_MAX_DECOMPRESSED_BYTES = 512 * 1024 * 1024  # 512 MiB
+MEMORY_ARCHIVE_MAX_FILE_BYTES = 16 * 1024 * 1024  # 16 MiB per member
+MEMORY_ARCHIVE_MAX_GZIP_RATIO = 100  # reject > 100x expansion
+
 # =============================================================================
 # Tool Restriction Configuration
 # =============================================================================
@@ -430,3 +446,41 @@ WORKFLOW_STEP_TIMEOUT = 600.0
 # flat 30s and covers any plausible multi-step, multi-minute workflow; an operator
 # running near the 100-step ceiling can raise it via the env override if needed.
 WORKFLOW_RUN_REQUEST_TIMEOUT = (WORKFLOW_STEP_TIMEOUT + 120.0) * 12 + 180.0  # = 8820.0s (~2.45h)
+
+# Script-linter rule inputs (Bolt 2, U1/C2, FR-1.3 / U1-BR-8). Import prefixes
+# whose first dotted segment marks a CAO-internal import — scripts reach CAO
+# over HTTP only (C-1). The ``cao_workflow`` shim (U6, ADR-6) is the sanctioned
+# import surface and is deliberately ABSENT from this set (U1-BR-3). Frozensets:
+# the prohibition list cannot drift within a process lifetime; extending it is a
+# reviewed constants.py diff, never a linter-local edit.
+SCRIPT_LINT_DISALLOWED_IMPORT_PREFIXES = frozenset({"cli_agent_orchestrator"})
+
+# Modules whose import earns a nondeterminism WARNING (U1-A3, Q3=A): resume
+# replays journaled calls and requires deterministic re-execution. Import-level
+# only — no call-site analysis. A warning never fails a script (FR-1.7).
+SCRIPT_LINT_NONDETERMINISM_MODULES = frozenset({"random", "secrets", "uuid", "time", "datetime"})
+
+# Env-var injection allowlist for POST /terminals/run-step (Bolt 2, U2/C6,
+# NFR-SEC-4 BINDING). Deny-by-default: the injection surface into a tmux
+# terminal environment is exactly these three documented identity keys.
+# Extending it is a constants.py + gate decision, never a route-local edit.
+WORKFLOW_ENV_ALLOWLIST = frozenset(
+    {"CAO_WORKFLOW_RUN_ID", "CAO_WORKFLOW_STEP_ID", "CAO_WORKFLOW_GENERATION"}
+)
+
+# Pre-regex length cap on run-step env-var VALUES (U2-BR-2). Defense-in-depth,
+# not redundancy: bounds the input O(1) before any regex evaluation and bounds
+# what can be staged into a terminal environment regardless of future regex
+# changes — do not simplify away as duplicate validation (the effective
+# accepted length is 64 via WORKFLOW_NAME_RE; this cap is the outer fence).
+WORKFLOW_ENV_VALUE_MAX_LEN = 256
+
+# Script-runner subprocess lifecycle (Bolt 3, U4/C1). Wall-clock bound + grace,
+# output ring-buffer cap, engine-owned scratch root for resume materialization.
+WORKFLOW_SCRIPT_TERM_GRACE = 5.0  # SIGTERM->SIGKILL grace (BR-10/11, NFR-REL-1)
+# INVARIANT: WORKFLOW_SCRIPT_TIMEOUT + WORKFLOW_SCRIPT_TERM_GRACE must be
+# <= WORKFLOW_RUN_REQUEST_TIMEOUT (= 8820.0), so the blocking POST socket outlives
+# the reap+grace envelope (tech-stack-decisions B3 fix). 8700 + 5 = 8705 <= 8820.
+WORKFLOW_SCRIPT_TIMEOUT = 8700.0
+WORKFLOW_SCRIPT_LOG_CAP = 256 * 1024  # per-stream tail cap, bytes (BR-24/25, Q7=A)
+WORKFLOW_SCRIPT_SCRATCH_DIR = CAO_HOME_DIR / "workflow-script-scratch"  # 0o700 (BR-30)

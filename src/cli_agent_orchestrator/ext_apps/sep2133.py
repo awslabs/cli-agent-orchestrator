@@ -27,8 +27,9 @@ Two complementary surfaces are provided:
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any, Dict
+
+from cli_agent_orchestrator.services.config_service import ConfigService
 
 logger = logging.getLogger(__name__)
 
@@ -58,15 +59,10 @@ SERVER_EXTENSION_CAPABILITY: Dict[str, Any] = {
 
 
 def _is_enabled() -> bool:
-    """Return whether the MCP App surface is enabled via ``CAO_MCP_APPS_ENABLED``."""
+    """Return whether the MCP App surface is enabled via ``apps.enabled``
+    (``CAO_MCP_APPS_ENABLED`` env var or ``settings.json``)."""
 
-    return os.getenv("CAO_MCP_APPS_ENABLED", "false").lower() in ("1", "true", "yes")
-
-
-# Frozen snapshot of the flag at import time, exported for callers that introspect
-# the surface directly. The functions below re-read the env via ``_is_enabled()``
-# so tests can toggle the flag without reimporting the module.
-CAO_MCP_APPS_ENABLED: bool = _is_enabled()
+    return bool(ConfigService.get("apps.enabled", default=False))
 
 
 def negotiate_capabilities(client_capabilities: Any = None) -> Dict[str, Any]:

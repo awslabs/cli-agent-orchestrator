@@ -236,6 +236,26 @@ class TestStickyLatching:
         m.feed(TerminalStatus.PROCESSING)  # arm gone — blocked
         assert m.status() == TerminalStatus.IDLE
 
+    def test_clear_rolling_buffer_preserves_arm(self):
+        """clear_rolling_buffer is byte-only — arm survives so the next
+        IDLE→PROCESSING transition (after send_input) is honored.
+
+        Regression guard for test_supervisor_assign_and_handoff: send_input
+        must clear the rolling buffer to drop stale idle placeholders, but
+        the arm must survive so the agent's PROCESSING signal isn't blocked
+        by stickiness.
+        """
+        m = _SequencedMonitor()
+        m.feed(TerminalStatus.IDLE)
+        m.sm.notify_input_sent("t1")
+        m.sm.clear_rolling_buffer("t1")
+        # Arm and last-status preserved
+        assert m.sm._allow_processing_revert.get("t1") is True
+        assert m.sm._last_status.get("t1") == TerminalStatus.IDLE
+        # PROCESSING transition honored (arm consumed on genuine PROCESSING)
+        m.feed(TerminalStatus.PROCESSING)
+        assert m.status() == TerminalStatus.PROCESSING
+
     def test_clear_terminal_clears_arm(self):
         m = _SequencedMonitor()
         m.feed(TerminalStatus.IDLE)

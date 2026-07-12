@@ -1,5 +1,6 @@
 """Tests for skill utilities."""
 
+import logging
 from pathlib import Path
 from unittest.mock import patch
 
@@ -427,3 +428,108 @@ class TestBuildSkillCatalog:
             "- **cao-worker-protocols**: Worker communication\n"
             "- **python-testing**: Pytest conventions"
         )
+
+
+class TestBuildSkillCatalogFilter:
+    """Tests for per-agent skill-catalog scoping via ``skill_filter``."""
+
+    @staticmethod
+    def _skills():
+        return [
+            SkillMetadata(name="ads-db", description="DB access"),
+            SkillMetadata(name="ads-task", description="Task workflow"),
+            SkillMetadata(name="cao-worker-protocols", description="Worker comms"),
+            SkillMetadata(name="linkedapi-task", description="LinkedAPI workflow"),
+        ]
+
+    @patch("cli_agent_orchestrator.utils.skills.list_skills")
+    def test_none_filter_lists_every_skill(self, mock_list_skills):
+        """``None`` (the default) keeps the original full-catalog behaviour."""
+        mock_list_skills.return_value = self._skills()
+
+        catalog = build_skill_catalog(None)
+
+        for name in ("ads-db", "ads-task", "cao-worker-protocols", "linkedapi-task"):
+            assert f"**{name}**" in catalog
+
+    @patch("cli_agent_orchestrator.utils.skills.list_skills")
+    def test_exact_names_allowlist(self, mock_list_skills):
+        """An exact-name allowlist advertises only the named skills."""
+        mock_list_skills.return_value = self._skills()
+
+        catalog = build_skill_catalog(["ads-task"])
+
+        assert "**ads-task**" in catalog
+        assert "**ads-db**" not in catalog
+        assert "**linkedapi-task**" not in catalog
+
+    @patch("cli_agent_orchestrator.utils.skills.list_skills")
+    def test_glob_prefix_scopes_to_project(self, mock_list_skills):
+        """A glob pattern scopes the catalog to one project's skills."""
+        mock_list_skills.return_value = self._skills()
+
+        catalog = build_skill_catalog(["ads-*"])
+
+        assert "**ads-db**" in catalog
+        assert "**ads-task**" in catalog
+        assert "**linkedapi-task**" not in catalog
+        assert "**cao-worker-protocols**" not in catalog
+
+    @patch("cli_agent_orchestrator.utils.skills.list_skills")
+    def test_mixed_exact_and_glob(self, mock_list_skills):
+        """Exact names and globs can be combined."""
+        mock_list_skills.return_value = self._skills()
+
+        catalog = build_skill_catalog(["ads-task", "cao-*"])
+
+        assert "**ads-task**" in catalog
+        assert "**cao-worker-protocols**" in catalog
+        assert "**ads-db**" not in catalog
+        assert "**linkedapi-task**" not in catalog
+
+    @patch("cli_agent_orchestrator.utils.skills.list_skills")
+    def test_empty_allowlist_advertises_nothing(self, mock_list_skills):
+        """An empty list hides every skill (no catalog block)."""
+        mock_list_skills.return_value = self._skills()
+
+        assert build_skill_catalog([]) == ""
+
+    @patch("cli_agent_orchestrator.utils.skills.list_skills")
+    def test_match_is_case_sensitive(self, mock_list_skills):
+        """Patterns match skill names case-sensitively (fnmatchcase), since skill
+        names are case-sensitive identifiers on disk."""
+        mock_list_skills.return_value = self._skills()
+
+        assert build_skill_catalog(["ADS-*"]) == ""
+        assert build_skill_catalog(["ADS-DB"]) == ""
+
+    @patch("cli_agent_orchestrator.utils.skills.list_skills")
+    def test_unmatched_patterns_are_logged(self, mock_list_skills, caplog):
+        """Patterns matching no skill are warned about (to catch profile typos),
+        without suppressing the patterns that do match."""
+        mock_list_skills.return_value = self._skills()
+
+        with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.utils.skills"):
+            catalog = build_skill_catalog(["ads-*", "missing-skill"])
+
+        assert "**ads-db**" in catalog  # the matching pattern still resolves
+        messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        # The unmatched pattern is rendered with repr() so a hostile / newline-y
+        # name cannot garble the log line.
+        assert any("'missing-skill'" in m for m in messages)
+        assert not any("ads-*" in m for m in messages)
+
+    @patch("cli_agent_orchestrator.utils.skills.list_skills")
+    def test_overlapping_patterns_emit_no_warning(self, mock_list_skills, caplog):
+        """Redundant/overlapping patterns (a glob plus an exact name it already
+        covers) are all counted as matched — no spurious unmatched warning. Guards
+        against a future 'break on first match' optimisation regressing this."""
+        mock_list_skills.return_value = self._skills()
+
+        with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.utils.skills"):
+            catalog = build_skill_catalog(["ads-*", "ads-db"])
+
+        assert "**ads-db**" in catalog
+        assert "**ads-task**" in catalog
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings == []

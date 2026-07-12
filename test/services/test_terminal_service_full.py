@@ -360,7 +360,8 @@ class TestCreateTerminal:
 
         skill_prompt = mock_provider_manager.create_provider.call_args.kwargs["skill_prompt"]
         assert skill_prompt == ""
-        mock_build_skill_catalog.assert_called_once_with()
+        # No `skills` field on the profile → catalog built with no filter (None).
+        mock_build_skill_catalog.assert_called_once_with(None)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("provider_name", ["kiro_cli", "copilot_cli"])
@@ -455,7 +456,10 @@ class TestCreateTerminal:
         mock_gen_window.return_value = "developer-abcd"
         mock_tmux.session_exists.return_value = False
         mock_load_profile.return_value = AgentProfile(
-            name="developer", description="Developer", system_prompt="You are the developer."
+            name="developer",
+            description="Developer",
+            system_prompt="You are the developer.",
+            skills=["ads-*"],
         )
         mock_build_skill_catalog.return_value = "## Available Skills\n\n- skill-a"
         mock_provider = AsyncMock()
@@ -466,7 +470,109 @@ class TestCreateTerminal:
 
         await create_terminal("claude_code", "developer", new_session=True)
 
-        mock_build_skill_catalog.assert_called_once_with()
+        # The profile's `skills` allowlist is threaded into the catalog builder.
+        mock_build_skill_catalog.assert_called_once_with(["ads-*"])
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.build_skill_catalog")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_build_skill_catalog_called_with_empty_filter_for_deny_all(
+        self,
+        mock_load_profile,
+        mock_build_skill_catalog,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_log_dir,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+    ):
+        """A `skills: []` deny-all profile threads the empty list through verbatim.
+        It must NOT be coerced to None — that would leak the full catalog to an
+        agent meant to advertise no skills."""
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = False
+        mock_load_profile.return_value = AgentProfile(
+            name="developer",
+            description="Developer",
+            system_prompt="You are the developer.",
+            skills=[],
+        )
+        mock_build_skill_catalog.return_value = ""
+        mock_provider = AsyncMock()
+        mock_provider.initialize.return_value = True
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_log_dir.__truediv__.return_value = MagicMock()
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+
+        await create_terminal("claude_code", "developer", new_session=True)
+
+        # [] must reach the builder as [] (deny-all), never coerced to None.
+        mock_build_skill_catalog.assert_called_once_with([])
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.fifo_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.FIFO_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_window_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.terminal_service.generate_terminal_id")
+    @patch("cli_agent_orchestrator.services.terminal_service.build_skill_catalog")
+    @patch("cli_agent_orchestrator.services.terminal_service.load_agent_profile")
+    async def test_build_skill_catalog_called_with_none_for_missing_profile_runtime_provider(
+        self,
+        mock_load_profile,
+        mock_build_skill_catalog,
+        mock_gen_id,
+        mock_gen_session,
+        mock_gen_window,
+        mock_tmux,
+        mock_db_create,
+        mock_provider_manager,
+        mock_log_dir,
+        mock_fifo_dir,
+        mock_fifo_manager,
+        mock_status_monitor,
+    ):
+        """A runtime-prompt provider with no profile in the CAO store builds the
+        catalog unfiltered (None). The `profile is None` guard must hold — no
+        AttributeError on `profile.skills`."""
+        mock_gen_id.return_value = "test1234"
+        mock_gen_session.return_value = "cao-session"
+        mock_gen_window.return_value = "developer-abcd"
+        mock_tmux.session_exists.return_value = False
+        mock_load_profile.side_effect = FileNotFoundError("Agent profile not found: developer")
+        mock_build_skill_catalog.return_value = "## Available Skills\n\n- skill-a"
+        mock_provider = AsyncMock()
+        mock_provider.initialize.return_value = True
+        mock_provider_manager.create_provider.return_value = mock_provider
+        mock_log_dir.__truediv__.return_value = MagicMock()
+        mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
+
+        await create_terminal("claude_code", "developer", new_session=True)
+
+        # No profile → no `skills` filter; catalog built with None (full catalog).
+        mock_build_skill_catalog.assert_called_once_with(None)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("provider_name", ["opencode_cli", "kiro_cli", "copilot_cli"])
@@ -670,6 +776,65 @@ class TestSendInput:
             use_paste_buffer=mock_provider.use_paste_buffer,
         )
         mock_update.assert_called_once_with("test1234")
+
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_input_clears_rolling_buffer_preserving_arm(
+        self, mock_get_metadata, mock_tmux, mock_pm, mock_update, mock_status_monitor
+    ):
+        """send_input clears the byte buffer AFTER arming the sticky latch.
+
+        Uses clear_rolling_buffer (byte-only) rather than reset_buffer so the
+        arm set by notify_input_sent survives. Without this distinction, the
+        buffer-clear would also wipe the arm, latch-blocking the subsequent
+        IDLE→PROCESSING transition and causing the terminal to read IDLE for
+        the entire busy turn (regression seen in test_supervisor_assign_and_
+        handoff — supervisor completed real work but wait_until_status timed
+        out because status never left IDLE).
+
+        The buffer clear itself is still needed to prevent stale idle
+        placeholders from the pre-task buffer combining with input_received=
+        True to trigger a false COMPLETED (the handoff-worker-killed-in-8s bug).
+        """
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_provider = mock_pm.get_provider.return_value
+        mock_provider.paste_enter_count = 2
+        mock_provider.paste_submit_delay = 1.0
+        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+
+        send_input("test1234", "hello worker")
+
+        mock_provider.mark_input_received.assert_called_once()
+        mock_status_monitor.notify_input_sent.assert_called_once_with("test1234")
+        mock_status_monitor.clear_rolling_buffer.assert_called_once_with("test1234")
+        # reset_buffer would wipe the arm — must NOT be called on send_input.
+        mock_status_monitor.reset_buffer.assert_not_called()
+
+        # Ordering guard: the byte-buffer clear must run BEFORE send_keys, not
+        # after. send_keys includes a submit-delay sleep during which the agent
+        # can start emitting output; a post-send_keys clear would wipe that
+        # newly-emitted first chunk of the turn. Attach both calls to a shared
+        # manager so we can assert their relative order.
+        manager = MagicMock()
+        manager.attach_mock(mock_status_monitor.clear_rolling_buffer, "clear")
+        manager.attach_mock(mock_tmux.send_keys, "send_keys")
+        # Re-run with the manager wired in to capture ordered calls.
+        mock_status_monitor.reset_mock()
+        mock_tmux.reset_mock()
+        manager.reset_mock()
+        manager.attach_mock(mock_status_monitor.clear_rolling_buffer, "clear")
+        manager.attach_mock(mock_tmux.send_keys, "send_keys")
+        send_input("test1234", "hello again")
+        ordered = [c[0] for c in manager.mock_calls]
+        assert ordered.index("clear") < ordered.index(
+            "send_keys"
+        ), f"clear_rolling_buffer must precede send_keys; got order {ordered}"
 
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
@@ -1076,3 +1241,94 @@ class TestDeleteTerminal:
         result = delete_terminal("test1234")
 
         assert result is True
+
+
+class TestDeferredInitFailureNotification:
+    """PR #390 must-fixes #1/#3: a deferred-init failure must be OBSERVABLE to
+    the supervisor (assign already returned success=True), teardown must pass
+    the registry (post_kill_terminal parity), and TerminalInputBlockedError
+    must NOT delete the worker.
+    """
+
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.create_inbox_message")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_notify_enqueues_inbox_to_caller_and_deletes_with_registry(
+        self, mock_meta, mock_create_inbox, mock_delete
+    ):
+        from cli_agent_orchestrator.services.terminal_service import (
+            _notify_caller_of_deferred_failure,
+        )
+
+        mock_meta.return_value = {"caller_id": "super123"}
+        registry = MagicMock()
+
+        _notify_caller_of_deferred_failure(
+            "worker99", "init failed: boom", registry, delete_worker=True
+        )
+
+        # Caller notified via inbox (sender = the failed worker, receiver = caller)
+        mock_create_inbox.assert_called_once()
+        _, kwargs = mock_create_inbox.call_args
+        assert kwargs["receiver_id"] == "super123"
+        assert kwargs["sender_id"] == "worker99"
+        assert "init failed: boom" in kwargs["message"]
+        # Teardown passes the registry so post_kill_terminal hooks fire.
+        mock_delete.assert_called_once_with("worker99", registry=registry)
+
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.create_inbox_message")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_notify_without_delete_leaves_worker_alive(
+        self, mock_meta, mock_create_inbox, mock_delete
+    ):
+        """delete_worker=False (the WAITING_USER_ANSWER case) must notify but
+        NOT tear the worker down."""
+        from cli_agent_orchestrator.services.terminal_service import (
+            _notify_caller_of_deferred_failure,
+        )
+
+        mock_meta.return_value = {"caller_id": "super123"}
+
+        _notify_caller_of_deferred_failure(
+            "worker99", "waiting on prompt", None, delete_worker=False
+        )
+
+        mock_create_inbox.assert_called_once()
+        mock_delete.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.create_inbox_message")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_notify_inbox_failure_does_not_block_teardown(
+        self, mock_meta, mock_create_inbox, mock_delete
+    ):
+        """If the inbox enqueue fails, teardown must still happen (independent
+        best-effort steps)."""
+        from cli_agent_orchestrator.services.terminal_service import (
+            _notify_caller_of_deferred_failure,
+        )
+
+        mock_meta.return_value = {"caller_id": "super123"}
+        mock_create_inbox.side_effect = Exception("db down")
+
+        _notify_caller_of_deferred_failure("worker99", "boom", None, delete_worker=True)
+
+        mock_delete.assert_called_once()
+
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.terminal_service.create_inbox_message")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_notify_no_caller_id_is_log_only(self, mock_meta, mock_create_inbox, mock_delete):
+        """No caller_id (e.g. operator-launched) → no inbox attempt, still tears
+        down."""
+        from cli_agent_orchestrator.services.terminal_service import (
+            _notify_caller_of_deferred_failure,
+        )
+
+        mock_meta.return_value = {"caller_id": None}
+
+        _notify_caller_of_deferred_failure("worker99", "boom", None, delete_worker=True)
+
+        mock_create_inbox.assert_not_called()
+        mock_delete.assert_called_once()

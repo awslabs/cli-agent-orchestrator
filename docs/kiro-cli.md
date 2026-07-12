@@ -196,3 +196,38 @@ uv run pytest -m e2e test/e2e/test_supervisor_orchestration.py -v -k KiroCli -o 
    - CAO's `load_agent_profile()` primarily scans for `.md` files
    - If the agent is not found, CAO gracefully falls back — kiro-cli resolves `.json` profiles natively
    - As a workaround, you can create a stub `.md` file alongside the `.json` profile
+
+## kiro-cli 2.11+ Notes
+
+Starting with kiro-cli 2.11, the TUI changed how it accepts pasted input and how
+it renders the processing indicator. CAO's kiro_cli provider handles these:
+
+- **Paste submission**: kiro 2.11 needs **two** Enter keystrokes after a
+  bracketed paste to submit the message (first Enter finalizes the paste, second
+  submits). The provider sets `paste_enter_count = 2` and `paste_submit_delay =
+  1.0s`. Older kiro versions submitted on a single Enter.
+- **Processing indicator**: kiro 2.11 replaced `"Kiro is working"` with
+  `"Thinking..."` (with an optional `"(esc to cancel)"` suffix). The provider
+  matches either variant in `TUI_PROCESSING_PATTERN`.
+- **Idle placeholder always visible**: The `"ask a question or describe a task"`
+  placeholder text remains in the raw buffer even during processing. The
+  provider's Check 6 in `get_status()` requires a bordered response box (two
+  separators + ≥2 content lines between them) before a bare idle-prompt match is
+  treated as COMPLETED — otherwise the worker would be torn down within seconds
+  of a task being sent.
+- **Spinner animation floods the event bus**: kiro 2.11's TUI redraws a braille
+  spinner (`⠋⠙⠹⠸⠼⠴⠦⠧`) roughly 10 times per second while an agent is thinking.
+  Each redraw is a separate FIFO write. Without coalescing, that produces
+  thousands of `terminal.{id}.output` events per turn — enough to overflow the
+  shared async queue and drop the worker's real state transitions along with
+  the animation noise. CAO's FIFO reader batches chunks arriving within a
+  50ms window into one publish (`_COALESCE_WINDOW`), reducing publish rate
+  ~20x during bursts. Consumers see the same bytes in the same order; only
+  the event boundaries change. If handoff/assign start hanging on a newer
+  kiro release, check whether the animation frame rate increased beyond what
+  50ms can absorb.
+
+If you upgrade kiro-cli and handoffs stop working (worker gets killed
+prematurely, or the task sits unsent in the input box), check whether the
+paste-submit behavior or processing-indicator text changed in the new version
+and update the provider constants accordingly.

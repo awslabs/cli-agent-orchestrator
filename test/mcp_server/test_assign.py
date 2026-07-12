@@ -52,6 +52,7 @@ class TestCreateTerminalProviderResolution:
                 "caller_id": "supervisor-1",
                 "working_directory": "/repo",
             },
+            json=None,
             timeout=_mcp_timeout(),
         )
 
@@ -95,62 +96,127 @@ class TestCreateTerminalProviderResolution:
                 "caller_id": "supervisor-1",
                 "working_directory": "/repo",
             },
+            json=None,
             timeout=_mcp_timeout(),
         )
 
+    @patch(
+        "cli_agent_orchestrator.mcp_server.server._resolve_child_allowed_tools", return_value=None
+    )
+    @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider", return_value="kiro_cli")
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_deferred_init_sends_message_in_json_body_not_params(
+        self, mock_requests, mock_resolve_provider, mock_allowed_tools
+    ):
+        """defer_init must carry the prompt in the JSON body (not the query
+        string) so prompt content isn't logged in HTTP access logs and isn't
+        subject to URL-length limits."""
+        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+        from cli_agent_orchestrator.models.inbox import OrchestrationType
+
+        metadata_response = MagicMock()
+        metadata_response.json.return_value = {
+            "provider": "kiro_cli",
+            "session_name": "cao-session",
+            "allowed_tools": None,
+        }
+        metadata_response.raise_for_status.return_value = None
+        post_response = MagicMock()
+        post_response.json.return_value = {"id": "worker-1", "provider": "kiro_cli"}
+        post_response.raise_for_status.return_value = None
+        mock_requests.get.return_value = metadata_response
+        mock_requests.post.return_value = post_response
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "supervisor-1"}):
+            _create_terminal(
+                "reviewer",
+                working_directory=None,
+                defer_init=True,
+                initial_message="Analyze the sensitive logs at /secret/path",
+                initial_message_orchestration_type=OrchestrationType.ASSIGN,
+            )
+
+        _, kwargs = mock_requests.post.call_args
+        # Routing flag stays in params; message payload is in the body.
+        assert kwargs["params"].get("defer_init") == "true"
+        assert "initial_message" not in kwargs["params"]
+        assert kwargs["json"]["initial_message"] == "Analyze the sensitive logs at /secret/path"
+        assert kwargs["json"]["initial_message_orchestration_type"] == "assign"
+
+    @patch("cli_agent_orchestrator.mcp_server.server.requests")
+    def test_defer_init_on_new_session_branch_raises(self, mock_requests):
+        """PR #390 must-fix #2: the new-session branch can't honor defer_init
+        (POST /sessions has no deferred-init support), so _create_terminal must
+        raise rather than silently create a worker whose task is never
+        delivered. This is the branch taken when CAO_TERMINAL_ID is unset."""
+        from cli_agent_orchestrator.mcp_server.server import _create_terminal
+        from cli_agent_orchestrator.models.inbox import OrchestrationType
+
+        with patch.dict(os.environ, {}, clear=True):  # no CAO_TERMINAL_ID
+            with pytest.raises(ValueError, match="not supported when creating a new session"):
+                _create_terminal(
+                    "reviewer",
+                    defer_init=True,
+                    initial_message="do work",
+                    initial_message_orchestration_type=OrchestrationType.ASSIGN,
+                )
+        # Must raise BEFORE creating anything.
+        mock_requests.post.assert_not_called()
+
 
 class TestAssignSenderIdInjection:
-    """Tests for sender ID injection in _assign_impl."""
+    """Tests for sender ID injection in _assign_impl.
+
+    _assign_impl now uses the deferred-init path: it composes the callback-
+    instructions suffix on the MCP-server side and passes the full message
+    to ``_create_terminal`` via ``initial_message`` so cao-server can deliver
+    it in the background once the worker's provider finishes initializing.
+    The tool-call itself returns as soon as the tmux window/DB row exist.
+    """
 
     @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
-    @patch("cli_agent_orchestrator.mcp_server.server._send_direct_input")
-    @patch("cli_agent_orchestrator.mcp_server.server.wait_until_terminal_status", return_value=True)
     @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
-    def test_assign_appends_sender_id_when_injection_enabled(
-        self, mock_create, mock_wait, mock_send
-    ):
-        """When injection is enabled, assign should append sender ID suffix."""
+    def test_assign_appends_sender_id_when_injection_enabled(self, mock_create):
+        """When injection is enabled, assign should pass a message with the
+        sender ID suffix as ``initial_message`` to _create_terminal."""
         from cli_agent_orchestrator.mcp_server.server import _assign_impl
 
         mock_create.return_value = ("worker-1", "claude_code")
-        mock_send.return_value = None
 
         with patch.dict(os.environ, {"CAO_TERMINAL_ID": "supervisor-abc123"}):
             result = _assign_impl("developer", "Analyze the logs")
 
         assert result["success"] is True
-        sent_message = mock_send.call_args[0][1]
-        assert mock_send.call_args[0][2] == "assign"
+        # _create_terminal is called with defer_init=True and the composed message
+        _, kwargs = mock_create.call_args
+        assert kwargs["defer_init"] is True
+        sent_message = kwargs["initial_message"]
         assert sent_message.startswith("Analyze the logs")
         assert "[Assigned by terminal supervisor-abc123" in sent_message
         assert "send results back to terminal supervisor-abc123 using send_message]" in sent_message
+        # And the orchestration_type is ASSIGN so plugin events see it
+        from cli_agent_orchestrator.models.inbox import OrchestrationType
+
+        assert kwargs["initial_message_orchestration_type"] == OrchestrationType.ASSIGN
 
     @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", False)
-    @patch("cli_agent_orchestrator.mcp_server.server._send_direct_input")
-    @patch("cli_agent_orchestrator.mcp_server.server.wait_until_terminal_status", return_value=True)
     @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
-    def test_assign_no_suffix_when_injection_disabled(self, mock_create, mock_wait, mock_send):
-        """When injection is disabled, assign should send the message unchanged."""
+    def test_assign_no_suffix_when_injection_disabled(self, mock_create):
+        """When injection is disabled, assign should pass the message unchanged."""
         from cli_agent_orchestrator.mcp_server.server import _assign_impl
 
         mock_create.return_value = ("worker-2", "claude_code")
-        mock_send.return_value = None
 
         with patch.dict(os.environ, {"CAO_TERMINAL_ID": "supervisor-abc123"}):
             result = _assign_impl("developer", "Analyze the logs")
 
         assert result["success"] is True
-        sent_message = mock_send.call_args[0][1]
-        assert mock_send.call_args[0][2] == "assign"
-        assert sent_message == "Analyze the logs"
+        _, kwargs = mock_create.call_args
+        assert kwargs["initial_message"] == "Analyze the logs"
 
     @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
-    @patch("cli_agent_orchestrator.mcp_server.server._send_direct_input")
-    @patch("cli_agent_orchestrator.mcp_server.server.wait_until_terminal_status", return_value=True)
     @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
-    def test_assign_missing_terminal_id_errors_before_creating_terminal(
-        self, mock_create, mock_wait, mock_send
-    ):
+    def test_assign_missing_terminal_id_errors_before_creating_terminal(self, mock_create):
         """When CAO_TERMINAL_ID is not set, assign must fail fast (issue #284) —
         never tell a worker to reply to terminal 'unknown', and never leave an
         orphan worker terminal behind."""
@@ -163,49 +229,75 @@ class TestAssignSenderIdInjection:
         assert result["terminal_id"] is None
         assert "CAO_TERMINAL_ID not set" in result["message"]
         mock_create.assert_not_called()
-        mock_send.assert_not_called()
 
-    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
-    @patch("cli_agent_orchestrator.mcp_server.server._send_direct_input")
-    @patch("cli_agent_orchestrator.mcp_server.server.wait_until_terminal_status", return_value=True)
+    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", False)
     @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
-    def test_assign_surfaces_terminal_id_when_send_fails_after_creation(
-        self, mock_create, mock_wait, mock_send
-    ):
-        """If the task send fails after the worker terminal was created, the
-        orphaned terminal's ID must be surfaced so the supervisor can inspect
-        or delete it — matching the ready-timeout path."""
+    def test_assign_missing_terminal_id_fails_fast_even_with_injection_off(self, mock_create):
+        """PR #390 must-fix #2: the CAO_TERMINAL_ID fail-fast must be
+        UNCONDITIONAL (not gated on sender-ID injection). With injection off and
+        no terminal id, the deferred path would otherwise take the new-session
+        branch, which can't deliver the task — assign would create a worker,
+        drop the task, and still return success. Guard fires regardless."""
         from cli_agent_orchestrator.mcp_server.server import _assign_impl
 
-        mock_create.return_value = ("worker-orphan", "claude_code")
-        mock_send.side_effect = Exception("connection refused")
+        with patch.dict(os.environ, {}, clear=True):
+            result = _assign_impl("developer", "Build feature X")
+
+        assert result["success"] is False
+        assert result["terminal_id"] is None
+        assert "CAO_TERMINAL_ID not set" in result["message"]
+        mock_create.assert_not_called()
+
+    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
+    @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
+    def test_assign_surfaces_terminal_id_when_create_fails(self, mock_create):
+        """If _create_terminal fails, the returned dict should carry
+        ``terminal_id=None`` and a failure message."""
+        from cli_agent_orchestrator.mcp_server.server import _assign_impl
+
+        mock_create.side_effect = Exception("connection refused")
 
         with patch.dict(os.environ, {"CAO_TERMINAL_ID": "supervisor-abc123"}):
             result = _assign_impl("developer", "Analyze the logs")
 
         assert result["success"] is False
-        assert result["terminal_id"] == "worker-orphan"
+        assert result["terminal_id"] is None
         assert "Assignment failed" in result["message"]
 
     @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
-    @patch("cli_agent_orchestrator.mcp_server.server._send_direct_input")
-    @patch("cli_agent_orchestrator.mcp_server.server.wait_until_terminal_status", return_value=True)
     @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
-    def test_assign_suffix_is_appended_not_prepended(self, mock_create, mock_wait, mock_send):
+    def test_assign_suffix_is_appended_not_prepended(self, mock_create):
         """The sender ID should be a suffix, not a prefix."""
         from cli_agent_orchestrator.mcp_server.server import _assign_impl
 
         mock_create.return_value = ("worker-4", "claude_code")
-        mock_send.return_value = None
         original = "Do the task described in /path/to/task.md"
 
         with patch.dict(os.environ, {"CAO_TERMINAL_ID": "sup-111"}):
             _assign_impl("developer", original)
 
-        sent_message = mock_send.call_args[0][1]
-        assert mock_send.call_args[0][2] == "assign"
+        _, kwargs = mock_create.call_args
+        sent_message = kwargs["initial_message"]
         assert sent_message.startswith(original)
         assert sent_message.index("[Assigned by terminal") > len(original)
+
+    @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)
+    @patch("cli_agent_orchestrator.mcp_server.server._create_terminal")
+    def test_assign_returns_fast_success_message(self, mock_create):
+        """Regression: assign() should tell the LLM the worker is initializing
+        in the background, not claim the message has been delivered."""
+        from cli_agent_orchestrator.mcp_server.server import _assign_impl
+
+        mock_create.return_value = ("worker-fast", "kiro_cli")
+
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "supervisor-abc123"}):
+            result = _assign_impl("developer", "Do work")
+
+        assert result["success"] is True
+        assert result["terminal_id"] == "worker-fast"
+        # The message must reflect deferred delivery so the LLM does not
+        # falsely conclude the worker has already received the task.
+        assert "initializing" in result["message"].lower()
 
 
 class TestBuildAssignDescription:

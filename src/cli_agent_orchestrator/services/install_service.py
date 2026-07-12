@@ -27,6 +27,7 @@ from cli_agent_orchestrator.utils.agent_profiles import (
     parse_agent_profile_text,
 )
 from cli_agent_orchestrator.utils.env import resolve_env_vars, set_env_var
+from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.opencode_config import (
     ensure_skills_symlink,
     remove_agent_tools,
@@ -57,6 +58,57 @@ class InstallResult(BaseModel):
 # traversal ("../etc/passwd"), separators, and absolute paths at the boundary.
 # CodeQL also recognises this regex as a path-injection sanitiser.
 _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+# Per-MCP-server tool-call timeout (milliseconds) injected into cao-mcp-server
+# entries in kiro agent profiles. kiro-cli's default MCP tool-call timeout
+# (~120s, inherited from the Q Developer CLI) is far too short for the handoff
+# tool, which blocks until a spawned worker finishes an entire task — routinely
+# minutes. Without a raised timeout kiro cancels the handoff RPC client-side and
+# tells the supervisor the tool failed even though CAO is still running the
+# worker. 1_200_000 ms (20 min) matches CAO's default handoff/run-step budget.
+# This mirrors the kimi_cli provider's tool_call_timeout_ms override.
+_KIRO_MCP_TOOL_TIMEOUT_MS = 1_200_000
+
+
+def _inject_kiro_mcp_timeout(
+    mcp_servers: Optional[Dict[str, object]],
+) -> Optional[Dict[str, object]]:
+    """Return a copy of ``mcp_servers`` with a large ``timeout`` set on every
+    cao-mcp-server entry that does not already specify one.
+
+    kiro reads the per-server ``timeout`` field (milliseconds) as its tool-call
+    timeout. We only touch entries whose name, command, or args reference the
+    bundled orchestration server so a user's other MCP servers keep their own
+    (or kiro's default) timeout. An explicit operator-set ``timeout`` is never
+    overwritten. The command/args checks cover every form the entry can take:
+    the bare console script, a resolved absolute path, the module entrypoint
+    (``<python> -m cli_agent_orchestrator.mcp_server.server``), and the legacy
+    ``uvx --from git+... cao-mcp-server`` form.
+    """
+    if not mcp_servers:
+        return mcp_servers
+
+    result: Dict[str, object] = {}
+    for name, cfg in mcp_servers.items():
+        if not isinstance(cfg, dict):
+            result[name] = cfg
+            continue
+        command = cfg.get("command")
+        args = cfg.get("args") or []
+        is_cao = (
+            name == "cao-mcp-server"
+            or (isinstance(command, str) and "cao-mcp-server" in command)
+            or any(
+                isinstance(a, str)
+                and ("cao-mcp-server" in a or a == "cli_agent_orchestrator.mcp_server.server")
+                for a in args
+            )
+        )
+        if is_cao and "timeout" not in cfg:
+            cfg = {**cfg, "timeout": _KIRO_MCP_TOOL_TIMEOUT_MS}
+        result[name] = cfg
+    return result
+
 
 # URL path component for allowlisted hosts. Each segment must start with an
 # alphanumeric, which forbids "..", "." and hidden segments — and by extension
@@ -232,6 +284,19 @@ def install_agent(
         resolved_content = resolve_env_vars(raw_content)
         profile = parse_agent_profile_text(resolved_content, agent_name)
 
+        # Resolve the bundled cao-mcp-server console script to a PATH-independent
+        # invocation before materializing provider configs. The
+        # configs Kiro/Q write to disk are consumed verbatim by those CLIs, so
+        # resolution must happen here rather than at launch time. persisted=True
+        # prefers the stable PATH launcher (e.g. ~/.local/bin/cao-mcp-server)
+        # over the versioned venv-internal path, so a later `uv tool upgrade`
+        # does not leave the written config pointing at a relocated binary.
+        if profile.mcpServers:
+            profile.mcpServers = {
+                name: resolve_mcp_server_config(dict(cfg), persisted=True)
+                for name, cfg in profile.mcpServers.items()
+            }
+
         unresolved_vars = sorted(set(re.findall(r"\$\{(\w+)\}", resolved_content)))
         context_file = _write_context_file(profile.name, raw_content)
 
@@ -259,7 +324,9 @@ def install_agent(
                 allowedTools=allowed_tools,
                 resources=kiro_resources,
                 prompt=raw_prompt,
-                mcpServers=profile.mcpServers,
+                # Raise the cao-mcp-server tool-call timeout so kiro doesn't
+                # cancel long handoff RPCs client-side (see helper docstring).
+                mcpServers=_inject_kiro_mcp_timeout(profile.mcpServers),
                 toolAliases=profile.toolAliases,
                 toolsSettings=profile.toolsSettings,
                 hooks=profile.hooks,

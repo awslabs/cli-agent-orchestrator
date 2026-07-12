@@ -39,6 +39,9 @@ def compose_agent_prompt(profile: AgentProfile, base_prompt: Optional[str] = Non
     if effective:
         parts.append(effective)
 
+    # Unfiltered on purpose: this baked/native path (Q CLI, Copilot) advertises
+    # the full catalog. Per-agent `skills` scoping applies only to the
+    # runtime-prompt providers, which build their catalog in terminal_service.
     catalog = build_skill_catalog()
     if catalog:
         parts.append(catalog)

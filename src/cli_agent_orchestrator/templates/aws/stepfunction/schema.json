@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "stepfunction",
+  "description": "Trigger and monitor AWS Step Functions executions",
+  "type": "object",
+  "properties": {
+    "profile": {
+      "type": "string",
+      "description": "AWS CLI profile name",
+      "pattern": "^[a-zA-Z0-9_-]+$"
+    },
+    "region": {
+      "type": "string",
+      "description": "AWS region",
+      "pattern": "^[a-z]{2}-[a-z]+-[0-9]+$"
+    },
+    "state_machine_arn": {
+      "type": "string",
+      "description": "Step Functions state machine ARN",
+      "pattern": "^arn:aws:states:[a-z0-9-]+:[0-9]+:stateMachine:[a-zA-Z0-9_.-]+$"
+    },
+    "execution_name_prefix": {
+      "type": "string",
+      "description": "Prefix for generated execution names",
+      "pattern": "^[a-zA-Z0-9_-]+$",
+      "default": "cao-exec"
+    },
+    "input_payload": {
+      "type": "string",
+      "description": "JSON input to the state machine (rendered via heredoc, safe for arbitrary JSON)",
+      "default": "{}",
+      "pattern": "^[^\n\r]*$",
+      "maxLength": 4096
+    },
+    "poll_interval_seconds": {
+      "type": "integer",
+      "description": "Seconds between status checks",
+      "minimum": 5,
+      "default": 15
+    },
+    "timeout_seconds": {
+      "type": "integer",
+      "description": "Max seconds to wait for completion",
+      "minimum": 30,
+      "default": 600
+    }
+  },
+  "required": [
+    "profile",
+    "region",
+    "state_machine_arn"
+  ],
+  "additionalProperties": false
+}

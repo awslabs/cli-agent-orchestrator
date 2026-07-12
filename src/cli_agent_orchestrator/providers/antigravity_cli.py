@@ -54,6 +54,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.mcp_resolution import resolve_cao_mcp_command
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
@@ -104,6 +105,13 @@ SEPARATOR_PATTERN = r"^\s*─{20,}\s*$"
 # hangs — the picker matches WAITING_USER_ANSWER and never reads IDLE. Dismissed
 # in initialize() by sending Enter (accepts the pre-selected "Yes").
 TRUST_PROMPT_PATTERN = r"Yes, I trust this folder|requires permission to read, edit"
+
+# Feedback-survey dialog agy occasionally shows right after startup ("How's
+# the CLI experience so far? [1] Good [2] Fine [3] Bad [0] Skip"). Like the
+# trust picker it blocks IDLE until answered — dismissed by sending "0"
+# (Skip) + Enter. Note the ready footer ("? for shortcuts") stays visible
+# UNDER this dialog, so it must be checked before any idle-footer early-exit.
+SURVEY_PROMPT_PATTERN = r"How'?s the CLI experience so far"
 
 # Interactive prompts that block on user input (approval dialogs, pickers).
 # With --dangerously-skip-permissions these are rare, but we still classify
@@ -330,9 +338,16 @@ class AntigravityCliProvider(BaseProvider):
                 cfg = dict(server_config)
             else:
                 cfg = server_config.model_dump(exclude_none=True)
-            entry = {
-                "command": cfg.get("command", ""),
-                "args": cfg.get("args", []),
+            # Resolve the bundled cao-mcp-server console script to a
+            # PATH-independent invocation. persisted=True: this command is
+            # written to mcp_config.json and read by agy at later launches,
+            # so prefer the stable PATH launcher over the versioned venv path.
+            command, args = resolve_cao_mcp_command(
+                cfg.get("command", ""), cfg.get("args", []) or [], persisted=True
+            )
+            entry: dict = {
+                "command": command,
+                "args": args,
             }
             env = dict(cfg.get("env", {}))
             env["CAO_TERMINAL_ID"] = self.terminal_id
@@ -368,29 +383,44 @@ class AntigravityCliProvider(BaseProvider):
             self._mcp_server_names = []
 
     def _handle_startup_dialog(self, timeout: Optional[float] = None) -> None:
-        """Accept agy's workspace-trust dialog if it appears at startup.
+        """Dismiss agy's blocking startup dialogs (workspace-trust, survey).
 
         Mirrors ClaudeCodeProvider._handle_startup_prompts / KimiCliProvider.
-        Polls the pane for the trust picker and sends Enter (the "Yes, I trust
-        this folder" option is pre-selected). Exits early once agy is at its
-        ready footer, so an already-trusted cwd isn't delayed.
+        Polls the pane and answers, in whatever order they appear:
+        - workspace-trust picker → Enter (accepts the pre-selected "Yes")
+        - feedback survey → "0" + Enter (Skip)
+        Both can appear in ONE startup (trust first, survey after), so a
+        dismissal continues the loop rather than returning. Exits once agy is
+        at its ready footer with no dialog on screen — the survey renders ON
+        TOP of the footer, so the survey check must run before the idle exit.
         """
         if timeout is None:
             timeout = get_server_settings()["startup_prompt_handler_timeout"]
+        from cli_agent_orchestrator.services.status_monitor import status_monitor
+
         start_time = time.time()
+        trust_done = survey_done = False
         while time.time() - start_time < timeout:
             output = get_backend().get_history(self.session_name, self.window_name)
             if output:
                 clean = strip_terminal_escapes(output)
-                if re.search(TRUST_PROMPT_PATTERN, clean):
-                    from cli_agent_orchestrator.services.status_monitor import status_monitor
-
+                if not trust_done and re.search(TRUST_PROMPT_PATTERN, clean):
                     logger.info("Antigravity workspace-trust dialog detected, accepting")
                     status_monitor.notify_input_sent(self.terminal_id)
                     get_backend().send_special_key(self.session_name, self.window_name, "Enter")
+                    trust_done = True
                     time.sleep(1.0)
-                    return
-                # Already at the ready footer → no dialog to handle, stop early.
+                    continue
+                if not survey_done and re.search(SURVEY_PROMPT_PATTERN, clean):
+                    logger.info("Antigravity feedback survey detected, skipping")
+                    status_monitor.notify_input_sent(self.terminal_id)
+                    get_backend().send_keys(self.session_name, self.window_name, "0", enter_count=0)
+                    time.sleep(0.5)
+                    get_backend().send_special_key(self.session_name, self.window_name, "Enter")
+                    survey_done = True
+                    time.sleep(1.0)
+                    continue
+                # At the ready footer with no dialog pending → done.
                 if re.search(IDLE_FOOTER_PATTERN, clean):
                     return
             time.sleep(1.0)
@@ -422,8 +452,8 @@ class AntigravityCliProvider(BaseProvider):
         # untrusted cwd). Unanswered it blocks init — the picker never reads IDLE.
         self._handle_startup_dialog()
 
-        # agy startup + first MCP connection (cao-mcp-server is fetched via uvx
-        # from git on first use) + the -i acknowledgment can take a while.
+        # agy startup + first MCP connection + the -i acknowledgment can take
+        # a while.
         if not await wait_until_status(
             self.terminal_id,
             {TerminalStatus.IDLE, TerminalStatus.COMPLETED},

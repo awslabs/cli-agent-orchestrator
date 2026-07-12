@@ -218,7 +218,7 @@ class TestListAgentProfiles:
             "kiro_cli": "/home/user/.kiro/agents",
         }
 
-        def fake_scan(directory, source_label, profiles):
+        def fake_scan(directory, source_label, profiles, name_sources=None):
             if source_label == "local":
                 profiles["local-agent"] = {
                     "name": "local-agent",
@@ -250,7 +250,8 @@ class TestListAgentProfiles:
     def test_list_agent_profiles_deduplicates_profiles_with_same_name(
         self, mock_resources, mock_local_dir, mock_scan, mock_get_agent_dirs, mock_get_extra_dirs
     ):
-        """Test that profiles with the same name are deduplicated (first wins)."""
+        """Same-named profile in built-in + on-disk: the on-disk copy wins, because
+        built-in is scanned last to match the loader (_read_agent_profile_source)."""
         from cli_agent_orchestrator.utils.agent_profiles import list_agent_profiles
 
         # Built-in store has "developer" profile
@@ -263,15 +264,17 @@ class TestListAgentProfiles:
         mock_agent_store.iterdir.return_value = [mock_builtin_file]
         mock_resources.files.return_value = mock_agent_store
 
-        # Local store also has "developer" profile — should be skipped (built-in scanned first)
+        # Local store also has "developer" profile — this WINS; built-in is scanned last.
         mock_local_dir.exists.return_value = True
         mock_local_dir.resolve.return_value = Path(
             "/home/user/.aws/cli-agent-orchestrator/agent-store"
         )
 
-        def fake_scan(directory, source_label, profiles):
+        def fake_scan(directory, source_label, profiles, name_sources=None):
             if source_label == "local":
-                # _scan_directory respects dedup: only adds if not present
+                # Mirror _scan_directory: record the source AND keep first-found.
+                if name_sources is not None:
+                    name_sources.setdefault("developer", []).append("local")
                 if "developer" not in profiles:
                     profiles["developer"] = {
                         "name": "developer",
@@ -283,10 +286,12 @@ class TestListAgentProfiles:
 
         result = list_agent_profiles()
 
-        # Should have exactly one "developer" profile, from built-in (scanned first)
+        # Exactly one "developer", and it's the on-disk (local) copy — matches what loads.
         developer_profiles = [p for p in result if p["name"] == "developer"]
         assert len(developer_profiles) == 1
-        assert developer_profiles[0]["source"] == "built-in"
+        assert developer_profiles[0]["source"] == "local"
+        # built-in is scanned last, so it lands in duplicated_in — not as the winner.
+        assert developer_profiles[0]["duplicated_in"] == ["built-in"]
 
     @patch("cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", return_value=[])
     @patch("cli_agent_orchestrator.services.settings_service.get_agent_dirs", return_value={})
@@ -378,7 +383,7 @@ class TestListAgentProfiles:
 
         scan_calls = []
 
-        def track_scan(directory, source_label, profiles):
+        def track_scan(directory, source_label, profiles, name_sources=None):
             scan_calls.append((str(directory), source_label))
             if str(directory) == "/custom/agents/dir1":
                 profiles["custom-agent1"] = {

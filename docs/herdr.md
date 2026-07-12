@@ -30,11 +30,13 @@ herdr --session cao          # explicit session name (recommended)
 
 ## Configuration
 
-Set `terminal_backend` in `~/.aws/cli-agent-orchestrator/config.json`:
+Set `terminal.backend` in `~/.aws/cli-agent-orchestrator/settings.json`:
 
 ```json
 {
-  "terminal_backend": "herdr"
+  "terminal": {
+    "backend": "herdr"
+  }
 }
 ```
 
@@ -42,31 +44,33 @@ Optionally specify the herdr session name (defaults to `"cao"`):
 
 ```json
 {
-  "terminal_backend": "herdr",
-  "herdr_session": "my-session"
+  "terminal": {
+    "backend": "herdr",
+    "herdr_session": "my-session"
+  }
 }
 ```
 
-> **Note:** This goes in `config.json`, not `settings.json`. See [settings.md](settings.md) for the distinction between the two files.
+See [configuration.md](configuration.md#terminal-backend-terminal) for the full schema, the `CAO_TERMINAL_BACKEND` / `CAO_HERDR_SESSION` env vars, and the `cao config` CLI.
 
 ## Launching
 
-With `terminal_backend` set in `config.json`, start the server the same way as
+With `terminal.backend` set in `settings.json`, start the server the same way as
 with tmux -- CAO detects the backend and connects to herdr automatically:
 
 ```bash
 cao-server
 ```
 
-To select herdr without editing `config.json`, pass `--terminal`:
+To select herdr without editing `settings.json`, pass `--terminal`:
 
 ```bash
 cao-server --terminal herdr
 ```
 
-The `--terminal` flag (`tmux` or `herdr`) overrides `terminal_backend` from
-`config.json` for that run. The `herdr_session` name, if set, is still read from
-`config.json`.
+The `--terminal` flag (`tmux` or `herdr`) overrides `terminal.backend` from
+`settings.json` for that run. The `herdr_session` name, if set, is still read from
+`settings.json`.
 
 ## Viewing and Attaching
 
@@ -106,11 +110,13 @@ The socket connection uses exponential backoff (1s to 30s) on disconnect.
 
 ## Switching Back to tmux
 
-Remove `terminal_backend` from `config.json`, or set it explicitly:
+Remove `terminal` from `settings.json`, or set it explicitly:
 
 ```json
 {
-  "terminal_backend": "tmux"
+  "terminal": {
+    "backend": "tmux"
+  }
 }
 ```
 
@@ -130,7 +136,7 @@ If sessions are genuinely running in herdr, they will be re-discovered on the ne
 
 ### Session visible in herdr but not in CAO
 
-The CAO server may be connected to the wrong herdr session. Verify `herdr_session` in `config.json` matches the session herdr is running under:
+The CAO server may be connected to the wrong herdr session. Verify `terminal.herdr_session` in `settings.json` matches the session herdr is running under:
 
 ```bash
 # Check which session herdr is using

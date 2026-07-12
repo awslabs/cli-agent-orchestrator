@@ -5,11 +5,8 @@ role: supervisor  # @cao-mcp-server, fs_read, fs_list. For fine-grained control,
 mcpServers:
   cao-mcp-server:
     type: stdio
-    command: uvx
-    args:
-      - "--from"
-      - "git+https://github.com/awslabs/cli-agent-orchestrator.git@main"
-      - "cao-mcp-server"
+    command: cao-mcp-server
+    args: []
 ---
 
 # CROSS-PROVIDER SUPERVISOR AGENT

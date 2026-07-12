@@ -1,6 +1,7 @@
 """Minimal database client with only terminal metadata."""
 
 import logging
+import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, cast
@@ -145,8 +146,24 @@ class FlowModel(Base):
     enabled = Column(Boolean, default=True)
 
 
+def _ensure_db_dir() -> None:
+    """Create the DB dir owner-only (0o700).
+
+    The DB stores sensitive data (workflow spec_snapshot carries full prompt
+    bodies + inputs_json), so the dir is owner-only — the same posture as
+    claude_code prompt files (0o600) and the audit log (0o700/0o600). mkdir's
+    mode is ignored when the dir already exists (exist_ok) and is masked by
+    umask on creation — the chmod enforces 0o700 in both cases, best-effort.
+    """
+    DB_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        os.chmod(DB_DIR, 0o700)
+    except OSError as e:
+        logger.warning(f"Could not restrict DB dir permissions on {DB_DIR}: {e}")
+
+
 # Module-level singletons
-DB_DIR.mkdir(parents=True, exist_ok=True)
+_ensure_db_dir()
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
@@ -155,12 +172,38 @@ def init_db() -> None:
     """Initialize database tables and apply schema migrations."""
     _migrate_project_aliases_schema()
     Base.metadata.create_all(bind=engine)
+    _restrict_db_file_permissions()
     _migrate_terminals_schema()
     _migrate_memory_indexes()
     _migrate_add_access_count()
     _migrate_add_last_compiled_at()
     _migrate_add_related_keys()
     _migrate_workflow_index()
+    _migrate_workflow_run()
+    _migrate_workflow_run_step()
+
+
+def _restrict_db_file_permissions() -> None:
+    """Chmod the SQLite file (+ -wal/-shm siblings if present) to 0o600.
+
+    The DB persists sensitive data (workflow spec_snapshot prompt bodies,
+    inputs_json), matching the owner-only posture of prompt files and the audit
+    log. Called after ``create_all`` so the file exists. Best-effort: a chmod
+    failure (exotic filesystems) degrades permissions only, never blocks startup.
+    """
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    for path in (
+        DATABASE_FILE,
+        DATABASE_FILE.with_name(DATABASE_FILE.name + "-wal"),
+        DATABASE_FILE.with_name(DATABASE_FILE.name + "-shm"),
+    ):
+        if not path.exists():
+            continue
+        try:
+            os.chmod(path, 0o600)
+        except OSError as e:
+            logger.warning(f"Could not restrict DB file permissions on {path}: {e}")
 
 
 def _migrate_project_aliases_schema() -> None:
@@ -324,6 +367,108 @@ def _migrate_workflow_index() -> None:
             )
     except Exception as e:  # noqa: BLE001 — derived table; rebuilt on next list
         logger.debug(f"workflow_index migration skipped: {e}")
+
+
+def _migrate_workflow_run() -> None:
+    """Create the durable ``workflow_run`` journal table if missing (issue #312, N6).
+
+    The run aggregate root: one row per run, keyed by ``run_id`` (E1,
+    domain-entities). Per Q1=B this is the **source of truth** for run execution
+    state; the Bolt-3 in-memory ``run_registry`` is a cache over it. No loop
+    columns (``iteration_counter`` etc.) — deferred to N8 (Q4=B, B4-BR-12).
+
+    Idempotent (``CREATE TABLE IF NOT EXISTS``), zero-arg and self-connecting —
+    mirrors ``_migrate_workflow_index`` (B2, B4-BR-1). Failure is logged at debug
+    and never propagated: a missing table is recoverable, the next write retries
+    the path and the live run completes on the in-memory floor (B4-RD-4).
+
+    U3 (issue #312, script-tier journal extension) additively appends two
+    columns — ``tier`` and ``generation`` (E1, domain-entities) — via the same
+    idempotent ``PRAGMA table_info`` gate used by ``_migrate_add_access_count`` /
+    ``_migrate_add_related_keys``. Both default to values that make a pre-U3 /
+    YAML row read identically to its pre-extension form (INV-1/INV-2): existing
+    rows back-fill to ``tier='yaml'``, ``generation='1'``. ``generation`` is TEXT,
+    not INTEGER, so it compares byte-identically against the env-var-transported
+    string generation value (domain-entities B4 fix).
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS workflow_run ("
+                "run_id TEXT PRIMARY KEY, "
+                "workflow_name TEXT NOT NULL, "
+                "spec_snapshot TEXT NOT NULL, "
+                "inputs_json TEXT NOT NULL, "
+                "state TEXT NOT NULL, "
+                "current_step_id TEXT, "
+                "started_at TEXT NOT NULL, "
+                "finished_at TEXT"
+                ")"
+            )
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(workflow_run)")}
+            if "tier" not in columns:
+                conn.execute(
+                    "ALTER TABLE workflow_run ADD COLUMN tier TEXT NOT NULL DEFAULT 'yaml'"
+                )
+                logger.info("Migration: added tier column to workflow_run")
+            if "generation" not in columns:
+                conn.execute(
+                    "ALTER TABLE workflow_run ADD COLUMN generation TEXT NOT NULL DEFAULT '1'"
+                )
+                logger.info("Migration: added generation column to workflow_run")
+    except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
+        logger.debug(f"workflow_run migration skipped: {e}")
+
+
+def _migrate_workflow_run_step() -> None:
+    """Create the durable ``workflow_run_step`` table if missing (issue #312, N6).
+
+    Per-step durable state: one row per ``(run_id, step_id)`` (E2,
+    domain-entities). ``reprompted``/``terminal_id`` are deliberately NOT
+    journaled (F3) — they are in-memory-only and defaulted on rebuild. No
+    ``which_guard_fired``/``iterations_run`` columns — N8 adds them via its own
+    additive migrator (Q4=B, B4-BR-12).
+
+    Idempotent, zero-arg, self-connecting; failure logged at debug and never
+    propagated (B4-BR-1 / B4-RD-4), same precedent as ``_migrate_workflow_index``.
+
+    U3 (issue #312, script-tier journal extension) additively appends
+    ``call_fingerprint`` (E2, domain-entities) via the same idempotent
+    ``PRAGMA table_info`` gate. Defaults to ``NULL`` so a pre-U3 / YAML row is
+    indistinguishable from its pre-extension form (INV-1/INV-2); ``append_step``
+    is the sole write path for the column (``update_step`` stays untouched — the
+    fingerprint is set once, at the RUNNING insert).
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS workflow_run_step ("
+                "run_id TEXT NOT NULL, "
+                "step_id TEXT NOT NULL, "
+                "state TEXT NOT NULL, "
+                "attempts INTEGER NOT NULL, "
+                "output_json TEXT, "
+                "error TEXT, "
+                "updated_at TEXT NOT NULL, "
+                "PRIMARY KEY (run_id, step_id)"
+                ")"
+            )
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(workflow_run_step)")}
+            if "call_fingerprint" not in columns:
+                conn.execute(
+                    "ALTER TABLE workflow_run_step ADD COLUMN call_fingerprint TEXT DEFAULT NULL"
+                )
+                logger.info("Migration: added call_fingerprint column to workflow_run_step")
+    except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
+        logger.debug(f"workflow_run_step migration skipped: {e}")
 
 
 def _migrate_terminals_schema() -> None:

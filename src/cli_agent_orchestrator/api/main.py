@@ -28,9 +28,12 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from pydantic import BaseModel, Field, field_validator
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from cli_agent_orchestrator.backends import TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
@@ -54,6 +57,8 @@ from cli_agent_orchestrator.constants import (
     SERVER_VERSION,
     TERMINALS_RUN_STEP_ROUTE,
     TRUSTED_FORWARDER_IPS,
+    WORKFLOW_ENV_ALLOWLIST,
+    WORKFLOW_ENV_VALUE_MAX_LEN,
     WS_ALLOWED_CLIENTS,
     add_local_cors_origins,
 )
@@ -88,6 +93,7 @@ from cli_agent_orchestrator.services.cleanup_service import (
     cleanup_expired_memories,
     cleanup_old_data,
 )
+from cli_agent_orchestrator.services.config_service import ConfigService
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.event_log_service import RING_CAPACITY
 from cli_agent_orchestrator.services.event_primitives import KINDS as EVENT_KINDS
@@ -97,6 +103,7 @@ from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.services.install_service import InstallResult, install_agent
 from cli_agent_orchestrator.services.log_writer import log_writer
 from cli_agent_orchestrator.services.status_monitor import status_monitor
+from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_service import OutputMode, TerminalInputBlockedError
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.logging import setup_logging
@@ -170,6 +177,20 @@ class TerminalOutputResponse(BaseModel):
     mode: str
 
 
+class CreateTerminalBody(BaseModel):
+    """Optional JSON body for POST /sessions/{name}/terminals.
+
+    Carries the deferred-init message payload OUT of the query string:
+    prompt content can be large (URL-length 414 risk) and sensitive (query
+    strings are routinely captured in HTTP access logs and traces). Routing
+    fields (provider, defer_init, etc.) stay as query params; only the
+    message content lives here.
+    """
+
+    initial_message: Optional[str] = None
+    initial_message_orchestration_type: Optional[str] = None
+
+
 class RunStepRequest(BaseModel):
     """Request body for the combined step-execution endpoint (N0, #312)."""
 
@@ -199,6 +220,87 @@ class RunStepRequest(BaseModel):
         default=None,
         description="Resolved allowed-tools list for a freshly created terminal (handoff inheritance)",
     )
+    env_vars: Optional[Dict[str, str]] = Field(
+        default=None,
+        description=(
+            "Workflow identity env vars injected into a freshly created terminal. "
+            "Keys are restricted to the WORKFLOW_ENV_ALLOWLIST (NFR-SEC-4); "
+            "values are validated but never echoed in error bodies."
+        ),
+    )
+
+    @field_validator("env_vars")
+    @classmethod
+    def validate_env_vars(cls, v: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
+        """Per-key checks for the env-var injection surface (U2/C6, A2).
+
+        Check order is load-bearing (security-requirements.md): allowlist ->
+        length cap -> control chars -> shared validator. Error messages name
+        the KEY and the violated rule only — the supplied VALUE is never
+        echoed into a 422 body (NFR-SEC-2 extended to the error path).
+        """
+        if v is None:
+            return v
+        for key, value in v.items():
+            if key not in WORKFLOW_ENV_ALLOWLIST:
+                raise ValueError(
+                    f"env var key '{key}' not in allowlist "
+                    f"{{{', '.join(sorted(WORKFLOW_ENV_ALLOWLIST))}}}"
+                )
+            # Pre-regex defense-in-depth, NOT redundancy: bounds the input
+            # O(1) before any regex evaluation and bounds what can be staged
+            # into a terminal environment regardless of future regex changes.
+            # Do not simplify away as duplicate validation (the effective
+            # accepted length is 64 via WORKFLOW_NAME_RE downstream).
+            if len(value) > WORKFLOW_ENV_VALUE_MAX_LEN:
+                raise ValueError(
+                    f"value for '{key}' exceeds the {WORKFLOW_ENV_VALUE_MAX_LEN}-char cap"
+                )
+            # Values land in a tmux session environment — escape-sequence
+            # injection into a terminal is the concrete threat.
+            if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+                raise ValueError(f"value for '{key}' contains control characters")
+            try:
+                _validate_key_part(value, key)
+            except ValueError:
+                # The shared validator's message interpolates the VALUE;
+                # re-raise with a key-name-only message so the supplied value
+                # never round-trips into the 422 body (NFR-SEC-4 sanitized
+                # error rule). `from None` drops the value-bearing cause.
+                raise ValueError(
+                    f"value for '{key}' is invalid (must be a 1-64 char "
+                    "[A-Za-z0-9_-] identifier)"
+                ) from None
+        return v
+
+    @model_validator(mode="after")
+    def validate_env_var_shape(self) -> "RunStepRequest":
+        """Cross-field checks (U2/C6, A3) — all surface as FastAPI-native 422s.
+
+        RUN_ID <-> GENERATION is a symmetric required pair (ADR-9/10): an
+        unanchored generation token — or a run id without its fence — would
+        silently no-op the stale-generation fence. STEP_ID requires RUN_ID
+        (a step key with no run to journal under is meaningless; RUN_ID
+        without STEP_ID is allowed for run-row-level calls).
+        """
+        keys = set(self.env_vars or {})
+        has_run = "CAO_WORKFLOW_RUN_ID" in keys
+        has_gen = "CAO_WORKFLOW_GENERATION" in keys
+        if has_run and not has_gen:
+            raise ValueError("CAO_WORKFLOW_RUN_ID requires CAO_WORKFLOW_GENERATION (required pair)")
+        if has_gen and not has_run:
+            raise ValueError("CAO_WORKFLOW_GENERATION requires CAO_WORKFLOW_RUN_ID (required pair)")
+        if "CAO_WORKFLOW_STEP_ID" in keys and not has_run:
+            raise ValueError("CAO_WORKFLOW_STEP_ID requires CAO_WORKFLOW_RUN_ID")
+        if self.env_vars and self.reuse_terminal_id:
+            # run_agent_step documents env injection as ignored on reused
+            # terminals — a silently dropped RUN_ID/GENERATION fence token is
+            # the quiet identity failure NFR-SEC-4 exists to prevent (BR-8).
+            raise ValueError(
+                "env_vars cannot be injected into a reused terminal "
+                "(env injection only applies to freshly created terminals)"
+            )
+        return self
 
 
 class RunStepResponse(BaseModel):
@@ -470,6 +572,33 @@ app.add_middleware(
 )
 
 
+@app.exception_handler(RequestValidationError)
+async def _redact_env_vars_validation_error(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """Redact ``env_vars`` VALUES from 422 bodies (U2, NFR-SEC-4).
+
+    FastAPI's default 422 envelope echoes the offending ``input`` back to the
+    caller. For ``env_vars`` violations the values are agent- or
+    attacker-supplied and must never round-trip into a response body — the
+    validator messages already name only the key and the rule, so the echoed
+    ``input``/``ctx`` are dropped for those entries. Every other field's 422
+    keeps FastAPI's stock shape byte-identical.
+    """
+    errors = []
+    for err in exc.errors():
+        # Field-validator errors anchor at ("body", "env_vars"); model-validator
+        # errors anchor at ("body",) with the WHOLE body echoed as input — both
+        # shapes can carry env_vars values, so both are redacted.
+        echoes_env_vars = "env_vars" in err.get("loc", ()) or (
+            isinstance(err.get("input"), dict) and "env_vars" in err["input"]
+        )
+        if echoes_env_vars:
+            err = {k: v for k, v in err.items() if k not in ("input", "ctx")}
+        errors.append(err)
+    return JSONResponse(status_code=422, content={"detail": jsonable_encoder(errors)})
+
+
 @app.get("/.well-known/oauth-protected-resource")
 async def oauth_protected_resource_metadata():
     """RFC 9728 Protected Resource Metadata.
@@ -523,12 +652,13 @@ async def health_check():
 def _mcp_apps_enabled() -> bool:
     """Whether the MCP Apps HTTP surface (event stream + widget) is enabled.
 
-    Mirrors the ``CAO_MCP_APPS_ENABLED`` gate used by the ``mcp_apps`` plugin,
+    Reads ``apps.enabled`` via ConfigService (``CAO_MCP_APPS_ENABLED`` env var
+    or ``settings.json``), mirroring the gate used by the ``mcp_apps`` plugin,
     ``app_tools``, ``sep2133`` and the ``event_log_publisher`` observer so the
     whole surface is consistently default-off.
     """
 
-    return os.getenv("CAO_MCP_APPS_ENABLED", "false").lower() in ("1", "true", "yes")
+    return bool(ConfigService.get("apps.enabled", default=False))
 
 
 def _require_mcp_apps_enabled() -> None:
@@ -700,19 +830,31 @@ async def list_providers_endpoint() -> List[Dict]:
 
 
 @app.get("/settings/agent-dirs")
-async def get_agent_dirs_endpoint() -> Dict:
-    """Get configured agent directories per provider."""
+async def get_agent_dirs_endpoint(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Get configured agent directories per provider.
+
+    Read-scope gated when auth is enabled: the response discloses local
+    filesystem layout (home paths), so it gets the same floor as other reads.
+    """
     from cli_agent_orchestrator.services.settings_service import (
         get_agent_dirs,
+        get_disabled_agent_dirs,
         get_extra_agent_dirs,
     )
 
-    return {"agent_dirs": get_agent_dirs(), "extra_dirs": get_extra_agent_dirs()}
+    return {
+        "agent_dirs": get_agent_dirs(),
+        "extra_dirs": get_extra_agent_dirs(),
+        "disabled_dirs": get_disabled_agent_dirs(),
+    }
 
 
 class AgentDirsUpdate(BaseModel):
     agent_dirs: Optional[Dict[str, str]] = None
     extra_dirs: Optional[List[str]] = None
+    disabled_dirs: Optional[List[str]] = None
 
 
 @app.get("/settings/memory")
@@ -728,22 +870,28 @@ async def set_agent_dirs_endpoint(
     body: AgentDirsUpdate,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
-    """Update agent directories per provider."""
+    """Update agent directories per provider (paths, extras, and disabled set)."""
     from cli_agent_orchestrator.services.settings_service import (
+        get_agent_dirs,
+        get_disabled_agent_dirs,
         get_extra_agent_dirs,
         set_agent_dirs,
+        set_disabled_agent_dirs,
         set_extra_agent_dirs,
     )
 
-    result_dirs = {}
-    result_extra = []
     if body.agent_dirs:
-        result_dirs = set_agent_dirs(body.agent_dirs)
+        set_agent_dirs(body.agent_dirs)
     if body.extra_dirs is not None:
-        result_extra = set_extra_agent_dirs(body.extra_dirs)
+        set_extra_agent_dirs(body.extra_dirs)
+    # After extras are persisted, so a just-added extra can be disabled in the
+    # same request; set_disabled validates against the current known dirs.
+    if body.disabled_dirs is not None:
+        set_disabled_agent_dirs(body.disabled_dirs)
     return {
-        "agent_dirs": result_dirs or {},
-        "extra_dirs": result_extra or get_extra_agent_dirs(),
+        "agent_dirs": get_agent_dirs(),
+        "extra_dirs": get_extra_agent_dirs(),
+        "disabled_dirs": get_disabled_agent_dirs(),
     }
 
 
@@ -938,7 +1086,14 @@ async def delete_session(
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
-        result = session_service.delete_session(session_name, registry=get_plugin_registry(request))
+        # Off the event loop: teardown is fully synchronous (tmux kills, FIFO
+        # cleanup, DB writes) and has wedged the whole server — /health
+        # included — when a FIFO operation stalled in the kernel (issue #382).
+        # A worker thread bounds the blast radius of any future stall to this
+        # one request.
+        result = await asyncio.to_thread(
+            session_service.delete_session, session_name, registry=get_plugin_registry(request)
+        )
         return {"success": True, **result}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -962,9 +1117,26 @@ async def create_terminal_in_session(
     working_directory: Optional[str] = None,
     allowed_tools: Optional[str] = None,
     caller_id: Optional[TerminalId] = None,
+    defer_init: bool = False,
+    body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
-    """Create additional terminal in existing session."""
+    """Create additional terminal in existing session.
+
+    ``defer_init=true``: return as soon as the tmux window is created and the
+    terminal is registered in the DB, without waiting for the CLI provider to
+    reach IDLE. Provider initialization runs as a background task; when
+    ``body.initial_message`` is also provided it is sent to the terminal via
+    the same task once init completes. Used by the MCP `assign` tool to keep
+    tool-call latency well under kiro-cli 2.11's ~60s per-tool client
+    timeout, and to allow multiple concurrent assigns to run their init
+    phases in parallel.
+
+    The message payload lives in the JSON body (``initial_message``,
+    ``initial_message_orchestration_type``) rather than query params so prompt
+    content isn't exposed in HTTP access logs and isn't subject to URL-length
+    limits.
+    """
     try:
         validate_tmux_name(session_name, "session_name")
     except ValueError as e:
@@ -978,6 +1150,43 @@ async def create_terminal_in_session(
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
+        initial_message = body.initial_message if body else None
+
+        # The initial-message payload is only delivered on the deferred-init
+        # path; create_terminal() ignores it otherwise. Reject it explicitly
+        # when defer_init is false rather than silently dropping it, which would
+        # surface later as a "worker never received task" mystery.
+        if (
+            not defer_init
+            and body
+            and (
+                body.initial_message is not None
+                or body.initial_message_orchestration_type is not None
+            )
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "initial_message / initial_message_orchestration_type require "
+                    "defer_init=true; they are not delivered on the synchronous path"
+                ),
+            )
+
+        # Deferred init only makes sense when a message will follow — we
+        # still accept the flag alone (no message) for future non-assign uses.
+        orch_type = None
+        if body and body.initial_message_orchestration_type:
+            try:
+                orch_type = OrchestrationType(body.initial_message_orchestration_type)
+            except ValueError:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"invalid initial_message_orchestration_type: "
+                        f"{body.initial_message_orchestration_type!r}"
+                    ),
+                )
+
         result = await terminal_service.create_terminal(
             provider=resolved_provider,
             agent_profile=agent_profile,
@@ -987,8 +1196,15 @@ async def create_terminal_in_session(
             allowed_tools=allowed_tools_list,
             registry=get_plugin_registry(request),
             caller_id=caller_id,
+            defer_init=defer_init,
+            initial_message=initial_message,
+            initial_message_orchestration_type=orch_type,
         )
         return result
+    except HTTPException:
+        # Deliberate 4xx (e.g. the initial_message/defer_init guard, invalid
+        # orchestration_type) — propagate as-is instead of masking as a 500.
+        raise
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -1019,7 +1235,12 @@ async def list_terminals_in_session(session_name: str) -> List[Dict]:
 @app.get("/terminals/{terminal_id}", response_model=Terminal)
 async def get_terminal(terminal_id: TerminalId) -> Terminal:
     try:
-        terminal = terminal_service.get_terminal(terminal_id)
+        # get_terminal reads status_monitor.get_status(), which for a
+        # PROCESSING terminal does a fresh detection that can shell out to
+        # tmux (blocking subprocess). This endpoint is polled heavily by
+        # wait_until_terminal_status, so run it off the loop to keep the
+        # server responsive under concurrent orchestration.
+        terminal = await asyncio.to_thread(terminal_service.get_terminal, terminal_id)
         return Terminal(**terminal)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -1081,7 +1302,12 @@ async def send_terminal_input(
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
     try:
-        success = terminal_service.send_input(
+        # send_input is blocking tmux I/O (bracketed paste + key sends). Run it
+        # off the event loop so a slow tmux call can't freeze every other
+        # request — including /health and concurrent assign/handoff. Same
+        # hazard class as issue #382 (only fixed for DELETE /sessions there).
+        success = await asyncio.to_thread(
+            terminal_service.send_input,
             terminal_id,
             message,
             registry=get_plugin_registry(request),
@@ -1117,7 +1343,8 @@ async def send_terminal_key(
         )
 
     try:
-        success = terminal_service.send_special_key(terminal_id, key)
+        # Blocking tmux send-keys — off the loop.
+        success = await asyncio.to_thread(terminal_service.send_special_key, terminal_id, key)
         return {"success": success}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -1133,7 +1360,10 @@ async def get_terminal_output(
     terminal_id: TerminalId, mode: OutputMode = OutputMode.FULL
 ) -> TerminalOutputResponse:
     try:
-        output = terminal_service.get_output(terminal_id, mode)
+        # get_output does a blocking tmux capture-pane plus provider regex
+        # extraction over the scrollback — run it off the loop so a large
+        # transcript can't stall the whole server.
+        output = await asyncio.to_thread(terminal_service.get_output, terminal_id, mode)
         return TerminalOutputResponse(output=output, mode=mode)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -1151,7 +1381,8 @@ async def exit_terminal(
 ) -> Dict:
     """Send provider-specific exit command to terminal."""
     try:
-        terminal_service.exit_terminal_cli(terminal_id)
+        # Blocking tmux I/O — off the loop.
+        await asyncio.to_thread(terminal_service.exit_terminal_cli, terminal_id)
         return {"success": True}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -1211,6 +1442,35 @@ async def run_step(
     The plugin registry is threaded so teardown's ``post_kill_terminal`` hooks
     fire (parity with the DELETE endpoint).
     """
+    # BR-31: for a script-tier run-step call, record the created terminal into the
+    # shared ScriptRunRecord's step_states AT creation time, so U4's orphan sweep
+    # can tear it down if the subprocess dies mid-call. No-op for YAML/handoff
+    # callers (no run/step env or no script record in the registry).
+    from cli_agent_orchestrator.services import workflow_service
+    from cli_agent_orchestrator.services.script_runner import make_step_terminal_recorder
+    from cli_agent_orchestrator.services.workflow_service import StaleGenerationError
+
+    on_terminal_created = make_step_terminal_recorder(body.env_vars)
+
+    # The generation fence (ADR-9 anti-double-drive, DR-5): a script run-step call
+    # carrying BOTH CAO_WORKFLOW_RUN_ID and CAO_WORKFLOW_GENERATION must be checked
+    # against the run's current journaled generation BEFORE dispatch — a resume or
+    # cancel bumps the generation, and a reparented predecessor subprocess's late
+    # calls must be fenced out rather than allowed to run.
+    env_vars = body.env_vars or {}
+    fence_run_id = env_vars.get("CAO_WORKFLOW_RUN_ID")
+    fence_generation = env_vars.get("CAO_WORKFLOW_GENERATION")
+    if fence_run_id is not None and fence_generation is not None:
+        try:
+            workflow_service.check_generation(fence_run_id, fence_generation)
+        except StaleGenerationError as e:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"run '{fence_run_id}': {e}",
+            )
+        except KeyError as e:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
     try:
         result = await run_agent_step(
             provider=body.provider,
@@ -1224,6 +1484,8 @@ async def run_step(
             caller_id=body.caller_id,
             allowed_tools=body.allowed_tools,
             registry=get_plugin_registry(request),
+            env_vars=body.env_vars,
+            on_terminal_created=on_terminal_created,
         )
         return RunStepResponse(
             terminal_id=result.terminal_id,
@@ -1436,6 +1698,39 @@ async def cancel_workflow_run_endpoint(
     return {"success": True, "run_id": run_id}
 
 
+@app.post("/workflows/runs/{run_id}/resume")
+async def resume_workflow_run_endpoint(
+    run_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Resume a crashed/failed run from its durable journal (FR-6.2, N6).
+
+    Re-drives the snapshotted spec from the journal, skipping already-completed
+    steps and re-running the rest with fresh terminals; awaited INLINE like the run
+    endpoint and returns the same ``WorkflowRunResult``. Error mapping
+    (business-logic-model §5): malformed run_id -> 400, unknown run -> 404, terminal
+    or live-RUNNING run -> 409, corrupt snapshot -> 422. The two resume subtypes are
+    caught BEFORE the bare ``ValueError`` arm so they map to their distinct codes.
+    """
+    from cli_agent_orchestrator.services import workflow_service
+
+    try:
+        result = await workflow_service.resume_from_last_completed(run_id)
+    except KeyError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown run '{run_id}'")
+    except workflow_service.ResumeNotAllowedError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except workflow_service.ResumeCorruptError as e:
+        # 422 by literal code: the ``status`` alias name differs across Starlette
+        # versions in the CI matrix; the integer is stable and warning-free.
+        raise HTTPException(status_code=422, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except workflow_service.WorkflowEngineError as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    return result.model_dump()
+
+
 @app.delete("/terminals/{terminal_id}")
 async def delete_terminal(
     request: Request,
@@ -1444,8 +1739,15 @@ async def delete_terminal(
 ) -> Dict:
     """Delete a terminal."""
     try:
-        success = terminal_service.delete_terminal(
-            terminal_id, registry=get_plugin_registry(request)
+        # delete_terminal is fully synchronous: blocking tmux kills, a
+        # full-history scrollback snapshot capture, and DB writes. Off the
+        # loop so a stalled tmux/FIFO op bounds its blast radius to this one
+        # request instead of wedging the whole server (issue #382 fixed this
+        # for DELETE /sessions; the per-terminal path had the same hazard).
+        success = await asyncio.to_thread(
+            terminal_service.delete_terminal,
+            terminal_id,
+            registry=get_plugin_registry(request),
         )
         return {"success": success}
     except ValueError as e:
@@ -1964,6 +2266,85 @@ async def list_memories_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to list memories: {str(e)}",
         )
+
+
+@app.get("/memory/export")
+async def export_memories_endpoint(
+    scope: MemoryScope,
+    format: str = Query(default="okf"),
+    scope_id: Optional[MemoryScopeId] = None,
+    include_history: bool = False,
+    redact: bool = False,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+):
+    """Stream one scope as an archive tarball (#345 D6, read-only mirror).
+
+    Declared BEFORE /memory/{key} so "export" is not captured as a key.
+    Private scopes (session/agent) are refused outright — there is no
+    include-private escape hatch over HTTP (D5). The bundle is built by
+    the same directory writer into a temp dir, tar'd, and streamed.
+    """
+    from fastapi.responses import FileResponse
+    from starlette.background import BackgroundTask
+
+    _require_memory_enabled()
+    # Private-scope gate: the CLI's --include-private is a local-operator
+    # affordance; the API surface never exports private tiers.
+    if scope in (MemoryScope.SESSION, MemoryScope.AGENT):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"scope '{scope.value}' is private and cannot be exported via the API",
+        )
+    if scope == MemoryScope.PROJECT and scope_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="scope 'project' requires scope_id",
+        )
+
+    import tempfile
+
+    from cli_agent_orchestrator.services.memory_archive import get_backend
+    from cli_agent_orchestrator.services.memory_archive.okf import export_bundle_to_tar
+
+    svc = _get_memory_service()
+    try:
+        backend = get_backend(format)(svc)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    tmp_dir = tempfile.mkdtemp(prefix="cao-memory-export-")
+    tar_path = Path(tmp_dir) / f"cao-memory-{scope.value}.tar.gz"
+
+    def _cleanup() -> None:
+        import shutil
+
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    try:
+        export_bundle_to_tar(
+            backend,
+            scope.value,
+            scope_id,
+            tar_path,
+            include_history=include_history,
+            redact=redact,
+        )
+    except ValueError as e:
+        _cleanup()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        _cleanup()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to export memories: {str(e)}",
+        )
+
+    return FileResponse(
+        path=str(tar_path),
+        media_type="application/gzip",
+        filename=tar_path.name,
+        background=BackgroundTask(_cleanup),
+    )
 
 
 @app.get("/memory/{key}", response_model=MemoryDetail)

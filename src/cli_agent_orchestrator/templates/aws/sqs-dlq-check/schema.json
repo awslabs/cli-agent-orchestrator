@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "sqs-dlq-check",
+  "description": "Inspect a Dead Letter Queue for failed messages",
+  "type": "object",
+  "properties": {
+    "profile": {
+      "type": "string",
+      "description": "AWS CLI profile name",
+      "pattern": "^[a-zA-Z0-9_-]+$"
+    },
+    "region": {
+      "type": "string",
+      "description": "AWS region",
+      "pattern": "^[a-z]{2}-[a-z]+-[0-9]+$"
+    },
+    "dlq_url": {
+      "type": "string",
+      "description": "Full DLQ queue URL",
+      "pattern": "^https://sqs\\.[a-z0-9-]+\\.amazonaws\\.com/[0-9]+/[a-zA-Z0-9_.-]+$"
+    },
+    "message_group_id": {
+      "type": "string",
+      "description": "Filter by group (FIFO queues; empty to skip filtering)",
+      "pattern": "^[a-zA-Z0-9_.-]*$",
+      "default": ""
+    },
+    "max_messages": {
+      "type": "integer",
+      "description": "Max messages to peek",
+      "minimum": 1,
+      "maximum": 10,
+      "default": 10
+    }
+  },
+  "required": ["profile", "region", "dlq_url"],
+  "additionalProperties": false
+}

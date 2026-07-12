@@ -1,0 +1,5 @@
+{
+  "name": "fleet-console",
+  "private": true,
+  "type": "module"
+}

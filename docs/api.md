@@ -108,9 +108,15 @@ Create an additional terminal in an existing session.
 - `provider` (string, required): Provider type
 - `agent_profile` (string, required): Agent profile name
 - `working_directory` (string, optional): Working directory for the terminal
+- `allowed_tools` (string, optional): Comma-separated list of allowed CAO tools for the worker.
 - `caller_id` (string, optional): Terminal ID of the creating terminal (8-character hexadecimal). Recorded so `send_message` can default replies to the caller (issue #284).
+- `defer_init` (bool, optional, default `false`): When `true`, return as soon as the tmux window and DB record exist, without waiting for `provider.initialize()` to finish. The provider is still created and initialized — but on a background asyncio task on cao-server, so the HTTP round-trip stays under ~2s regardless of provider startup latency. Used by the MCP `assign` tool to keep tool-call latency well under kiro-cli 2.11's ~60s per-tool client timeout, and to allow multiple concurrent assigns to run their init phases in parallel.
 
-**Response:** Terminal object (201 Created)
+**Request body (optional, JSON):** the deferred-init message payload is sent in the body — not query params — so prompt content is not exposed in HTTP access logs and is not subject to URL-length limits.
+- `initial_message` (string, optional): When `defer_init=true`, this message is delivered to the newly created worker via `send_input` after `provider.initialize()` completes. Ignored if `defer_init=false`. Ordering: init runs first, then message delivery, both on the same background task.
+- `initial_message_orchestration_type` (string, optional): One of `assign` or `handoff`. Passed through to `send_input` for plugin event emission when `initial_message` is delivered.
+
+**Response:** Terminal object (201 Created). When `defer_init=true`, the returned status is `unknown` (the provider is still initializing on a background task); poll `GET /terminals/{id}` for the live status before sending further input.
 
 ### GET /sessions/{session_name}/terminals
 List all terminals in a session.
@@ -312,6 +318,25 @@ List stored memories across all projects (the CLI's `cao memory list --all`).
 
 `scope_id` is the project ID for project memories, the session/agent ID for
 those scopes, and `null` for global.
+
+### GET /memory/export
+Export one memory scope as an archive bundle (the CLI's `cao memory export`).
+Streams a gzipped tarball of the OKF bundle (topic files plus `index.md` and
+`manifest.md`).
+
+**Parameters:**
+- `scope` (string, required): Scope to export (`global`, `project`, or `federated`; `400` for the private `session`/`agent` scopes — there is no include-private escape hatch over HTTP)
+- `format` (string, optional): Archive format (default: `okf`; `400` on unknown formats)
+- `scope_id` (string): Required for `project` scope (`400` if missing)
+- `include_history` (boolean, optional): Include `history/<key>.md` files (default: `false`)
+- `redact` (boolean, optional): Redact secret matches instead of skipping the topic (default: `false`)
+
+**Response:** `200` with `Content-Type: application/gzip` — the bundle tarball
+as the response body.
+
+When API auth is enabled, this endpoint requires a token carrying at least the
+read scope (`cao:read`, `cao:write`, or `cao:admin`); requests without one are
+`403`'d.
 
 ### GET /memory/{key}
 Show a memory by key (first match wins when the same key exists in several

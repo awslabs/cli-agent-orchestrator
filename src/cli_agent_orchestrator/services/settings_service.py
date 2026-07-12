@@ -4,9 +4,10 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.utils.paths import normalized_path
 
 logger = logging.getLogger(__name__)
 
@@ -38,16 +39,29 @@ def _save(data: Dict[str, Any]) -> None:
     """Save settings to disk."""
     CAO_HOME_DIR.mkdir(parents=True, exist_ok=True)
     SETTINGS_FILE.write_text(json.dumps(data, indent=2))
+    # Invalidate any cached server settings so the next read reflects the change.
+    global _server_settings_cache, _server_settings_mtime_ns
+    _server_settings_cache = None
+    _server_settings_mtime_ns = -1
 
 
 def get_agent_dirs() -> Dict[str, str]:
     """Get configured agent directories per provider.
 
+    Reads from the nested schema first (``agents.dirs``), falls back to the
+    legacy flat key (``agent_dirs``) for backward compatibility.
+
     Returns dict like:
       {"kiro_cli": "/home/user/.kiro/agents", "claude_code": "...", ...}
     """
     settings = _load()
-    saved = settings.get("agent_dirs", {})
+    # Nested format (documented schema): {"agents": {"dirs": {...}}}
+    nested = settings.get("agents", {})
+    if isinstance(nested, dict) and "dirs" in nested and isinstance(nested["dirs"], dict):
+        saved = nested["dirs"]
+    else:
+        # Legacy flat format: {"agent_dirs": {...}}
+        saved = settings.get("agent_dirs", {})
     # Merge defaults with saved — saved overrides defaults
     result = dict(_DEFAULTS)
     result.update(saved)
@@ -55,16 +69,100 @@ def get_agent_dirs() -> Dict[str, str]:
 
 
 def set_agent_dirs(dirs: Dict[str, str]) -> Dict[str, str]:
-    """Update agent directories. Only updates providers that are specified."""
+    """Update agent directories. Only updates providers that are specified.
+
+    Writes to the nested schema format (``agents.dirs``). Also updates the
+    legacy flat key (``agent_dirs``) for backward compatibility with older
+    CAO versions that may still read it.
+    """
     settings = _load()
-    current = settings.get("agent_dirs", {})
+    # Read current from nested first, fall back to flat
+    nested = settings.get("agents", {})
+    if isinstance(nested, dict) and "dirs" in nested and isinstance(nested["dirs"], dict):
+        current = nested["dirs"]
+    else:
+        current = settings.get("agent_dirs", {})
     for provider, path in dirs.items():
         if provider in _DEFAULTS:
             current[provider] = path
+    # Write nested format
+    agents_section = settings.get("agents", {})
+    if not isinstance(agents_section, dict):
+        agents_section = {}
+    agents_section["dirs"] = current
+    settings["agents"] = agents_section
+    # Also write flat key for backward compat
     settings["agent_dirs"] = current
     _save(settings)
     logger.info(f"Updated agent directories: {current}")
     return get_agent_dirs()
+
+
+def get_disabled_agent_dirs() -> List[str]:
+    """Directory paths the user has toggled OFF.
+
+    A disabled directory stays listed in Settings but is skipped when scanning
+    for (and loading) agent profiles, so its profiles disappear from the active
+    set without editing paths. Covers both provider defaults (fixes GH #281 —
+    a removed default used to silently reappear) and user extras (GH #280).
+
+    Reads from the nested schema first (``agents.disabled_dirs``), falls back
+    to the legacy flat key (``disabled_agent_dirs``) — same contract as the
+    sibling ``agents.dirs`` / ``agents.extra_dirs`` settings.
+    """
+    settings = _load()
+    nested = settings.get("agents", {})
+    if isinstance(nested, dict) and isinstance(nested.get("disabled_dirs"), list):
+        # list(...) narrows the untyped-dict Any to list[str] for mypy's
+        # no-any-return gate, matching get_extra_agent_dirs' return guard.
+        return list(nested["disabled_dirs"])
+    dirs = settings.get("disabled_agent_dirs", [])
+    return dirs if isinstance(dirs, list) else []
+
+
+def set_disabled_agent_dirs(dirs: List[str]) -> List[str]:
+    """Persist which configured directories are disabled.
+
+    Only paths that are actually configured (a provider default from
+    ``get_agent_dirs`` or a user extra) are accepted — an arbitrary path would
+    silently match nothing during scanning, so rejecting it keeps the stored
+    state honest and the UI truthful. Validation uses the same path
+    normalization as the scan/load side (``utils.paths.normalized_path``), so
+    a valid directory sent in a different spelling (trailing slash, ``~``,
+    symlink) is accepted rather than silently dropped; what gets PERSISTED is
+    always the configured spelling, so the UI's exact-string matching keeps
+    working. Order and duplicates are normalized away.
+
+    Writes to the nested schema (``agents.disabled_dirs``) and the legacy flat
+    key (``disabled_agent_dirs``) for backward compatibility — mirroring
+    ``set_agent_dirs`` / ``set_extra_agent_dirs``.
+    """
+    norm_to_configured = {
+        normalized_path(v): v
+        for v in list(get_agent_dirs().values()) + list(get_extra_agent_dirs())
+        if isinstance(v, str)
+    }
+    seen: Set[str] = set()
+    cleaned: List[str] = []
+    for d in dirs:
+        if not isinstance(d, str) or not d.strip():
+            continue
+        configured = norm_to_configured.get(normalized_path(d.strip()))
+        if configured is not None and configured not in seen:
+            seen.add(configured)
+            cleaned.append(configured)
+    settings = _load()
+    # Write nested format
+    agents_section = settings.get("agents", {})
+    if not isinstance(agents_section, dict):
+        agents_section = {}
+    agents_section["disabled_dirs"] = cleaned
+    settings["agents"] = agents_section
+    # Also write flat key for backward compat
+    settings["disabled_agent_dirs"] = cleaned
+    _save(settings)
+    logger.info(f"Disabled agent dirs: {cleaned}")
+    return cleaned
 
 
 # Default server tuning values
@@ -75,6 +173,14 @@ _SERVER_DEFAULTS = {
     "startup_prompt_handler_timeout": 20,
 }
 
+# Env-var overrides for server settings. Precedence: env var > settings.json > default.
+_SERVER_ENV_VARS = {
+    "mcp_request_timeout": "CAO_MCP_REQUEST_TIMEOUT",
+    "event_bus_max_queue_size": "CAO_EVENT_BUS_MAX_QUEUE_SIZE",
+    "provider_init_timeout": "CAO_PROVIDER_INIT_TIMEOUT",
+    "startup_prompt_handler_timeout": "CAO_STARTUP_PROMPT_HANDLER_TIMEOUT",
+}
+
 
 _server_settings_cache: Optional[Dict[str, Any]] = None
 _server_settings_mtime_ns: int = -1
@@ -83,6 +189,8 @@ _server_settings_mtime_ns: int = -1
 def get_server_settings() -> Dict[str, Any]:
     """Get server tuning settings (cached; re-reads only when file changes).
 
+    Precedence per key: CAO_* env var > settings.json > built-in default.
+
     Returns a dict with the following keys (defaults shown):
       - mcp_request_timeout (30): Seconds to wait for MCP HTTP calls
       - event_bus_max_queue_size (1024): Max events buffered per subscriber
@@ -90,8 +198,8 @@ def get_server_settings() -> Dict[str, Any]:
       - startup_prompt_handler_timeout (20): Seconds to handle startup prompts
         (e.g., workspace trust dialogs) before giving up
 
-    Values can be set in ~/.aws/cli-agent-orchestrator/settings.json under
-    the "server" key:
+    Values can be set via CAO_* environment variables or in
+    ~/.aws/cli-agent-orchestrator/settings.json under the "server" key:
 
         {
           "server": {
@@ -118,6 +226,19 @@ def get_server_settings() -> Dict[str, Any]:
         saved = {}
     result = dict(_SERVER_DEFAULTS)
     result.update({k: v for k, v in saved.items() if k in _SERVER_DEFAULTS})
+
+    # Env-var overlay: CAO_* env var beats settings.json value.
+    for key, env_name in _SERVER_ENV_VARS.items():
+        raw = os.environ.get(env_name)
+        if raw is not None and raw.strip() != "":
+            try:
+                result[key] = int(raw)
+            except ValueError:
+                logger.warning(
+                    f"Ignoring invalid {env_name}={raw!r} (expected int); "
+                    f"using file/default {result[key]}"
+                )
+
     # Validate types and ranges; coerce to int for queue size
     for key, default in _SERVER_DEFAULTS.items():
         val = result[key]
@@ -133,6 +254,8 @@ def get_server_settings() -> Dict[str, Any]:
 def get_memory_settings() -> Dict[str, Any]:
     """Get memory-related settings.
 
+    Precedence per key: CAO_* env var > settings.json > built-in default.
+
     ``enabled`` defaults to ``True`` (opt-out) to preserve current shipping
     behavior. Setting it to ``False`` disables all memory subsystem
     operations — see ``is_memory_enabled()``.
@@ -142,14 +265,38 @@ def get_memory_settings() -> Dict[str, Any]:
     saved = settings.get("memory", {})
     result = dict(defaults)
     result.update(saved)
+
+    # Env-var overlay: CAO_MEMORY_ENABLED beats settings.json
+    env_enabled = os.environ.get("CAO_MEMORY_ENABLED")
+    if env_enabled is not None and env_enabled.strip() != "":
+        result["enabled"] = env_enabled.strip().lower() in ("1", "true", "yes")
+
+    # Env-var overlay: CAO_MEMORY_FLUSH_THRESHOLD beats settings.json
+    env_threshold = os.environ.get("CAO_MEMORY_FLUSH_THRESHOLD")
+    if env_threshold is not None and env_threshold.strip() != "":
+        try:
+            fval = float(env_threshold)
+            if 0.0 < fval <= 1.0:
+                result["flush_threshold"] = fval
+            else:
+                logger.warning(
+                    f"Ignoring CAO_MEMORY_FLUSH_THRESHOLD={env_threshold!r} "
+                    f"(must be between 0.0 and 1.0); using file/default"
+                )
+        except ValueError:
+            logger.warning(
+                f"Ignoring invalid CAO_MEMORY_FLUSH_THRESHOLD={env_threshold!r} "
+                f"(expected float); using file/default"
+            )
+
     return result
 
 
 def is_memory_enabled() -> bool:
     """Return True when the memory subsystem is enabled.
 
-    Reads the ``memory.enabled`` flag; defaults to True (opt-out) so
-    existing installations preserve current behavior.
+    Precedence: CAO_MEMORY_ENABLED env var > memory.enabled in settings.json
+    > default (True).
     """
     try:
         value = get_memory_settings().get("enabled", True)
@@ -236,39 +383,94 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
 
 
 def get_extra_agent_dirs() -> List[str]:
-    """Get extra agent scan directories (user-added custom paths)."""
+    """Get extra agent scan directories (user-added custom paths).
+
+    Reads from the nested schema first (``agents.extra_dirs``), falls back to
+    the legacy flat key (``extra_agent_dirs``) for backward compatibility.
+    """
     settings = _load()
-    dirs = settings.get("extra_agent_dirs", [])
+    # Nested format: {"agents": {"extra_dirs": [...]}}
+    nested = settings.get("agents", {})
+    if (
+        isinstance(nested, dict)
+        and "extra_dirs" in nested
+        and isinstance(nested["extra_dirs"], list)
+    ):
+        dirs = nested["extra_dirs"]
+    else:
+        # Legacy flat format: {"extra_agent_dirs": [...]}
+        dirs = settings.get("extra_agent_dirs", [])
     return dirs if isinstance(dirs, list) else []
 
 
 def set_extra_agent_dirs(dirs: List[str]) -> List[str]:
-    """Set extra agent scan directories."""
+    """Set extra agent scan directories.
+
+    Writes to nested schema (``agents.extra_dirs``) and legacy flat key
+    (``extra_agent_dirs``) for backward compatibility.
+    """
     settings = _load()
     extra_agent_dirs = [d for d in dirs if d.strip()]
+    # Write nested format
+    agents_section = settings.get("agents", {})
+    if not isinstance(agents_section, dict):
+        agents_section = {}
+    agents_section["extra_dirs"] = extra_agent_dirs
+    settings["agents"] = agents_section
+    # Also write flat key for backward compat
     settings["extra_agent_dirs"] = extra_agent_dirs
     _save(settings)
+    # Prune disabled entries that no longer point at any configured directory —
+    # otherwise removing an extra dir leaves a stale disabled entry behind, and
+    # re-adding that path later would come back silently pre-disabled.
+    disabled = get_disabled_agent_dirs()
+    if disabled:
+        set_disabled_agent_dirs(disabled)
     return extra_agent_dirs
 
 
 def get_extra_skill_dirs() -> List[str]:
     """Get extra skill scan directories (user-added custom paths).
 
+    Reads from the nested schema first (``skills.extra_dirs``), falls back to
+    the legacy flat key (``extra_skill_dirs``) for backward compatibility.
+
     Filters to non-empty strings so malformed persisted data (e.g. a manually
     edited ``settings.json`` storing ``null`` or numbers) cannot later raise a
     ``TypeError`` from ``Path(extra)`` and break skill listing/loading.
     """
     settings = _load()
-    dirs = settings.get("extra_skill_dirs", [])
+    # Nested format: {"skills": {"extra_dirs": [...]}}
+    nested = settings.get("skills", {})
+    if (
+        isinstance(nested, dict)
+        and "extra_dirs" in nested
+        and isinstance(nested["extra_dirs"], list)
+    ):
+        dirs = nested["extra_dirs"]
+    else:
+        # Legacy flat format: {"extra_skill_dirs": [...]}
+        dirs = settings.get("extra_skill_dirs", [])
     if not isinstance(dirs, list):
         return []
     return [d.strip() for d in dirs if isinstance(d, str) and d.strip()]
 
 
 def set_extra_skill_dirs(dirs: List[str]) -> List[str]:
-    """Set extra skill scan directories."""
+    """Set extra skill scan directories.
+
+    Writes to nested schema (``skills.extra_dirs``) and legacy flat key
+    (``extra_skill_dirs``) for backward compatibility.
+    """
     settings = _load()
     extra_skill_dirs = [d.strip() for d in dirs if isinstance(d, str) and d.strip()]
+    # Write nested format
+    skills_section = settings.get("skills", {})
+    if not isinstance(skills_section, dict):
+        skills_section = {}
+    skills_section["extra_dirs"] = extra_skill_dirs
+    settings["skills"] = skills_section
+    # Also write flat key for backward compat
     settings["extra_skill_dirs"] = extra_skill_dirs
     _save(settings)
     return extra_skill_dirs

@@ -20,6 +20,11 @@ from cli_agent_orchestrator.constants import (
     MEMORY_SCOPE_BUDGET_CHARS,
 )
 from cli_agent_orchestrator.models.memory import Memory, MemoryScope, MemoryType
+from cli_agent_orchestrator.services.memory_archive.base import ExportReport, ImportReport
+from cli_agent_orchestrator.utils.path_validation import (
+    safe_join_under_base,
+    validate_path_component,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -543,7 +548,11 @@ class MemoryService:
         # wiki path (see get_wiki_path) for isolation, not into the
         # container directory.
         if scope == MemoryScope.PROJECT.value and scope_id:
-            return self.base_dir / scope_id
+            # ``scope_id`` is user/context-derived (project-identity slug,
+            # override, or cwd hash). Validate it as a single safe path
+            # segment and confine the container under the memory base via
+            # realpath containment so a crafted scope_id cannot escape.
+            return Path(safe_join_under_base(str(self.base_dir), scope_id, description="scope_id"))
         # ``federated`` is a machine-wide shared tier living in its own
         # top-level container, a sibling of ``global``.
         if scope == MemoryScope.FEDERATED.value:
@@ -557,23 +566,40 @@ class MemoryService:
         path so that two sessions (or two agent profiles) with the same
         key do not collide on disk.
 
-        Validates the resolved path stays within MEMORY_BASE_DIR to
-        prevent path traversal.
+        Every user-derived segment (``scope``, ``scope_id``, ``key``) is
+        validated as a single safe path component and the assembled path is
+        confined under MEMORY_BASE_DIR via realpath containment, so a
+        crafted value cannot traverse out of the memory base directory.
         """
-        project_dir = self._get_project_dir(scope, scope_id)
-        if scope in (MemoryScope.SESSION.value, MemoryScope.AGENT.value) and scope_id:
-            wiki_path = (project_dir / "wiki" / scope / scope_id / f"{key}.md").resolve()
+        # Validate every user-derived segment as a single safe path
+        # component up front. ``key`` is validated in its raw form (not just
+        # the ``{key}.md`` filename) so empty/``.``/``..`` keys are rejected
+        # rather than turning into benign-but-unintended filenames.
+        validate_path_component(scope, "scope")
+        validate_path_component(key, "key")
+        if scope_id is not None:
+            validate_path_component(scope_id, "scope_id")
+
+        # Container segment: ``project`` scope keys off the scope_id;
+        # session/agent memories live under the ``global`` container with
+        # scope_id nested into the wiki path; federated is its own tier.
+        if scope == MemoryScope.PROJECT.value and scope_id:
+            container = scope_id
+        elif scope == MemoryScope.FEDERATED.value:
+            container = "federated"
         else:
-            wiki_path = (project_dir / "wiki" / scope / f"{key}.md").resolve()
-        base_resolved = self.base_dir.resolve()
-        if (
-            not str(wiki_path).startswith(str(base_resolved) + os.sep)
-            and wiki_path != base_resolved
-        ):
-            raise ValueError(
-                f"Path traversal detected: resolved path escapes memory base directory"
+            container = "global"
+
+        if scope in (MemoryScope.SESSION.value, MemoryScope.AGENT.value) and scope_id:
+            components = [container, "wiki", scope, scope_id, f"{key}.md"]
+        else:
+            components = [container, "wiki", scope, f"{key}.md"]
+
+        return Path(
+            safe_join_under_base(
+                str(self.base_dir), *components, description="memory path component"
             )
-        return wiki_path
+        )
 
     def get_index_path(self, scope: str, scope_id: Optional[str]) -> Path:
         """Get the path to the index.md file."""
@@ -584,6 +610,26 @@ class MemoryService:
     # Store
     # -------------------------------------------------------------------------
 
+    @staticmethod
+    def _occurred_at_would_clamp(
+        occurred_at: Optional[datetime],
+        latest_section_at: Optional[datetime],
+        now: datetime,
+    ) -> bool:
+        """D5 clamp decision, shared by ``store()`` and the OKF import dry-run.
+
+        Clamp when ``occurred_at`` is in the future, or older than the
+        topic's latest section timestamp (merges only — pass ``None`` for
+        new topics). ``None`` ``occurred_at`` never clamps. Keeping this
+        rule in one place guarantees the dry-run report cannot drift from
+        what a real ``store()`` would do.
+        """
+        if occurred_at is None:
+            return False
+        return occurred_at > now or (
+            latest_section_at is not None and occurred_at < latest_section_at
+        )
+
     async def store(
         self,
         content: str,
@@ -592,11 +638,24 @@ class MemoryService:
         key: Optional[str] = None,
         tags: str = "",
         terminal_context: Optional[dict] = None,
+        occurred_at: Optional[datetime] = None,
     ) -> Memory:
         """Store or update a memory. Upserts wiki file + index.md.
 
         Declared async for compatibility with async callers (MCP server, FastAPI).
         File I/O is synchronous; a future improvement would use aiofiles.
+
+        ``occurred_at`` (archive import, #345 D5): optional original entry
+        timestamp. ``None`` keeps today's behavior byte-identical. An
+        in-order value (not in the future and, for an existing topic, not
+        older than its latest section timestamp) is used verbatim for the
+        ``## <ts>`` section heading (and ``created_at`` when the topic is
+        new). An out-of-order or future value is CLAMPED: the heading uses
+        now() — preserving the append-only contract that the last section
+        is the latest — and the original timestamp is recorded as a first
+        body line ``_Originally recorded: <ISO-ts>_``. The returned Memory
+        sets ``timestamp_clamped=True`` when clamping happened so the
+        importer can count it.
 
         Raises ``MemoryDisabledError`` when ``memory.enabled`` is False
         (U5 / SC-6) — no filesystem or SQLite writes happen.
@@ -674,6 +733,17 @@ class MemoryService:
         now = datetime.now(timezone.utc)
         timestamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
 
+        # Normalize occurred_at to UTC-aware for the ordering comparisons
+        # below. A future value is clamped for new topics AND merges (D5);
+        # the older-than-latest-section check needs the existing file and
+        # runs inside the topic lock.
+        if occurred_at is not None:
+            if occurred_at.tzinfo is None:
+                occurred_at = occurred_at.replace(tzinfo=timezone.utc)
+            else:
+                occurred_at = occurred_at.astimezone(timezone.utc)
+        timestamp_clamped = False
+
         wiki_path = self.get_wiki_path(scope, scope_id, key)
         wiki_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -682,7 +752,7 @@ class MemoryService:
         # (scope, scope_id, key) can both read the old content and
         # then overwrite each other, losing one update. Mirrors the
         # .index.lock pattern in _update_index.
-        topic_lock_path = wiki_path.parent / f".{key}.lock"
+        topic_lock_path = wiki_path.parent / f".{wiki_path.stem}.lock"
         topic_lock_fd = open(topic_lock_path, "w")
         try:
             fcntl.flock(topic_lock_fd, fcntl.LOCK_EX)
@@ -691,6 +761,7 @@ class MemoryService:
             is_update = wiki_path.exists()
             memory_id = str(uuid.uuid4())
             created_at = now
+            latest_section_at: Optional[datetime] = None
 
             if is_update:
                 # Read existing file to get original created_at and id from comment
@@ -699,12 +770,22 @@ class MemoryService:
                 id_match = re.search(r"<!-- id: ([a-f0-9\-]+)", existing_content)
                 if id_match:
                     memory_id = id_match.group(1)
-                # Extract original created_at
-                ts_match = re.search(r"## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)", existing_content)
-                if ts_match:
-                    created_at = datetime.strptime(ts_match.group(1), "%Y-%m-%dT%H:%M:%SZ").replace(
+                # Extract original created_at (first section) and the latest
+                # section timestamp (last) for the occurred_at ordering rule.
+                # The regex is deliberately unanchored, matching
+                # _parse_wiki_file's existing behavior: a timestamp-shaped line
+                # inside an untrusted body can match. Import-time escaping
+                # (Unit 3) is the mitigation; deferred here, no behavior change.
+                existing_ts = re.findall(
+                    r"## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)", existing_content
+                )
+                if existing_ts:
+                    created_at = datetime.strptime(existing_ts[0], "%Y-%m-%dT%H:%M:%SZ").replace(
                         tzinfo=timezone.utc
                     )
+                    latest_section_at = datetime.strptime(
+                        existing_ts[-1], "%Y-%m-%dT%H:%M:%SZ"
+                    ).replace(tzinfo=timezone.utc)
                 # Rewrite the header line so updated memory_type/tags stay
                 # in sync with index.md (recall() reads the file header).
                 new_header = (
@@ -717,19 +798,52 @@ class MemoryService:
                     existing_content,
                     count=1,
                 )
+
+            # D5 ordering rule: an in-order, non-future occurred_at is used
+            # verbatim for the section heading; a future value (new topics
+            # AND merges) or a value older than the topic's latest section
+            # is clamped to now(), with provenance preserved as a first
+            # body line. occurred_at=None keeps the pre-#345 bytes exactly.
+            entry_body = content
+            if occurred_at is not None:
+                if self._occurred_at_would_clamp(occurred_at, latest_section_at, now):
+                    timestamp_clamped = True
+                    original_iso = occurred_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+                    entry_body = f"_Originally recorded: {original_iso}_\n{content}"
+                else:
+                    timestamp = occurred_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+                    if not is_update:
+                        created_at = occurred_at
+
+            if is_update:
                 # Append new timestamped entry
-                new_content = existing_content.rstrip("\n") + f"\n\n## {timestamp}\n{content}\n"
+                new_content = existing_content.rstrip("\n") + f"\n\n## {timestamp}\n{entry_body}\n"
             else:
                 new_content = (
                     f"# {key}\n"
                     f"<!-- id: {memory_id} | scope: {scope} | type: {memory_type} | tags: {tags} -->\n"
-                    f"\n## {timestamp}\n{content}\n"
+                    f"\n## {timestamp}\n{entry_body}\n"
                 )
 
             # Atomic write of the append version: write to tmp then os.replace.
             # This is always the immediate, durable result of store(). LLM
             # compaction (below) is deferred and rewrites the file later.
-            tmp_path = wiki_path.parent / f".{key}.tmp"
+            #
+            # CodeQL note (py/clear-text-storage-sensitive-data): this write is
+            # flagged only because ``new_content`` embeds the topic ``key`` and
+            # CodeQL's name-based heuristic classifies any variable named
+            # ``key`` as a secret. It is a FALSE POSITIVE, not a leak: ``key``
+            # is a user-authored topic slug (see ``_sanitize_key``), never a
+            # credential. The memory wiki is intentionally human-readable
+            # plaintext markdown — that is the product contract, and encrypting
+            # it would defeat the feature (agents and humans read these files
+            # directly). No secret is persisted here. Dismiss the alert as
+            # "won't fix / by-design" in the Security tab with this rationale;
+            # do NOT add encryption. As an additional safeguard, content
+            # written to the machine-wide federated tier is screened by the
+            # secret gate (``scan_for_secrets``) earlier in ``store()`` and
+            # rejected if it matches a credential pattern.
+            tmp_path = wiki_path.parent / f".{wiki_path.stem}.tmp"
             tmp_path.write_text(new_content, encoding="utf-8")
             os.replace(str(tmp_path), str(wiki_path))
 
@@ -750,7 +864,10 @@ class MemoryService:
                         scope=scope,
                         scope_id=scope_id,
                         key=key,
-                        new_entry=content,
+                        # Pass the clamped entry_body (not raw content) so the
+                        # LLM rewrite sees the "_Originally recorded:" provenance
+                        # line when the timestamp was clamped.
+                        new_entry=entry_body,
                         # Compile input is the PRE-append article — the append
                         # version just written already contains the new entry,
                         # so merging into it would feed the LLM a duplicate.
@@ -820,6 +937,7 @@ class MemoryService:
             updated_at=now,
             content=content,
             action=action,
+            timestamp_clamped=timestamp_clamped,
         )
 
     # -------------------------------------------------------------------------
@@ -999,7 +1117,7 @@ class MemoryService:
         except Exception as e:  # noqa: BLE001 — non-blocking promise
             logger.warning(f"find_related raised, ignoring: {e}")
 
-        topic_lock_path = wiki_path.parent / f".{key}.lock"
+        topic_lock_path = wiki_path.parent / f".{wiki_path.stem}.lock"
         try:
             topic_lock_fd = open(topic_lock_path, "w")
         except OSError:
@@ -1015,7 +1133,7 @@ class MemoryService:
                 logger.info(f"background compile stale, dropping (key={key})")
                 _audit("compile_stale_dropped", "newer store won the race")
                 return "stale"
-            tmp_path = wiki_path.parent / f".{key}.compile.tmp"
+            tmp_path = wiki_path.parent / f".{wiki_path.stem}.compile.tmp"
             tmp_path.write_text(compiled_content, encoding="utf-8")
             os.replace(str(tmp_path), str(wiki_path))
             try:
@@ -1323,7 +1441,7 @@ class MemoryService:
         try:
             if not wiki_path.exists():
                 return None
-            resolved = wiki_path.resolve()
+            resolved = Path(os.path.realpath(str(wiki_path)))
             # Validate against the scope directory the key legitimately lives
             # in, not the global memory base — a symlink planted inside one
             # scope's tree must not leak another scope's (or project's)
@@ -1334,7 +1452,8 @@ class MemoryService:
             scope_dir = self._get_project_dir(scope, scope_id) / "wiki" / scope
             if scope in (MemoryScope.SESSION.value, MemoryScope.AGENT.value) and scope_id:
                 scope_dir = scope_dir / scope_id
-            if resolved.parent != scope_dir.resolve():
+            scope_dir_real = os.path.realpath(str(scope_dir))
+            if not str(resolved).startswith(scope_dir_real + os.sep):
                 return None
             file_content = resolved.read_text(encoding="utf-8")
             entry = {
@@ -1875,6 +1994,9 @@ class MemoryService:
             if not index_path.exists():
                 continue
 
+            wiki_dir = project_dir / "wiki"
+            wiki_resolved = os.path.realpath(str(wiki_dir))
+
             entries = self._parse_index(index_path)
 
             for entry in entries:
@@ -1890,11 +2012,23 @@ class MemoryService:
                     continue
 
                 # Read the wiki file
-                wiki_file = project_dir / "wiki" / entry["relative_path"]
-                if not wiki_file.exists():
+                wiki_file = wiki_dir / entry["relative_path"]
+                resolved_wiki = Path(os.path.realpath(str(wiki_file)))
+                # Guard against a crafted/corrupted index entry (e.g.
+                # ``[x](../../../../etc/passwd)``) escaping this scope's wiki
+                # directory and leaking an arbitrary out-of-base file as a
+                # "memory". Mirrors get_memory_context_for_terminal: skip the
+                # escaping entry rather than raising, keeping recall resilient
+                # to a corrupted index.
+                if not str(resolved_wiki).startswith(wiki_resolved + os.sep):
+                    logger.warning(
+                        f"Path traversal in index entry rejected: {entry.get('relative_path')}"
+                    )
+                    continue
+                if not resolved_wiki.exists():
                     continue
 
-                file_content = wiki_file.read_text(encoding="utf-8")
+                file_content = resolved_wiki.read_text(encoding="utf-8")
 
                 # Query matching: check if query terms appear in content (case-insensitive)
                 if query:
@@ -2180,8 +2314,17 @@ class MemoryService:
             # Include the specific project dir for this terminal's cwd
             project_scope_id = self.resolve_scope_id("project", terminal_context)
             if project_scope_id:
-                project_dir = self.base_dir / project_scope_id
-                if project_dir.exists() and project_dir not in dirs:
+                # ``project_scope_id`` is context-derived; validate + confine
+                # under the base before touching the filesystem.
+                try:
+                    project_dir = Path(
+                        safe_join_under_base(
+                            str(self.base_dir), project_scope_id, description="scope_id"
+                        )
+                    )
+                except ValueError:
+                    project_dir = None
+                if project_dir is not None and project_dir.exists() and project_dir not in dirs:
                     dirs.append(project_dir)
                 # Also include legacy cwd-hash dirs recorded as aliases so
                 # pre-U6 memories survive the canonical-id transition.
@@ -2193,7 +2336,18 @@ class MemoryService:
                     for alias in list_aliases_for_project(project_scope_id):
                         if alias.get("kind") != "cwd_hash":
                             continue
-                        alias_dir = self.base_dir / alias["alias"]
+                        # Alias names originate from stored git/cwd identities;
+                        # validate + confine each before filesystem access.
+                        try:
+                            alias_dir = Path(
+                                safe_join_under_base(
+                                    str(self.base_dir),
+                                    alias["alias"],
+                                    description="alias",
+                                )
+                            )
+                        except (ValueError, KeyError, TypeError):
+                            continue
                         if alias_dir.exists() and alias_dir not in dirs:
                             dirs.append(alias_dir)
                 except Exception as e:
@@ -2406,7 +2560,7 @@ class MemoryService:
             scope_id = self.resolve_scope_id(scope_val, terminal_context)
             project_dir = self._get_project_dir(scope_val, scope_id)
             wiki_dir = project_dir / "wiki"
-            wiki_resolved = wiki_dir.resolve()
+            wiki_resolved = os.path.realpath(str(wiki_dir))
             index_path = wiki_dir / "index.md"
             if not index_path.exists():
                 continue
@@ -2430,12 +2584,12 @@ class MemoryService:
                 if len(scope_memories) >= MEMORY_MAX_PER_SCOPE:
                     break
                 wiki_file = wiki_dir / entry["relative_path"]
-                resolved_wiki = wiki_file.resolve()
+                resolved_wiki = Path(os.path.realpath(str(wiki_file)))
                 # Guard against a crafted/corrupted index entry (e.g.
                 # ``../<other-project>/wiki/...``) escaping this scope's wiki
                 # directory and leaking another project's memory. Validate
                 # against the per-scope wiki dir, not the global memory base.
-                if not str(resolved_wiki).startswith(str(wiki_resolved) + os.sep):
+                if not str(resolved_wiki).startswith(wiki_resolved + os.sep):
                     logger.warning(
                         f"Path traversal in index entry rejected: {entry.get('relative_path')}"
                     )
@@ -2597,6 +2751,47 @@ class MemoryService:
             logger.debug(f"get_curated_memory_context failed, falling back: {e}")
 
         return self.get_memory_context_for_terminal(terminal_id)
+
+    # -------------------------------------------------------------------------
+    # Archive export/import (#345 D6) — thin delegators, no format logic here
+    # -------------------------------------------------------------------------
+
+    def export_memories(
+        self,
+        fmt: str,
+        scope: str,
+        scope_id: Optional[str],
+        dest: Path,
+        include_history: bool = False,
+        redact: bool = False,
+        prune: bool = False,
+    ) -> ExportReport:
+        """Export one scope through the archive backend registered as ``fmt``.
+
+        Raises ``ValueError`` on unknown format names (registry contract);
+        the CLI/API boundary maps it to a user-facing error.
+        """
+        from cli_agent_orchestrator.services.memory_archive import get_backend
+
+        backend = get_backend(fmt)(self)
+        return backend.export_bundle(scope, scope_id, dest, include_history, redact, prune=prune)
+
+    def import_memories(
+        self,
+        fmt: str,
+        src: Path,
+        target_scope: str,
+        conflict_policy: str = "skip",
+        dry_run: bool = False,
+        terminal_context: Optional[dict] = None,
+    ) -> ImportReport:
+        """Import an archive bundle through the backend registered as ``fmt``."""
+        from cli_agent_orchestrator.services.memory_archive import get_backend
+
+        backend = get_backend(fmt)(self)
+        return backend.import_bundle(
+            src, target_scope, conflict_policy, dry_run, terminal_context=terminal_context
+        )
 
     def _get_terminal_context(self, terminal_id: str) -> Optional[dict]:
         """Get terminal context for scope resolution.
