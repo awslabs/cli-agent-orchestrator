@@ -245,7 +245,12 @@ You are restricted to only use the following tools: {tools_list}
 
             command = self._build_command()
             from cli_agent_orchestrator.backends.registry import get_backend
+            from cli_agent_orchestrator.services.status_monitor import status_monitor
 
+            # Arm the StatusMonitor stickiness gate before launching the CLI so
+            # the PROCESSING and IDLE/COMPLETED transitions during init are
+            # honored past any previously-latched ready state.
+            status_monitor.notify_input_sent(self.terminal_id)
             get_backend().send_keys(
                 self.session_name,
                 self.window_name,
@@ -310,13 +315,13 @@ You are restricted to only use the following tools: {tools_list}
             TerminalStatus based on pattern matching
         """
         if not buffer:
-            return TerminalStatus.ERROR
+            return TerminalStatus.UNKNOWN
 
         # Strip ANSI codes for clean matching
         clean_output = self._clean(buffer)
 
         if not clean_output.strip():
-            return TerminalStatus.ERROR
+            return TerminalStatus.UNKNOWN
 
         lines = clean_output.splitlines()
 
@@ -342,10 +347,10 @@ You are restricted to only use the following tools: {tools_list}
         ):
             return TerminalStatus.IDLE
 
-        # 4. Fallback: if we have substantial output (not just shell prompt) and no processing, still return ERROR
-        # to be conservative. We don't want to incorrectly classify error states as ready.
-        # Let the status monitor's history fallback handle ambiguous cases.
-        return TerminalStatus.ERROR
+        # 4. Fallback: we have output but no idle prompt or processing indicator yet.
+        # Report UNKNOWN so the status monitor keeps polling and doesn't latch a
+        # false ERROR before Devin has finished rendering the TUI.
+        return TerminalStatus.UNKNOWN
 
     def get_idle_pattern_for_log(self) -> str:
         return IDLE_PROMPT_PATTERN

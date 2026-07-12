@@ -79,13 +79,13 @@ class TestDevinCliProviderStatusDetection:
         assert status == TerminalStatus.COMPLETED
 
     def test_get_status_empty_output(self):
-        """ERROR: empty/blank output → CLI failed to start."""
+        """UNKNOWN: no signal yet from the Devin CLI."""
         buffer = ""
 
         provider = DevinCliProvider("test1234", "test-session", "window-0")
         status = provider.get_status(buffer)
 
-        assert status == TerminalStatus.ERROR
+        assert status == TerminalStatus.UNKNOWN
 
     def test_get_status_user_input_no_response(self):
         """COMPLETED: user input sent, prompt returned (ready for next input)."""
