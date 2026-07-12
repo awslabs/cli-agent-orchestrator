@@ -76,7 +76,7 @@ try:
     TEMP_BASE = Path(tempfile.gettempdir())
     FIFO_DIR = TEMP_BASE / "cli-agent-orchestrator" / _user / "fifos"
     FIFO_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
-except (OSError, PermissionError):
+except OSError:
     # Fallback to CAO_HOME_DIR if temp directory is not accessible
     # (e.g., restricted containers, read-only filesystems)
     FIFO_DIR = CAO_HOME_DIR / "fifos"

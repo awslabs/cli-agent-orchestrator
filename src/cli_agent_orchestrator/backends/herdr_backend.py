@@ -284,7 +284,7 @@ class HerdrBackend(TerminalBackend):
             session_name, window_name, terminal_id, pane_id=new_pane_id, extra_env=extra_env
         )
 
-        logger.info(f"Created herdr workspace: {session_name} in {working_directory}")
+        logger.info("Created herdr workspace: %s in %s", session_name, working_directory)
         return window_name
 
     def session_exists(self, session_name: str) -> bool:
@@ -323,12 +323,12 @@ class HerdrBackend(TerminalBackend):
         try:
             workspace_id = self._resolve_workspace_id(session_name)
         except TerminalBackendError:
-            logger.warning(f"kill_session: workspace '{session_name}' not found")
+            logger.warning("kill_session: workspace '%s' not found", session_name)
             return False
         result = self._run_herdr(["workspace", "close", workspace_id], check=False)
         if result.returncode == 0:
             self._workspace_cache.pop(session_name, None)
-            logger.info(f"Killed herdr workspace: {session_name}")
+            logger.info("Killed herdr workspace: %s", session_name)
             return True
         return False
 
@@ -371,9 +371,11 @@ class HerdrBackend(TerminalBackend):
             try:
                 self._run_herdr(["pane", "run", new_pane_id, window_shell])
             except TerminalBackendError as e:
-                logger.warning(f"create_window: pane run failed for {new_pane_id} (non-fatal): {e}")
+                logger.warning(
+                    "create_window: pane run failed for %s (non-fatal): %s", new_pane_id, e
+                )
 
-        logger.info(f"Created herdr tab in workspace {session_name}")
+        logger.info("Created herdr tab in workspace %s", session_name)
         return window_name
 
     def kill_window(self, session_name: str, window_name: str) -> bool:
@@ -381,13 +383,15 @@ class HerdrBackend(TerminalBackend):
         try:
             pane_id = self._resolve_pane_id_from_window(session_name, window_name)
         except TerminalBackendError:
-            logger.warning(f"kill_window: could not resolve pane for {session_name}:{window_name}")
+            logger.warning(
+                "kill_window: could not resolve pane for %s:%s", session_name, window_name
+            )
             return False
 
         result = self._run_herdr(["pane", "close", pane_id], check=False)
 
         if result.returncode == 0:
-            logger.info(f"Killed herdr pane {pane_id} for {session_name}:{window_name}")
+            logger.info("Killed herdr pane %s for %s:%s", pane_id, session_name, window_name)
             return True
         return False
 
@@ -487,7 +491,7 @@ class HerdrBackend(TerminalBackend):
 
         result = self._run_herdr(args, check=False)
         if result.returncode != 0:
-            logger.warning(f"herdr pane read failed: {result.stderr}")
+            logger.warning("herdr pane read failed: %s", result.stderr)
             return ""
         return cast(str, result.stdout)
 
@@ -627,11 +631,11 @@ class HerdrBackend(TerminalBackend):
 
     def pipe_pane(self, session_name: str, window_name: str, file_path: str) -> None:
         """No-op: herdr uses socket events for inbox delivery."""
-        logger.debug(f"pipe_pane is a no-op for herdr backend (session={session_name})")
+        logger.debug("pipe_pane is a no-op for herdr backend (session=%s)", session_name)
 
     def stop_pipe_pane(self, session_name: str, window_name: str) -> None:
         """No-op: herdr uses socket events for inbox delivery."""
-        logger.debug(f"stop_pipe_pane is a no-op for herdr backend (session={session_name})")
+        logger.debug("stop_pipe_pane is a no-op for herdr backend (session=%s)", session_name)
 
     # --- Internal helpers ---
 
@@ -677,7 +681,7 @@ class HerdrBackend(TerminalBackend):
         deadline = time.time() + 15.0
         while time.time() < deadline:
             if os.path.exists(socket_path):
-                logger.info(f"Herdr session '{self._herdr_session}' is ready.")
+                logger.info("Herdr session '%s' is ready.", self._herdr_session)
                 return
             time.sleep(0.1)
 
@@ -754,7 +758,7 @@ class HerdrBackend(TerminalBackend):
                 self._run_herdr(["pane", "send-text", target_pane_id, env_cmd])
                 self._run_herdr(["pane", "send-keys", target_pane_id, "Enter"])
         except (TerminalBackendError, json.JSONDecodeError, KeyError) as e:
-            logger.warning(f"Failed to inject env vars for {terminal_id}: {e}")
+            logger.warning("Failed to inject env vars for %s: %s", terminal_id, e)
 
     @staticmethod
     def _build_extra_env_exports(extra_env: Optional[Dict[str, str]]) -> List[str]:
