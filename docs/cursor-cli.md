@@ -55,7 +55,7 @@ Status detection checks patterns in priority order: PROCESSING → WAITING_USER_
 
 The PROCESSING check is **structural** — for older text-mode builds it walks backwards from the last separator looking for a spinner line, so stale spinner text from a previously completed turn does not trigger a false positive (the same approach used by the Claude Code provider).
 
-For v2026+ TUI detection, the tail of the rolling 8KB buffer (last ~1KB) is consulted. The `ctrl+c to stop` indicator is always rendered in the last few hundred bytes of the input-box line on every Cursor TUI frame, so the 1KB window is well below the 8KB cap and the indicator is present whenever the agent is actively working.
+For v2026+ TUI detection, the tail of the rolling state buffer (last ~1KB) is consulted. The `ctrl+c to stop` indicator is always rendered in the last few hundred bytes of the input-box line on every Cursor TUI frame, so the 1KB window is well below the buffer cap (`STATE_BUFFER_MAX`, 32KB by default) and the indicator is present whenever the agent is actively working.
 
 ### Message Extraction
 
