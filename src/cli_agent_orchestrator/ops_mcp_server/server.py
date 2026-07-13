@@ -329,11 +329,12 @@ async def send_session_message(
 def _read_session_output_impl(
     terminal_id: Optional[str],
     session_name: Optional[str],
-    mode: str,
+    mode: Optional[str],
     max_chars: Optional[int],
 ) -> JsonDict:
     """Resolve a terminal and return its captured output (sync; mirrors other helpers)."""
-    if mode not in ("full", "last"):
+    normalized = (mode or "full").lower()
+    if normalized not in ("full", "last"):
         return {"success": False, "message": f"Invalid mode '{mode}'; expected 'full' or 'last'"}
 
     resolved_terminal_id = terminal_id
@@ -349,7 +350,13 @@ def _read_session_output_impl(
             return {"success": False, "message": error}
         terminals = info.get("terminals", []) if isinstance(info, dict) else []
         if len(terminals) == 1:
-            resolved_terminal_id = str(terminals[0].get("id"))
+            terminal = terminals[0]
+            if not terminal.get("id"):
+                return {
+                    "success": False,
+                    "message": f"Session '{session_name}' returned a terminal without an id",
+                }
+            resolved_terminal_id = str(terminal["id"])
         elif not terminals:
             return {"success": False, "message": f"Session '{session_name}' has no terminals"}
         else:
@@ -365,7 +372,7 @@ def _read_session_output_impl(
     data, error = _request_json(
         "get",
         f"/terminals/{resolved_terminal_id}/output",
-        params={"mode": mode},
+        params={"mode": normalized},
         operation=f"Read output for terminal '{resolved_terminal_id}'",
     )
     if error:
@@ -383,7 +390,7 @@ def _read_session_output_impl(
     return {
         "success": True,
         "terminal_id": resolved_terminal_id,
-        "mode": mode,
+        "mode": normalized,
         "output": output,
         "truncated": truncated,
         "total_chars": total_chars,
@@ -410,9 +417,10 @@ async def read_session_output(
     mode: Annotated[
         str,
         Field(
-            description="'full' (default): the recent rolling output buffer — deterministic "
-            "and provider-agnostic. 'last': provider-extracted last response — can be "
-            "unreliable on redraw-heavy TUIs; prefer 'full'."
+            description="'full' (default) returns the raw rolling buffer: deterministic and "
+            "best for scrollback/debugging. 'last' returns the provider-extracted final "
+            "response: best for a completed worker's final message, but can be flaky on "
+            "redraw-heavy TUIs."
         ),
     ] = "full",
     max_chars: Annotated[
@@ -420,19 +428,18 @@ async def read_session_output(
         Field(
             description="Optional cap: return only the last max_chars of output "
             "(guards against flooding the caller's context). Truncation is flagged "
-            "in the result."
+            "in the result. Values <= 0 are treated as no cap."
         ),
     ] = None,
 ) -> JsonDict:
-    """Read a CAO terminal's captured text output.
+    """Read a CAO terminal's captured scrollback with a deterministic full-buffer default.
 
-    Wraps GET /terminals/{id}/output with two conveniences get_terminal_output
-    does not offer: the terminal can be addressed by session_name (resolved when
-    the session has exactly one terminal), and the returned text can be tail-capped
-    with max_chars so large buffers do not flood the caller. For sandboxed MCP
-    consumers whose own network cannot reach the CAO API, this tool is the only
-    way to read a worker's output; for host-side callers it is a typed convenience
-    over a raw HTTP GET.
+    Defaults to mode='full' because raw rolling-buffer output is deterministic and
+    best for scrollback/debugging. Use get_terminal_output, which defaults to
+    mode='last', to read a completed worker's provider-extracted final message;
+    'last' can be flaky on redraw-heavy TUIs. This tool adds session_name addressing
+    (when the session has exactly one terminal) and max_chars tail-capping, which
+    get_terminal_output does not provide.
 
     Args:
         terminal_id: Target terminal ID (primary key)
@@ -484,19 +491,23 @@ async def get_terminal_output(
         str,
         Field(
             description=(
-                "'last' returns only the worker's final response (provider-extracted); "
-                "'full' returns the recent rolling output buffer."
+                "'last' (default) returns the provider-extracted final response: best for "
+                "a completed worker's final message, but can be flaky on redraw-heavy "
+                "TUIs. 'full' returns the raw rolling buffer: deterministic and best for "
+                "scrollback/debugging."
             )
         ),
     ] = "last",
 ) -> JsonDict:
-    """Read a worker terminal's output so the supervisor can review its work.
+    """Read a worker terminal's output with a completed-message-oriented default.
 
-    Pair with get_terminal_status: poll until status is completed/idle, then
-    read with mode='last' to get the worker's final message. Note the returned
-    text is screen-scraped from the worker's TUI and can be truncated on very
-    long turns — for code review, prefer inspecting the worker's files / git
-    diff directly rather than relying solely on this text.
+    Defaults to mode='last' because this tool is optimized for reading a completed
+    worker's provider-extracted final message, though redraw-heavy TUIs can make
+    extraction flaky. For deterministic raw rolling-buffer scrollback/debugging,
+    use read_session_output, which defaults to mode='full' and also supports
+    session_name addressing and max_chars tail-capping. For code review, prefer
+    inspecting the worker's files / git diff directly rather than relying solely
+    on terminal text.
 
     Args:
         terminal_id: Target terminal ID

@@ -46,6 +46,23 @@ class TestReadSessionOutputImpl:
             json=None,
         )
 
+    @pytest.mark.parametrize(("mode", "normalized"), [("FULL", "full"), (None, "full")])
+    def test_normalizes_full_mode(self, mode: str | None, normalized: str) -> None:
+        """Uppercase and None modes normalize to the default full mode."""
+        with patch(
+            REQUEST, return_value=_response(json_data={"output": "hello", "mode": normalized})
+        ) as mock_request:
+            result = _read_session_output_impl("term-1", None, mode, None)
+
+        assert result["success"] is True
+        assert result["mode"] == normalized
+        mock_request.assert_called_once_with(
+            "get",
+            "http://127.0.0.1:9889/terminals/term-1/output",
+            params={"mode": normalized},
+            json=None,
+        )
+
     def test_resolves_session_with_single_terminal(self) -> None:
         """A session_name with exactly one terminal resolves to that terminal."""
         responses = [
@@ -58,6 +75,37 @@ class TestReadSessionOutputImpl:
         assert result["success"] is True
         assert result["terminal_id"] == "term-9"
         assert result["output"] == "abc"
+
+    def test_session_resolve_error_is_returned(self) -> None:
+        """An API error while resolving a session is surfaced without an output read."""
+        with patch(
+            REQUEST,
+            return_value=_response(status_code=503, json_data={"detail": "Session unavailable"}),
+        ) as mock_request:
+            result = _read_session_output_impl(None, "cao-x", "full", None)
+
+        assert result["success"] is False
+        assert "Session unavailable" in result["message"]
+        mock_request.assert_called_once_with(
+            "get",
+            "http://127.0.0.1:9889/sessions/cao-x",
+            params=None,
+            json=None,
+        )
+
+    def test_session_terminal_without_id_errors(self) -> None:
+        """A resolved terminal without an id returns a clear error before output read."""
+        with patch(
+            REQUEST,
+            return_value=_response(json_data={"name": "cao-x", "terminals": [{}]}),
+        ) as mock_request:
+            result = _read_session_output_impl(None, "cao-x", "full", None)
+
+        assert result == {
+            "success": False,
+            "message": "Session 'cao-x' returned a terminal without an id",
+        }
+        mock_request.assert_called_once()
 
     def test_ambiguous_session_returns_terminal_list(self) -> None:
         """A session with more than one terminal returns the list and requires terminal_id."""
@@ -110,6 +158,17 @@ class TestReadSessionOutputImpl:
         assert result["truncated"] is True
         assert result["total_chars"] == 10
 
+    def test_zero_max_chars_disables_cap(self) -> None:
+        """max_chars=0 returns the full output without marking it truncated."""
+        with patch(
+            REQUEST, return_value=_response(json_data={"output": "0123456789", "mode": "full"})
+        ):
+            result = _read_session_output_impl("term-1", None, "full", 0)
+
+        assert result["output"] == "0123456789"
+        assert result["truncated"] is False
+        assert result["total_chars"] == 10
+
     def test_no_truncation_when_under_cap(self) -> None:
         """max_chars larger than the output leaves it intact."""
         with patch(REQUEST, return_value=_response(json_data={"output": "short", "mode": "full"})):
@@ -129,6 +188,28 @@ class TestReadSessionOutputImpl:
 
         assert result["success"] is False
         assert "Terminal not found" in result["message"]
+
+    def test_reads_last_mode_end_to_end(self) -> None:
+        """The last mode reaches the API and is returned in the success payload."""
+        with patch(
+            REQUEST, return_value=_response(json_data={"output": "final answer", "mode": "last"})
+        ) as mock_request:
+            result = _read_session_output_impl("term-1", None, "last", None)
+
+        assert result == {
+            "success": True,
+            "terminal_id": "term-1",
+            "mode": "last",
+            "output": "final answer",
+            "truncated": False,
+            "total_chars": 12,
+        }
+        mock_request.assert_called_once_with(
+            "get",
+            "http://127.0.0.1:9889/terminals/term-1/output",
+            params={"mode": "last"},
+            json=None,
+        )
 
     def test_invalid_output_payload_is_rejected(self) -> None:
         """A payload missing the output field is treated as a failure."""
