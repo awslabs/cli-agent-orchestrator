@@ -136,6 +136,7 @@ RUNTIME_SKILL_PROMPT_PROVIDERS = {
     ProviderType.CODEX.value,
     ProviderType.KIMI_CLI.value,
     ProviderType.ANTIGRAVITY_CLI.value,
+    ProviderType.DEVIN_CLI.value,
 }
 
 # Providers whose tool restrictions are prompt-level text only (no native

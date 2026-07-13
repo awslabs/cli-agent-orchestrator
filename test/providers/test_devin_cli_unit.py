@@ -349,3 +349,4 @@ class TestDevinCliProviderRegistration:
         assert "execute_bash" in mapping
         assert "fs_read" in mapping
         assert "fs_write" in mapping
+        assert "fs_list" in mapping

@@ -106,7 +106,7 @@ def _is_safe_dir(path: Path, mode: int = 0o700) -> bool:
     if hasattr(st, "st_uid") and hasattr(os, "getuid"):
         if st.st_uid != os.getuid():
             return False
-    if stat.S_IMODE(st.st_mode) & ~mode:
+    if (st.st_mode & 0o777) != mode:
         try:
             os.chmod(path, mode)
         except OSError:

@@ -52,11 +52,14 @@ Status detection checks patterns in priority order: PROCESSING → IDLE/COMPLETE
 
 ### Message Extraction
 
-The provider extracts the last assistant response by finding the horizontal rule separator:
+`extract_last_message_from_script()` reconstructs the agent's response by walking the **last** `> <user>` input line and collecting lines until the **next** horizontal rule (or status-bar line). The horizontal rule is mandatory; the algorithm does not stop at `#`, because a Markdown heading like `# Overview` could otherwise truncate the response prematurely.
 
-1. Find the last horizontal rule (`────────`)
-2. Extract text until the next `>` prompt or end of buffer
-3. Strip ANSI codes from the result
+Algorithm:
+
+1. Strip ANSI codes / OSC sequences / stray control characters with `_clean()` so redraws and cursor-motion don't glue the prompt onto a previous line.
+2. Find the index of the last line matching `> <non-blank>`.
+3. Walk forward from that index, collecting every line until the next horizontal rule (`^[\u2500-\u257f]{3,}`) **or** a status-bar line (`Mode:.*Model:`) is seen.
+4. Return the joined block, trimmed. The `#` input prompt is intentionally **not** a terminator.
 
 ### Permission Mode
 
@@ -140,10 +143,7 @@ uv run cao-server
 # Run all Devin CLI E2E tests
 uv run pytest -m e2e test/e2e/ -v -k devin
 
-# Run specific test types
-uv run pytest -m e2e test/e2e/test_handoff.py -v -k devin
-uv run pytest -m e2e test/e2e/test_assign.py -v -k devin
-uv run pytest -m e2e test/e2e/test_send_message.py -v -k devin
+# Run the only flow that currently has Devin-named tests
 uv run pytest -m e2e test/e2e/test_supervisor_orchestration.py -v -k devin -o "addopts="
 ```
 
