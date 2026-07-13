@@ -677,20 +677,24 @@ class MemoryService:
         # ``content``. It now applies to every scope and scans ``content`` (body),
         # ``key`` (header + filename) and ``tags`` (header + index) — every
         # caller-supplied value that reaches ``new_content``/disk. Fail closed on
-        # the first match. The log line carries the pattern NAME only, and the
-        # raised message names the offending FIELD and pattern, never the bytes.
+        # the first match. Neither the log line nor the raised message echoes any
+        # input — they carry only the fixed FIELD name (content/key/tags).
         from cli_agent_orchestrator.services.secret_gate import scan_for_secrets
 
         for field_name, field_value in (("content", content), ("key", key), ("tags", tags)):
             if not field_value:
                 continue
-            hit = scan_for_secrets(field_value)
-            if hit:
-                # ``hit`` is the matched pattern NAME (e.g. "aws_access_key"),
-                # never the offending bytes — safe to log for diagnosability.
-                logger.warning("memory_secret_rejected field=%s pattern=%s", field_name, hit)
+            if scan_for_secrets(field_value):
+                # Log and raise using ONLY the hardcoded field name. The matched
+                # pattern name from scan_for_secrets is derived from the secret
+                # input, and CodeQL's taint tracker flags it as clear-text
+                # logging of sensitive information (py/clear-text-logging) even
+                # though it is only a pattern label — so we deliberately do not
+                # surface it. ``field_name`` is a fixed literal (content/key/tags),
+                # never tainted, and tells the caller which field to fix.
+                logger.warning("memory_secret_rejected field=%s", field_name)
                 raise ValueError(
-                    f"memory write rejected: {field_name} matched credential pattern {hit!r}"
+                    f"memory write rejected: {field_name} matched a credential pattern"
                 )
 
         # Store-time cross-scope write guard. A caller may
