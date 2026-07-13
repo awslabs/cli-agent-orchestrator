@@ -1,4 +1,4 @@
-"""U6 — ObsidianGraphSink tests: happy path, traversal rejection, unsafe-label edge."""
+"""U6 — ObsidianGraphSink tests: happy path, export-root confinement, escaping."""
 
 import os
 
@@ -9,8 +9,13 @@ from cli_agent_orchestrator.graph.models import Edge, EdgeType, GraphView, Node
 from cli_agent_orchestrator.graph.sinks.obsidian import ObsidianGraphSink
 
 
-def _traversal_dest(base) -> str:
-    return os.path.join(str(base), *([".."] * 40), "etc", "cao-obsidian-traversal")
+@pytest.fixture
+def export_root(tmp_path, monkeypatch):
+    """Point CAO_GRAPH_EXPORT_ROOT at a tmp dir; return its realpath."""
+    root = tmp_path / "export-root"
+    root.mkdir()
+    monkeypatch.setenv("CAO_GRAPH_EXPORT_ROOT", str(root))
+    return os.path.realpath(str(root))
 
 
 def _view() -> GraphView:
@@ -27,66 +32,91 @@ def _view() -> GraphView:
     )
 
 
-def test_obsidian_export_vault(tmp_path):
+def test_obsidian_export_vault(export_root):
     """A small view exports N notes with wikilinks; contradiction edge suffixed."""
-    dest = tmp_path / "vault"
-    written = ObsidianGraphSink().export(_view(), str(dest))
+    written = ObsidianGraphSink().export(_view(), "vault")
 
-    notes = sorted(p.name for p in dest.glob("*.md"))
+    dest = os.path.join(export_root, "vault")
+    notes = sorted(os.path.basename(p) for p in written)
     assert notes == ["a.md", "b.md", "c.md"]
     assert len(written) == 3
-    # No .obsidian/ config directory is written.
-    assert not (dest / ".obsidian").exists()
+    assert not os.path.exists(os.path.join(dest, ".obsidian"))
+    for p in written:
+        assert os.path.realpath(p).startswith(export_root + os.sep)
 
-    a_text = (dest / "a.md").read_text(encoding="utf-8")
+    a_text = open(os.path.join(dest, "a.md"), encoding="utf-8").read()
     assert "## Links" in a_text
     assert "- [[b]]" in a_text
     assert "- [[c]] (contradiction)" in a_text
 
-    # Frontmatter is valid YAML round-trips (PyYAML, not hand-rolled).
     front = a_text.split("---")[1]
     parsed = yaml.safe_load(front)
     assert parsed["kind"] == "topic"
     assert parsed["status"] == "active"
     assert parsed["attrs"] == {"weight": 3}
 
-    # A node with no outgoing edges omits the Links heading entirely.
-    b_text = (dest / "b.md").read_text(encoding="utf-8")
+    b_text = open(os.path.join(dest, "b.md"), encoding="utf-8").read()
     assert "## Links" not in b_text
 
 
-def test_obsidian_traversal_rejected(tmp_path):
-    """A traversal dest is rejected via the shared path_validation utility."""
+def test_obsidian_relative_traversal_escape_rejected(export_root):
+    """A relative dest escaping the export root is rejected; nothing written."""
     with pytest.raises(ValueError):
-        ObsidianGraphSink().export(_view(), _traversal_dest(tmp_path))
-    assert list(tmp_path.rglob("*.md")) == []
+        ObsidianGraphSink().export(_view(), os.path.join("..", "..", "etc", "cao-obs-escape"))
+    assert list(_all_files(export_root)) == []
 
 
-def test_obsidian_unsafe_label_sanitized(tmp_path):
+def test_obsidian_absolute_dest_outside_root_rejected(export_root, tmp_path):
+    """An absolute dest outside the root -> ValueError, writes nothing (MUST-FIX #2)."""
+    outside = tmp_path / "outside-root" / "vault"
+    with pytest.raises(ValueError):
+        ObsidianGraphSink().export(_view(), str(outside))
+    assert not outside.exists()
+    assert list(_all_files(export_root)) == []
+
+
+def test_obsidian_unsafe_label_sanitized(export_root):
     """A node id with filename-unsafe chars sanitizes to a writable file, no crash."""
-    view = GraphView(
-        nodes=[Node(id="a/b:c", kind="topic", label="Weird a/b:c")],
-        edges=[],
-    )
-    dest = tmp_path / "vault"
-    written = ObsidianGraphSink().export(view, str(dest))
+    view = GraphView(nodes=[Node(id="a/b:c", kind="topic", label="Weird a/b:c")], edges=[])
+    written = ObsidianGraphSink().export(view, "vault")
 
     assert len(written) == 1
-    # The slug collapses unsafe chars; the file exists and has no path separators.
     name = os.path.basename(written[0])
     assert name.endswith(".md")
     assert "/" not in name and ":" not in name
     assert os.path.exists(written[0])
 
 
-def test_obsidian_filename_collision_raises(tmp_path):
+def test_obsidian_filename_collision_raises(export_root):
     """Two distinct ids slugging to the same filename raise ValueError."""
     view = GraphView(
         nodes=[
             Node(id="a/b", kind="topic", label="One"),
-            Node(id="a:b", kind="topic", label="Two"),  # slugs to the same 'a-b'
+            Node(id="a:b", kind="topic", label="Two"),
         ],
         edges=[],
     )
     with pytest.raises(ValueError, match="collision"):
-        ObsidianGraphSink().export(view, str(tmp_path / "vault"))
+        ObsidianGraphSink().export(view, "vault")
+
+
+def test_obsidian_label_injection_escaped(export_root):
+    """A label with a newline heading + link chars is emitted safely (S3)."""
+    view = GraphView(
+        nodes=[Node(id="n1", kind="topic", label="Safe\n# Injected\n[[evil]]")],
+        edges=[],
+    )
+    written = ObsidianGraphSink().export(view, "vault")
+
+    text = open(written[0], encoding="utf-8").read()
+    h1 = next(line for line in text.splitlines() if line.startswith("# "))
+    assert "Injected" in h1  # collapsed onto the H1, not a standalone heading
+    # No injected heading or wikilink on its own line in the body.
+    assert "\n# Injected" not in text
+    assert "[[evil]]" not in text  # brackets escaped
+
+
+def _all_files(root):
+    for dirpath, _dirs, files in os.walk(root):
+        for f in files:
+            yield os.path.join(dirpath, f)

@@ -350,7 +350,7 @@ wheels = [
 
 [[package]]
 name = "cli-agent-orchestrator"
-version = "2.2.0"
+version = "2.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "apscheduler" },
@@ -366,6 +366,7 @@ dependencies = [
     { name = "pyte" },
     { name = "python-dotenv" },
     { name = "python-frontmatter" },
+    { name = "pyyaml" },
     { name = "rank-bm25" },
     { name = "requests" },
     { name = "sqlalchemy" },
@@ -404,6 +405,7 @@ requires-dist = [
     { name = "pyte", specifier = ">=0.8.2" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
     { name = "python-frontmatter", specifier = ">=1.1.0" },
+    { name = "pyyaml", specifier = ">=6.0" },
     { name = "rank-bm25", specifier = ">=0.2.2" },
     { name = "requests", specifier = ">=2.32.0" },
     { name = "sqlalchemy", specifier = ">=2.0.0" },

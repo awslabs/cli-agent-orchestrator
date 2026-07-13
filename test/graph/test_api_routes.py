@@ -101,14 +101,42 @@ def test_get_graph_unregistered_provider_404(client):
     assert resp.status_code == 404
 
 
-def test_get_graph_is_ungated_even_with_auth_enabled(client, auth_on):
-    """With auth ENABLED, a no-Authorization GET still returns 200.
+def test_get_graph_no_token_401(client, auth_on):
+    """With auth ENABLED, a no-Authorization GET is 401 (MUST-FIX #1).
 
-    Proves the GET route carries no scope dependency (FR-12): if it were
-    gated, an unauthenticated request would be 401, not 200.
+    The GET route is now scope-gated (SCOPE_READ floor, matching /events),
+    superseding FR-12's original "ungated" wording: an unauthenticated
+    caller must not read graph structure (which carries private-scope
+    contradiction summaries of memory content). Regression guard — this
+    FAILS if the require_any_scope dependency is removed (200 instead of 401).
     """
     resp = client.get("/graph/stub")
+    assert resp.status_code == 401
+
+
+def test_get_graph_read_scope_admitted(client, auth_on):
+    """A cao:read token passes the GET scope gate for a public scope (200)."""
+    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_READ])
+    resp = client.get("/graph/stub?scope=project")
     assert resp.status_code == 200
+
+
+@pytest.mark.parametrize(
+    "scope",
+    ["session", "agent", "Session", "AGENT", "Agent", "SESSION"],
+)
+def test_get_graph_private_scope_refused_400(client, auth_on, scope):
+    """A session/agent scope is refused with 400 even for an authed reader.
+
+    Mirrors /memory/export's private-tier refusal (D5): the API surface
+    never exposes private tiers. The detail must mention "private". The
+    refusal is case-insensitive: mixed/upper-case aliases (``Session``,
+    ``AGENT``) must not slip past the guard.
+    """
+    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_READ])
+    resp = client.get(f"/graph/stub?scope={scope}")
+    assert resp.status_code == 400
+    assert "private" in resp.json()["detail"]
 
 
 # ── POST /graph/{provider}/export ────────────────────────────────────────
@@ -217,6 +245,30 @@ def test_post_export_secret_gate_422_and_sink_not_called(client, monkeypatch):
     assert secret_value not in resp.text
     # export() must never have run on the rejected branch.
     spy.assert_not_called()
+
+
+# ── S2: OSError from the sink is mapped to 4xx (not a bare 500) ──────────
+
+
+def test_post_export_oserror_maps_to_400(client, monkeypatch, tmp_path):
+    """A real graphml export whose dest is an existing DIRECTORY -> 400, not 500.
+
+    ElementTree.write() on a directory raises IsADirectoryError (an OSError).
+    Regression guard for S2: the route now catches OSError and maps it to
+    400 instead of letting it escape as an unhandled 500.
+    """
+    # Point the export root at a tmp dir, then make dest an existing directory
+    # UNDER the root so confinement passes and the OSError fires at write time.
+    monkeypatch.setenv("CAO_GRAPH_EXPORT_ROOT", str(tmp_path))
+    existing_dir = tmp_path / "already-a-dir"
+    existing_dir.mkdir()
+
+    resp = client.post(
+        "/graph/stub/export",
+        json={"sink": "graphml", "dest": "already-a-dir", "options": {}},
+    )
+    assert resp.status_code == 400
+    assert "destination" in resp.json()["detail"].lower()
 
 
 # ── ValueError -> 400 route mapping (error-taxonomy AC) ──────────────────

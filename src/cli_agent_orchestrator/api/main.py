@@ -354,7 +354,15 @@ class GraphExportRequest(BaseModel):
     """Request body for ``POST /graph/{provider}/export`` (U4, Issue #348)."""
 
     sink: str = Field(description="Registered sink name (resolved via get_sink; KeyError -> 404)")
-    dest: str = Field(description="Export destination, passed positionally to sink.export")
+    dest: str = Field(
+        description=(
+            "Export destination, confined UNDER the configured graph-export root "
+            "(CAO_GRAPH_EXPORT_ROOT). Treated as a path RELATIVE to that root; an "
+            "absolute path is accepted only if it already resolves under the root, "
+            "otherwise the export is rejected (400). Traversal/symlink escapes are "
+            "rejected via safe_join_under_base."
+        )
+    )
     options: dict = Field(
         default_factory=dict,
         description="Opaque per-sink options forwarded as **options; the route never inspects them",
@@ -1756,18 +1764,47 @@ async def resume_workflow_run_endpoint(
 
 
 @app.get("/graph/{provider}")
-async def get_graph_endpoint(provider: str, request: Request) -> Dict:
-    """Project a provider's GraphView and return its wire shape (FR-12).
+async def get_graph_endpoint(
+    provider: str,
+    request: Request,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Project a provider's GraphView and return its wire shape.
 
-    UNGATED by design: this route carries no ``require_any_scope``
-    dependency at all — graph reads are open (per business-rules.md). All
-    query params (``scope``, ``scope_id``, and any extras) are forwarded to
-    the provider as ``**filters``.
+    Scope-gated (D5 posture): when auth is enabled, any of
+    ``cao:read`` / ``cao:write`` / ``cao:admin`` is required (read is the
+    floor) — identical to ``/events``. This SUPERSEDES the original FR-12
+    "UNGATED by design" wording: the graph carries private-scope
+    structure, including contradiction-edge summaries of memory CONTENT, so
+    an unauthenticated caller must not be able to read it (PR #424 review).
 
-    Error taxonomy: unregistered provider -> 404; provider ValueError
-    (e.g. a bad filter value) -> 400.
+    Private tiers are REFUSED outright: a ``scope`` of ``session`` or
+    ``agent`` is rejected with 400 even for an authed ``cao:read`` caller,
+    mirroring ``/memory/export`` — the API surface never exposes private
+    tiers (D5). All other query params (``scope_id`` and any extras) are
+    forwarded to the provider as ``**filters``.
+
+    Error taxonomy: unregistered provider -> 404; private-scope request or
+    provider ValueError (e.g. a bad filter value) -> 400.
     """
     filters = dict(request.query_params)
+
+    # Private-scope gate (D5): the graph route takes ``scope`` as a query
+    # string, so compare its value against the private MemoryScope values.
+    # Mirrors /memory/export's MemoryScope.SESSION/AGENT refusal. The check is
+    # case-insensitive so ``scope=Session`` / ``scope=AGENT`` can't slip past;
+    # only this local comparison is normalized — the raw value is still
+    # forwarded to the provider in ``filters`` unchanged.
+    requested_scope = filters.get("scope")
+    if requested_scope is not None and requested_scope.lower() in (
+        MemoryScope.SESSION.value,
+        MemoryScope.AGENT.value,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"scope '{requested_scope}' is private and cannot be read via the graph API",
+        )
+
     try:
         inst = get_provider(provider)
     except KeyError:
@@ -1798,7 +1835,9 @@ async def export_graph_endpoint(
     matched bytes.
 
     Error taxonomy: unregistered provider or sink -> 404; secret hit -> 422;
-    provider/sink ValueError -> 400.
+    provider/sink ValueError -> 400; sink OSError (e.g. dest is an existing
+    directory, permission denied, ENOSPC) -> 400 — a bad-dest-shape failure
+    kept consistent with the ValueError mapping rather than leaking a 500.
     """
     filters = dict(request.query_params)
     try:
@@ -1830,6 +1869,14 @@ async def export_graph_endpoint(
         written_files = sink.export(view, body.dest, **body.options)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except OSError as e:
+        # dest is an existing directory (IsADirectoryError), permission
+        # denied, ENOSPC, etc. — a bad destination, mapped to 400 for
+        # consistency with the ValueError branch rather than a bare 500.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"export failed writing to destination: {e}",
+        )
 
     return {"written_files": written_files, "sink": body.sink, "dest": body.dest}
 

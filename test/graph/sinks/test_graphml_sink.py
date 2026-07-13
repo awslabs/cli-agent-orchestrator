@@ -1,4 +1,4 @@
-"""U7 — GraphMLGraphSink tests: round-trip, no third-party XML, traversal, attrs."""
+"""U7 — GraphMLGraphSink tests: round-trip, no third-party XML, export-root confinement."""
 
 import ast
 import os
@@ -12,8 +12,13 @@ from cli_agent_orchestrator.graph.sinks.graphml import GraphMLGraphSink
 networkx = pytest.importorskip("networkx", reason="networkx needed for GraphML round-trip")
 
 
-def _traversal_dest(base) -> str:
-    return os.path.join(str(base), *([".."] * 40), "etc", "cao-graphml-traversal.graphml")
+@pytest.fixture
+def export_root(tmp_path, monkeypatch):
+    """Point CAO_GRAPH_EXPORT_ROOT at a tmp dir; return its realpath."""
+    root = tmp_path / "export-root"
+    root.mkdir()
+    monkeypatch.setenv("CAO_GRAPH_EXPORT_ROOT", str(root))
+    return os.path.realpath(str(root))
 
 
 def _view() -> GraphView:
@@ -30,29 +35,32 @@ def _view() -> GraphView:
     )
 
 
-def test_graphml_roundtrips_counts(tmp_path):
+def test_graphml_roundtrips_counts(export_root):
     """The .graphml parses with networkx and round-trips node/edge counts (AC-1)."""
     view = _view()
-    dest = tmp_path / "graph.graphml"
-    written = GraphMLGraphSink().export(view, str(dest))
+    written = GraphMLGraphSink().export(view, "graph.graphml")
 
-    assert written == [str(dest)]
-    assert dest.exists()
+    dest = os.path.join(export_root, "graph.graphml")
+    assert [os.path.realpath(p) for p in written] == [os.path.realpath(dest)]
+    assert os.path.exists(dest)
+    assert os.path.realpath(written[0]).startswith(export_root + os.sep)
 
-    g = networkx.read_graphml(str(dest))
+    g = networkx.read_graphml(dest)
     assert g.number_of_nodes() == len(view.nodes)
     assert g.number_of_edges() == len(view.edges)
-    # A node's fixed <data> keys survive the round-trip.
     assert g.nodes["a"]["kind"] == "topic"
     assert g.nodes["a"]["label"] == "Alpha"
 
 
-def test_graphml_no_third_party_xml_import():
-    """graphml.py imports no third-party XML library (C-2).
+def test_graphml_subdir_dest_confined(export_root):
+    """A relative dest with a subdir is created under the root."""
+    written = GraphMLGraphSink().export(_view(), os.path.join("sub", "graph.graphml"))
+    assert os.path.realpath(written[0]).startswith(export_root + os.sep)
+    assert os.path.exists(os.path.join(export_root, "sub", "graph.graphml"))
 
-    Parse the module's AST and assert every imported top-level module is
-    either stdlib xml.* or an in-repo/stdlib module — never lxml/xmltodict.
-    """
+
+def test_graphml_no_third_party_xml_import():
+    """graphml.py imports no third-party XML library (C-2)."""
     src = ast.parse(open(graphml_module.__file__).read())
     imported: list[str] = []
     for node in ast.walk(src):
@@ -64,27 +72,52 @@ def test_graphml_no_third_party_xml_import():
     forbidden = ("lxml", "xmltodict", "untangle", "xmlschema")
     for mod in imported:
         assert not any(mod == f or mod.startswith(f + ".") for f in forbidden), mod
-    # Positive: the stdlib XML module is what's used.
     assert any(m.startswith("xml.etree") for m in imported)
 
 
-def test_graphml_traversal_rejected(tmp_path):
-    """A traversal dest is rejected before any file is written."""
+def test_graphml_relative_traversal_escape_rejected(export_root):
+    """A relative dest escaping the export root is rejected before any write."""
     with pytest.raises(ValueError):
-        GraphMLGraphSink().export(_view(), _traversal_dest(tmp_path))
-    assert list(tmp_path.rglob("*.graphml")) == []
+        GraphMLGraphSink().export(
+            _view(), os.path.join("..", "..", "etc", "cao-graphml-escape.graphml")
+        )
+    assert list(_all_files(export_root)) == []
 
 
-def test_graphml_non_native_attrs_stringified(tmp_path):
+def test_graphml_absolute_overwrite_outside_root_rejected(export_root, tmp_path):
+    """An absolute dest at an existing sensitive-looking file OUTSIDE the root is rejected.
+
+    Regression guard for MUST-FIX #2: with allow_file=True the old blocklist
+    let an authed writer overwrite nearly any existing file (e.g.
+    ~/.ssh/authorized_keys). Confinement rejects it before any write, so the
+    victim file's bytes are untouched.
+    """
+    victim = tmp_path / "victim" / "authorized_keys"
+    victim.parent.mkdir()
+    victim.write_text("ORIGINAL", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        GraphMLGraphSink().export(_view(), str(victim))
+
+    # The out-of-root file was never touched.
+    assert victim.read_text(encoding="utf-8") == "ORIGINAL"
+    assert list(_all_files(export_root)) == []
+
+
+def test_graphml_non_native_attrs_stringified(export_root):
     """A non-native attrs value is json-stringified into the data text, not dropped."""
     view = GraphView(
         nodes=[Node(id="a", kind="topic", label="A", attrs={"nested": {"k": [1, 2, 3]}})],
         edges=[],
     )
-    dest = tmp_path / "graph.graphml"
-    GraphMLGraphSink().export(view, str(dest))
+    written = GraphMLGraphSink().export(view, "graph.graphml")
 
-    g = networkx.read_graphml(str(dest))
-    # The attrs map is preserved as a JSON string (data survives, not silently lost).
+    g = networkx.read_graphml(written[0])
     attrs_text = g.nodes["a"]["attrs"]
     assert "nested" in attrs_text and "1" in attrs_text
+
+
+def _all_files(root):
+    for dirpath, _dirs, files in os.walk(root):
+        for f in files:
+            yield os.path.join(dirpath, f)

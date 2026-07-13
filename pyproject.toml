@@ -46,6 +46,9 @@ dependencies = [
     "pyjwt[crypto]>=2.8.0",
     "jsonschema>=4.25",
     "jinja2>=3.1.0",
+    # Obsidian graph sink (Issue #348) imports yaml at module top; declare it
+    # directly instead of relying on a transitive dep so the import can't break.
+    "pyyaml>=6.0",
 ]
 
 [project.scripts]

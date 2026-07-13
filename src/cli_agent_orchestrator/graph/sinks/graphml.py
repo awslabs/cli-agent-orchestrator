@@ -4,9 +4,16 @@ Exports a GraphView as a single ``.graphml`` XML file using ONLY the
 standard library (``xml.etree.ElementTree``) per constraint C-2 — no
 lxml, xmltodict, or any third-party XML dependency.
 
-Security contract: ``dest`` is a FILE here, confined via
-``resolve_and_validate_path`` with ``allow_file=True``. No ``secret_gate``
-call (route already scanned, ADR-5).
+Security contract: ``dest`` is a FILE here, confined UNDER the configured
+graph-export root (``CAO_GRAPH_EXPORT_ROOT``) via
+``base.confine_under_export_root``. ``dest`` is treated as a file path
+relative to that root (an absolute ``dest`` is accepted only when it already
+resolves under the root); ``safe_join_under_base`` guarantees the ``.graphml``
+file is written inside it — this is REAL confinement, not the
+``resolve_and_validate_path`` blocklist (which permits e.g. ``~/.ssh`` and
+would let ``allow_file=True`` overwrite arbitrary existing files). The sink
+owns this confinement — the U4 route does NOT pre-validate ``dest``. No
+``secret_gate`` call (route already scanned, ADR-5).
 """
 
 import json
@@ -15,8 +22,11 @@ from typing import Any
 from xml.etree.ElementTree import Element, ElementTree, SubElement
 
 from cli_agent_orchestrator.graph.models import GraphView
-from cli_agent_orchestrator.graph.sinks.base import GraphSink, register_sink
-from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
+from cli_agent_orchestrator.graph.sinks.base import (
+    GraphSink,
+    confine_under_export_root,
+    register_sink,
+)
 
 _GRAPHML_NS = "http://graphml.graphdrawing.org/xmlns"
 
@@ -56,10 +66,13 @@ class GraphMLGraphSink(GraphSink):
     """Export a GraphView to a single GraphML (.graphml) XML file."""
 
     def export(self, view: GraphView, dest: str, **options: Any) -> list[str]:
-        # dest is a FILE (allow_file=True); defense in depth on top of U4.
-        dest_real = resolve_and_validate_path(
-            dest, allow_create=True, allow_file=True, description="GraphML export destination"
-        )
+        # dest is a FILE confined UNDER the configured graph-export root:
+        # treated as a file path relative to CAO_GRAPH_EXPORT_ROOT (the .graphml
+        # leaf is the last segment). This confinement — not the blocklist —
+        # is what stops an allow_file overwrite of an arbitrary existing file.
+        # The sink owns confinement — the U4 route does NOT pre-validate dest.
+        dest_path = confine_under_export_root(dest, description="GraphML export destination")
+        dest_real = str(dest_path)
 
         root = Element("graphml", xmlns=_GRAPHML_NS)
 

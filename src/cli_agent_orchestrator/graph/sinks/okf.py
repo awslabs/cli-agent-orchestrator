@@ -7,11 +7,14 @@ markdown file per node plus a deterministic ``index.md`` and a
 (``_write_if_changed``) is adopted as a PATTERN here — this module does
 NOT import the memory-archive exporter.
 
-Security contract: ``dest`` is confined via
-``utils.path_validation.resolve_and_validate_path`` (ADR: sink-side
-defense in depth, even though the U4 route validates first). No
-``secret_gate`` call inside ``export()`` — the route scans the serialized
-view before dispatch (ADR-5); the sink assumes clean content.
+Security contract: ``dest`` is confined UNDER the configured graph-export
+root (``CAO_GRAPH_EXPORT_ROOT``) via
+``base.confine_under_export_root`` — ``dest`` is a path relative to that
+root (an absolute ``dest`` is accepted only when it already resolves under
+the root), and ``safe_join_under_base`` guarantees the write stays inside
+it. The sink owns this confinement — the U4 route does NOT pre-validate
+``dest``. No ``secret_gate`` call inside ``export()`` — the route scans the
+serialized view before dispatch (ADR-5); the sink assumes clean content.
 """
 
 import json
@@ -20,12 +23,19 @@ from pathlib import Path
 from typing import Any
 
 from cli_agent_orchestrator.graph.models import Edge, GraphView, Node
-from cli_agent_orchestrator.graph.sinks.base import GraphSink, register_sink
-from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
+from cli_agent_orchestrator.graph.sinks.base import (
+    GraphSink,
+    confine_under_export_root,
+    register_sink,
+)
 
 # Filesystem-unsafe characters collapsed to '-' so a node id/label maps to a
 # stable, portable filename. Empty results fall back to a fixed token.
 _UNSAFE_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
+
+# Reserved bundle-file stems. A node whose id slugs to one of these would
+# otherwise be silently overwritten by the generated index.md / manifest.md.
+_RESERVED_STEMS = frozenset({"index", "manifest"})
 
 
 def _slug(value: str) -> str:
@@ -39,6 +49,22 @@ def _slug(value: str) -> str:
     return slug or "node"
 
 
+def _md_inline(value: Any) -> str:
+    """Escape an untrusted value for safe single-line markdown emission.
+
+    label/attrs are untrusted (Node docstring: sinks MUST escape on output).
+    Newlines/CRs are collapsed to a space so an LLM summary cannot inject a
+    new ``#`` heading, list item, or ``[[wikilink]]`` on its own line; the
+    markdown-structural characters that open links/wikilinks/emphasis
+    (``[]()*_`\\`` plus ``#``) are backslash-escaped so they render literally.
+    """
+    text = str(value)
+    # Collapse any line break (LF, CR, CRLF, and unicode line/para separators)
+    # to a single space so nothing can start a new markdown block.
+    text = re.sub(r"[\r\n\u2028\u2029]+", " ", text)
+    return re.sub(r"([\\`*_\[\]()#])", r"\\\1", text)
+
+
 @register_sink("okf")
 class OkfGraphSink(GraphSink):
     """Export a GraphView as an OKF-shaped markdown bundle.
@@ -49,13 +75,11 @@ class OkfGraphSink(GraphSink):
     """
 
     def export(self, view: GraphView, dest: str, **options: Any) -> list[str]:
-        # Defense in depth: confine dest even though U4 already validated it.
-        # dest is a DIRECTORY (allow_file defaults to False); traversal /
-        # symlink / blocked-system-path -> ValueError -> route maps to 400.
-        dest_real = resolve_and_validate_path(
-            dest, allow_create=True, description="OKF export destination"
-        )
-        dest_dir = Path(dest_real)
+        # Confine dest UNDER the configured graph-export root. dest is a
+        # DIRECTORY treated as relative to CAO_GRAPH_EXPORT_ROOT; traversal /
+        # absolute-escape / symlink-escape -> ValueError -> route maps to 400.
+        # The route does NOT pre-validate dest — this sink owns confinement.
+        dest_dir = confine_under_export_root(dest, description="OKF export destination")
         dest_dir.mkdir(parents=True, exist_ok=True)
 
         # Group outgoing edges by source id for the per-node "See Also"
@@ -65,16 +89,31 @@ class OkfGraphSink(GraphSink):
             outgoing.setdefault(edge.source, []).append(edge)
 
         written: list[str] = []
+        # Fail loudly (matching the Obsidian sink's posture) instead of
+        # last-write-wins: a node id that slugs to a reserved stem
+        # ("index"/"manifest") would be clobbered by the generated
+        # index.md/manifest.md, and two ids slugging to the same stem would
+        # clobber each other. Both are detected before any per-node write.
+        stems: dict[str, str] = {}
 
         # One markdown file per node. Sorted by slug so a same-content view
         # always writes files in the same order (deterministic output).
-        #
-        # NOTE: unlike the Obsidian sink, OKF does NOT guard against two ids
-        # slugging to the same stem (last write wins). This asymmetry is
-        # deliberate: OKF's AC (U6) does not mandate collision detection —
-        # only the Obsidian sink's does. Left as-is by design, not oversight.
         for node in sorted(view.nodes, key=lambda n: _slug(n.id)):
-            filename = _slug(node.id) + ".md"
+            slug = _slug(node.id)
+            if slug in _RESERVED_STEMS:
+                raise ValueError(
+                    f"node id {node.id!r} slugs to reserved bundle stem {slug!r}.md "
+                    f"(collides with the generated {slug}.md)"
+                )
+            existing = stems.get(slug)
+            if existing is not None and existing != node.id:
+                raise ValueError(
+                    f"filename collision: nodes {existing!r} and {node.id!r} "
+                    f"both map to {slug!r}.md"
+                )
+            stems[slug] = node.id
+
+            filename = slug + ".md"
             content = self._render_node(node, outgoing.get(node.id, []))
             path = dest_dir / filename
             self._write_if_changed(path, content)
@@ -106,13 +145,15 @@ class OkfGraphSink(GraphSink):
             f"attrs: {json.dumps(node.attrs, sort_keys=True)}",
             "---",
             "",
-            f"# {node.label}",
+            # label is untrusted (may be an LLM summary): escape so a newline
+            # or markdown-structural char cannot inject a heading/link/list.
+            f"# {_md_inline(node.label)}",
         ]
 
         if node.attrs:
             lines.extend(["", "## Attributes", ""])
             for key in sorted(node.attrs):
-                lines.append(f"- **{key}**: {node.attrs[key]}")
+                lines.append(f"- **{_md_inline(key)}**: {_md_inline(node.attrs[key])}")
 
         if edges:
             lines.extend(["", "## See Also", ""])
@@ -127,7 +168,9 @@ class OkfGraphSink(GraphSink):
         """Regenerate ``index.md`` — a pure, sorted function of the node set."""
         lines = ["# Index", ""]
         for node in sorted(nodes, key=lambda n: _slug(n.id)):
-            lines.append(f"- [{node.label}]({_slug(node.id)}.md)")
+            # _slug already yields a safe filename stem; the label is untrusted
+            # link text and is escaped so it cannot break the link syntax.
+            lines.append(f"- [{_md_inline(node.label)}]({_slug(node.id)}.md)")
         return "\n".join(lines).rstrip() + "\n"
 
     @staticmethod
@@ -147,7 +190,8 @@ class OkfGraphSink(GraphSink):
             f"- edges: {len(view.edges)}",
         ]
         for key in sorted(view.meta):
-            lines.append(f"- {key}: {view.meta[key]}")
+            # meta is provider-supplied; escape both key and value on output.
+            lines.append(f"- {_md_inline(key)}: {_md_inline(view.meta[key])}")
         return "\n".join(lines).rstrip() + "\n"
 
     @staticmethod
