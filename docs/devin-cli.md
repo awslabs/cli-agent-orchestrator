@@ -45,9 +45,10 @@ The Devin CLI provider detects terminal states by analyzing output patterns:
 - **IDLE**: Terminal shows `#` prompt (preceded by a horizontal rule), ready for input
 - **PROCESSING**: Processing indicators visible (e.g., `Running tools`, `esc to interrupt`)
 - **COMPLETED**: User input line (`> text`) visible with the `#` prompt and horizontal rule
-- **ERROR**: Empty output or unrecognized state
+- **UNKNOWN**: Empty, whitespace-only, or otherwise ambiguous output (kept polling; nothing is latched)
+- **ERROR**: Explicit error markers matched in `ERROR_PATTERNS` (e.g., crash stack traces)
 
-Status detection checks patterns in priority order: PROCESSING → IDLE/COMPLETED (via `#` prompt + horizontal rule) → welcome screen → ERROR.
+Status detection checks patterns in priority order: PROCESSING → IDLE/COMPLETED (via `#` prompt + horizontal rule) → welcome screen → ERROR_PATTERNS → UNKNOWN.
 
 ### Message Extraction
 
@@ -123,7 +124,8 @@ This is injected via `--prompt-file` and combined with the agent profile system 
 - `TerminalStatus.IDLE`: Ready for input (`#` prompt visible)
 - `TerminalStatus.PROCESSING`: Working on task (processing indicators visible)
 - `TerminalStatus.COMPLETED`: Task finished (user input + response visible)
-- `TerminalStatus.ERROR`: Error occurred or empty output
+- `TerminalStatus.ERROR`: Error marker matched in `ERROR_PATTERNS` (e.g., crash stack traces); never latched from empty/ambiguous output
+- `TerminalStatus.UNKNOWN`: Empty, whitespace-only, or otherwise ambiguous output; polling continues, nothing is latched
 
 ## End-to-End Testing
 
