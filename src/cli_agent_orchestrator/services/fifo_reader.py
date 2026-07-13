@@ -13,6 +13,7 @@ from typing import Callable, Dict, Optional, Tuple
 from cli_agent_orchestrator.constants import (
     FIFO_DIR,
     PIPE_LIVENESS_CHECK_INTERVAL_S,
+    PIPE_LIVENESS_MAX_REARM_FAILURES,
     PIPE_LIVENESS_STALL_CHECKS,
 )
 from cli_agent_orchestrator.services.event_bus import bus
@@ -77,9 +78,14 @@ class FifoManager:
         # register these; herdr and callers that pass none are never watched).
         self._pane_probe: Dict[str, PaneProbe] = {}
         self._rearm: Dict[str, RearmPipe] = {}
-        # Per-terminal watchdog bookkeeping: (last_pane_hash, last_check_monotonic,
-        # consecutive_diverging_checks).
-        self._liveness: Dict[str, Tuple[int, float, int]] = {}
+        # Per-terminal watchdog bookkeeping: (last_pane_content, last_check_monotonic,
+        # consecutive_diverging_checks). The full tail string (not a hash) is
+        # stored so an accidental hash collision can never mask a real stall.
+        self._liveness: Dict[str, Tuple[str, float, int]] = {}
+        # Consecutive re-arm *failures* per terminal (rearm() raised). Reset on
+        # any successful re-arm; once it hits PIPE_LIVENESS_MAX_REARM_FAILURES
+        # the terminal is dropped from the watchdog instead of retrying forever.
+        self._rearm_failures: Dict[str, int] = {}
         self._watchdog_stop = threading.Event()
         self._watchdog_thread: Optional[threading.Thread] = None
 
@@ -129,7 +135,7 @@ class FifoManager:
         if enroll:
             self._ensure_watchdog()
 
-        logger.info(f"Started FIFO reader for terminal {terminal_id}")
+        logger.info("Started FIFO reader for terminal %s", terminal_id)
 
     def stop_reader(self, terminal_id: str) -> None:
         """Stop the reader thread (if running) and delete the FIFO file.
@@ -149,7 +155,18 @@ class FifoManager:
             self._rearm.pop(terminal_id, None)
             self._liveness.pop(terminal_id, None)
             self._last_data_at.pop(terminal_id, None)
+            self._rearm_failures.pop(terminal_id, None)
 
+        # Deliberately NOT stopping the watchdog thread here even when this was
+        # the last enrolled terminal: doing it under a "now idle" check raced
+        # against a concurrent create_reader() enrolling a new terminal between
+        # this method releasing the lock and calling stop_watchdog() — the
+        # watchdog thread that create_reader's _ensure_watchdog() decided was
+        # still alive and reusable could be torn down out from under the newly
+        # enrolled terminal, leaving it silently unwatched. A single lingering
+        # thread waking every PIPE_LIVENESS_CHECK_INTERVAL_S to iterate an empty
+        # dict is a cheap, correctness-preserving tradeoff instead; it is
+        # actually torn down at process shutdown (api/main.py's lifespan).
         fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
 
         if stop_flag and thread:
@@ -165,11 +182,12 @@ class FifoManager:
                 # Never silent: a leaked reader thread was how #382's wedge
                 # built up. With the non-blocking loop this should not happen.
                 logger.warning(
-                    f"FIFO reader thread for terminal {terminal_id} did not exit "
-                    "within 2s; leaking a daemon thread"
+                    "FIFO reader thread for terminal %s did not exit "
+                    "within 2s; leaking a daemon thread",
+                    terminal_id,
                 )
             else:
-                logger.info(f"Stopped FIFO reader for terminal {terminal_id}")
+                logger.info("Stopped FIFO reader for terminal %s", terminal_id)
 
         # Best-effort unlink regardless of whether a reader was tracked — when
         # none is tracked there is no active reader holding the FIFO, so removing
@@ -251,7 +269,18 @@ class FifoManager:
                         # off the FIFO, independent of the coalescing/publish
                         # schedule below — the watchdog cares whether the FIFO
                         # delivered data, not whether/when a batch flushed.
-                        self._last_data_at[terminal_id] = time.monotonic()
+                        #
+                        # Guarded by membership rather than unconditional: if
+                        # stop_reader already popped this terminal (torn down
+                        # while this thread was mid-read, before it noticed
+                        # stop_flag), writing here would resurrect a dict entry
+                        # nothing will ever clean up again — a slow leak across
+                        # create/stop churn. The check is unlocked (consistent
+                        # with the watchdog loop's own lock-free dict reads
+                        # elsewhere in this class); it only needs to be right
+                        # often enough to close the common case, not atomic.
+                        if terminal_id in self._readers:
+                            self._last_data_at[terminal_id] = time.monotonic()
                         if not pending:
                             batch_start = time.monotonic()
                         pending.extend(raw)
@@ -270,7 +299,7 @@ class FifoManager:
                     pending.clear()
         except Exception as e:
             if not stop_flag.is_set():
-                logger.error(f"FIFO reader for terminal {terminal_id} exiting on error: {e}")
+                logger.error("FIFO reader for terminal %s exiting on error: %s", terminal_id, e)
         finally:
             # Flush any unpublished bytes so the last frame of a torn-down
             # terminal isn't lost — status/log consumers may need it.
@@ -314,9 +343,7 @@ class FifoManager:
                 try:
                     self._check_pipe_liveness(terminal_id)
                 except Exception:
-                    logger.exception(
-                        "pipe-pane liveness check failed for terminal %s", terminal_id
-                    )
+                    logger.exception("pipe-pane liveness check failed for terminal %s", terminal_id)
 
     def _check_pipe_liveness(self, terminal_id: str) -> None:
         """One liveness check for a terminal: re-arm a stalled pipe-pane forwarder.
@@ -333,57 +360,124 @@ class FifoManager:
         Requiring BOTH "pane advanced" and "FIFO silent" is what stops a
         legitimately idle terminal (pane unchanged, FIFO silent) from triggering
         a needless re-pipe. Re-arm only after ``PIPE_LIVENESS_STALL_CHECKS``
-        consecutive diverging checks (default 1).
+        consecutive diverging checks (default 2 — a single diverging check can be
+        a false positive on a healthy-but-bursty pipe).
         """
         probe = self._pane_probe.get(terminal_id)
         rearm = self._rearm.get(terminal_id)
         if probe is None or rearm is None:
             return
 
+        # probe() is a slow tmux `capture-pane` call — deliberately made
+        # without holding self._lock so it never blocks stop_reader() (or
+        # other terminals' housekeeping) for its duration.
         content = probe()
         now = time.monotonic()
-        current_hash = hash(content)
-        last_data_at = self._last_data_at.get(terminal_id, 0.0)
 
-        prev = self._liveness.get(terminal_id)
-        if prev is None:
-            # First observation: establish a baseline, never act on it.
-            self._liveness[terminal_id] = (current_hash, now, 0)
-            return
-        prev_hash, last_check_at, strikes = prev
+        do_rearm = False
+        with self._lock:
+            # stop_reader() may have unenrolled this terminal while probe()
+            # was in flight above. Re-check membership before touching any
+            # per-terminal state: writing back unconditionally (the previous
+            # behavior) would resurrect dict entries for a terminal that is
+            # gone — _watchdog_loop only ever iterates _pane_probe, so a
+            # resurrected entry in _liveness/_last_data_at is never revisited
+            # and never cleaned up, leaking slowly across create/stop churn.
+            if terminal_id not in self._pane_probe:
+                return
+            last_data_at = self._last_data_at.get(terminal_id, 0.0)
 
-        pane_advanced = current_hash != prev_hash
-        # Did the reader deliver anything since the previous check?
-        fifo_advanced = last_data_at >= last_check_at
+            prev = self._liveness.get(terminal_id)
+            if prev is None:
+                # First observation: establish a baseline, never act on it.
+                self._liveness[terminal_id] = (content, now, 0)
+                return
+            prev_content, last_check_at, strikes = prev
 
-        if pane_advanced and not fifo_advanced:
-            strikes += 1
-            if strikes >= PIPE_LIVENESS_STALL_CHECKS:
-                logger.warning(
-                    "pipe-pane forwarder for terminal %s appears stalled "
-                    "(pane advanced, no FIFO data for %.1fs) — re-arming",
-                    terminal_id,
-                    now - last_check_at,
-                )
-                try:
-                    rearm()
-                except Exception:
-                    logger.exception(
-                        "failed to re-arm pipe-pane for terminal %s", terminal_id
-                    )
-                else:
-                    # Bytes lost during the stall are gone (tmux never buffered
-                    # them), but the pane's *current* content is not — replay it
-                    # into the pipeline so the StatusMonitor buffer / GET output
-                    # immediately reflect the live screen instead of staying
-                    # frozen until the agent happens to emit something new.
-                    bus.publish(f"terminal.{terminal_id}.output", {"data": content})
-                    self._last_data_at[terminal_id] = time.monotonic()
+            # Full tail string compared, not a hash: a hash collision would
+            # make pane_advanced False and mask a real stall (negligible
+            # probability, but the string is just as cheap to compare and
+            # collision-free).
+            pane_advanced = content != prev_content
+            # Did the reader deliver anything since the previous check?
+            fifo_advanced = last_data_at >= last_check_at
+
+            if pane_advanced and not fifo_advanced:
+                strikes += 1
+                if strikes >= PIPE_LIVENESS_STALL_CHECKS:
+                    do_rearm = True
+                    strikes = 0
+            else:
                 strikes = 0
-        else:
-            strikes = 0
 
-        self._liveness[terminal_id] = (current_hash, now, strikes)
+            self._liveness[terminal_id] = (content, now, strikes)
+
+        if not do_rearm:
+            return
+
+        logger.warning(
+            "pipe-pane forwarder for terminal %s appears stalled "
+            "(pane advanced, no FIFO data) — re-arming",
+            terminal_id,
+        )
+        try:
+            rearm()
+        except Exception:
+            logger.exception("failed to re-arm pipe-pane for terminal %s", terminal_id)
+            with self._lock:
+                if terminal_id not in self._pane_probe:
+                    return
+                failures = self._rearm_failures.get(terminal_id, 0) + 1
+                self._rearm_failures[terminal_id] = failures
+                give_up = failures >= PIPE_LIVENESS_MAX_REARM_FAILURES
+                if give_up:
+                    self._pane_probe.pop(terminal_id, None)
+                    self._rearm.pop(terminal_id, None)
+                    self._liveness.pop(terminal_id, None)
+                    self._rearm_failures.pop(terminal_id, None)
+            if give_up:
+                # Not a silent retry-forever: a re-arm that keeps failing
+                # (e.g. the tmux pane is gone) previously re-struck and
+                # re-attempted every ~PIPE_LIVENESS_STALL_CHECKS intervals
+                # indefinitely, each logging at WARNING/exception — bounded
+                # but noisy forever. Give up after N consecutive failures and
+                # say so loudly instead.
+                logger.error(
+                    "pipe-pane forwarder for terminal %s failed to re-arm %d "
+                    "consecutive times — giving up and dropping it from the "
+                    "liveness watchdog",
+                    terminal_id,
+                    failures,
+                )
+            return
+
+        # Bytes lost during the stall are gone (tmux never buffered them), but
+        # the pane's *current* content is not — replay it into the pipeline so
+        # the StatusMonitor buffer / GET output immediately reflect the live
+        # screen instead of staying frozen until the agent happens to emit
+        # something new.
+        #
+        # capture-pane output is joined with a bare "\n" (clients/tmux.py's
+        # get_history), which is linefeed-without-carriage-return. pyte's
+        # screen (fed by StatusMonitor for CAO_PYTE_STATUS providers — on by
+        # default, and opted into by claude_code, exactly the provider #388
+        # was filed against) defaults LNM (line-feed/new-line mode) off, so a
+        # bare "\n" advances the row without returning to column 0: each
+        # replayed line renders indented past the previous one
+        # ("staircasing"), and the composited screen no longer matches the
+        # real pane until a later cursor-addressed repaint happens to paper
+        # over it — meaning status detection can stay broken after the very
+        # re-arm meant to fix it. Replaying with "\r\n" makes pyte treat it as
+        # a real newline, matching what a real terminal does with tmux's own
+        # capture-pane output.
+        replay = content.replace("\n", "\r\n")
+        with self._lock:
+            if terminal_id not in self._pane_probe:
+                return
+            self._rearm_failures.pop(terminal_id, None)
+            self._last_data_at[terminal_id] = time.monotonic()
+
+        bus.publish(f"terminal.{terminal_id}.output", {"data": replay})
 
 
 # Module-level singleton

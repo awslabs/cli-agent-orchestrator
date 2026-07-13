@@ -97,6 +97,7 @@ from cli_agent_orchestrator.services.config_service import ConfigService
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.event_log_service import RING_CAPACITY
 from cli_agent_orchestrator.services.event_primitives import KINDS as EVENT_KINDS
+from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.herdr_inbox_registry import set_herdr_inbox_service
 from cli_agent_orchestrator.services.herdr_inbox_service import HerdrInboxService
 from cli_agent_orchestrator.services.inbox_service import inbox_service
@@ -514,6 +515,11 @@ async def lifespan(app: FastAPI):
         await inbox_reconcile_task
     except asyncio.CancelledError:
         pass
+
+    # Stop the pipe-pane liveness watchdog thread (issue #388). It is a plain
+    # threading.Thread (not asyncio), so join it directly rather than via
+    # asyncio.gather with the tasks above.
+    fifo_manager.stop_watchdog()
 
     await registry.teardown()
     logger.info("Shutting down CLI Agent Orchestrator server...")

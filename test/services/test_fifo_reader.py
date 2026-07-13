@@ -1,9 +1,14 @@
 """Tests for the FIFO reader manager."""
 
 import os
+import threading
+import time
+from unittest.mock import patch
 
+import pyte
 import pytest
 
+from cli_agent_orchestrator.services import fifo_reader as fr
 from cli_agent_orchestrator.services.fifo_reader import FifoManager
 
 pytestmark = pytest.mark.skipif(
@@ -98,10 +103,6 @@ class TestReaderThreadLifecycle:
     def test_data_received_across_writer_reconnects(self, tmp_path, monkeypatch):
         """Chunks written by successive writers (tmux re-attaching pipe-pane)
         are all published; writer disconnects must not kill the reader."""
-        import time
-
-        from cli_agent_orchestrator.services import fifo_reader as fr
-
         received = []
         monkeypatch.setattr(
             fr.bus, "publish", lambda topic, data: received.append((topic, data["data"]))
@@ -131,8 +132,6 @@ class TestReaderThreadLifecycle:
     def test_repeated_create_stop_cycles_leave_no_threads(self, tmp_path, monkeypatch):
         """Accumulation guard: the #382 report showed 26+ leaked reader threads
         after repeated session create/delete cycles."""
-        import threading as _threading
-
         manager = self._manager(tmp_path, monkeypatch)
         threads = []
         for i in range(5):
@@ -144,7 +143,7 @@ class TestReaderThreadLifecycle:
         for t in threads:
             t.join(timeout=3.0)
         assert all(not t.is_alive() for t in threads)
-        leftover = [t.name for t in _threading.enumerate() if t.name.startswith("fifo-term-cycle")]
+        leftover = [t.name for t in threading.enumerate() if t.name.startswith("fifo-term-cycle")]
         assert leftover == []
 
 
@@ -165,10 +164,6 @@ class TestReaderLoopCoalescing:
         each spinner frame was a separate publish, dropping worker completion
         events on the floor.
         """
-        import threading
-        import time
-        from unittest.mock import patch
-
         monkeypatch.setattr("cli_agent_orchestrator.services.fifo_reader.FIFO_DIR", tmp_path)
 
         fifo_path = tmp_path / "term-coalesce.fifo"
@@ -230,10 +225,6 @@ class TestReaderLoopCoalescing:
         LLM response would strand bytes in the pending buffer, leaving the
         status monitor with a stale view.
         """
-        import threading
-        import time
-        from unittest.mock import patch
-
         monkeypatch.setattr("cli_agent_orchestrator.services.fifo_reader.FIFO_DIR", tmp_path)
 
         fifo_path = tmp_path / "term-flush.fifo"
@@ -305,9 +296,11 @@ class TestPipeLivenessWatchdog:
 
     def test_stall_is_detected_and_pipe_rearmed(self, tmp_path, monkeypatch):
         """Pane advanced but the FIFO delivered nothing since the last check ->
-        the forwarder is stalled and gets re-armed."""
-        import time
-
+        the forwarder is stalled and gets re-armed once PIPE_LIVENESS_STALL_CHECKS
+        consecutive checks confirm it (monkeypatched to 1 here to isolate the
+        detect/re-arm decision from the default-threshold behavior, which
+        test_stall_requires_configured_consecutive_checks covers separately)."""
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_STALL_CHECKS", 1)
         manager = self._manager(tmp_path, monkeypatch)
         pane = {"content": "line0"}
         rearm_calls: list = []
@@ -326,8 +319,6 @@ class TestPipeLivenessWatchdog:
     def test_idle_terminal_is_not_rearmed(self, tmp_path, monkeypatch):
         """Pane unchanged + FIFO silent = a genuinely idle terminal, which must
         NOT trigger a needless re-pipe (the false-positive guard)."""
-        import time
-
         manager = self._manager(tmp_path, monkeypatch)
         pane = {"content": "idle prompt"}
         rearm_calls: list = []
@@ -340,8 +331,6 @@ class TestPipeLivenessWatchdog:
     def test_healthy_pipe_is_not_rearmed(self, tmp_path, monkeypatch):
         """Pane advancing AND the FIFO delivering bytes = a healthy pipe; no
         re-arm even though the screen keeps changing."""
-        import time
-
         manager = self._manager(tmp_path, monkeypatch)
         pane = {"content": "line0"}
         rearm_calls: list = []
@@ -359,10 +348,7 @@ class TestPipeLivenessWatchdog:
         """After re-arm the lost bytes are gone, but the pane's CURRENT content
         is republished so the StatusMonitor buffer / GET output stop being frozen
         instead of waiting for the agent to emit something new."""
-        import time
-
-        from cli_agent_orchestrator.services import fifo_reader as fr
-
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_STALL_CHECKS", 1)
         published: list = []
         monkeypatch.setattr(fr.bus, "publish", lambda topic, data: published.append((topic, data)))
 
@@ -376,15 +362,70 @@ class TestPipeLivenessWatchdog:
         manager._check_pipe_liveness("term")
 
         assert rearm_calls == [True]
+        # Single-line content has no "\n" to CRLF-convert, so the republished
+        # payload equals the raw pane content verbatim; the multi-line CRLF
+        # conversion itself is covered by test_rearm_replay_converts_lf_to_crlf.
         assert ("terminal.term.output", {"data": pane["content"]}) in published
+
+    def test_rearm_replay_converts_lf_to_crlf(self, tmp_path, monkeypatch):
+        """Regression for the round-2 review finding: capture-pane joins lines
+        with a bare "\\n" (clients/tmux.py's get_history), which pyte treats as
+        linefeed-without-carriage-return (LNM off by default) — replaying that
+        verbatim staircases the composited screen, so status detection for
+        CAO_PYTE_STATUS providers (claude_code, #388's own repro target) can
+        stay broken after the very re-arm meant to fix it. The replay must
+        convert each bare "\\n" to "\\r\\n" so pyte renders it as a real newline."""
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_STALL_CHECKS", 1)
+        published: list = []
+        monkeypatch.setattr(fr.bus, "publish", lambda topic, data: published.append((topic, data)))
+
+        manager = self._manager(tmp_path, monkeypatch)
+        multiline = "line0\nline1\nline2 (rendered but never piped)"
+        pane = {"content": "line0"}
+        rearm_calls: list = []
+        self._enroll(manager, "term", pane, rearm_calls, last_data_at=time.monotonic())
+
+        manager._check_pipe_liveness("term")  # baseline
+        pane["content"] = multiline
+        manager._check_pipe_liveness("term")
+
+        assert rearm_calls == [True]
+        assert ("terminal.term.output", {"data": multiline.replace("\n", "\r\n")}) in published
+        # And the raw bare-LF form must NOT have been published — that's
+        # exactly the payload that staircases pyte's screen.
+        assert ("terminal.term.output", {"data": multiline}) not in published
+
+    def test_pyte_screen_staircases_on_bare_lf_and_is_fixed_by_crlf(self):
+        """End-to-end confirmation (not just string equality) that bare "\\n"
+        actually breaks pyte's composited screen the way the review claimed,
+        and that "\\r\\n" fixes it — using the real pyte library, not a mock."""
+        multiline = "root@host:~$ line one\nroot@host:~$ line two\nroot@host:~$ line three"
+
+        bare_screen = pyte.Screen(80, 24)
+        pyte.Stream(bare_screen).feed(multiline)
+        bare_lines = [line for line in bare_screen.display if line.strip()]
+
+        crlf_screen = pyte.Screen(80, 24)
+        pyte.Stream(crlf_screen).feed(multiline.replace("\n", "\r\n"))
+        crlf_lines = [line for line in crlf_screen.display if line.strip()]
+
+        # With bare "\n" (LNM off), each line's cursor column carries over
+        # from the previous line's end instead of returning to 0, so
+        # "line two"/"line three" render indented ("staircased") rather than
+        # left-aligned like the first line.
+        assert not all(line.startswith("root@host") for line in bare_lines), (
+            "expected the bare-LF replay to staircase — if this now passes, "
+            "pyte's LNM default changed and the CRLF fix may be unnecessary"
+        )
+        # With "\r\n" every line starts at column 0, exactly like a real
+        # terminal rendering tmux's own output.
+        assert all(
+            line.startswith("root@host") for line in crlf_lines
+        ), "CRLF-converted replay must render each line left-aligned"
 
     def test_stall_requires_configured_consecutive_checks(self, tmp_path, monkeypatch):
         """With PIPE_LIVENESS_STALL_CHECKS > 1, a single diverging check is not
         enough — re-arm waits for the configured number of consecutive stalls."""
-        import time
-
-        from cli_agent_orchestrator.services import fifo_reader as fr
-
         monkeypatch.setattr(fr, "PIPE_LIVENESS_STALL_CHECKS", 2)
         manager = self._manager(tmp_path, monkeypatch)
         pane = {"content": "l0"}
@@ -398,6 +439,70 @@ class TestPipeLivenessWatchdog:
         pane["content"] = "l2"
         manager._check_pipe_liveness("term")  # strike 2 — re-arm
         assert rearm_calls == [True]
+
+    def test_stop_during_probe_does_not_resurrect_state(self, tmp_path, monkeypatch):
+        """Regression for the round-2 review's stop-during-probe race:
+        ``_check_pipe_liveness`` calls the injected ``probe()`` (a slow tmux
+        ``capture-pane``) without holding the lock. If ``stop_reader()`` pops a
+        terminal's watchdog state while that call is in flight, the check must
+        not write ``_liveness``/``_last_data_at`` back afterward — the old
+        unconditional write-back resurrected entries for a terminal that
+        ``_watchdog_loop`` (which only iterates ``_pane_probe``) would never
+        revisit again, leaking them for process lifetime across create/stop
+        churn."""
+        manager = self._manager(tmp_path, monkeypatch)
+
+        def slow_probe():
+            # Simulate stop_reader() completing atomically, under its own
+            # lock, while this capture-pane call is still in flight.
+            manager._pane_probe.pop("term", None)
+            manager._rearm.pop("term", None)
+            manager._liveness.pop("term", None)
+            manager._last_data_at.pop("term", None)
+            return "content"
+
+        manager._pane_probe["term"] = slow_probe
+        manager._rearm["term"] = lambda: None
+        manager._liveness["term"] = ("previous content", 0.0, 0)
+        manager._last_data_at["term"] = 0.0
+
+        manager._check_pipe_liveness("term")
+
+        assert "term" not in manager._liveness, "stopped terminal's state must not be resurrected"
+        assert (
+            "term" not in manager._last_data_at
+        ), "stopped terminal's state must not be resurrected"
+
+    def test_rearm_failures_capped_and_terminal_dropped(self, tmp_path, monkeypatch):
+        """A rearm() that keeps raising must not retry forever: after
+        PIPE_LIVENESS_MAX_REARM_FAILURES consecutive failures the terminal is
+        dropped from the watchdog instead of re-striking and logging a
+        WARNING/exception every cycle indefinitely."""
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_STALL_CHECKS", 1)
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_MAX_REARM_FAILURES", 3)
+
+        manager = self._manager(tmp_path, monkeypatch)
+        pane = {"content": "l0"}
+        rearm_calls: list = []
+
+        def failing_rearm():
+            rearm_calls.append(True)
+            raise RuntimeError("tmux pane gone")
+
+        manager._pane_probe["term"] = lambda: pane["content"]
+        manager._rearm["term"] = failing_rearm
+        manager._last_data_at["term"] = time.monotonic()
+
+        manager._check_pipe_liveness("term")  # baseline
+
+        for i in range(1, 4):
+            pane["content"] = f"l{i}"
+            manager._check_pipe_liveness("term")
+
+        assert len(rearm_calls) == 3, "must stop attempting after the failure cap"
+        assert "term" not in manager._pane_probe, "terminal must be dropped after repeated failures"
+        assert "term" not in manager._rearm
+        assert "term" not in manager._rearm_failures
 
     def test_create_reader_enrolls_and_starts_watchdog(self, tmp_path, monkeypatch):
         """A tmux caller passing probe+rearm enrolls the terminal and starts the

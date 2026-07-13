@@ -22,6 +22,14 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    """Read a float env var, falling back when the value is invalid."""
+    try:
+        return float(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
 # =============================================================================
 # Session Configuration
 # =============================================================================
@@ -88,19 +96,23 @@ EVENT_BUS_MAX_QUEUE_SIZE = _env_int("CAO_EVENT_BUS_MAX_QUEUE_SIZE", 16384)
 # FIFO delivered any bytes in the same window: pane advanced + FIFO silent =
 # a stalled forwarder, which it re-arms (stop_pipe_pane then pipe_pane — a bare
 # re-pipe would just toggle the already-"piped" pane OFF).
-PIPE_LIVENESS_CHECK_INTERVAL_S = float(
-    _env_int("CAO_PIPE_LIVENESS_CHECK_INTERVAL_S", 4)
-)
-# Lines of live pane content hashed to decide whether the pane advanced. A tail
-# is enough: a stall diverges the visible screen, and hashing only the tail
-# keeps each check to one cheap capture-pane call.
+PIPE_LIVENESS_CHECK_INTERVAL_S = _env_float("CAO_PIPE_LIVENESS_CHECK_INTERVAL_S", 4.0)
+# Lines of live pane content compared to decide whether the pane advanced. A
+# tail is enough: a stall diverges the visible screen, and comparing only the
+# tail keeps each check to one cheap capture-pane call.
 PIPE_LIVENESS_TAIL_LINES = _env_int("CAO_PIPE_LIVENESS_TAIL_LINES", 80)
 # Consecutive diverging checks (pane advanced, FIFO delivered nothing) before
-# re-arming. 1 = re-arm on first confirmed divergence: with a multi-second
-# window a healthy pipe always delivers within milliseconds of a pane change,
-# so "pane moved but not one byte arrived in the whole interval" is already a
-# strong stall signal. Raise it to trade recovery latency for extra caution.
-PIPE_LIVENESS_STALL_CHECKS = _env_int("CAO_PIPE_LIVENESS_STALL_CHECKS", 1)
+# re-arming. Default 2, not 1: a single diverging check can be a false
+# positive on a healthy-but-bursty pipe (a burst lands just before the check
+# boundary and the reader hasn't drained it yet) and the immediate
+# stop-then-start re-arm loses any bytes produced in that gap. Requiring two
+# consecutive diverging checks absorbs that race at the cost of one extra
+# interval of recovery latency on a genuine stall.
+PIPE_LIVENESS_STALL_CHECKS = _env_int("CAO_PIPE_LIVENESS_STALL_CHECKS", 2)
+# Consecutive re-arm *failures* (rearm() itself raising) before the watchdog
+# gives up on a terminal and drops its enrollment, instead of retrying forever
+# with a WARNING/exception log every failure.
+PIPE_LIVENESS_MAX_REARM_FAILURES = _env_int("CAO_PIPE_LIVENESS_MAX_REARM_FAILURES", 5)
 
 # pyte-rendered status detection. When enabled, the StatusMonitor feeds each
 # terminal's output through a pyte terminal emulator and runs detection against
