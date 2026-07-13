@@ -1427,8 +1427,19 @@ class TestFederatedScope:
                 )
             )
         assert "AKIAIOSFODNN7EXAMPLE" not in str(exc_tags.value)
-        assert not list(tmp_path.rglob("clean-key.md"))
-        # Secret smuggled via key (ghp_ GitHub PAT shape).
+
+        def _wiki_files():
+            # Any wiki article written under base_dir (index.md is not a topic).
+            return [p for p in tmp_path.rglob("*.md") if p.name != "index.md"]
+
+        # No topic file written for the tags rejection. Assert on the whole
+        # tree, not a specific filename: store() sanitizes the key before
+        # building the path, so a regression could write under a DIFFERENT name
+        # than the one passed in — a name-specific rglob would miss it.
+        assert _wiki_files() == []
+        # Secret smuggled via key (ghp_ GitHub PAT shape). ``key`` is sanitized
+        # before the path is built, so check that NO topic file exists at all
+        # rather than the unsanitized ``pat_key`` name.
         pat_key = "ghp_" + "A" * 36
         with pytest.raises(ValueError):
             _run(
@@ -1440,4 +1451,4 @@ class TestFederatedScope:
                     terminal_context=ctx,
                 )
             )
-        assert not list(tmp_path.rglob(f"{pat_key}.md"))
+        assert _wiki_files() == []

@@ -686,8 +686,9 @@ class MemoryService:
                 continue
             hit = scan_for_secrets(field_value)
             if hit:
-                # Do not log detector output; emit only a constant event marker.
-                logger.warning("memory_secret_rejected field=%s", field_name)
+                # ``hit`` is the matched pattern NAME (e.g. "aws_access_key"),
+                # never the offending bytes — safe to log for diagnosability.
+                logger.warning("memory_secret_rejected field=%s pattern=%s", field_name, hit)
                 raise ValueError(
                     f"memory write rejected: {field_name} matched credential pattern {hit!r}"
                 )
