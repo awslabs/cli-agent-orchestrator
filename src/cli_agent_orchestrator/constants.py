@@ -134,15 +134,12 @@ def _init_fifo_dir() -> Path:
     temp_base = Path(tempfile.gettempdir())
     user = _get_user_name()
     fifo_dir = temp_base / "cli-agent-orchestrator" / user / "fifos"
-    try:
-        if (
-            _secure_dir(temp_base / "cli-agent-orchestrator", 0o700)
-            and _secure_dir(temp_base / "cli-agent-orchestrator" / user, 0o700)
-            and _secure_dir(fifo_dir, 0o700)
-        ):
-            return fifo_dir
-    except OSError:
-        pass
+    if (
+        _secure_dir(temp_base / "cli-agent-orchestrator", 0o700)
+        and _secure_dir(temp_base / "cli-agent-orchestrator" / user, 0o700)
+        and _secure_dir(fifo_dir, 0o700)
+    ):
+        return fifo_dir
     # Fallback to CAO_HOME_DIR if temp directory is not accessible or unsafe
     # (e.g., restricted containers, read-only filesystems, hostile pre-creation).
     fallback = CAO_HOME_DIR / "fifos"

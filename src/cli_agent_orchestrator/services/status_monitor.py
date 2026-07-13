@@ -614,8 +614,10 @@ class StatusMonitor:
                         # Do not latch ERROR or UNKNOWN from a partial history snapshot.
                         # Those are typically transient (TUI still rendering, or a
                         # torn frame) and should not overwrite a valid ready status.
+                        # Return None so callers fall back to the cached status
+                        # instead of getting a transient error that aborts steps.
                         if fresh in (TerminalStatus.ERROR, TerminalStatus.UNKNOWN):
-                            return fresh
+                            return None
                         # Update the cached status so subsequent calls don't re-read history
                         self._apply_detection(terminal_id, fresh)
                         return fresh
