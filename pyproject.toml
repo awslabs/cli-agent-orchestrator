@@ -1,6 +1,6 @@
 [project]
 name = "cli-agent-orchestrator"
-version = "2.2.0"
+version = "2.3.0"
 description = "CLI Agent Orchestrator"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -108,7 +108,7 @@ profile = "black"
 line_length = 100
 
 [tool.mypy]
-python_version = "2.1.1"
+python_version = "2.3.0"
 strict = true
 warn_return_any = true
 warn_unused_configs = true
