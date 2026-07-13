@@ -6,6 +6,7 @@ ABC, no edits to memory_service/wiki_lint) and awaiting
 ``wiki_lint.run_lint`` in-request (ADR-7).
 """
 
+import asyncio
 import logging
 from typing import Any, Optional
 
@@ -24,7 +25,8 @@ class MemoryGraphProvider(GraphProvider):
     Nodes: one kind="topic" node per key in the scope's index (FR-6),
     plus one per orphan_page lint finding — orphans are by definition
     absent from the index, so without an added node the is_orphan
-    attribute (FR-8) could never land anywhere. Edges: related_keys rows
+    attribute (FR-8) could never land anywhere. graph_density findings
+    map to an existing node's is_hub attribute. Edges: related_keys rows
     (FR-7a) and contradiction lint findings; stale_claim /
     poison_frequency / lint_error findings are dropped (ADR-2). Edges
     never cross the (scope, scope_id) boundary (FR-9).
@@ -66,9 +68,7 @@ class MemoryGraphProvider(GraphProvider):
                 seen.add(entry["key"])
                 keys.append(entry["key"])
 
-        nodes: dict[str, Node] = {
-            key: Node(id=key, kind="topic", label=key, attrs={"status": "active"}) for key in keys
-        }
+        nodes: dict[str, Node] = {key: Node(id=key, kind="topic", label=key) for key in keys}
         edges: list[Edge] = []
 
         # related_keys edges (FR-7a). related_keys carries no relevance
@@ -91,9 +91,10 @@ class MemoryGraphProvider(GraphProvider):
         # Lint findings — awaited directly in-request (ADR-7); no SQL or LLM
         # calls beyond what run_lint itself performs (FR-7, C-1). A lint
         # failure degrades to a lint-free graph rather than a 500.
-        import asyncio
-
         try:
+            # project_hash arg is only used for run_lint's audit log, not for
+            # lookup — `project()` has no cwd/terminal_context to resolve the
+            # real project id (resolve_project_id), so this is a placeholder.
             issues = await wiki_lint.run_lint(scope_id or scope, scope=scope)
         except asyncio.CancelledError:
             raise
@@ -110,12 +111,7 @@ class MemoryGraphProvider(GraphProvider):
                     continue
                 node = nodes.get(issue.key)
                 if node is None:
-                    node = Node(
-                        id=issue.key,
-                        kind="topic",
-                        label=issue.key,
-                        attrs={"status": "active"},
-                    )
+                    node = Node(id=issue.key, kind="topic", label=issue.key)
                     nodes[issue.key] = node
                 node.attrs["is_orphan"] = True
             elif issue.issue_type == "graph_density":

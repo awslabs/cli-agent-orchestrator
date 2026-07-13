@@ -6,6 +6,7 @@ timing assertion for NFR-1. Fixtures use a real tmp_path wiki + SQLite
 engine (no mocking of the memory internals); the lint LLM is stubbed.
 """
 
+import asyncio
 import json
 import time
 
@@ -17,7 +18,7 @@ from cli_agent_orchestrator.clients.database import Base, MemoryMetadataModel
 from cli_agent_orchestrator.graph.models import EdgeType, GraphView
 from cli_agent_orchestrator.graph.providers import get_provider
 from cli_agent_orchestrator.graph.providers.memory import MemoryGraphProvider
-from cli_agent_orchestrator.services import wiki_lint
+from cli_agent_orchestrator.services import settings_service, wiki_lint
 from cli_agent_orchestrator.services.memory_service import MemoryService
 from cli_agent_orchestrator.services.wiki_lint import LintIssue
 
@@ -97,6 +98,9 @@ def _patch_lint_env(monkeypatch, db_engine, svc) -> None:
 
     monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=db_engine))
     monkeypatch.setattr(ms_mod, "MEMORY_BASE_DIR", svc.base_dir)
+    # Hermeticity: run_lint short-circuits on is_memory_enabled() — pin it so
+    # a CAO_MEMORY_ENABLED=0 environment can't fail these tests (N3).
+    monkeypatch.setattr(settings_service, "is_memory_enabled", lambda: True)
 
 
 def _stub_llm_contradicts(monkeypatch) -> None:
@@ -154,6 +158,19 @@ class TestMemoryProviderEdgeCases:
         provider = MemoryGraphProvider(memory_service=svc)
 
         view = await provider.project(scope="project", scope_id="nonexistent123")
+
+        assert isinstance(view, GraphView)
+        assert view.nodes == [] and view.edges == []
+
+    @pytest.mark.asyncio
+    async def test_invalid_scope_id_returns_empty_view(self, svc):
+        """get_index_path raises ValueError for a scope_id containing a path
+        separator (validate_path_component rejects it before any join); the
+        ValueError branch must degrade to an empty GraphView, not raise.
+        """
+        provider = MemoryGraphProvider(memory_service=svc)
+
+        view = await provider.project(scope="project", scope_id="../evil")
 
         assert isinstance(view, GraphView)
         assert view.nodes == [] and view.edges == []
@@ -262,3 +279,35 @@ class TestMemoryProviderEdgeCases:
 
         # Soft NFR-1 bound; loosen rather than gate CI on it if it flakes.
         assert elapsed < 2.0, f"project() took {elapsed:.2f}s (soft NFR-1 bound)"
+
+    @pytest.mark.asyncio
+    async def test_run_lint_failure_degrades_to_lint_free_graph(self, populated_scope, monkeypatch):
+        """A run_lint failure must degrade to a lint-free graph (topic nodes
+        still returned) with meta["lint_error"] set, rather than raising.
+        """
+
+        async def _raise_runtime_error(project_hash, *, scope=None, **kw):
+            raise RuntimeError("lint backend unavailable")
+
+        monkeypatch.setattr(wiki_lint, "run_lint", _raise_runtime_error)
+        provider = MemoryGraphProvider(memory_service=populated_scope)
+
+        view = await provider.project(scope="global")
+
+        assert {n.id for n in view.nodes} >= {"a", "b", "c"}
+        assert view.meta["lint_error"] == "RuntimeError"
+
+    @pytest.mark.asyncio
+    async def test_run_lint_cancelled_error_propagates(self, populated_scope, monkeypatch):
+        """asyncio.CancelledError from run_lint must propagate, not be
+        swallowed by the general lint-failure handler.
+        """
+
+        async def _raise_cancelled(project_hash, *, scope=None, **kw):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(wiki_lint, "run_lint", _raise_cancelled)
+        provider = MemoryGraphProvider(memory_service=populated_scope)
+
+        with pytest.raises(asyncio.CancelledError):
+            await provider.project(scope="global")
