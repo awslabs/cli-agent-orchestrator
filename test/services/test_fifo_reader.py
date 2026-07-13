@@ -536,3 +536,173 @@ class TestPipeLivenessWatchdog:
             assert manager._watchdog_thread is None
         finally:
             manager.stop_reader("term-plain")
+
+
+class TestConcurrencyRaces:
+    """Round-3 Copilot review on #397: two lock-scope gaps in code the round-2
+    review had already touched.
+
+    True interpreter-level race conditions (a context switch landing in the
+    exact unlucky spot) can't be forced deterministically in a unit test the
+    way the round-2 ``test_stop_during_probe_does_not_resurrect_state`` could
+    (that one worked because the injected ``probe()`` callback gave us a hook
+    to run the "concurrent" mutation synchronously, in-line, at the precise
+    moment). Neither gap here has an equivalent injection point, so these
+    tests use real threads and a synchronization barrier (for the first) and
+    a real-thread churn stress test (for the second) to raise confidence
+    rather than guarantee a repro on every run.
+    """
+
+    def test_reader_loop_last_data_at_write_is_atomic_with_stop(self, tmp_path, monkeypatch):
+        """The reader loop's ``if terminal_id in self._readers:
+        self._last_data_at[terminal_id] = time.monotonic()`` must check and
+        write under the same ``_lock`` acquisition. If the check and the write
+        are not atomic, a ``stop_reader()`` that pops both dicts between them
+        resurrects ``_last_data_at[terminal_id]`` after teardown — a slow leak
+        across create/stop churn that ``_watchdog_loop`` (which only iterates
+        ``_pane_probe``) will never revisit or clean up.
+
+        This forces the exact interleaving via a synchronization barrier
+        (blocking ``time.monotonic()`` while the reader thread holds the lock
+        for the write) instead of relying on timing luck, and additionally
+        asserts that ``stop_reader()`` is provably blocked on the held lock
+        during that window — a mechanical proof the two sections share a
+        critical section, not just a probabilistic absence of the bug.
+        """
+        monkeypatch.setattr("cli_agent_orchestrator.services.fifo_reader.FIFO_DIR", tmp_path)
+        fifo_path = tmp_path / "term-race.fifo"
+        os.mkfifo(fifo_path)
+
+        manager = FifoManager()
+        terminal_id = "term-race"
+        # Enroll by hand (no create_reader/watchdog needed for this race).
+        manager._readers[terminal_id] = threading.Event()
+        manager._last_data_at[terminal_id] = 0.0
+
+        entered_write_section = threading.Event()
+        release_write_section = threading.Event()
+        real_monotonic = time.monotonic
+
+        def blocking_monotonic():
+            entered_write_section.set()
+            release_write_section.wait(timeout=2.0)
+            return real_monotonic()
+
+        stop_flag = threading.Event()
+
+        with patch("cli_agent_orchestrator.services.fifo_reader.bus.publish"), patch(
+            "cli_agent_orchestrator.services.fifo_reader.time.monotonic",
+            side_effect=blocking_monotonic,
+        ):
+            reader = threading.Thread(
+                target=manager._reader_loop,
+                args=(terminal_id, fifo_path, stop_flag),
+                daemon=True,
+            )
+            reader.start()
+            time.sleep(0.1)  # let the reader open its fds
+
+            wfd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
+            try:
+                os.write(wfd, b"x")
+                assert entered_write_section.wait(timeout=2.0), (
+                    "reader thread never reached the _last_data_at write — "
+                    "test setup is broken, not exercising the race"
+                )
+
+                stopper = threading.Thread(target=manager.stop_reader, args=(terminal_id,))
+                stopper.start()
+                # If the check-then-write is atomic under _lock, stop_reader
+                # must block trying to acquire it (held by the reader thread,
+                # parked in blocking_monotonic) rather than racing ahead.
+                time.sleep(0.1)
+                assert stopper.is_alive(), (
+                    "stop_reader must be blocked on the lock held by the reader "
+                    "thread's check-then-write, not proceeding concurrently"
+                )
+
+                release_write_section.set()
+                stopper.join(timeout=2.0)
+            finally:
+                os.close(wfd)
+                stop_flag.set()
+                reader.join(timeout=2.0)
+
+        assert terminal_id not in manager._last_data_at, (
+            "stop_reader's pop must win the race — an atomic check-then-write "
+            "must not resurrect the entry after teardown"
+        )
+        assert terminal_id not in manager._readers
+
+    def test_watchdog_loop_survives_concurrent_enroll_unenroll_churn(self, tmp_path, monkeypatch):
+        """``_watchdog_loop`` must snapshot ``_pane_probe.keys()`` under
+        ``_lock``. Taken unlocked, concurrent create_reader()/stop_reader()
+        calls resizing the dict mid-snapshot can raise ``RuntimeError:
+        dictionary changed size during iteration`` inside the watchdog
+        thread's target — an unhandled exception there kills the thread
+        outright (it's not inside the loop's own try/except, which only
+        wraps ``_check_pipe_liveness``), permanently disabling self-healing
+        for the rest of the process's life.
+
+        Stress test: hammer real enroll/unenroll churn from several threads
+        while the real ``_watchdog_loop`` runs with a tiny check interval,
+        with the OS thread-switch interval lowered to maximize the chance of
+        an unlucky interleaving. Confirms the watchdog thread is still alive
+        immediately before being told to stop — if it had already died from
+        an unhandled exception, it would be observably not-alive at that
+        point instead of only after ``stop_watchdog()``.
+        """
+        import sys
+
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_CHECK_INTERVAL_S", 0.005)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.fifo_reader.FIFO_DIR", tmp_path
+        )
+        manager = FifoManager()
+        # Keep _check_pipe_liveness cheap and side-effect-free: this test is
+        # about the snapshot line racing churn, not probe/rearm behavior
+        # (covered by TestPipeLivenessWatchdog).
+        monkeypatch.setattr(manager, "_check_pipe_liveness", lambda terminal_id: None)
+
+        manager._watchdog_stop.clear()
+        watchdog = threading.Thread(target=manager._watchdog_loop, daemon=True)
+
+        stop_churn = threading.Event()
+
+        def churn():
+            i = 0
+            while not stop_churn.is_set():
+                tid = f"term-{i % 8}"
+                manager._pane_probe[tid] = lambda: "content"
+                manager._rearm[tid] = lambda: None
+                manager._pane_probe.pop(tid, None)
+                manager._rearm.pop(tid, None)
+                i += 1
+
+        churners = [threading.Thread(target=churn) for _ in range(6)]
+
+        original_interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-5)
+        try:
+            watchdog.start()
+            for t in churners:
+                t.start()
+
+            time.sleep(0.5)
+
+            still_alive_before_stop = watchdog.is_alive()
+
+            stop_churn.set()
+            for t in churners:
+                t.join(timeout=2.0)
+        finally:
+            sys.setswitchinterval(original_interval)
+            manager._watchdog_stop.set()
+            watchdog.join(timeout=2.0)
+
+        assert still_alive_before_stop, (
+            "watchdog thread died before being told to stop — an unlocked "
+            "dict-keys snapshot racing concurrent enroll/unenroll churn is "
+            "exactly the kind of unhandled RuntimeError that would kill it"
+        )
+        assert not watchdog.is_alive(), "watchdog thread must exit cleanly once stopped"

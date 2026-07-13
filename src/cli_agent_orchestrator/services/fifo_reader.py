@@ -275,12 +275,15 @@ class FifoManager:
                         # while this thread was mid-read, before it noticed
                         # stop_flag), writing here would resurrect a dict entry
                         # nothing will ever clean up again — a slow leak across
-                        # create/stop churn. The check is unlocked (consistent
-                        # with the watchdog loop's own lock-free dict reads
-                        # elsewhere in this class); it only needs to be right
-                        # often enough to close the common case, not atomic.
-                        if terminal_id in self._readers:
-                            self._last_data_at[terminal_id] = time.monotonic()
+                        # create/stop churn. The check-then-write must happen
+                        # under _lock as one critical section: a stop_reader()
+                        # pop between an unlocked check and the assignment
+                        # could still resurrect the entry (round-3 Copilot
+                        # review on #397). Cheap and non-blocking either way —
+                        # this is a plain dict write, not the slow tmux probe.
+                        with self._lock:
+                            if terminal_id in self._readers:
+                                self._last_data_at[terminal_id] = time.monotonic()
                         if not pending:
                             batch_start = time.monotonic()
                         pending.extend(raw)
@@ -339,7 +342,16 @@ class FifoManager:
 
     def _watchdog_loop(self) -> None:
         while not self._watchdog_stop.wait(PIPE_LIVENESS_CHECK_INTERVAL_S):
-            for terminal_id in list(self._pane_probe.keys()):
+            # Snapshot under _lock: create_reader()/stop_reader() mutate
+            # _pane_probe concurrently (enroll/unenroll), and iterating a dict
+            # while it's being resized raises RuntimeError — which would kill
+            # this thread and permanently disable the watchdog (round-3
+            # Copilot review on #397). The lock is released before calling
+            # _check_pipe_liveness(), which takes it again itself per-terminal
+            # — so no lock is held across the slow probe()/rearm() calls.
+            with self._lock:
+                terminal_ids = list(self._pane_probe.keys())
+            for terminal_id in terminal_ids:
                 try:
                     self._check_pipe_liveness(terminal_id)
                 except Exception:
