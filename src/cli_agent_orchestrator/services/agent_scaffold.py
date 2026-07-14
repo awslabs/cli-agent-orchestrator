@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from jinja2 import Environment, FileSystemLoader
+from jinja2 import Environment, FileSystemLoader, select_autoescape
 from jsonschema import Draft202012Validator
 
 # Templates live under src/cli_agent_orchestrator/templates/
@@ -121,11 +121,20 @@ def render_template(template_name: str, config: dict) -> str:
             + "\n".join(f"  - {e}" for e in errors)
         )
 
-    # Render with Jinja2 defaults. Templates use {{ config.x }} for values
-    # and bash ${VAR} passes through unchanged (not Jinja2 syntax).
+    # Templates use {{ config.x }} for values and bash ${VAR} passes through
+    # unchanged (not Jinja2 syntax). Autoescape is enabled via
+    # select_autoescape so it is never off by default (Jinja2's own default is
+    # autoescape=False, flagged by security scanners as an XSS risk). The
+    # scaffold renders markdown/bash profile files, not HTML, so escaping only
+    # engages for HTML/XML template extensions — should such a template ever be
+    # added, its output is escaped; the current .md.j2 output is byte-identical.
     env = Environment(
         loader=FileSystemLoader(str(template_dir)),
         keep_trailing_newline=True,
+        autoescape=select_autoescape(
+            enabled_extensions=("html", "htm", "xml"),
+            default_for_string=False,
+        ),
     )
     template = env.get_template("template.md.j2")
 
