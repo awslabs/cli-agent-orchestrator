@@ -178,7 +178,7 @@ Get terminal output.
 
 **Parameters:**
 - `mode` (string, optional): Output mode - "full" (default), "last", or "tail"
-  - `"full"` returns the StatusMonitor rolling buffer (most recent `STATE_BUFFER_MAX` bytes of streamed output, 32KB by default — configurable via `CAO_STATE_BUFFER_MAX`), not unbounded scrollback. Long sessions are truncated to the tail; use the on-disk terminal log for complete history.
+  - `"full"` returns the StatusMonitor rolling buffer (most recent `state_buffer_max` bytes of streamed output — server setting, 32KB by default, see `docs/configuration.md`), not unbounded scrollback. Long sessions are truncated to the tail; use the on-disk terminal log for complete history.
 
 **Response:**
 ```json

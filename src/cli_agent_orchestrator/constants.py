@@ -69,26 +69,10 @@ FIFO_DIR.mkdir(parents=True, exist_ok=True)
 # =============================================================================
 # Event-Driven State Detection Configuration
 # =============================================================================
-# Rolling buffer size for state detection and GET /terminals/{id}/output(FULL)
-# (default 32KB; override via CAO_STATE_BUFFER_MAX). Keeps the trailing N bytes
-# of raw terminal output.
-#
-# The old fixed 8192 was measured too small against the pyte screen geometry
-# this buffer has to outlive: a single full-screen repaint of the 220x50
-# viewport (PYTE_SCREEN_COLS x PYTE_SCREEN_ROWS) already needs ~11,000 visible
-# characters, and cursor-addressed redraws add per-line/per-cell ANSI escapes
-# on top of that -- so one repaint alone can exceed 8KB of raw bytes. A long,
-# chatty session with several such repaints (status-bar refreshes, spinner
-# frames, full menu redraws) could evict a still-pending prompt from the
-# buffer entirely before the operator or CAO's own raw-buffer status checks
-# ever saw it (harness-control awslabs/cli-agent-orchestrator#115). 32KB
-# covers several trailing repaints instead of a fraction of one, without
-# reverting to unbounded scrollback -- this is still a deliberately bounded
-# trade-off, not a fix for arbitrarily long gaps between output and a pending
-# prompt. Kept configurable (rather than a further blind bump) since the
-# "safe" size depends on how chatty a given provider's TUI redraws are; there
-# is no single right number upstream.
-STATE_BUFFER_MAX = _env_int("CAO_STATE_BUFFER_MAX", 32768)
+# The rolling per-terminal raw-output buffer StatusMonitor keeps for raw-path
+# status detection and GET /terminals/{id}/output (mode=full) is a server
+# tuning value, not a fixed constant -- see settings_service.py's
+# ``_SERVER_DEFAULTS["state_buffer_max"]`` / ``get_server_settings()``.
 
 # Max events buffered per subscriber queue before dropping. Claude's TUI startup
 # can emit thousands of small chunks in a short burst, so keep this comfortably

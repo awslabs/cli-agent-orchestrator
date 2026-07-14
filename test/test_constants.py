@@ -311,38 +311,6 @@ class TestEventBusConstants:
         assert mod.EVENT_BUS_MAX_QUEUE_SIZE == 16384
 
 
-class TestStateBufferMaxConstant:
-    """Tests for the rolling state-detection buffer size (issue #115)."""
-
-    def _reload_constants(self, env_overrides):
-        import importlib
-        import os
-
-        env_copy = os.environ.copy()
-        env_copy.pop("CAO_STATE_BUFFER_MAX", None)
-        env_copy.update(env_overrides)
-        with patch.dict("os.environ", env_copy, clear=True):
-            import cli_agent_orchestrator.constants as constants_module
-
-            importlib.reload(constants_module)
-            return constants_module
-
-    def test_state_buffer_max_defaults_to_32768(self):
-        mod = self._reload_constants({})
-
-        assert mod.STATE_BUFFER_MAX == 32768
-
-    def test_state_buffer_max_honors_env_override(self):
-        mod = self._reload_constants({"CAO_STATE_BUFFER_MAX": "65536"})
-
-        assert mod.STATE_BUFFER_MAX == 65536
-
-    def test_state_buffer_max_falls_back_when_env_is_non_numeric(self):
-        mod = self._reload_constants({"CAO_STATE_BUFFER_MAX": "not-a-number"})
-
-        assert mod.STATE_BUFFER_MAX == 32768
-
-
 class TestOpenCodeConstants:
     """Tests for OpenCode provider path constants."""
 

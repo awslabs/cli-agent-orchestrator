@@ -509,7 +509,8 @@ class KimiCliProvider(BaseProvider):
           IS still visible in the capture, and persists through completion
 
         Args:
-            output: Terminal output buffer (up to ~8KB rolling buffer)
+            output: Terminal output buffer (rolling buffer, up to
+                ``state_buffer_max`` bytes -- server setting, 32KB default)
 
         Returns:
             TerminalStatus indicating current state

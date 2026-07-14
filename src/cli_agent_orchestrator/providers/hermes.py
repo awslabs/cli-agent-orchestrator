@@ -198,8 +198,9 @@ class HermesProvider(BaseProvider):
         """Get Hermes status by analyzing the terminal output buffer.
 
         Args:
-            output: Terminal output buffer (up to ~8KB rolling buffer) supplied
-                by the StatusMonitor via the FIFO reader pipeline.
+            output: Terminal output buffer (rolling buffer, up to
+                ``state_buffer_max`` bytes -- server setting, 32KB default)
+                supplied by the StatusMonitor via the FIFO reader pipeline.
         """
         # Native status (herdr): trust the backend's agent state when available.
         # Must precede the empty-buffer -> ERROR default below: on herdr the
