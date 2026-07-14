@@ -442,6 +442,18 @@ class FifoManager:
             # hash: a hash collision would make this False and mask a real
             # stall (negligible probability, but the string is just as
             # cheap to compare and collision-free).
+            #
+            # Tradeoff (round-3 review, call-me-ram): pinning the baseline
+            # means ANY one-shot pane divergence seen while the FIFO happens
+            # to be silent — not just a genuine stall — now accumulates
+            # strikes toward a re-arm, where the old previous-check
+            # comparison would have reset on the very next unchanging check.
+            # E.g. an attached client resizing the pane, causing tmux to
+            # rewrap the captured tail once, then nothing further changing.
+            # The cost of a false-positive re-arm here is mild (a
+            # stop/start on an otherwise-idle pipe plus one snapshot
+            # replay), and it's the unavoidable price of catching a stall
+            # that settles into a new static frame — accepted deliberately.
             diverged_from_baseline = content != baseline_content
 
             if diverged_from_baseline:

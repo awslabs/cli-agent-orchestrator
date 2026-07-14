@@ -643,9 +643,12 @@ class TestConcurrencyRaces:
 
         stop_flag = threading.Event()
 
-        with patch("cli_agent_orchestrator.services.fifo_reader.bus.publish"), patch(
-            "cli_agent_orchestrator.services.fifo_reader.time.monotonic",
-            side_effect=blocking_monotonic,
+        with (
+            patch("cli_agent_orchestrator.services.fifo_reader.bus.publish"),
+            patch(
+                "cli_agent_orchestrator.services.fifo_reader.time.monotonic",
+                side_effect=blocking_monotonic,
+            ),
         ):
             reader = threading.Thread(
                 target=manager._reader_loop,
@@ -708,9 +711,7 @@ class TestConcurrencyRaces:
         import sys
 
         monkeypatch.setattr(fr, "PIPE_LIVENESS_CHECK_INTERVAL_S", 0.005)
-        monkeypatch.setattr(
-            "cli_agent_orchestrator.services.fifo_reader.FIFO_DIR", tmp_path
-        )
+        monkeypatch.setattr("cli_agent_orchestrator.services.fifo_reader.FIFO_DIR", tmp_path)
         manager = FifoManager()
         # Keep _check_pipe_liveness cheap and side-effect-free: this test is
         # about the snapshot line racing churn, not probe/rearm behavior
