@@ -246,10 +246,15 @@ async def run_agent_step(
         ready_timeout: Max seconds to wait for a freshly created terminal to be
             ready to accept input.
         working_directory: Optional working directory for a freshly created
-            terminal (ignored when reusing a terminal).
+            terminal (ignored when reusing a terminal). When None and
+            ``caller_id`` is set, the worker inherits the caller's pane CWD
+            via ``get_working_directory()`` (best-effort; falls back to the
+            server default on failure).
         caller_id: Terminal ID of the supervisor creating this terminal, recorded
-            so send_message can route callbacks structurally (issue #284). None
-            for operator-launched / engine steps with no supervisor.
+            so ``send_message`` can route callbacks structurally (issue #284).
+            Also used to inherit the working directory when
+            ``working_directory`` is None (best-effort). None for
+            operator-launched / engine steps with no supervisor.
         allowed_tools: Resolved allowed-tools list for the freshly created
             terminal (handoff inheritance). None lets ``create_terminal`` derive
             them from the agent profile.
@@ -300,6 +305,35 @@ async def run_agent_step(
     terminal_id = reuse_terminal_id
 
     if created_here:
+        # Inherit working directory from supervisor when not explicitly set.
+        # Without this, a handoff worker starts in the cao-server process CWD
+        # instead of the supervisor's project directory. Best-effort: if
+        # resolution fails, fall back to the server default.
+        #
+        # caller_id is not authenticated/authorized (arrives via HTTP body);
+        # this is consistent with its existing use for callback routing (#284).
+        # The resolved path still passes _resolve_and_validate_working_directory
+        # so risk is confined to inheriting a real existing pane's CWD in a
+        # single-user trust model.
+        if working_directory is None and caller_id is not None:
+            try:
+                resolved = await asyncio.to_thread(
+                    terminal_service.get_working_directory, caller_id
+                )
+                if resolved:
+                    working_directory = resolved
+            except asyncio.CancelledError:
+                raise
+            except (
+                Exception
+            ) as exc:  # noqa: BLE001 — CWD inheritance is best-effort; step must not fail on it
+                logger.warning(
+                    "run_agent_step: failed to resolve working directory from "
+                    "caller %r, falling back to server default: %r",
+                    caller_id,
+                    exc,
+                )
+
         # When no session_name is supplied we must CREATE a fresh tmux session
         # (new_session=True): create_terminal auto-names it. Leaving the default
         # new_session=False here would auto-generate a name and then immediately
