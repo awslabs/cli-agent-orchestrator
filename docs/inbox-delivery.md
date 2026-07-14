@@ -2,7 +2,7 @@
 
 ## Overview
 
-When an agent calls `send_message(terminal_id, message)`, the message is queued in the database and delivered to the target terminal's input area via bracketed paste. Delivery has two paths:
+When an agent calls `send_message(terminal_id, message)`, the message is queued in the database and delivered to the target terminal's input area via `tmux paste-buffer -p`. tmux wraps the paste in bracketed-paste markers when the receiving TUI has enabled bracketed paste mode (DECSET 2004); TUIs that never enable it receive the raw text without markers, and multi-line content then submits per line (standard tmux paste semantics). CAO never injects the `ESC [200~` markers itself: tmux >= 3.7 sanitizes raw escape bytes in pasted buffers, so hand-crafted markers would render as literal `^[[200~` in the receiving TUI (issue #413). Delivery has two paths:
 
 1. **Immediate**: the API endpoint attempts delivery right after persisting the message
 2. **Watchdog**: a `PollingObserver` (5s interval) monitors terminal log files for changes and attempts delivery when idle patterns are detected

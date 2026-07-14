@@ -147,6 +147,65 @@ class TestSendKeys:
         assert len(load_call[1]["input"]) == 50000
 
 
+class TestSendKeysNoHandCraftedMarkers:
+    """Regression tests for issue #413.
+
+    tmux >= 3.7 sanitizes pasted buffer content through vis(3), turning raw
+    ESC (0x1b) bytes into the literal characters "^[". send_keys must never
+    hand-craft \\x1b[200~/\\x1b[201~ markers in the buffer; it must let tmux
+    emit them conditionally via paste-buffer -p. -r (raw, used by the old
+    force_bracketed_paste path) and -S (would bypass the vis(3) hardening)
+    are both forbidden.
+    """
+
+    def test_buffer_content_has_no_escape_bytes(self, client, mock_subprocess, mock_uuid):
+        """Loaded buffer contains only raw message bytes — no ESC, no markers."""
+        client.send_keys("sess", "win", "hello world", force_bracketed_paste=True)
+
+        load_call = mock_subprocess.run.call_args_list[0]
+        buf_content = load_call[1]["input"]
+        assert b"\x1b" not in buf_content
+        assert b"[200~" not in buf_content
+        assert b"[201~" not in buf_content
+        assert buf_content == b"hello world"
+
+    def test_paste_uses_p_flag_not_r_or_S(self, client, mock_subprocess, mock_uuid):
+        """paste-buffer is invoked with -p and never -r or -S."""
+        client.send_keys("sess", "win", "hello", force_bracketed_paste=True)
+
+        paste_call = mock_subprocess.run.call_args_list[1]
+        paste_argv = paste_call[0][0]
+        assert paste_argv[:2] == ["tmux", "paste-buffer"]
+        assert "-p" in paste_argv
+        assert "-r" not in paste_argv
+        assert "-S" not in paste_argv
+
+    def test_force_bracketed_paste_multiline_content_unmodified(
+        self, client, mock_subprocess, mock_uuid
+    ):
+        """Multi-line message delivery loads the content byte-for-byte."""
+        msg = "line 1\nline 2\n\nline 4 with \x03 control char"
+        client.send_keys("sess", "win", msg, force_bracketed_paste=True)
+
+        load_call = mock_subprocess.run.call_args_list[0]
+        assert load_call == call(
+            ["tmux", "load-buffer", "-b", "cao_abcd1234", "-"],
+            input=msg.encode(),
+            check=True,
+        )
+
+    def test_force_flag_delivery_identical_to_default(self, client, mock_subprocess, mock_uuid):
+        """force_bracketed_paste no longer alters the tmux command sequence."""
+        client.send_keys("sess", "win", "same message", force_bracketed_paste=True)
+        forced_calls = list(mock_subprocess.run.call_args_list)
+        mock_subprocess.run.reset_mock()
+
+        client.send_keys("sess", "win", "same message", force_bracketed_paste=False)
+        default_calls = list(mock_subprocess.run.call_args_list)
+
+        assert forced_calls == default_calls
+
+
 class TestSendKeysLogRedaction:
     """send_keys must not log payload content at INFO — launch commands carry
     MCP env values (API tokens) and full system prompts. Content is DEBUG-only."""

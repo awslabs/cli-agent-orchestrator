@@ -155,7 +155,13 @@ class TerminalBackend(ABC):
             window_name: Target window
             keys: Text to send
             enter_count: Number of Enter keys to send after the text
-            force_bracketed_paste: If True, wrap in bracketed paste sequences
+            force_bracketed_paste: If True, request bracketed-paste delivery.
+                The herdr backend wraps content in \\x1b[200~...\\x1b[201~
+                itself (it writes raw bytes to the pty). The tmux backend
+                ignores the flag and always pastes with ``paste-buffer -p``,
+                which emits markers only when the pane enabled DECSET 2004 —
+                tmux >= 3.7 sanitizes raw ESC bytes in pasted buffers, so
+                hand-crafted markers arrive as literal "^[[200~" (issue #413).
             submit_delay: Seconds to wait after pasting before sending Enter, so
                 a TUI (e.g. Claude Code's Ink renderer) finishes processing the
                 paste before submission. Backends without a paste step may ignore.

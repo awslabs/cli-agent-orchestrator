@@ -256,8 +256,9 @@ class TmuxClient:
 
         Uses load-buffer + paste-buffer instead of chunked send-keys to avoid
         slow character-by-character input and special character interpretation.
-        The -p flag enables bracketed paste mode so multi-line content is treated
-        as a single input rather than submitting on each newline.
+        The -p flag makes tmux emit bracketed paste markers whenever the pane
+        has enabled bracketed paste mode (DECSET 2004), so multi-line content
+        is treated as a single input rather than submitting on each newline.
 
         Args:
             session_name: Name of tmux session
@@ -266,12 +267,24 @@ class TmuxClient:
             enter_count: Number of Enter keys to send after pasting (default 1).
                 Some TUIs enter multi-line mode after bracketed paste,
                 requiring 2 Enters to submit.
-            force_bracketed_paste: If True, unconditionally wrap content in
-                bracketed paste sequences (\x1b[200~...\x1b[201~) instead of
-                relying on paste-buffer -p. Use for message delivery to TUIs.
-                Do NOT use for shell commands sent to bash during initialization
-                (bash 4.x does not support bracketed paste and will inject the
-                escape sequences literally into the command line).
+            force_bracketed_paste: Accepted for TerminalBackend interface
+                parity; no longer alters the tmux delivery path (the herdr
+                backend still honors it). Historically True wrapped the buffer
+                in hand-crafted \x1b[200~...\x1b[201~ markers and pasted with
+                -r, but tmux >= 3.7 sanitizes pasted buffer content through
+                vis(3) (hardening against bracket-end injection), turning each
+                raw ESC into the literal two characters "^[" — every delivered
+                message then rendered with visible "^[[200~"/"^[[201~" garbage
+                in the receiving TUI (issue #413). paste-buffer -p emits
+                genuine 0x1b markers, conditionally on the pane's DECSET 2004
+                state, on all supported tmux versions. Panes that never
+                enabled 2004 (e.g. bash during initialization, or TUIs that
+                don't request it) receive the raw text with no markers and
+                multi-line content submits per-line — pre-existing tmux paste
+                semantics. -S is deliberately NOT used: it bypasses the vis(3)
+                sanitization and would reopen the injection surface tmux 3.7
+                closed (worker-authored message bytes could smuggle control
+                sequences into a receiving TUI).
         """
         # Defence-in-depth: re-validate at the sink even though callers
         # validate at the API/MCP boundary. Both halves flow into a
@@ -292,23 +305,20 @@ class TmuxClient:
             # available here at DEBUG for local delivery troubleshooting.
             logger.info(f"send_keys: {target} - keys length: {len(keys)}")
             logger.debug(f"send_keys: {target} - keys: {keys}")
-            if force_bracketed_paste:
-                # Wrap unconditionally and use -r (no newline→CR conversion).
-                # paste-buffer -p only adds bracketed sequences if tmux tracks
-                # ?2004h for the pane — some TUIs (e.g. current Kiro) don't
-                # send ?2004h so -p is a no-op and \n becomes CR (Enter).
-                buf_content = b"\x1b[200~" + keys.encode() + b"\x1b[201~"
-                paste_flag = "-r"
-            else:
-                buf_content = keys.encode()
-                paste_flag = "-p"
+            # The buffer holds ONLY the raw message bytes — never hand-crafted
+            # \x1b[200~/\x1b[201~ markers. tmux >= 3.7 runs pasted buffer
+            # content through vis(3) sanitization, so raw ESC bytes in the
+            # buffer arrive as the literal characters "^[" (issue #413).
+            # paste-buffer -p makes tmux itself emit genuine markers when the
+            # pane has bracketed paste (DECSET 2004) enabled.
+            buf_content = keys.encode()
             subprocess.run(
                 ["tmux", "load-buffer", "-b", buf_name, "-"],
                 input=buf_content,
                 check=True,
             )
             subprocess.run(
-                ["tmux", "paste-buffer", paste_flag, "-b", buf_name, "-t", target],
+                ["tmux", "paste-buffer", "-p", "-b", buf_name, "-t", target],
                 check=True,
             )
             # Delay to let the TUI process the bracketed paste end sequence before
