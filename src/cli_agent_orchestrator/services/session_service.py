@@ -20,7 +20,7 @@ Session Lifecycle:
 """
 
 import logging
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import list_terminals_by_session
@@ -47,12 +47,19 @@ async def create_session(
     allowed_tools: list[str] | None = None,
     registry: PluginRegistry | None = None,
     env_vars: dict[str, str] | None = None,
+    group: Optional[List[str]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> Terminal:
     """Create a new session by creating its initial terminal.
 
     ``env_vars`` are operator-forwarded env vars from ``cao launch --env``.
     They are persisted on the session record so every worker spawned later
     in the same session inherits them. See issue #248.
+
+    ``group``/``metadata`` are the #432 discovery fields, set on the initial
+    terminal at creation time (``group`` is also updatable later via
+    ``PATCH /terminals/{id}/group``, ``metadata`` via the ``update_metadata``
+    MCP tool).
     """
     if provider is None:
         resolved_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
@@ -68,6 +75,8 @@ async def create_session(
         allowed_tools=allowed_tools,
         registry=registry,
         env_vars=env_vars,
+        group=group,
+        metadata=metadata,
     )
     dispatch_plugin_event(
         registry,

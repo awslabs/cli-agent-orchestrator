@@ -1253,6 +1253,114 @@ def delete_terminal(
         return {"success": False, "message": f"Failed to delete terminal: {str(e)}"}
 
 
+def _own_terminal_id_or_error(action: str) -> Union[str, Dict[str, Any]]:
+    """Resolve this MCP process's own terminal id, or an error dict.
+
+    The identity comes from this process's own environment — set by CAO when
+    the terminal was spawned, never a client-supplied argument the calling
+    model could set — the same trust mechanism ``send_message``/``handoff``
+    already rely on (#432).
+    """
+    own_terminal_id = os.environ.get("CAO_TERMINAL_ID")
+    if not own_terminal_id:
+        return {
+            "success": False,
+            "error": f"CAO_TERMINAL_ID not set - cannot {action} (must run within a CAO terminal)",
+        }
+    return own_terminal_id
+
+
+def _list_siblings_impl(depth: Optional[int]) -> Dict[str, Any]:
+    """Implementation of list_siblings logic."""
+    own_terminal_id = _own_terminal_id_or_error("list siblings")
+    if isinstance(own_terminal_id, dict):
+        return own_terminal_id
+
+    try:
+        params: Dict[str, Any] = {}
+        if depth is not None:
+            params["depth"] = depth
+        response = requests.get(
+            f"{API_BASE_URL}/terminals/{own_terminal_id}/siblings",
+            params=params,
+            timeout=_mcp_timeout(),
+        )
+        response.raise_for_status()
+        return {"success": True, "siblings": response.json()}
+    except requests.HTTPError as e:
+        detail = _extract_error_detail(e.response, str(e)) if e.response is not None else str(e)
+        return {"success": False, "error": f"Failed to list siblings: {detail}"}
+    except Exception as e:
+        return {"success": False, "error": f"Failed to list siblings: {str(e)}"}
+
+
+def _update_metadata_impl(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """Implementation of update_metadata logic."""
+    own_terminal_id = _own_terminal_id_or_error("update metadata")
+    if isinstance(own_terminal_id, dict):
+        return own_terminal_id
+
+    try:
+        response = requests.patch(
+            f"{API_BASE_URL}/terminals/{own_terminal_id}/metadata",
+            json={"metadata": metadata},
+            timeout=_mcp_timeout(),
+        )
+        response.raise_for_status()
+        return {"success": True, "metadata": response.json().get("metadata")}
+    except requests.HTTPError as e:
+        detail = _extract_error_detail(e.response, str(e)) if e.response is not None else str(e)
+        return {"success": False, "error": f"Failed to update metadata: {detail}"}
+    except Exception as e:
+        return {"success": False, "error": f"Failed to update metadata: {str(e)}"}
+
+
+@mcp.tool()
+async def list_siblings(
+    depth: Optional[int] = Field(
+        default=None,
+        description=(
+            "How many leading elements of THIS terminal's own group to match "
+            "against. Omit for the widest scope you're allowed to see (your "
+            "full own group). The server clamps this to your own group's "
+            "length — you can never see a wider scope than your own group — "
+            "and rejects 0 outright rather than treating it as an unscoped, "
+            "all-terminals query."
+        ),
+    ),
+) -> Dict[str, Any]:
+    """Discover sibling terminals sharing a leading prefix of your own group.
+
+    Resolves your identity from your own CAO_TERMINAL_ID (never a value you
+    pass in) and looks up your own persisted `group`. Returns the id, group,
+    and metadata of every OTHER terminal whose group shares the resolved
+    prefix. If you have no group set, you have no siblings — this is not an
+    error.
+
+    Use this to find other agents working in the same project/folder/tenant,
+    then message them with send_message using the returned id.
+    """
+    return _list_siblings_impl(depth)
+
+
+@mcp.tool()
+async def update_metadata(
+    metadata: Dict[str, Any] = Field(
+        description=(
+            "Free-form JSON describing what this terminal is doing right "
+            "now. Replaces any existing metadata entirely (not merged). "
+            "Visible to sibling terminals via list_siblings."
+        )
+    ),
+) -> Dict[str, Any]:
+    """Update your own terminal's metadata, visible to siblings via list_siblings.
+
+    Use this so other agents in your group can see a short description of
+    what you're currently working on without messaging you directly.
+    """
+    return _update_metadata_impl(metadata)
+
+
 # =============================================================================
 # Memory Tools
 # =============================================================================

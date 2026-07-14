@@ -41,6 +41,16 @@ class TerminalModel(Base):
     allowed_tools = Column(String, nullable=True)  # JSON-encoded list of CAO tool names
     shell_command = Column(String, nullable=True)  # shell process name captured before kiro launch
     caller_id = Column(String, nullable=True)  # terminal that created this one (callback target)
+    # Ordered, general-to-specific array of strings (JSON-encoded), e.g.
+    # '["tenant_1", "project_5", "folder_12"]'. CAO only does ordered-prefix
+    # matching (list_siblings); consumers own what the levels mean (#432).
+    group = Column(Text, nullable=True)
+    # Free-form JSON (JSON-encoded dict), consumer-defined, no fixed schema.
+    # Python attribute is ``metadata_json`` (not ``metadata``) because
+    # SQLAlchemy's declarative Base reserves ``.metadata`` for the schema
+    # MetaData object on every mapped class; the DB column itself is still
+    # literally named "metadata" per #432's design.
+    metadata_json = Column("metadata", Text, nullable=True)
     last_active = Column(DateTime, default=datetime.now)
 
 
@@ -493,6 +503,16 @@ def _migrate_terminals_schema() -> None:
             conn.execute("ALTER TABLE terminals ADD COLUMN caller_id TEXT")
             conn.commit()
             logger.info("Migration: added caller_id column to terminals table")
+        if "group" not in columns:
+            # "group" is a SQL reserved word in some dialects but not SQLite;
+            # quoted defensively so this ALTER survives if that ever changes.
+            conn.execute('ALTER TABLE terminals ADD COLUMN "group" TEXT')
+            conn.commit()
+            logger.info("Migration: added group column to terminals table")
+        if "metadata" not in columns:
+            conn.execute('ALTER TABLE terminals ADD COLUMN "metadata" TEXT')
+            conn.commit()
+            logger.info("Migration: added metadata column to terminals table")
         conn.close()
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
@@ -507,6 +527,8 @@ def create_terminal(
     allowed_tools: Optional[List[str]] = None,
     shell_command: Optional[str] = None,
     caller_id: Optional[str] = None,
+    group: Optional[List[str]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record."""
     import json as _json
@@ -521,6 +543,8 @@ def create_terminal(
             allowed_tools=_json.dumps(allowed_tools) if allowed_tools else None,
             shell_command=shell_command,
             caller_id=caller_id,
+            group=_json.dumps(group) if group else None,
+            metadata_json=_json.dumps(metadata) if metadata else None,
         )
         db.add(terminal)
         db.commit()
@@ -533,6 +557,8 @@ def create_terminal(
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
+            "group": group,
+            "metadata": metadata,
         }
 
 
@@ -549,6 +575,8 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             f"Retrieved terminal metadata for {terminal_id}: provider={terminal.provider}, session={terminal.tmux_session}"
         )
         allowed_tools = _json.loads(terminal.allowed_tools) if terminal.allowed_tools else None
+        group = _json.loads(terminal.group) if terminal.group else None
+        metadata = _json.loads(terminal.metadata_json) if terminal.metadata_json else None
         return {
             "id": terminal.id,
             "tmux_session": terminal.tmux_session,
@@ -558,8 +586,82 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
+            "group": group,
+            "metadata": metadata,
             "last_active": terminal.last_active,
         }
+
+
+def update_terminal_group(terminal_id: str, group: Optional[List[str]]) -> bool:
+    """Replace a terminal's group array. ``None``/``[]`` clears it (opts out of discovery)."""
+    import json as _json
+
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if not terminal:
+            return False
+        terminal.group = _json.dumps(group) if group else None
+        db.commit()
+        return True
+
+
+def update_terminal_metadata(terminal_id: str, metadata: Optional[Dict[str, Any]]) -> bool:
+    """Replace a terminal's free-form metadata dict. ``None``/``{}`` clears it."""
+    import json as _json
+
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if not terminal:
+            return False
+        terminal.metadata_json = _json.dumps(metadata) if metadata else None
+        db.commit()
+        return True
+
+
+def get_terminal_group(terminal_id: str) -> Optional[List[str]]:
+    """Return a terminal's own group array, or None if unset or the terminal doesn't exist."""
+    import json as _json
+
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if not terminal or not terminal.group:
+            return None
+        return cast(List[str], _json.loads(terminal.group))
+
+
+def list_siblings_by_group_prefix(caller_id: str, prefix: List[str]) -> List[Dict[str, Any]]:
+    """Return ``{id, group, metadata}`` for every OTHER terminal sharing ``prefix``.
+
+    ``prefix`` is the caller's own group truncated to the (already-clamped)
+    depth — this function does no clamping itself, it only matches. A
+    candidate terminal with no group, or a group shorter than ``len(prefix)``,
+    is excluded rather than compared partially or raising (#432).
+    """
+    import json as _json
+
+    depth = len(prefix)
+    with SessionLocal() as db:
+        rows = (
+            db.query(TerminalModel)
+            .filter(TerminalModel.id != caller_id, TerminalModel.group.isnot(None))
+            .all()
+        )
+        siblings = []
+        for row in rows:
+            sibling_group = _json.loads(row.group)
+            if len(sibling_group) < depth:
+                continue
+            if sibling_group[:depth] == prefix:
+                siblings.append(
+                    {
+                        "id": row.id,
+                        "group": sibling_group,
+                        "metadata": (
+                            _json.loads(row.metadata_json) if row.metadata_json else None
+                        ),
+                    }
+                )
+        return siblings
 
 
 def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
