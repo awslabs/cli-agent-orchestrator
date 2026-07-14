@@ -67,12 +67,12 @@ class TestClaudeCodeIdleGap:
         """
         mock_time.sleep = MagicMock()
         mock_time.monotonic.side_effect = [
-            0.0,    # outer_deadline = 60
-            0.0,    # last_prompt_time = 0
-            18.0,   # iter1 now: gap=18<20, bypass prompt → handled
-            18.0,   # last_prompt_time reset to 18
+            0.0,  # outer_deadline = 60
+            0.0,  # last_prompt_time = 0
+            18.0,  # iter1 now: gap=18<20, bypass prompt → handled
+            18.0,  # last_prompt_time reset to 18
             # continues past the old 20s total window...
-            35.0,   # iter2 now: gap=35-18=17<20, trust prompt → handled → return
+            35.0,  # iter2 now: gap=35-18=17<20, trust prompt → handled → return
         ]
         mock_backend.get_history.side_effect = [
             "WARNING: Bypass\n1. No\n2. Yes, I accept\n",
@@ -85,7 +85,7 @@ class TestClaudeCodeIdleGap:
         # Bypass at t=18 (Down + Enter) and the late trust prompt at t=35 (Enter)
         # are both handled — proving the idle-gap reset kept the loop polling past
         # the old 20s window. Under old logic send_special_key would fire once.
-        assert mock_backend.send_keys.call_count == 1         # bypass Down arrow
+        assert mock_backend.send_keys.call_count == 1  # bypass Down arrow
         assert mock_backend.send_special_key.call_count == 2  # bypass Enter + trust Enter
 
     @patch("cli_agent_orchestrator.providers.claude_code.get_server_settings", _settings)
@@ -95,9 +95,9 @@ class TestClaudeCodeIdleGap:
         """No prompt ever appears — loop exits after idle_gap seconds."""
         mock_time.sleep = MagicMock()
         mock_time.monotonic.side_effect = [
-            0.0,   # outer_deadline = 60
-            0.0,   # last_prompt_time = 0
-            5.0,   # iter1 now: gap=5<20, not past deadline
+            0.0,  # outer_deadline = 60
+            0.0,  # last_prompt_time = 0
+            5.0,  # iter1 now: gap=5<20, not past deadline
             # output: "Loading..." → no prompt match, sleep
             25.0,  # iter2 now: gap=25>=20 → return (idle gap elapsed)
         ]
@@ -123,13 +123,13 @@ class TestClaudeCodeIdleGap:
         """
         mock_time.sleep = MagicMock()
         mock_time.monotonic.side_effect = [
-            0.0,    # outer_deadline = 60
-            0.0,    # last_prompt_time = 0
-            10.0,   # iter1: bypass prompt found, handled
-            10.0,   # last_prompt_time reset after bypass
+            0.0,  # outer_deadline = 60
+            0.0,  # last_prompt_time = 0
+            10.0,  # iter1: bypass prompt found, handled
+            10.0,  # last_prompt_time reset after bypass
             # continues loop (gap=20<100, so idle gap never fires)...
-            30.0,   # iter2: bypass_accepted=True, no trust, no welcome; sleep
-            61.0,   # iter3 now >= 60 outer_deadline → return (outer cap)
+            30.0,  # iter2: bypass_accepted=True, no trust, no welcome; sleep
+            61.0,  # iter3 now >= 60 outer_deadline → return (outer cap)
         ]
         # Output always has bypass prompt (handled once, then ignored)
         mock_backend.get_history.return_value = (
@@ -150,12 +150,12 @@ class TestClaudeCodeIdleGap:
         """Multiple prompts in sequence — bypass then trust, both handled."""
         mock_time.sleep = MagicMock()
         mock_time.monotonic.side_effect = [
-            0.0,   # outer_deadline = 60
-            0.0,   # last_prompt_time = 0
-            3.0,   # iter1: gap=3<20, bypass prompt → handled
-            3.0,   # last_prompt_time reset
+            0.0,  # outer_deadline = 60
+            0.0,  # last_prompt_time = 0
+            3.0,  # iter1: gap=3<20, bypass prompt → handled
+            3.0,  # last_prompt_time reset
             # loop continues
-            8.0,   # iter2: gap=8-3=5<20, trust prompt → handled → return
+            8.0,  # iter2: gap=8-3=5<20, trust prompt → handled → return
         ]
         mock_backend.get_history.side_effect = [
             "WARNING: Bypass\n1. No\n2. Yes, I accept\n",
@@ -180,10 +180,10 @@ class TestClaudeCodeIdleGap:
         # Second prompt at t=22: gap=22-5=17<20, so still polled and handled.
         # Without reset, gap would be 22-0=22>=20 → would have exited.
         mock_time.monotonic.side_effect = [
-            0.0,   # outer_deadline = 60
-            0.0,   # last_prompt_time = 0
-            5.0,   # iter1: gap=5<20, bypass prompt → handled
-            5.0,   # last_prompt_time reset to 5
+            0.0,  # outer_deadline = 60
+            0.0,  # last_prompt_time = 0
+            5.0,  # iter1: gap=5<20, bypass prompt → handled
+            5.0,  # last_prompt_time reset to 5
             # continues
             22.0,  # iter2: gap=22-5=17<20, trust prompt → handled → return
         ]
@@ -196,7 +196,7 @@ class TestClaudeCodeIdleGap:
         p._handle_startup_prompts()
 
         # Both prompts handled
-        assert mock_backend.send_keys.call_count == 1      # bypass Down arrow
+        assert mock_backend.send_keys.call_count == 1  # bypass Down arrow
         assert mock_backend.send_special_key.call_count == 2  # bypass Enter + trust Enter
 
 
@@ -226,8 +226,8 @@ class TestKimiCliIdleGap:
         mock_backend = MagicMock()
         mock_get_backend.return_value = mock_backend
         mock_time.monotonic.side_effect = [
-            0.0,   # outer_deadline = 60
-            0.0,   # last_prompt_time = 0
+            0.0,  # outer_deadline = 60
+            0.0,  # last_prompt_time = 0
             18.0,  # iter1: gap=18<20, upgrade prompt → handled
             18.0,  # last_prompt_time reset to 18
             # continues past the old 20s total window...
@@ -256,9 +256,9 @@ class TestKimiCliIdleGap:
         mock_backend = MagicMock()
         mock_get_backend.return_value = mock_backend
         mock_time.monotonic.side_effect = [
-            0.0,   # outer_deadline = 60
-            0.0,   # last_prompt_time = 0
-            5.0,   # iter1: gap=5<20, output has no prompt, not ready → sleep
+            0.0,  # outer_deadline = 60
+            0.0,  # last_prompt_time = 0
+            5.0,  # iter1: gap=5<20, output has no prompt, not ready → sleep
             25.0,  # iter2: gap=25>=20 → return
         ]
         mock_backend.get_history.return_value = "Starting kimi..."
@@ -284,8 +284,8 @@ class TestKimiCliIdleGap:
         mock_backend = MagicMock()
         mock_get_backend.return_value = mock_backend
         mock_time.monotonic.side_effect = [
-            0.0,   # outer_deadline = 60
-            0.0,   # last_prompt_time = 0
+            0.0,  # outer_deadline = 60
+            0.0,  # last_prompt_time = 0
             10.0,  # iter1: upgrade prompt → handled
             10.0,  # last_prompt_time reset
             # continues (gap=15<100, so idle gap never fires)...
@@ -345,10 +345,10 @@ class TestKimiCliIdleGap:
         mock_get_backend.return_value = mock_backend
         # Without reset: t=22-0=22>=20 would exit. With reset: 22-5=17<20.
         mock_time.monotonic.side_effect = [
-            0.0,   # outer_deadline = 60
-            0.0,   # last_prompt_time = 0
-            5.0,   # iter1: upgrade prompt → handled
-            5.0,   # last_prompt_time reset to 5
+            0.0,  # outer_deadline = 60
+            0.0,  # last_prompt_time = 0
+            5.0,  # iter1: upgrade prompt → handled
+            5.0,  # last_prompt_time reset to 5
             # continues
             22.0,  # iter2: gap=22-5=17<20, check output → ready → return
         ]
@@ -392,8 +392,8 @@ class TestAntigravityCliIdleGap:
         mock_backend = MagicMock()
         mock_get_backend.return_value = mock_backend
         mock_time.monotonic.side_effect = [
-            0.0,   # outer_deadline = 60
-            0.0,   # last_prompt_time = 0
+            0.0,  # outer_deadline = 60
+            0.0,  # last_prompt_time = 0
             18.0,  # iter1: gap=18<20, trust prompt → handled
             18.0,  # last_prompt_time reset to 18
             # continues past the old 20s total window...
@@ -415,7 +415,7 @@ class TestAntigravityCliIdleGap:
         # handled — the idle-gap reset kept the loop polling past the old 20s
         # window. Under old logic send_special_key would fire once.
         assert mock_backend.send_special_key.call_count == 2  # trust Enter + survey Enter
-        assert mock_backend.send_keys.call_count == 1         # survey "0"
+        assert mock_backend.send_keys.call_count == 1  # survey "0"
 
     @patch("cli_agent_orchestrator.providers.antigravity_cli.get_server_settings", _settings)
     @patch("cli_agent_orchestrator.providers.antigravity_cli.time")
@@ -426,9 +426,9 @@ class TestAntigravityCliIdleGap:
         mock_backend = MagicMock()
         mock_get_backend.return_value = mock_backend
         mock_time.monotonic.side_effect = [
-            0.0,   # outer_deadline = 60
-            0.0,   # last_prompt_time = 0
-            5.0,   # iter1: gap=5<20, no dialog, no ready footer → sleep
+            0.0,  # outer_deadline = 60
+            0.0,  # last_prompt_time = 0
+            5.0,  # iter1: gap=5<20, no dialog, no ready footer → sleep
             25.0,  # iter2: gap=25>=20 → return
         ]
         mock_backend.get_history.return_value = "Starting agy..."
@@ -439,7 +439,9 @@ class TestAntigravityCliIdleGap:
         mock_backend.send_special_key.assert_not_called()
         mock_backend.send_keys.assert_not_called()
 
-    @patch("cli_agent_orchestrator.providers.antigravity_cli.get_server_settings", _outer_cap_settings)
+    @patch(
+        "cli_agent_orchestrator.providers.antigravity_cli.get_server_settings", _outer_cap_settings
+    )
     @patch("cli_agent_orchestrator.providers.antigravity_cli.time")
     @patch("cli_agent_orchestrator.providers.antigravity_cli.get_backend")
     def test_outer_cap_respected(self, mock_get_backend, mock_time):
@@ -453,8 +455,8 @@ class TestAntigravityCliIdleGap:
         mock_backend = MagicMock()
         mock_get_backend.return_value = mock_backend
         mock_time.monotonic.side_effect = [
-            0.0,   # outer_deadline = 60
-            0.0,   # last_prompt_time = 0
+            0.0,  # outer_deadline = 60
+            0.0,  # last_prompt_time = 0
             10.0,  # iter1: trust prompt → handled
             10.0,  # last_prompt_time reset
             # continues (gap=15<100, so idle gap never fires)...
@@ -489,7 +491,7 @@ class TestAntigravityCliIdleGap:
             8.0,  # iter2: survey prompt → handled
             8.0,  # last_prompt_time reset
             # continues
-            14.0, # iter3: ready footer → return
+            14.0,  # iter3: ready footer → return
         ]
         mock_backend.get_history.side_effect = [
             "Yes, I trust this folder\nrequires permission",
@@ -516,10 +518,10 @@ class TestAntigravityCliIdleGap:
         # Without reset: 22-0=22>=20 would exit before seeing survey.
         # With reset: 22-5=17<20, so survey is still polled.
         mock_time.monotonic.side_effect = [
-            0.0,   # outer_deadline = 60
-            0.0,   # last_prompt_time = 0
-            5.0,   # iter1: trust prompt → handled
-            5.0,   # last_prompt_time reset to 5
+            0.0,  # outer_deadline = 60
+            0.0,  # last_prompt_time = 0
+            5.0,  # iter1: trust prompt → handled
+            5.0,  # last_prompt_time reset to 5
             # continues
             22.0,  # iter2: gap=22-5=17<20, survey → handled
             22.0,  # last_prompt_time reset to 22
@@ -537,4 +539,4 @@ class TestAntigravityCliIdleGap:
 
         # Both dialogs handled
         assert mock_backend.send_special_key.call_count == 2  # trust Enter + survey Enter
-        assert mock_backend.send_keys.call_count == 1         # survey "0"
+        assert mock_backend.send_keys.call_count == 1  # survey "0"

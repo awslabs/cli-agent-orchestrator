@@ -162,8 +162,8 @@ def test_idle_timeout_prompt_handler(mock_backend, mock_time):
     """
     mock_time.sleep = MagicMock()
     mock_time.monotonic.side_effect = [
-        0.0,   # outer_deadline = 0 + 180 (per-profile init timeout)
-        0.0,   # last_prompt_time = 0
+        0.0,  # outer_deadline = 0 + 180 (per-profile init timeout)
+        0.0,  # last_prompt_time = 0
         18.0,  # iter1: gap 18<20 and 18<180 -> bypass handled, timer reset
         18.0,  # last_prompt_time reset to 18
         35.0,  # iter2: gap 35-18=17<20 and 35<180 -> trust handled -> return

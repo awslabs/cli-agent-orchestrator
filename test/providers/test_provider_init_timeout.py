@@ -57,9 +57,7 @@ class TestInitializePassesResolvedInitTimeout:
         """provider_init_timeout=180 caps wait_for_shell, handler, and wait_until_status."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
-        mock_load.return_value = AgentProfile(
-            name="a", description="d", provider_init_timeout=180
-        )
+        mock_load.return_value = AgentProfile(name="a", description="d", provider_init_timeout=180)
 
         provider = ClaudeCodeProvider("t1", "sess", "win", "agent-x")
         result = await provider.initialize()
@@ -159,9 +157,7 @@ class TestInitializePassesResolvedInitTimeout:
         """
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
-        mock_load.return_value = AgentProfile(
-            name="a", description="d", provider_init_timeout=180
-        )
+        mock_load.return_value = AgentProfile(name="a", description="d", provider_init_timeout=180)
 
         provider = ClaudeCodeProvider("t1", "sess", "win", "agent-x")
         await provider.initialize()
@@ -233,8 +229,8 @@ class TestStartupPromptHandlerHonorsOuterTimeout:
         """
         mock_time.sleep = MagicMock()
         mock_time.monotonic.side_effect = [
-            0.0,    # outer_deadline = 0 + 180 = 180
-            0.0,    # last_prompt_time = 0
+            0.0,  # outer_deadline = 0 + 180 = 180
+            0.0,  # last_prompt_time = 0
             100.0,  # iter1 now: 100<180 (alive), gap 100<1000 -> trust prompt -> handled
         ]
         mock_backend.get_history.return_value = "Yes, I trust this folder"
@@ -256,8 +252,8 @@ class TestStartupPromptHandlerHonorsOuterTimeout:
 
         mock_time.sleep = MagicMock()
         mock_time.monotonic.side_effect = [
-            0.0,    # outer_deadline = 180
-            0.0,    # last_prompt_time = 0
+            0.0,  # outer_deadline = 180
+            0.0,  # last_prompt_time = 0
             100.0,  # iter1 now: 100<180, gap 100<1000, no prompt -> sleep
             181.0,  # iter2 now: 181>=180 -> outer cap -> return
         ]
