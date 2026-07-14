@@ -185,6 +185,22 @@ class BaseProvider(ABC):
         """
         return 0.3
 
+    async def wait_until_input_ready(self, timeout: float = 5.0) -> bool:
+        """Wait until the provider's input surface actually accepts keystrokes.
+
+        Called after ``initialize()``'s status wait reports IDLE/COMPLETED and
+        before the first paste is sent. For most CLIs the status wait is
+        sufficient and this default returns immediately. TUI providers whose
+        renderer drops keystrokes for a beat after the prompt first renders
+        (e.g. Claude Code's Ink input box) override this with a real readiness
+        check, so the first ``send_input`` does not race the widget.
+
+        Returns True when input is believed ready; False on timeout. Callers
+        treat False as "proceed anyway" (best effort) — the method must never
+        raise for a readiness miss.
+        """
+        return True
+
     @property
     def accepts_input_while_processing(self) -> bool:
         """Whether this provider buffers pasted input during PROCESSING for next-turn pickup.

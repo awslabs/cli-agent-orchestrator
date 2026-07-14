@@ -1870,3 +1870,62 @@ class TestBackgroundWaitReviewHardening:
             + "\n  ⏵⏵ bypass permissions on\n"
         )
         assert self._p().get_status(output) == TerminalStatus.COMPLETED
+
+
+class TestWaitUntilInputReady:
+    """Settle-check gate: 'box rendered' is not 'box accepting input'.
+
+    The gate requires the rendered pane to be stable across two consecutive
+    captures AND still showing the input box before the first paste is sent.
+    """
+
+    BOX = "─" * 40 + "\n> \n" + "─" * 40
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_ready_when_pane_stable_with_box(self, mock_tmux):
+        mock_tmux.get_history.side_effect = [self.BOX, self.BOX]
+        provider = ClaudeCodeProvider("t1", "sess", "win")
+        assert await provider.wait_until_input_ready(timeout=3.0) is True
+        assert mock_tmux.get_history.call_count == 2
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_waits_out_still_painting_pane(self, mock_tmux):
+        # Startup content still changing between captures (banner, tips, MCP
+        # status lines) — exactly the window where Ink drops keystrokes. The
+        # gate must NOT pass until two identical box-bearing captures.
+        mock_tmux.get_history.side_effect = [
+            "Welcome to Claude Code",
+            "Welcome to Claude Code\ntips...",
+            self.BOX,
+            self.BOX,
+        ]
+        provider = ClaudeCodeProvider("t2", "sess", "win")
+        assert await provider.wait_until_input_ready(timeout=5.0) is True
+        assert mock_tmux.get_history.call_count == 4
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_stable_pane_without_box_does_not_pass(self, mock_tmux):
+        # A stable pane that never shows the input box (e.g. stuck on an
+        # error screen) must time out with False, not report ready.
+        mock_tmux.get_history.return_value = "some stable non-box content"
+        provider = ClaudeCodeProvider("t3", "sess", "win")
+        assert await provider.wait_until_input_ready(timeout=1.2) is False
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_capture_failure_returns_false_not_raise(self, mock_tmux):
+        # Backend hiccups must never fail initialization via the gate.
+        mock_tmux.get_history.side_effect = RuntimeError("pane gone")
+        provider = ClaudeCodeProvider("t4", "sess", "win")
+        assert await provider.wait_until_input_ready(timeout=2.0) is False
+
+    @pytest.mark.asyncio
+    async def test_base_provider_default_is_immediate_true(self):
+        # Non-TUI providers keep the old behavior: no extra gate.
+        from cli_agent_orchestrator.providers.base import BaseProvider
+
+        provider = ClaudeCodeProvider("t5", "sess", "win")
+        assert await BaseProvider.wait_until_input_ready(provider) is True

@@ -1,5 +1,6 @@
 """Claude Code provider implementation."""
 
+import asyncio
 import json
 import logging
 import os
@@ -439,8 +440,55 @@ class ClaudeCodeProvider(BaseProvider):
         ):
             raise TimeoutError(f"Claude Code initialization timed out after {init_timeout}s")
 
+        # The status wait fires as soon as the input box RENDERS, but the Ink
+        # renderer drops keystrokes for a beat after that — "box rendered" is
+        # not "box accepting input". Gate on actual input readiness so the
+        # first paste does not race the widget (best effort: a False return
+        # proceeds anyway rather than failing init).
+        await self.wait_until_input_ready()
+
         self._initialized = True
         return True
+
+    async def wait_until_input_ready(self, timeout: float = 5.0) -> bool:
+        """Settle-check readiness gate for the Ink input box.
+
+        The new-TUI input box matching NEW_TUI_BOX_PATTERN appears one render
+        pass before the widget accepts keystrokes. Require the rendered pane
+        content to be STABLE across two consecutive captures ~0.5s apart (and
+        still showing the input box) before declaring input-ready. A changing
+        pane means Ink is still painting startup content (banner, tips, MCP
+        status), during which the first keystrokes get dropped.
+
+        Uses capture-pane (rendered screen) rather than the pipe-pane buffer:
+        stability of the RENDERED output is the actual readiness signal.
+        """
+        poll = 0.5
+        deadline = time.monotonic() + timeout
+        previous: Optional[str] = None
+        while time.monotonic() < deadline:
+            try:
+                current = get_backend().get_history(
+                    self.session_name, self.window_name, tail_lines=40
+                )
+            except Exception as exc:  # backend hiccup: don't fail init for the gate
+                logger.warning("input-ready settle check capture failed: %s", exc)
+                return False
+            if (
+                previous is not None
+                and current == previous
+                and NEW_TUI_BOX_PATTERN.search(strip_terminal_escapes(current))
+            ):
+                logger.debug("input-ready settle check passed for %s", self.terminal_id)
+                return True
+            previous = current
+            await asyncio.sleep(poll)
+        logger.warning(
+            "input-ready settle check timed out after %.1fs for %s; proceeding anyway",
+            timeout,
+            self.terminal_id,
+        )
+        return False
 
     def get_status(self, output: str) -> TerminalStatus:
         """Get Claude Code status.
