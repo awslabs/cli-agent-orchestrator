@@ -397,10 +397,14 @@ class InstallAgentProfileRequest(BaseModel):
 
     ``env_vars`` travels in the JSON body rather than as a query parameter so
     that any secrets callers inject are not written to HTTP access logs.
+
+    ``provider`` may be omitted (None): the install service then honours the
+    profile's frontmatter ``provider:`` key, falling back to the default
+    provider — the same flag > frontmatter > default precedence as the CLI.
     """
 
     source: str
-    provider: str = DEFAULT_PROVIDER
+    provider: Optional[str] = None
     env_vars: Optional[Dict[str, str]] = None
 
 

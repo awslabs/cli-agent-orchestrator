@@ -6,7 +6,7 @@ import requests  # type: ignore[import-untyped]
 from fastmcp import FastMCP
 from pydantic import Field
 
-from cli_agent_orchestrator.constants import API_BASE_URL, DEFAULT_PROVIDER
+from cli_agent_orchestrator.constants import API_BASE_URL
 from cli_agent_orchestrator.ops_mcp_server.models import (
     InstallResult,
     LaunchResult,
@@ -194,9 +194,14 @@ async def get_profile_details(
 async def install_profile(
     source: Annotated[str, Field(description="Agent name or https:// URL to install")],
     provider: Annotated[
-        str,
-        Field(description="Target provider for the installed profile"),
-    ] = DEFAULT_PROVIDER,
+        Optional[str],
+        Field(
+            description=(
+                "Target provider for the installed profile. Omit to honour the "
+                "profile's frontmatter provider, falling back to the default."
+            )
+        ),
+    ] = None,
     env_vars: Annotated[
         Optional[Dict[str, str]],
         Field(description="Optional environment variables to inject before install"),
@@ -224,13 +229,16 @@ async def install_profile(
 
     Args:
         source: Agent name or https:// URL from an allow-listed host
-        provider: Target provider (default: kiro_cli)
+        provider: Target provider. Precedence: explicit value > the profile's
+            frontmatter ``provider:`` key > the server default (kiro_cli)
         env_vars: Optional env vars written to the managed .env before install
 
     Returns:
         InstallResult with success status, file paths, and unresolved env vars
     """
-    body: Dict[str, Any] = {"source": source, "provider": provider}
+    body: Dict[str, Any] = {"source": source}
+    if provider is not None:
+        body["provider"] = provider
     if env_vars:
         body["env_vars"] = env_vars
 
