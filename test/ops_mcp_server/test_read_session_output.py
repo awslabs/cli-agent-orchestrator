@@ -107,6 +107,32 @@ class TestReadSessionOutputImpl:
         }
         mock_request.assert_called_once()
 
+    @pytest.mark.parametrize("terminals", ["not-a-list", [None]])
+    def test_invalid_session_terminals_payload_is_rejected(self, terminals) -> None:
+        """Malformed terminal collections return a structured error."""
+        with patch(
+            REQUEST,
+            return_value=_response(json_data={"name": "cao-x", "terminals": terminals}),
+        ) as mock_request:
+            result = _read_session_output_impl(None, "cao-x", "full", None)
+
+        assert result == {
+            "success": False,
+            "message": "Session 'cao-x' returned an invalid terminals payload",
+        }
+        mock_request.assert_called_once()
+
+    def test_invalid_session_payload_is_rejected(self) -> None:
+        """A non-object session response returns a structured error."""
+        with patch(REQUEST, return_value=_response(json_data=[])) as mock_request:
+            result = _read_session_output_impl(None, "cao-x", "full", None)
+
+        assert result == {
+            "success": False,
+            "message": "Session 'cao-x' returned an invalid response payload",
+        }
+        mock_request.assert_called_once()
+
     def test_ambiguous_session_returns_terminal_list(self) -> None:
         """A session with more than one terminal returns the list and requires terminal_id."""
         payload = {"name": "cao-x", "terminals": [{"id": "term-1"}, {"id": "term-2"}]}
@@ -214,6 +240,20 @@ class TestReadSessionOutputImpl:
     def test_invalid_output_payload_is_rejected(self) -> None:
         """A payload missing the output field is treated as a failure."""
         with patch(REQUEST, return_value=_response(json_data={"mode": "full"})):
+            result = _read_session_output_impl("term-1", None, "full", None)
+
+        assert result == {
+            "success": False,
+            "message": "Read output failed: invalid response payload",
+        }
+
+    @pytest.mark.parametrize("output", [None, 123, []])
+    def test_non_string_output_payload_is_rejected(self, output) -> None:
+        """A non-string output value returns the documented structured error."""
+        with patch(
+            REQUEST,
+            return_value=_response(json_data={"output": output, "mode": "full"}),
+        ):
             result = _read_session_output_impl("term-1", None, "full", None)
 
         assert result == {
