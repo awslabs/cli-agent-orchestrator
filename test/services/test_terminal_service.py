@@ -7,6 +7,7 @@ import pytest
 from cli_agent_orchestrator.services.terminal_service import (
     exit_terminal_cli,
     get_working_directory,
+    list_siblings,
     send_special_key,
 )
 
@@ -271,3 +272,100 @@ class TestExitTerminalCli:
         mock_pm.get_provider.return_value = None
         with pytest.raises(ValueError, match="Provider not found"):
             exit_terminal_cli("deadbeef")
+
+
+class TestListSiblingsDepthClamping:
+    """#432: list_siblings() must clamp depth to [1, len(caller_group)] and
+    never let a caller widen its own discovery scope.
+
+    ``get_terminal_group``/``list_siblings_by_group_prefix`` are mocked so
+    these tests isolate the clamping arithmetic itself (the actual prefix
+    match is covered by the real-DB tests in
+    test/clients/test_database.py::TestListSiblingsByGroupPrefix).
+    """
+
+    @patch(f"{_TS}.list_siblings_by_group_prefix")
+    @patch(f"{_TS}.get_terminal_group")
+    def test_caller_with_no_group_returns_empty_without_querying(
+        self, mock_get_group, mock_list_prefix
+    ):
+        """A caller with no group participates in no discovery (#432) --
+        must short-circuit before ever calling the prefix-match query."""
+        mock_get_group.return_value = None
+
+        result = list_siblings("caller-1", depth=2)
+
+        assert result == []
+        mock_list_prefix.assert_not_called()
+
+    @patch(f"{_TS}.list_siblings_by_group_prefix")
+    @patch(f"{_TS}.get_terminal_group")
+    def test_depth_none_defaults_to_full_own_group_length(self, mock_get_group, mock_list_prefix):
+        """Omitting depth means the widest scope the caller is allowed: its
+        own full group."""
+        mock_get_group.return_value = ["tenant_1", "project_5", "folder_9"]
+        mock_list_prefix.return_value = []
+
+        list_siblings("caller-1", depth=None)
+
+        mock_list_prefix.assert_called_once_with(
+            "caller-1", ["tenant_1", "project_5", "folder_9"]
+        )
+
+    @patch(f"{_TS}.list_siblings_by_group_prefix")
+    @patch(f"{_TS}.get_terminal_group")
+    def test_depth_wider_than_own_group_is_clamped_down(self, mock_get_group, mock_list_prefix):
+        """depth can never exceed len(caller_group) -- a caller cannot widen
+        its own scope by asking for more than it has (#432)."""
+        mock_get_group.return_value = ["tenant_1", "project_5"]
+        mock_list_prefix.return_value = []
+
+        list_siblings("caller-1", depth=99)
+
+        mock_list_prefix.assert_called_once_with("caller-1", ["tenant_1", "project_5"])
+
+    @patch(f"{_TS}.list_siblings_by_group_prefix")
+    @patch(f"{_TS}.get_terminal_group")
+    def test_depth_within_range_uses_exact_prefix(self, mock_get_group, mock_list_prefix):
+        mock_get_group.return_value = ["tenant_1", "project_5", "folder_9"]
+        mock_list_prefix.return_value = []
+
+        list_siblings("caller-1", depth=2)
+
+        mock_list_prefix.assert_called_once_with("caller-1", ["tenant_1", "project_5"])
+
+    @patch(f"{_TS}.list_siblings_by_group_prefix")
+    @patch(f"{_TS}.get_terminal_group")
+    def test_depth_zero_is_clamped_up_to_one_defense_in_depth(
+        self, mock_get_group, mock_list_prefix
+    ):
+        """The API layer rejects depth=0 outright (422, see test_terminals.py).
+        This asserts the service layer ALSO never treats an explicit 0 as an
+        unscoped, all-terminals query if it's ever reached directly --
+        defense in depth, not a documented public entry point for 0."""
+        mock_get_group.return_value = ["tenant_1", "project_5"]
+        mock_list_prefix.return_value = []
+
+        list_siblings("caller-1", depth=0)
+
+        mock_list_prefix.assert_called_once_with("caller-1", ["tenant_1"])
+
+    @patch(f"{_TS}.list_siblings_by_group_prefix")
+    @patch(f"{_TS}.get_terminal_group")
+    def test_negative_depth_is_clamped_up_to_one(self, mock_get_group, mock_list_prefix):
+        mock_get_group.return_value = ["tenant_1", "project_5"]
+        mock_list_prefix.return_value = []
+
+        list_siblings("caller-1", depth=-5)
+
+        mock_list_prefix.assert_called_once_with("caller-1", ["tenant_1"])
+
+    @patch(f"{_TS}.list_siblings_by_group_prefix")
+    @patch(f"{_TS}.get_terminal_group")
+    def test_returns_prefix_match_results_unchanged(self, mock_get_group, mock_list_prefix):
+        mock_get_group.return_value = ["tenant_1"]
+        mock_list_prefix.return_value = [{"id": "sib-1", "group": ["tenant_1"], "metadata": None}]
+
+        result = list_siblings("caller-1", depth=1)
+
+        assert result == [{"id": "sib-1", "group": ["tenant_1"], "metadata": None}]

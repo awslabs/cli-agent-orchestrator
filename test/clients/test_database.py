@@ -23,16 +23,20 @@ from cli_agent_orchestrator.clients.database import (
     get_flow,
     get_inbox_messages,
     get_pending_messages,
+    get_terminal_group,
     get_terminal_metadata,
     init_db,
     list_flows,
     list_pending_receiver_ids_by_provider,
     list_pending_receiver_ids_older_than,
+    list_siblings_by_group_prefix,
     list_terminals_by_session,
     update_flow_enabled,
     update_flow_run_times,
     update_last_active,
     update_message_status,
+    update_terminal_group,
+    update_terminal_metadata,
     update_terminal_shell_command,
 )
 from cli_agent_orchestrator.models.inbox import MessageStatus
@@ -78,6 +82,8 @@ class TestTerminalOperations:
         mock_terminal.provider = "kiro_cli"
         mock_terminal.agent_profile = "developer"
         mock_terminal.allowed_tools = None
+        mock_terminal.group = None
+        mock_terminal.metadata_json = None
         mock_terminal.last_active = datetime.now()
 
         mock_query = MagicMock()
@@ -89,6 +95,8 @@ class TestTerminalOperations:
 
         assert result is not None
         assert result["id"] == "test123"
+        assert result["group"] is None
+        assert result["metadata"] is None
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_get_terminal_metadata_not_found(self, mock_session_class):
@@ -316,6 +324,373 @@ class TestTerminalOperations:
         result = delete_terminals_by_session("cao-session")
 
         assert result == 2
+
+
+class TestGroupAndMetadata:
+    """Tests for the #432 group/metadata columns and their CRUD helpers."""
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_create_terminal_persists_group_and_metadata(self, mock_session_class):
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        mock_session_class.return_value = mock_session
+
+        result = create_terminal(
+            "test123",
+            "cao-session",
+            "window-0",
+            "kiro_cli",
+            "developer",
+            group=["tenant_1", "project_5"],
+            metadata={"task": "reviewing PR"},
+        )
+
+        assert result["group"] == ["tenant_1", "project_5"]
+        assert result["metadata"] == {"task": "reviewing PR"}
+        added_terminal = mock_session.add.call_args[0][0]
+        assert added_terminal.group == '["tenant_1", "project_5"]'
+        assert added_terminal.metadata_json == '{"task": "reviewing PR"}'
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_create_terminal_no_group_or_metadata_stores_null(self, mock_session_class):
+        """Omitting group/metadata must not write the literal string 'null'."""
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        mock_session_class.return_value = mock_session
+
+        result = create_terminal("test123", "cao-session", "window-0", "kiro_cli", "developer")
+
+        assert result["group"] is None
+        assert result["metadata"] is None
+        added_terminal = mock_session.add.call_args[0][0]
+        assert added_terminal.group is None
+        assert added_terminal.metadata_json is None
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_get_terminal_metadata_decodes_group_and_metadata(self, mock_session_class):
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_terminal = MagicMock()
+        mock_terminal.id = "test123"
+        mock_terminal.tmux_session = "cao-session"
+        mock_terminal.tmux_window = "window-0"
+        mock_terminal.provider = "kiro_cli"
+        mock_terminal.agent_profile = "developer"
+        mock_terminal.allowed_tools = None
+        mock_terminal.group = '["tenant_1", "project_5"]'
+        mock_terminal.metadata_json = '{"task": "reviewing PR"}'
+        mock_terminal.last_active = datetime.now()
+
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = mock_terminal
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        result = get_terminal_metadata("test123")
+
+        assert result["group"] == ["tenant_1", "project_5"]
+        assert result["metadata"] == {"task": "reviewing PR"}
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_update_terminal_group(self, mock_session_class):
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_terminal = MagicMock()
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = mock_terminal
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        result = update_terminal_group("test123", ["tenant_1", "project_9"])
+
+        assert result is True
+        assert mock_terminal.group == '["tenant_1", "project_9"]'
+        mock_session.commit.assert_called_once()
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_update_terminal_group_empty_list_clears(self, mock_session_class):
+        """An empty list clears the group column (opts back out of discovery)."""
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_terminal = MagicMock()
+        mock_terminal.group = '["stale"]'
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = mock_terminal
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        result = update_terminal_group("test123", [])
+
+        assert result is True
+        assert mock_terminal.group is None
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_update_terminal_group_not_found(self, mock_session_class):
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = None
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        result = update_terminal_group("nonexistent", ["a"])
+
+        assert result is False
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_update_terminal_metadata(self, mock_session_class):
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_terminal = MagicMock()
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = mock_terminal
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        result = update_terminal_metadata("test123", {"task": "writing tests"})
+
+        assert result is True
+        assert mock_terminal.metadata_json == '{"task": "writing tests"}'
+        mock_session.commit.assert_called_once()
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_update_terminal_metadata_not_found(self, mock_session_class):
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = None
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        result = update_terminal_metadata("nonexistent", {"task": "x"})
+
+        assert result is False
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_get_terminal_group_returns_decoded_list(self, mock_session_class):
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_terminal = MagicMock()
+        mock_terminal.group = '["tenant_1", "project_5"]'
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = mock_terminal
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        assert get_terminal_group("test123") == ["tenant_1", "project_5"]
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_get_terminal_group_none_when_unset(self, mock_session_class):
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_terminal = MagicMock()
+        mock_terminal.group = None
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = mock_terminal
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        assert get_terminal_group("test123") is None
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_get_terminal_group_none_when_terminal_missing(self, mock_session_class):
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = None
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        assert get_terminal_group("nonexistent") is None
+
+
+class TestListSiblingsByGroupPrefix:
+    """Real-DB regression tests for the #432 sibling-discovery prefix match.
+
+    Uses the in-memory-sqlite ``test_db`` fixture (not a mocked session) so
+    the actual JSON decode + prefix comparison across multiple rows is
+    exercised, not just the query-building calls.
+    """
+
+    def _seed(self, test_db, terminals):
+        with test_db() as seed:
+            seed.add_all(terminals)
+            seed.commit()
+
+    def test_matching_siblings_returned_with_group_and_metadata(self, test_db):
+        self._seed(
+            test_db,
+            [
+                TerminalModel(
+                    id="sib-1",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1", "project_5", "folder_1"]',
+                    metadata_json='{"task": "reviewing"}',
+                ),
+                TerminalModel(
+                    id="sib-2",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1", "project_5", "folder_2"]',
+                ),
+                TerminalModel(
+                    id="other-tenant",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_2", "project_5", "folder_1"]',
+                ),
+            ],
+        )
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            result = list_siblings_by_group_prefix("caller-1", ["tenant_1", "project_5"])
+
+        ids = {r["id"] for r in result}
+        assert ids == {"sib-1", "sib-2"}
+        by_id = {r["id"]: r for r in result}
+        assert by_id["sib-1"]["group"] == ["tenant_1", "project_5", "folder_1"]
+        assert by_id["sib-1"]["metadata"] == {"task": "reviewing"}
+        assert by_id["sib-2"]["metadata"] is None
+
+    def test_caller_excluded_from_its_own_results(self, test_db):
+        self._seed(
+            test_db,
+            [
+                TerminalModel(
+                    id="caller-1",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1", "project_5"]',
+                ),
+                TerminalModel(
+                    id="sib-1",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1", "project_5"]',
+                ),
+            ],
+        )
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            result = list_siblings_by_group_prefix("caller-1", ["tenant_1", "project_5"])
+
+        assert {r["id"] for r in result} == {"sib-1"}
+
+    def test_shorter_sibling_group_excluded_not_partially_matched(self, test_db):
+        """A sibling whose group is shorter than the requested depth is
+        excluded rather than compared partially or raising an IndexError
+        (#432's own documented edge case)."""
+        self._seed(
+            test_db,
+            [
+                TerminalModel(
+                    id="shallow",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1"]',
+                ),
+            ],
+        )
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            result = list_siblings_by_group_prefix("caller-1", ["tenant_1", "project_5"])
+
+        assert result == []
+
+    def test_longer_sibling_group_matches_on_shared_prefix(self, test_db):
+        """A sibling with a LONGER group than the requested depth still
+        matches as long as its leading elements agree."""
+        self._seed(
+            test_db,
+            [
+                TerminalModel(
+                    id="deep",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1", "project_5", "folder_9", "subtask_2"]',
+                ),
+            ],
+        )
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            result = list_siblings_by_group_prefix("caller-1", ["tenant_1", "project_5"])
+
+        assert [r["id"] for r in result] == ["deep"]
+
+    def test_no_group_terminal_excluded_from_being_found(self, test_db):
+        """A terminal with no group set is never returned as a sibling to
+        anyone, regardless of what prefix is requested."""
+        self._seed(
+            test_db,
+            [
+                TerminalModel(
+                    id="no-group",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group=None,
+                ),
+                TerminalModel(
+                    id="has-group",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1"]',
+                ),
+            ],
+        )
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            result = list_siblings_by_group_prefix("caller-1", ["tenant_1"])
+
+        assert [r["id"] for r in result] == ["has-group"]
+
+    def test_no_matching_prefix_returns_empty(self, test_db):
+        self._seed(
+            test_db,
+            [
+                TerminalModel(
+                    id="unrelated",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_9", "project_1"]',
+                ),
+            ],
+        )
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            result = list_siblings_by_group_prefix("caller-1", ["tenant_1", "project_5"])
+
+        assert result == []
 
 
 class TestInboxOperations:
