@@ -348,7 +348,19 @@ def _read_session_output_impl(
         )
         if error:
             return {"success": False, "message": error}
-        terminals = info.get("terminals", []) if isinstance(info, dict) else []
+        if not isinstance(info, dict):
+            return {
+                "success": False,
+                "message": f"Session '{session_name}' returned an invalid response payload",
+            }
+        terminals = info.get("terminals", [])
+        if not isinstance(terminals, list) or any(
+            not isinstance(terminal, dict) for terminal in terminals
+        ):
+            return {
+                "success": False,
+                "message": f"Session '{session_name}' returned an invalid terminals payload",
+            }
         if len(terminals) == 1:
             terminal = terminals[0]
             if not terminal.get("id"):
@@ -377,7 +389,7 @@ def _read_session_output_impl(
     )
     if error:
         return {"success": False, "message": error}
-    if not isinstance(data, dict) or "output" not in data:
+    if not isinstance(data, dict) or not isinstance(data.get("output"), str):
         return {"success": False, "message": "Read output failed: invalid response payload"}
 
     output = data["output"]
