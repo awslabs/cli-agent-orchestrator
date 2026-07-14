@@ -557,8 +557,14 @@ def create_terminal(
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
-            "group": group,
-            "metadata": metadata,
+            # Normalized the same way as what was actually stored (an empty
+            # container is stored as NULL, same as omitted) -- self-ROAST
+            # finding: echoing the raw `group`/`metadata` input here made
+            # create_terminal(group=[]) return {"group": []} while an
+            # immediately-following get_terminal_metadata() on the same row
+            # returns {"group": None}, an API-consistency gap.
+            "group": group if group else None,
+            "metadata": metadata if metadata else None,
         }
 
 

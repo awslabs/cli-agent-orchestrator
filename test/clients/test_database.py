@@ -369,6 +369,27 @@ class TestGroupAndMetadata:
         assert added_terminal.metadata_json is None
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_create_terminal_explicit_empty_group_and_metadata_normalized_to_none(
+        self, mock_session_class
+    ):
+        """Self-ROAST finding: an explicit empty container (group=[], metadata={},
+        as opposed to omitted/None) is stored as NULL -- the return dict must echo
+        that same normalized None, not the raw [] / {} the caller passed in, or a
+        create_terminal() response would disagree with an immediately-following
+        get_terminal_metadata()/GET /terminals/{id} on the same row."""
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        mock_session_class.return_value = mock_session
+
+        result = create_terminal(
+            "test123", "cao-session", "window-0", "kiro_cli", "developer", group=[], metadata={}
+        )
+
+        assert result["group"] is None
+        assert result["metadata"] is None
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_get_terminal_metadata_decodes_group_and_metadata(self, mock_session_class):
         mock_session = MagicMock()
         mock_session.__enter__ = MagicMock(return_value=mock_session)
@@ -1130,6 +1151,67 @@ class TestTerminalsSchemaMigration:
             columns = [row[1] for row in conn.execute("PRAGMA table_info(terminals)")]
         assert columns.count("caller_id") == 1
         assert columns.count("allowed_tools") == 1
+
+    def test_group_and_metadata_columns_added_to_legacy_table(self, tmp_path, monkeypatch):
+        """#432: a pre-existing terminals table (predating group/metadata) gains both
+        columns, and existing rows get NULL rather than erroring."""
+        import sqlite3
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        db_file = tmp_path / "pre432.db"
+        with sqlite3.connect(str(db_file)) as conn:
+            conn.execute(
+                "CREATE TABLE terminals ("
+                "id TEXT PRIMARY KEY, tmux_session TEXT NOT NULL, "
+                "tmux_window TEXT NOT NULL, provider TEXT NOT NULL, "
+                "agent_profile TEXT, allowed_tools TEXT, shell_command TEXT, "
+                "caller_id TEXT, last_active TIMESTAMP)"
+            )
+            conn.execute(
+                "INSERT INTO terminals (id, tmux_session, tmux_window, provider) "
+                "VALUES ('abc12345', 'cao-s', 'w-0', 'kiro_cli')"
+            )
+            conn.commit()
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.constants.DATABASE_FILE", db_file, raising=False
+        )
+
+        db_mod._migrate_terminals_schema()
+
+        with sqlite3.connect(str(db_file)) as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(terminals)")}
+            rows = conn.execute("SELECT id, \"group\", \"metadata\" FROM terminals").fetchall()
+        assert {"group", "metadata"} <= columns
+        assert rows == [("abc12345", None, None)]
+
+    def test_group_and_metadata_migration_is_idempotent(self, tmp_path, monkeypatch):
+        """Running the migration twice must not fail or duplicate the new columns."""
+        import sqlite3
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        db_file = tmp_path / "pre432_twice.db"
+        with sqlite3.connect(str(db_file)) as conn:
+            conn.execute(
+                "CREATE TABLE terminals ("
+                "id TEXT PRIMARY KEY, tmux_session TEXT NOT NULL, "
+                "tmux_window TEXT NOT NULL, provider TEXT NOT NULL)"
+            )
+            conn.commit()
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.constants.DATABASE_FILE", db_file, raising=False
+        )
+
+        db_mod._migrate_terminals_schema()
+        db_mod._migrate_terminals_schema()
+
+        with sqlite3.connect(str(db_file)) as conn:
+            columns = [row[1] for row in conn.execute("PRAGMA table_info(terminals)")]
+        assert columns.count("group") == 1
+        assert columns.count("metadata") == 1
 
 
 class TestCallerIdRoundTrip:
