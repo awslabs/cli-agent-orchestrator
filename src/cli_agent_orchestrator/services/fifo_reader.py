@@ -61,7 +61,11 @@ class FifoManager:
     simply no data to read). From inside the FIFO reader a stalled forwarder is
     indistinguishable from a genuinely idle terminal, so the watchdog compares
     tmux's *live* pane content against whether the FIFO delivered any bytes: pane
-    advanced + FIFO silent = a stall, which it self-heals by re-arming the pipe.
+    diverged from its last known-healthy baseline + FIFO silent = a stall, which
+    it self-heals by re-arming the pipe. The baseline is pinned across checks
+    (not just the previous one) so a stall that settles into a new static frame
+    right after the burst — instead of staying visibly in flux — is still caught
+    (harness-control#148).
     """
 
     def __init__(self):
@@ -364,16 +368,32 @@ class FifoManager:
         read, exactly like an idle terminal). The only ground truth is tmux's own
         live pane content, which keeps rendering through the stall. So:
 
-        - pane content advanced since the last check AND the FIFO delivered no
-          bytes in that same window  -> the pipe is stalled: re-arm it.
-        - pane content unchanged                                   -> idle: do nothing.
-        - FIFO delivered bytes                                     -> healthy: do nothing.
+        - pane content has diverged from the last known-healthy baseline AND the
+          FIFO has delivered no bytes since        -> the pipe is stalled: re-arm.
+        - pane content matches the baseline                        -> idle: do nothing.
+        - FIFO delivered bytes since the last check       -> healthy: re-baseline.
 
-        Requiring BOTH "pane advanced" and "FIFO silent" is what stops a
+        The baseline is pinned to the pane content last observed while the FIFO
+        was confirmed delivering data (or the first-ever observation) — NOT to
+        the immediately-previous check's content. This matters for a "burst-then-
+        settle" stall: tmux can silently stop forwarding mid-burst and the pane
+        then settles into a new, different, static frame before the next poll
+        observes it (e.g. an AskUserQuestion menu finishing its render and
+        sitting idle awaiting input — harness-control#148's live repro). Comparing
+        only against the immediately-previous check's content would see exactly
+        one diverging check (baseline -> new frame) followed by unchanging checks
+        thereafter (new frame -> same new frame), resetting the strike counter to
+        0 forever — even though the FIFO-fed buffer is permanently stuck on stale
+        mid-burst content. Pinning the baseline until the FIFO actually delivers
+        data again means every check keeps comparing against the ORIGINAL
+        pre-stall content, so a settle-and-freeze keeps accumulating strikes
+        exactly like an ongoing divergence would.
+
+        Requiring BOTH "diverged from baseline" and "FIFO silent" is what stops a
         legitimately idle terminal (pane unchanged, FIFO silent) from triggering
         a needless re-pipe. Re-arm only after ``PIPE_LIVENESS_STALL_CHECKS``
-        consecutive diverging checks (default 2 — a single diverging check can be
-        a false positive on a healthy-but-bursty pipe).
+        consecutive checks confirm the divergence persists (default 2 — a single
+        diverging check can be a false positive on a healthy-but-bursty pipe).
         """
         probe = self._pane_probe.get(terminal_id)
         rearm = self._rearm.get(terminal_id)
@@ -404,17 +424,27 @@ class FifoManager:
                 # First observation: establish a baseline, never act on it.
                 self._liveness[terminal_id] = (content, now, 0)
                 return
-            prev_content, last_check_at, strikes = prev
+            baseline_content, last_check_at, strikes = prev
 
-            # Full tail string compared, not a hash: a hash collision would
-            # make pane_advanced False and mask a real stall (negligible
-            # probability, but the string is just as cheap to compare and
-            # collision-free).
-            pane_advanced = content != prev_content
             # Did the reader deliver anything since the previous check?
             fifo_advanced = last_data_at >= last_check_at
 
-            if pane_advanced and not fifo_advanced:
+            if fifo_advanced:
+                # Healthy: the pipe is confirmed delivering. Re-baseline to
+                # the current pane content and clear strikes.
+                self._liveness[terminal_id] = (content, now, 0)
+                return
+
+            # FIFO silent since the last check. Compare against the STICKY
+            # baseline (last known-healthy content), not the previous
+            # check's content — see docstring for why this matters for a
+            # burst-then-settle stall. Full tail string compared, not a
+            # hash: a hash collision would make this False and mask a real
+            # stall (negligible probability, but the string is just as
+            # cheap to compare and collision-free).
+            diverged_from_baseline = content != baseline_content
+
+            if diverged_from_baseline:
                 strikes += 1
                 if strikes >= PIPE_LIVENESS_STALL_CHECKS:
                     do_rearm = True
@@ -422,7 +452,11 @@ class FifoManager:
             else:
                 strikes = 0
 
-            self._liveness[terminal_id] = (content, now, strikes)
+            # Baseline is intentionally left unchanged (not reset to
+            # `content`) so a burst-then-settle stall keeps accumulating
+            # strikes against the original pre-stall baseline across
+            # checks where the now-static content no longer changes.
+            self._liveness[terminal_id] = (baseline_content, now, strikes)
 
         if not do_rearm:
             return

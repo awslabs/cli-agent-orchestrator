@@ -440,6 +440,59 @@ class TestPipeLivenessWatchdog:
         manager._check_pipe_liveness("term")  # strike 2 — re-arm
         assert rearm_calls == [True]
 
+    def test_burst_then_settle_stall_is_still_detected(self, tmp_path, monkeypatch):
+        """Regression for harness-control#148's live repro: a stall that occurs
+        mid-burst and then settles into a NEW static frame before the next poll
+        (e.g. an AskUserQuestion menu finishing its render and sitting idle) must
+        still be caught, not just an ongoing/ever-changing divergence.
+
+        Before the fix, ``_check_pipe_liveness`` compared each check's content
+        only against the IMMEDIATELY PREVIOUS check's content. That works for a
+        stall that's actively churning while polled, but a single clean
+        transition into a new static frame produced exactly one diverging check
+        (baseline -> new frame) followed by unchanging checks thereafter (new
+        frame -> same new frame each time), resetting the strike counter to 0
+        forever — even though the FIFO-fed buffer was permanently stuck on stale
+        mid-burst content. The fix pins the comparison baseline to the last
+        known-healthy content (not the previous check) so a settle-and-freeze
+        keeps accumulating strikes exactly like an ongoing divergence would.
+        """
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_STALL_CHECKS", 2)  # production default
+        manager = self._manager(tmp_path, monkeypatch)
+        pane = {"content": "idle prompt"}
+        rearm_calls: list = []
+        self._enroll(manager, "term", pane, rearm_calls, last_data_at=time.monotonic())
+
+        manager._check_pipe_liveness("term")  # baseline
+        assert rearm_calls == []
+
+        # The pipe silently stalls right now (no further last_data_at bumps in
+        # this test — the FIFO never delivers anything again). The pane renders
+        # a burst of redraws that settles into ONE new static frame before the
+        # next poll observes it — a single clean transition, not an ongoing
+        # divergence.
+        pane["content"] = "1) yes\n2) no\n3) cancel  (menu fully rendered, now static)"
+
+        manager._check_pipe_liveness("term")  # strike 1: diverged from baseline
+        assert rearm_calls == [], "a single diverging check must not re-arm yet"
+
+        # Pane is now static — unchanged from the previous check — but still
+        # diverged from the pre-stall baseline. This is the exact shape that
+        # evaded detection pre-fix.
+        manager._check_pipe_liveness("term")  # strike 2: still diverged -> re-arm
+        assert rearm_calls == [True], (
+            "a stall that settles into a new static frame after one clean "
+            "transition must still be re-armed once the configured number of "
+            "checks confirm the divergence persists"
+        )
+
+        # And it must not keep re-arming on every subsequent check once healthy
+        # again (rearm() bumps _last_data_at in the real code path via the
+        # replay publish; simulate that here).
+        manager._last_data_at["term"] = time.monotonic()
+        manager._check_pipe_liveness("term")
+        assert rearm_calls == [True], "must not spuriously re-arm again once healthy"
+
     def test_stop_during_probe_does_not_resurrect_state(self, tmp_path, monkeypatch):
         """Regression for the round-2 review's stop-during-probe race:
         ``_check_pipe_liveness`` calls the injected ``probe()`` (a slow tmux
