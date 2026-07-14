@@ -59,10 +59,10 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
 - `/terminals/{terminal_id}*` inspects terminals, sends input or keys, reads
   output and working-directory state, exits providers, and deletes terminals.
 - `GET /terminals/{terminal_id}/output?mode=full` returns the StatusMonitor
-  rolling buffer (most recent `STATE_BUFFER_MAX` bytes of streamed output,
-  32KB by default — configurable via `CAO_STATE_BUFFER_MAX` or the
-  `state_buffer_max` server setting), not unbounded scrollback. Long sessions
-  are truncated to the tail; use the on-disk terminal log for complete history.
+  rolling buffer (most recent `state_buffer_max` bytes of streamed output —
+  server setting, 32KB by default, see [Configuration](configuration.md)),
+  not unbounded scrollback. Long sessions are truncated to the tail; use the
+  on-disk terminal log for complete history.
 
 Terminal identifiers used in these routes are eight-character hexadecimal
 strings. See [Control Planes](control-planes.md) for operator-facing choices.

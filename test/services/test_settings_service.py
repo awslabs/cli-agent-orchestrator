@@ -289,6 +289,7 @@ class TestGetServerSettings:
             "event_bus_max_queue_size": 1024,
             "provider_init_timeout": 60,
             "startup_prompt_handler_timeout": 20,
+            "state_buffer_max": 32768,
         }
 
     def test_reads_custom_values(self, settings_file):
@@ -327,3 +328,74 @@ class TestGetServerSettings:
         _save({"server": {"provider_init_timeout": -5}})
         result = get_server_settings()
         assert result["provider_init_timeout"] == 60
+
+    def test_state_buffer_max_reads_custom_value(self, settings_file):
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        _save({"server": {"state_buffer_max": 65536}})
+        result = get_server_settings()
+        assert result["state_buffer_max"] == 65536
+
+    def test_state_buffer_max_is_int(self, settings_file):
+        """A settings.json float (e.g. 32768.0) must come back as int -- it's
+        used as a slice bound (``buffer[-state_buffer_max:]``), which raises
+        TypeError on a float."""
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        _save({"server": {"state_buffer_max": 65536.0}})
+        result = get_server_settings()
+        assert result["state_buffer_max"] == 65536
+        assert isinstance(result["state_buffer_max"], int)
+
+    def test_state_buffer_max_zero_falls_back_to_default(self, settings_file):
+        """0 must not silently disable truncation: ``buffer[-0:]`` is the
+        whole buffer (``-0 == 0``, and ``s[0:]`` is everything), not an empty
+        slice -- unbounded per-terminal memory from a config typo."""
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        _save({"server": {"state_buffer_max": 0}})
+        result = get_server_settings()
+        assert result["state_buffer_max"] == 32768
+
+    def test_state_buffer_max_negative_falls_back_to_default(self, settings_file):
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        _save({"server": {"state_buffer_max": -1}})
+        result = get_server_settings()
+        assert result["state_buffer_max"] == 32768
+
+    def test_state_buffer_max_invalid_type_falls_back_to_default(self, settings_file):
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        _save({"server": {"state_buffer_max": "not_a_number"}})
+        result = get_server_settings()
+        assert result["state_buffer_max"] == 32768
+
+    def test_state_buffer_max_env_override(self, settings_file, monkeypatch):
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        # Write the (empty) file so SETTINGS_FILE.exists() is True and this
+        # test's mtime is distinct from a prior test's -- get_server_settings()
+        # caches purely on file mtime, and a nonexistent file always hashes to
+        # mtime_ns=-1, so two tests that never call _save() could otherwise
+        # collide on the cache and silently return a stale prior result.
+        _save({})
+        monkeypatch.setenv("CAO_STATE_BUFFER_MAX", "65536")
+        result = get_server_settings()
+        assert result["state_buffer_max"] == 65536
+
+    def test_state_buffer_max_env_override_beats_settings_file(self, settings_file, monkeypatch):
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        _save({"server": {"state_buffer_max": 16384}})
+        monkeypatch.setenv("CAO_STATE_BUFFER_MAX", "65536")
+        result = get_server_settings()
+        assert result["state_buffer_max"] == 65536
+
+    def test_state_buffer_max_env_zero_falls_back_to_default(self, settings_file, monkeypatch):
+        from cli_agent_orchestrator.services.settings_service import get_server_settings
+
+        _save({})  # see test_state_buffer_max_env_override for why
+        monkeypatch.setenv("CAO_STATE_BUFFER_MAX", "0")
+        result = get_server_settings()
+        assert result["state_buffer_max"] == 32768
