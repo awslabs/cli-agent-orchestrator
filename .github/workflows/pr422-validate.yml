@@ -1,0 +1,38 @@
+name: Validate PR 422 fixes
+
+on:
+  push:
+    branches:
+      - upstream-pr/read-session-output
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: upstream-pr/read-session-output
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Run targeted tests and formatting checks
+        shell: bash
+        run: |
+          uv sync --group dev
+          uv run pytest -q test/ops_mcp_server/test_read_session_output.py
+          uv run black --check src/cli_agent_orchestrator/ops_mcp_server/server.py test/ops_mcp_server/test_read_session_output.py
+          uv run isort --check-only src/cli_agent_orchestrator/ops_mcp_server/server.py test/ops_mcp_server/test_read_session_output.py
+
+      - name: Remove workflow after successful validation
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/pr422-validate.yml
+          git commit -m "chore: complete PR #422 validation"
+          git push origin HEAD:upstream-pr/read-session-output
