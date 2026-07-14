@@ -44,6 +44,22 @@ def _safe_join(root: Path, *parts: str) -> Path | None:
     return candidate
 
 
+def _discovery_fields(metadata: dict) -> Dict:
+    """Extract optional discovery metadata (capabilities/tags/role) from frontmatter.
+
+    Non-list values are coerced to empty lists so downstream search code can
+    rely on the shape without re-validating.
+    """
+    caps = metadata.get("capabilities")
+    tags = metadata.get("tags")
+    role = metadata.get("role")
+    return {
+        "capabilities": [str(c) for c in caps] if isinstance(caps, list) else [],
+        "tags": [str(t) for t in tags] if isinstance(tags, list) else [],
+        "role": str(role) if isinstance(role, str) else "",
+    }
+
+
 def _scan_directory(
     directory: Path,
     source_label: str,
@@ -71,12 +87,14 @@ def _scan_directory(
         if item.is_dir():
             profile_name = item.name
             desc = ""
+            discovery = _discovery_fields({})
             # Check for agent.md inside directory
             agent_md = item / "agent.md"
             if agent_md.exists():
                 try:
                     data = frontmatter.loads(agent_md.read_text())
                     desc = data.metadata.get("description", "")
+                    discovery = _discovery_fields(data.metadata)
                 except Exception:
                     pass
             _record(profile_name)
@@ -85,13 +103,16 @@ def _scan_directory(
                     "name": profile_name,
                     "description": desc,
                     "source": source_label,
+                    **discovery,
                 }
         elif item.suffix == ".md" and item.is_file():
             profile_name = item.stem
             desc = ""
+            discovery = _discovery_fields({})
             try:
                 data = frontmatter.loads(item.read_text())
                 desc = data.metadata.get("description", "")
+                discovery = _discovery_fields(data.metadata)
             except Exception:
                 pass
             _record(profile_name)
@@ -100,6 +121,7 @@ def _scan_directory(
                     "name": profile_name,
                     "description": desc,
                     "source": source_label,
+                    **discovery,
                 }
 
 
@@ -172,12 +194,14 @@ def list_agent_profiles() -> List[Dict]:
                         "name": profile_name,
                         "description": data.metadata.get("description", ""),
                         "source": "built-in",
+                        **_discovery_fields(data.metadata),
                     }
                 except Exception:
                     profiles[profile_name] = {
                         "name": profile_name,
                         "description": "",
                         "source": "built-in",
+                        **_discovery_fields({}),
                     }
     except Exception as e:
         logger.debug(f"Could not scan built-in agent store: {e}")

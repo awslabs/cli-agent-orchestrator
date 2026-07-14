@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `cao profile find <query>` CLI verb and `find_profiles` MCP tool for keyword/BM25 profile discovery over metadata (name, description, tags, capabilities); metadata-only, never exposes prompt bodies (#340)
+- Optional `capabilities` and `tags` arrays in the agent profile frontmatter schema
+
 ### Security
 
 - enable Jinja2 autoescape in the agent-profile scaffolding `Environment` (`agent_scaffold.py`). Jinja2 defaults to `autoescape=False`, which AppSec scanners flag as an XSS risk (ACAT `Jinja2AutoescapeDisabled`). A custom selector strips a trailing `.j2` before delegating to `select_autoescape(enabled_extensions=("html","htm","xml"))`, so a future `template.html.j2` / `template.xml.j2` is treated as HTML/XML and escaped, while the current `template.md.j2` markdown/bash output stays byte-identical (regression test added) (#429)

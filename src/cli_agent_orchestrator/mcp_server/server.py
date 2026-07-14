@@ -4,7 +4,7 @@ import logging
 import os
 import re
 import time
-from typing import Any, Dict, NamedTuple, Optional, Tuple, Union
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import requests
 from fastmcp import FastMCP
@@ -1251,6 +1251,44 @@ def delete_terminal(
         return {"success": False, "message": f"Failed to delete terminal: {str(e)}"}
     except Exception as e:
         return {"success": False, "message": f"Failed to delete terminal: {str(e)}"}
+
+
+# =============================================================================
+# Profile Discovery Tools
+# =============================================================================
+
+
+@mcp.tool()
+def find_profiles(
+    query: str = Field(
+        description="Free-text keywords describing the capability you need (e.g. 'monitor sqs')"
+    ),
+    limit: int = Field(default=10, description="Maximum number of results to return"),
+) -> List[Dict[str, Any]]:
+    """Find installed agent profiles by keyword, ranked by relevance.
+
+    Searches profile metadata (name, description, tags, capabilities) and
+    returns the best matches. Use this to discover which agent profile to
+    hand off or assign work to when you don't know the profile name.
+
+    This tool is read-only and returns metadata only — it never exposes a
+    profile's prompt body and cannot install, spawn, or delegate.
+
+    Args:
+        query: Free-text keywords (e.g. "monitor sqs")
+        limit: Maximum number of results
+
+    Returns:
+        List of matches sorted by descending relevance, each with:
+        name, description, capabilities, tags, role, source, score.
+    """
+    from cli_agent_orchestrator.services.profile_search import search_profiles
+
+    try:
+        return search_profiles(query, limit=limit)
+    except Exception as e:
+        logger.error(f"find_profiles failed: {e}")
+        return []
 
 
 # =============================================================================
