@@ -64,8 +64,11 @@ def _copy_local_profile_to_store(agent_source: str) -> Optional[str]:
 @click.option(
     "--provider",
     type=click.Choice(PROVIDERS),
-    default=DEFAULT_PROVIDER,
-    help=f"Provider to use (default: {DEFAULT_PROVIDER})",
+    default=None,
+    help=(
+        "Provider to use. Precedence: this flag > the profile's frontmatter "
+        f"'provider:' key > default ({DEFAULT_PROVIDER})."
+    ),
 )
 @click.option(
     "--env",
@@ -77,7 +80,7 @@ def _copy_local_profile_to_store(agent_source: str) -> Optional[str]:
         "Repeatable: --env KEY=VALUE. Example: --env API_TOKEN=my-secret-token."
     ),
 )
-def install(agent_source: str, provider: str, env_vars: tuple[str, ...]) -> None:
+def install(agent_source: str, provider: Optional[str], env_vars: tuple[str, ...]) -> None:
     """
     Install an agent from local store, built-in store, URL, or file path.
 
@@ -138,4 +141,8 @@ def install(agent_source: str, provider: str, env_vars: tuple[str, ...]) -> None
     if result.context_file:
         click.echo(f"✓ Context file: {result.context_file}")
     if result.agent_file:
-        click.echo(f"✓ {provider} agent: {result.agent_file}")
+        # The service resolves flag > frontmatter > default; result.provider
+        # carries the winner (older mocks may omit it, hence the fallback).
+        click.echo(
+            f"✓ {result.provider or provider or DEFAULT_PROVIDER} agent: {result.agent_file}"
+        )

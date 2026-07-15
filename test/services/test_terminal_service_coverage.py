@@ -20,6 +20,7 @@ class TestCreateTerminalCleanup:
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
     @patch(
         "cli_agent_orchestrator.services.terminal_service.generate_window_name", return_value="w1"
@@ -35,13 +36,15 @@ class TestCreateTerminalCleanup:
         mock_tid,
         mock_wname,
         mock_db_create,
+        mock_db_delete,
         mock_pm,
         mock_tmux,
         mock_log_dir,
         mock_fifo_manager,
         mock_status_monitor,
     ):
-        """When provider.initialize() fails, cleanup should kill session and cleanup provider."""
+        """When provider.initialize() fails, cleanup should kill session, cleanup
+        provider, AND roll back the DB terminal row."""
         from cli_agent_orchestrator.services.terminal_service import create_terminal
 
         mock_tmux.session_exists.return_value = False
@@ -64,6 +67,7 @@ class TestCreateTerminalCleanup:
 
         mock_pm.cleanup_provider.assert_called_once_with("tid1")
         mock_tmux.kill_session.assert_called_once()
+        mock_db_delete.assert_called_once_with("tid1")
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
@@ -71,6 +75,7 @@ class TestCreateTerminalCleanup:
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
     @patch(
         "cli_agent_orchestrator.services.terminal_service.generate_window_name", return_value="w1"
@@ -86,13 +91,16 @@ class TestCreateTerminalCleanup:
         mock_tid,
         mock_wname,
         mock_db_create,
+        mock_db_delete,
         mock_pm,
         mock_tmux,
         mock_log_dir,
         mock_fifo_manager,
         mock_status_monitor,
     ):
-        """When new_session=False, cleanup should NOT kill the session."""
+        """When new_session=False, cleanup rolls back the DB terminal row but must
+        NOT kill the pre-existing session. The regression guard for "delete DB
+        row, don't kill session."."""
         from cli_agent_orchestrator.services.terminal_service import create_terminal
 
         mock_tmux.session_exists.return_value = True
@@ -114,6 +122,7 @@ class TestCreateTerminalCleanup:
             )
 
         mock_pm.cleanup_provider.assert_called_once()
+        mock_db_delete.assert_called_once_with("tid1")
         mock_tmux.kill_session.assert_not_called()
 
     @pytest.mark.asyncio
@@ -122,6 +131,7 @@ class TestCreateTerminalCleanup:
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
     @patch(
         "cli_agent_orchestrator.services.terminal_service.generate_window_name", return_value="w1"
@@ -137,13 +147,16 @@ class TestCreateTerminalCleanup:
         mock_tid,
         mock_wname,
         mock_db_create,
+        mock_db_delete,
         mock_pm,
         mock_tmux,
         mock_log_dir,
         mock_fifo_manager,
         mock_status_monitor,
     ):
-        """Cleanup errors should be swallowed, original error re-raised."""
+        """Cleanup errors should be swallowed, original error re-raised. The DB
+        rollback still runs after cleanup_provider raises, and its own error is
+        swallowed too."""
         from cli_agent_orchestrator.services.terminal_service import create_terminal
 
         mock_tmux.session_exists.return_value = False
@@ -155,6 +168,7 @@ class TestCreateTerminalCleanup:
         mock_provider.initialize = AsyncMock(side_effect=Exception("original error"))
         mock_pm.create_provider.return_value = mock_provider
         mock_pm.cleanup_provider.side_effect = Exception("cleanup error")
+        mock_db_delete.side_effect = Exception("db delete error")
         mock_tmux.kill_session.side_effect = Exception("kill error")
 
         with pytest.raises(Exception, match="original error"):
@@ -165,6 +179,9 @@ class TestCreateTerminalCleanup:
                 new_session=True,
                 allowed_tools=["*"],
             )
+
+        # DB rollback runs even though cleanup_provider raised first.
+        mock_db_delete.assert_called_once_with("tid1")
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")

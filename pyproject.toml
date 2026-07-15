@@ -46,6 +46,9 @@ dependencies = [
     "pyjwt[crypto]>=2.8.0",
     "jsonschema>=4.25",
     "jinja2>=3.1.0",
+    # Obsidian graph sink (Issue #348) imports yaml at module top; declare it
+    # directly instead of relying on a transitive dep so the import can't break.
+    "pyyaml>=6.0",
 ]
 
 [project.scripts]
@@ -96,6 +99,7 @@ dev = [
     "mypy>=1.5.0",
     "pytest-xdist>=3.8.0",
     "hypothesis>=6.0",
+    "networkx>=3.0",
     "tomli>=2.0.0; python_version < '3.11'",
 ]
 
@@ -108,7 +112,7 @@ profile = "black"
 line_length = 100
 
 [tool.mypy]
-python_version = "2.3.0"
+python_version = "3.10"
 strict = true
 warn_return_any = true
 warn_unused_configs = true

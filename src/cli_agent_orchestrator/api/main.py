@@ -35,7 +35,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from cli_agent_orchestrator.backends import TerminalNotFoundError
+from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
@@ -63,6 +63,11 @@ from cli_agent_orchestrator.constants import (
     add_local_cors_origins,
 )
 from cli_agent_orchestrator.ext_apps import mount_widget_static
+from cli_agent_orchestrator.graph.providers import get_provider
+
+# Import the sinks package for its import-time @register_sink side effects
+# ("okf", "obsidian", "graphml"); get_sink resolves by name from the registry.
+from cli_agent_orchestrator.graph.sinks import get_sink
 from cli_agent_orchestrator.models.flow import Flow
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
 from cli_agent_orchestrator.models.memory import (
@@ -85,6 +90,7 @@ from cli_agent_orchestrator.security.auth import (
 )
 from cli_agent_orchestrator.services import (
     flow_service,
+    secret_gate,
     session_service,
     terminal_service,
 )
@@ -345,6 +351,25 @@ class WorkflowRunRequest(BaseModel):
     )
 
 
+class GraphExportRequest(BaseModel):
+    """Request body for ``POST /graph/{provider}/export`` (U4, Issue #348)."""
+
+    sink: str = Field(description="Registered sink name (resolved via get_sink; KeyError -> 404)")
+    dest: str = Field(
+        description=(
+            "Export destination, confined UNDER the configured graph-export root "
+            "(CAO_GRAPH_EXPORT_ROOT). Treated as a path RELATIVE to that root; an "
+            "absolute path is accepted only if it already resolves under the root, "
+            "otherwise the export is rejected (400). Traversal/symlink escapes are "
+            "rejected via safe_join_under_base."
+        )
+    )
+    options: dict = Field(
+        default_factory=dict,
+        description="Opaque per-sink options forwarded as **options; the route never inspects them",
+    )
+
+
 class StepOutputResponse(BaseModel):
     """Response for the structured-return endpoint — mirrors the stored record."""
 
@@ -373,10 +398,14 @@ class InstallAgentProfileRequest(BaseModel):
 
     ``env_vars`` travels in the JSON body rather than as a query parameter so
     that any secrets callers inject are not written to HTTP access logs.
+
+    ``provider`` may be omitted (None): the install service then honours the
+    profile's frontmatter ``provider:`` key, falling back to the default
+    provider — the same flag > frontmatter > default precedence as the CLI.
     """
 
     source: str
-    provider: str = DEFAULT_PROVIDER
+    provider: Optional[str] = None
     env_vars: Optional[Dict[str, str]] = None
 
 
@@ -1736,6 +1765,132 @@ async def resume_workflow_run_endpoint(
     return result.model_dump()
 
 
+# ── graph layer (U4, Issue #348) ────────────────────────────────────────
+#
+# Two routes over the provider/sink seams. There is ZERO branching over the
+# provider or sink NAME (NFR-5): the only conditionals are try/except on
+# registry-resolution outcome. Names resolve through get_provider/get_sink,
+# which raise KeyError for an unregistered name (mapped to 404 here).
+
+
+@app.get("/graph/{provider}")
+async def get_graph_endpoint(
+    provider: str,
+    request: Request,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Project a provider's GraphView and return its wire shape.
+
+    Scope-gated (D5 posture): when auth is enabled, any of
+    ``cao:read`` / ``cao:write`` / ``cao:admin`` is required (read is the
+    floor) — identical to ``/events``. This SUPERSEDES the original FR-12
+    "UNGATED by design" wording: the graph carries private-scope
+    structure, including contradiction-edge summaries of memory CONTENT, so
+    an unauthenticated caller must not be able to read it (PR #424 review).
+
+    Private tiers are REFUSED outright: a ``scope`` of ``session`` or
+    ``agent`` is rejected with 400 even for an authed ``cao:read`` caller,
+    mirroring ``/memory/export`` — the API surface never exposes private
+    tiers (D5). All other query params (``scope_id`` and any extras) are
+    forwarded to the provider as ``**filters``.
+
+    Error taxonomy: unregistered provider -> 404; private-scope request or
+    provider ValueError (e.g. a bad filter value) -> 400.
+    """
+    filters = dict(request.query_params)
+
+    # Private-scope gate (D5): the graph route takes ``scope`` as a query
+    # string, so compare its value against the private MemoryScope values.
+    # Mirrors /memory/export's MemoryScope.SESSION/AGENT refusal. The check is
+    # case-insensitive so ``scope=Session`` / ``scope=AGENT`` can't slip past;
+    # only this local comparison is normalized — the raw value is still
+    # forwarded to the provider in ``filters`` unchanged.
+    requested_scope = filters.get("scope")
+    if requested_scope is not None and requested_scope.lower() in (
+        MemoryScope.SESSION.value,
+        MemoryScope.AGENT.value,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"scope '{requested_scope}' is private and cannot be read via the graph API",
+        )
+
+    try:
+        inst = get_provider(provider)
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"unknown graph provider '{provider}'",
+        )
+    try:
+        view = await inst.project(**filters)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return view.to_dict()
+
+
+@app.post("/graph/{provider}/export")
+async def export_graph_endpoint(
+    provider: str,
+    body: GraphExportRequest,
+    request: Request,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Project a provider's view and export it through a named sink (FR-12).
+
+    Scope-gated (401 no/invalid token, 403 valid-but-insufficient). The
+    serialized view is scanned by ``secret_gate`` BEFORE the sink is
+    invoked; a hit rejects the export with 422 and the sink's ``export`` is
+    never called. The 422 detail names only the matched PATTERN, never the
+    matched bytes.
+
+    Error taxonomy: unregistered provider or sink -> 404; secret hit -> 422;
+    provider/sink ValueError -> 400; sink OSError (e.g. dest is an existing
+    directory, permission denied, ENOSPC) -> 400 — a bad-dest-shape failure
+    kept consistent with the ValueError mapping rather than leaking a 500.
+    """
+    filters = dict(request.query_params)
+    try:
+        prov = get_provider(provider)
+        sink = get_sink(body.sink)
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"unknown graph provider '{provider}' or sink '{body.sink}'",
+        )
+
+    try:
+        view = await prov.project(**filters)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    # Credential gate (ADR-5): scan the serialized view; on a hit, reject
+    # before the sink writes anything. secret_gate returns the pattern NAME,
+    # never the matched bytes, so the detail is safe to surface.
+    serialized = json.dumps(view.to_dict())
+    hit = secret_gate.scan_for_secrets(serialized)
+    if hit is not None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"export rejected: secret pattern '{hit}' detected",
+        )
+
+    try:
+        written_files = sink.export(view, body.dest, **body.options)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except OSError as e:
+        # dest is an existing directory (IsADirectoryError), permission
+        # denied, ENOSPC, etc. — a bad destination, mapped to 400 for
+        # consistency with the ValueError branch rather than a bare 500.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"export failed writing to destination: {e}",
+        )
+
+    return {"written_files": written_files, "sink": body.sink, "dest": body.dest}
+
+
 @app.delete("/terminals/{terminal_id}")
 async def delete_terminal(
     request: Request,
@@ -1901,6 +2056,7 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     # or future code paths could still bypass that, and tmux parses
     # ':' / '.' as target delimiters. Bind the validator return values
     # so the sanitization is explicit at the actual sink below.
+    # This tmux-shaped validation is deliberately applied to every backend.
     try:
         session_name = validate_tmux_name(metadata["tmux_session"], "session_name")
         window_name = validate_tmux_name(metadata["tmux_window"], "window_name")
@@ -1908,14 +2064,23 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
         await websocket.close(code=4003, reason="Invalid tmux target name")
         return
 
-    # Create PTY pair for tmux attach
+    try:
+        attach_command = await asyncio.to_thread(
+            get_backend().prepare_web_attach, session_name, window_name
+        )
+    except TerminalBackendError as e:
+        logger.error(f"Web attach failed for terminal {terminal_id}: {e}")
+        await websocket.close(code=4004, reason="Failed to attach terminal")
+        return
+
+    # Create PTY pair for backend attach
     master_fd, slave_fd = pty.openpty()
 
     # Set initial terminal size
     winsize = struct.pack("HHHH", 24, 80, 0, 0)
     fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
 
-    # Start tmux attach inside the PTY.
+    # Start the configured backend's interactive client inside the PTY.
     # Container/devcontainer environments often leave TERM unset or set to
     # ``dumb``, which strips colours, breaks cursor positioning and corrupts
     # the Ink-based TUIs that agent CLIs render. Force a sane default so the
@@ -1923,7 +2088,7 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     # Any explicit non-dumb TERM the operator set is preserved.
     pty_env = _build_pty_env()
     proc = subprocess.Popen(
-        ["tmux", "-u", "attach-session", "-t", f"{session_name}:{window_name}"],
+        attach_command,
         stdin=slave_fd,
         stdout=slave_fd,
         stderr=slave_fd,
