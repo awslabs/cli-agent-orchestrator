@@ -640,7 +640,9 @@ class TestColdStartStallDetection:
 
         manager._check_pipe_liveness("term")
 
-        assert rearm_calls == [True], "a born-stale pipe must be re-armed without waiting for divergence"
+        assert rearm_calls == [
+            True
+        ], "a born-stale pipe must be re-armed without waiting for divergence"
 
     def test_cold_start_not_triggered_before_grace_period_elapses(self, tmp_path, monkeypatch):
         """A terminal registered moments ago must get its grace period, not
@@ -687,7 +689,9 @@ class TestColdStartStallDetection:
         for _ in range(4):
             manager._check_pipe_liveness("term")  # pane never changes, FIFO silent since
 
-        assert rearm_calls == [], "a pipe that has ever delivered must use the idle/divergence path, not cold-start"
+        assert (
+            rearm_calls == []
+        ), "a pipe that has ever delivered must use the idle/divergence path, not cold-start"
 
     def test_cold_start_state_absent_falls_back_to_existing_behavior(self, tmp_path, monkeypatch):
         """Terminals enrolled directly (bypassing create_reader — exactly how
@@ -736,9 +740,7 @@ class TestColdStartStallDetection:
         content stops changing."""
         manager = self._manager(tmp_path, monkeypatch)
         try:
-            manager.create_reader(
-                "term-e2e", pane_probe=lambda: "content", rearm=lambda: None
-            )
+            manager.create_reader("term-e2e", pane_probe=lambda: "content", rearm=lambda: None)
             with manager._lock:
                 assert manager._registered_at.get("term-e2e") is not None
                 assert manager._ever_delivered.get("term-e2e") is False
@@ -756,9 +758,9 @@ class TestColdStartStallDetection:
                 time.sleep(0.02)
 
             with manager._lock:
-                assert manager._ever_delivered.get("term-e2e") is True, (
-                    "the reader thread must flip _ever_delivered once real bytes are read"
-                )
+                assert (
+                    manager._ever_delivered.get("term-e2e") is True
+                ), "the reader thread must flip _ever_delivered once real bytes are read"
         finally:
             manager.stop_reader("term-e2e")
             manager.stop_watchdog()

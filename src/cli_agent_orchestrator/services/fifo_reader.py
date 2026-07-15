@@ -632,9 +632,11 @@ class FifoManager:
         logger.warning(
             "pipe-pane forwarder for terminal %s appears %s — re-arming",
             terminal_id,
-            "never started forwarding (cold-start, harness-control#93)"
-            if cold_start
-            else "stalled (pane advanced, no FIFO data)",
+            (
+                "never started forwarding (cold-start, harness-control#93)"
+                if cold_start
+                else "stalled (pane advanced, no FIFO data)"
+            ),
         )
         try:
             rearm()
@@ -653,6 +655,7 @@ class FifoManager:
                     self._rearm_failures.pop(terminal_id, None)
                     self._registered_at.pop(terminal_id, None)
                     self._ever_delivered.pop(terminal_id, None)
+                    self._cold_start_attempts.pop(terminal_id, None)
             if give_up:
                 # Not a silent retry-forever: a re-arm that keeps failing
                 # (e.g. the tmux pane is gone) previously re-struck and
