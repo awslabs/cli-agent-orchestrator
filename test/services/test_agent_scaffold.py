@@ -195,3 +195,52 @@ class TestRenderTemplate:
     def test_invalid_config_raises(self):
         with pytest.raises(ValueError, match="validation failed"):
             render_template("aws/stepfunction", {"profile": "x"})
+
+
+class TestAutoescapeBehavior:
+    """Locks in the Jinja2 autoescape configuration (PR #429 follow-up).
+
+    The scaffold enables autoescape via a custom selector so it is never
+    silently off (Jinja2's default), but the current ``*.md.j2`` templates must
+    stay byte-identical — escaping HTML entities into a bash heredoc / JSON
+    body would functionally corrupt the generated agent. These tests assert
+    both halves of that contract explicitly, since the other render tests only
+    use benign values with no escapable characters.
+    """
+
+    # Contains every character HTML autoescape would rewrite: & < > " '
+    _SPECIAL = "<tag> & \"dquote\" 'squote' >payload<"
+    # markupsafe/Jinja2 HTML entities that MUST NOT appear in markdown output.
+    _HTML_ENTITIES = ["&amp;", "&lt;", "&gt;", "&#34;", "&quot;", "&#39;"]
+
+    def test_markdown_output_is_not_escaped(self):
+        config = {
+            "profile": "my-profile",
+            "region": "us-east-1",
+            "queue_url": "https://sqs.us-east-1.amazonaws.com/123/MyQueue",
+            "message_body": self._SPECIAL,
+            "message_group_id": "",
+        }
+        result = render_template("aws/sqs-send", config)
+
+        # The raw value is embedded verbatim (twice: the "Message Body" line
+        # and the heredoc), proving autoescape did not engage for .md.j2.
+        assert self._SPECIAL in result
+        for entity in self._HTML_ENTITIES:
+            assert entity not in result, f"unexpected HTML escaping: {entity}"
+
+    def test_selector_engages_for_html_and_xml_templates(self):
+        """The advertised safety net is real: a future ``template.html.j2`` /
+        ``template.xml.j2`` would be escaped despite the trailing ``.j2``."""
+        from cli_agent_orchestrator.services.agent_scaffold import (
+            _autoescape_for_template,
+        )
+
+        # Escaping engages for HTML/XML under the *.ext.j2 naming convention.
+        assert _autoescape_for_template("template.html.j2") is True
+        assert _autoescape_for_template("template.htm.j2") is True
+        assert _autoescape_for_template("template.xml.j2") is True
+        # ... and stays off for markdown and unknown inputs (byte-identical).
+        assert _autoescape_for_template("template.md.j2") is False
+        assert _autoescape_for_template("template.md") is False
+        assert _autoescape_for_template(None) is False

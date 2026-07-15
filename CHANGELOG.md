@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Security
+
+- enable Jinja2 autoescape in the agent-profile scaffolding `Environment` (`agent_scaffold.py`). Jinja2 defaults to `autoescape=False`, which AppSec scanners flag as an XSS risk (ACAT `Jinja2AutoescapeDisabled`). A custom selector strips a trailing `.j2` before delegating to `select_autoescape(enabled_extensions=("html","htm","xml"))`, so a future `template.html.j2` / `template.xml.j2` is treated as HTML/XML and escaped, while the current `template.md.j2` markdown/bash output stays byte-identical (regression test added) (#429)
+
 ## [2.3.0] - 2026-07-12
 
 ### Added
@@ -85,8 +92,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Fixed
-
-- security: enable Jinja2 autoescape in the agent-profile scaffolding `Environment` (`agent_scaffold.py`). Jinja2 defaults to `autoescape=False`, which AppSec scanners flag as an XSS risk. Uses `select_autoescape(enabled_extensions=("html","htm","xml"))` so HTML/XML templates would be escaped while the current markdown/bash `.md.j2` output stays byte-identical
 
 - stop TestPyPI squats breaking the release smoke test (#270)
 
