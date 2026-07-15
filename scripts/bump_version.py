@@ -29,7 +29,11 @@ def bump(part: str, version: str) -> str:
 
 def update_pyproject(new_version: str) -> None:
     content = PYPROJECT.read_text()
-    content = re.sub(r'version = "[^"]+"', f'version = "{new_version}"', content)
+    # Anchor to the start of a line so only the [project] ``version`` key is
+    # rewritten. An unanchored ``version = "..."`` also matches the tail of
+    # ``python_version = "..."`` under [tool.mypy], which previously clobbered
+    # the mypy target with the package version on every release.
+    content = re.sub(r'(?m)^version = "[^"]+"', f'version = "{new_version}"', content, count=1)
     PYPROJECT.write_text(content)
 
 
