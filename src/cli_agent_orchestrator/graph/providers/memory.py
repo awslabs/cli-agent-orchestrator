@@ -10,12 +10,21 @@ import asyncio
 import logging
 from typing import Any, Optional
 
+from cli_agent_orchestrator.graph.cache import GraphViewCache, make_meta
 from cli_agent_orchestrator.graph.models import Edge, EdgeType, GraphView, Node
 from cli_agent_orchestrator.graph.providers.base import GraphProvider, register_provider
 from cli_agent_orchestrator.services import wiki_lint
 from cli_agent_orchestrator.services.memory_service import MemoryService
 
 logger = logging.getLogger(__name__)
+
+# Module-level cache shared across every MemoryGraphProvider instance (the U4
+# route instantiates a fresh provider per request via get_provider, so a
+# per-instance cache would never hit). DELIBERATE reversal of the original
+# "lint-on-demand, no caching" ADR — see graph/cache.py for the perf finding
+# (ripgrep stale_claim ~20s + LLM ~8.5s ⇒ ~30s typical, up to ~148s under
+# load, past the frontend's 120s timeout). Keyed by (provider, scope, scope_id).
+_CACHE = GraphViewCache()
 
 
 @register_provider("memory")
@@ -36,9 +45,30 @@ class MemoryGraphProvider(GraphProvider):
         self._svc = memory_service or MemoryService()
 
     async def project(self, **filters: Any) -> GraphView:
+        """Return this scope's GraphView, served from cache when fresh.
+
+        The expensive build (``_build`` — which awaits ``wiki_lint.run_lint``)
+        runs at most once per (scope, scope_id) per TTL window; concurrent cold
+        requests for the same key collapse onto a single build (single-flight,
+        see GraphViewCache). ``meta.cached`` / ``meta.as_of`` tell the frontend
+        whether it got a hit and when the underlying data was projected.
+        """
         scope = str(filters.get("scope", "global"))
         raw_scope_id = filters.get("scope_id")
         scope_id: Optional[str] = None if raw_scope_id is None else str(raw_scope_id)
+
+        key = ("memory", scope, scope_id)
+        view, cached, as_of = await _CACHE.get_or_build(key, lambda: self._build(scope, scope_id))
+        # Re-wrap with fresh cache provenance without mutating the cached
+        # instance's own meta (the same GraphView object is served to every hit).
+        return GraphView(
+            nodes=view.nodes,
+            edges=view.edges,
+            meta=make_meta(view.meta, cached=cached, as_of=as_of),
+        )
+
+    async def _build(self, scope: str, scope_id: Optional[str]) -> GraphView:
+        """Project the scope's wiki into a GraphView (the uncached, ~148s path)."""
         meta: dict[str, Any] = {"provider": "memory", "scope": scope, "scope_id": scope_id}
 
         # Resolve + parse the scope's index. A scope with no wiki on disk
