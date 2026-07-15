@@ -74,6 +74,15 @@ class TestTmuxBackendDelegation:
         assert len(result) == 1
         mock_client.list_sessions.assert_called_once()
 
+    def test_prepare_web_attach_returns_window_target(self, backend):
+        assert backend.prepare_web_attach("cao-test", "developer-abcd") == [
+            "tmux",
+            "-u",
+            "attach-session",
+            "-t",
+            "cao-test:developer-abcd",
+        ]
+
     def test_kill_session_delegates(self, backend, mock_client):
         mock_client.kill_session.return_value = True
         assert backend.kill_session("cao-test") is True

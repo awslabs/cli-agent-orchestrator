@@ -613,6 +613,15 @@ class TestWebSocketSubprocessTerm:
             captured["kwargs"] = kwargs
             raise _StopHere("captured Popen args")
 
+        backend = MagicMock()
+        backend.prepare_web_attach.return_value = [
+            "tmux",
+            "-u",
+            "attach-session",
+            "-t",
+            "cao-s:w",
+        ]
+
         with (
             patch.dict("os.environ", {"TERM": "dumb", "HOME": "/root"}, clear=True),
             patch.object(
@@ -620,6 +629,7 @@ class TestWebSocketSubprocessTerm:
                 "get_terminal_metadata",
                 return_value={"tmux_session": "cao-s", "tmux_window": "w"},
             ),
+            patch.object(main_module, "get_backend", return_value=backend),
             patch.object(main_module.subprocess, "Popen", side_effect=capture_and_stop),
             patch.object(main_module.pty, "openpty", return_value=(100, 101)),
             patch.object(main_module.fcntl, "ioctl"),
@@ -635,6 +645,72 @@ class TestWebSocketSubprocessTerm:
             "the parent's broken TERM (issue #150)"
         )
         assert passed_env["TERM"] == "xterm-256color"
+
+    @pytest.mark.asyncio
+    async def test_websocket_uses_configured_backend_attach_command(self):
+        """Herdr-backed terminals must not be attached through tmux."""
+        from cli_agent_orchestrator.api import main as main_module
+
+        ws = MagicMock()
+        ws.client = MagicMock(host="127.0.0.1")
+        ws.accept = AsyncMock()
+        ws.close = AsyncMock()
+
+        backend = MagicMock()
+        backend.prepare_web_attach.return_value = ["herdr", "--session", "cao"]
+
+        captured: Dict[str, object] = {}
+
+        def capture_and_stop(*args, **kwargs):
+            captured["args"] = args
+            raise _StopHere("captured Popen args")
+
+        with (
+            patch.object(
+                main_module,
+                "get_terminal_metadata",
+                return_value={"tmux_session": "cao-s", "tmux_window": "w"},
+            ),
+            patch.object(main_module, "get_backend", return_value=backend),
+            patch.object(main_module.subprocess, "Popen", side_effect=capture_and_stop),
+            patch.object(main_module.pty, "openpty", return_value=(100, 101)),
+            patch.object(main_module.fcntl, "ioctl"),
+            patch.object(main_module.fcntl, "fcntl"),
+            patch.object(main_module.os, "close"),
+        ):
+            with pytest.raises(_StopHere):
+                await main_module.terminal_ws(ws, "abcd1234")
+
+        backend.prepare_web_attach.assert_called_once_with("cao-s", "w")
+        assert captured["args"][0] == ["herdr", "--session", "cao"]
+
+    @pytest.mark.asyncio
+    async def test_websocket_closes_safely_when_backend_attach_fails(self):
+        """Backend attach errors close safely before allocating a PTY."""
+        from cli_agent_orchestrator.api import main as main_module
+        from cli_agent_orchestrator.backends import TerminalBackendError
+
+        ws = MagicMock()
+        ws.client = MagicMock(host="127.0.0.1")
+        ws.accept = AsyncMock()
+        ws.close = AsyncMock()
+
+        backend = MagicMock()
+        backend.prepare_web_attach.side_effect = TerminalBackendError("sensitive backend detail")
+
+        with (
+            patch.object(
+                main_module,
+                "get_terminal_metadata",
+                return_value={"tmux_session": "cao-s", "tmux_window": "w"},
+            ),
+            patch.object(main_module, "get_backend", return_value=backend),
+            patch.object(main_module.pty, "openpty") as mock_openpty,
+        ):
+            await main_module.terminal_ws(ws, "abcd1234")
+
+        ws.close.assert_awaited_once_with(code=4004, reason="Failed to attach terminal")
+        mock_openpty.assert_not_called()
 
 
 class _StopHere(Exception):
