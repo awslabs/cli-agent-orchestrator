@@ -288,6 +288,97 @@
     };
   }
 
+  // Canned knowledge-graph snapshot for the ui://cao/graph view. Mirrors
+  // GraphView.to_dict()'s wire shape (nodes id/kind/label/status/attrs; edges
+  // source/target/type/attrs; meta). Deliberately exercises all three FR-19
+  // visual signals so the render proof is meaningful: `auth` is a hub
+  // (attrs.is_hub + several outgoing edges), `orphan-note` is dimmed
+  // (attrs.is_orphan), and login↔session is a red `contradiction` edge. Every
+  // edge endpoint resolves to a declared node id — the GraphView model rejects
+  // dangling edges.
+  function graphSnapshot() {
+    const now = nowIso();
+    const nodes = [
+      {
+        id: "auth",
+        kind: "topic",
+        label: "auth",
+        status: "active",
+        attrs: { is_hub: true },
+      },
+      {
+        id: "login",
+        kind: "topic",
+        label: "login",
+        status: "active",
+        attrs: {},
+      },
+      {
+        id: "session",
+        kind: "topic",
+        label: "session",
+        status: "active",
+        attrs: {},
+      },
+      {
+        id: "tokens",
+        kind: "topic",
+        label: "tokens",
+        status: "active",
+        attrs: {},
+      },
+      {
+        id: "orphan-note",
+        kind: "topic",
+        label: "orphan-note",
+        status: "active",
+        attrs: { is_orphan: true },
+      },
+    ];
+    const edges = [
+      {
+        source: "auth",
+        target: "login",
+        type: "relates_to",
+        attrs: { source: "related_keys" },
+      },
+      {
+        source: "auth",
+        target: "session",
+        type: "relates_to",
+        attrs: { source: "related_keys" },
+      },
+      {
+        source: "auth",
+        target: "tokens",
+        type: "relates_to",
+        attrs: { source: "related_keys" },
+      },
+      {
+        source: "login",
+        target: "session",
+        type: "contradiction",
+        attrs: {
+          source: "wiki_lint",
+          summary: "login vs session lifetime disagree",
+        },
+      },
+    ];
+    return {
+      nodes,
+      edges,
+      meta: {
+        provider: "memory",
+        generated_at: now,
+        node_count: nodes.length,
+        edge_count: edges.length,
+        filters: {},
+        live: false,
+        as_of: now,
+      },
+    };
+  }
+
   // --- iframe registry + JSON-RPC plumbing --------------------------------
   /** view name -> { win: contentWindow, initialized: boolean, resolve } */
   const frames = new Map();
@@ -310,6 +401,8 @@
       return replyResult(winInfo, id, dashboardSnapshot());
     if (name === "render_agent_view")
       return replyResult(winInfo, id, agentSnapshot(args.terminal_id));
+    if (name === "render_graph_view")
+      return replyResult(winInfo, id, graphSnapshot());
     if (name === "cao_fetch_history")
       return replyResult(winInfo, id, {
         events: state.events.map((e) => ({ ...e })),
@@ -396,6 +489,11 @@
       if (winInfo.view === "agent") {
         pushTo(winInfo, "ui/notifications/tool-result", {
           structuredContent: agentSnapshot(AGENT_VIEW_ID),
+        });
+      }
+      if (winInfo.view === "graph") {
+        pushTo(winInfo, "ui/notifications/tool-result", {
+          structuredContent: graphSnapshot(),
         });
       }
       if (winInfo.resolve) winInfo.resolve();

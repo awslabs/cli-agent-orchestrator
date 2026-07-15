@@ -1,0 +1,618 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CAO Memory Graph Explorer (dev)</title>
+  <!--
+    STANDALONE, READ-ONLY dev tool. NOT shipped product code, NOT the
+    MCP-Apps ui://cao/graph renderer. Loads a REAL memory graph from a
+    running cao-server and lets you click a node to READ that memory.
+
+    Visual rules mirror cao_mcp_apps/src/graph/GraphView.tsx:
+      HUB_SIZE=12, DEFAULT_SIZE=6, ORPHAN_COLOR=#9ca3af,
+      DEFAULT_NODE_COLOR=#2563eb, CONTRADICTION_COLOR=#dc2626,
+      DEFAULT_EDGE_COLOR=#94a3b8, circular.assign() before Sigma mounts.
+
+    Deps loaded via esm.sh CDN, pinned to the repo's versions:
+      sigma 3.0.3, graphology 0.26.0, graphology-layout 0.6.1.
+
+    See README.md in this dir for run instructions (CORS + ports).
+  -->
+  <style>
+    :root {
+      --node-default: #2563eb;
+      --edge-default: #94a3b8;
+      --contradiction: #dc2626;
+      --orphan: #9ca3af;
+      --bg: #f8fafc;
+      --panel-bg: #ffffff;
+      --border: #e2e8f0;
+      --text: #1e293b;
+      --muted: #64748b;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: var(--text); background: var(--bg); }
+    #app { display: flex; flex-direction: column; height: 100vh; }
+
+    header {
+      display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+      padding: 10px 16px; background: var(--panel-bg);
+      border-bottom: 1px solid var(--border);
+    }
+    header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+    header .spacer { flex: 1; }
+    header label { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 4px; }
+    header select, header input {
+      font-size: 13px; padding: 4px 6px; border: 1px solid var(--border);
+      border-radius: 4px; background: #fff;
+    }
+    header input#scopeId { width: 130px; }
+    header input#serverBase { width: 190px; }
+    header button {
+      font-size: 13px; padding: 5px 12px; border: 1px solid var(--node-default);
+      background: var(--node-default); color: #fff; border-radius: 4px; cursor: pointer;
+    }
+    header button:hover { filter: brightness(1.08); }
+    header button:disabled { opacity: 0.6; cursor: default; }
+
+    #body { flex: 1; display: flex; min-height: 0; }
+    #graph-pane { flex: 1; position: relative; min-width: 0; }
+    #graph-canvas { position: absolute; inset: 0; }
+
+    /* Centered status overlay for loading / empty / error states. */
+    #status {
+      position: absolute; inset: 0; display: none;
+      align-items: center; justify-content: center; text-align: center;
+      padding: 24px; z-index: 5; pointer-events: none;
+    }
+    #status.show { display: flex; }
+    #status .box {
+      max-width: 460px; background: var(--panel-bg); border: 1px solid var(--border);
+      border-radius: 8px; padding: 20px 24px; pointer-events: auto;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    }
+    #status .box h2 { margin: 0 0 8px; font-size: 15px; }
+    #status .box p { margin: 4px 0; font-size: 13px; color: var(--muted); }
+    #status .box code { background: #f1f5f9; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+    #status.error .box { border-color: var(--contradiction); }
+    #status.error .box h2 { color: var(--contradiction); }
+
+    .spinner {
+      width: 26px; height: 26px; margin: 0 auto 12px;
+      border: 3px solid var(--border); border-top-color: var(--node-default);
+      border-radius: 50%; animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Side panel: shows fetched memory content on node click. */
+    #side-panel {
+      width: 420px; flex-shrink: 0; background: var(--panel-bg);
+      border-left: 1px solid var(--border); display: flex; flex-direction: column;
+      overflow: hidden;
+    }
+    #side-panel .sp-header {
+      padding: 12px 16px; border-bottom: 1px solid var(--border);
+    }
+    #side-panel .sp-key { font-size: 14px; font-weight: 600; word-break: break-all; }
+    #side-panel .sp-meta { font-size: 11px; color: var(--muted); margin-top: 4px; }
+    #side-panel .sp-tag {
+      display: inline-block; background: #eff6ff; color: var(--node-default);
+      border-radius: 3px; padding: 1px 6px; margin: 2px 4px 0 0; font-size: 11px;
+    }
+    #side-panel .sp-body {
+      flex: 1; overflow: auto; padding: 12px 16px; font-size: 13px; line-height: 1.5;
+    }
+    #side-panel .sp-body pre {
+      white-space: pre-wrap; word-break: break-word; margin: 0;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+    }
+    #side-panel .sp-empty { color: var(--muted); font-size: 13px; padding: 24px 16px; text-align: center; }
+    #side-panel .sp-loading { color: var(--muted); font-size: 13px; padding: 24px 16px; text-align: center; }
+    #side-panel .sp-error { color: var(--contradiction); font-size: 13px; padding: 24px 16px; text-align: center; }
+
+    /* Minimal markdown rendering for the memory body. */
+    .md h1, .md h2, .md h3 { margin: 12px 0 6px; line-height: 1.3; }
+    .md h1 { font-size: 17px; } .md h2 { font-size: 15px; } .md h3 { font-size: 13px; }
+    .md p { margin: 6px 0; }
+    .md ul { margin: 6px 0; padding-left: 20px; }
+    .md li { margin: 2px 0; }
+    .md code { background: #f1f5f9; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
+    .md pre { background: #f1f5f9; padding: 10px; border-radius: 5px; overflow: auto; }
+    .md strong { font-weight: 600; }
+    .md a { color: var(--node-default); }
+
+    /* Export result toast: anchored top-right of the graph pane so it doesn't
+       obscure the (already-rendered) graph the way the #status overlay would. */
+    #export-toast {
+      position: absolute; top: 10px; right: 10px; z-index: 6; display: none;
+      max-width: 420px; background: var(--panel-bg); border: 1px solid var(--border);
+      border-left-width: 4px; border-radius: 6px; padding: 10px 12px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.10); font-size: 13px; line-height: 1.45;
+    }
+    #export-toast.show { display: block; }
+    #export-toast.ok { border-left-color: var(--node-default); }
+    #export-toast.err { border-left-color: var(--contradiction); }
+    #export-toast .et-title { font-weight: 600; margin-bottom: 4px; }
+    #export-toast.err .et-title { color: var(--contradiction); }
+    #export-toast .et-body { color: var(--muted); }
+    #export-toast .et-body code {
+      background: #f1f5f9; padding: 1px 5px; border-radius: 3px; font-size: 12px;
+      word-break: break-all;
+    }
+    #export-toast .et-close {
+      position: absolute; top: 6px; right: 8px; cursor: pointer; border: none;
+      background: none; color: var(--muted); font-size: 15px; padding: 0; line-height: 1;
+    }
+
+    .legend {
+      position: absolute; bottom: 10px; left: 10px; z-index: 4;
+      background: rgba(255,255,255,0.92); border: 1px solid var(--border);
+      border-radius: 6px; padding: 8px 10px; font-size: 11px; color: var(--muted);
+    }
+    .legend .row { display: flex; align-items: center; gap: 6px; margin: 2px 0; }
+    .legend .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>🧠 CAO Memory Graph Explorer <span style="font-weight:400;color:var(--muted);font-size:12px">(dev / read-only)</span></h1>
+      <div class="spacer"></div>
+      <label>server
+        <input id="serverBase" type="text" value="http://127.0.0.1:9894" title="cao-server base URL" />
+      </label>
+      <label>scope
+        <select id="scope">
+          <option value="global" selected>global</option>
+          <option value="project">project</option>
+        </select>
+      </label>
+      <label>scope_id
+        <input id="scopeId" type="text" placeholder="(optional)" />
+      </label>
+      <button id="loadBtn">Load graph</button>
+      <label>vault
+        <input id="vaultName" type="text" placeholder="(auto)" title="relative vault name under CAO_GRAPH_EXPORT_ROOT" />
+      </label>
+      <button id="exportBtn" disabled title="load a graph first">Export to Obsidian</button>
+    </header>
+
+    <div id="body">
+      <div id="graph-pane">
+        <div id="graph-canvas"></div>
+        <div id="status" class="show">
+          <div class="box">
+            <h2>Ready</h2>
+            <p>Pick a scope and click <strong>Load graph</strong>.</p>
+          </div>
+        </div>
+        <div id="export-toast">
+          <button class="et-close" id="et-close" title="dismiss">×</button>
+          <div class="et-title" id="et-title"></div>
+          <div class="et-body" id="et-body"></div>
+        </div>
+        <div class="legend">
+          <div class="row"><span class="dot" style="background:var(--node-default)"></span> topic</div>
+          <div class="row"><span class="dot" style="background:var(--orphan)"></span> orphan</div>
+          <div class="row"><span class="dot" style="width:14px" title="hub"></span> larger = hub</div>
+          <div class="row"><span style="display:inline-block;width:14px;height:2px;background:var(--contradiction)"></span> contradiction edge</div>
+        </div>
+      </div>
+
+      <aside id="side-panel">
+        <div class="sp-header">
+          <div class="sp-key" id="sp-key">No memory selected</div>
+          <div class="sp-meta" id="sp-meta"></div>
+          <div id="sp-tags"></div>
+        </div>
+        <div class="sp-body" id="sp-body">
+          <div class="sp-empty">Click a node in the graph to read that memory.</div>
+        </div>
+      </aside>
+    </div>
+  </div>
+
+  <script type="module">
+    // ── deps (CDN, pinned to repo versions) ────────────────────────────
+    import Graph from "https://esm.sh/graphology@0.26.0";
+    import { circular } from "https://esm.sh/graphology-layout@0.6.1";
+    import Sigma from "https://esm.sh/sigma@3.0.3";
+
+    // Visual constants — mirror GraphView.tsx exactly.
+    const HUB_SIZE = 12;
+    const DEFAULT_SIZE = 6;
+    const ORPHAN_COLOR = "#9ca3af";
+    const DEFAULT_NODE_COLOR = "#2563eb";
+    const CONTRADICTION_COLOR = "#dc2626";
+    const DEFAULT_EDGE_COLOR = "#94a3b8";
+
+    // Graph projection runs wiki_lint (ripgrep detectors) server-side and can
+    // take ~60s on a populated scope, so give the graph fetch a wide budget.
+    const GRAPH_TIMEOUT_MS = 120_000;
+    const MEMORY_TIMEOUT_MS = 30_000;
+
+    const els = {
+      serverBase: document.getElementById("serverBase"),
+      scope: document.getElementById("scope"),
+      scopeId: document.getElementById("scopeId"),
+      loadBtn: document.getElementById("loadBtn"),
+      vaultName: document.getElementById("vaultName"),
+      exportBtn: document.getElementById("exportBtn"),
+      canvas: document.getElementById("graph-canvas"),
+      status: document.getElementById("status"),
+      exportToast: document.getElementById("export-toast"),
+      etTitle: document.getElementById("et-title"),
+      etBody: document.getElementById("et-body"),
+      etClose: document.getElementById("et-close"),
+      spKey: document.getElementById("sp-key"),
+      spMeta: document.getElementById("sp-meta"),
+      spTags: document.getElementById("sp-tags"),
+      spBody: document.getElementById("sp-body"),
+    };
+
+    let sigmaInstance = null;
+    let currentScope = "global";
+    let currentScopeId = "";
+    // Gate for the export button: true only while a graph with >0 nodes is
+    // mounted for (currentScope, currentScopeId). Exporting a scope you haven't
+    // loaded is confusing, so we tie export to a loaded snapshot.
+    let graphLoaded = false;
+
+    // Export also projects the graph server-side (runs wiki-lint detectors),
+    // so give it the same wide budget the graph fetch gets.
+    const EXPORT_TIMEOUT_MS = 60_000;
+
+    // Enable/disable the export button in lockstep with load state, the way
+    // loadBtn is managed. Kept in one place so every state transition below is
+    // consistent.
+    function setGraphLoaded(loaded) {
+      graphLoaded = loaded;
+      els.exportBtn.disabled = !loaded;
+      els.exportBtn.title = loaded
+        ? "export the loaded scope's graph to an Obsidian vault"
+        : "load a graph first";
+    }
+
+    function base() {
+      return els.serverBase.value.replace(/\/+$/, "");
+    }
+
+    function showStatus(kind, title, htmlBody) {
+      els.status.className = "show" + (kind === "error" ? " error" : "");
+      const spinner = kind === "loading" ? '<div class="spinner"></div>' : "";
+      els.status.innerHTML =
+        `<div class="box">${spinner}<h2>${title}</h2>${htmlBody || ""}</div>`;
+    }
+    function hideStatus() {
+      els.status.className = "";
+      els.status.innerHTML = "";
+    }
+
+    // fetch with an AbortController timeout so a hung/slow server surfaces a
+    // clear message instead of a silently-pending request.
+    async function fetchJson(url, timeoutMs) {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+      try {
+        const resp = await fetch(url, { signal: ctrl.signal });
+        let body = null;
+        try { body = await resp.json(); } catch { /* non-JSON body */ }
+        return { ok: resp.ok, status: resp.status, body };
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    // POST sibling of fetchJson: same AbortController-timeout pattern, but sends
+    // a JSON body with the right Content-Type. Used by the export button.
+    async function postJson(url, payload, timeoutMs) {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+      try {
+        const resp = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+          signal: ctrl.signal,
+        });
+        let body = null;
+        try { body = await resp.json(); } catch { /* non-JSON body */ }
+        return { ok: resp.ok, status: resp.status, body };
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    // Build a graphology graph from the GraphView wire shape, mirroring
+    // GraphView.tsx buildGraph(). circular.assign gives every node an x/y —
+    // Sigma throws at construction otherwise.
+    function buildGraph(snapshot) {
+      const graph = new Graph();
+      for (const node of snapshot.nodes) {
+        const attrs = node.attrs || {};
+        graph.addNode(node.id, {
+          label: node.label,
+          size: attrs.is_hub ? HUB_SIZE : DEFAULT_SIZE,
+          color: attrs.is_orphan ? ORPHAN_COLOR : DEFAULT_NODE_COLOR,
+        });
+      }
+      for (const edge of snapshot.edges) {
+        const isContradiction = edge.type === "contradiction";
+        // Guard: skip edges referencing unknown nodes rather than throwing.
+        if (!graph.hasNode(edge.source) || !graph.hasNode(edge.target)) continue;
+        if (graph.hasEdge(edge.source, edge.target)) continue;
+        graph.addEdge(edge.source, edge.target, {
+          color: isContradiction ? CONTRADICTION_COLOR : DEFAULT_EDGE_COLOR,
+        });
+      }
+      circular.assign(graph);
+      return graph;
+    }
+
+    function mountGraph(snapshot) {
+      if (sigmaInstance) {
+        sigmaInstance.kill();
+        sigmaInstance = null;
+      }
+      const graph = buildGraph(snapshot);
+      const sigma = new Sigma(graph, els.canvas, {
+        renderLabels: true,
+        labelRenderedSizeThreshold: 0,
+      });
+      // CLICK-TO-READ: the whole point of this tool. Produces VISIBLE feedback
+      // in the side panel (unlike the shipped renderer's silent no-op).
+      sigma.on("clickNode", ({ node }) => {
+        void openTopic(node);
+      });
+      sigmaInstance = sigma;
+      // expose for headless proof
+      window.__sigma = sigma;
+      window.__graph = graph;
+    }
+
+    async function loadGraph() {
+      currentScope = els.scope.value;
+      currentScopeId = els.scopeId.value.trim();
+      els.loadBtn.disabled = true;
+      // Any new load invalidates the previously-loaded snapshot; re-enable
+      // export only once this load succeeds with >0 nodes.
+      setGraphLoaded(false);
+      hideExportToast();
+
+      const qs = new URLSearchParams({ scope: currentScope });
+      if (currentScopeId) qs.set("scope_id", currentScopeId);
+      const url = `${base()}/graph/memory?${qs.toString()}`;
+
+      showStatus("loading", "Loading graph…",
+        `<p>Fetching <code>${url}</code></p>
+         <p>This can take up to ~60s — the server runs wiki-lint detectors.</p>`);
+
+      try {
+        const { ok, status, body } = await fetchJson(url, GRAPH_TIMEOUT_MS);
+        if (!ok) {
+          // 400 == private tier (session/agent) or bad filter value.
+          if (status === 400) {
+            showStatus("error", "Scope not available",
+              `<p>session/agent scopes are private and not available via the graph API.</p>
+               <p>Try <strong>global</strong> or <strong>project</strong>.</p>
+               <p style="font-size:11px">server said: <code>${escapeHtml(body?.detail || status)}</code></p>`);
+          } else if (status === 404) {
+            showStatus("error", "Not found",
+              `<p>${escapeHtml(body?.detail || "unknown graph provider / memory disabled")}</p>`);
+          } else {
+            showStatus("error", `Server error (${status})`,
+              `<p>${escapeHtml(body?.detail || "unexpected response")}</p>`);
+          }
+          return;
+        }
+        if (!body || !Array.isArray(body.nodes)) {
+          showStatus("error", "Unexpected response", "<p>Response had no <code>nodes</code> array.</p>");
+          return;
+        }
+        if (body.nodes.length === 0) {
+          showStatus("empty", "No memory nodes for this scope",
+            `<p>Scope <code>${escapeHtml(currentScope)}</code>${currentScopeId ? " / <code>" + escapeHtml(currentScopeId) + "</code>" : ""} has no topics.</p>`);
+          if (sigmaInstance) { sigmaInstance.kill(); sigmaInstance = null; }
+          return;
+        }
+        hideStatus();
+        mountGraph(body);
+        // Snapshot is live for (currentScope, currentScopeId) → allow export.
+        setGraphLoaded(true);
+      } catch (err) {
+        // AbortError (timeout) or network failure → server likely down.
+        const aborted = err && err.name === "AbortError";
+        showStatus("error", aborted ? "Request timed out" : "Server unreachable",
+          `<p>Could not reach <code>${escapeHtml(base())}</code>.</p>
+           <p>Is cao-server running on that port? Start it with:</p>
+           <p><code>CAO_API_PORT=9894 CAO_CORS_ORIGINS=http://127.0.0.1:8900 uv run cao-server</code></p>
+           <p style="font-size:11px">${escapeHtml(String(err && err.message || err))}</p>`);
+      } finally {
+        els.loadBtn.disabled = false;
+      }
+    }
+
+    // Fetch and show one topic's content in the side panel.
+    async function openTopic(nodeId) {
+      els.spKey.textContent = nodeId;
+      els.spMeta.textContent = `scope: ${currentScope}${currentScopeId ? " / " + currentScopeId : ""}`;
+      els.spTags.innerHTML = "";
+      els.spBody.innerHTML = `<div class="sp-loading">Loading “${escapeHtml(nodeId)}”…</div>`;
+
+      const qs = new URLSearchParams({ scope: currentScope });
+      if (currentScopeId) qs.set("scope_id", currentScopeId);
+      const url = `${base()}/memory/${encodeURIComponent(nodeId)}?${qs.toString()}`;
+
+      try {
+        const { ok, status, body } = await fetchJson(url, MEMORY_TIMEOUT_MS);
+        if (status === 404) {
+          els.spBody.innerHTML = `<div class="sp-error">Memory not found (404).<br/>${escapeHtml(body?.detail || "")}</div>`;
+          return;
+        }
+        if (!ok) {
+          els.spBody.innerHTML = `<div class="sp-error">Server error (${status}).<br/>${escapeHtml(body?.detail || "")}</div>`;
+          return;
+        }
+        if (!body || !body.content) {
+          els.spBody.innerHTML = `<div class="sp-empty">No content for this memory.</div>`;
+          return;
+        }
+        // header: type + timestamps + tags
+        const metaBits = [];
+        if (body.memory_type) metaBits.push(body.memory_type);
+        if (body.updated_at) metaBits.push("updated " + body.updated_at);
+        els.spMeta.textContent = `scope: ${body.scope || currentScope}` +
+          (metaBits.length ? " · " + metaBits.join(" · ") : "");
+        if (body.tags) {
+          els.spTags.innerHTML = String(body.tags)
+            .split(",").map((t) => t.trim()).filter(Boolean)
+            .map((t) => `<span class="sp-tag">${escapeHtml(t)}</span>`).join("");
+        }
+        els.spBody.innerHTML = `<div class="md">${renderMarkdown(body.content)}</div>`;
+        window.__lastTopic = body; // headless proof hook
+      } catch (err) {
+        const aborted = err && err.name === "AbortError";
+        els.spBody.innerHTML = `<div class="sp-error">${aborted ? "Request timed out" : "Fetch failed"}: ${escapeHtml(String(err && err.message || err))}</div>`;
+      }
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, (c) => (
+        { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+      ));
+    }
+
+    // Tiny, safe-enough markdown renderer for the dev tool: escapes first,
+    // then applies a handful of block/inline rules. No raw HTML passthrough.
+    function renderMarkdown(md) {
+      const lines = escapeHtml(md).split("\n");
+      let html = "";
+      let inList = false, inCode = false;
+      const closeList = () => { if (inList) { html += "</ul>"; inList = false; } };
+      for (const line of lines) {
+        if (/^```/.test(line)) {
+          if (inCode) { html += "</pre>"; inCode = false; }
+          else { closeList(); html += "<pre>"; inCode = true; }
+          continue;
+        }
+        if (inCode) { html += line + "\n"; continue; }
+        let m;
+        if ((m = line.match(/^(#{1,3})\s+(.*)$/))) {
+          closeList();
+          const lvl = m[1].length;
+          html += `<h${lvl}>${inline(m[2])}</h${lvl}>`;
+        } else if (/^\s*[-*]\s+/.test(line)) {
+          if (!inList) { html += "<ul>"; inList = true; }
+          html += `<li>${inline(line.replace(/^\s*[-*]\s+/, ""))}</li>`;
+        } else if (line.trim() === "") {
+          closeList();
+        } else {
+          closeList();
+          html += `<p>${inline(line)}</p>`;
+        }
+      }
+      if (inCode) html += "</pre>";
+      closeList();
+      return html;
+    }
+    function inline(s) {
+      return s
+        .replace(/`([^`]+)`/g, "<code>$1</code>")
+        .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+        .replace(/\[\[([^\]]+)\]\]/g, "<code>[[$1]]</code>")
+        .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    }
+
+    // ── export toast ───────────────────────────────────────────────────
+    function showExportToast(kind, title, htmlBody) {
+      els.exportToast.className = "show " + (kind === "ok" ? "ok" : "err");
+      els.etTitle.textContent = title;
+      els.etBody.innerHTML = htmlBody || "";
+    }
+    function hideExportToast() {
+      els.exportToast.className = "";
+      els.etTitle.textContent = "";
+      els.etBody.innerHTML = "";
+    }
+    els.etClose.addEventListener("click", hideExportToast);
+
+    // Export the currently-loaded scope's graph to an Obsidian vault via the
+    // shipped export sink. Gated on graphLoaded (button is disabled otherwise),
+    // but re-checked here defensively.
+    async function exportToObsidian() {
+      if (!graphLoaded) return;
+
+      // dest is a RELATIVE vault name; the server confines it under
+      // CAO_GRAPH_EXPORT_ROOT via safe_join_under_base. Never send an absolute
+      // path — it'd be rejected (400). Default derives from the loaded scope.
+      const raw = els.vaultName.value.trim();
+      const dest = raw || `${currentScope}-vault`;
+
+      const qs = new URLSearchParams({ scope: currentScope });
+      if (currentScopeId) qs.set("scope_id", currentScopeId);
+      const url = `${base()}/graph/memory/export?${qs.toString()}`;
+
+      els.exportBtn.disabled = true;
+      showExportToast("ok", "Exporting…",
+        `<div class="et-body">Writing vault <code>${escapeHtml(dest)}</code> — this can take up to ~60s (the server re-projects the graph).</div>`);
+
+      try {
+        const { ok, status, body } = await postJson(
+          url, { sink: "obsidian", dest, options: {} }, EXPORT_TIMEOUT_MS);
+
+        // detail is server-provided; for 422 it names only the matched PATTERN,
+        // never the secret bytes. We surface it verbatim and dump nothing else.
+        const detail = escapeHtml(body?.detail || "");
+
+        if (ok) {
+          const files = Array.isArray(body?.written_files) ? body.written_files : [];
+          const n = files.length;
+          const shownDest = escapeHtml(body?.dest || dest);
+          // Prefer showing the actual server-returned path so the user can find
+          // the vault on disk; fall back to the dest name.
+          const firstPath = n ? escapeHtml(files[0]) : "";
+          const pathLine = n
+            ? `<div>First note: <code>${firstPath}</code></div>`
+            : "";
+          showExportToast("ok", `Exported ${n} note${n === 1 ? "" : "s"}`,
+            `<div>Vault: <code>${shownDest}</code></div>
+             ${pathLine}
+             <div style="margin-top:6px">Open that folder in <strong>Obsidian → Graph view</strong>.</div>`);
+          return;
+        }
+
+        if (status === 401 || status === 403) {
+          showExportToast("err", `Export not authorized (${status})`,
+            `<div>Export is scope-gated (needs <code>cao:write</code>/<code>cao:admin</code>). With auth disabled this shouldn't happen; if you've configured an IdP, this dev tool sends no token.</div>`);
+        } else if (status === 422) {
+          showExportToast("err", "Export blocked by the secret gate",
+            `<div>A memory value matched a secret pattern${detail ? `: <code>${detail}</code>` : ""}. Nothing was written.</div>`);
+        } else if (status === 400) {
+          showExportToast("err", "Bad export destination or private scope",
+            `<div>${detail || "The destination was rejected (traversal/outside-root) or the scope is private (session/agent)."}</div>`);
+        } else if (status === 404) {
+          showExportToast("err", `Not found (404)`,
+            `<div>${detail || "unknown graph provider or sink 'obsidian' (memory disabled?)."}</div>`);
+        } else {
+          showExportToast("err", `Server error (${status})`,
+            `<div>${detail || "unexpected response"}</div>`);
+        }
+      } catch (err) {
+        const aborted = err && err.name === "AbortError";
+        showExportToast("err", aborted ? "Export timed out" : "Server unreachable",
+          `<div>Could not reach <code>${escapeHtml(base())}</code>. Is cao-server running?</div>
+           <div style="font-size:11px;margin-top:4px">${escapeHtml(String(err && err.message || err))}</div>`);
+      } finally {
+        // Re-enable only if the snapshot is still considered loaded.
+        els.exportBtn.disabled = !graphLoaded;
+      }
+    }
+
+    els.loadBtn.addEventListener("click", () => void loadGraph());
+    els.exportBtn.addEventListener("click", () => void exportToObsidian());
+    // Auto-load default scope on open.
+    void loadGraph();
+  </script>
+</body>
+</html>
