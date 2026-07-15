@@ -200,20 +200,27 @@ class CreateTerminalBody(BaseModel):
 class UpdateGroupBody(BaseModel):
     """Request body for ``PATCH /terminals/{id}/group`` (#432).
 
-    A dedicated body (rather than a bare query param) so an empty-list
-    "clear the group" request is unambiguous from an omitted field.
+    ``group`` is required (no default) so an omitted field is rejected with
+    422 rather than silently treated the same as an explicit ``null`` —
+    clearing the group is always an explicit choice (``null`` or ``[]``),
+    never an accident of a partial/empty body (Copilot review, PR #433).
     """
 
-    group: Optional[List[str]] = None
+    group: Optional[List[str]]
 
 
 class UpdateMetadataBody(BaseModel):
     """Request body for ``PATCH /terminals/{id}/metadata`` (#432).
 
     Called by the running agent itself via the ``update_metadata`` MCP tool.
+
+    ``metadata`` is required (no default) for the same reason as
+    ``UpdateGroupBody.group`` above: an omitted field is rejected with 422
+    instead of being indistinguishable from an explicit clearing ``null``
+    (Copilot review, PR #433).
     """
 
-    metadata: Optional[Dict] = None
+    metadata: Optional[Dict]
 
 
 class RunStepRequest(BaseModel):
@@ -1322,11 +1329,13 @@ async def update_terminal_group_endpoint(
 
     Lets a consumer whose own grouping can change after a terminal already
     exists (e.g. harness-control folder/project reassignment,
-    harness-control#92) keep ``group`` from going stale. An empty/omitted
-    ``group`` clears it, opting the terminal back out of discovery.
+    harness-control#92) keep ``group`` from going stale. ``group`` is
+    required in the request body: an explicit ``null`` or ``[]`` clears it
+    (opting the terminal back out of discovery), while omitting the field
+    entirely is rejected with 422 rather than silently clearing it.
     """
     try:
-        updated = terminal_service.update_group(terminal_id, body.group)
+        updated = await asyncio.to_thread(terminal_service.update_group, terminal_id, body.group)
         if not updated:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail=f"Terminal '{terminal_id}' not found"
@@ -1354,7 +1363,9 @@ async def update_terminal_metadata_endpoint(
     (as well as by any other authorized API caller).
     """
     try:
-        updated = terminal_service.update_metadata(terminal_id, body.metadata)
+        updated = await asyncio.to_thread(
+            terminal_service.update_metadata, terminal_id, body.metadata
+        )
         if not updated:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail=f"Terminal '{terminal_id}' not found"
@@ -1405,7 +1416,7 @@ async def list_terminal_siblings(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
     try:
-        return terminal_service.list_siblings(terminal_id, depth=depth)
+        return await asyncio.to_thread(terminal_service.list_siblings, terminal_id, depth=depth)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

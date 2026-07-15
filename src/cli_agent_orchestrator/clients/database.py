@@ -642,14 +642,44 @@ def list_siblings_by_group_prefix(caller_id: str, prefix: List[str]) -> List[Dic
     depth — this function does no clamping itself, it only matches. A
     candidate terminal with no group, or a group shorter than ``len(prefix)``,
     is excluded rather than compared partially or raising (#432).
+
+    ``group`` is stored JSON-encoded (see ``TerminalModel.group``), so the
+    query prefilters with a SQL ``LIKE`` prefix match on that encoding before
+    loading/decoding candidate rows in Python (Copilot review, PR #433) —
+    without it this scanned and JSON-decoded every grouped terminal on the
+    server regardless of how narrow ``prefix`` is. Because ``json.dumps``
+    closes each string element in a quote immediately, the encoded prefix
+    (full array minus its trailing ``]``) can't false-positive match a
+    longer sibling element that merely shares a text prefix (e.g. prefix
+    element ``"project_5"`` vs. a sibling group containing ``"project_50"``
+    — the sibling's extra ``0`` before its closing ``"`` breaks the SQL
+    match). The exact Python-level comparison below is kept regardless, as
+    the source of truth — the SQL match only narrows candidates (a prefilter
+    defect can only cause a false negative here, i.e. a missed perf win,
+    never a false positive / correctness or security regression).
+
+    This SQL-level match assumes the stored ``group`` was encoded with the
+    same ``json.dumps`` defaults used below (notably ``ensure_ascii=True``,
+    the default) — true today since ``update_terminal_group`` is the only
+    write path and uses plain ``json.dumps(group)``. If that write path ever
+    changes its encoding, this prefilter must change with it.
     """
     import json as _json
 
     depth = len(prefix)
+    # Encode the prefix array and drop its trailing ']' so this matches both
+    # a sibling group of the same length and a longer one that starts with
+    # it, e.g. prefix ["a", "b"] -> '["a", "b"' matches '["a", "b"]' and
+    # '["a", "b", "c"]'.
+    like_prefix = _json.dumps(prefix)[:-1]
     with SessionLocal() as db:
         rows = (
             db.query(TerminalModel)
-            .filter(TerminalModel.id != caller_id, TerminalModel.group.isnot(None))
+            .filter(
+                TerminalModel.id != caller_id,
+                TerminalModel.group.isnot(None),
+                TerminalModel.group.startswith(like_prefix, autoescape=True),
+            )
             .all()
         )
         siblings = []

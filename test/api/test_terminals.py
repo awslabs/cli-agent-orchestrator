@@ -858,6 +858,29 @@ class TestUpdateTerminalGroupEndpoint:
             assert response.status_code == 500
             assert "Failed to update terminal group" in response.json()["detail"]
 
+    def test_update_group_omitted_field_rejected_not_treated_as_clear(self, client):
+        """Copilot review, PR #433: an omitted ``group`` field must be
+        rejected (422) rather than silently treated the same as an explicit
+        ``null`` (which clears the group) -- a partial/empty body must never
+        accidentally clear data."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            response = client.patch("/terminals/abcd1234/group", json={})
+
+            assert response.status_code == 422
+            mock_svc.update_group.assert_not_called()
+
+    def test_update_group_explicit_null_still_clears(self, client):
+        """The omitted-field fix must not break the pre-existing explicit-null
+        clearing path."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_group.return_value = True
+            mock_svc.get_terminal.return_value = _terminal_dict(group=None)
+
+            response = client.patch("/terminals/abcd1234/group", json={"group": None})
+
+            assert response.status_code == 200
+            mock_svc.update_group.assert_called_once_with("abcd1234", None)
+
 
 class TestUpdateTerminalMetadataEndpoint:
     """#432: PATCH /terminals/{id}/metadata (also called by the update_metadata MCP tool)."""
@@ -886,6 +909,26 @@ class TestUpdateTerminalMetadataEndpoint:
             )
 
             assert response.status_code == 404
+
+    def test_update_metadata_omitted_field_rejected_not_treated_as_clear(self, client):
+        """Copilot review, PR #433: same omitted-vs-null fix as ``group`` --
+        an omitted ``metadata`` field must be rejected (422), not silently
+        treated as an explicit clearing ``null``."""
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            response = client.patch("/terminals/abcd1234/metadata", json={})
+
+            assert response.status_code == 422
+            mock_svc.update_metadata.assert_not_called()
+
+    def test_update_metadata_explicit_null_still_clears(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.update_metadata.return_value = True
+            mock_svc.get_terminal.return_value = _terminal_dict(metadata=None)
+
+            response = client.patch("/terminals/abcd1234/metadata", json={"metadata": None})
+
+            assert response.status_code == 200
+            mock_svc.update_metadata.assert_called_once_with("abcd1234", None)
 
 
 class TestListSiblingsEndpoint:
