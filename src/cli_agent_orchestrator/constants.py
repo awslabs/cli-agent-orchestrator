@@ -130,6 +130,18 @@ PIPE_LIVENESS_MAX_REARM_FAILURES = _env_int("CAO_PIPE_LIVENESS_MAX_REARM_FAILURE
 # much shorter than PIPE_LIVENESS_CHECK_INTERVAL_S's steady-state cadence:
 # this is a one-shot "did it ever start" deadline, not a recurring poll.
 PIPE_LIVENESS_COLD_START_GRACE_S = _env_float("CAO_PIPE_LIVENESS_COLD_START_GRACE_S", 3.0)
+# Cap on cold-start re-arm ATTEMPTS (not exceptions — rearm() succeeding but the
+# pipe still never delivering counts here too), separate from
+# PIPE_LIVENESS_MAX_REARM_FAILURES (which only counts rearm() raising). Without
+# this, a terminal whose pipe is genuinely, permanently dead (not just racing a
+# one-time attach timing gap) would re-trigger the cold-start check every grace
+# period forever: a successful rearm() doesn't mark the FIFO as having
+# delivered — only the reader thread pulling a real byte off it does — so
+# "still False after grace period" stays true and the same terminal gets
+# re-armed and replayed indefinitely, an unbounded stop/start + replay loop.
+# After this many attempts, give up loudly and drop the terminal from the
+# watchdog, exactly like the rearm()-exception path already does.
+PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS = _env_int("CAO_PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS", 5)
 
 # pyte-rendered status detection. When enabled, the StatusMonitor feeds each
 # terminal's output through a pyte terminal emulator and runs detection against

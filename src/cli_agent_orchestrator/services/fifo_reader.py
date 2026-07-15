@@ -14,6 +14,7 @@ from cli_agent_orchestrator.constants import (
     FIFO_DIR,
     PIPE_LIVENESS_CHECK_INTERVAL_S,
     PIPE_LIVENESS_COLD_START_GRACE_S,
+    PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS,
     PIPE_LIVENESS_MAX_REARM_FAILURES,
     PIPE_LIVENESS_STALL_CHECKS,
 )
@@ -106,6 +107,15 @@ class FifoManager:
         # stays uniform; only enrolled terminals ever have it consulted.
         self._registered_at: Dict[str, float] = {}
         self._ever_delivered: Dict[str, bool] = {}
+        # Cold-start re-arm attempts (self-ROAST finding: a rearm() call that
+        # succeeds does NOT mean the FIFO actually started delivering — only
+        # the reader thread pulling a real byte off it flips _ever_delivered.
+        # A genuinely, permanently dead pipe would otherwise re-trigger the
+        # cold-start check every grace period forever. Bounded the same way
+        # the rearm()-exception path already is, via a dedicated counter so
+        # the two failure classes — "rearm() raised" vs. "rearm() succeeded
+        # but the pipe still never delivered" — don't get conflated.
+        self._cold_start_attempts: Dict[str, int] = {}
         # Per-terminal probes/re-arm callbacks (only tmux/pipe-pane terminals
         # register these; herdr and callers that pass none are never watched).
         self._pane_probe: Dict[str, PaneProbe] = {}
@@ -193,6 +203,7 @@ class FifoManager:
             self._rearm_failures.pop(terminal_id, None)
             self._registered_at.pop(terminal_id, None)
             self._ever_delivered.pop(terminal_id, None)
+            self._cold_start_attempts.pop(terminal_id, None)
 
         # Deliberately NOT stopping the watchdog thread here even when this was
         # the last enrolled terminal: doing it under a "now idle" check raced
@@ -449,6 +460,7 @@ class FifoManager:
 
         do_rearm = False
         cold_start = False
+        cold_start_give_up = False
         with self._lock:
             # stop_reader() may have unenrolled this terminal while probe()
             # was in flight above. Re-check membership before touching any
@@ -478,12 +490,44 @@ class FifoManager:
                 # The FIFO has never delivered a single byte in the grace
                 # period since registration, yet the live pane already has
                 # real content — the forwarder never started, full stop.
-                # Reset liveness bookkeeping to the post-rearm state so the
-                # divergence check starts clean on the next tick instead of
-                # possibly re-triggering off a baseline captured before rearm.
-                cold_start = True
-                do_rearm = True
-                self._liveness[terminal_id] = (content, now, 0)
+                #
+                # self-ROAST finding: a rearm() call SUCCEEDING does not mean
+                # the pipe actually started delivering — only the reader
+                # thread pulling a real byte off it flips `ever_delivered`
+                # (the replay below publishes straight to the event bus,
+                # bypassing the FIFO entirely, so it never touches that
+                # flag). Without a bound, a genuinely, permanently dead pipe
+                # would re-trigger this exact branch every grace period
+                # forever: an unbounded stop/start + replay loop, live-
+                # reproduced (5/5 checks all re-armed with a never-delivering
+                # fake FIFO). Bounded the same way the rearm()-exception path
+                # already is, via a dedicated counter/constant so the two
+                # failure classes don't get conflated.
+                attempts = self._cold_start_attempts.get(terminal_id, 0) + 1
+                if attempts > PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS:
+                    cold_start_give_up = True
+                    self._pane_probe.pop(terminal_id, None)
+                    self._rearm.pop(terminal_id, None)
+                    self._liveness.pop(terminal_id, None)
+                    self._rearm_failures.pop(terminal_id, None)
+                    self._registered_at.pop(terminal_id, None)
+                    self._ever_delivered.pop(terminal_id, None)
+                    self._cold_start_attempts.pop(terminal_id, None)
+                else:
+                    self._cold_start_attempts[terminal_id] = attempts
+                    # Reset the grace-period clock so the NEXT evaluation is
+                    # a fresh grace period after THIS attempt, not literally
+                    # the very next watchdog tick (~PIPE_LIVENESS_CHECK_
+                    # INTERVAL_S later) — gives each rearm a real chance to
+                    # start delivering before being judged again.
+                    self._registered_at[terminal_id] = now
+                    cold_start = True
+                    do_rearm = True
+                    # Reset liveness bookkeeping to the post-rearm state so
+                    # the divergence check starts clean on the next tick
+                    # instead of possibly re-triggering off a baseline
+                    # captured before rearm.
+                    self._liveness[terminal_id] = (content, now, 0)
             else:
                 prev = self._liveness.get(terminal_id)
                 if prev is None:
@@ -538,6 +582,16 @@ class FifoManager:
                         # baseline across checks where the now-static content
                         # no longer changes.
                         self._liveness[terminal_id] = (baseline_content, now, strikes)
+
+        if cold_start_give_up:
+            logger.error(
+                "pipe-pane forwarder for terminal %s never started delivering after "
+                "%d cold-start re-arm attempts — giving up and dropping it from the "
+                "liveness watchdog",
+                terminal_id,
+                PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS,
+            )
+            return
 
         if not do_rearm:
             return

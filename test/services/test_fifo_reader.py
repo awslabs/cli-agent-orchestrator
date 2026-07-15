@@ -763,6 +763,73 @@ class TestColdStartStallDetection:
             manager.stop_reader("term-e2e")
             manager.stop_watchdog()
 
+    def test_cold_start_gives_up_after_max_attempts_instead_of_retrying_forever(
+        self, tmp_path, monkeypatch
+    ):
+        """Self-ROAST regression: a rearm() call SUCCEEDING does not mean the
+        pipe actually started delivering — only the reader thread pulling a
+        real byte off it flips `_ever_delivered` (the cold-start replay
+        publishes straight to the event bus, bypassing the FIFO entirely, so
+        it never touches that flag). Before this test existed, a genuinely,
+        permanently dead pipe (rearm() never raises, but nothing ever
+        actually flows) re-triggered the cold-start branch on literally every
+        watchdog check with no bound at all — live-reproduced directly: 5
+        consecutive checks against a fake FIFO that never delivers produced 5
+        re-arms, `_ever_delivered` still False, and `_rearm_failures` never
+        touched (the exception-based give-up mechanism has no visibility into
+        this failure class). This must now bound to
+        PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS and then stop — dropping the
+        terminal from the watchdog entirely, exactly like the rearm()-
+        exception give-up path already does."""
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_COLD_START_GRACE_S", 0.0)
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS", 3)
+        manager = self._manager(tmp_path, monkeypatch)
+        pane = {"content": "user@host:~$ "}  # never changes, FIFO never delivers
+        rearm_calls: list = []
+        self._enroll_cold(manager, "term", pane, rearm_calls, registered_at=time.monotonic() - 10)
+
+        # Attempts 1-3 (<= max) must still re-arm.
+        for _ in range(3):
+            manager._check_pipe_liveness("term")
+        assert rearm_calls == [True, True, True]
+        assert "term" in manager._pane_probe, "must still be enrolled within the attempt budget"
+
+        # The 4th check crosses the budget: give up, do NOT re-arm again, and
+        # fully unenroll the terminal (matching the exception-path give-up).
+        manager._check_pipe_liveness("term")
+        assert rearm_calls == [True, True, True], "must not re-arm past the attempt cap"
+        assert "term" not in manager._pane_probe
+        assert "term" not in manager._rearm
+        assert "term" not in manager._liveness
+
+        # Further checks on an unenrolled terminal must be silent no-ops, not
+        # errors and not further re-arms (probe/rearm are gone).
+        manager._check_pipe_liveness("term")
+        assert rearm_calls == [True, True, True]
+
+    def test_cold_start_attempt_counter_resets_the_grace_clock_between_tries(
+        self, tmp_path, monkeypatch
+    ):
+        """Each cold-start attempt gets its own fresh grace period rather than
+        re-firing on literally the next watchdog tick — `_registered_at` is
+        bumped forward on every attempt, so a second check immediately after
+        the first (before a new grace period has elapsed) must not re-arm
+        again yet."""
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_COLD_START_GRACE_S", 100.0)
+        manager = self._manager(tmp_path, monkeypatch)
+        pane = {"content": "user@host:~$ "}
+        rearm_calls: list = []
+        # Grace period already elapsed for the FIRST attempt only.
+        self._enroll_cold(manager, "term", pane, rearm_calls, registered_at=time.monotonic() - 200)
+
+        manager._check_pipe_liveness("term")
+        assert rearm_calls == [True]
+
+        # Immediately after: _registered_at was just reset to "now", so the
+        # 100s grace period has NOT elapsed again yet.
+        manager._check_pipe_liveness("term")
+        assert rearm_calls == [True], "must wait out a fresh grace period before re-arming again"
+
 
 class TestConcurrencyRaces:
     """Round-3 Copilot review on #397: two lock-scope gaps in code the round-2
