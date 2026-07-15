@@ -7,159 +7,271 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- enable Jinja2 autoescape in the agent-profile scaffolding `Environment` (`agent_scaffold.py`). Jinja2 defaults to `autoescape=False`, which AppSec scanners flag as an XSS risk (ACAT `Jinja2AutoescapeDisabled`). A custom selector strips a trailing `.j2` before delegating to `select_autoescape(enabled_extensions=("html","htm","xml"))`, so a future `template.html.j2` / `template.xml.j2` is treated as HTML/XML and escaped, while the current `template.md.j2` markdown/bash output stays byte-identical (regression test added) (#429)
+
+## [2.3.0] - 2026-07-12
+
 ### Added
 
-- add `cao profile` command group for profile lifecycle management: list/show/validate/remove/templates/create. Includes Jinja2 scaffolding engine with 7 AWS templates (stepfunction, cloudwatch-logs, dynamodb-query, dynamodb-delete, sqs-monitor, sqs-send, sqs-dlq-check) and JSON-Schema validation for both profiles and template configs (#340)
+- add reconciliation sweep for orphaned PENDING messages (#266)
 
-- Enable/disable an agent-profile directory without removing it, so its profiles leave the active set while the path stays listed (#280, #281).
+- add provider support (#272)
 
 - add script-tier workflows: a `.py` workflow spec is now runnable via `cao workflow run` (and the `workflow_run`/`workflow_cancel` MCP tools), with the same `resume`/`cancel`/`status` support as YAML workflows — tier is detected automatically from the file extension (#312)
 - add optional `skills` field to `AgentProfile` to scope the per-agent skill catalog via an fnmatch allowlist; runtime-prompt providers only, `load_skill` resolution unchanged (#351)
+- add herdr terminal backend with event-driven inbox delivery (#271)
 
-- add Antigravity CLI (`agy`) provider — Google's terminal-native coding agent and the successor to the Gemini CLI after the free "Login with Google" path was retired (#323)
+- bundle built-in memory plugins for Claude Code, Kiro, and Codex (#269)
 
-- add built-in Hermes provider support through profile-configured `hermesProfile` wrappers
+- Web UI support for the memory system (#290)
 
-- add OKF memory export/import — `cao memory export`/`cao memory import` CLI commands plus a read-scoped `GET /memory/export` API endpoint streaming a scope as a tar.gz bundle (#345)
-- add `examples/fleet` — a cross-node fleet coordinator that manages many CAO nodes from one place: one-command node bootstrap, a `fleet` control helper (list/show/exec against any node), and an AI conductor wired to one `cao-ops-mcp-server` per node. Purely additive under `examples/`; each node stays a stateless client of the existing `cao-server` API (#349)
-- add `examples/fleet/panel` — a web control panel + live console for the fleet: a stateless FastAPI app that fans out to every node's `cao-server` REST API and serves a browser SPA (a wall of live agent screens + a focused console). Isolates per-node failures, degrades `/screen` → `/output` for older nodes, and adds opt-in shared-token auth (`CAO_PANEL_TOKEN`) for off-loopback use (#366)
+- Phase 3 — LLM wiki compile, cross-references, lint, audit log, scoring (#285)
 
-### Changed
+- add Cursor CLI as a first-class provider (#296)
 
-- rename `cao flow` → `cao schedule` to avoid confusion with the new `cao workflow` feature. `cao flow` remains as a hidden deprecated alias that prints a warning to stderr; flow files, `~/.cao/flows`, stored schedules, and the `/flows` REST API are unchanged, and the web UI only updates its CLI hint string (#378)
+- pyte rendered-screen status detection (closes #287) (#293)
 
-### Deprecated
+- gate network egress behind a web_fetch tool category (#311)
 
-- `cao flow` — use `cao schedule` instead; the alias will be removed in a future release (#378)
+- discover skills from extra_skill_dirs (mirror extra_agent_dirs) (#277)
 
-### Fixed
+- pass per-agent config overrides via codexConfig (#278)
 
-- mcp: bundled agent profiles now launch the installed `cao-mcp-server` console script instead of re-fetching the whole package from GitHub via `uvx --from git+…@main` on every agent launch — the cold fetch (~20s) exceeded some providers' MCP startup timeout (Codex: 10s), so agents came up without their orchestration tools (`handoff`/`assign`/`send_message`) and silently could not delegate; a shared resolver (`utils/mcp_resolution.py`) rewrites the bare command to a PATH-independent invocation (interpreter-sibling → PATH → `python -m`), used by all providers, and a regression test keeps new profiles from reintroducing the network fetch (#403)
+- add optional Session Name field to the Spawn Agent dialog (#279)
 
-- claude_code: a backgrounded task ("✻ Waiting for N dynamic workflow(s) to finish") no longer reads as COMPLETED — the wait line has no spinner ellipsis (invisible to every PROCESSING check) while the printed response + idle ❯ box look like a finished turn, and it even matched the lenient completion pattern; both the raw-buffer and pyte screen paths now report PROCESSING until a newer response/completion summary appears, so dashboards and wait_until_terminal_status no longer see a mid-run terminal as done (#392)
+- worker status/output tools + orchestration worker profiles (#324)
 
-- fifo: non-blocking FIFO reader loop and event-loop-safe session teardown — reader threads can no longer be stranded in a blocking FIFO `open()` by a stop/reopen race, and `DELETE /sessions` runs teardown in a worker thread, so repeated create/delete cycles can no longer wedge cao-server (#382)
-- kiro-cli 2.11 compatibility:
-  - bracketed paste now sends 2 Enters with a 1s submit delay so pasted task text is actually submitted (kiro 2.11's TUI swallows the single Enter used by older versions, leaving the message unsent)
-  - `TUI_PROCESSING_PATTERN` matches both `"Kiro is working"` (pre-2.11) and `"Thinking..."` (2.11+)
-  - Check 6 (no-Credits completion path) now requires a full bordered response box (two separators + ≥2 content lines) instead of any idle-prompt match after `input_received`; kiro 2.11 keeps the `"ask a question or describe a task"` placeholder in the raw buffer at all times, so the previous logic tore workers down within seconds of receiving a task
-  - always launch `kiro-cli chat` with `--trust-all-tools`, not just in yolo mode. kiro 2.11 introduced a `"subagent requires approval"` interactive prompt that fires on every MCP tool call spawning a subagent (e.g. `cao-mcp-server` `assign`/`handoff`); with no human at the terminal in headless orchestration, the supervisor deadlocked on the dialog. CAO still enforces tool scoping at its own layers (profile `allowedTools` + MCP allowlist), so bypassing kiro's UI-level per-invocation confirm is safe. Also broadened `TUI_PERMISSION_PATTERN` to detect the new `Yes / Trust / No` layout and the `"subagent requires approval"` header
-- status monitor: `send_input` now uses `clear_rolling_buffer` (byte-only) instead of `reset_buffer` so the sticky-latch arm set by `notify_input_sent` survives. Prevents the IDLE→PROCESSING transition from being latch-blocked when kiro 2.11's TUI immediately renders a partial idle frame after `send_input` (regression seen in `test_supervisor_assign_and_handoff`: supervisor completed real work but status stayed IDLE for the whole turn)
-- fifo reader: coalesce chunks arriving within a 50ms window into one publish. Kiro's TUI spinner animates ~10 fps and each frame is a separate FIFO write — without coalescing that flooded the shared async queue and dropped worker state transitions along with the animation noise, breaking assign and handoff (supervisor never saw the worker's completion). Coalescing reduces publish rate ~20x during bursts and keeps the queue drained
-- event_bus: rate-limit "queue full" drop reporting to at most one line per topic per second (first drop still logs immediately so back-pressure is not silently swallowed). Under a real dual-worker output burst the previous per-drop ERROR log accumulated 42,000+ lines in ~20 minutes, which itself contributed to event-loop starvation. Also downgraded the message from ERROR to WARNING — a dropped event is a soft signal, not a fatal condition. The per-topic drop-state maps are now bounded: since topics embed terminal IDs, a long-running server that churns through many short-lived terminals would otherwise accumulate a dead entry per terminal forever — stale entries (idle past a TTL) are evicted once the map grows past a cap
-- log_writer: drain the event-bus queue in batches of up to 256 events and group same-file writes so each unique log file is opened at most once per batch. The prior "one asyncio.to_thread(write) per event" pattern capped throughput at ~one file-write per event-loop tick, which was slower than the FIFO reader's publish rate under two concurrent evaluators streaming multi-KB frames. Ordering per terminal is preserved (chunks are concatenated in drain order before the write)
-- event loop: offload blocking tmux subprocess I/O off the asyncio event loop — the most operator-relevant fix here. `StatusMonitor` chunk processing (which shells out to `tmux` per output burst for tmux-backed providers) and the blocking `terminal_service` calls in the API handlers (`send_input`, `get_output`, `exit_terminal_cli`, `delete_terminal`, `send_special_key`, `get_terminal`) and in `run_agent_step` (handoff) now run via `asyncio.to_thread`. Under concurrent worker output these were forking `tmux` directly on the loop, freezing the whole server — `/health` and the supervisor's follow-up `assign` calls stranded until clients timed out. Diagnosed via lldb (loop thread parked in `__fork`/`subprocess_fork_exec`). Same hazard class as #382, previously fixed only for `DELETE /sessions`. Spawned detection/deferred-init tasks are held in strong-reference sets (asyncio only weak-refs `create_task` results)
-- codex: `extract_last_message_from_script` now strips ALL terminal escape sequences (`strip_terminal_escapes`) instead of only SGR colour codes. codex's TUI emits cursor-move/erase CSI sequences heavily; the SGR-only strip left them in, so `get_output(mode=last)` returned escape garbage instead of the response
-- poll_until_done (`cao launch` / `cao session send`, sync mode): now returns on a STABLE ready state — COMPLETED immediately (unchanged), or IDLE after the agent has been observed working and idle then persists for a short window. Previously required COMPLETED only, so a kiro agent that finished a turn at IDLE with no Credits marker would hang until the 300s timeout. This semantics change affects every provider, not just kiro. Only PROCESSING/WAITING_USER_ANSWER now flip the "observed working" flag — UNKNOWN does not, since a terminal can report UNKNOWN before it starts (no output yet / provider not registered / deferred init) and counting it would let a following stable idle return early with empty output. The status GET also carries a per-request timeout so a stalled server cannot block past the outer timeout budget
-- status monitor: `_arm_quiesce_timer` now cancels any outstanding quiescence timer for a terminal before arming the new one. Several output chunks arriving in quick succession queued multiple `_arm` closures; the later one overwrote the stored `TimerHandle` while leaving the earlier timer live, so two timers fired and a stale one firing mid-burst caused early/duplicate quiescence detections and status flaps. One outstanding timer per terminal now, always the latest
-- terminal_service: deferred-init failure path logs with `exc_info=True` (preserving the traceback) and formats the exception with `{e!r}` in both the log line and the supervisor-facing inbox message, so provider-supplied error text can't inject newlines/control characters
-- api: `POST /sessions/{name}/terminals` now rejects an `initial_message` / `initial_message_orchestration_type` body with 400 when `defer_init=false` — that payload is only delivered on the deferred-init path, so silently dropping it previously surfaced as a hard-to-diagnose "worker never received task". Deliberate 4xx responses (this guard and the invalid-orchestration-type check) also propagate as-is instead of being masked as 500
+- spec grammar + run_agent_step substrate (#312 Bolt 1) (#320)
 
-### Security
+- authoring, persistence & structured returns (#312 Bolt 2) (#326)
 
-- memory: validate every user-derived path component (`key`, `scope`, `scope_id`) as a single safe path segment and confine assembled wiki/index paths under the memory base directory via `os.path.realpath` + an explicit containment guard, closing the 11 CodeQL `py/path-injection` alerts in `memory_service.py`. Added shared helpers `validate_path_component` / `safe_join_under_base` in `utils/path_validation.py`. The remaining `py/clear-text-storage-sensitive-data` alert is assessed as a false positive (the memory wiki is intentionally plaintext markdown; the flagged value is a topic `key` slug, not a credential) and documented in-code for won't-fix dismissal.
+- add Antigravity CLI (agy) provider (#323)
 
-## [2.2.0] - 2026-06-04
+- wiki self-healing — `cao memory heal` (Phase 4 U1) (#306)
 
-### Highlights
+- sandboxed host-rendered fleet UI (SEP-1865) + capabil… (#332)
 
-- **CAO memory** — Agents can now store and recall knowledge across sessions via `memory_store` / `memory_recall` / `memory_forget` MCP tools. Memories are scoped to `global` / `project` / `session` / `agent`, persisted as wiki-style markdown under `~/.aws/cli-agent-orchestrator/memory/`, indexed in SQLite with BM25 fallback retrieval, and auto-injected as `<cao-memory>` context at session start. Ships with CLI commands (`cao memory list/show/delete/clear`), tiered retention, file-lock concurrent-write safety, per-scope caps, and stable project identity via git remote. See [docs/memory.md](docs/memory.md). (#245, #254, #262)
+- cross-project federation — FEDERATED scope (Phase 4 U3) (#314)
 
-- **External tool integration: OpenClaw & Hermes Agent** — A new external-tool-integration skill lets CAO orchestrate non-CAO CLI agents (OpenClaw, Hermes Agent, etc.) as first-class workers. Hermes Agent is shipped as a worked end-to-end example. See [docs/external-tool-integration.md](docs/external-tool-integration.md). (#241, #253)
+- canonical-source fidelity + host-delegated dogfooding (#347)
 
-### Added
+- orchestration run engine (#312 Bolt 3 / N5) (#329)
 
-- Build an MCP server for cao operations (#166)
+- rename cao flow → cao schedule with deprecated alias (#380)
 
-- auto-delete handoff terminals with snapshot-based restore (#233)
+- cross-node fleet coordinator (bootstrap + AI conductor) (#365)
 
-- shell command tracking, flow recycling fixes, and inbox delivery reliability (#230)
+- scope the per-agent skill catalog via a profile allowlist (#351)
 
-- eager inbox delivery for providers that buffer input during processing (#251)
+- Open Knowledge Format (OKF) export/import (#345) (#384)
 
-- forward `cao launch --env` vars to supervisor and child agents (#259)
+- durable run journal + resume (#312 N6) (#372)
 
-- add optional `codexProfile` field to AgentProfile for codex provider (#250)
+- script-tier journal extension (#312 C3/U3) (#391)
 
-- add optional `permission_mode` field to AgentProfile for claude_code provider (#244)
+- script linter + run-step env guard (#312 B2: U1+U2) (#394)
 
-- auto-derive CORS origins from `cao-server --host/--port` (#261)
+- fleet web panel + live console (#366)
 
-- official devcontainer feature for CAO (#260)
+- enable/disable an agent-profile directory (closes #280, #281) (#368)
 
-- memory: Phase 2.5 hardening — per-scope caps, ISO-8601 Z round-trip lock, durability + concurrent flock tests, `memory.enabled` short-circuit, stable project identity via git remote (#262)
+- script-tier execution engine — U4 runner (#312) (#396)
 
-- enhance Web UI DashboardHome with filtering, sorting, grouping, and session deletion (#200)
-
-- add OpenCode provider label to Web UI (#217)
+- GraphView contract + provider/sink registries (#348, B1) (#402)
 
 
 ### Documentation
 
-- reorganize README, split detail into topic docs, and add control-plane overview (#225)
+- add per-scope store samples, on-disk comparison, SQLite architecture diagram (#355)
 
-- fix Web UI build instructions and add 404 troubleshooting (#252)
+- add AWS cloud-ops agent examples with config (#377)
 
-- add install with pypi in README.md (#214)
+- fleet coordinator guide (docs/fleet_instructions.md) (#367)
+
+- draft CHANGELOG for v2.3.0 (#418)
 
 
 ### Fixed
 
-- codex: detect v0.136+ TUI footer (`model · path` without `N% left`) so handoff/assign workers reliably reach COMPLETED instead of pinning at IDLE
+- stop TestPyPI squats breaking the release smoke test (#270)
 
-- codex: skip `• Called <tool>(...)` MCP tool-call markers during last-message extraction so skill body text (including `[CAO Handoff]`) no longer leaks into worker output
+- handle v0.136+ TUI footer and skip MCP tool-call markers … (#274)
 
-- ci: stop TestPyPI squats breaking the release smoke test by installing the package with `--no-deps` and resolving deps from PyPI alone (#270)
+- mark messages DELIVERED before send_input to stop double delivery (#265)
 
-- kiro_cli: treat MCP-server boot screen as PROCESSING and gate shell-baseline IDLE on `_initialized` to fix paste-into-boot-screen race that dropped the first message after launch (#268)
+- address CodeQL command-injection and URL-sanitization … (#288)
 
-- mcp: reject `send_message` when `receiver_id` equals sender (#263)
+- structural callback routing for worker agents (#284) (#289)
 
-- tmux name validation hardening (CodeQL #66) (#258)
+- auto-detect server backend + herdr reconcile fixes (#309)
 
-- launch: resolve profile.provider regardless of yolo/allowed-tools branch (#257)
+- detect TUI idle state without falling back to --legacy-ui (#330)
 
-- api: default TERM to xterm-256color for tmux PTY attach (#256)
+- harden Claude and OpenCode status detection (#327)
 
-- api: make network allowlists configurable via env vars (#255)
+- stop echoed system prompt from short-circuiting trust dialog (#319)
 
-- tmux: filter environment to prevent 'command too long' errors (#246)
+- allow permissionMode to override yolo in claude_code provider (#322)
 
-- session-service: resolve profile.provider in `create_session()` (#198)
+- adopt vite 8 / vitest 4 and restore the 90% coverage floor (#346)
 
-- fix mcp worker provider resolution (#224)
+- also deny Claude Code's renamed subagent tool (Agent) (#350)
 
-- fix ops mcp profile provider resolution (#229)
+- accept workspace-trust dialog so init doesn't hang (#364)
 
-- agent_profiles: guard agent-name path lookups against traversal (#228)
+- dismiss startup upgrade-reminder dialog so init doesn't hang (#363)
 
-- install: harden agent-profile install against SSRF and path injection (#226)
+- read herdr native status in all providers (#359) (#361)
 
-- gemini_cli: isolate `GEMINI.md` per terminal in a dedicated workspace (#227)
+- add --version/-V option (#354) (#379)
 
-- kiro_cli: fix handoff hang for Q Developer Pro — Credits marker not emitted in TUI mode (#238)
+- dismiss startup feedback survey so init doesn't block (#371)
 
-- kiro_cli: detect TUI `Initializing...` to prevent false IDLE (#215)
+- non-blocking reader loop + event-loop-safe teardown (fixes #382) (#383)
 
-- tmux: start panes at 220x50 to avoid kiro-cli SIGWINCH input death (#218)
+- fix: unblock multi-agent orchestration on kiro-cli 2.11 — event-loop deadlock, serial/timed-out assign, and provider output/status detection (#390)
 
-- launch: wait for idle before tmux attach on non-headless launch (#221)
+- background task ("✻ Waiting for N workflows") no longer reads as COMPLETED (fixes #392) (#393)
 
-- opencode: add a poller to OpenCode CLI inbox delivery to drain stuck messages (#210)
+- validate user-derived path components to close CodeQL path-injection alerts (#401)
+
+- launch bundled cao-mcp-server without a per-launch network fetch (#403)
 
 
 ### Other
 
-- bump idna from 3.10 to 3.15 (#247)
+- Potential fix for code scanning alert no. 66: Uncontrolled command line (#275)
 
-- bump authlib from 1.6.11 to 1.6.12 (#236)
+- bump starlette from 0.49.1 to 1.0.1 (#276)
 
-- bump urllib3 from 2.6.3 to 2.7.0 (#234)
+- Event-driven architecture: rebase onto main + green the suite (continues #115) (#273)
+
+- bump esbuild, @vitejs/plugin-react and vite in /web (#295)
+
+- bump pyjwt from 2.12.0 to 2.13.0 (#301)
+
+- bump python-multipart from 0.0.27 to 0.0.31 (#302)
+
+- bump cryptography from 46.0.7 to 48.0.1 (#303)
+
+- bump starlette from 1.0.1 to 1.3.1 (#304)
+
+- bump form-data from 4.0.5 to 4.0.6 in /web (#305)
+
+- Add configurable server timeouts and file-based Claude Code prompt delivery (#318)
+
+- fix kiro/q integration tests (mock_db signature + event-loop starvation) (#333)
+
+- bump happy-dom from 15.11.7 to 20.10.6 in /cao_mcp_apps (#341)
+
+- Remove Amazon Q CLI and Gemini CLI providers (#353)
+
+- quickly remove some comments (#370)
+
+- Unify CAO configuration into a single source of truth (#357) (#381)
+
+- bump ws from 8.20.0 to 8.21.0 in /web (#398)
+
+- [Feat] cao profile — profile lifecycle management (#395)
+
+## [2.2.0] - 2026-06-02
+
+### Added
+
+- Add Opencode provider label to Web UI (#217)
+
+- add install with pypi in README.md (#214)
+
+- Build an MCP server for cao operations (#166)
+
+- shell command tracking, flow recycling fixes, and inbox delivery reliability (#230)
+
+- auto-delete handoff terminals with snapshot-based restore (#233)
+
+- enhance DashboardHome with filtering, sorting, grouping, and session deletion (#200)
+
+- persistent agent memory system (Phase 1) — foundation (#245)
+
+- forward env vars to supervisor and child agents (#259)
+
+- SQLite metadata, BM25 fallback, context-manager injection (#254)
+
+- auto-derive CORS origins from cao-server --host/--port (#261)
+
+- Official devcontainer feature for CAO (#260)
+
+- eager inbox delivery for providers that buffer input during processing (#251)
+
+- Phase 2.5 hardening (#262)
+
+
+### Documentation
+
+- add external tool integration guide for CAO skills (#241)
+
+- fix web UI build instructions and add 404 troubleshooting (#252)
+
+- add Hermes Agent as worked example (#253)
+
+
+### Fixed
+
+- detect TUI Initializing... to prevent false IDLE (#211) (#215)
+
+- start panes at 220x50 to avoid kiro-cli SIGWINCH input death (#216) (#218)
+
+- Add a poller to opencode CLI inbox delivery to drain s… (#210)
+
+- resolve profile.provider in create_session() (#198)
+
+- wait for idle before tmux attach on non-headless launch (#220) (#221)
+
+- fix mcp worker provider resolution (#224)
+
+- harden agent-profile install against SSRF and path inje… (#226)
+
+- isolate GEMINI.md per terminal in a dedicated workspace (#227)
+
+- guard agent-name path lookups against traversal (#228)
+
+- fix ops mcp profile provider resolution (#229)
+
+- fix handoff hang for Q Developer Pro — Credits marker not emitted in TUI mode (#238)
+
+- filter environment to prevent 'command too long' errors (#246)
+
+- default TERM to xterm-256color for tmux PTY attach (#256)
+
+- make network allowlists configurable via env vars (#255)
+
+- resolve profile.provider regardless of yolo/allowed-tools branch (#257)
+
+- reject send_message when receiver_id equals sender (#24) (#263)
+
+
+### Other
+
+- [Docs]Reorganize README, split detail into topic docs, and add control-plane overview (#225)
 
 - bump python-multipart from 0.0.26 to 0.0.27 (#232)
 
+- bump urllib3 from 2.6.3 to 2.7.0 (#234)
+
+- bump authlib from 1.6.11 to 1.6.12 (#236)
+
+- bump idna from 3.10 to 3.15 (#247)
+
+- Add optional permission_mode field to AgentProfile for claude_code provider (#244)
+
+- Add optional codexProfile field to AgentProfile for codex provider (#250)
+
+- Fix/codeql 66 tmux name validation (#258)
+
 - bump vitest from 3.2.4 to 4.1.0 in /web (#267)
 
+- Fix/resolve provider explicit override (#268)
 
 ## [2.1.1] - 2026-04-28
 
@@ -190,6 +302,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - bump postcss from 8.5.8 to 8.5.12 in /web (#208)
 
 - switch to deploy key to bypass commit to main (#213)
+
+- release v2.1.1
 
 ## [2.1.0] - 2026-04-22
 
@@ -501,3 +615,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bump to v0.51.0, update method name (#31)
 
 - accept optional U+03BB (λ) after % in kiro and q CLIs (#44)
+
+

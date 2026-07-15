@@ -267,10 +267,9 @@ class CodexProvider(BaseProvider):
                 # Escape backslashes, double quotes, and newlines for TOML basic string.
                 # Newlines must become literal \n to prevent tmux send_keys from
                 # splitting the command across multiple lines.
-                escaped_prompt = (
-                    system_prompt.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+                command_parts.extend(
+                    ["-c", f"developer_instructions={_toml_scalar(system_prompt)}"]
                 )
-                command_parts.extend(["-c", f'developer_instructions="{escaped_prompt}"'])
 
             # Add MCP servers via -c config overrides (per-session, no global config changes).
             # Each server field is set via dotted path: mcp_servers.<name>.<field>=<value>
@@ -285,13 +284,17 @@ class CodexProvider(BaseProvider):
                     # PATH-independent invocation.
                     cfg = resolve_mcp_server_config(cfg)
                     if "command" in cfg:
-                        command_parts.extend(["-c", f'{prefix}.command="{cfg["command"]}"'])
+                        command_parts.extend(
+                            ["-c", f"{prefix}.command={_toml_scalar(cfg['command'])}"]
+                        )
                     if "args" in cfg:
-                        args_toml = "[" + ", ".join(f'"{a}"' for a in cfg["args"]) + "]"
+                        args_toml = "[" + ", ".join(_toml_scalar(a) for a in cfg["args"]) + "]"
                         command_parts.extend(["-c", f"{prefix}.args={args_toml}"])
                     if "env" in cfg and cfg["env"]:
                         for env_key, env_val in cfg["env"].items():
-                            command_parts.extend(["-c", f'{prefix}.env.{env_key}="{env_val}"'])
+                            command_parts.extend(
+                                ["-c", f"{prefix}.env.{env_key}={_toml_scalar(str(env_val))}"]
+                            )
                     # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
                     # can identify the current session for handoff/assign operations.
                     # Codex does not forward env vars to MCP subprocesses by default;
@@ -299,7 +302,7 @@ class CodexProvider(BaseProvider):
                     env_vars = cfg.get("env_vars", [])
                     if "CAO_TERMINAL_ID" not in env_vars:
                         env_vars = list(env_vars) + ["CAO_TERMINAL_ID"]
-                    env_vars_toml = "[" + ", ".join(f'"{v}"' for v in env_vars) + "]"
+                    env_vars_toml = "[" + ", ".join(_toml_scalar(v) for v in env_vars) + "]"
                     command_parts.extend(["-c", f"{prefix}.env_vars={env_vars_toml}"])
                     # Set a generous tool timeout for MCP calls like handoff, which
                     # create a new terminal, initialize the provider, send a message,

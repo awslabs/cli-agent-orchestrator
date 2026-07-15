@@ -161,6 +161,29 @@ LOCAL_AGENT_STORE_DIR = CAO_HOME_DIR / "agent-store"
 # Local skill store for installed CAO skills
 SKILLS_DIR = CAO_HOME_DIR / "skills"
 
+# Confinement root for graph-layer sink exports (Issue #348, B3). Every graph
+# sink writes ONLY under this directory: ``dest`` is treated as a path
+# relative to this root and joined via ``safe_join_under_base`` (realpath
+# containment), so no export can escape it. Override with the
+# ``CAO_GRAPH_EXPORT_ROOT`` env var — resolved at CALL time by
+# ``graph_export_root()`` (below) so tests and operators can point it at a
+# scratch directory without re-importing. Default lives under CAO_HOME_DIR,
+# mirroring the KIRO_AGENTS_DIR env-override convention; never /tmp or cwd.
+GRAPH_EXPORT_ROOT_DEFAULT = CAO_HOME_DIR / "graph-exports"
+
+
+def graph_export_root() -> Path:
+    """Resolve the graph-export confinement root (env-overridable at call time).
+
+    Reads ``CAO_GRAPH_EXPORT_ROOT`` on each call so a monkeypatched/exported
+    value takes effect without a module reload; falls back to
+    ``GRAPH_EXPORT_ROOT_DEFAULT`` (``~/.aws/cli-agent-orchestrator/
+    graph-exports``). The directory need not exist yet — sinks create it under
+    the confined join.
+    """
+    return Path(os.environ.get("CAO_GRAPH_EXPORT_ROOT", str(GRAPH_EXPORT_ROOT_DEFAULT)))
+
+
 # Provider-specific agent directories
 KIRO_AGENTS_DIR = Path(os.environ.get("CAO_AGENTS_DIR", str(Path.home() / ".kiro" / "agents")))
 COPILOT_AGENTS_DIR = Path.home() / ".copilot" / "agents"  # Copilot custom agents

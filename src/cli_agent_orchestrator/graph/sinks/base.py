@@ -5,10 +5,58 @@ aidlc/spaces/default/intents/260709-graph-layer/ (AIDLC intent, not shipped
 with the package).
 """
 
+import os
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any, Callable, ClassVar
 
+from cli_agent_orchestrator.constants import graph_export_root
 from cli_agent_orchestrator.graph.models import GraphView
+from cli_agent_orchestrator.utils.path_validation import safe_join_under_base
+
+
+def confine_under_export_root(dest: str, description: str = "export destination") -> Path:
+    """Confine ``dest`` under the configured graph-export root (B3 security).
+
+    This is the sink-side containment primitive owned by BOTH the route and
+    the sink (the U4 route does NOT pre-validate ``dest``, so every sink must
+    confine it before its first write). ``dest`` is treated as a path
+    *relative* to ``CAO_GRAPH_EXPORT_ROOT`` (see
+    ``constants.graph_export_root``); an ABSOLUTE ``dest`` is accepted only
+    when it already resolves under that root, otherwise it is rejected. The
+    relative segments are joined via
+    :func:`utils.path_validation.safe_join_under_base`, which validates every
+    segment and enforces realpath containment — so no ``..`` traversal,
+    absolute-path escape, or symlink escape can leave the root.
+
+    Unlike the plain ``resolve_and_validate_path`` blocklist (which blocks
+    only ~18 exact system dirs, NOT their subdirectories), this guarantees
+    the result is the root itself or a descendant of it.
+
+    Returns:
+        The canonicalized absolute path under the export root (may not exist
+        yet — the caller creates it under this confined path).
+
+    Raises:
+        ValueError: If ``dest`` escapes the root or names no subpath.
+    """
+    root_real = os.path.realpath(os.path.abspath(str(graph_export_root())))
+
+    if os.path.isabs(dest):
+        dest_real = os.path.realpath(os.path.abspath(os.path.expanduser(dest)))
+        if dest_real != root_real and not dest_real.startswith(root_real + os.sep):
+            raise ValueError(
+                f"{description} {dest!r} is outside the graph export root "
+                f"{root_real!r}; supply a path relative to the root or one under it"
+            )
+        rel = os.path.relpath(dest_real, root_real)
+    else:
+        rel = dest
+
+    segments = [seg for seg in rel.split(os.sep) if seg not in ("", ".")]
+    if not segments:
+        raise ValueError(f"{description} must name a subpath under the graph export root: {dest!r}")
+    return Path(safe_join_under_base(root_real, *segments, description=description))
 
 
 class GraphSink(ABC):
@@ -17,11 +65,19 @@ class GraphSink(ABC):
     Security contract for ``dest``: implementations MUST resolve and
     confine ``dest`` under an allowed base directory before writing —
     reject ``..`` traversal, absolute-path escapes, and symlink escapes.
-    Follow this repo's path-validation convention
-    (``utils/path_validation.resolve_and_validate_path``). Validation is
-    owned by BOTH the U4 route (first line of defense, validates before
-    calling a sink) AND each sink implementation (defense in depth) — a
-    sink must not assume its caller already validated ``dest``.
+    The allowed base is the configured graph-export root
+    (``CAO_GRAPH_EXPORT_ROOT`` / ``constants.graph_export_root``); use the
+    shared :func:`confine_under_export_root` helper, which joins ``dest``
+    under that root via ``safe_join_under_base`` (per-segment validation +
+    realpath containment). ``dest`` validation is owned by the sink
+    implementation itself — the U4 route forwards ``dest`` unvalidated, so a
+    sink must never assume its caller already confined the path. Every sink
+    confines before its first write.
+
+    NOTE: the plain ``resolve_and_validate_path`` blocklist is NOT sufficient
+    confinement here — it blocks only a fixed set of exact system directories,
+    not their subdirectories, so ``~/.ssh`` / ``/etc/cron.d`` / ``/var/www``
+    would pass. Confinement under the export root is mandatory.
     """
 
     capabilities: ClassVar[set[str]] = set()

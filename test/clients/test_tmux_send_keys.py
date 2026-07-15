@@ -145,3 +145,32 @@ class TestSendKeys:
         assert mock_subprocess.run.call_count == 4
         load_call = mock_subprocess.run.call_args_list[0]
         assert len(load_call[1]["input"]) == 50000
+
+
+class TestSendKeysLogRedaction:
+    """send_keys must not log payload content at INFO — launch commands carry
+    MCP env values (API tokens) and full system prompts. Content is DEBUG-only."""
+
+    def test_info_log_omits_payload(self, client, mock_subprocess, mock_uuid, caplog):
+        import logging
+
+        secret = "API_TOKEN=super-secret-value"
+        with caplog.at_level(logging.INFO, logger="cli_agent_orchestrator.clients.tmux"):
+            client.send_keys("sess", "win", f"launch --env {secret}")
+
+        info_text = "\n".join(r.getMessage() for r in caplog.records if r.levelno == logging.INFO)
+        assert "super-secret-value" not in info_text
+        # Metadata still logged: target and payload length.
+        assert "sess:win" in info_text
+        assert "keys length" in info_text
+
+    def test_debug_log_retains_payload_for_troubleshooting(
+        self, client, mock_subprocess, mock_uuid, caplog
+    ):
+        import logging
+
+        with caplog.at_level(logging.DEBUG, logger="cli_agent_orchestrator.clients.tmux"):
+            client.send_keys("sess", "win", "visible-at-debug")
+
+        debug_text = "\n".join(r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG)
+        assert "visible-at-debug" in debug_text
