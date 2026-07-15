@@ -172,6 +172,9 @@ class TestSearchableTextRobustness:
         results = search_profiles("sqs", profiles=profiles)  # must not raise TypeError
         assert isinstance(results, list)
         assert results and results[0]["name"] == "sqs-a"  # matched via name token
+        # Regression (Copilot): contract must hold even for malformed input
+        assert results[0]["tags"] == []
+        assert results[0]["capabilities"] == []
 
 
 class TestDiscoveryFields:
@@ -196,6 +199,12 @@ class TestDiscoveryFields:
     def test_invalid_tags_dropped(self):
         out = self._fields({"tags": ["good-tag", "has spaces", "bad$char", "x" * 65]})
         assert out["tags"] == ["good-tag"]
+
+    def test_trailing_newline_tag_rejected(self):
+        """Regression (Copilot): $ matches before a trailing newline with
+        re.match; fullmatch must reject the whole string."""
+        out = self._fields({"tags": ["good-tag\n", "ok-tag"]})
+        assert out["tags"] == ["ok-tag"]
 
     def test_item_count_capped(self):
         out = self._fields(

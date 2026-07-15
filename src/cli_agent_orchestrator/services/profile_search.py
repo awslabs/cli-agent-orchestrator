@@ -51,10 +51,17 @@ def _searchable_text(profile: Dict) -> str:
 
 
 def _result(profile: Dict, score: float) -> Dict:
-    """Shape a profile into the shared CLI/MCP result contract."""
+    """Shape a profile into the shared CLI/MCP result contract.
+
+    ``tags``/``capabilities`` are always lists of strings in the contract,
+    even if a raw caller passed malformed values (the real pipeline already
+    normalizes via ``_discovery_fields``).
+    """
     out = {field: profile.get(field, "") for field in RESULT_FIELDS}
-    out["capabilities"] = profile.get("capabilities") or []
-    out["tags"] = profile.get("tags") or []
+    tags = profile.get("tags")
+    capabilities = profile.get("capabilities")
+    out["tags"] = [str(t) for t in tags] if isinstance(tags, list) else []
+    out["capabilities"] = [str(c) for c in capabilities] if isinstance(capabilities, list) else []
     out["score"] = round(float(score), 4)
     return out
 

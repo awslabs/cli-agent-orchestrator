@@ -73,7 +73,7 @@ def _discovery_fields(metadata: dict) -> Dict:
         else []
     )
     tags = (
-        [str(t) for t in tags_raw[:_DISCOVERY_MAX_ITEMS] if _TAG_PATTERN.match(str(t))]
+        [str(t) for t in tags_raw[:_DISCOVERY_MAX_ITEMS] if _TAG_PATTERN.fullmatch(str(t))]
         if isinstance(tags_raw, list)
         else []
     )
