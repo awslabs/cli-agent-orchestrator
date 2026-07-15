@@ -93,9 +93,17 @@ class FifoManager:
         self._lock = threading.Lock()
 
         # ---- pipe-pane liveness watchdog state (issue #388) ----
-        # Monotonic timestamp of the last byte the FIFO reader delivered for a
-        # terminal. Updated by the reader thread; read by the watchdog to tell a
+        # Monotonic timestamp of the last time this terminal is considered to
+        # have delivered real, current output. Read by the watchdog to tell a
         # stalled pipe (pane moving, FIFO silent) from a genuinely idle one.
+        # Updated from two places, not just the reader thread (round-3
+        # Copilot review on #397, flagging this comment as stale): the reader
+        # thread bumps it on every real byte pulled off the FIFO, AND
+        # _rearm_stalled_pipe() also bumps it after a successful re-arm +
+        # replay — deliberately, so the check immediately following a re-arm
+        # sees "FIFO advanced" (via the replay, which bypasses the FIFO/
+        # reader thread entirely) and doesn't misread the just-fixed pipe as
+        # still stalled on the very next tick.
         self._last_data_at: Dict[str, float] = {}
         # Monotonic timestamp of when this reader was registered, and whether
         # the FIFO has EVER delivered a real byte since — the cold-start check

@@ -30,6 +30,21 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_positive_float(name: str, default: float) -> float:
+    """Read a float env var, falling back when the value is invalid OR non-positive.
+
+    For env vars that feed a ``threading.Event.wait(timeout)``-style poll
+    interval, a non-positive value isn't just atypical, it's actually
+    invalid for the parameter's meaning: ``Event.wait(0)``/``wait(negative)``
+    returns immediately, turning a periodic poll loop into a hot spin (round-3
+    Copilot review on #397, ``PIPE_LIVENESS_CHECK_INTERVAL_S``). Treated the
+    same way ``_env_float`` already treats a malformed string — fall back to
+    the default — rather than introducing a separate arbitrary floor value.
+    """
+    value = _env_float(name, default)
+    return value if value > 0 else default
+
+
 # =============================================================================
 # Session Configuration
 # =============================================================================
@@ -96,7 +111,7 @@ EVENT_BUS_MAX_QUEUE_SIZE = _env_int("CAO_EVENT_BUS_MAX_QUEUE_SIZE", 16384)
 # FIFO delivered any bytes in the same window: pane advanced + FIFO silent =
 # a stalled forwarder, which it re-arms (stop_pipe_pane then pipe_pane — a bare
 # re-pipe would just toggle the already-"piped" pane OFF).
-PIPE_LIVENESS_CHECK_INTERVAL_S = _env_float("CAO_PIPE_LIVENESS_CHECK_INTERVAL_S", 4.0)
+PIPE_LIVENESS_CHECK_INTERVAL_S = _env_positive_float("CAO_PIPE_LIVENESS_CHECK_INTERVAL_S", 4.0)
 # Lines of live pane content compared to decide whether the pane advanced. A
 # tail is enough: a stall diverges the visible screen, and comparing only the
 # tail keeps each check to one cheap capture-pane call.

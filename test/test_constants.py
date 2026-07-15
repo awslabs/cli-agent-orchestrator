@@ -244,6 +244,51 @@ class TestAddLocalCorsOrigins:
         assert "http://2001:db8::1:9889" not in mod.CORS_ORIGINS
 
 
+class TestPipeLivenessCheckIntervalClamp:
+    """Regression for the round-3 Copilot review on #397: PIPE_LIVENESS_CHECK_INTERVAL_S
+    feeds ``threading.Event.wait(timeout)`` in the watchdog's poll loop
+    (services/fifo_reader.py's ``_watchdog_loop``) — a non-positive value makes
+    ``wait()`` return immediately every iteration, turning the periodic poll
+    into a hot spin (high CPU + a tmux ``capture-pane`` call as fast as the
+    loop can run). A non-positive value here is invalid for the parameter's
+    meaning, not just atypical, so it's treated the same way an unparseable
+    string already is: fall back to the default.
+    """
+
+    def _reload_constants(self, env_overrides):
+        import importlib
+        import os
+
+        env_copy = os.environ.copy()
+        env_copy.pop("CAO_PIPE_LIVENESS_CHECK_INTERVAL_S", None)
+        env_copy.update(env_overrides)
+        with patch.dict("os.environ", env_copy, clear=True):
+            import cli_agent_orchestrator.constants as constants_module
+
+            importlib.reload(constants_module)
+            return constants_module
+
+    def test_zero_falls_back_to_default(self):
+        mod = self._reload_constants({"CAO_PIPE_LIVENESS_CHECK_INTERVAL_S": "0"})
+        assert mod.PIPE_LIVENESS_CHECK_INTERVAL_S == 4.0
+
+    def test_negative_falls_back_to_default(self):
+        mod = self._reload_constants({"CAO_PIPE_LIVENESS_CHECK_INTERVAL_S": "-1.5"})
+        assert mod.PIPE_LIVENESS_CHECK_INTERVAL_S == 4.0
+
+    def test_non_numeric_falls_back_to_default(self):
+        mod = self._reload_constants({"CAO_PIPE_LIVENESS_CHECK_INTERVAL_S": "not-a-number"})
+        assert mod.PIPE_LIVENESS_CHECK_INTERVAL_S == 4.0
+
+    def test_positive_value_is_honored(self):
+        mod = self._reload_constants({"CAO_PIPE_LIVENESS_CHECK_INTERVAL_S": "0.5"})
+        assert mod.PIPE_LIVENESS_CHECK_INTERVAL_S == 0.5
+
+    def test_default_when_env_not_set(self):
+        mod = self._reload_constants({})
+        assert mod.PIPE_LIVENESS_CHECK_INTERVAL_S == 4.0
+
+
 class TestCaoHomeDir:
     """Tests for CAO home directory constants."""
 
