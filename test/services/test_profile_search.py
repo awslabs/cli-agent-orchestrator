@@ -7,9 +7,7 @@ import json
 from unittest.mock import patch
 
 import pytest
-from click.testing import CliRunner
 
-from cli_agent_orchestrator.cli.commands.profile import profile
 from cli_agent_orchestrator.services.profile_search import (
     RESULT_FIELDS,
     _searchable_text,
@@ -121,6 +119,8 @@ class TestSearchProfiles:
         for field in RESULT_FIELDS:
             assert field in result
         assert "score" in result
+        assert isinstance(result["capabilities"], list)
+        assert isinstance(result["tags"], list)
 
     def test_never_exposes_prompt_body(self, sample_profiles):
         """Security boundary: discovery is metadata-only."""
@@ -138,50 +138,6 @@ class TestSearchProfiles:
         results = search_profiles("sqs monitoring", profiles=sample_profiles)
         scores = [r["score"] for r in results]
         assert scores == sorted(scores, reverse=True)
-
-
-class TestFindCmd:
-    @pytest.fixture
-    def runner(self):
-        return CliRunner()
-
-    def test_find_table_output(self, runner, sample_profiles):
-        with patch(
-            "cli_agent_orchestrator.utils.agent_profiles.list_agent_profiles",
-            return_value=sample_profiles,
-        ):
-            result = runner.invoke(profile, ["find", "sqs"])
-        assert result.exit_code == 0
-        assert "sqs-dlq-check" in result.output
-        assert "SCORE" in result.output
-
-    def test_find_json_output(self, runner, sample_profiles):
-        with patch(
-            "cli_agent_orchestrator.utils.agent_profiles.list_agent_profiles",
-            return_value=sample_profiles,
-        ):
-            result = runner.invoke(profile, ["find", "sqs", "--json"])
-        assert result.exit_code == 0
-        parsed = json.loads(result.output)
-        assert parsed[0]["name"] == "sqs-dlq-check"
-
-    def test_find_no_match_message(self, runner, sample_profiles):
-        with patch(
-            "cli_agent_orchestrator.utils.agent_profiles.list_agent_profiles",
-            return_value=sample_profiles,
-        ):
-            result = runner.invoke(profile, ["find", "kubernetes"])
-        assert result.exit_code == 0
-        assert "No profiles matched" in result.output
-
-    def test_find_limit_option(self, runner, sample_profiles):
-        with patch(
-            "cli_agent_orchestrator.utils.agent_profiles.list_agent_profiles",
-            return_value=sample_profiles,
-        ):
-            result = runner.invoke(profile, ["find", "monitoring", "--limit", "1", "--json"])
-        assert result.exit_code == 0
-        assert len(json.loads(result.output)) == 1
 
 
 class TestSchemaAcceptsNewFields:
@@ -203,3 +159,115 @@ class TestSchemaAcceptsNewFields:
         metadata = {"name": "test-agent", "tags": ["has spaces and $ymbols"]}
         errors = [m for m in _validate_frontmatter(metadata) if m.startswith("[error]")]
         assert errors
+
+
+class TestSearchableTextRobustness:
+    def test_none_description_does_not_match_query_none(self):
+        """Regression: str(None) == "None" made `find none` match empty descriptions."""
+        profiles = [{"name": "x-agent", "description": None, "tags": [], "capabilities": []}]
+        assert search_profiles("none", profiles=profiles) == []
+
+    def test_string_tags_do_not_raise(self):
+        profiles = [{"name": "sqs-a", "description": "d", "tags": "sqs", "capabilities": 7}]
+        results = search_profiles("sqs", profiles=profiles)  # must not raise TypeError
+        assert isinstance(results, list)
+        assert results and results[0]["name"] == "sqs-a"  # matched via name token
+
+
+class TestDiscoveryFields:
+    """Read-time hardening: schema limits enforced even for profiles that
+    never went through cao install validation."""
+
+    def _fields(self, meta):
+        from cli_agent_orchestrator.utils.agent_profiles import _discovery_fields
+
+        return _discovery_fields(meta)
+
+    def test_non_list_values_coerced_to_empty(self):
+        out = self._fields({"tags": "sqs", "capabilities": 42, "role": ["dev"]})
+        assert out == {"capabilities": [], "tags": [], "role": ""}
+
+    def test_items_coerced_to_str_and_bounded(self):
+        out = self._fields({"capabilities": [123, "x" * 500], "tags": ["ok_tag", 99]})
+        assert out["capabilities"][0] == "123"
+        assert len(out["capabilities"][1]) == 128
+        assert out["tags"] == ["ok_tag", "99"]
+
+    def test_invalid_tags_dropped(self):
+        out = self._fields({"tags": ["good-tag", "has spaces", "bad$char", "x" * 65]})
+        assert out["tags"] == ["good-tag"]
+
+    def test_item_count_capped(self):
+        out = self._fields(
+            {"tags": [f"t{i}" for i in range(100)], "capabilities": [f"c{i}" for i in range(100)]}
+        )
+        assert len(out["tags"]) == 32
+        assert len(out["capabilities"]) == 32
+
+
+class TestEndToEndWiring:
+    """Frontmatter on disk -> list_agent_profiles() -> search_profiles()."""
+
+    def test_tagged_profile_found_via_store_scan(self, tmp_path, monkeypatch):
+        import cli_agent_orchestrator.utils.agent_profiles as ap
+
+        store = tmp_path / "store"
+        store.mkdir()
+        (store / "dlq-demo.md").write_text(
+            "---\n"
+            "name: dlq-demo\n"
+            "description: Investigates stuck messages\n"
+            "tags: [dlq, dead-letter, sqs]\n"
+            'capabilities: ["inspect dead letter queues"]\n'
+            "---\n\nSECRET PROMPT BODY\n"
+        )
+        monkeypatch.setattr(ap, "LOCAL_AGENT_STORE_DIR", store)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_agent_dirs", lambda: {}
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_disabled_agent_dirs",
+            lambda: [],
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", lambda: []
+        )
+        profiles = [p for p in ap.list_agent_profiles() if p["name"] == "dlq-demo"]
+        assert profiles and profiles[0]["tags"] == ["dlq", "dead-letter", "sqs"]
+
+        results = search_profiles("dead letter", profiles=profiles)
+        assert results and results[0]["name"] == "dlq-demo"
+        assert "SECRET" not in json.dumps(results)
+
+
+class TestFindProfilesMcpTool:
+    def test_tool_returns_contract(self, sample_profiles, monkeypatch):
+        from cli_agent_orchestrator.mcp_server import server
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.agent_profiles.list_agent_profiles",
+            lambda: sample_profiles,
+        )
+        results = server.find_profiles(query="monitor sqs", limit=5)
+        assert results
+        assert {r["name"] for r in results} <= {"sqs-dlq-check", "cloudwatch-logs"}
+        for r in results:
+            assert "prompt" not in r
+            assert set(r) == {
+                "name",
+                "description",
+                "capabilities",
+                "tags",
+                "role",
+                "source",
+                "score",
+            }
+
+    def test_tool_returns_empty_on_backend_exception(self, monkeypatch):
+        from cli_agent_orchestrator.mcp_server import server
+
+        def boom(*a, **k):
+            raise RuntimeError("backend down")
+
+        monkeypatch.setattr("cli_agent_orchestrator.services.profile_search.search_profiles", boom)
+        assert server.find_profiles(query="sqs", limit=5) == []

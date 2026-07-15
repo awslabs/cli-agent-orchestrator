@@ -32,12 +32,20 @@ def _tokenize(text: str) -> List[str]:
 
 
 def _searchable_text(profile: Dict) -> str:
-    """Concatenate the metadata fields a profile is discoverable by."""
+    """Concatenate the metadata fields a profile is discoverable by.
+
+    Tolerates malformed inputs (``None`` description, non-list tags) so raw
+    callers can't trigger a TypeError; the real pipeline already normalizes
+    via ``_discovery_fields``. Tokenization is ASCII-alphanumeric, matching
+    the memory search tokenizer.
+    """
+    tags = profile.get("tags")
+    capabilities = profile.get("capabilities")
     parts = [
-        str(profile.get("name", "")),
-        str(profile.get("description", "")),
-        " ".join(profile.get("tags") or []),
-        " ".join(profile.get("capabilities") or []),
+        str(profile.get("name") or ""),
+        str(profile.get("description") or ""),
+        " ".join(str(t) for t in tags) if isinstance(tags, list) else "",
+        " ".join(str(c) for c in capabilities) if isinstance(capabilities, list) else "",
     ]
     return " ".join(p for p in parts if p)
 

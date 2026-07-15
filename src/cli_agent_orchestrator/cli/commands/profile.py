@@ -363,9 +363,9 @@ def create_cmd(template: str, config_path: str, output_dir: str):
 
 @profile.command("find")
 @click.argument("query")
-@click.option("--limit", default=10, show_default=True, help="Maximum results to return.")
+@click.option("--limit", default=None, type=int, help="Maximum results to return.  [default: 10]")
 @click.option("--json", "as_json", is_flag=True, help="Output results as JSON.")
-def find_cmd(query: str, limit: int, as_json: bool):
+def find_cmd(query: str, limit: Optional[int], as_json: bool):
     """Find agent profiles by keyword (searches name, description, tags, capabilities).
 
     Examples:
@@ -376,9 +376,15 @@ def find_cmd(query: str, limit: int, as_json: bool):
     """
     import json as json_mod
 
-    from cli_agent_orchestrator.services.profile_search import search_profiles
+    from cli_agent_orchestrator.services.profile_search import DEFAULT_LIMIT, search_profiles
 
-    results = search_profiles(query, limit=limit)
+    if limit is None:
+        limit = DEFAULT_LIMIT
+
+    try:
+        results = search_profiles(query, limit=limit)
+    except Exception as e:
+        raise click.ClickException(f"Profile search failed: {e}")
 
     if as_json:
         click.echo(json_mod.dumps(results, indent=2))
@@ -391,8 +397,10 @@ def find_cmd(query: str, limit: int, as_json: bool):
     click.echo(f"{'NAME':<30} {'SCORE':<8} {'TAGS':<24} {'DESCRIPTION'}")
     click.echo(f"{'─' * 30} {'─' * 8} {'─' * 24} {'─' * 40}")
     for r in results:
-        tags = ",".join(r.get("tags") or [])[:24]
-        desc = (r.get("description") or "")[:80]
+        tags = ",".join(r.get("tags") or [])
+        if len(tags) > 24:
+            tags = tags[:21] + "..."
+        desc = (r.get("description") or "")[:108]
         click.echo(f"{r['name']:<30} {r['score']:<8} {tags:<24} {desc}")
 
     click.echo(f"\n{len(results)} profile(s) matched.")

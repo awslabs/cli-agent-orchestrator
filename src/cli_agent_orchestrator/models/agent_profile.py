@@ -33,6 +33,12 @@ class AgentProfile(BaseModel):
     # by CAO when composing the prompt, not passed through to provider JSON.
     skills: Optional[List[str]] = None
 
+    # Discovery metadata used by `cao profile find` / the find_profiles MCP
+    # tool (#340). Declared here so parse paths built on this model keep the
+    # fields (pydantic silently drops undeclared keys).
+    capabilities: Optional[List[str]] = None
+    tags: Optional[List[str]] = None
+
     # Q CLI agent fields (all optional, will be passed through to JSON)
     prompt: Optional[str] = None
     mcpServers: Optional[Dict[str, Any]] = None

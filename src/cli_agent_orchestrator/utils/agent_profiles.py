@@ -1,6 +1,7 @@
 """Agent profile utilities."""
 
 import logging
+import re
 from importlib import resources
 from pathlib import Path
 from typing import Dict, List, Set
@@ -44,18 +45,41 @@ def _safe_join(root: Path, *parts: str) -> Path | None:
     return candidate
 
 
+# Read-time bounds for discovery metadata, mirroring agent_profile.schema.json.
+# The schema is only enforced at install/validate time; profiles can reach the
+# stores without passing through it (manual copy, git checkout), so the read
+# path re-enforces the limits before the values feed search corpora and the
+# find_profiles MCP surface.
+_DISCOVERY_MAX_ITEMS = 32
+_CAPABILITY_MAX_LEN = 128
+_TAG_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
 def _discovery_fields(metadata: dict) -> Dict:
     """Extract optional discovery metadata (capabilities/tags/role) from frontmatter.
 
-    Non-list values are coerced to empty lists so downstream search code can
-    rely on the shape without re-validating.
+    Non-list values are coerced to empty lists, and schema limits (item counts,
+    lengths, tag charset) are enforced here so downstream search code can rely
+    on bounded, well-shaped values even for profiles that never went through
+    ``cao install`` validation.
     """
-    caps = metadata.get("capabilities")
-    tags = metadata.get("tags")
+    caps_raw = metadata.get("capabilities")
+    tags_raw = metadata.get("tags")
     role = metadata.get("role")
+
+    capabilities = (
+        [str(c)[:_CAPABILITY_MAX_LEN] for c in caps_raw[:_DISCOVERY_MAX_ITEMS]]
+        if isinstance(caps_raw, list)
+        else []
+    )
+    tags = (
+        [str(t) for t in tags_raw[:_DISCOVERY_MAX_ITEMS] if _TAG_PATTERN.match(str(t))]
+        if isinstance(tags_raw, list)
+        else []
+    )
     return {
-        "capabilities": [str(c) for c in caps] if isinstance(caps, list) else [],
-        "tags": [str(t) for t in tags] if isinstance(tags, list) else [],
+        "capabilities": capabilities,
+        "tags": tags,
         "role": str(role) if isinstance(role, str) else "",
     }
 
