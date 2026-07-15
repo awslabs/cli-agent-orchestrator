@@ -463,8 +463,9 @@ WORKFLOW_RUN_REQUEST_TIMEOUT = (WORKFLOW_STEP_TIMEOUT + 120.0) * 12 + 180.0  # =
 SCRIPT_LINT_DISALLOWED_IMPORT_PREFIXES = frozenset({"cli_agent_orchestrator"})
 
 # Modules whose import earns a nondeterminism WARNING (U1-A3, Q3=A): resume
-# replays journaled calls and requires deterministic re-execution. Import-level
-# only — no call-site analysis. A warning never fails a script (FR-1.7).
+# re-executes the frozen script, including completed ``run_step`` calls, so
+# deterministic control flow keeps repeated work predictable. Import-level only
+# — no call-site analysis. A warning never fails a script (FR-1.7).
 SCRIPT_LINT_NONDETERMINISM_MODULES = frozenset({"random", "secrets", "uuid", "time", "datetime"})
 
 # Env-var injection allowlist for POST /terminals/run-step (Bolt 2, U2/C6,

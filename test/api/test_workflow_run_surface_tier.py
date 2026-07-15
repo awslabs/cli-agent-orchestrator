@@ -22,6 +22,7 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.models.workflow import ScriptSpec, TierCollisionError
+from cli_agent_orchestrator.models.workflow_runtime import RunState
 from cli_agent_orchestrator.services import script_runner, workflow_journal, workflow_service
 
 _GOOD_SCRIPT = "def main():\n    pass\n"
@@ -264,6 +265,42 @@ class TestRunTierDispatch:
         # anything past the mocked (raising) run_script_workflow call.
         assert workflow_journal.get_run("r-lint") is None
 
+    def test_script_post_dispatch_key_error_maps_to_409(self, client, monkeypatch):
+        spec = self._script_spec()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.workflow_spec_service.get_workflow",
+            lambda name_or_path, scan_dir=None: spec,
+        )
+        monkeypatch.setattr(workflow_service, "_check_run_id_available", lambda rid: None)
+
+        async def _raise(spec_arg, inputs, run_id):
+            raise KeyError("run_id became unavailable")
+
+        monkeypatch.setattr(script_runner, "run_script_workflow", _raise)
+        resp = client.post(
+            "/workflows/runs",
+            json={"name_or_path": "scriptwf", "inputs": {}, "run_id": "r-race"},
+        )
+        assert resp.status_code == 409
+
+    def test_script_post_dispatch_value_error_maps_to_400(self, client, monkeypatch):
+        spec = self._script_spec()
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.workflow_spec_service.get_workflow",
+            lambda name_or_path, scan_dir=None: spec,
+        )
+        monkeypatch.setattr(workflow_service, "_check_run_id_available", lambda rid: None)
+
+        async def _raise(spec_arg, inputs, run_id):
+            raise ValueError("bad script run input")
+
+        monkeypatch.setattr(script_runner, "run_script_workflow", _raise)
+        resp = client.post(
+            "/workflows/runs",
+            json={"name_or_path": "scriptwf", "inputs": {}, "run_id": "r-invalid"},
+        )
+        assert resp.status_code == 400
+
 
 class TestResumeTierDispatch:
     def _seed_row(self, monkeypatch, tier, run_id="run1"):
@@ -318,6 +355,26 @@ class TestResumeTierDispatch:
         resp = client.post("/workflows/runs/run1/resume")
         assert resp.status_code == 422
 
+    def test_script_tier_resume_key_error_maps_to_404(self, client, monkeypatch):
+        self._seed_row(monkeypatch, "script")
+
+        async def _raise(run_id):
+            raise KeyError(run_id)
+
+        monkeypatch.setattr(script_runner, "resume_script_run", _raise)
+        resp = client.post("/workflows/runs/run1/resume")
+        assert resp.status_code == 404
+
+    def test_script_tier_resume_value_error_maps_to_400(self, client, monkeypatch):
+        self._seed_row(monkeypatch, "script")
+
+        async def _raise(run_id):
+            raise ValueError("bad run id")
+
+        monkeypatch.setattr(script_runner, "resume_script_run", _raise)
+        resp = client.post("/workflows/runs/run1/resume")
+        assert resp.status_code == 400
+
     def test_unknown_tier_value_routes_to_yaml_arm(self, client, monkeypatch):
         """U5-Q2=A: any tier value other than the literal 'script' is the YAML arm."""
         self._seed_row(monkeypatch, "some-future-tier")
@@ -361,6 +418,23 @@ class TestCancelTierDispatch:
         resp = client.post("/workflows/runs/run1/cancel")
         assert resp.status_code == 200
         assert called["hit"] is True
+
+    @pytest.mark.parametrize(
+        "terminal_state", [RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED]
+    )
+    def test_script_tier_live_terminal_record_returns_409(
+        self, client, monkeypatch, terminal_state
+    ):
+        record = types.SimpleNamespace(tier="script", state=terminal_state)
+        monkeypatch.setattr(workflow_service, "run_registry", {"run1": record})
+
+        async def _must_not_cancel(rec):
+            raise AssertionError("terminal script record must not be cancelled")
+
+        monkeypatch.setattr(script_runner, "cancel_script_run", _must_not_cancel)
+        resp = client.post("/workflows/runs/run1/cancel")
+        assert resp.status_code == 409
+        assert terminal_state.value in resp.json()["detail"]
 
     def test_no_live_record_falls_back_to_journal(self, client, monkeypatch):
         monkeypatch.setattr(workflow_service, "run_registry", {})

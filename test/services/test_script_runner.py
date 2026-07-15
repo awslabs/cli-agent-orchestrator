@@ -490,6 +490,35 @@ async def test_cancel_idempotent_second_is_noop(monkeypatch: pytest.MonkeyPatch)
     assert row is not None and row.generation == "1"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal_state", [RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED]
+)
+async def test_cancel_terminal_record_is_service_noop(
+    monkeypatch: pytest.MonkeyPatch, terminal_state: RunState
+):
+    """Direct callers cannot rewrite a retained terminal record to CANCELLED."""
+
+    async def _must_not_sweep(run_id):
+        raise AssertionError("terminal run must return before cancellation work")
+
+    monkeypatch.setattr(script_runner, "_reconcile_orphans", _must_not_sweep)
+    _seed_script_run("run-terminal", state=terminal_state.value, generation="1")
+    process = _FakeProcess()
+    record = _make_record("run-terminal", process=process, generation="1")
+    record.state = terminal_state
+    record.finished_at = "2026-07-08T00:00:01Z"
+
+    await cancel_script_run(record)
+
+    row = workflow_journal.get_run("run-terminal")
+    assert row is not None and row.state == terminal_state.value
+    assert row.generation == "1"
+    assert record.state == terminal_state
+    assert record.cancelled is False
+    assert process.signals == []
+
+
 # ---------------------------------------------------------------------------
 # A2 — resume admission + happy path
 # ---------------------------------------------------------------------------
@@ -903,8 +932,8 @@ def test_completion_adopts_validated_structured_output(_patched_journal):
     st = record.step_states["s1"]
     assert st.state == StepState.COMPLETED
     assert st.output is not None and st.output.output == {"answer": 42}
-    # The structured output round-trips to the durable row (not NULL) so a
-    # resumed run's lookup_replay can reuse it instead of losing it.
+    # The structured output round-trips to the durable row (not NULL), preserving
+    # complete status history and the reserved lookup_replay primitive's data.
     row = workflow_journal.get_step("run-out", "s1")
     assert row is not None and row.output_json is not None
     assert json.loads(row.output_json) == {"answer": 42}
@@ -991,6 +1020,28 @@ def test_completion_journal_failure_never_raises(monkeypatch, _patched_journal):
     settle("term-1", None)  # must not raise
     # In-memory transition still applied despite the journal write failing.
     assert record.step_states["s1"].state == StepState.COMPLETED
+
+
+def test_get_run_status_script_cold_miss_uses_journal_row_without_yaml_rebuild(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A journal-only script run returns its row state and no reconstructed steps."""
+    from cli_agent_orchestrator.services import workflow_service
+
+    _seed_script_run("run-cold", state="failed", generation="3")
+
+    def _must_not_rebuild(run_id):
+        raise AssertionError("script status must not use the YAML journal rebuild")
+
+    monkeypatch.setattr(workflow_service, "_rebuild_record_from_journal", _must_not_rebuild)
+
+    status = workflow_service.get_run_status("run-cold")
+
+    assert status.run_id == "run-cold"
+    assert status.state == RunState.FAILED
+    assert status.current_step_id is None
+    assert status.steps == []
+    assert "run-cold" not in workflow_service.run_registry
 
 
 # ---------------------------------------------------------------------------

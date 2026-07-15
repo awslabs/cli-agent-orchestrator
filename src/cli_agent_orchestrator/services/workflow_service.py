@@ -112,14 +112,11 @@ class StaleGenerationError(ValueError):
 
 
 class ReplayDivergenceError(Exception):
-    """A resumed script call's fingerprint diverged from its journaled row (A2, DR-4).
+    """The reserved replay lookup found a fingerprint mismatch (A2, DR-4).
 
-    U3 addition (issue #312, script-tier journal extension, C3). NOT a
-    ``ValueError`` / NOT mapped to an HTTP status at the resume route boundary
-    (business-rules "Error-to-status mapping" table) — the script changed between
-    runs at the same ``(run_id, step_id)`` key, so resume cannot honor the replay
-    determinism contract (ADR-5). The run is failed loudly (state -> FAILED,
-    surfaced in the run result), never silently re-executed.
+    U3 addition (issue #312, script-tier journal extension, C3). The current
+    run-step route does not call ``lookup_replay``, so this exception is not
+    mapped at an HTTP boundary or surfaced by script resume today.
     """
 
 

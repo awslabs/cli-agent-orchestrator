@@ -66,24 +66,21 @@ more power, more responsibility (see the determinism obligation next).
 If you're unsure, start with YAML. Reach for a script only when you hit a
 concrete limitation.
 
-## The determinism obligation (why there is no retry)
+## The determinism obligation (and repeated work on resume)
 
-`run_step` never retries, backs off, or reconnects. This is a *permanent*
-design decision, not a missing feature: a client-side retry after an
-unknown-completion-state transport failure could re-issue a call that the
-server's replay/fingerprint contract would then have to reconcile as a
-duplicate or a divergence — exactly the nondeterminism-across-runs hazard
-that contract exists to prevent.
+`run_step` never retries, backs off, or reconnects. A client-side retry after
+an unknown-completion-state transport failure could issue the same agent work
+twice, so failures are returned to your script unchanged.
 
 This puts an obligation on **your script**: its control flow and the
 prompts it sends must be deterministic across runs of the *same* script
 source. If your script's behavior can vary run-to-run — a `random()` call
 that isn't seeded, a prompt that embeds `datetime.now()`, branching on
-wall-clock time — a **resume** of that run can diverge from what actually
-executed, and the server raises `ReplayDivergenceError`. The shim performs
-no runtime check for this; it has no way to know whether a given call is a
-fresh execution or a replay. This is a documentation obligation the author
-carries, not a guard the shim builds for you.
+wall-clock time — a **resume** can repeat different work from the original
+attempt. The current runtime does not replay completed calls or reject that
+divergence: it re-executes the frozen script from the top, including every
+`run_step` call. Determinism makes that repeated work predictable, but your
+workflow must tolerate it being issued again.
 
 ## Fan-out and `step_id`
 
@@ -94,8 +91,8 @@ ever get the same key — but it is **not safe for fan-out**. Thread
 scheduling, not the counter's correctness, decides which call claims which
 `call-N`, so two runs of the same fan-out script can assign `call-1`/
 `call-2` to different logical calls depending on how the OS scheduled your
-threads that run. On resume, that reassignment is exactly what
-`ReplayDivergenceError` is designed to catch.
+threads that run. On resume, that reassignment makes journal history and
+diagnostics refer to different logical calls under the same `call-N` key.
 
 **The rule:** any time you call `run_step` from more than one thread
 (`concurrent.futures.ThreadPoolExecutor`, manual `threading.Thread`), pass
@@ -109,27 +106,25 @@ with ThreadPoolExecutor(max_workers=3) as pool:
     futures = [pool.submit(_run_shard, s) for s in ("alpha", "beta", "gamma")]
 ```
 
-The linter (`cao workflow validate`) heuristically warns when it sees
-thread/executor use without an accompanying `step_id` — treat that warning
-as load-bearing, not stylistic.
+The linter (`cao workflow validate`) does not infer concurrency or check this
+rule. It reports syntax errors, disallowed or unverifiable dynamic imports,
+and imports associated with nondeterminism. Supplying stable `step_id` values
+for fan-out is the author's responsibility.
 
-## Resume is CLI + HTTP only — the shim has no resume branch
+## Resume re-executes the frozen script
 
 `run_step()` behaves **identically** whether the surrounding script is a
 fresh run or a resume drive. There is no `if resuming:` branch inside the
-shim, and there never will be — resume-awareness lives entirely
-server-side (the journal's replay lookup) and CLI-side (`cao workflow
-resume`). On resume, the CLI re-executes your script from the top; the
-server transparently returns journaled results for calls that already
-completed, and your script's `run_step` calls have no visibility into
-which case they're in — they always make the same HTTP call, and the
-server decides whether to execute or replay.
+shim. `cao workflow resume` re-executes the frozen source snapshot from the
+top with a new generation token, and each `run_step` call makes a new HTTP
+request that executes the agent step again. Completed calls are journaled,
+and a replay lookup primitive exists in the journal layer, but it is not
+connected to the run-step route and cannot currently suppress repeated work.
 
-Concretely: your script never needs to check "am I resuming?" — if it does,
-that's a sign the script has drifted into doing the server's job. The one
-thing resume changes that your script's *behavior* depends on is the
-determinism obligation above: a deterministic script resumes cleanly with
-no code change; a nondeterministic one surfaces `ReplayDivergenceError`.
+Design scripts so repeated steps are acceptable, or add application-level
+idempotency around external side effects. `CAO_WORKFLOW_RESUME=1` is present
+in the resumed subprocess environment for code that must distinguish the
+drive, but the `cao_workflow` shim itself does not branch on it.
 
 ## The `reuse_terminal_id` 422 trap
 

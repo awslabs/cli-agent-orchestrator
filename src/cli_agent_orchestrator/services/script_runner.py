@@ -400,10 +400,10 @@ def make_step_terminal_recorder(
 def _step_call_fingerprint(provider: str, agent: str, prompt: str) -> str:
     """``sha256(provider || agent || prompt)`` for the journal step row (ADR-5).
 
-    The stable call identity U3's ``lookup_replay`` compares against on resume:
-    a completed step row keeps the fingerprint recorded at its FIRST arrival, so
-    a resume can replay it instead of re-executing. NUL-separated so distinct
-    field boundaries can never collide (``a|b`` vs ``ab|``).
+    The stable call identity consumed by U3's reserved ``lookup_replay`` primitive.
+    Runtime replay is not currently wired into the run-step route, but preserving
+    this identity keeps the journal compatible with that future integration.
+    NUL-separated so distinct field boundaries cannot collide (``a|b`` vs ``ab|``).
     """
     joined = "\x00".join((provider, agent, prompt))
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()
@@ -437,9 +437,10 @@ def record_step_completion(
       error string recorded.
 
     The transition is written through to the durable journal best-effort
-    (``append_step`` — U3's sole ``call_fingerprint`` write path) so a resume's
-    ``lookup_replay`` sees the completed step and skips re-execution. A journal
-    failure only degrades resumability; it never fails the step (INV-4).
+    (``append_step`` — U3's sole ``call_fingerprint`` write path). This preserves
+    status history and the data needed by the reserved replay primitive; current
+    resumes still execute every ``run_step`` call again. A journal failure only
+    degrades durable status; it never fails the step (INV-4).
     """
     if not env_vars:
         return None
@@ -480,15 +481,13 @@ def record_step_completion(
                 st.state = StepState.COMPLETED
             st.error = None
 
-        # Best-effort durable write-through so resume's lookup_replay sees the
-        # settled row WITH its attempts/output/error, not just its state. Two
-        # writes, matching the U3 contract (append_step's docstring): (1)
+        # Best-effort durable write-through so status reads and the reserved
+        # lookup_replay primitive see the settled row WITH its attempts/output/error,
+        # not just its state. Two writes, matching the U3 contract: (1)
         # append_step establishes the row + the stable call_fingerprint (its sole
         # writer, VR-4 — excluded from DO UPDATE so it is fixed at first arrival);
         # (2) update_step fills attempts/output_json/error, which append_step
-        # hardcodes to 0/NULL/NULL. Without (2) a resumed run's lookup_replay
-        # would read null output for a step that produced structured data (silent
-        # data loss on resume). Never raises into the step (INV-4).
+        # hardcodes to 0/NULL/NULL. Never raises into the step (INV-4).
         now = _now()
         output_json = json.dumps(st.output.output) if st.output is not None else None
         try:
@@ -522,8 +521,8 @@ def record_step_completion(
 def _materialize_snapshot(run_id: str, source: str) -> str:
     """Write the frozen ``spec_snapshot.source`` to an engine-owned temp file (BR-30).
 
-    Resume re-drives the FROZEN snapshot, not the author's on-disk file (INV-7):
-    a naive re-exec of an edited file would mass-trigger ``ReplayDivergenceError``.
+    Resume re-drives the FROZEN snapshot, not the author's on-disk file (INV-7),
+    so a resumed run executes the same source even if the author edits the file.
     The temp file lives under ``WORKFLOW_SCRIPT_SCRATCH_DIR`` (0o700, created if
     absent) with mode 0o600 so a co-tenant cannot read or swap the source between
     materialize and exec. The filename is derived from the engine-validated
@@ -866,7 +865,8 @@ async def resume_script_run(run_id: str) -> WorkflowRunResult:
     Execution (only after admission): bump + persist generation BEFORE spawn
     (INV-6); materialize the frozen snapshot to an engine-owned temp file (BR-30);
     re-spawn with ``CAO_WORKFLOW_RESUME=1``; drive as A1; delete the temp file in
-    a ``finally`` after reap. The replay/fence machinery is U3's, server-side.
+    a ``finally`` after reap. Generation fencing is active; U3's replay lookup
+    remains a reserved journal primitive and is not wired into this drive.
     """
     from cli_agent_orchestrator.services.workflow_service import update_run_generation
 
@@ -970,6 +970,16 @@ async def cancel_script_run(record: ScriptRunRecord) -> None:
     ``WORKFLOW_SCRIPT_TERM_GRACE`` the reaper uses (NFR-REL-1).
     """
     from cli_agent_orchestrator.services.workflow_service import update_run_generation
+
+    # The API route rejects this as 409. Keep the service safe for direct callers:
+    # cancellation must never rewrite a retained COMPLETED/FAILED record.
+    if record.state in (RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED):
+        logger.info(
+            "cancel: run '%s' already terminal (%s) — no-op",
+            record.run_id,
+            record.state.value,
+        )
+        return
 
     # --- Idempotency: a second cancel is a no-op (BR-19) ---
     if record.cancelled:

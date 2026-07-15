@@ -1557,6 +1557,7 @@ async def run_step(
             detail={"message": str(e), "kind": e.kind, "terminal_id": e.terminal_id},
         )
     except TimeoutError as e:
+        _settle_step(None, str(e))
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail={"message": str(e), "kind": "timeout", "terminal_id": None},
@@ -1565,6 +1566,7 @@ async def run_step(
         # Unknown terminal / bad input surfaced by the terminal layer.
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
+        _settle_step(None, str(e))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to run step: {str(e)}",
@@ -1587,8 +1589,8 @@ async def validate_workflow_endpoint(body: WorkflowValidateRequest) -> Dict:
     Extension-based dispatch (U5, A1a, BR-23a): ``.yaml``/``.yml`` calls
     ``validate_only`` UNCHANGED (FR-5.1); ``.py`` calls ``lint_script``
     DIRECTLY — NOT via ``get_workflow``/``ScriptSpec`` — staying read-only,
-    side-effect-free, and collision-check-free like the YAML arm (BR-23b),
-    and renders through the shared ``render_findings`` helper (BR-10 reuse).
+    side-effect-free, and collision-check-free like the YAML arm (BR-23b).
+    The complete ``ScriptValidationResult`` is returned with ``model_dump()``.
     """
     import os as _os
 
@@ -1867,6 +1869,15 @@ async def cancel_workflow_run_endpoint(
         return {"success": True, "run_id": run_id}
 
     if getattr(record, "tier", "yaml") == "script":
+        record_state = getattr(record, "state", None)
+        if record_state in (RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"run '{run_id}' is already "
+                    f"{getattr(record_state, 'value', record_state)}; cannot cancel"
+                ),
+            )
         await script_runner.cancel_script_run(
             cast(script_runner.ScriptRunRecord, record)
         )  # NEVER raises (BR-19)

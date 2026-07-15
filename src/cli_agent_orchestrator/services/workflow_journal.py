@@ -292,7 +292,8 @@ def append_step(
 
     Called at the RUNNING insert for a script call — ``call_fingerprint`` is
     known BEFORE execution (``sha256(provider || agent || prompt)``, ADR-5) so a
-    later resume's ``lookup_replay`` (A2) has something to compare against. The
+    future caller of the reserved ``lookup_replay`` primitive has a stable value
+    to compare. The
     completion transition (RUNNING -> COMPLETED/FAILED) reuses the base
     ``update_step`` UNCHANGED (INV-1); this function is the sole write path for
     ``call_fingerprint`` (VR-4).
@@ -319,6 +320,9 @@ def append_step(
 
 def lookup_replay(run_id: str, step_id: str, call_fingerprint: str) -> Optional[StepRow]:
     """Decide replay-from-journal vs execute-fresh for a script call (A2, the M3 core).
+
+    This is a reserved journal primitive. The current run-step route does not call
+    it, so script resume re-executes completed calls rather than replaying them.
 
     Three-way outcome (DR-1/DR-2/DR-3/DR-4, business-rules.md):
 

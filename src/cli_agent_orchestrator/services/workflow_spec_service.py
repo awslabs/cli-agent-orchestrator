@@ -416,11 +416,10 @@ def _resolve_source_path(name: str, scan_dir: Optional[str] = None) -> str:
 
 
 def render_findings(findings: List[LintFinding]) -> List[dict]:
-    """Render a list of ``LintFinding`` into the shared 422/findings-body shape (A1a, BR-10).
+    """Render ``LintFinding`` values into the run route's 422 findings body.
 
-    ONE function used by BOTH the validate route's ``.py`` success path (A1a)
-    and the run route's ``ScriptLintError`` 422 handler (A3) — never
-    duplicated per-verb (BR-21).
+    The validate route returns ``lint_script(...).model_dump()`` directly; this
+    helper is used when ``ScriptLintError`` must be mapped to an HTTP error.
     """
     return [finding.model_dump() for finding in findings]
 
