@@ -591,6 +591,179 @@ class TestPipeLivenessWatchdog:
             manager.stop_reader("term-plain")
 
 
+class TestColdStartStallDetection:
+    """harness-control#93: the divergence check above can ONLY ever catch a
+    pipe that WAS delivering and then stalled — it needs an established
+    "healthy" baseline to diverge from. A pipe that has been dead since the
+    terminal was created never gets one: an already-idle shell prompt renders
+    once and never changes again, so every check sees identical content and
+    "diverged_from_baseline" is permanently False — the watchdog could wait
+    forever without ever re-arming, while wait_for_shell() times out (60s)
+    waiting on a FIFO buffer that was never going to fill. Live-reproduced:
+    a real tmux pane sitting on a stable, genuinely-ready shell prompt whose
+    FIFO never delivered a single byte from the moment pipe-pane attached.
+
+    This is a positive, independent check — not a variant of the divergence
+    logic — checked BEFORE it: has the FIFO delivered anything since
+    registration, within a short grace period? If not, and the pane already
+    shows real content (ruling out "still genuinely booting"), re-arm
+    immediately.
+    """
+
+    def _manager(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cli_agent_orchestrator.services.fifo_reader.FIFO_DIR", tmp_path)
+        return FifoManager()
+
+    def _enroll_cold(self, manager, terminal_id, pane_holder, rearm_calls, registered_at):
+        """Register a terminal exactly as create_reader() would for a pipe
+        that has never delivered anything since ``registered_at``."""
+        manager._pane_probe[terminal_id] = lambda: pane_holder["content"]
+        manager._rearm[terminal_id] = lambda: rearm_calls.append(True)
+        manager._last_data_at[terminal_id] = registered_at
+        manager._registered_at[terminal_id] = registered_at
+        manager._ever_delivered[terminal_id] = False
+
+    def test_cold_start_stall_is_detected_and_rearmed_on_first_check(self, tmp_path, monkeypatch):
+        """The defining case: a single, static, already-rendered pane (no
+        divergence ever occurs) whose FIFO never delivered anything must
+        still be re-armed — on the VERY FIRST check, unlike the steady-state
+        path which always lets the first observation pass to establish a
+        baseline. Requiring a second check here would just re-introduce the
+        same "nothing ever changes" blind spot for a terminal whose pane
+        genuinely never changes again after this."""
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_COLD_START_GRACE_S", 0.0)
+        manager = self._manager(tmp_path, monkeypatch)
+        pane = {"content": "user@host:~$ "}
+        rearm_calls: list = []
+        # Registered "in the past" relative to now — grace period already elapsed.
+        self._enroll_cold(manager, "term", pane, rearm_calls, registered_at=time.monotonic() - 10)
+
+        manager._check_pipe_liveness("term")
+
+        assert rearm_calls == [True], "a born-stale pipe must be re-armed without waiting for divergence"
+
+    def test_cold_start_not_triggered_before_grace_period_elapses(self, tmp_path, monkeypatch):
+        """A terminal registered moments ago must get its grace period, not
+        an instant re-arm — the pipe may simply not have had a chance to
+        deliver its first byte yet."""
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_COLD_START_GRACE_S", 3.0)
+        manager = self._manager(tmp_path, monkeypatch)
+        pane = {"content": "user@host:~$ "}
+        rearm_calls: list = []
+        self._enroll_cold(manager, "term", pane, rearm_calls, registered_at=time.monotonic())
+
+        manager._check_pipe_liveness("term")
+
+        assert rearm_calls == [], "must not re-arm before the cold-start grace period elapses"
+
+    def test_cold_start_not_triggered_while_pane_still_empty(self, tmp_path, monkeypatch):
+        """A pane with no content yet (genuinely still booting — nothing has
+        rendered at all) must not be re-armed just because time passed: there
+        is nothing for a re-arm+replay to recover, and re-arming an already-
+        correct "still starting" pipe is pure churn."""
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_COLD_START_GRACE_S", 0.0)
+        manager = self._manager(tmp_path, monkeypatch)
+        pane = {"content": "   \n  "}  # whitespace only
+        rearm_calls: list = []
+        self._enroll_cold(manager, "term", pane, rearm_calls, registered_at=time.monotonic() - 10)
+
+        manager._check_pipe_liveness("term")
+
+        assert rearm_calls == [], "an empty pane must not be treated as a cold-start stall"
+
+    def test_cold_start_never_fires_once_fifo_has_delivered(self, tmp_path, monkeypatch):
+        """Backward compat with the steady-state path: once the FIFO has ever
+        delivered a byte, `_ever_delivered` is True and every future check —
+        including one where the pane happens to be unchanged — must go
+        through the ordinary divergence logic (idle, no re-arm), never the
+        cold-start branch, even though content never diverges here either."""
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_COLD_START_GRACE_S", 0.0)
+        manager = self._manager(tmp_path, monkeypatch)
+        pane = {"content": "user@host:~$ "}
+        rearm_calls: list = []
+        self._enroll_cold(manager, "term", pane, rearm_calls, registered_at=time.monotonic() - 10)
+        manager._ever_delivered["term"] = True  # the FIFO has delivered at least once
+
+        for _ in range(4):
+            manager._check_pipe_liveness("term")  # pane never changes, FIFO silent since
+
+        assert rearm_calls == [], "a pipe that has ever delivered must use the idle/divergence path, not cold-start"
+
+    def test_cold_start_state_absent_falls_back_to_existing_behavior(self, tmp_path, monkeypatch):
+        """Terminals enrolled directly (bypassing create_reader — exactly how
+        TestPipeLivenessWatchdog's own `_enroll` helper works) never populate
+        `_ever_delivered`/`_registered_at`. The cold-start check must default
+        to "not a cold start" rather than crashing or misfiring, so every
+        pre-existing test in TestPipeLivenessWatchdog keeps exercising only
+        the divergence path unchanged."""
+        manager = self._manager(tmp_path, monkeypatch)
+        pane = {"content": "line0"}
+        rearm_calls: list = []
+        manager._pane_probe["term"] = lambda: pane["content"]
+        manager._rearm["term"] = lambda: rearm_calls.append(True)
+        manager._last_data_at["term"] = time.monotonic()
+        # Deliberately NOT setting _ever_delivered / _registered_at.
+
+        manager._check_pipe_liveness("term")  # must not raise, must not rearm (baseline only)
+
+        assert rearm_calls == []
+        assert "term" in manager._liveness
+
+    def test_cold_start_rearm_replays_live_pane_into_pipeline(self, tmp_path, monkeypatch):
+        """Same recovery mechanism as the steady-state stall: the pane's
+        current snapshot is republished directly to the event bus, bypassing
+        the FIFO/reader thread entirely — this is what actually unblocks
+        wait_for_shell() even though the FIFO itself never delivered a byte."""
+        monkeypatch.setattr(fr, "PIPE_LIVENESS_COLD_START_GRACE_S", 0.0)
+        published: list = []
+        monkeypatch.setattr(fr.bus, "publish", lambda topic, data: published.append((topic, data)))
+
+        manager = self._manager(tmp_path, monkeypatch)
+        pane = {"content": "user@host:~$ "}
+        rearm_calls: list = []
+        self._enroll_cold(manager, "term", pane, rearm_calls, registered_at=time.monotonic() - 10)
+
+        manager._check_pipe_liveness("term")
+
+        assert rearm_calls == [True]
+        assert ("terminal.term.output", {"data": pane["content"]}) in published
+
+    def test_cold_start_end_to_end_via_real_reader_thread(self, tmp_path, monkeypatch):
+        """Integration-level: create_reader() seeds the cold-start state
+        correctly, and a real reader thread flips `_ever_delivered` to True
+        the moment actual bytes flow through the FIFO — after which the
+        cold-start check must never fire again for this terminal, even if
+        content stops changing."""
+        manager = self._manager(tmp_path, monkeypatch)
+        try:
+            manager.create_reader(
+                "term-e2e", pane_probe=lambda: "content", rearm=lambda: None
+            )
+            with manager._lock:
+                assert manager._registered_at.get("term-e2e") is not None
+                assert manager._ever_delivered.get("term-e2e") is False
+
+            fifo_path = tmp_path / "term-e2e.fifo"
+            wfd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
+            os.write(wfd, b"real bytes")
+            os.close(wfd)
+
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                with manager._lock:
+                    if manager._ever_delivered.get("term-e2e") is True:
+                        break
+                time.sleep(0.02)
+
+            with manager._lock:
+                assert manager._ever_delivered.get("term-e2e") is True, (
+                    "the reader thread must flip _ever_delivered once real bytes are read"
+                )
+        finally:
+            manager.stop_reader("term-e2e")
+            manager.stop_watchdog()
+
+
 class TestConcurrencyRaces:
     """Round-3 Copilot review on #397: two lock-scope gaps in code the round-2
     review had already touched.

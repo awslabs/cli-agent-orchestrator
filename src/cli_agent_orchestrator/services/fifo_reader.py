@@ -13,6 +13,7 @@ from typing import Callable, Dict, Optional, Tuple
 from cli_agent_orchestrator.constants import (
     FIFO_DIR,
     PIPE_LIVENESS_CHECK_INTERVAL_S,
+    PIPE_LIVENESS_COLD_START_GRACE_S,
     PIPE_LIVENESS_MAX_REARM_FAILURES,
     PIPE_LIVENESS_STALL_CHECKS,
 )
@@ -66,6 +67,23 @@ class FifoManager:
     (not just the previous one) so a stall that settles into a new static frame
     right after the burst — instead of staying visibly in flux — is still caught
     (harness-control#148).
+
+    Also runs a separate cold-start check (harness-control#93): the
+    divergence logic above can only ever catch a pipe that WAS delivering
+    and then stalled — it needs a baseline to diverge from. A pipe that has
+    been dead since the terminal was created never gets one: an already-idle
+    shell prompt renders once and then never changes, so every check sees
+    identical content and "diverged" is permanently False. This is the
+    common, live-reproduced shape of #93 — a shell that IS genuinely ready,
+    sitting on a stable prompt, whose FIFO simply never forwarded anything
+    (tmux's ``pipe-pane -o`` only captures output produced after it attaches;
+    a fast shell can draw its prompt in the same instant, and the guaranteed
+    "nudge a fresh prompt through the pipe" keystroke terminal_service.py
+    already sends is not 100% reliable under load). The cold-start check is
+    independent of any baseline: has the FIFO delivered ANYTHING since
+    registration, within a short, fixed grace period? If not — and the live
+    pane already shows real content — re-arm immediately instead of waiting
+    on a divergence that structurally cannot happen.
     """
 
     def __init__(self):
@@ -78,6 +96,16 @@ class FifoManager:
         # terminal. Updated by the reader thread; read by the watchdog to tell a
         # stalled pipe (pane moving, FIFO silent) from a genuinely idle one.
         self._last_data_at: Dict[str, float] = {}
+        # Monotonic timestamp of when this reader was registered, and whether
+        # the FIFO has EVER delivered a real byte since — the cold-start check
+        # (harness-control#93) is "has anything come through, within this much
+        # time of registration", entirely independent of the baseline/diverge
+        # bookkeeping below (which presupposes at least one healthy delivery
+        # to establish a baseline against). Tracked for every reader (like
+        # _last_data_at above), not just enrolled ones, so the bookkeeping
+        # stays uniform; only enrolled terminals ever have it consulted.
+        self._registered_at: Dict[str, float] = {}
+        self._ever_delivered: Dict[str, bool] = {}
         # Per-terminal probes/re-arm callbacks (only tmux/pipe-pane terminals
         # register these; herdr and callers that pass none are never watched).
         self._pane_probe: Dict[str, PaneProbe] = {}
@@ -130,7 +158,10 @@ class FifoManager:
             self._threads[terminal_id] = thread
             # Seed the liveness clock BEFORE pipe-pane starts so the first
             # watchdog check has a baseline; the reader bumps it on real data.
-            self._last_data_at[terminal_id] = time.monotonic()
+            now = time.monotonic()
+            self._last_data_at[terminal_id] = now
+            self._registered_at[terminal_id] = now
+            self._ever_delivered[terminal_id] = False
             if enroll:
                 self._pane_probe[terminal_id] = pane_probe
                 self._rearm[terminal_id] = rearm
@@ -160,6 +191,8 @@ class FifoManager:
             self._liveness.pop(terminal_id, None)
             self._last_data_at.pop(terminal_id, None)
             self._rearm_failures.pop(terminal_id, None)
+            self._registered_at.pop(terminal_id, None)
+            self._ever_delivered.pop(terminal_id, None)
 
         # Deliberately NOT stopping the watchdog thread here even when this was
         # the last enrolled terminal: doing it under a "now idle" check raced
@@ -288,6 +321,7 @@ class FifoManager:
                         with self._lock:
                             if terminal_id in self._readers:
                                 self._last_data_at[terminal_id] = time.monotonic()
+                                self._ever_delivered[terminal_id] = True
                         if not pending:
                             batch_start = time.monotonic()
                         pending.extend(raw)
@@ -394,6 +428,13 @@ class FifoManager:
         a needless re-pipe. Re-arm only after ``PIPE_LIVENESS_STALL_CHECKS``
         consecutive checks confirm the divergence persists (default 2 — a single
         diverging check can be a false positive on a healthy-but-bursty pipe).
+
+        Before any of that, a separate cold-start check (harness-control#93)
+        runs first: has the FIFO delivered ANYTHING since the terminal was
+        registered, within ``PIPE_LIVENESS_COLD_START_GRACE_S``? This is not
+        a variant of the divergence logic — it is checked instead of it,
+        because divergence requires a healthy baseline to diverge FROM, and a
+        pipe that's been dead since t=0 never gets one. See module docstring.
         """
         probe = self._pane_probe.get(terminal_id)
         rearm = self._rearm.get(terminal_id)
@@ -407,6 +448,7 @@ class FifoManager:
         now = time.monotonic()
 
         do_rearm = False
+        cold_start = False
         with self._lock:
             # stop_reader() may have unenrolled this terminal while probe()
             # was in flight above. Re-check membership before touching any
@@ -419,64 +461,126 @@ class FifoManager:
                 return
             last_data_at = self._last_data_at.get(terminal_id, 0.0)
 
-            prev = self._liveness.get(terminal_id)
-            if prev is None:
-                # First observation: establish a baseline, never act on it.
+            # ---- cold-start check (harness-control#93) ----
+            # `.get(..., True)` / `registered_at is None` default to "not a
+            # cold start": entries created via create_reader() always have
+            # both set, but tests that poke _pane_probe/_rearm/_last_data_at
+            # directly (bypassing create_reader) leave them absent, and must
+            # keep exercising only the pre-existing divergence path.
+            ever_delivered = self._ever_delivered.get(terminal_id, True)
+            registered_at = self._registered_at.get(terminal_id)
+            if (
+                not ever_delivered
+                and registered_at is not None
+                and now - registered_at >= PIPE_LIVENESS_COLD_START_GRACE_S
+                and content.strip()
+            ):
+                # The FIFO has never delivered a single byte in the grace
+                # period since registration, yet the live pane already has
+                # real content — the forwarder never started, full stop.
+                # Reset liveness bookkeeping to the post-rearm state so the
+                # divergence check starts clean on the next tick instead of
+                # possibly re-triggering off a baseline captured before rearm.
+                cold_start = True
+                do_rearm = True
                 self._liveness[terminal_id] = (content, now, 0)
-                return
-            baseline_content, last_check_at, strikes = prev
-
-            # Did the reader deliver anything since the previous check?
-            fifo_advanced = last_data_at >= last_check_at
-
-            if fifo_advanced:
-                # Healthy: the pipe is confirmed delivering. Re-baseline to
-                # the current pane content and clear strikes.
-                self._liveness[terminal_id] = (content, now, 0)
-                return
-
-            # FIFO silent since the last check. Compare against the STICKY
-            # baseline (last known-healthy content), not the previous
-            # check's content — see docstring for why this matters for a
-            # burst-then-settle stall. Full tail string compared, not a
-            # hash: a hash collision would make this False and mask a real
-            # stall (negligible probability, but the string is just as
-            # cheap to compare and collision-free).
-            #
-            # Tradeoff (round-3 review, call-me-ram): pinning the baseline
-            # means ANY one-shot pane divergence seen while the FIFO happens
-            # to be silent — not just a genuine stall — now accumulates
-            # strikes toward a re-arm, where the old previous-check
-            # comparison would have reset on the very next unchanging check.
-            # E.g. an attached client resizing the pane, causing tmux to
-            # rewrap the captured tail once, then nothing further changing.
-            # The cost of a false-positive re-arm here is mild (a
-            # stop/start on an otherwise-idle pipe plus one snapshot
-            # replay), and it's the unavoidable price of catching a stall
-            # that settles into a new static frame — accepted deliberately.
-            diverged_from_baseline = content != baseline_content
-
-            if diverged_from_baseline:
-                strikes += 1
-                if strikes >= PIPE_LIVENESS_STALL_CHECKS:
-                    do_rearm = True
-                    strikes = 0
             else:
-                strikes = 0
+                prev = self._liveness.get(terminal_id)
+                if prev is None:
+                    # First observation: establish a baseline, never act on it.
+                    self._liveness[terminal_id] = (content, now, 0)
+                else:
+                    baseline_content, last_check_at, strikes = prev
 
-            # Baseline is intentionally left unchanged (not reset to
-            # `content`) so a burst-then-settle stall keeps accumulating
-            # strikes against the original pre-stall baseline across
-            # checks where the now-static content no longer changes.
-            self._liveness[terminal_id] = (baseline_content, now, strikes)
+                    # Did the reader deliver anything since the previous check?
+                    fifo_advanced = last_data_at >= last_check_at
+
+                    if fifo_advanced:
+                        # Healthy: the pipe is confirmed delivering. Re-baseline
+                        # to the current pane content and clear strikes.
+                        self._liveness[terminal_id] = (content, now, 0)
+                    else:
+                        # FIFO silent since the last check. Compare against the
+                        # STICKY baseline (last known-healthy content), not the
+                        # previous check's content — see docstring for why this
+                        # matters for a burst-then-settle stall. Full tail
+                        # string compared, not a hash: a hash collision would
+                        # make this False and mask a real stall (negligible
+                        # probability, but the string is just as cheap to
+                        # compare and collision-free).
+                        #
+                        # Tradeoff (round-3 review, call-me-ram): pinning the
+                        # baseline means ANY one-shot pane divergence seen
+                        # while the FIFO happens to be silent — not just a
+                        # genuine stall — now accumulates strikes toward a
+                        # re-arm, where the old previous-check comparison
+                        # would have reset on the very next unchanging check.
+                        # E.g. an attached client resizing the pane, causing
+                        # tmux to rewrap the captured tail once, then nothing
+                        # further changing. The cost of a false-positive
+                        # re-arm here is mild (a stop/start on an otherwise-
+                        # idle pipe plus one snapshot replay), and it's the
+                        # unavoidable price of catching a stall that settles
+                        # into a new static frame — accepted deliberately.
+                        diverged_from_baseline = content != baseline_content
+
+                        if diverged_from_baseline:
+                            strikes += 1
+                            if strikes >= PIPE_LIVENESS_STALL_CHECKS:
+                                do_rearm = True
+                                strikes = 0
+                        else:
+                            strikes = 0
+
+                        # Baseline is intentionally left unchanged (not reset
+                        # to `content`) so a burst-then-settle stall keeps
+                        # accumulating strikes against the original pre-stall
+                        # baseline across checks where the now-static content
+                        # no longer changes.
+                        self._liveness[terminal_id] = (baseline_content, now, strikes)
 
         if not do_rearm:
             return
 
+        self._rearm_stalled_pipe(terminal_id, content, rearm, cold_start=cold_start)
+
+    def _rearm_stalled_pipe(
+        self, terminal_id: str, content: str, rearm: RearmPipe, *, cold_start: bool
+    ) -> None:
+        """Re-arm a confirmed-stalled pipe-pane forwarder and replay the live
+        pane snapshot into the pipeline, shared by both stall checks above —
+        they differ only in HOW a stall is detected, not in what happens once
+        one is confirmed.
+
+        Bytes lost during the stall are gone (tmux never buffered them), but
+        the pane's *current* content is not — replay it into the pipeline so
+        the StatusMonitor buffer / GET output immediately reflect the live
+        screen instead of staying frozen until the agent happens to emit
+        something new. This is also what makes the cold-start case actually
+        resolve: the replay publishes straight to the event bus, bypassing
+        the FIFO reader entirely, so wait_for_shell()'s buffer read is
+        satisfied even though the FIFO itself never delivered a byte.
+
+        capture-pane output is joined with a bare "\\n" (clients/tmux.py's
+        get_history), which is linefeed-without-carriage-return. pyte's
+        screen (fed by StatusMonitor for CAO_PYTE_STATUS providers — on by
+        default, and opted into by claude_code, exactly the provider #388
+        was filed against) defaults LNM (line-feed/new-line mode) off, so a
+        bare "\\n" advances the row without returning to column 0: each
+        replayed line renders indented past the previous one
+        ("staircasing"), and the composited screen no longer matches the
+        real pane until a later cursor-addressed repaint happens to paper
+        over it — meaning status detection can stay broken after the very
+        re-arm meant to fix it. Replaying with "\\r\\n" makes pyte treat it as
+        a real newline, matching what a real terminal does with tmux's own
+        capture-pane output.
+        """
         logger.warning(
-            "pipe-pane forwarder for terminal %s appears stalled "
-            "(pane advanced, no FIFO data) — re-arming",
+            "pipe-pane forwarder for terminal %s appears %s — re-arming",
             terminal_id,
+            "never started forwarding (cold-start, harness-control#93)"
+            if cold_start
+            else "stalled (pane advanced, no FIFO data)",
         )
         try:
             rearm()
@@ -493,6 +597,8 @@ class FifoManager:
                     self._rearm.pop(terminal_id, None)
                     self._liveness.pop(terminal_id, None)
                     self._rearm_failures.pop(terminal_id, None)
+                    self._registered_at.pop(terminal_id, None)
+                    self._ever_delivered.pop(terminal_id, None)
             if give_up:
                 # Not a silent retry-forever: a re-arm that keeps failing
                 # (e.g. the tmux pane is gone) previously re-struck and
@@ -509,25 +615,6 @@ class FifoManager:
                 )
             return
 
-        # Bytes lost during the stall are gone (tmux never buffered them), but
-        # the pane's *current* content is not — replay it into the pipeline so
-        # the StatusMonitor buffer / GET output immediately reflect the live
-        # screen instead of staying frozen until the agent happens to emit
-        # something new.
-        #
-        # capture-pane output is joined with a bare "\n" (clients/tmux.py's
-        # get_history), which is linefeed-without-carriage-return. pyte's
-        # screen (fed by StatusMonitor for CAO_PYTE_STATUS providers — on by
-        # default, and opted into by claude_code, exactly the provider #388
-        # was filed against) defaults LNM (line-feed/new-line mode) off, so a
-        # bare "\n" advances the row without returning to column 0: each
-        # replayed line renders indented past the previous one
-        # ("staircasing"), and the composited screen no longer matches the
-        # real pane until a later cursor-addressed repaint happens to paper
-        # over it — meaning status detection can stay broken after the very
-        # re-arm meant to fix it. Replaying with "\r\n" makes pyte treat it as
-        # a real newline, matching what a real terminal does with tmux's own
-        # capture-pane output.
         replay = content.replace("\n", "\r\n")
         with self._lock:
             if terminal_id not in self._pane_probe:

@@ -113,6 +113,23 @@ PIPE_LIVENESS_STALL_CHECKS = _env_int("CAO_PIPE_LIVENESS_STALL_CHECKS", 2)
 # gives up on a terminal and drops its enrollment, instead of retrying forever
 # with a WARNING/exception log every failure.
 PIPE_LIVENESS_MAX_REARM_FAILURES = _env_int("CAO_PIPE_LIVENESS_MAX_REARM_FAILURES", 5)
+# Cold-start stall deadline (harness-control#93): the divergence check above
+# can ONLY ever catch a pipe that WAS delivering and then went stale — it
+# requires a change from an established "healthy" baseline. A pipe that has
+# been dead since the terminal was created never establishes one: if the
+# shell renders its prompt once and then sits idle (the common case), every
+# check sees the identical content as the last, "diverged_from_baseline" is
+# always False, and the watchdog can wait forever without ever re-arming —
+# meanwhile wait_for_shell() times out (60s default) waiting for a FIFO
+# buffer that was never going to fill. This is a separate, positive check:
+# has the FIFO delivered ANYTHING at all since the terminal was registered?
+# If not, and this much time has passed, and the live pane already has real
+# content (ruling out "still genuinely booting, nothing to show yet"), the
+# forwarder never started forwarding in the first place — re-arm immediately
+# rather than waiting on a divergence that will never arrive. Deliberately
+# much shorter than PIPE_LIVENESS_CHECK_INTERVAL_S's steady-state cadence:
+# this is a one-shot "did it ever start" deadline, not a recurring poll.
+PIPE_LIVENESS_COLD_START_GRACE_S = _env_float("CAO_PIPE_LIVENESS_COLD_START_GRACE_S", 3.0)
 
 # pyte-rendered status detection. When enabled, the StatusMonitor feeds each
 # terminal's output through a pyte terminal emulator and runs detection against
