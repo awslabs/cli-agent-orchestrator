@@ -35,7 +35,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from cli_agent_orchestrator.backends import TerminalNotFoundError
+from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
@@ -397,10 +397,14 @@ class InstallAgentProfileRequest(BaseModel):
 
     ``env_vars`` travels in the JSON body rather than as a query parameter so
     that any secrets callers inject are not written to HTTP access logs.
+
+    ``provider`` may be omitted (None): the install service then honours the
+    profile's frontmatter ``provider:`` key, falling back to the default
+    provider — the same flag > frontmatter > default precedence as the CLI.
     """
 
     source: str
-    provider: str = DEFAULT_PROVIDER
+    provider: Optional[str] = None
     env_vars: Optional[Dict[str, str]] = None
 
 
@@ -2046,6 +2050,7 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     # or future code paths could still bypass that, and tmux parses
     # ':' / '.' as target delimiters. Bind the validator return values
     # so the sanitization is explicit at the actual sink below.
+    # This tmux-shaped validation is deliberately applied to every backend.
     try:
         session_name = validate_tmux_name(metadata["tmux_session"], "session_name")
         window_name = validate_tmux_name(metadata["tmux_window"], "window_name")
@@ -2053,14 +2058,23 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
         await websocket.close(code=4003, reason="Invalid tmux target name")
         return
 
-    # Create PTY pair for tmux attach
+    try:
+        attach_command = await asyncio.to_thread(
+            get_backend().prepare_web_attach, session_name, window_name
+        )
+    except TerminalBackendError as e:
+        logger.error(f"Web attach failed for terminal {terminal_id}: {e}")
+        await websocket.close(code=4004, reason="Failed to attach terminal")
+        return
+
+    # Create PTY pair for backend attach
     master_fd, slave_fd = pty.openpty()
 
     # Set initial terminal size
     winsize = struct.pack("HHHH", 24, 80, 0, 0)
     fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
 
-    # Start tmux attach inside the PTY.
+    # Start the configured backend's interactive client inside the PTY.
     # Container/devcontainer environments often leave TERM unset or set to
     # ``dumb``, which strips colours, breaks cursor positioning and corrupts
     # the Ink-based TUIs that agent CLIs render. Force a sane default so the
@@ -2068,7 +2082,7 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     # Any explicit non-dumb TERM the operator set is preserved.
     pty_env = _build_pty_env()
     proc = subprocess.Popen(
-        ["tmux", "-u", "attach-session", "-t", f"{session_name}:{window_name}"],
+        attach_command,
         stdin=slave_fd,
         stdout=slave_fd,
         stderr=slave_fd,

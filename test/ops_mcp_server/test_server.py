@@ -184,6 +184,31 @@ class TestProfileTools:
             json={"source": "https://example.com/remote.md", "provider": "kiro_cli"},
         )
 
+    async def test_install_profile_omits_provider_when_not_explicit(self) -> None:
+        """Omitted provider should be left out of the body so the install API
+        resolves the profile's frontmatter provider (GH #414)."""
+        payload: InstallPayload = {
+            "success": True,
+            "message": "Agent 'developer' installed successfully",
+            "agent_name": "developer",
+            "context_file": "/tmp/developer.md",
+            "agent_file": None,
+            "unresolved_vars": None,
+        }
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data=payload),
+        ) as mock_request:
+            result = await install_profile("developer")
+
+        assert result == InstallResult(**payload)
+        mock_request.assert_called_once_with(
+            "post",
+            "http://127.0.0.1:9889/agents/profiles/install",
+            params=None,
+            json={"source": "developer"},
+        )
+
     async def test_install_profile_forwards_env_vars(self) -> None:
         """Env var maps should be forwarded to the API install endpoint."""
         payload = {

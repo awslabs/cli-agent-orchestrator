@@ -12,9 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cao profile find <query>` CLI verb and `find_profiles` MCP tool for keyword/BM25 profile discovery over metadata (name, description, tags, capabilities); metadata-only, never exposes prompt bodies (#340)
 - Optional `capabilities` and `tags` arrays in the agent profile frontmatter schema (#340)
 
+### Fixed
+
+- web: attach web terminals through the configured backend so herdr-backed terminals no longer fail to attach (#417)
+- honor profile frontmatter `provider:` during install (flag > frontmatter > default) (#414)
 ### Security
 
-- enable Jinja2 autoescape in the agent-profile scaffolding `Environment` (`agent_scaffold.py`). Jinja2 defaults to `autoescape=False`, which AppSec scanners flag as an XSS risk (ACAT `Jinja2AutoescapeDisabled`). A custom selector strips a trailing `.j2` before delegating to `select_autoescape(enabled_extensions=("html","htm","xml"))`, so a future `template.html.j2` / `template.xml.j2` is treated as HTML/XML and escaped, while the current `template.md.j2` markdown/bash output stays byte-identical (regression test added) (#429)
+- clear the `py/clear-text-storage-sensitive-data` CodeQL false positive (code-scanning alert #142) by renaming the local `secret` fixture variable in two `memory_service` secret-gate tests to `gated_content`. CodeQL's name-based heuristic classified the variable named `secret` as a sensitive-data source and traced it into the memory-wiki write (an intentionally plaintext, by-design markdown sink). The literal is the canonical AWS documentation example key, not a real credential; the value and all assertions are unchanged, so the federated secret-gate rejection and global-scope allow paths are still exercised exactly. No production behavior change
 
 ## [2.3.0] - 2026-07-12
 
