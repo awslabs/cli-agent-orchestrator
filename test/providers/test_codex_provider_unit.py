@@ -596,7 +596,7 @@ class TestTomlOverride:
         assert _toml_override("features.fast_mode", True) == "features.fast_mode=true"
         assert _toml_override("model_reasoning_effort", "xhigh") == 'model_reasoning_effort="xhigh"'
 
-    @pytest.mark.parametrize("key", ["bad key", "a=b", 'k"x', "key\ninjected", "", "a/b"])
+    @pytest.mark.parametrize("key", ["bad key", "a=b", 'k"x', "key\ninjected", "key\n", "", "a/b"])
     def test_rejects_unsafe_key(self, key):
         # Unsafe keys would produce a malformed -c override or split the tmux
         # command across lines; fail fast instead.
@@ -625,7 +625,7 @@ class TestMcpKeyValidation:
         return mock_profile
 
     @pytest.mark.parametrize(
-        "name", ['srv"x', "srv\ninjected", "bad name", "a=b", "", "srv.dotted"]
+        "name", ['srv"x', "srv\ninjected", "srv\n", "bad name", "a=b", "", "srv.dotted"]
     )
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_rejects_unsafe_server_name(self, mock_load, name):
@@ -634,7 +634,7 @@ class TestMcpKeyValidation:
         with pytest.raises(ValueError, match="Invalid mcpServers name key"):
             provider._build_codex_command()
 
-    @pytest.mark.parametrize("env_key", ['K"X', "K\nY", "BAD KEY", "a=b", "", "K.DOTTED"])
+    @pytest.mark.parametrize("env_key", ['K"X', "K\nY", "K\n", "BAD KEY", "a=b", "", "K.DOTTED"])
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_rejects_unsafe_env_key(self, mock_load, env_key):
         mock_load.return_value = self._profile_with(

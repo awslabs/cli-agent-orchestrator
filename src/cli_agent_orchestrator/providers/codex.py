@@ -181,7 +181,10 @@ def _validate_config_key(key: Any, *, source: str, allow_dots: bool = False) -> 
             "a single TOML bare key over [A-Za-z0-9_-] (no dots -- a dot "
             "would nest the entry under the wrong TOML table)"
         )
-    if not isinstance(key, str) or not pattern.match(key):
+    # fullmatch, not match: with ``$`` alone, re.match accepts a TRAILING
+    # newline ("srv\n" passes ^...$), which is exactly the bug class this
+    # validation exists to close.
+    if not isinstance(key, str) or not pattern.fullmatch(key):
         raise ValueError(f"Invalid {source} key {key!r}: must be {expected}")
     return key
 
