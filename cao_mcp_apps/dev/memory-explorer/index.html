@@ -281,8 +281,10 @@
     function showStatus(kind, title, htmlBody) {
       els.status.className = "show" + (kind === "error" ? " error" : "");
       const spinner = kind === "loading" ? '<div class="spinner"></div>' : "";
+      const safeTitle = escapeHtml(String(title ?? ""));
+      const bodyHtml = typeof htmlBody === "string" ? htmlBody : "";
       els.status.innerHTML =
-        `<div class="box">${spinner}<h2>${title}</h2>${htmlBody || ""}</div>`;
+        `<div class="box">${spinner}<h2>${safeTitle}</h2>${bodyHtml}</div>`;
     }
     function hideStatus() {
       els.status.className = "";
@@ -385,7 +387,7 @@
       const url = `${base()}/graph/memory?${qs.toString()}`;
 
       showStatus("loading", "Loading graph…",
-        `<p>Fetching <code>${url}</code></p>
+        `<p>Fetching <code>${escapeHtml(url)}</code></p>
          <p>This can take up to ~60s — the server runs wiki-lint detectors.</p>`);
 
       try {
