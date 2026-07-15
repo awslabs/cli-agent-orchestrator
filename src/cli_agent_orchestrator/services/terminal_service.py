@@ -187,6 +187,14 @@ async def create_terminal(
         TimeoutError: If provider initialization times out
     """
     session_created = False  # tracks whether THIS call created the tmux session
+    # harness-control#186: tracks whether THIS call created a new WINDOW in an
+    # already-existing session (the `new_session=False` branch below — what
+    # every MCP spawn/assign-into-existing-session call does). Independent of
+    # `session_created` above: on failure, the cleanup path already tears
+    # down the whole session (window included) when THIS call created a brand
+    # new one, but had no equivalent for a window added to a session that
+    # already existed — see the `except` block.
+    window_created = False
     try:
         # Step 1: Generate unique identifiers
         terminal_id = generate_terminal_id()
@@ -236,6 +244,7 @@ async def create_terminal(
                 working_directory,
                 extra_env=get_session_env(session_name),
             )
+            window_created = True  # only set after successful creation
 
         # Step 3: Load the profile once for allowed tool resolution before
         # provider initialization. The skill catalog is computed only for
@@ -429,6 +438,24 @@ async def create_terminal(
             # secrets don't linger in memory or bleed into a future reuse
             # of the same name.
             clear_session_env(session_name)
+        elif window_created and session_name and window_name:
+            # harness-control#186: a window added to an ALREADY-EXISTING session
+            # (new_session=False -- every MCP spawn/assign-into-existing-session
+            # call) has no session-level teardown to fall back on above, since
+            # `session_created` is False and the pre-existing session must stay
+            # up. Live-reproduced without this: a provider init timeout here
+            # (e.g. "Claude Code initialization timed out after 60s") rolls back
+            # the DB row and stops the FIFO/provider/status-monitor above, but
+            # the tmux WINDOW itself — the actual pane, still running whatever
+            # shell/process the provider left behind — was never torn down.
+            # Result: the caller (the spawning agent's MCP tool call) gets a
+            # hard error back, AND a permanently orphaned window is left behind:
+            # invisible to this terminal's own list/tree (the DB row is gone),
+            # never cleaned up, sitting there indefinitely.
+            try:
+                get_backend().kill_window(session_name, window_name)
+            except Exception:
+                pass  # Ignore cleanup errors
         raise
 
 
