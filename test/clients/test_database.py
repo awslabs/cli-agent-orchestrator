@@ -713,6 +713,115 @@ class TestListSiblingsByGroupPrefix:
 
         assert result == []
 
+    def test_sql_prefilter_narrows_rows_before_python_decode(self, test_db):
+        """Copilot review, PR #433: prove the SQL query itself narrows the
+        candidate set, not just that the final (correct) results happen to
+        match -- i.e. this is no longer a full-table scan + Python filter.
+
+        ``json.loads`` is only ever called (inside the function) on
+        ``row.group`` for rows the DB query actually returned, so its call
+        count is a direct proxy for how many rows were pulled into Python
+        for decoding. 5 non-matching siblings (different top-level tenant)
+        plus 1 matching one are seeded -- a full scan would decode all 6; a
+        working SQL prefilter decodes only the 1 that can possibly match.
+        """
+        import json as real_json
+
+        non_matching = [
+            TerminalModel(
+                id=f"other-tenant-{i}",
+                tmux_session="s",
+                tmux_window="w",
+                provider="kiro_cli",
+                group=f'["tenant_{i}", "project_5"]',
+            )
+            for i in range(2, 7)
+        ]
+        self._seed(
+            test_db,
+            non_matching
+            + [
+                TerminalModel(
+                    id="sib-1",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1", "project_5", "folder_1"]',
+                ),
+            ],
+        )
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            with patch("json.loads", wraps=real_json.loads) as mock_loads:
+                result = list_siblings_by_group_prefix("caller-1", ["tenant_1", "project_5"])
+
+        assert [r["id"] for r in result] == ["sib-1"]
+        # Only the 1 matching row should ever reach json.loads -- proof the
+        # other 5 were excluded at the SQL level, never loaded for decoding.
+        assert mock_loads.call_count == 1
+
+    def test_element_text_prefix_does_not_false_positive_match(self, test_db):
+        """A sibling group element that merely shares a *text* prefix with a
+        requested prefix element (e.g. "project_50" vs. requested
+        "project_5") must not match -- the SQL LIKE prefilter operates on
+        the JSON encoding, where each string element is quote-delimited, so
+        this can't false-positive."""
+        self._seed(
+            test_db,
+            [
+                TerminalModel(
+                    id="near-miss",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1", "project_50"]',
+                ),
+                TerminalModel(
+                    id="exact",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group='["tenant_1", "project_5", "folder_1"]',
+                ),
+            ],
+        )
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            result = list_siblings_by_group_prefix("caller-1", ["tenant_1", "project_5"])
+
+        assert [r["id"] for r in result] == ["exact"]
+
+    def test_group_element_with_like_special_characters_matches_literally(self, test_db):
+        """Group elements containing SQL LIKE wildcards (``%``, ``_``) must
+        be matched as literal text, not interpreted as wildcards, in the SQL
+        prefilter (autoescape)."""
+        import json as real_json
+
+        self._seed(
+            test_db,
+            [
+                TerminalModel(
+                    id="literal-match",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group=real_json.dumps(["50%_off", "folder_1"]),
+                ),
+                TerminalModel(
+                    id="unrelated",
+                    tmux_session="s",
+                    tmux_window="w",
+                    provider="kiro_cli",
+                    group=real_json.dumps(["completely_different", "folder_1"]),
+                ),
+            ],
+        )
+
+        with patch("cli_agent_orchestrator.clients.database.SessionLocal", test_db):
+            result = list_siblings_by_group_prefix("caller-1", ["50%_off"])
+
+        assert [r["id"] for r in result] == ["literal-match"]
+
 
 class TestInboxOperations:
     """Tests for inbox database operations."""
