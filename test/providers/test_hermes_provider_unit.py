@@ -429,8 +429,11 @@ class TestHermesStatusDetection:
         assert provider.get_status("Error: failed\n") == TerminalStatus.ERROR
 
     def test_get_status_empty_output(self):
+        # native=None always falls through (no dispatch-timing guess); on tmux
+        # the live-read fallback is a pass-through, so an empty buffer hits
+        # Hermes's own no-output default (ERROR) directly.
         provider = HermesProvider("tid", "sess", "win", None)
-        assert provider.get_status("") == TerminalStatus.IDLE
+        assert provider.get_status("") == TerminalStatus.ERROR
 
 
 class TestHermesExtraction:

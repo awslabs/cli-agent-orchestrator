@@ -282,12 +282,15 @@ class TestGetStatus:
         assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
 
     def test_empty_output_returns_unknown(self):
+        # native=None always falls through (no dispatch-timing guess); on tmux
+        # the live-read fallback is a pass-through, so an empty buffer hits
+        # Cursor's own no-output default directly.
         provider = make_provider()
-        assert provider.get_status("") == TerminalStatus.IDLE
+        assert provider.get_status("") == TerminalStatus.UNKNOWN
 
     def test_none_output_returns_unknown(self):
         provider = make_provider()
-        assert provider.get_status(None) == TerminalStatus.IDLE
+        assert provider.get_status(None) == TerminalStatus.UNKNOWN
 
     def test_unrecognizable_output_returns_unknown(self):
         provider = make_provider()

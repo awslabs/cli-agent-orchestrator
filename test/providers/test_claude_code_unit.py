@@ -467,21 +467,21 @@ class TestClaudeCodeProviderStatusDetection:
         assert status != TerminalStatus.WAITING_USER_ANSWER
         assert status == TerminalStatus.COMPLETED
 
-    def test_get_status_empty_buffer_not_dispatched_returns_idle(self):
-        """Empty buffer + no task dispatched -> IDLE via native-None resolution.
+    def test_get_status_empty_buffer_returns_unknown(self):
+        """Empty buffer -> UNKNOWN (native=None always falls through to buffer analysis).
 
         The backend's get_native_status() returns None (tmux always; herdr
-        'unknown'); with an empty buffer and no dispatch the shared
-        _resolve_native_status() reports IDLE to unblock init rather than
-        falling through to buffer analysis (which would yield UNKNOWN). See the
-        native-None matrix in BaseProvider._resolve_native_status.
+        'unknown'); this always falls through to buffer analysis -- no
+        dispatch-timing guess. On tmux, BaseProvider._resolve_buffer() is a
+        pass-through, so the empty buffer hits Claude Code's own no-output
+        default (UNKNOWN) directly.
         """
         output = ""
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         status = provider.get_status(output)
 
-        assert status == TerminalStatus.IDLE
+        assert status == TerminalStatus.UNKNOWN
 
     def test_get_status_error_unrecognized(self):
         """Test UNKNOWN status with unrecognized output."""

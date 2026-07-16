@@ -747,10 +747,13 @@ class TestCodexProviderStatusDetection:
         assert status == TerminalStatus.ERROR
 
     def test_get_status_empty_output(self):
+        # native=None always falls through (no dispatch-timing guess); on tmux
+        # the live-read fallback is a pass-through, so an empty buffer hits
+        # Codex's own no-output default directly.
         provider = CodexProvider("test1234", "test-session", "window-0")
         status = provider.get_status("")
 
-        assert status == TerminalStatus.IDLE
+        assert status == TerminalStatus.UNKNOWN
 
     def test_get_status_processing_when_old_prompt_present(self):
         # If the captured history contains an earlier prompt but the *latest* output is processing,

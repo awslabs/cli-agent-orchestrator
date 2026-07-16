@@ -184,10 +184,15 @@ class TestNonPermissionCases:
         assert provider.get_status(output) == TerminalStatus.IDLE
 
     def test_empty_output(self):
-        """Empty output returns IDLE (empty buffer + no dispatch)."""
+        """Empty output returns UNKNOWN.
+
+        native=None always falls through to buffer analysis now (no dispatch-
+        timing guess) -- on tmux the live-read fallback is a pass-through, so
+        an empty buffer hits Kiro's own no-output default directly.
+        """
         output = ""
         provider = make_provider("developer")
-        assert provider.get_status(output) == TerminalStatus.IDLE
+        assert provider.get_status(output) == TerminalStatus.UNKNOWN
 
 
 class TestPermissionPromptEdgeCases:

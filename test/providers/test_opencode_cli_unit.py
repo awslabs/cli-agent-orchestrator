@@ -145,14 +145,15 @@ class TestGetStatusFromFixtures:
         assert provider.get_status(output) == TerminalStatus.IDLE
 
     def test_empty_output_returns_unknown(self):
-        # Empty buffer + native None + no dispatch → IDLE.
+        # native=None always falls through (no dispatch-timing guess); on tmux
+        # the live-read fallback is a pass-through, so an empty buffer hits
+        # OpenCode's own no-output default directly.
         provider = make_provider()
-        assert provider.get_status("") == TerminalStatus.IDLE
+        assert provider.get_status("") == TerminalStatus.UNKNOWN
 
     def test_none_output_returns_unknown(self):
-        # None buffer + native None + no dispatch → IDLE.
         provider = make_provider()
-        assert provider.get_status(None) == TerminalStatus.IDLE
+        assert provider.get_status(None) == TerminalStatus.UNKNOWN
 
     def test_unknown_output_returns_unknown_fallback(self):
         """Non-empty output with no recognizable pattern → UNKNOWN fallback.

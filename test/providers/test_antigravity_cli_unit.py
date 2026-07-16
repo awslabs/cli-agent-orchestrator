@@ -71,8 +71,11 @@ def test_status_idle_vs_completed_split_on_turns():
 
 
 def test_status_empty_is_unknown():
-    assert make_provider().get_status("") == TerminalStatus.IDLE
-    assert make_provider().get_status(None) == TerminalStatus.IDLE
+    # native=None always falls through (no dispatch-timing guess); on tmux the
+    # live-read fallback is a pass-through, so an empty buffer hits agy's own
+    # no-output default (UNKNOWN) directly.
+    assert make_provider().get_status("") == TerminalStatus.UNKNOWN
+    assert make_provider().get_status(None) == TerminalStatus.UNKNOWN
 
 
 def test_status_processing_takes_priority_over_idle_footer():
