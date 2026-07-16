@@ -48,12 +48,6 @@ class BaseProvider(ABC):
         _allowed_tools: CAO-vocabulary tool names this agent is allowed to use
     """
 
-    # Seconds after task dispatch that an unresolvable native status (herdr
-    # "unknown" with an empty buffer) is treated as optimistic PROCESSING.
-    # Past this, the agent is presumed wedged and reported ERROR. See the
-    # native-None matrix in _resolve_native_status().
-    _TASK_DISPATCH_STALENESS_TIMEOUT = 120
-
     def __init__(
         self,
         terminal_id: str,
@@ -273,7 +267,7 @@ class BaseProvider(ABC):
         self._done_first_detected = 0.0
         self._idle_first_detected = 0.0
 
-    def _resolve_native_status(self, buffer: Optional[str]) -> Optional[TerminalStatus]:
+    def _resolve_native_status(self, buffer: Optional[str] = None) -> Optional[TerminalStatus]:
         """Resolve status from the backend's native agent state, if available.
 
         On the herdr backend, ``pipe_pane`` is a no-op so the StatusMonitor
@@ -281,25 +275,17 @@ class BaseProvider(ABC):
         rather than buffer parsing. Every provider calls this at the top of
         ``get_status()``; when it returns non-None the buffer path is skipped.
 
-        ``get_native_status()`` returns None in two distinct situations, which
-        ``buffer`` disambiguates:
-
-        - tmux backend: always None, and the StatusMonitor ``buffer`` is
-          populated. This method returns None so the caller falls through to
-          buffer analysis unchanged.
-        - herdr backend, "unknown" agent_status: None with an empty ``buffer``
-          (a wrapped ``podman``/``docker exec`` launch hides the agent CLI from
-          herdr). Buffer parsing cannot help, so status is inferred from
-          dispatch state per the matrix below.
-
-        Native-None resolution matrix:
-
-        | buffer      | _task_dispatched      | Result                    |
-        |-------------|-----------------------|---------------------------|
-        | non-empty   | *                     | None (fall to buffer)     |
-        | empty       | False                 | IDLE                      |
-        | empty       | True, fresh (<120s)   | PROCESSING (optimistic)   |
-        | empty       | True, stale (>=120s)  | ERROR (+ warning log)     |
+        ``get_native_status()`` returns None when the backend cannot resolve a
+        real agent state — always on tmux, and on herdr when the agent_status
+        is "unknown" (a wrapped ``podman``/``docker exec`` launch hides the
+        agent CLI from herdr). In both cases this returns None unconditionally
+        so the caller falls through to buffer analysis via ``_resolve_buffer()``
+        — never a guess derived from dispatch timing. A guess here previously
+        traded fail-fast init detection (a dead/wedged launch reported ERROR)
+        for optimistic PROCESSING/IDLE, which silently masked real failures
+        until a hardcoded staleness window elapsed. Buffer analysis on real
+        pane content (see ``_resolve_buffer``) restores both fail-fast ERROR
+        detection and a real COMPLETED path without that tradeoff.
 
         The only ambiguous non-None native state is IDLE: herdr reports "idle"
         both before any task has been dispatched AND after a task completed
@@ -311,8 +297,8 @@ class BaseProvider(ABC):
         (reports COMPLETED) 300s after dispatch.
 
         Args:
-            buffer: The StatusMonitor output buffer for this terminal. Empty (or
-                None) on the herdr backend; populated on tmux.
+            buffer: Unused; retained so existing call sites (``self.
+                _resolve_native_status(output)``) do not need updating.
         """
         from cli_agent_orchestrator.backends.registry import get_backend
 
@@ -323,30 +309,9 @@ class BaseProvider(ABC):
             native.value if native is not None else None,
         )
         if native is None:
-            # Native status unresolvable. On tmux the buffer is populated —
-            # fall through to buffer analysis. On herdr "unknown" the buffer is
-            # empty (wrapped exec hides the agent), so infer from dispatch state.
-            if buffer:
-                return None
-            if not self._task_dispatched:
-                return TerminalStatus.IDLE
-            elapsed = time.time() - self._last_dispatch_time
-            if elapsed < self._TASK_DISPATCH_STALENESS_TIMEOUT:
-                logger.debug(
-                    "[get_status] terminal=%s -> PROCESSING "
-                    "(native unresolved, %.0fs since dispatch, optimistic)",
-                    self.terminal_id,
-                    elapsed,
-                )
-                return TerminalStatus.PROCESSING
-            logger.warning(
-                "[get_status] terminal=%s -> ERROR "
-                "(native unresolved, %.0fs since dispatch exceeds %ds staleness timeout)",
-                self.terminal_id,
-                elapsed,
-                self._TASK_DISPATCH_STALENESS_TIMEOUT,
-            )
-            return TerminalStatus.ERROR
+            # Unresolvable at the backend level (tmux always; herdr "unknown").
+            # Fall through to buffer analysis unchanged — no guessing here.
+            return None
         if native == TerminalStatus.PROCESSING:
             # Reset flush-wait timers — herdr is actively working, so any
             # previously stamped idle/done timestamp is from a pre-work gap
@@ -409,6 +374,53 @@ class BaseProvider(ABC):
         # COMPLETED (no task dispatched), WAITING_USER_ANSWER, ERROR -- return directly
         logger.debug("[get_status] terminal=%s -> %s (native)", self.terminal_id, native.value)
         return native
+
+    def _resolve_buffer(self, buffer: Optional[str]) -> str:
+        """Resolve the buffer ``get_status()`` should parse when native status is None.
+
+        Event-inbox backends (herdr) never populate the pushed StatusMonitor
+        buffer -- ``pipe_pane`` is a no-op there (see ``_resolve_native_status``)
+        -- so an empty ``buffer`` on herdr does not mean the pane has no
+        content, only that the push pipeline was never fed. Falling straight
+        through to a provider's "no output" default (UNKNOWN, or ERROR for
+        hermes) on every herdr call was the original #359 gap; guessing status
+        from dispatch timing (the #400 native-None matrix this replaces) traded
+        that gap for silently masking real failures behind an optimistic
+        window. Reading the backend's live pane content instead lets each
+        provider's EXISTING pattern matching (idle prompt, error text, response
+        markers) run against real content: a dead launch's error text is
+        visible, a wedged pane genuinely shows no prompt, and a finished turn's
+        response is genuinely there to extract.
+
+        On tmux, ``buffer`` is already populated by the FIFO push pipeline, so
+        this is a pure pass-through -- no extra backend round-trip.
+
+        Args:
+            buffer: The StatusMonitor's pushed buffer for this terminal (may be
+                empty or None).
+
+        Returns:
+            ``buffer`` unchanged (tmux, or a non-empty herdr buffer), or a live
+            ``get_history()`` read (herdr with an empty pushed buffer). Never
+            raises -- a backend read failure falls back to ``buffer`` (or "").
+        """
+        if buffer:
+            return buffer
+        from cli_agent_orchestrator.backends.registry import get_backend
+
+        backend = get_backend()
+        if not backend.supports_event_inbox():
+            return buffer or ""
+        try:
+            return backend.get_history(self.session_name, self.window_name)
+        except Exception as e:
+            logger.debug(
+                "[get_status] terminal=%s live buffer read failed, falling back to "
+                "pushed buffer: %s",
+                self.terminal_id,
+                e,
+            )
+            return buffer or ""
 
     @staticmethod
     def _extract_questions(user_messages: List[str]) -> List[str]:

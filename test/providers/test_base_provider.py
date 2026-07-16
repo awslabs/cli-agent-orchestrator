@@ -1,6 +1,5 @@
 """Tests for base provider."""
 
-import time
 from unittest.mock import patch
 
 import pytest
@@ -128,100 +127,119 @@ class TestTranslatePath:
         assert self.provider._translate_path("/hostile/x.txt", profile) == "/hostile/x.txt"
 
 
-# Absolute path to base.time so staleness tests can pin time.time() deterministically.
-_BASE_TIME = "cli_agent_orchestrator.providers.base.time.time"
-
-
 class TestResolveNativeStatus:
-    """Tests for BaseProvider._resolve_native_status when the backend reports None.
+    """Tests for BaseProvider._resolve_native_status.
 
-    Covers the native-None resolution matrix (see the method docstring). The
-    backend's get_native_status() returns None both on tmux (buffer populated)
-    and on the herdr 'unknown' agent_status (empty buffer); this method
-    disambiguates via ``buffer`` and dispatch state:
+    ``get_native_status()`` returns None whenever the backend cannot resolve a
+    real agent state -- always on tmux, and on herdr for the "unknown"
+    agent_status (a wrapped exec launch hides the agent CLI). Both cases must
+    return None unconditionally: no guessing from dispatch state. A prior
+    version of this method inferred IDLE/PROCESSING/ERROR from
+    ``_task_dispatched`` timing when native was unresolvable and the buffer was
+    empty; that traded fail-fast init detection for optimistic guessing (a dead
+    herdr launch reported false-success IDLE, and a genuinely wedged wrapped
+    pane could never reach a real COMPLETED). This test class guards the
+    restored invariant: native unresolvable always falls through to buffer
+    analysis (via ``_resolve_buffer``, tested separately below), regardless of
+    dispatch state or buffer emptiness. No provider overrides
+    ``_resolve_native_status``, so ConcreteProvider exercises the real shared
+    implementation.
+    """
 
-    | buffer      | _task_dispatched     | Result                  |
-    |-------------|----------------------|-------------------------|
-    | non-empty   | *                    | None (fall to buffer)   |
-    | empty       | False                | IDLE                    |
-    | empty       | True, fresh (<120s)  | PROCESSING (optimistic) |
-    | empty       | True, stale (>=120s) | ERROR (+ warning log)   |
+    def _provider(self):
+        return ConcreteProvider("term-123", "session-1", "window-0")
 
-    Called directly (not via get_status) because row 1 — non-empty buffer
-    returning None — is only observable at this method's boundary; through
-    get_status() it continues into provider buffer parsing. No provider
-    overrides _resolve_native_status, so ConcreteProvider exercises the real
-    shared implementation.
+    @pytest.mark.parametrize(
+        "buffer, dispatched",
+        [("", False), ("", True), (None, False), (None, True), ("some content", False)],
+        ids=[
+            "empty_not_dispatched",
+            "empty_dispatched",
+            "none_not_dispatched",
+            "none_dispatched",
+            "nonempty_buffer",
+        ],
+    )
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_native_none_always_falls_through(self, mock_backend, buffer, dispatched):
+        """native=None -> always None, regardless of buffer content or dispatch state.
+
+        No guessing: the caller must fall through to buffer analysis on real
+        pane content in every case -- this is the fail-fast/real-COMPLETED fix.
+        """
+        mock_backend.get_native_status.return_value = None
+        provider = self._provider()
+        provider._task_dispatched = dispatched
+        assert provider._resolve_native_status(buffer) is None
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_native_none_default_buffer_arg_falls_through(self, mock_backend):
+        """buffer defaults to None when omitted -- still falls through, not a guess."""
+        mock_backend.get_native_status.return_value = None
+        provider = self._provider()
+        assert provider._resolve_native_status() is None
+
+
+class TestResolveBuffer:
+    """Tests for BaseProvider._resolve_buffer -- the herdr live-read fallback.
+
+    On tmux the pushed StatusMonitor buffer is always populated by the FIFO
+    pipeline, so this is a pass-through. On herdr, ``pipe_pane`` is a no-op and
+    the pushed buffer is always empty; an empty pushed buffer there means "the
+    push pipeline was never fed", not "the pane has no content" -- so this
+    reads the backend's live pane content instead, letting the provider's own
+    pattern matching run against real output rather than nothing.
     """
 
     def _provider(self):
         return ConcreteProvider("term-123", "session-1", "window-0")
 
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_native_none_empty_buffer_not_dispatched_returns_idle(self, mock_backend):
-        """Row: empty buffer, no task dispatched -> IDLE (unblocks init)."""
-        mock_backend.get_native_status.return_value = None
+    def test_nonempty_buffer_passthrough(self, mock_backend):
+        """A non-empty buffer is returned unchanged -- no backend read at all."""
         provider = self._provider()
-        assert provider._task_dispatched is False  # precondition
-        assert provider._resolve_native_status("") == TerminalStatus.IDLE
+        assert provider._resolve_buffer("some content") == "some content"
+        mock_backend.get_history.assert_not_called()
 
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_native_none_empty_buffer_none_arg_not_dispatched_returns_idle(self, mock_backend):
-        """A None buffer is treated like an empty buffer (herdr passes no buffer)."""
-        mock_backend.get_native_status.return_value = None
+    def test_empty_buffer_tmux_passthrough(self, mock_backend):
+        """tmux (supports_event_inbox=False): empty buffer stays empty, no live read."""
+        mock_backend.supports_event_inbox.return_value = False
         provider = self._provider()
-        assert provider._resolve_native_status(None) == TerminalStatus.IDLE
+        assert provider._resolve_buffer("") == ""
+        mock_backend.get_history.assert_not_called()
 
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_native_none_empty_buffer_dispatched_fresh_returns_processing(self, mock_backend):
-        """Row: empty buffer, dispatched, 119s elapsed (<120s) -> PROCESSING.
-
-        Boundary value: just inside the freshness window.
-        """
-        mock_backend.get_native_status.return_value = None
+    def test_none_buffer_tmux_returns_empty_string(self, mock_backend):
+        """tmux: a None buffer resolves to "" (never leaks None to callers)."""
+        mock_backend.supports_event_inbox.return_value = False
         provider = self._provider()
-        provider._task_dispatched = True
-        provider._last_dispatch_time = 1000.0
-        with patch(_BASE_TIME, return_value=1000.0 + 119.0):
-            assert provider._resolve_native_status("") == TerminalStatus.PROCESSING
+        assert provider._resolve_buffer(None) == ""
 
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_native_none_dispatched_at_staleness_boundary_returns_error(self, mock_backend):
-        """Boundary value: elapsed == 120s is NOT < timeout, so -> ERROR (not PROCESSING)."""
-        mock_backend.get_native_status.return_value = None
+    def test_empty_buffer_herdr_reads_live_history(self, mock_backend):
+        """herdr (supports_event_inbox=True): empty pushed buffer -> live get_history() read."""
+        mock_backend.supports_event_inbox.return_value = True
+        mock_backend.get_history.return_value = "live pane content"
         provider = self._provider()
-        provider._task_dispatched = True
-        provider._last_dispatch_time = 1000.0
-        with patch(_BASE_TIME, return_value=1000.0 + 120.0):
-            assert provider._resolve_native_status("") == TerminalStatus.ERROR
+        assert provider._resolve_buffer("") == "live pane content"
+        mock_backend.get_history.assert_called_once_with("session-1", "window-0")
 
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_native_none_empty_buffer_dispatched_stale_returns_error(self, mock_backend, caplog):
-        """Row: empty buffer, dispatched, 121s elapsed (>120s) -> ERROR + warning log."""
-        import logging
-
-        mock_backend.get_native_status.return_value = None
+    def test_none_buffer_herdr_reads_live_history(self, mock_backend):
+        """herdr: a None pushed buffer also triggers the live read."""
+        mock_backend.supports_event_inbox.return_value = True
+        mock_backend.get_history.return_value = "live pane content"
         provider = self._provider()
-        provider._task_dispatched = True
-        provider._last_dispatch_time = 1000.0
-        with patch(_BASE_TIME, return_value=1000.0 + 121.0):
-            with caplog.at_level(logging.WARNING, logger="cli_agent_orchestrator.providers.base"):
-                result = provider._resolve_native_status("")
-        assert result == TerminalStatus.ERROR
-        assert any(
-            "staleness timeout" in r.message and r.levelno == logging.WARNING
-            for r in caplog.records
-        ), "stale native-None resolution must log a WARNING"
+        assert provider._resolve_buffer(None) == "live pane content"
 
-    @pytest.mark.parametrize("dispatched", [False, True], ids=["not_dispatched", "dispatched"])
     @patch("cli_agent_orchestrator.backends.registry._backend")
-    def test_native_none_nonempty_buffer_falls_through(self, mock_backend, dispatched):
-        """Row: non-empty buffer -> None regardless of dispatch state (defer to buffer path)."""
-        mock_backend.get_native_status.return_value = None
+    def test_herdr_live_read_failure_falls_back_to_empty(self, mock_backend):
+        """A live read failure (backend hiccup) falls back to the pushed buffer, not a raise."""
+        mock_backend.supports_event_inbox.return_value = True
+        mock_backend.get_history.side_effect = RuntimeError("herdr socket closed")
         provider = self._provider()
-        provider._task_dispatched = dispatched
-        provider._last_dispatch_time = time.time()
-        assert provider._resolve_native_status("some content") is None
+        assert provider._resolve_buffer("") == ""
 
 
 # Where get_init_timeout reads the server default from.
