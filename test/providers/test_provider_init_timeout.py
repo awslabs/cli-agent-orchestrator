@@ -38,11 +38,17 @@ class TestInitializePassesResolvedInitTimeout:
     """The timeout get_init_timeout resolves must cap every wait in initialize().
 
     Mocks every external call so only the timeout wiring is exercised:
-    load_agent_profile (profile source), wait_for_shell / wait_until_status
-    (the async waits), _build_claude_command (avoids temp-file I/O),
-    _handle_startup_prompts (asserted separately), _ensure_skip_bypass_prompt_setting
-    (avoids writing ~/.claude/settings.json), and the terminal backend.
+    load_agent_profile (profile source), wait_for_shell / wait_until_status /
+    wait_until_input_ready (the async waits), _build_claude_command (avoids
+    temp-file I/O), _handle_startup_prompts (asserted separately),
+    _ensure_skip_bypass_prompt_setting (avoids writing
+    ~/.claude/settings.json), and the terminal backend.
     """
+
+    @pytest.fixture(autouse=True)
+    def _mock_input_ready(self):
+        with patch.object(ClaudeCodeProvider, "wait_until_input_ready"):
+            yield
 
     @pytest.mark.asyncio
     @patch.object(ClaudeCodeProvider, "_ensure_skip_bypass_prompt_setting")
